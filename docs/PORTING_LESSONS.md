@@ -285,3 +285,40 @@ Cite the C source (`file:line`) or dump probe that proves it.
   iterate isn't — so `stop_gradient(x0)` is correct. Exact warm-start dump-matching at step
   ≥2 (the C's stop threshold uses the original `‖b‖`) is finalized with the full `step()` in
   Task 2.11. (`ssh.solve_ssh`, Task 2.7.)
+
+- **[hbar] ⚠️ `compute_hbar`'s `ssh_rhs_old` IS `compute_ssh_rhs` with `uv_rhs=0` and
+  `alpha=1` — reuse it, don't re-port.** Substep 11's transport divergence
+  (`fesom_momentum.c:796-830`) is the byte-identical antisymmetric edge→node scatter as
+  substep 8 (`fesom_ssh.c:261`); the *only* differences are it uses the bare **new** velocity
+  `u` (not `u+u_rhs`) and drops the `alpha` factor (`alpha=1`). So
+  `ssh_rhs_old = compute_ssh_rhs(mesh, uv, zeros_like(uv), helem, alpha=1.0)` is exact. Edge
+  range is `myDim_edge2D` (the C warns the `+eDim` double-count → CG NaN ~step 85-95 in MPI)
+  but for single-rank pi `myDim_edge2D == edge2D == 8986`, so the all-edges JAX scatter is
+  identical. (`ssh.compute_hbar`, Task 2.8.)
+
+- **[hbar/fidelity] A downstream `÷ (large area)` RESTORES tight fidelity that the
+  intermediate scatter lost — gate the OUTPUT, not the noisy intermediate.** `hbar =
+  hbar_old + ssh_rhs_old·dt / areasvol[n,0]`. `ssh_rhs_old` is the *same* near-cancelling
+  transport-divergence scatter as `ssh_rhs` (abs floor ~1e-7, amplified by `dx·helem~1e7`),
+  yet `hbar` matches the dump to **~1e-17 absolute** — because `areasvol ~ 1e9–1e12 m²`
+  divides that amplified error right back down (`1e-7·100/1e10 ~ 1e-15`). So the substeps
+  10–12 dump gates are TIGHT (uv ~2e-17, hbar/eta_n ~1e-17), unlike the loose `ssh_rhs` gate
+  (atol 1e-7). Moral: don't inherit an upstream field's loose tolerance — re-measure at the
+  gated field; a `÷area`/average can recover map-class fidelity. (`ssh.compute_hbar`, Task 2.8.)
+
+- **[update_vel] The SSH-gradient correction `(Fx,Fy)=∇N·(−gθdt·d_eta)` is BAROTROPIC
+  (uniform over the column) and `uv` ACCUMULATES (`uv += du + F`).** `Fx,Fy` are a single
+  per-element scalar added to *every* layer `nz∈[nzmin,nzmax)` (broadcast over `nz`), unlike
+  the per-level increment `du` (`fesom_momentum.c:496-500`). At step 1 `uv=0` so this is the
+  first wind-driven velocity (~1e-3 surface); at step ≥2 it increments the carried `uv`. uv
+  matched the dump ~2e-17 (gather class) since both `du` (~1e-17) and the replicated
+  early-stop `d_eta` (~1e-18) are near-exact. `d_eta` is *read* here, not consumed — it stays
+  as the next step's CG warm-start `x0`. (`momentum.update_vel`, Task 2.8.)
+
+- **[eta_n] With `SSH_ALPHA=1` the eta_n blend collapses to `eta_n = hbar` exactly** (the
+  dump confirms `eta_n == hbar` at every probe). `eta_n = α·hbar + (1−α)·hbar_old`
+  (`fesom_step.c:257-268`); the `(1−α)·hbar_old` term vanishes at `α=1` (same shape as the
+  `ssh_rhs`'s `(1−α)·ssh_rhs_old` blend). Keep the blend form for generality, but in Phase 2
+  `eta_n` is a renamed copy of the post-update `hbar`. Only non-cavity nodes
+  (`ulevels_nod2D==1`, all of pi) are written; cavity nodes keep their prior `eta_n`.
+  (`ssh.eta_n_update`, Task 2.8.)

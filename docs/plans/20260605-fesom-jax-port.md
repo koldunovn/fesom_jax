@@ -376,9 +376,9 @@ files noted per task.
 - Modify: `fesom_jax/momentum.py`, `fesom_jax/ssh.py`
 - Modify: tests
 
-- [ ] port `update_vel` (gather SSH correction to elements), `compute_hbar` (transport-divergence edge→node scatter, save `ssh_rhs_old`), `eta_n` blend — ref `fesom_momentum.c:474/779`, `fesom_ale.c`
-- [ ] write tests: `hbar` (11) and `eta_n` (12) are **node** fields → compare vs Fortran dumps directly (≤1e-12). `uv` (10) is **element** → element dump or indirect via `hbar` @11
-- [ ] run — must pass before next task
+- [x] port `update_vel` (gather SSH correction to elements), `compute_hbar` (transport-divergence edge→node scatter, save `ssh_rhs_old`), `eta_n` blend — ref `fesom_momentum.c:474/779`, `fesom_ale.c` — `momentum.update_vel` (barotropic `∇N·d_eta` correction, `uv += du + F`), `ssh.compute_hbar` (= `compute_ssh_rhs` with `uv_rhs=0`,`α=1`, then `hbar += ssh_rhs_old·dt/areasvol`), `ssh.eta_n_update` (`α=1` ⇒ `eta_n = hbar`)
+- [x] write tests: `hbar` (11) and `eta_n` (12) are **node** fields → compare vs dumps directly (≤1e-12). `uv` (10) is **element** → **element dump directly** at all 5 probes. **uv ~2e-17, hbar/eta_n ~1e-17** (gather/`÷area`-suppressed, far tighter than `ssh_rhs`'s 1e-7); + `update_vel`/`compute_hbar` synthetic-vs-numpy refs + AD (linear) + end-to-end `d(Σeta_n)/d(du)` through `custom_linear_solve`
+- [x] run — must pass before next task — **test_ssh.py +18 / test_momentum.py +2 (= 175 full suite)**
 
 #### Task 2.9: ALE step (linfs) (substep 13)
 
@@ -722,3 +722,29 @@ physics.
     `custom_linear_solve`); step-1 `x0=0`. **Exact warm-start dump-matching at step
     ≥2 (the stop threshold uses the original ‖b‖) is finalized with the full
     `step()` in Task 2.11.** Next: Task 2.8 (update_vel / compute_hbar / eta_n).
+- **2026-06-05 — execution session 5** (Phase 2, Task 2.8: velocity update + hbar +
+  eta_n, substeps 10–12). `momentum.update_vel` + `ssh.compute_hbar`/`eta_n_update`
+  (+20 tests; **full suite 175 passed**). Phase-2 config unchanged. **Substeps 1–12
+  (the full momentum + SSH + free-surface chain) now ported.**
+  - **update_vel (10):** `uv += du + (Fx,Fy)`, `(Fx,Fy)=∇N·(−g·θ·dt·d_eta)` at the
+    element (gather d_eta to 3 vertices, contract `gradient_sca`). The correction is
+    **barotropic** (one per-element scalar broadcast over all layers), unlike the
+    per-level `du`; `uv` **accumulates**. At step-1 `uv=0` ⇒ first wind-driven uv
+    (~1e-3 surface). ELEM dump at all 5 probes, **max|Δ| ~2e-17** (gather class — both
+    `du` ~1e-17 and the replicated early-stop `d_eta` ~1e-18 are near-exact). `d_eta`
+    is read, not consumed (→ next step's CG `x0`).
+  - **compute_hbar (11):** `ssh_rhs_old` = the substep-8 antisymmetric edge→node
+    transport scatter **reused verbatim** (`compute_ssh_rhs` with `uv_rhs=0`, `α=1`,
+    bare new `uv`), then `hbar = hbar_old + ssh_rhs_old·dt/areasvol[n,0]`. ⚠️ Although
+    `ssh_rhs_old` carries the *same* near-cancelling ~1e-7 floor as `ssh_rhs`, the
+    `÷areasvol` (1e9–1e12 m²) divides it back down ⇒ **hbar matches the dump ~1e-17
+    absolute**. Edge range `myDim_edge2D == edge2D` single-rank → all-edges scatter
+    exact.
+  - **eta_n (12):** `eta_n = α·hbar + (1−α)·hbar_old`; **`α=1` ⇒ `eta_n = hbar`
+    exactly** (dump confirms `eta_n == hbar` at every probe). Non-cavity nodes only
+    (all of pi).
+  - **AD:** `update_vel`/`compute_hbar` are linear ⇒ AD == central FD (exact); the
+    **end-to-end `d(Σeta_n)/d(du)`** flows `compute_ssh_rhs → custom_linear_solve →
+    update_vel (du term + d_eta gather) → compute_hbar → eta_n`, finite & nonzero —
+    the implicit-diff chain now spans substeps 8–12. Next: Task 2.9 (ALE step:
+    `w`/`hnode_new`, substep 13).

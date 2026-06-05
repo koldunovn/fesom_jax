@@ -30,7 +30,17 @@ from fesom_jax.io_dump import find_record
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
 
 NODE_PROBES = [1001, 1500, 2000, 2500, 3000]
+ELEM_PROBES = [1757, 2656, 3688, 4604, 5575]   # first cell incident to each node probe
 DT = 100.0
+
+# Task 2.8 dump-gate floors (calibrated to the observed CPU diffs, with margin):
+#  * uv (substep 10) = du + ∇N·d_eta; du matches the dump ~1e-17 and d_eta is the
+#    replicated early-stopped iterate (~1e-18) → observed max|Δ| ~2e-17.
+#  * hbar/eta_n (11/12) = ssh_rhs_old·dt/areasvol; the /area (1e9–1e12 m²) divides
+#    the near-cancelling ssh_rhs_old's amplified error back down → observed ~1e-17,
+#    well below the smallest cancellation-node signal (~3e-10).
+UV_ATOL = 1e-13
+HBAR_ATOL = 1e-12
 
 # ssh_rhs is a transport divergence with heavy cancellation (the wind-forced
 # convergence is a small residual of large opposing edge fluxes ~1e4). Its abs
@@ -238,6 +248,142 @@ def test_grad_flows_to_upstream_increment(mesh, chain):
     def loss(du_in):
         rhs = ssh.compute_ssh_rhs(mesh, st.uv, du_in, st.helem)
         return jnp.sum(ssh.solve_ssh(op, rhs))
+
+    g = np.asarray(jax.grad(loss)(du))
+    assert np.all(np.isfinite(g))
+    assert np.max(np.abs(g)) > 0
+
+
+# ==========================================================================
+# Task 2.8 — velocity update + hbar + eta_n (substeps 10–12)
+#
+# Continues the step-1 chain past the CG solve: update_vel (10, momentum.py) →
+# compute_hbar (11, ssh.py) → eta_n (12, ssh.py). The AD chain flows from the
+# upstream du, through custom_linear_solve, into BOTH the direct uv update and
+# the d_eta gather, then through compute_hbar's transport scatter to eta_n.
+# ==========================================================================
+def _compute_hbar_ref(mesh, uv, helem, hbar, dt):
+    """Loop reference for ``fesom_compute_hbar`` (``fesom_momentum.c:779``):
+    transport divergence of ``uv`` (alpha=1, no AB-velocity) → ``ssh_rhs_old``,
+    then ``hbar = hbar_old + ssh_rhs_old·dt/areasvol[n,top]``."""
+    sro = _ssh_rhs_ref(mesh, uv, np.zeros_like(np.asarray(uv)), helem, alpha=1.0)
+    av = np.asarray(mesh.areasvol)
+    uln = np.asarray(mesh.ulevels_nod2D)
+    hb = np.asarray(hbar).astype(np.float64).copy()
+    out = hb.copy()
+    for n in range(mesh.nod2D):
+        if uln[n] > 1:
+            continue
+        top = uln[n] - 1
+        out[n] = hb[n] + sro[n] * dt / av[n, top]
+    return sro, out
+
+
+@pytest.fixture(scope="module")
+def chain2(mesh, chain):
+    """Continue the chain through substeps 10–12. Returns
+    ``(uv, ssh_rhs_old, hbar, eta_n)`` (all the dumped fields)."""
+    st, du, ssh_rhs, op = chain
+    d_eta = ssh.solve_ssh(op, ssh_rhs)
+    uv = momentum.update_vel(mesh, st.uv, du, d_eta, dt=DT)
+    ssh_rhs_old, hbar = ssh.compute_hbar(mesh, uv, st.helem, st.hbar, dt=DT)
+    eta_n = ssh.eta_n_update(mesh, st.eta_n, hbar, st.hbar_old)
+    return uv, ssh_rhs_old, hbar, eta_n
+
+
+# --- dump gates ----------------------------------------------------------
+@pytest.mark.parametrize("gid", ELEM_PROBES)
+@pytest.mark.parametrize("field,ci", [("uv_u", 0), ("uv_v", 1)])
+def test_update_vel_matches_dump_step1(load_dump, mesh, chain2, gid, field, ci):
+    """uv (substep 10) at the element probes — the first wind-driven velocity."""
+    uv, *_ = chain2
+    rec = find_record(load_dump("pi_cdump.00000"), step=1, substep=10,
+                      field=field, probe_gid=gid)
+    verify.assert_close(np.asarray(uv)[gid - 1, :, ci], rec, kind="gather",
+                        atol=UV_ATOL)
+
+
+def test_update_vel_nonzero_wind_driven(mesh, chain2):
+    """At step 1 the at-rest uv becomes the first nonzero (wind-driven) velocity."""
+    uv, *_ = chain2
+    assert float(jnp.max(jnp.abs(uv))) > 1e-4
+
+
+@pytest.mark.parametrize("gid", NODE_PROBES)
+def test_hbar_matches_dump_step1(load_dump, mesh, chain2, gid):
+    _, _, hbar, _ = chain2
+    rec = find_record(load_dump("pi_cdump.00000"), step=1, substep=11,
+                      field="hbar", probe_gid=gid)
+    verify.assert_close(np.asarray(hbar)[gid - 1:gid], rec, kind="scatter",
+                        atol=HBAR_ATOL)
+
+
+@pytest.mark.parametrize("gid", NODE_PROBES)
+def test_eta_n_matches_dump_step1(load_dump, mesh, chain2, gid):
+    *_, eta_n = chain2
+    rec = find_record(load_dump("pi_cdump.00000"), step=1, substep=12,
+                      field="eta_n", probe_gid=gid)
+    verify.assert_close(np.asarray(eta_n)[gid - 1:gid], rec, kind="scatter",
+                        atol=HBAR_ATOL)
+
+
+def test_eta_n_equals_hbar_at_alpha1(mesh, chain2):
+    """With SSH_ALPHA=1 the eta_n blend collapses to eta_n = hbar (the dump
+    confirms eta_n == hbar at every probe)."""
+    _, _, hbar, eta_n = chain2
+    assert np.array_equal(np.asarray(eta_n), np.asarray(hbar))
+
+
+# --- synthetic vs numpy reference (exercise the transport scatter) -------
+def test_compute_hbar_synthetic_matches_reference(mesh, chain):
+    """Nonzero uv drives a nonzero transport divergence + hbar update, vs an
+    independent loop reference. (The hbar/area division means the absolute
+    agreement is far tighter than the raw ssh_rhs_old scatter floor.)"""
+    st, *_ = chain
+    uv, _ = _synthetic_uv(mesh)
+    sro, hbar = ssh.compute_hbar(mesh, uv, st.helem, st.hbar, dt=DT)
+    ref_sro, ref_hbar = _compute_hbar_ref(mesh, uv, st.helem, st.hbar, DT)
+    # ssh_rhs_old is a large near-cancelling scatter → abs floor ~1e-6 (rel ~1e-15)
+    assert np.allclose(np.asarray(sro), ref_sro, rtol=1e-12, atol=1e-6)
+    # hbar = sro·dt/area (area 1e9–1e12) → the /area suppresses that floor to ~1e-13
+    assert np.allclose(np.asarray(hbar), ref_hbar, rtol=1e-10, atol=1e-13)
+    assert np.max(np.abs(np.asarray(hbar))) > 0  # genuinely exercised
+
+
+# --- AD gates ------------------------------------------------------------
+def test_compute_hbar_gradient_vs_fd(mesh, chain):
+    """``compute_hbar`` is linear in uv (transport scatter + /area) → AD exact;
+    central FD (exact for a linear map) agrees at a few element components."""
+    st, *_ = chain
+    uv, _ = _synthetic_uv(mesh)
+    w = jnp.asarray(np.random.RandomState(5).randn(mesh.nod2D))
+
+    def loss(u):
+        _, hbar = ssh.compute_hbar(mesh, u, st.helem, st.hbar, dt=DT)
+        return jnp.sum(w * hbar)
+
+    g_ad = np.asarray(jax.grad(loss)(uv))
+    assert np.all(np.isfinite(g_ad))
+    h = 1e-3
+    for idx in [(100, 4, 0), (2500, 10, 1)]:
+        gf = float((loss(uv.at[idx].add(h)) - loss(uv.at[idx].add(-h))) / (2 * h))
+        assert abs(g_ad[idx] - gf) <= 1e-8 * max(abs(gf), 1.0) + 1e-15, \
+            f"{idx}: AD {g_ad[idx]:.6e} vs FD {gf:.6e}"
+
+
+def test_grad_flows_du_to_eta_n(mesh, chain):
+    """End-to-end implicit-diff gate: d(Σ eta_n)/d(du) flows through
+    compute_ssh_rhs → custom_linear_solve → update_vel (both the du term and the
+    d_eta gather) → compute_hbar → eta_n. Finite and nonzero."""
+    st, du, _, op = chain
+
+    def loss(du_in):
+        rhs = ssh.compute_ssh_rhs(mesh, st.uv, du_in, st.helem)
+        d_eta = ssh.solve_ssh(op, rhs)
+        uv = momentum.update_vel(mesh, st.uv, du_in, d_eta, dt=DT)
+        _, hbar = ssh.compute_hbar(mesh, uv, st.helem, st.hbar, dt=DT)
+        eta_n = ssh.eta_n_update(mesh, st.eta_n, hbar, st.hbar_old)
+        return jnp.sum(eta_n)
 
     g = np.asarray(jax.grad(loss)(du))
     assert np.all(np.isfinite(g))

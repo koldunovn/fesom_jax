@@ -500,3 +500,77 @@ def test_impl_vert_visc_gradient_through_tdma(mesh):
         assert np.isfinite(g_ad)
         assert abs(g_ad - g_fd) <= 1e-6 * max(abs(g_fd), 1.0) + 1e-9, \
             f"{loss.__name__}: AD {g_ad:.6e} vs FD {g_fd:.6e}"
+
+
+# --------------------------------------------------------------------------
+# Task 2.8 — velocity update (substep 10)
+#
+# The substep-10 dump gate (which needs the real CG output ``d_eta``) and the
+# integrated substep 10–12 story (update_vel → compute_hbar → eta_n) live in
+# test_ssh.py, next to the SSH chain. Here we unit-test the update_vel kernel in
+# isolation — the node→element gather + ∇N·d_eta contraction + barotropic
+# broadcast — against an independent loop reference, plus its AD.
+# --------------------------------------------------------------------------
+_THETA = 1.0
+
+
+def _update_vel_ref(mesh, uv, du, d_eta, dt):
+    """Loop reference for ``fesom_update_vel`` (``fesom_momentum.c:474``)."""
+    coef = -G * _THETA * dt
+    en = np.asarray(mesh.elem_nodes)
+    gs = np.asarray(mesh.gradient_sca)
+    ule, nle = np.asarray(mesh.ulevels), np.asarray(mesh.nlevels)
+    uvn, dun, de = np.asarray(uv), np.asarray(du), np.asarray(d_eta)
+    out = np.zeros((mesh.elem2D, mesh.nl, 2))
+    for e in range(mesh.elem2D):
+        nzmin, nzmax = ule[e] - 1, nle[e] - 1
+        n0, n1, n2 = en[e]
+        e0, e1, e2 = coef * de[n0], coef * de[n1], coef * de[n2]
+        g = gs[e]
+        Fx = g[0] * e0 + g[1] * e1 + g[2] * e2
+        Fy = g[3] * e0 + g[4] * e1 + g[5] * e2
+        for nz in range(nzmin, nzmax):
+            out[e, nz, 0] = uvn[e, nz, 0] + dun[e, nz, 0] + Fx
+            out[e, nz, 1] = uvn[e, nz, 1] + dun[e, nz, 1] + Fy
+    return out
+
+
+def test_update_vel_synthetic_matches_reference(mesh):
+    """Nonzero uv/du/d_eta exercise the full ``uv += du + ∇N·(−gθdt·d_eta)`` vs
+    an independent numpy loop reference (the step-1 d_eta is so close to the dump
+    that the dump gate alone barely tests the SSH-gradient term)."""
+    uv, _, eta, _ = _synthetic(mesh)          # reuse the node field as d_eta
+    k = np.arange(mesh.nl)[None, :]
+    e = np.arange(mesh.elem2D)[:, None]
+    du = jnp.where(mesh.elem_layer_mask[..., None], jnp.asarray(
+        np.stack([1e-4 * np.cos(0.1 * k + 0.001 * e),
+                  1e-4 * np.sin(0.05 * k) * np.ones_like(e)], -1)), 0.0)
+    out = np.asarray(momentum.update_vel(mesh, uv, du, eta, dt=DT))
+    ref = _update_vel_ref(mesh, uv, du, eta, DT)
+    m = np.asarray(mesh.elem_layer_mask)
+    assert np.allclose(out[m], ref[m], atol=1e-15, rtol=1e-12)
+    # the SSH-gradient correction must actually move uv off the plain uv+du
+    base = (np.asarray(uv) + np.asarray(du))
+    assert np.max(np.abs(out[m] - base[m])) > 0
+
+
+def test_update_vel_gradient_ad_vs_fd(mesh):
+    """``update_vel`` is linear in ``d_eta`` → AD is exact; central FD (exact for
+    a linear map) must agree. This is the gather of the CG output into uv that
+    continues the implicit-diff chain (the integrated version is in test_ssh.py)."""
+    uv, _, eta, _ = _synthetic(mesh)
+    du = jnp.zeros((mesh.elem2D, mesh.nl, 2))
+    w = jnp.where(mesh.elem_layer_mask[..., None],
+                  jnp.asarray(np.random.RandomState(11).randn(mesh.elem2D, mesh.nl, 2)),
+                  0.0)
+
+    def loss(de):
+        return jnp.sum(w * momentum.update_vel(mesh, uv, du, de, dt=DT))
+
+    g_ad = np.asarray(jax.grad(loss)(eta))
+    assert np.all(np.isfinite(g_ad))
+    h = 1.0  # linear map → central FD is exact at any step
+    for j in (0, 1500, mesh.nod2D - 1):
+        gf = float((loss(eta.at[j].add(h)) - loss(eta.at[j].add(-h))) / (2 * h))
+        assert abs(g_ad[j] - gf) <= 1e-9 * max(abs(gf), 1.0) + 1e-12, \
+            f"node {j}: AD {g_ad[j]:.6e} vs FD {gf:.6e}"

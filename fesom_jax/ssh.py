@@ -42,7 +42,7 @@ import numpy as np
 import scipy.sparse as sp
 from jax import lax, tree_util
 
-from .config import G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
+from .config import DT_DEFAULT, G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
 from .mesh import Mesh
 
 # Tolerance for the *gradient* (transpose) solve — tight so the implicit-diff
@@ -300,3 +300,46 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, forward_tol: float = SOLTOL,
         matvec, b_eff, solve, transpose_solve, symmetric=True
     )
     return x0 + delta
+
+
+# ==========================================================================
+# Substeps 11–12 — hbar (transport divergence) + eta_n blend
+# ==========================================================================
+def compute_hbar(mesh: Mesh, uv, helem, hbar, *, dt: float = DT_DEFAULT):
+    """Transport-divergence → ``ssh_rhs_old``, then the hbar update (substep 11).
+
+    Mirror of ``fesom_compute_hbar`` (``fesom_momentum.c:779``; Fortran
+    ``oce_ale.F90:2005-2102``). Returns ``(ssh_rhs_old, hbar_new)``:
+
+    * ``ssh_rhs_old`` ``[nod2D]`` — the antisymmetric edge→node transport
+      divergence of the **new** (post-:func:`~fesom_jax.momentum.update_vel`)
+      velocity ``uv`` with the static thickness ``helem``, ``alpha=1`` and **no**
+      AB-velocity (``u+ur → u``). This is exactly :func:`compute_ssh_rhs` with
+      ``uv_rhs=0``. It is saved as the next step's AB history: linfs reads it via
+      the ``(1−alpha)·ssh_rhs_old`` term of the next ``compute_ssh_rhs`` — which
+      vanishes at ``alpha=1`` but is still computed (fidelity + the field is
+      dumped at substep 11's siblings).
+    * ``hbar_new = hbar + ssh_rhs_old·dt / areasvol[n, top]`` on non-cavity nodes
+      (all of pi; ``top = ulevels_nod2D−1 = 0``); cavity nodes keep ``hbar``. The
+      input ``hbar`` *is* ``hbar_old`` (the caller saves it before overwriting).
+
+    The division by the large CV area (``~1e9–1e12 m²``) strongly suppresses the
+    absolute error of the near-cancelling ``ssh_rhs_old`` (see the ssh/rhs
+    lesson), so ``hbar`` matches the dump tightly in absolute terms."""
+    ssh_rhs_old = compute_ssh_rhs(mesh, uv, jnp.zeros_like(uv), helem, alpha=1.0)
+    top = mesh.ulevels_nod2D - 1                          # 0 for pi (non-cavity)
+    area = jnp.take_along_axis(mesh.areasvol, top[:, None], axis=1)[:, 0]
+    nocav = mesh.ulevels_nod2D == 1
+    safe_area = jnp.where(nocav, area, 1.0)               # AD-safe (no 0/0 at cavity)
+    hbar_new = jnp.where(nocav, hbar + ssh_rhs_old * dt / safe_area, hbar)
+    return ssh_rhs_old, hbar_new
+
+
+def eta_n_update(mesh: Mesh, eta_n_prev, hbar, hbar_old, *, alpha: float = SSH_ALPHA):
+    """SSH elevation blend (substep 12): ``eta_n = α·hbar + (1−α)·hbar_old`` on
+    non-cavity nodes; cavity nodes keep ``eta_n_prev``. With ``α=1`` this is just
+    ``eta_n = hbar``. Mirror of the inline blend at ``fesom_step.c:257-268``
+    (Fortran ``oce_ale.F90:3771-3775``)."""
+    nocav = mesh.ulevels_nod2D == 1
+    blend = alpha * hbar + (1.0 - alpha) * hbar_old
+    return jnp.where(nocav, blend, eta_n_prev)

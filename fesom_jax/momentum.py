@@ -28,6 +28,7 @@ from .config import (
     DENSITY_0,
     DT_DEFAULT,
     G,
+    SSH_THETA,
     VISC_GAMMA0,
     VISC_GAMMA0_H,
     VISC_GAMMA1,
@@ -302,3 +303,27 @@ def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT):
     du = ops.tdma(a, b, c, rhs_u)
     dv = ops.tdma(a, b, c, rhs_v)
     return ops.mask_below_bottom(jnp.stack([du, dv], axis=-1), valid)
+
+
+def update_vel(mesh: Mesh, uv, du, d_eta, *, dt=DT_DEFAULT, theta=SSH_THETA):
+    """Velocity update (substep 10). Returns the new ``uv`` ``[elem2D, nl, 2]``.
+
+    Mirror of ``fesom_update_vel`` (``fesom_momentum.c:474``):
+    ``uv += du + (Fx, Fy)`` where ``du`` is the substep-7 increment from
+    :func:`impl_vert_visc` (the C keeps it in ``uv_rhs``) and ``(Fx, Fy)`` is the
+    SSH-gradient correction ``coef·∇N·d_eta`` evaluated at the element from the CG
+    output ``d_eta`` at its 3 vertices, ``coef = −g·θ·dt``. ``Fx,Fy`` are uniform
+    over the element's layers (a barotropic correction), so they broadcast over
+    ``nz``. ``uv`` is the *previous-step* velocity (0 at rest), so step 1 gives the
+    first wind-driven ``uv``.
+
+    ``d_eta`` is read but not modified — it warm-starts the next step's CG solve
+    (``solve_ssh``'s ``x0``); see the ssh/warmstart lesson."""
+    lm = mesh.elem_layer_mask
+    coef = -G * theta * dt
+    ec = coef * ops.gather_nodes_to_elem(d_eta, mesh.elem_nodes)   # (elem2D,3)
+    gs = mesh.gradient_sca
+    Fx = gs[:, 0] * ec[:, 0] + gs[:, 1] * ec[:, 1] + gs[:, 2] * ec[:, 2]   # (elem2D,)
+    Fy = gs[:, 3] * ec[:, 0] + gs[:, 4] * ec[:, 1] + gs[:, 5] * ec[:, 2]
+    F = jnp.stack([Fx, Fy], axis=-1)[:, None, :]                   # (elem2D,1,2) → bcast nz
+    return ops.mask_below_bottom(uv + du + F, lm)
