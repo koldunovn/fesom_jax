@@ -386,9 +386,9 @@ files noted per task.
 - Create: `fesom_jax/ale.py`
 - Create: `fesom_jax/tests/test_ale.py`
 
-- [ ] port linfs ALE: `hnode_new = hnode` everywhere; compute `w` (vertical velocity, edge→node scatter divergence) and `helem` — ref `fesom_ale.c`, FRESH_START §6
-- [ ] write `tests/test_ale.py`: compare `w`, `hnode_new` vs C dump substep 13
-- [ ] run — must pass before next task
+- [x] port linfs ALE: `hnode_new = hnode` (static memcpy, `fesom_ale.c:10`); compute `w` (vertical velocity) — `fesom_jax/ale.py` (`thickness_linfs`, `compute_w`). `w` = the **per-level** antisymmetric edge→node `(v·dx−u·dy)·helem` transport divergence (the ssh_rhs/hbar scatter kept per-level, new `uv`, α=1), then a **reverse bottom→top cumsum** (`lax.cumsum(reverse=True)`; the masked scatter ⇒ no-flux `w[nzmax]=0` falls out), then **÷`mesh.area`** (⚠️ NOT `areasvol`), safe-divide guarded. helem recompute is substep 16 (Task 2.10), not here.
+- [x] write `tests/test_ale.py`: compare `w`, `hnode_new` vs C dump substep 13 — `w` matches **~4e-20** (tight, hbar-class: ÷area crushes the cancellation floor), `hnode_new` **bit-for-bit** (max|Δ|=0) at all 5 node probes; step-1 `w` is a REAL gate (post-`update_vel` wind-driven `uv`). + synthetic-vs-numpy-loop-ref (~1e-18), `w[nzmax]==0` BC, AD==central-FD (linear in `uv`, finite at rest), end-to-end `d(Σw)/d(du)` through `custom_linear_solve`
+- [x] run — must pass before next task — **test_ale.py 17 passed; full suite 192 passed**
 
 #### Task 2.10: Tracer advection (upwind) + diffusion + commit (substeps 15–16)
 
@@ -748,3 +748,37 @@ physics.
     update_vel (du term + d_eta gather) → compute_hbar → eta_n`, finite & nonzero —
     the implicit-diff chain now spans substeps 8–12. Next: Task 2.9 (ALE step:
     `w`/`hnode_new`, substep 13).
+- **2026-06-05 — execution session 6** (Phase 2, Task 2.9: ALE step linfs, substep
+  13). `fesom_jax/ale.py` + `tests/test_ale.py` (+17 tests; **full suite 192
+  passed**). Phase-2 config unchanged. **Substep 13 (`w` + `hnode_new`) ported —
+  the full momentum + SSH + free-surface + ALE-vertical-velocity chain (substeps
+  1–13) now runs.**
+  - **`compute_w` (13):** the SAME antisymmetric edge→node `(v·dx−u·dy)·helem`
+    transport-divergence scatter as `compute_ssh_rhs`/`compute_hbar`, but kept
+    **per-level** (not column-summed), driven by the **new** post-`update_vel`
+    `uv` (α=1, no AB-velocity). Then (3) a **reverse bottom→top cumsum**
+    (`lax.cumsum(div, axis=1, reverse=True)`) — the masked scatter is already 0 at
+    and below each node's bottom interface (element layer range ⊆ node range), so
+    the suffix-sum == the C's bounded `for nz=nzmax-1..nzmin` loop and the no-flux
+    `w[nzmax]=0` BC falls out for free (verified `w[nzmax]==0` exactly). Then (4)
+    **÷ `mesh.area`** — ⚠️ the *upper-edge scalar CV area*, **NOT `areasvol`**
+    (which `compute_hbar` used) — safe-divide guarded (`where(area>0,area,1)`)
+    mirroring the C's `if(a>0)`. Final `node_iface_mask`.
+  - **Fidelity:** like `hbar`, the ÷area (1e9–1e12 m²) crushes the near-cancelling
+    divergence's amplified floor ⇒ **`w` matches the dump ~4e-20 on CPU** (TIGHT,
+    hbar-class — not the loose ssh_rhs ~1e-7). **Step-1 `w` is a REAL gate**
+    (post-`update_vel` `uv` ~1e-3 wind-driven ⇒ `w` ~1e-6). Gated at `W_ATOL=1e-12`
+    (hbar precedent, GPU-safe). Synthetic O(0.1)-uv vs an independent numpy loop ref
+    agrees ~1e-18 (rel 3e-16).
+  - **`hnode_new` (13):** `= hnode` **bit-for-bit** (linfs memcpy, `fesom_ale.c:10`)
+    — confirms `State.rest().hnode` (the `zbar_3d_n` differences) equals the C's
+    static `hnode` exactly (max|Δ|=0 at all 5 probes). The `helem` recompute +
+    `hnode=hnode_new` commit is `commit_thickness` = substep **16** (Task 2.10).
+  - **Config note:** `use_wsplit=0` in Phase 2 ⇒ `w_e=w`, `w_i=0`; the substep-13
+    `w` IS `w_e` for tracer advection and `w_i=0` confirms the Task-2.6
+    `impl_vert_visc` simplification. `cflz`/`wvel_split` (no substep-13 dump) →
+    ported when consumed (Task 2.10/2.11).
+  - **AD:** `w` is **linear** in `uv` ⇒ AD == central FD exactly (~6e-15), finite at
+    `uv=0`; end-to-end `d(Σw)/d(du)` flows `compute_ssh_rhs → custom_linear_solve →
+    update_vel → compute_w`, finite & nonzero. Next: Task 2.10 (upwind tracers +
+    diffusion + thickness commit, substeps 15–16).

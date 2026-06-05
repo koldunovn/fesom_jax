@@ -1,11 +1,12 @@
 # Next-session prompt — FESOM2 → JAX port
 
 Paste the block below to start the next session. Phases 0 & 1 are complete and
-**Phase 2 substeps 1–12 (Tasks 2.1–2.8: the momentum chain + SSH RHS/CG solver +
-velocity update / hbar / eta_n) are done**. Tasks 2.1–2.7 are committed
-(`0b9d9d1`, `a9166e0`); **Task 2.8 (`update_vel`/`compute_hbar`/`eta_n_update`) is
-done and tested but NOT yet committed.** Next is **Task 2.9 — ALE step (linfs):
-`w` + `hnode_new` (substep 13)**.
+**Phase 2 substeps 1–13 (Tasks 2.1–2.9: the momentum chain + SSH RHS/CG solver +
+velocity update / hbar / eta_n + the ALE vertical velocity `w` / `hnode_new`) are
+done**. Tasks 2.1–2.7 are committed (`0b9d9d1`, `a9166e0`, `096ebb6`); **Tasks 2.8
+(`update_vel`/`compute_hbar`/`eta_n`) and 2.9 (`ale.py`: `w`/`hnode_new`) are done
+and tested but NOT yet committed.** Next is **Task 2.10 — upwind tracer advection +
+vertical diffusion + thickness commit (substeps 15–16)**.
 
 ---
 
@@ -18,7 +19,7 @@ Work from `/home/a/a270088/port_jax`. Use max effort.
 1. **Read the plan (source of truth):**
    `/home/a/a270088/port_jax/docs/plans/20260605-fesom-jax-port.md` — decisions,
    verification ladder, 8 phases, per-task gates, Revision Log. Keep its checkboxes
-   in sync as you go. Phase 2 = Tasks 2.1–2.11; **2.1–2.8 are `[x]`**, start at 2.9.
+   in sync as you go. Phase 2 = Tasks 2.1–2.11; **2.1–2.9 are `[x]`**, start at 2.10.
 2. **Read the lessons log (NEW, read every session):**
    `/home/a/a270088/port_jax/docs/PORTING_LESSONS.md` — the running gotcha/lesson
    log. **STANDING RULE: append one entry per task as you go** (config traps,
@@ -26,75 +27,73 @@ Work from `/home/a/a270088/port_jax`. Use max effort.
 3. **Read the project memory:**
    `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/` (MEMORY.md +
    `fesom-jax-port.md` + `porting-lessons-log.md`).
-4. **Read** `docs/REFERENCE_RUNS.md` (the oracle + the ⚠️ T-blob IC) and
-   `docs/MESH_EXPORT_LAYOUT.md` (mesh arrays). Skim the Phase-2 modules you build on
-   (all committed): `fesom_jax/{eos,ic,pgf,pp,momentum,forcing}.py` and their tests,
-   plus the Phase-1 base `{mesh,state,ops,verify,io_dump,config}.py`.
-5. Skim the C for substep 13 (the ALE step, linfs): `fesom_ale_thickness_linfs`
-   (`fesom_ale.c:10` — linfs ⇒ `hnode_new = hnode`) and `fesom_ale_vert_vel_linfs`
-   (`fesom_ale.c:77` — the `w` edge→node transport-divergence scatter), wired at
-   `fesom_step.c:272-279`. Build on the done modules `fesom_jax/{momentum,ssh}.py`.
+4. **Read** `docs/REFERENCE_RUNS.md` (the oracle + the ⚠️ T-blob IC + the ⚠️
+   "substep 15 upwind-vs-FCT" caveat) and `docs/MESH_EXPORT_LAYOUT.md` (mesh arrays).
+   Skim the Phase-2 modules you build on (all done): `fesom_jax/{eos,ic,pgf,pp,
+   momentum,forcing,ssh,ale}.py` and their tests, plus the Phase-1 base
+   `{mesh,state,ops,verify,io_dump,config}.py`.
+5. Skim the C for substeps 15–16: **upwind** horizontal advection `adv_tra_hor_upw1`
+   (`fesom_tracer_adv.c:212`) + **upwind** vertical `adv_tra_ver_upw1`
+   (`fesom_tracer_adv.c:701`) / `flux2dtracer_upwind` (`:740`); the ALE reconstruction
+   `ale_reconstruct` (`:792`); the non-FCT driver `fesom_tracer_advect_one` (`:1269`);
+   vertical implicit diffusion `fesom_impl_vert_diff_tracers` (`fesom_tracer_diff.c:338`)
+   + `diff_ver_part_impl_ale` (`:85`); thickness commit `fesom_ale_commit_thickness`
+   (`fesom_ale.c:18`). Wired at `fesom_step.c:316-353` (tracers) and `:420-423`
+   (thickness). **NOTE the C dump runs FCT (`fesom_tracer_advect_one_fct`,
+   `fesom_step.c:323/332`); JAX Phase 2 runs UPWIND** — see the step-1 caveat below.
 
-## STATUS — Phases 0 & 1 + Phase 2 substeps 1–12 COMPLETE (2.8 uncommitted)
+## STATUS — Phases 0 & 1 + Phase 2 substeps 1–13 COMPLETE (2.8, 2.9 uncommitted)
 - **Phase 0 (GATE 0):** env (`fesom-jax`, jax 0.10.1 x64, A100), verify harness
   (`io_dump.py`+`verify.py`), pi mesh export (`data/mesh_pi/`, 31 arrays), and the
   **C-port per-substep dump oracle** (`fesom_jax/tests/fixtures/pi_cdump.00000`).
 - **Phase 1 (GATE 1):** `mesh.py` (frozen `Mesh` pytree, 4 ragged-level masks),
   `state.py` (`State` pytree), `ops.py` (`gather*`, masked `scatter_add`,
   `mask_below_bottom`, vectorized `tdma`). AD gates pass.
-- **Phase 2 substeps 1–9 (Tasks 2.1–2.7), committed `0b9d9d1` + `a9166e0`:**
-  - 2.1 `eos.py` (+`ic.py`): JM-EOS density (**bit-exact** vs dump), hydrostatic
-    pressure, N² + the single-sweep area-weighted N² smoother. **IC = constant
-    T=10/S=35 + a Gaussian T-blob** (`ic.initial_state`) — the dump's real IC.
-  - 2.2 `pgf.py`: pressure-gradient force at elements.
-  - 2.3 `pp.py`: PP mixing + convective adjustment. Outputs on **interior**
-    interfaces `[nzmin+1,nzmax)` only.
-  - 2.4 `momentum.py::compute_vel_rhs`: AB2 Coriolis + SSH grad + PGF +
-    `momentum_adv_scalar` (momadv_opt=2 edge→node scatter).
-  - 2.5 `momentum.py::visc_filt_bidiff`: biharmonic flow-aware viscosity (opt_visc=7),
-    two edge→element scatters; AD-safe `_safe_sqrt`.
-  - 2.6 `momentum.py::impl_vert_visc`: per-element TDMA (`ops.tdma`), wind stress +
-    quadratic bottom drag. **`forcing.py`**: analytical wind, **double-averaged**
-    elem→node→elem (the stress `impl_vert_visc` actually reads).
-  - 2.7 `ssh.py` (8–9): `compute_ssh_rhs` antisymmetric edge→node transport scatter
-    (`SSH_ALPHA=1` ⇒ `(1−α)·ssh_rhs_old`=0; dump **atol 1e-7**, cancelling divergence);
-    `build_ssh_operator` **static** linfs Galerkin `S` + **MITgcm symmetric** precond
-    (load-bearing vs Jacobi); `solve_ssh` — **⚠️ C CG stops LOOSE `soltol=1e-5` (≈3
-    iters) ⇒ dump `d_eta` is the EARLY-STOPPED iterate**, replicated exactly (forward,
-    ~1e-18) while `custom_linear_solve`’s tight `transpose_solve` gives the clean
-    implicit-diff `S⁻¹` gradient.
-- **Phase 2 substeps 10–12 (Task 2.8) — DONE, NOT committed:**
-  - `momentum.update_vel` (10): `uv += du + ∇N·(−g·θ·dt·d_eta)`; the SSH-grad term is
-    **barotropic** (per-element scalar, broadcast over layers), `uv` accumulates. ELEM
-    dump **~2e-17** (gather class). `d_eta` read-only → next step's CG `x0`.
-  - `ssh.compute_hbar` (11): `ssh_rhs_old` = `compute_ssh_rhs` **reused** (`uv_rhs=0`,
-    `α=1`, bare new `uv`), then `hbar += ssh_rhs_old·dt/areasvol[n,0]`. ⚠️ the `÷area`
-    (1e9–1e12) suppresses `ssh_rhs_old`’s ~1e-7 cancelling-scatter floor ⇒ **hbar dump
-    ~1e-17**. (Gate the OUTPUT, not the noisy intermediate.)
-  - `ssh.eta_n_update` (12): `α=1` ⇒ **`eta_n = hbar` exactly** (dump confirms).
-  - AD: `update_vel`/`compute_hbar` linear (AD==FD exact); **end-to-end `d(Σeta_n)/d(du)`
-    flows through `custom_linear_solve`** (substeps 8–12 implicit-diff chain).
-- **Full suite: 175 passing** (`JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`).
+- **Phase 2 substeps 1–9 (Tasks 2.1–2.7), committed:**
+  - 2.1 `eos.py` (+`ic.py`): JM-EOS density (**bit-exact**), pressure, N² + smoother.
+    **IC = constant T=10/S=35 + a Gaussian T-blob** (`ic.initial_state`).
+  - 2.2 `pgf.py`; 2.3 `pp.py` (interior interfaces `[nzmin+1,nzmax)`); 2.4–2.6
+    `momentum.py` (`compute_vel_rhs` AB2+momadv, `visc_filt_bidiff` opt_visc=7,
+    `impl_vert_visc` TDMA + `forcing.py` double-averaged wind).
+  - 2.7 `ssh.py` (8–9): `compute_ssh_rhs` antisymmetric edge→node scatter (`α=1`,
+    dump **atol 1e-7**, cancelling divergence); static linfs `build_ssh_operator` +
+    **MITgcm symmetric** precond; `solve_ssh` — **⚠️ C CG stops LOOSE `soltol=1e-5`
+    (≈3 iters) ⇒ dump `d_eta` is the EARLY-STOPPED iterate**, replicated exactly,
+    `custom_linear_solve` gives the clean implicit-diff gradient.
+- **Phase 2 substeps 10–12 (Task 2.8) — DONE, NOT committed:** `momentum.update_vel`
+  (10, barotropic `∇N·d_eta`, ELEM dump ~2e-17), `ssh.compute_hbar` (11, reuse
+  `compute_ssh_rhs` with `uv_rhs=0,α=1`; `÷areasvol` ⇒ hbar dump ~1e-17),
+  `ssh.eta_n_update` (12, `α=1` ⇒ `eta_n=hbar`).
+- **Phase 2 substep 13 (Task 2.9) — DONE, NOT committed:** `fesom_jax/ale.py`
+  - `thickness_linfs` (`hnode_new = hnode`): linfs `dh/dt=0` ⇒ static memcpy. NODE
+    dump **bit-for-bit** (max|Δ|=0) — confirms `State.rest().hnode` == C's `hnode`.
+  - `compute_w` (`w`): the **per-level** sibling of the `ssh_rhs`/`hbar` antisymmetric
+    edge→node `(v·dx−u·dy)·helem` scatter (new `uv`, α=1, NOT column-summed), then a
+    **reverse bottom→top cumsum** (`lax.cumsum(reverse=True)`; masked scatter ⇒ no-flux
+    `w[nzmax]=0` falls out), then **÷`mesh.area`** (⚠️ NOT `areasvol`), safe-divide.
+    Step-1 `w` is a REAL gate (post-`update_vel` wind-driven `uv` ⇒ `w`~1e-6); NODE
+    dump **~4e-20** (hbar-class: ÷area crushes the cancellation floor; gated 1e-12).
+  - **Config:** `use_wsplit=0` ⇒ `w_e=w`, `w_i=0` (no split); `cflz`/`wvel_split`
+    have no substep-13 dump → port them when consumed (2.10/2.11).
+- **Full suite: 192 passing** (`JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`).
 
 ## THE PROVEN VERIFICATION RECIPE (follow it for every substep)
-This worked cleanly for 2.1–2.6 — reuse it:
 1. **Dump gate** at the pinned probes (node fields → node gids `1001,1500,2000,2500,
    3000`; element fields → first-incident-cell gids `1757,2656,3688,4604,5575`).
    Truncate the JAX column to the record's `nlevels`; use
    `verify.assert_close(col, rec, kind=…)` (`map`/`gather`=1e-15, `scatter`/
-   `reduction`=1e-12). For tiny-valued fields the `atol` floor is what gates.
-2. **⚠️ Step 1 is at REST (uv=η=uv_rhsAB=0).** Velocity-dependent kernels collapse to
-   trivial values, so the dump gate is WEAK. Exercise the dormant path with a
-   **synthetic-input unit test vs an independent loop-based numpy reference** of the C
-   (a different code path). Re-verify the full multi-step field once `step()` exists
-   (2.11).
-3. **AD check** every kernel (`jax.grad` vs central-FD sweep) in a smooth regime,
-   away from kinks (`max(N²,0)`, convection, `|∇u|=0`). Use the double-`where`
-   `_safe_sqrt` for any `sqrt(x)` that can hit 0.
-4. **Build step-1 inputs by chaining the committed modules:** `ic.initial_state` →
-   `eos.compute_pressure_bv` → `pgf.pressure_force_linfs` → `pp.mixing_pp` →
-   `momentum.compute_vel_rhs` → `visc_filt_bidiff` → `impl_vert_visc`
-   (see `test_momentum.py::_chain_step1`).
+   `reduction`=1e-12). For tiny-valued / near-cancelling fields the `atol` floor gates
+   (calibrate it; a downstream `÷area`/average often recovers map-class fidelity).
+2. **⚠️ Step 1 was at REST for the early kernels, but `uv`/`d_eta`/`w` are now NONZERO
+   (wind-driven).** Tracer advection at step 1 IS exercised (the wind-driven `uv` moves
+   the T-blob), but ⚠️ **upwind ≠ the dump's FCT in general** — see the step-1 caveat.
+   Still add a **synthetic-input unit test vs an independent loop-based numpy reference**
+   of the C, plus a constant-tracer-stays-constant + a pure-diffusion smoothing test.
+3. **AD check** every kernel (`jax.grad` vs central-FD sweep) in a smooth regime. Use
+   the double-`where` `_safe_sqrt` for any `sqrt(x)` that can hit 0; safe-divide any
+   `÷area`/`÷h`.
+4. **Build step-1 inputs by chaining the done modules** (see `test_ale.py::chain` /
+   `test_ssh.py::chain` for the full substep-1→13 chain to copy).
 5. Append the lesson(s) to `PORTING_LESSONS.md`; tick the plan checkbox; do NOT commit
    unless asked.
 
@@ -121,8 +120,7 @@ This worked cleanly for 2.1–2.6 — reuse it:
 
 ## THE VERIFICATION ORACLE — substep → field map (fixture `pi_cdump.00000`)
 `density`=`density_m_rho0`=in-situ ρ−ρ0; `pressure`=`hpressure`. Substeps 1–13,16 match
-at **every** step; substep 15 (T,S) matches at **step 1 only** until Phase 4 (C runs FCT,
-Phase-2 JAX runs upwind; at step 1 the field is horizontally constant so upwind==FCT).
+at **every** step; substep 15 (T,S) — see the ⚠️ caveat below.
 
 | substep | C fields (entity) | port task | status |
 |---|---|---|---|
@@ -137,36 +135,42 @@ Phase-2 JAX runs upwind; at step 1 the field is horizontally constant so upwind=
 | 10 update_vel | `uv_u`,`uv_v` (ELEM) | 2.8 | ✅ |
 | 11 compute_hbar | `hbar` (NODE) | 2.8 | ✅ |
 | 12 eta_n | `eta_n` (NODE) | 2.8 | ✅ |
-| 13 ale_step | `w`,`hnode_new` (NODE) | **2.9** | ⏳ next |
-| 15 solve_tracers | `T`,`S` (NODE) | 2.10 | |
-| 16 update_thickness | `hnode` (NODE) | 2.10 | |
+| 13 ale_step | `w`,`hnode_new` (NODE) | 2.9 | ✅ |
+| 15 solve_tracers | `T`,`S` (NODE) | 2.10 | ⏳ next |
+| 16 update_thickness | `hnode` (NODE) | 2.10 | ⏳ next |
 
-## IMMEDIATE WORK — Task 2.9 (ALE step, linfs: `w` + `hnode_new`, substep 13)
-Create `fesom_jax/ale.py` + `fesom_jax/tests/test_ale.py`. Config unchanged: pi, linfs,
-PP, upwind tracers, CG SSH, no GM/KPP/ice, analytical wind, dt=100, nl=48. Build on the
-done `ssh.py`/`momentum.py` + the new `uv` from `update_vel`. **First read
-`fesom_ale.c:10` (`fesom_ale_thickness_linfs`) and `fesom_ale.c:44-187`
-(`fesom_ale_vert_vel_linfs`, with the algorithm comment), wired at `fesom_step.c:272-279`.**
-- **`hnode_new`** (trivial in linfs): `hnode_new = hnode` (a copy — `fesom_ale.c:10-16`).
-  In linfs `dh/dt=0`, so `hnode`/`helem` are *static* the whole run (matches the
-  `st.helem`/`st.hnode` you already use). NODE dump at substep 13 → should equal `hnode`.
-- **`w`** (vertical velocity, `fesom_ale.c:77`): **the SAME `(v·dx − u·dy)·helem`
-  antisymmetric edge→node transport-divergence scatter as `compute_ssh_rhs`/`compute_hbar`,
-  but kept PER-LEVEL** (not summed over levels), using the **new** `uv` (post `update_vel`).
-  Then (3) a **reverse (bottom→top) cumulative sum** over levels `w[n,nz] += w[n,nz+1]`
-  (vertical integral of divergence; the bottom interface `w[nzmax]=0` no-flux BC stays 0),
-  then (4) **÷ `area[n,nz]`** → m/s. ⚠️ **TRAP: this divides by `mesh.area` (upper-edge
-  scalar CV area), NOT `areasvol`** (which `compute_hbar` used) — different array. NODE dump
-  at substep 13. AD-safe: guard the `÷area` like `compute_hbar`'s `safe_area`.
-- **Gate:** `w` and `hnode_new` are NODE → compare vs dump directly. `w` valid on
-  `[nzmin,nzmax)` with `w[nzmax]=0`; truncate to `nlevels` as always. **At step 1 uv is now
-  nonzero (wind-driven, from `update_vel`), so `w` is a real (non-trivial) gate** — but the
-  scatter+cumsum may inherit the cancelling-divergence floor (calibrate atol like `ssh_rhs`
-  if needed; the `÷area` may tighten it as it did for `hbar`). Add a synthetic-vs-numpy-ref
-  for the per-level scatter + reverse-cumsum, and an AD check (`w` is linear in `uv`).
-- Then 2.10 (upwind tracers + diffusion, substeps 15–16) → 2.11 (assemble `step()`,
-  rest-state + 100-step stability + snapshot). **GATE 2:** pi 100 steps stable; each substep
-  matches C. **Commit Tasks 2.8 (and any later) when the user asks.**
+## IMMEDIATE WORK — Task 2.10 (upwind tracers + diffusion + thickness commit, 15–16)
+Create `fesom_jax/tracer_adv.py` + `fesom_jax/tracer_diff.py` + `fesom_jax/tests/
+test_tracers.py`; extend `fesom_jax/ale.py` with `commit_thickness` (substep 16). Config
+unchanged. Build on the done modules + the new `uv`/`w`/`hnode_new`.
+- **Upwind advection (substep 15, no FCT yet):** horizontal `adv_tra_hor_upw1`
+  (`fesom_tracer_adv.c:212`) — edge→node upwind flux of `T`/`S` by the volume flux
+  `((v·dx−u·dy)·helem)` (same edge geometry as `compute_w`!), pick the upwind node value
+  by flux sign; vertical `adv_tra_ver_upw1`/`flux2dtracer_upwind` (`:701/:740`) using
+  **`w_e` (= `w` since `use_wsplit=0`)**. Accumulate into `del_ttf`, then `ale_reconstruct`
+  (`:792`): `T_new = (T·hnode + del_ttf)/hnode_new` (linfs `hnode_new=hnode` ⇒ `T +
+  del_ttf/hnode`). ⚠️ **Watch the `edge_vflux` sign** (FRESH_START §12/§14.5) — verify with
+  a constant-tracer-stays-constant test.
+- **Vertical diffusion (substep 15):** `fesom_impl_vert_diff_tracers`
+  (`fesom_tracer_diff.c:338`) + `diff_ver_part_impl_ale` (`:85`) — per-NODE implicit TDMA
+  (1 unknown, vs `impl_vert_visc`'s per-element 2-unknown), `Kv` diffusivity, surface
+  heat/salt flux BC (none in this config). Reuse `ops.tdma`. Pad below-bottom rows
+  `(b=1,a=c=0,d=0)` as in `impl_vert_visc`.
+- **Thickness commit (substep 16):** `fesom_ale_commit_thickness` (`fesom_ale.c:18`):
+  `hnode = hnode_new` (linfs no-op) + recompute `helem` = vertex-mean of `hnode_new`
+  over each element's 3 nodes (`/3`), masked to `elem_layer_mask`. NODE dump `hnode` at
+  substep 16 = static `hnode` (bit-for-bit, like `hnode_new`).
+- **⚠️ STEP-1 GATE CAVEAT (verify carefully, update `REFERENCE_RUNS.md` if needed):** the
+  C dump runs **FCT**, JAX runs **upwind**. **S=35 is horizontally constant ⇒ S advects
+  trivially ⇒ upwind==FCT==dump at step 1 (clean S gate).** But **T has the Gaussian blob
+  (horizontal gradients), so upwind T may NOT equal the dump's FCT T at step 1** — the
+  REFERENCE_RUNS "horizontally constant" note predates the T-blob. So: gate **S** at step 1
+  directly; for **T**, first CHECK vs the dump — if it matches (limiter inactive at this
+  tiny `dt·uv`), gate it; if not, defer T's full match to Phase 4 (FCT) and validate the
+  upwind T via the constant-tracer + pure-diffusion synthetic tests (the plan's Task 2.10
+  already lists these). AD check the diffusion TDMA (`d(ΣT)/d(Kv)`).
+- Then 2.11 (assemble `step()`, rest-state + 100-step stability + snapshot). **GATE 2:** pi
+  100 steps stable; each substep matches C. **Commit Tasks 2.8/2.9/2.10 when the user asks.**
 
 ## GOLDEN RULE (JAX-adapted)
 Preserve the EXACT computation — the math and the load-bearing association order — but
@@ -176,17 +180,21 @@ value at a probe and match it. Fidelity target: ~1e-15 map/gather, ~1e-12 scatte
 
 ## CRITICAL GOTCHAS (verified; full list in PORTING_LESSONS.md)
 - **IC is constant + a Gaussian T-blob** — use `ic.initial_state` (not bare constant).
+  S stays 35 (horizontally constant); T varies (the blob).
 - **Wind stress is double-averaged** elem→node→elem (`forcing.surface_stress`), not raw.
 - **Three level-range classes:** layer `[nzmin,nzmax)` (T,S,ρ,p,u,v,pgf); interface
   `[nzmin,nzmax]` (bvfreq,w); **interior interface** `[nzmin+1,nzmax)` (Kv,Av).
+- **`w` ÷`mesh.area`, but `hbar` ÷`areasvol`** — different `[nod2D,nl]` CV-area arrays.
+- **`use_wsplit=0` ⇒ `w_e=w`, `w_i=0`** (the substep-13 `w` IS `w_e` for tracer advection).
 - **Truncate every JAX probe column to the record's `nlevels` before diffing.**
 - Mesh indices 0-based; `edge_tri`/`edge_up_dn_tri` use −1 (masked by `ops.scatter_add`).
   `gradient_sca` `[elem,6]` (∂N/∂x cols 0–2, ∂N/∂y cols 3–5); `edge_cross_dxdy` `[edge,4]` m.
-- **AD-safe `sqrt`:** double-`where` (`momentum._safe_sqrt`) for any `sqrt(x)` hitting 0.
+- **AD-safe `sqrt`/divide:** double-`where` (`momentum._safe_sqrt`) for `sqrt(x)→0`;
+  `where(area>0, area, 1)` for any `÷area`.
 
 ## WORKFLOW NOTES
 - Plan is authoritative; tick `[x]` as you finish; keep the Revision Log + lessons current.
-- Commit only when asked (Phase 2 substeps 1–7 are committed `0b9d9d1` on `main`).
+- Commit only when asked (Phase 2 substeps 1–7 are committed; 2.8/2.9 are not).
 - C/Fortran edits go on a separate `port2` branch (`jax-mesh-export`); never touch port2
   main branches. Regenerate the dump: `sbatch /home/a/a270088/port2/fesom2_port/jobs/jax_cdump_pi.sh`.
 - All python/pytest via the env python above. GPU work = SLURM `shared`/`gpu`, acct `ab0995`.

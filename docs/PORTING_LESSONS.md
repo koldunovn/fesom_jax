@@ -322,3 +322,53 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `eta_n` is a renamed copy of the post-update `hbar`. Only non-cavity nodes
   (`ulevels_nod2D==1`, all of pi) are written; cavity nodes keep their prior `eta_n`.
   (`ssh.eta_n_update`, Task 2.8.)
+
+- **[ale] ⚠️ `w` (substep 13) is the PER-LEVEL sibling of the ssh_rhs/hbar scatter —
+  reuse the flux, keep it per-level, then reverse-cumsum + ÷area.** Same antisymmetric
+  edge→node `(v·dx − u·dy)·helem` transport divergence as `compute_ssh_rhs`/`compute_hbar`
+  (`alpha=1`, bare new `uv`, no AB-velocity), but NOT summed over levels — keep the
+  `[edge,nl]` term, scatter `[+c,−c]→[n1,n2]` per level, then (3) a reverse bottom→top
+  cumulative sum, then (4) ÷ area. (`fesom_ale.c:104-187`, `ale.compute_w`, Task 2.9.)
+
+- **[ale] ⚠️ Stage-4 divides by `mesh.area` (upper-edge scalar CV area), NOT `areasvol`
+  (which `compute_hbar` used) — they are DIFFERENT arrays.** Easy to grab the wrong one
+  since both are `[nod2D,nl]` CV-area fields and the surrounding code (hbar) just used
+  `areasvol`. The C is explicit: `w /= mesh->area[FESOM_NODE3D(n,nz,nl)]` with the
+  `if (a>0)` guard → mirror as `safe_area = where(area>0, area, 1.0)` (AD-finite; the only
+  nonzero `w` lanes are `[nzmin,nzmax)` where `area>0`, so it's exact). (`fesom_ale.c:178`,
+  Task 2.9.)
+
+- **[ale] The full reverse suffix-sum `lax.cumsum(div, axis=1, reverse=True)` == the C's
+  bounded `for nz=nzmax-1..nzmin: w[nz]+=w[nz+1]` loop — for free.** Because the per-level
+  scatter is masked to `elem_layer_mask` and every element's layer range ⊆ its vertices'
+  node range (node nlevels=MAX, ulevels=MIN over cells), `div` is already 0 at and below
+  each node's bottom interface `nzmax` — so the suffix-sum naturally preserves the no-flux
+  BC `w[nzmax]=0` and equals the bounded loop. Mask the final `w` with `node_iface_mask` to
+  zero a cavity node's suffix-sum spill above `nzmin` (a no-op for non-cavity pi, but
+  correct in general). Verified `w[nzmax]==0` exactly at every node. (`ale.compute_w`, Task 2.9.)
+
+- **[ale/fidelity] Like `hbar`, the ÷area (1e9–1e12 m²) crushes the near-cancelling
+  divergence floor — `w` matches the dump ~4e-20 on CPU (a TIGHT, hbar-class gate), not the
+  loose ssh_rhs-class ~1e-7.** Even though the per-level `div` carries the same amplified
+  cancellation floor as `ssh_rhs` (`dx·helem~1e7`), the reverse cumsum's partial
+  cancellation + the ÷area divide it back to ~1e-20. Step 1 is a REAL gate (post-`update_vel`
+  `uv` is the first wind-driven ~1e-3 velocity → `w` ~1e-6, non-trivial). Synthetic O(0.1)
+  uv vs a numpy loop ref agrees to ~1e-18 (rel ~3e-16); `w` is LINEAR in `uv` so AD==central
+  FD exactly and is finite at uv=0. Gate at `W_ATOL=1e-12` (hbar precedent, GPU-safe).
+  (`test_ale.py`, Task 2.9.)
+
+- **[ale] `hnode_new = hnode` bit-for-bit in linfs (dh/dt=0, a memcpy) — confirms
+  `State.rest().hnode` (the `zbar_3d_n` differences) EQUALS the C's static `hnode` exactly.**
+  The substep-13 node dump of `hnode_new` matched `State.rest().hnode` to max|Δ|=0 at all 5
+  probes (top layer 5 m, deepest ~250 m). The `helem` recompute + `hnode = hnode_new` commit
+  is `fesom_ale_commit_thickness` = substep **16** (Task 2.10), NOT substep 13 — the plan's
+  Task-2.9 "and helem" wording predates the substep map; 2.9 is strictly `w`+`hnode_new`.
+  (`fesom_ale.c:10-16`, `ale.thickness_linfs`, Task 2.9.)
+
+- **[ale/config] `use_wsplit=0` in Phase 2 ⇒ `w_e = w`, `w_i = 0` (no vertical-velocity
+  split).** `fesom_ale_compute_wvel_split` (`fesom_ale.c:241`) reduces to a copy when
+  `use_wsplit=0` (`fesom_constants.h:56`, off for the linfs reference runs — the split was
+  what seeded a Fortran day-92 blow-up). So the `w` from substep 13 IS `w_e` (read by tracer
+  advection, Task 2.10) and `w_i=0` confirms the Task-2.6 `impl_vert_visc` simplification
+  (`w_i=0` ⇒ advective tridiagonal terms drop). `cfl_z`/`w_e`/`w_i`/`wvel_split` have no
+  substep-13 dump → ported when consumed (Task 2.10/2.11), not here. (Task 2.9.)
