@@ -253,10 +253,10 @@ arrays exported + verified; node AND element step-1..10 dumps captured as fixtur
 - Create: `fesom_jax/mesh.py`
 - Create: `fesom_jax/tests/test_mesh.py`
 
-- [ ] `mesh.py`: load the C-exported mesh NPZ into a frozen `Mesh` pytree/dataclass (static); convert 1-based→0-based indices once; keep connectivity as `int32` arrays
-- [ ] build derived static arrays needed by kernels (e.g. `nod_in_elem2D` as offsets+flat, masks for ragged levels from `nlevels_nod2D`)
-- [ ] write `tests/test_mesh.py`: assert every loaded array equals the C export bit-for-bit (it's the same bytes) and index conversion is correct (all `elem_nodes ∈ [0,nod2D)`, `edge_tri` ≤ 2 nonneg, etc. per FRESH_START §20)
-- [ ] run — must pass before Task 1.2
+- [x] `mesh.py`: load the C-exported mesh NPZ into a frozen `Mesh` pytree/dataclass (registered via `register_dataclass`: arrays = leaves, scalar counts = static meta); keep connectivity as `int32`. **No 1→0 conversion needed** — the export is already 0-based (`edge_tri`/`edge_up_dn_tri` use −1 for boundary), verified.
+- [x] build derived static arrays — four ragged-level masks (`node_/elem_ × layer/iface`) from `(ulevels,nlevels)`: **layer** valid `[ulevels-1, nlevels-1)` (T,S,ρ,p,u,v), **interface** valid `[ulevels-1, nlevels-1]` (bvfreq,w,Kv,Av), per `fesom_eos.c:93-208`. CSR (`nod_in_elem2D` offsets+flat) consumed as-is.
+- [x] `tests/test_mesh.py`: every array == export bit-for-bit (31 arrays); indices 0-based + in range (`elem_nodes∈[0,nod2D)`, `edge_tri∈{−1}∪[0,elem2D)`, CSR consistent w/ `elem_nodes`); 8531 interior + 455 boundary edges; masks match level counts; no-cavity (`ulevels==1`); pytree round-trip — **12 passed**
+- [x] run — must pass before Task 1.2 — green
 
 #### Task 1.2: State pytree & gather/scatter/mask primitives
 
@@ -265,13 +265,14 @@ arrays exported + verified; node AND element step-1..10 dumps captured as fixtur
 - Create: `fesom_jax/ops.py`
 - Create: `fesom_jax/tests/test_ops.py`
 
-- [ ] `state.py`: a `State` pytree holding all evolving fields (`T, S, uv, eta_n, d_eta, ssh_rhs*, hbar*, w, hnode, hnode_new, helem, density, pressure, bvfreq, Kv, Av, uv_rhs*` …) as `[n_entity, nl]` / `[n_elem, nl, 2]` dense arrays; document layout vs C macros
-- [ ] `ops.py`: `gather_nodes_to_elem(field, elem_nodes)`, `gather_to_edges(field, edges)`, `scatter_add_edges_to_nodes(vals, idx, n)` (via `segment_sum`), `mask_below_bottom(field, level_mask)`, column-TDMA solver `tdma(a,b,c,d)` (vectorized over the entity axis)
-- [ ] write `tests/test_ops.py`: gather/scatter round-trip identities; `segment_sum` matches a reference loop; **gradient check** on `scatter_add` (grad == gather) and on `tdma` (vs finite-diff); mask zeros below-bottom levels
-- [ ] run — must pass before Phase 2
+- [x] `state.py`: a `State` pytree (registered dataclass) holding all evolving fields (T,S,T_old,S_old,del_ttf; uv,uv_rhs,uv_rhsAB,uvnode,uvnode_rhs; w,w_e,w_i,cfl_z; eta_n,d_eta,ssh_rhs,ssh_rhs_old; hnode,hnode_new,helem,hbar,hbar_old; density,hpressure,bvfreq,Kv,Av,pgf_x,pgf_y) as `[n,nl]`/`[e,nl]`/`[·,nl,2]` dense arrays, each annotated w/ its C owner (`fesom_dyn`/`fesom_aux`) + layer-vs-interface. `State.zeros`/`State.rest(mesh,T0,S0)` factories
+- [x] `ops.py`: `gather`/`gather_nodes_to_elem`/`gather_to_edges`; `scatter_add(vals,seg,n)` + `…_edges_to_nodes`/`…_edges_to_elems` (masked `segment_sum`; −1 sentinel contributes 0 fwd **and** in grad); `mask_below_bottom(field,mask)` (`where`, broadcasts over component axis); `tdma(a,b,c,d)` two-`lax.scan` (fwd elim + reverse back-sub), vectorized over the entity axis
+- [x] `tests/test_ops.py` (+`test_state.py`): gather/scatter round-trip = degree-weighted; `scatter_add` vs reference loop; −1 masking; **scatter transpose == gather** (analytic vjp); `tdma` vs dense `linalg.solve` + **grad vs central FD** (d & b, ≤1e-6); mask zeros below-bottom & grad passes valid-only; State scan+grad — **17 passed**
+- [x] run — must pass before Phase 2 — full suite **46 passed**
 
-**GATE 1:** all mesh arrays match the C export to FP tol; `ops` primitives verified
-forward **and** under autodiff.
+**GATE 1 — ✅ MET (2026-06-05):** mesh arrays match the C export **bit-for-bit**
+(stronger than FP tol); `ops` primitives verified forward **and** under autodiff
+(scatter transpose == gather; TDMA grad == finite-diff). **Phase 1 complete.**
 
 ---
 
@@ -289,7 +290,7 @@ files noted per task.
 - Create: `fesom_jax/tests/test_eos.py`
 
 - [ ] port full Jackett-McDougall EOS (`densityJM_components`), in-situ density, hydrostatic pressure, Brunt-Väisälä N² — ref `fesom_eos.c`, FRESH_START §8
-- [ ] **port the `fesom_smooth_nod3D(bvfreq)` pass** (3-pass node-patch gather-average; `fesom_step.c:87`, N2smth_h=.true.) — the substep-1 `bvfreq` dump is taken POST-smooth, so without this the gate fails (review Minor #13)
+- [ ] **port the `fesom_smooth_nod3D(bvfreq)` pass** (`fesom_step.c:92`, `fesom_eos.c:226`, N2smth_h=.true.) — **CORRECTION: it is `n_smooth=1` (a SINGLE sweep)**, not "3-pass"; the "3" is the 3-vertex normalization `1/(3·Σ_patch area_el)`. Per owned node: `arr[n,nz] ← (Σ_{el∈patch(n)} area_el·(arr[v0]+arr[v1]+arr[v2])) / (3·Σ area_el)` over `nz∈[ulevels-1, nlevels-1]` (an element→node area-weighted patch average via `nod_in_elem2D` CSR → scatter/reduction class, ~1e-12). The substep-1 `bvfreq` dump is POST-smooth, so without this the gate fails (review Minor #13)
 - [ ] (EOS/pressure are map/gather → ~1e-15; the smoother is a node-patch gather → ~1e-15)
 - [ ] write `tests/test_eos.py`: compare `density`, `pressure`, `bvfreq` (post-smooth) probe columns vs Fortran dump substep 1; assert ≤1e-15. Note: substep 2 (`sw_alpha_beta`) is deferred to Phase 6 (GM/KPP-only); its dump exists but goes unused now
 - [ ] gradient check: `d(mean density)/d(T at a node)` AD vs finite-diff
@@ -644,3 +645,21 @@ physics.
     climate-level cross-check only (realistic IC + KPP/opt_visc5 → not per-substep
     comparable). **GATE 0 MET — Phase 0 complete.** Next: Phase 1 (mesh load + ops,
     pure JAX).
+- **2026-06-05 — execution session 2** (Phase 1). Tasks 1.1, 1.2 complete; **GATE 1 MET**.
+  - Mesh (1.1): `fesom_jax/mesh.py` — frozen `Mesh` registered as a JAX pytree
+    (`register_dataclass`: 31 arrays = leaves, 7 scalar counts = static meta), `load_mesh`.
+    **Export confirmed already 0-based** (no 1→0 conversion); −1 = boundary in
+    `edge_tri`/`edge_up_dn_tri`. Four ragged-level masks derived from `(ulevels,nlevels)`:
+    **layer** `[ulevels-1,nlevels-1)` (T,S,ρ,p,u,v) vs **interface** `[ulevels-1,nlevels-1]`
+    (bvfreq,w,Kv,Av) — read off `fesom_eos.c:93-208` (density loop `nz<nzmax`; bvfreq
+    padded at nzmin/nzmax). `test_mesh.py`: bit-for-bit vs export + index/CSR/mask/level
+    consistency, 12 passed.
+  - State+ops (1.2): `state.py` (`State` pytree mirroring `fesom_dyn`+`fesom_aux`+thickness,
+    `zeros`/`rest` factories) and `ops.py` (gather; masked `scatter_add` via `segment_sum`,
+    −1→0 fwd+grad; `mask_below_bottom`; vectorized `tdma` = two `lax.scan` sweeps).
+    `test_ops.py`+`test_state.py`: forward correctness + **AD gates** (scatter transpose ==
+    gather; TDMA grad == central FD to 1e-6; State through scan+grad), 17 passed.
+  - **Full suite 46 passed** (CPU; login-node `cuInit 303` warning is the documented benign
+    GPU-absent fallback — run with `JAX_PLATFORMS=cpu` to silence). Convention note for
+    Phase 2: 3D field layout is row-major `[n_entity, nl]` == C `FESOM_NODE3D`; vectors
+    `[·, nl, 2]` == `FESOM_ELEMVEC`. **Next: Phase 2 (Task 2.1, EOS/pressure/N² substep 1).**
