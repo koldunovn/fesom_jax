@@ -362,13 +362,13 @@ files noted per task.
 - Create: `fesom_jax/ssh.py`
 - Create: `fesom_jax/tests/test_ssh.py`
 
-- [ ] port `compute_ssh_rhs` linfs branch (edge→node scatter; the α / (1−α) blend) — ref `fesom_ssh.c:261`. This IS a node field → dumped at substep 8
-- [ ] port the stiffness-matrix assembly (element Galerkin, NEGATIVE factor −g·dt·α·hbar) — ref `init_stiff_mat_ale` / `fesom_ssh.c`, FRESH_START §11. **In linfs the operator is built ONCE and reused every step** (`fesom_ssh.c:9-12`; `update_stiff_mat_ale` gated off) — so it is a *static* operator, not a per-step closure. (Per-step rebuild is a Phase-5/zlevel concern.) Represent it as a precomputed matvec (element contributions + `segment_sum`)
-- [ ] port the **MITgcm-style symmetric preconditioner** (`solver.F90:77-86` / `fesom_ssh.c:239-253`): `pr[diag]=1/diag(row)`, `pr[off,node]=-0.5*(off/diag_row)/(diag_row+diag(node))` — it has **off-diagonal terms** and is applied as a sparse **matvec**, NOT a diagonal/Jacobi scaling. Getting this wrong changes the Krylov path and the `d_eta` residual structure
-- [ ] solve with **`jax.lax.custom_linear_solve`** (symmetric; the preconditioner is part of `solve`); global dot = plain sum on single device (`psum` under shard_map in Phase 8)
-- [ ] write `tests/test_ssh.py`: compare `ssh_rhs` (substep 8) and `d_eta` (substep 9) vs Fortran dump (≤1e-12; CG residual reassociates)
-- [ ] **gradient check:** `d(d_eta)/d(rhs)` from `custom_linear_solve` vs finite-diff / vs an unrolled fixed-iter reference on a small case. Note: with a static linfs operator, the AD story is simpler — the operator does not depend on the evolving `hbar`
-- [ ] run — must pass before next task
+- [x] port `compute_ssh_rhs` linfs branch (edge→node scatter; the α / (1−α) blend) — ref `fesom_ssh.c:261`. This IS a node field → dumped at substep 8 — `ssh.compute_ssh_rhs`; antisymmetric edge→node scatter of `α·((v+vr)·dx−(u+ur)·dy)·helem`. **`α=1` ⇒ the `(1−α)·ssh_rhs_old` blend vanishes.** At step-1 rest `uv=0` but `uv_rhs=du` (wind-forced from substep 7) → the field is non-trivial (driven by the wind increment)
+- [x] port the stiffness-matrix assembly (element Galerkin, NEGATIVE factor −g·dt·α·hbar) — ref `init_stiff_mat_ale` / `fesom_ssh.c`, FRESH_START §11. **In linfs the operator is built ONCE and reused every step** (`fesom_ssh.c:9-12`; `update_stiff_mat_ale` gated off) — so it is a *static* operator, not a per-step closure. (Per-step rebuild is a Phase-5/zlevel concern.) Represent it as a precomputed matvec (element contributions + `segment_sum`) — `ssh.build_ssh_operator` (host scipy assemble → static COO `segment_sum` matvec). The NEGATIVE comes from `depth=zbar_bot−zbar_srf<0` (= −hbar) × positive `factor=g·dt·α·θ`. Static (uses `zbar`, never the evolving `hbar`)
+- [x] port the **MITgcm-style symmetric preconditioner** (`solver.F90:77-86` / `fesom_ssh.c:239-253`): `pr[diag]=1/diag(row)`, `pr[off,node]=-0.5*(off/diag_row)/(diag_row+diag(node))` — it has **off-diagonal terms** and is applied as a sparse **matvec**, NOT a diagonal/Jacobi scaling. Getting this wrong changes the Krylov path and the `d_eta` residual structure — `ssh.ssh_precond` (19336 off-diag entries). **Verified load-bearing**: a Jacobi variant gives a different early-stopped `d_eta` (off by 2.9e-10 @ probe 1001 → fails the dump)
+- [x] solve with **`jax.lax.custom_linear_solve`** (symmetric; the preconditioner is part of `solve`); global dot = plain sum on single device (`psum` under shard_map in Phase 8) — `ssh.solve_ssh`. **⚠️ KEY FINDING:** the C stops at a *loose* `soltol=1e-5` (≈3 iters, `cond(S)≈800`), so the dumped `d_eta` is the **early-stopped** iterate — it matches the 3-iter PCG to ~1e-18 but the *exact* solve only to ~2e-10. So the forward `solve` **replicates the C PCG exactly** (early-stop), while `transpose_solve` converges *tight* → the gradient is the clean implicit-diff `S⁻¹` regardless
+- [x] write `tests/test_ssh.py`: compare `ssh_rhs` (substep 8) and `d_eta` (substep 9) vs Fortran dump (≤1e-12; CG residual reassociates) — `d_eta` matches **~1e-18** at all 5 probes; `ssh_rhs` matches at **atol 1e-7** (transport divergence with cancellation → abs floor set by upstream `du`’s ~1e-12 rel amplified by `dx·helem~1e7`, NOT the scatter). + synthetic-vs-numpy-reference (nonzero `uv` exercises the dormant `(u+ur)` part), operator-symmetric, residual<soltol
+- [x] **gradient check:** `d(d_eta)/d(rhs)` from `custom_linear_solve` vs finite-diff / vs an unrolled fixed-iter reference on a small case. Note: with a static linfs operator, the AD story is simpler — the operator does not depend on the evolving `hbar` — AD cotangent == tight `S⁻¹·w` (rel 2e-14) and == central-FD; finite; flows back through `compute_ssh_rhs` to `du`
+- [x] run — must pass before next task — **test_ssh.py 18 passed; full suite 148 passed**
 
 #### Task 2.8: Velocity update + hbar + eta_n (substeps 10–12)
 
@@ -682,3 +682,43 @@ physics.
     (EOS→pressure→PGF→momentum→…) must reproduce the blob. `REFERENCE_RUNS.md` IC row
     updated. T/S are effectively frozen over the 10 dumped steps (weak flow), so
     substep-1 EOS fields are step-independent here. Detail in PORTING_LESSONS.md.
+- **2026-06-05 — execution session 4** (Phase 2, Task 2.7: SSH RHS + CG solve,
+  substeps 8–9). `fesom_jax/ssh.py` + `tests/test_ssh.py` (18 tests; **full suite
+  148 passed**). Phase-2 config unchanged (linfs, PP, opt_visc7, analytical wind,
+  dt=100).
+  - **ssh_rhs (8):** `compute_ssh_rhs` — antisymmetric edge→node scatter of
+    `α·((v+vr)·dx−(u+ur)·dy)·helem`. **`SSH_ALPHA=1` ⇒ the `(1−α)·ssh_rhs_old` blend
+    term is identically 0.** Step-1 is at rest (`uv=0`) but `uv_rhs=du` (the
+    wind-forced increment overwritten into `uv_rhs` at substep 7), so ssh_rhs is
+    non-trivial. Matches the dump at **atol 1e-7** (not 1e-12): ssh_rhs is a
+    transport divergence with heavy cancellation; its abs floor (~5e-9 @ probe 1500)
+    is the upstream `du`’s ~1e-12 *relative* error **amplified by `dx·helem ~ 1e7`**,
+    not the ssh_rhs scatter (a numpy-sequential ref and `segment_sum` both land ~5e-9
+    vs the dump — the floor is shared upstream `du`, confirming the diagnosis).
+  - **Stiffness operator:** **static in linfs** — `build_ssh_operator` assembles the
+    element-Galerkin `S` once (host scipy COO→CSR), stored as a `segment_sum` matvec.
+    The "NEGATIVE factor −g·dt·α·hbar" = positive `factor=g·dt·α·θ` × `depth=zbar_bot−
+    zbar_srf < 0` (= −hbar in linfs, the *static* full depth). `cond(S)≈800`,
+    symmetric to FP.
+  - **⚠️ KEY FINDING — the C stops the CG at a *loose* `soltol=1e-5`** (≈**3
+    iterations** on pi: residuals `[65, 1.0, 0.015]` vs `rtol=0.197`), so the dumped
+    `d_eta` is the **early-stopped iterate**, which matches the 3-iter PCG to ~1e-18
+    but the *exact* solve only to ~2e-10. ⇒ we **replicate the C PCG exactly**
+    (static `S` + MITgcm preconditioner + same stop) for the forward value, and use
+    `custom_linear_solve`’s **tight `transpose_solve`** for the gradient ⇒ forward =
+    dump-matching early-stop, backward = clean implicit-diff `S⁻¹`. The huge residual
+    margin (5× above / 13× below the threshold between iters 2–3) makes the 3-iter
+    stop robust to `segment_sum` reassociation. **d_eta matches the dump ~1e-18 at
+    all 5 probes.**
+  - **MITgcm symmetric preconditioner** (19336 off-diag entries) verified
+    **load-bearing**: a Jacobi/diagonal variant gives a different early-stopped
+    `d_eta` (off 2.9e-10 @ probe 1001 → fails the dump).
+  - **AD:** `d(d_eta)/d(ssh_rhs)` from `custom_linear_solve` == tight `S⁻¹·w`
+    (rel 2e-14) == central-FD; finite; flows through `compute_ssh_rhs` to `du`. The
+    static linfs operator makes the AD clean (operator independent of evolving state).
+  - **Warm start:** the C does NOT zero `d_eta` between steps (`fesom_main.c` only
+    inits it) → step ≥2 warm-starts from the previous `d_eta`. `solve_ssh` takes an
+    `x0` (stop_gradient’d, folded into the rhs so the inner solve stays *linear* for
+    `custom_linear_solve`); step-1 `x0=0`. **Exact warm-start dump-matching at step
+    ≥2 (the stop threshold uses the original ‖b‖) is finalized with the full
+    `step()` in Task 2.11.** Next: Task 2.8 (update_vel / compute_hbar / eta_n).

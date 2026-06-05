@@ -226,3 +226,62 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `[nzmin,nzmax)` loop. Phase-2 simplifications that made this tractable: `w_i=0`
   (advective tridiagonal terms vanish) and no partial cells (`zbar_n=zbar`, `Z_n=Z`
   globally, computed once and broadcast). (`momentum.py:impl_vert_visc`, Task 2.6.)
+
+- **[ssh/solver] ⚠️ The C CG stops at a LOOSE `soltol=1e-5`, so the dumped `d_eta` is
+  the EARLY-STOPPED iterate — NOT the converged solution.** On pi `cond(S)≈800`, so PCG
+  hits `‖r‖<soltol·‖b‖` in just **3 iterations** (residuals `[65, 1.0, 0.015]` vs
+  `rtol=0.197`); the early iterate is ~2e-9 from the exact `S⁻¹b`. **Consequence: to
+  match the dump you MUST replicate the C PCG (same static `S`, same MITgcm
+  preconditioner, same `x0`, same stop) — converging *tight* gives a DIFFERENT `d_eta`
+  (off ~2e-10 @ probe 1001, rel 2.5e-6 → fails the gate).** The replicated 3-iter PCG
+  matches the dump to **~1e-18**. The huge residual margin (iter 2 is 5× above, iter 3
+  is 13× below the threshold) makes the iteration count robust to `segment_sum`
+  reassociation. *(The plan's "≤1e-12" gate is met by `d_eta`; the early-stop replication
+  is what makes it possible.)* (`fesom_ssh.c:407-412,484`, Task 2.7.)
+
+- **[ssh/AD] `custom_linear_solve` cleanly decouples a dump-matching forward from an
+  accurate gradient via SEPARATE `solve`/`transpose_solve`.** Reverse-mode AD uses ONLY
+  `transpose_solve` for the cotangent, so: forward `solve` = early-stopped PCG (matches
+  the dump), `transpose_solve` = *tight* PCG → the gradient is the clean implicit-diff
+  `S⁻¹·x̄` regardless of the loose forward stop. Verified: AD cotangent == an independent
+  tight `S⁻¹w` (rel 2e-14) == central-FD, and is finite. The forward value and the
+  gradient genuinely have different fidelity needs (dump-match vs accuracy); don't force
+  one solver to serve both. (`ssh.solve_ssh`, Task 2.7.)
+
+- **[ssh/precond] The MITgcm symmetric preconditioner is LOAD-BEARING — test that a
+  Jacobi variant FAILS the dump.** Because the dump is the early-stopped iterate, the
+  preconditioner (which shapes the Krylov path) directly changes `d_eta`. Zeroing the
+  19336 off-diagonal `pr` entries (→ Jacobi) shifts `d_eta` by 2.9e-10 @ probe 1001 →
+  fails the dump. Same discipline as the bvfreq-smoother: prove the "looks like a detail"
+  pass actually moves the gated field. `pr[diag]=1/diag`, `pr[off]=−0.5·(S[r,c]/diag_r)/
+  (diag_r+diag_c)` — off-diagonal, applied as a sparse matvec, not a diagonal scaling.
+  (`fesom_ssh.c:239-253`, `ssh.ssh_precond`, Task 2.7.)
+
+- **[ssh/rhs] `ssh_rhs` is a near-cancelling transport divergence → its abs floor is
+  upstream `du` amplified by geometry (`dx·helem ~ 1e7`), NOT the ssh_rhs scatter.** The
+  wind-forced convergence is a small residual of large opposing edge fluxes (~1e4), so at
+  cancellation nodes (probe 1500: value 1.13) the abs diff vs the dump is ~5e-9 (rel ~4e-9)
+  while at constructive nodes (probe 1001: value 2.8e4) it's rel ~1e-14. A
+  numpy-*sequential* reference AND `segment_sum` both land ~5e-9 vs the dump — same floor,
+  so it's the shared upstream `du` (~1e-12 rel) ×`dx·helem`, not the scatter order. Gate at
+  **atol 1e-7**, not 1e-12; the relative error at cancellation nodes is meaningless.
+  (`ssh.compute_ssh_rhs`, Task 2.7.)
+
+- **[ssh/static-op] In linfs the stiffness operator is STATIC: the "−g·dt·α·hbar" factor
+  uses the FIXED `zbar` depths, never the evolving `hbar`.** `depth = zbar[nlevels-1] −
+  zbar[0] < 0` IS the `−hbar` (full static column depth); the positive `factor=g·dt·α·θ`
+  carries the magnitude. So `update_stiff_mat_ale` is gated off (`fesom_ssh.c:9-12`), the
+  operator is assembled ONCE (host scipy COO→CSR → a `segment_sum` matvec reused every
+  step), and AD is clean (the operator carries no differentiable/evolving dependence — the
+  whole `d(d_eta)/d(params)` path is through the rhs). Per-step rebuild is a Phase-5/zlevel
+  concern. (`fesom_ssh.c:120-145`, `ssh.build_ssh_operator`, Task 2.7.)
+
+- **[ssh/warmstart] The C warm-starts the CG from the previous step's `d_eta` (it's never
+  zeroed between steps — only inited at `fesom_ic.c:57`).** Step-1 `x0=0` (a clean *linear*
+  solve, ideal for `custom_linear_solve`). For step ≥2 the warm start makes the
+  early-stopped iterate depend on `x0`, which would make the inner `solve` non-linear; keep
+  it linear by folding the warm start into the rhs (`b_eff = b − A·stop_gradient(x0)`, solve
+  `δ` from 0, return `x0+δ`). The *solution* is `x0`-independent — only the early-stop
+  iterate isn't — so `stop_gradient(x0)` is correct. Exact warm-start dump-matching at step
+  ≥2 (the C's stop threshold uses the original `‖b‖`) is finalized with the full `step()` in
+  Task 2.11. (`ssh.solve_ssh`, Task 2.7.)

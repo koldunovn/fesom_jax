@@ -1,9 +1,10 @@
 # Next-session prompt — FESOM2 → JAX port
 
 Paste the block below to start the next session. Phases 0 & 1 are complete and
-**Phase 2 substeps 1–7 (Tasks 2.1–2.6, the whole momentum chain) are done and
-committed**. Next is **Task 2.7 — SSH RHS + CG solve (substeps 8–9)**, the
-AD-critical solver.
+**Phase 2 substeps 1–9 (Tasks 2.1–2.7: the momentum chain + the SSH RHS/CG solver)
+are done**. Tasks 2.1–2.6 are committed (`0b9d9d1`); **Task 2.7 (`ssh.py`) is done
+and tested but NOT yet committed.** Next is **Task 2.8 — velocity update + hbar +
+eta_n (substeps 10–12)**.
 
 ---
 
@@ -16,7 +17,7 @@ Work from `/home/a/a270088/port_jax`. Use max effort.
 1. **Read the plan (source of truth):**
    `/home/a/a270088/port_jax/docs/plans/20260605-fesom-jax-port.md` — decisions,
    verification ladder, 8 phases, per-task gates, Revision Log. Keep its checkboxes
-   in sync as you go. Phase 2 = Tasks 2.1–2.11; **2.1–2.6 are `[x]`**, start at 2.7.
+   in sync as you go. Phase 2 = Tasks 2.1–2.11; **2.1–2.7 are `[x]`**, start at 2.8.
 2. **Read the lessons log (NEW, read every session):**
    `/home/a/a270088/port_jax/docs/PORTING_LESSONS.md` — the running gotcha/lesson
    log. **STANDING RULE: append one entry per task as you go** (config traps,
@@ -28,10 +29,11 @@ Work from `/home/a/a270088/port_jax`. Use max effort.
    `docs/MESH_EXPORT_LAYOUT.md` (mesh arrays). Skim the Phase-2 modules you build on
    (all committed): `fesom_jax/{eos,ic,pgf,pp,momentum,forcing}.py` and their tests,
    plus the Phase-1 base `{mesh,state,ops,verify,io_dump,config}.py`.
-5. Skim `/home/a/a270088/port2/FRESH_START.md` (SSH CG solver §11) and the C module
-   for substeps 8–9: `/home/a/a270088/port2/fesom2_port/src/fesom_ssh.c`.
+5. Skim the C modules for substeps 10–12: `update_vel` + `compute_hbar`
+   (`/home/a/a270088/port2/fesom2_port/src/fesom_momentum.c:474,779`), the eta_n blend
+   (`fesom_ale.c`), and the Phase-2 SSH module you build on (`fesom_jax/ssh.py`, done).
 
-## STATUS — Phases 0 & 1 + Phase 2 substeps 1–7 COMPLETE, committed
+## STATUS — Phases 0 & 1 + Phase 2 substeps 1–9 COMPLETE (2.7 uncommitted)
 - **Phase 0 (GATE 0):** env (`fesom-jax`, jax 0.10.1 x64, A100), verify harness
   (`io_dump.py`+`verify.py`), pi mesh export (`data/mesh_pi/`, 31 arrays), and the
   **C-port per-substep dump oracle** (`fesom_jax/tests/fixtures/pi_cdump.00000`).
@@ -52,7 +54,18 @@ Work from `/home/a/a270088/port_jax`. Use max effort.
   - 2.6 `momentum.py::impl_vert_visc`: per-element TDMA (`ops.tdma`), wind stress +
     quadratic bottom drag. **`forcing.py`**: analytical wind, **double-averaged**
     elem→node→elem (the stress `impl_vert_visc` actually reads).
-- **Full suite: 130 passing** (`JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`).
+- **Phase 2 substeps 8–9 (Task 2.7), `ssh.py` — DONE, NOT committed:**
+  - `compute_ssh_rhs` (8): antisymmetric edge→node transport scatter; `SSH_ALPHA=1`
+    ⇒ the `(1−α)·ssh_rhs_old` blend term is 0. Matches dump at **atol 1e-7**
+    (cancelling transport divergence; abs floor = upstream `du` ×`dx·helem~1e7`).
+  - `build_ssh_operator`: **static** linfs Galerkin stiffness `S` (host scipy
+    assemble → `segment_sum` matvec) + **MITgcm symmetric** preconditioner (verified
+    load-bearing vs Jacobi).
+  - `solve_ssh` (9): **⚠️ the C CG stops at a LOOSE `soltol=1e-5` (≈3 iters), so the
+    dump's `d_eta` is the EARLY-STOPPED iterate** — replicated exactly (forward) ⇒
+    matches dump **~1e-18**; `custom_linear_solve`’s tight `transpose_solve` gives the
+    clean implicit-diff `S⁻¹` gradient (== tight solve rel 2e-14, == FD).
+- **Full suite: 148 passing** (`JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`).
 
 ## THE PROVEN VERIFICATION RECIPE (follow it for every substep)
 This worked cleanly for 2.1–2.6 — reuse it:
@@ -110,37 +123,38 @@ Phase-2 JAX runs upwind; at step 1 the field is horizontally constant so upwind=
 | 5 vel_rhs | `uv_rhs_u`,`uv_rhs_v` (ELEM) | 2.4 | ✅ |
 | 6 viscosity_filter | `uv_rhs_u`,`uv_rhs_v` (ELEM) | 2.5 | ✅ |
 | 7 impl_vert_visc | `uv_rhs_u`,`uv_rhs_v` (ELEM) | 2.6 | ✅ |
-| 8 ssh_rhs | `ssh_rhs` (NODE) | **2.7** | ⏳ next |
-| 9 ssh_solve | `d_eta` (NODE) | **2.7** | ⏳ next |
-| 10 update_vel | `uv_u`,`uv_v` (ELEM) | 2.8 | |
-| 11 compute_hbar | `hbar` (NODE) | 2.8 | |
-| 12 eta_n | `eta_n` (NODE) | 2.8 | |
+| 8 ssh_rhs | `ssh_rhs` (NODE) | 2.7 | ✅ |
+| 9 ssh_solve | `d_eta` (NODE) | 2.7 | ✅ |
+| 10 update_vel | `uv_u`,`uv_v` (ELEM) | **2.8** | ⏳ next |
+| 11 compute_hbar | `hbar` (NODE) | **2.8** | ⏳ next |
+| 12 eta_n | `eta_n` (NODE) | **2.8** | ⏳ next |
 | 13 ale_step | `w`,`hnode_new` (NODE) | 2.9 | |
 | 15 solve_tracers | `T`,`S` (NODE) | 2.10 | |
 | 16 update_thickness | `hnode` (NODE) | 2.10 | |
 
-## IMMEDIATE WORK — Task 2.7 (SSH RHS + CG solve, substeps 8–9), AD-critical
-Create `fesom_jax/ssh.py` + `tests/test_ssh.py`. Config unchanged: pi, linfs, PP,
-upwind tracers, CG SSH, no GM/KPP/ice, analytical wind, dt=100, nl=48.
-- **`compute_ssh_rhs`** (substep 8, `fesom_ssh.c:261`): linfs branch, edge→node scatter
-  (transport divergence; the α/(1−α) blend). NODE field → dumped at substep 8. (At rest
-  uv=0 — check whether step-1 `ssh_rhs` is driven by the wind-forced `uv_rhs`/`hbar` or
-  is trivial; if trivial, add a synthetic edge-scatter unit test, per the recipe.)
-- **Stiffness matrix** (`init_stiff_mat_ale`, FRESH_START §11): element Galerkin,
-  NEGATIVE factor −g·dt·α·hbar. **In linfs it is built ONCE and reused** (`fesom_ssh.c:9-12`;
-  `update_stiff_mat_ale` gated off) → a *static* operator (precompute element
-  contributions + `segment_sum` matvec), not a per-step closure.
-- **MITgcm-style SYMMETRIC preconditioner** (`fesom_ssh.c:239-253`): `pr[diag]=1/diag(row)`,
-  `pr[off,node]=−0.5·(off/diag_row)/(diag_row+diag(node))` — has **off-diagonal** terms,
-  applied as a sparse **matvec**, NOT Jacobi/diagonal.
-- **Solve** with `jax.lax.custom_linear_solve` (symmetric; preconditioner inside `solve`);
-  global dot = plain sum on single device.
-- **Gate:** `ssh_rhs` (8) and `d_eta` (9) vs dump (≤1e-12; CG residual reassociates).
-  **Gradient check:** `d(d_eta)/d(rhs)` from `custom_linear_solve` vs FD / an unrolled
-  fixed-iter reference. With a static linfs operator the AD story is simpler (the operator
-  doesn't depend on the evolving `hbar`).
-- Then continue 2.8 (update_vel/hbar/eta_n) … 2.11 (assemble `step()`, rest-state +
-  100-step stability + snapshot). **GATE 2:** pi 100 steps stable; each substep matches C.
+## IMMEDIATE WORK — Task 2.8 (velocity update + hbar + eta_n, substeps 10–12)
+Add to `fesom_jax/momentum.py` + `fesom_jax/ssh.py` (+ tests). Config unchanged: pi,
+linfs, PP, upwind tracers, CG SSH, no GM/KPP/ice, analytical wind, dt=100, nl=48. Build
+on the done `ssh.py` (`compute_ssh_rhs`, `build_ssh_operator`, `solve_ssh`) and the
+momentum chain. **First read `fesom_step.c:176-280`** (the substep 10–12 wiring).
+- **`update_vel`** (substep 10, `fesom_momentum.c:474`): `uv += du` (the increment from
+  `impl_vert_visc`, currently stored in `uv_rhs`) **plus** the SSH-gradient correction
+  `coef=-g·theta·dt`, `uv += coef·∇N·d_eta` gathered to elements (`fesom_momentum.c:468-491`).
+  ELEM field (`uv_u`,`uv_v`) → element dump at substep 10 (probes 1757…5575). At step 1
+  this is the first nonzero `uv` (wind-driven).
+- **`compute_hbar`** (substep 11, `fesom_momentum.c:779` / `fesom_ale.c`): transport-
+  divergence edge→node scatter; **save `ssh_rhs_old = ssh_rhs`** (the AB history the linfs
+  ssh_rhs blend reads next step), then update `hbar`. NODE field (`hbar`) at substep 11.
+- **`eta_n`** (substep 12): the eta_n blend (`eta_n += ...·d_eta`/hbar — check the C). NODE
+  field (`eta_n`) at substep 12.
+- **Gate:** `hbar` (11) and `eta_n` (12) are NODE → compare vs dump directly (≤1e-12).
+  `uv` (10) is ELEM → element dump directly. AD: gradient flows through the gather of the
+  CG output `d_eta` into `uv`/`eta_n` (continues the `custom_linear_solve` chain). Watch the
+  **warm-start**: `d_eta` is consumed here but NOT zeroed → it is the next step's CG `x0`
+  (see the ssh/warmstart lesson; `solve_ssh` already takes `x0`).
+- Then 2.9 (ALE `w`/`hnode_new`) → 2.10 (upwind tracers + diffusion) → 2.11 (assemble
+  `step()`, rest-state + 100-step stability + snapshot). **GATE 2:** pi 100 steps stable;
+  each substep matches C. **Commit Task 2.7 (`ssh.py`) when the user asks.**
 
 ## GOLDEN RULE (JAX-adapted)
 Preserve the EXACT computation — the math and the load-bearing association order — but
