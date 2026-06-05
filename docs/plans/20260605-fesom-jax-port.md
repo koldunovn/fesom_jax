@@ -125,6 +125,13 @@ target is **climate-close**, exactly the Kokkos GPU acceptance:
 - **All gates must pass before starting the next task.** No exceptions.
 - **Update this plan file when scope changes**; expand Phases 5–8 into sub-plans when
   reached.
+- **STANDING RULE — keep a running lessons log (`docs/PORTING_LESSONS.md`).** Append to
+  it *as you go* (not only at phase end) whenever a task surfaces something non-obvious:
+  a config that differs from the docs, a sign/index/association-order trap, an AD
+  subtlety, a fidelity surprise, or a "this cost an hour" fact. One entry = one lesson,
+  cite the C `file:line` or dump probe that proves it. This is the project's externalized
+  memory across sessions — treat it as a required deliverable of every task, on par with
+  the verification gate.
 
 ## Verification Strategy (the ladder)
 
@@ -289,12 +296,12 @@ files noted per task.
 - Create: `fesom_jax/eos.py`
 - Create: `fesom_jax/tests/test_eos.py`
 
-- [ ] port full Jackett-McDougall EOS (`densityJM_components`), in-situ density, hydrostatic pressure, Brunt-Väisälä N² — ref `fesom_eos.c`, FRESH_START §8
-- [ ] **port the `fesom_smooth_nod3D(bvfreq)` pass** (`fesom_step.c:92`, `fesom_eos.c:226`, N2smth_h=.true.) — **CORRECTION: it is `n_smooth=1` (a SINGLE sweep)**, not "3-pass"; the "3" is the 3-vertex normalization `1/(3·Σ_patch area_el)`. Per owned node: `arr[n,nz] ← (Σ_{el∈patch(n)} area_el·(arr[v0]+arr[v1]+arr[v2])) / (3·Σ area_el)` over `nz∈[ulevels-1, nlevels-1]` (an element→node area-weighted patch average via `nod_in_elem2D` CSR → scatter/reduction class, ~1e-12). The substep-1 `bvfreq` dump is POST-smooth, so without this the gate fails (review Minor #13)
-- [ ] (EOS/pressure are map/gather → ~1e-15; the smoother is a node-patch gather → ~1e-15)
-- [ ] write `tests/test_eos.py`: compare `density`, `pressure`, `bvfreq` (post-smooth) probe columns vs Fortran dump substep 1; assert ≤1e-15. Note: substep 2 (`sw_alpha_beta`) is deferred to Phase 6 (GM/KPP-only); its dump exists but goes unused now
-- [ ] gradient check: `d(mean density)/d(T at a node)` AD vs finite-diff
-- [ ] run — must pass before next task
+- [x] port full Jackett-McDougall EOS (`densityJM_components`), in-situ density, hydrostatic pressure, Brunt-Väisälä N² — ref `fesom_eos.c`, FRESH_START §8 — `fesom_jax/eos.py` (`jm_components`, `pressure_bv`); `density` matches the dump **bit-for-bit** (max|Δ|=0, pointwise map), `pressure` ~1e-11/rel 1e-16 (cumsum integration)
+- [x] **port the `fesom_smooth_nod3D(bvfreq)` pass** (`fesom_step.c:92`, `fesom_eos.c:226`, N2smth_h=.true.) — **CORRECTION: it is `n_smooth=1` (a SINGLE sweep)**, not "3-pass"; the "3" is the 3-vertex normalization `1/(3·Σ_patch area_el)`. Per owned node: `arr[n,nz] ← (Σ_{el∈patch(n)} area_el·(arr[v0]+arr[v1]+arr[v2])) / (3·Σ area_el)` over `nz∈[ulevels-1, nlevels-1]` (an element→node area-weighted patch average via `nod_in_elem2D` CSR → scatter/reduction class, ~1e-12). The substep-1 `bvfreq` dump is POST-smooth, so without this the gate fails (review Minor #13) — `eos.smooth_nod3D` (element→node `scatter_add`); verified **load-bearing** (raw bvfreq FAILS, smoothed PASSES @1e-16)
+- [x] (EOS/pressure are map/gather → ~1e-15; the smoother is a node-patch **scatter** → ~1e-12) — confirmed
+- [x] write `tests/test_eos.py`: compare `density`, `pressure`, `bvfreq` (post-smooth) probe columns vs **C** dump substep 1 at **all 5 probes**; assert per-kind tol. Note: substep 2 (`sw_alpha_beta`) is deferred to Phase 6 (GM/KPP-only) — `fesom_jax/ic.py` (constant + **T-blob** IC) added as the EOS input; node 1001 in-blob (bvfreq≠0), 3000 out (=0)
+- [x] gradient check: `d(mean density)/d(T at a node)` AD vs finite-diff — central-FD step sweep, rel err <1e-6
+- [x] run — must pass before next task — **test_eos.py 18 passed; full suite 64 passed**
 
 #### Task 2.2: Pressure-gradient force (substep 3)
 
@@ -302,9 +309,9 @@ files noted per task.
 - Create: `fesom_jax/pgf.py` (or fold into `momentum.py`)
 - Create: `fesom_jax/tests/test_pgf.py`
 
-- [ ] port PGF at elements: `fesom_pressure_force_linfs_fullcell` (`fesom_step.c:104`; Fortran `pressure_force_4_linfs`, `oce_ale.F90:3461`)
-- [ ] write `tests/test_pgf.py`: compare `pgf_x/pgf_y` (element field) vs the Task-0.4 element dump substep 3 (≤1e-15). **If element dumps are deferred:** verify indirectly via `ssh_rhs` @8 + snapshot
-- [ ] run — must pass before next task
+- [x] port PGF at elements: `fesom_pressure_force_linfs_fullcell` (`fesom_step.c:104`; Fortran `pressure_force_4_linfs`, `oce_ale.F90:3461`) — `fesom_jax/pgf.py` (`pressure_force_linfs`): gather hpressure→elem + `gradient_sca` contraction in C association order, /ρ0, masked to `elem_layer_mask`
+- [x] write `tests/test_pgf.py`: compare `pgf_x/pgf_y` (element field) vs the Task-0.4 element dump substep 3 — element dumps ARE present, verified **directly** at all 5 element probes (max|Δ|~1e-20, gather class) + below-bottom-zero + EOS→PGF gradient flow
+- [x] run — must pass before next task — **test_pgf.py 12 passed**
 
 #### Task 2.3: PP vertical mixing (substep 4)
 
@@ -312,10 +319,10 @@ files noted per task.
 - Create: `fesom_jax/pp.py`
 - Create: `fesom_jax/tests/test_pp.py`
 
-- [ ] port PP scheme (shear/N² factor, background, convective adjustment min) — ref `fesom_pp.c`, FRESH_START §10; keep the `max(N²,0)` clamp and the convective `min` exactly (note non-smooth points for AD)
-- [ ] write `tests/test_pp.py`: compare `Kv` (node) vs Fortran dump substep 4 (≤1e-15, or 1e-12 if a node→node smoothing scatter is involved). **`Av` is element-based — NOT in the node shim** (`oce_ale.F90:3561` defers it); verify `Av` via the Task-0.4 element extension or indirectly via `impl_vert_visc`→`uv`
-- [ ] gradient check on `Kv(shear, N²)` away from the `max(N²,0)` / convective-`min` kinks
-- [ ] run — must pass before next task
+- [x] port PP scheme (shear/N² factor, background, convective adjustment min) — ref `fesom_pp.c`, FRESH_START §10; keep the `max(N²,0)` clamp and the convective `max` exactly — `fesom_jax/pp.py` (`compute_vel_nodes`, `pp_mixing`, `mo_convect`, `mixing_pp`). 3-loop order preserved (Av reads factor² before Kv→factor³). Outputs on **interior** interfaces `[nzmin+1,nzmax)` only (surface/bottom 0)
+- [x] write `tests/test_pp.py`: compare `Kv` (node) vs C dump substep 4 — `Av` **element dump present → verified DIRECTLY** at all 5 element probes (not indirect). Step-1 is at-rest (uv=0 → Kv=K_ver, Av=A_ver); the shear/N²/factor path + convective bump checked against an **independent loop-based numpy reference** of `fesom_pp.c` (synthetic uvnode/N²)
+- [x] gradient check on `Kv(shear, N²)` away from the `max(N²,0)` / convective-`max` kinks — `d(ΣKv)/d(uvnode)` AD vs central FD, rel <1e-6
+- [x] run — must pass before next task — **test_pp.py 14 passed; full suite 90 passed**
 
 #### Task 2.4: Momentum RHS — Coriolis(AB2) + PGF + SSH grad (substep 5)
 
@@ -323,10 +330,10 @@ files noted per task.
 - Create: `fesom_jax/momentum.py`
 - Create: `fesom_jax/tests/test_momentum.py`
 
-- [ ] port `compute_vel_rhs`: AB2 Coriolis (single-slot history, AB_order=2 — FRESH_START §14.4), PGF, SSH gradient; ref `fesom_momentum.c:49`
-- [ ] **port `momentum_adv_scalar` (momadv_opt=2)** — the edge→node scalar-control-volume advection bundled into `compute_vel_rhs` (`fesom_momentum.c:156`, called at :119); it is an edge→node **scatter** (~1e-12). Do NOT omit it (review Critical #4); the rest-state test won't catch its absence
-- [ ] write `tests/test_momentum.py::test_vel_rhs`: compare `uv_rhs` (element field) vs the element dump substep 5 (or indirectly via `ssh_rhs` @8 if element dumps deferred)
-- [ ] run — must pass before next task
+- [x] port `compute_vel_rhs`: AB2 Coriolis (single-slot history, AB_order=2, ε=0.1 offset), PGF, SSH gradient; ref `fesom_momentum.c:49` — `fesom_jax/momentum.py` (`compute_vel_rhs`). AB-slot order preserved (OLD `uv_rhsAB` drives the shift, NEW Coriolis overwrites it, advection adds to NEW)
+- [x] **port `momentum_adv_scalar` (momadv_opt=2)** — edge→node scalar-CV advection (`fesom_momentum.c:156`); element→node vertical-flux scatter + **antisymmetric edge→node** horizontal scatter, /areasvol, vertex→element. NOT omitted — verified nonzero & matched
+- [x] write `tests/test_momentum.py::test_vel_rhs`: compare `uv_rhs` (element field) vs element dump substep 5 — **directly** at all 5 element probes (step-1 rest → `uv_rhs=−dt·pgf`). Coriolis/SSH/advection exercised by a synthetic test vs an **independent loop numpy reference** (both `is_first_step`) + AD gate
+- [x] run — must pass before next task — **test_momentum.py 14 passed; full suite 104 passed**
 
 #### Task 2.5: Horizontal (biharmonic) viscosity (substep 6)
 
@@ -334,9 +341,9 @@ files noted per task.
 - Modify: `fesom_jax/momentum.py`
 - Modify: `fesom_jax/tests/test_momentum.py`
 
-- [ ] port `visc_filt_bidiff` (**biharmonic** — this is what the C port runs live, `fesom_step.c:654`/`:134-137`, i.e. opt_visc=7) two edge→element scatter stages via `segment_sum` — ref `fesom_momentum.c:654/~720`; **first scatter** → expect ~1e-12
-- [ ] write `test_momentum.py::test_visc_filter`: compare `uv_rhs` (element field) vs the element dump substep 6 (≤1e-12; or indirectly via `ssh_rhs`/`uv` if element dumps deferred)
-- [ ] run — must pass before next task
+- [x] port `visc_filt_bidiff` (**biharmonic**, opt_visc=7, `fesom_momentum.c:654`) two edge→element antisymmetric scatter stages — `momentum.py` (`visc_filt_bidiff`, `_bidiff_edge_terms`). Interior edges only (el1≥0 AND el2≥0); per-edge overlap level range `[max(ulevels)-1, min(nlevels)-1)`. Flow-aware `sqrt(|∇u|²)` uses an **AD-safe double-`where` sqrt** (forward-identical, finite grad at the |∇u|=0 kink)
+- [x] write `test_momentum.py::test_visc_filter`: compare `uv_rhs` vs element dump substep 6 — **directly** at all 5 element probes (rest → substep6==substep5). Synthetic vs **numpy reference** + AD gate + a **no-NaN-grad-at-rest** test for the safe-sqrt
+- [x] run — must pass before next task — **test_momentum.py 27 passed; full suite 117 passed**
 
 #### Task 2.6: Implicit vertical viscosity TDMA (substep 7)
 
@@ -344,10 +351,10 @@ files noted per task.
 - Modify: `fesom_jax/momentum.py`
 - Modify: `fesom_jax/tests/test_momentum.py`
 
-- [ ] port per-element TDMA (2 unknowns u,v), wind stress surface BC, quadratic bottom drag — ref `fesom_momentum.c:291`; vectorize over elements using `ops.tdma`
-- [ ] write `test_momentum.py::test_impl_vert_visc`: compare `uv_rhs` (element field) vs the element dump substep 7 (or indirectly via `uv` @10 / `hbar` @11 if element dumps deferred)
-- [ ] gradient check through the TDMA solve
-- [ ] run — must pass before next task
+- [x] port per-element TDMA (2 unknowns u,v), wind stress surface BC, quadratic bottom drag — ref `fesom_momentum.c:291`; vectorize over elements using `ops.tdma` — `momentum.py` (`impl_vert_visc`). Phase-2 simplifications: `w_i=0` (advective tridiag terms drop), no partial cells (`zbar_n=zbar`, `Z_n=Z`). Bottom drag `|u|` uses `_safe_sqrt`. ➕ **`forcing.py`** added (analytical wind, **double-averaged** elem→node→elem per `oce_fluxes_mom`)
+- [x] write `test_momentum.py::test_impl_vert_visc`: compare `uv_rhs` vs element dump substep 7 — **directly** at all 5 element probes (wind stress active even at rest → real TDMA solve). Synthetic vs numpy reference + re-averaged-stress unit test
+- [x] gradient check through the TDMA solve — `d(Σdu)/d(uv_rhs)` (linear) and `d(Σdu)/d(Av)` (nonlinear via matrix) AD vs FD
+- [x] run — must pass before next task — **test_momentum.py 40 passed; full suite 130 passed**
 
 #### Task 2.7: SSH RHS + CG solve (substeps 8–9) — the AD-critical solver
 
@@ -663,3 +670,15 @@ physics.
     GPU-absent fallback — run with `JAX_PLATFORMS=cpu` to silence). Convention note for
     Phase 2: 3D field layout is row-major `[n_entity, nl]` == C `FESOM_NODE3D`; vectors
     `[·, nl, 2]` == `FESOM_ELEMVEC`. **Next: Phase 2 (Task 2.1, EOS/pressure/N² substep 1).**
+- **2026-06-05 — execution session 3** (Phase 2 start, Task 2.1).
+  - **Added a STANDING RULE + `docs/PORTING_LESSONS.md`** (living lessons log; see
+    Development Approach). Append per-task, cite source.
+  - **⚠️ IC CORRECTION (load-bearing for ALL of Phase 2):** the pi reference dump is
+    **NOT** a bare constant T=10/S=35 IC. `fesom_main.c:744-753` adds
+    `fesom_ic_tracer_T_blob` (Gaussian +5 °C T-blob, centre (−45°,40°) geo, σ_h=10°,
+    σ_z=300 m, 4σ horizontal cutoff, S unchanged) on top of the constant whenever no PHC
+    path is given — and the dump run gives none. Probe 1001 is inside the blob
+    (stratified, bvfreq≠0), 3000 outside (T=10, bvfreq=0). Every T/S-dependent gate
+    (EOS→pressure→PGF→momentum→…) must reproduce the blob. `REFERENCE_RUNS.md` IC row
+    updated. T/S are effectively frozen over the 10 dumped steps (weak flow), so
+    substep-1 EOS fields are step-independent here. Detail in PORTING_LESSONS.md.

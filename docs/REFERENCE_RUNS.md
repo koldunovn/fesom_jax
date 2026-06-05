@@ -39,11 +39,25 @@ Config (must match the JAX target exactly):
 | mixing | PP (Pacanowski-Philander) | `FESOM_MIX_SCHEME=PP` |
 | GM/Redi | off | `FESOM_NO_GMREDI=1` |
 | horizontal visc | opt_visc=7 (biharmonic) | C default (`visc_filt_bidiff`) |
-| IC | constant T=10, S=35 | C Phase-1 default |
+| IC | constant T=10, S=35 **+ a Gaussian T-blob** (see below) | C default when no PHC path |
 | forcing | analytical wind (`fesom_forcing_analytical.c`), no heat/water flux | C default |
 | dt | 100 s | CLI arg |
 | steps dumped | 1..10 | `FESOM_DUMP_MAXSTEPS=10` |
 | dump enable | `FESOM_DUMP_FILE=<prefix>` | → `<prefix>.00000` |
+
+### ⚠️ The IC is constant **plus a T-blob** (not bare constant)
+
+`fesom_main.c:744-753`, when given no PHC path (the dump run gives none), applies
+`fesom_ic_tracer_T_blob` *on top of* the constant T=10/S=35 IC: a Gaussian +5 °C
+temperature anomaly, centre `(lon0,lat0)=(−45°,40°)` geographic, horizontal
+`σ_h=10°` (with a `cos(lat0)` small-circle correction and a **4σ cutoff**:
+`if r²_h > 16: continue`), vertical `σ_z=300 m` about `z=Z[nz]` (negative
+downward), added additively to T on every wet layer; **S stays 35**
+(`fesom_ic.c:82-129`). So node 1001 sits inside the blob (stratified → bvfreq≠0)
+and node 3000 outside (T=10 → bvfreq=0). **Any kernel verified against this dump
+whose result depends on T/S must reproduce the blob**, not the bare constant. T/S
+are effectively frozen over the 10 dumped steps (weak wind-only flow), so the
+substep-1 EOS fields are step-independent in this config.
 
 ## Probes
 
