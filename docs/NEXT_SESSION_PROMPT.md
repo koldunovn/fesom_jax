@@ -1,11 +1,12 @@
 # Next-session prompt — FESOM2 → JAX port
 
-Paste the block below to start the next session. **Phases 0, 1, and 2 are COMPLETE
-(GATEs 0/1/2 met).** The full single-step pi ocean model is ported, dump-gated, jitted,
-and 100-step stable. Next is **Phase 3 — the AD smoke test (the project's
-biggest-risk de-risking gate): wrap `step` in a checkpointed `lax.scan` (Task 3.1) and
-prove an end-to-end gradient through the whole model incl. the CG `custom_linear_solve`
-(Task 3.2).**
+Paste the block below to start the next session. **Phases 0, 1, 2, and 3 are COMPLETE
+(GATEs 0/1/2/3 met).** The full single-step pi ocean model is ported, dump-gated, jitted,
+100-step stable, AND **proven differentiable end-to-end** (checkpointed `lax.scan`, the
+CG `custom_linear_solve` gradient, an end-to-end FD-checked `d(loss)/d(K_ver)`, the N=200
+backward fits GPU memory). **The project's biggest risk is retired.** Next is **Phase 4 —
+pi fully stable: FCT (Zalesak) advection + the limiter-gradient decision (Task 4.1),
+complete opt_visc=7 + wsplit (Task 4.2), pi 1000-step stability + AD re-check (Task 4.3).**
 
 ---
 
@@ -17,92 +18,95 @@ eddy fluxes, trained end-to-end). This continues a multi-session effort. Work fr
 ## START HERE, in order
 1. **Read the plan (source of truth):**
    `/home/a/a270088/port_jax/docs/plans/20260605-fesom-jax-port.md` — decisions, the
-   verification ladder, per-task gates, Revision Log. Phase 3 = Tasks 3.1–3.2; keep its
+   verification ladder, per-task gates, Revision Log. Phase 4 = Tasks 4.1–4.3; keep its
    checkboxes in sync.
 2. **Read the lessons log (every session):** `docs/PORTING_LESSONS.md` — esp. the AD
-   entries (safe-sqrt, safe-divide / masked-NaN traps, `custom_linear_solve` forward-vs-
-   gradient split, the upwind `|vflux|` kink). **STANDING RULE: append a lesson per task.**
+   entries (the eos `bvfreq` `1/zdiff` backward-NaN trap; the safe-sqrt / safe-divide
+   masked-NaN rule; `custom_linear_solve` forward-vs-gradient split; the upwind `|vflux|`
+   kink; the FD-floor / plateau-at-large-h note). **STANDING RULE: append a lesson per task.**
 3. **Read the project memory:**
    `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
-4. Skim `fesom_jax/step.py` (the `step`/`step_jit`/`run` you'll scan) + `ssh.py`
-   (`solve_ssh`/`custom_linear_solve` — the AD-critical solver) + the Phase-3 plan
-   section (Tasks 3.1/3.2, incl. the FD step-size-sweep requirement and the
-   smooth-regime caveat).
+4. Skim `fesom_jax/tracer_adv.py` (the upwind advection you'll extend to FCT) +
+   `fesom_jax/integrate.py` (`integrate`/`integrate_jit` — the differentiable entry) +
+   `fesom_jax/tests/test_gradient.py` (the permanent AD gate, re-run at every later gate)
+   + the Phase-4 plan section (Tasks 4.1–4.3, incl. the limiter-gradient `docs/LIMITER_GRADIENTS.md`
+   research item).
 
-## STATUS — Phases 0/1/2 COMPLETE (GATE 2 met); all committed on `main`
-- **Phase 0/1 (GATE 0/1):** env, verify harness, pi mesh export, the C-port per-substep
-  dump oracle (`pi_cdump.00000`); `mesh.py`/`state.py`/`ops.py` (AD-verified).
-- **Phase 2 (GATE 2):** the full single-step ocean chain, substeps 1–16, each dump-gated:
-  `eos`, `pgf`, `pp`, `momentum` (+`forcing`), `ssh` (compute_ssh_rhs / static linfs
-  operator + MITgcm precond / `solve_ssh` early-stop CG via `custom_linear_solve`),
-  `ale` (`compute_w`/`thickness_linfs`/`commit_thickness`), `tracer_adv` (upwind),
-  `tracer_diff` (per-node TDMA). Assembled in **`step.py`** (`step`/`step_jit`/`run`).
-  - Step 1 reproduces every per-kernel dump gate; **rest state** machine-precision;
-    **`S` exactly 35** multi-step; **100 steps stable** (`max|uv|`=0.075, `|eta|`=0.35 m,
-    no NaN); the CG **warm-start** is load-bearing (the `solve_ssh` `rtol_abs` fix).
-  - ⚠️ Tight multi-step `T` match is Phase-4 (upwind ≠ the dump's FCT, cascades via density).
-- **Full suite: 274 passing** (`JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`; the
-  100-step test runs jitted, ~20 s).
+## STATUS — Phases 0/1/2/3 COMPLETE (GATE 3 met); all committed on `main`
+- **Phase 0/1/2 (GATE 0/1/2):** env, verify harness, pi mesh export, the C-port per-substep
+  dump oracle (`pi_cdump.00000`); `mesh.py`/`state.py`/`ops.py`; the full single-step ocean
+  chain (substeps 1–16) in **`step.py`** (`step`/`step_jit`/`run`), each dump-gated; step 1
+  reproduces every per-kernel gate, rest state machine-precision, `S` exactly 35, 100 steps
+  stable.
+- **Phase 3 (GATE 3 — the AD de-risking gate):**
+  - **`params.py`** — a `Params` pytree (`k_ver`, `a_ver`) threaded `step(...,params) →
+    pp.mixing_pp`; `params=None ⇒ defaults` (numerically transparent). **The ML-hook seam**
+    (Phase 7 swaps the mixing here).
+  - **`integrate.py`** — `step` in a `jax.checkpoint`-ed `lax.scan`. **Step 1 eager
+    (`is_first_step=True`) OUTSIDE the scan**, steps 2..N scanned with `is_first_step=False`
+    baked in. Forward == the Phase-2 `run` loop **bit-identical**; checkpoint forward-transparent.
+  - **`test_gradient.py`** — the permanent AD gate: `d(mean SST)/d(k_ver)` AD↔FD sweep
+    (plateau 5.9e-7 ≪1e-4), gradient **flows through the CG**, `d(loss)/d(T₀)` finite, smooth
+    regime certified.
+  - **⚠️ Fixed an eos `bvfreq` backward-NaN trap** (`zdiff=0` at the bottom-padding lane →
+    `0·inf` in the backward pass → `d/d(T₀)` NaN; the forward was always fine). Fix:
+    `where(zdiff==0,1,zdiff)`. The **IC-field gradient is the stronger masked-NaN probe**.
+  - **GPU memory sanity (job 25378918):** N=200 backward = **4.23 GB checkpointed** vs **48.7 GB
+    OOM** without ⇒ checkpointing load-bearing.
+  - ⚠️ Tight multi-step `T` match is still Phase-4 (upwind ≠ the dump's FCT, cascades via density).
+- **Full suite: 286 passing** (`JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`; ~3 min;
+  the 100-step test + the gradient FD sweeps dominate the time).
 
-## IMMEDIATE WORK — Phase 3 (Tasks 3.1 + 3.2): the AD de-risking gate
-This is THE gate that retires the project's biggest risk — that the hard AD patterns
-(`lax.scan`+`jax.checkpoint`, the CG `custom_linear_solve`, the upwind/PP kinks) hold
-end-to-end on the real model. AD was kept safe-by-construction throughout (every kernel
-grad-checked), so this should mostly *confirm* — but expect to hunt one or two masked-NaN
-or kink issues over a long window.
+## IMMEDIATE WORK — Phase 4 (Tasks 4.1 + 4.2 + 4.3): pi fully stable
+This makes pi match the dump's *live* physics (FCT, full opt_visc=7) and pushes to 1000-step
+stability — at which point the **tight multi-step `T/S` dump match** (deferred since Phase 2)
+finally becomes available, and the Phase-3 AD gate is **re-run with the full pi physics**.
 
-### Task 3.1 — checkpointed scan time loop (`fesom_jax/integrate.py` + `tests/test_integrate.py`)
-- Wrap `step` in `jax.lax.scan` over N steps; apply `jax.checkpoint` (rematerialization)
-  to the per-step fn for backward-pass memory.
-- **⚠️ `is_first_step`:** the scan body must be uniform. Cleanest: run step 1 eagerly
-  (`is_first_step=True`) OUTSIDE the scan, then `scan` steps 2..N with `is_first_step=False`
-  baked in (the flag only flips the AB2 `ff_step`). Don't try to carry it as a traced bool.
-- The static SSH `op` + `stress_surf` are loop-invariant → close over them (or pass as
-  non-scanned args). `mesh`/`op` are pytrees; fine to close over.
-- Gates: scan forward == the Phase-2 `run` loop (climate-close); N=200 backward pass fits
-  device memory with checkpointing (memory sanity).
+### Task 4.1 — FCT (Zalesak) advection + the limiter-gradient decision
+- Port high-order + Zalesak limiter (`fct_plus/minus`, local min/max bounds, sign-dependent
+  flux selection) — ref `fesom_tracer_adv.c:814+`, FRESH_START §12. Extend `tracer_adv.py`.
+- **⚠️ RESEARCH ITEM — `docs/LIMITER_GRADIENTS.md`:** the Zalesak limiter has `min`/`max`/
+  sign-select **kinks** that AD must handle. Decide + document one of: (a) subgradient as-is,
+  (b) smooth min/max relaxation, (c) `stop_gradient` on the limiter coefficients (treat the
+  limited-flux mask as fixed in the backward pass). Implement the choice. This is the new
+  **AD-hard** item (the same risk class as the CG, now retired) — keep `test_gradient.py`
+  finite + FD-consistent **where smooth** under the chosen strategy.
+- Forward gate: FCT `T/S` vs the C dump substep 15 (≤1e-12) — now a TIGHT gate (the dump runs
+  FCT, so the upwind−FCT gap closes); `S` already bit-exact.
 
-### Task 3.2 — end-to-end gradient (`fesom_jax/tests/test_gradient.py`)
-- Scalar loss (e.g. mean SST after N steps). **Pick the param/window to stay in a SMOOTH
-  regime** — verify the probe column never goes convective (the PP `max(N²,0)` / convective-
-  `max` kinks) and that `S` stays ≳0.5 (the salinity-floor `max` kink) and away from
-  `|vflux|=0` (the upwind kink). Keep N modest (the model is mildly chaotic via scatter
-  reassociation; long windows amplify).
-- **`d(loss)/d(param)`** for a scalar param — the plan names **PP `K_ver`** (background
-  vertical diffusivity). ⚠️ `K_ver` is currently a **config constant** (`config.py`,
-  `FESOM_PHASE1_K_VER=1e-5`); to differentiate it you must thread it as a traced **arg**
-  through `pp.mixing_pp` (→ `step`). This is also the first concrete "ML-hook" seam
-  (Phase 7 swaps the mixing here) — do it cleanly (a `params` dict or explicit arg).
-- **FD check with a step-size SWEEP** (`h ∈ {1e-4…1e-7}`, relative, central, float64):
-  report the FD-convergence plateau and assert `|grad_AD − grad_FD|/|grad_FD| < 1e-4` at
-  the plateau — NOT at a single `h` (chaos floor below, truncation above). (See the
-  Task-2.10 diffusion-`d/dKv` note: FD underflows at tiny-gradient entries.)
-- **Confirm the gradient flows through the CG** `custom_linear_solve` (perturb a param
-  affecting the stiffness/RHS — already proven per-step in `test_ssh.py`; now over the scan).
-- **grad w.r.t. an IC field** (vector-valued, e.g. `d(loss)/d(T₀)`) sanity check — easy
-  (differentiate w.r.t. the initial `State.T`); finite + nonzero.
-- Write `test_gradient.py` as the permanent AD gate (re-run at every later gate).
+### Task 4.2 — complete opt_visc=7 (flow-aware biharmonic) + wsplit
+- Complete the flow-aware terms of `visc_filt_bidiff` (opt_visc=7, `visc_gamma0=0.003`) to
+  match the live C kernel; port `use_wsplit` vertical-velocity splitting (`wsplit_maxcfl=1.0`).
+  Modify `momentum.py`/`ale.py`.
+- Forward gate vs dumps (substep-13 `w` node-direct; substep-6 `uv_rhs` element-direct).
 
-**GATE 3 (DE-RISKING):** end-to-end gradient passes; scan+checkpoint and
-`custom_linear_solve` proven on the real model. Then Phase 4 (FCT + opt_visc7 completion
-+ pi 1000-step) — at which point the tight multi-step `T/S` dump match becomes available.
+### Task 4.3 — pi 1000-step stability + AD re-check
+- Run pi 1000 steps at dt=100; assert stable; snapshot climate-close to C.
+- **Re-run the Phase-3 gradient gate (`test_gradient.py`) with FCT + opt_visc7 active** — the
+  AD must still pass with the limiter-gradient strategy live (this is why AD is never deferred).
+
+**GATE 4:** pi 1000 steps stable & climate-close; gradient check still passes with full pi
+physics. Then Phase 5 (CORE2 single-device) — expand into `docs/plans/<date>-fesom-jax-core2.md`.
 
 ## THE PROVEN VERIFICATION RECIPE (still applies)
 Dump gate at the pinned probes (node `1001,1500,2000,2500,3000`; elem `1757,2656,3688,
 4604,5575`), truncate to `nlevels`, `verify.assert_close(col, rec, kind=…)` (`map`/`gather`
 1e-15, `scatter`/`reduction` 1e-12; calibrate `atol`). AD-check with the **double-`where`
-safe-sqrt** for `sqrt(x→0)` and **`where(d==0,1,d)` / `where(a>0,a,1)`** for any divide
-whose denominator can vanish in a masked lane (the forward `where` does NOT stop a 0·inf
-NaN in the backward pass — this bit `tracer_diff`'s `d/dKv`). Append lessons; tick the plan;
-commit only when asked.
+safe-sqrt** for `sqrt(x→0)` and **`where(d==0,1,d)` / `where(a>0,a,1)`** for any divide whose
+denominator can vanish in a masked lane (the forward `where` does NOT stop a 0·inf NaN in the
+backward pass — this bit `tracer_diff`'s `d/dKv` AND the eos `bvfreq` `d/dT₀`). **Re-run
+`test_gradient.py` at every gate**, and always grad w.r.t. a full IC field (the strongest
+masked-NaN probe). For end-to-end FD checks, sweep `h` and assert the **plateau** (round-off
+floor below, truncation above) — and remember the plateau may be at LARGE `h` for a
+near-linear loss. Append lessons; tick the plan; commit only when asked.
 
 ## KEY PATHS
 - Working repo (git `main`, local-only, no remote): `/home/a/a270088/port_jax`
 - **Env python (ALL python/pytest):**
   `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python`
-  → `JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`. **For the backward-pass memory
-  sanity (N=200) use the GPU** (SLURM `shared`/`gpu`, acct `ab0995`) — CPU is fine for
-  correctness/gradient-value gates.
+  → `JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`. **For GPU runs** (the N=200 backward
+  memory gate, future 1000-step timings) use SLURM: `sbatch scripts/phase3_grad_memory.sbatch`
+  (acct `ab0995_gpu`, `-p gpu`/`gpu-devel`, A100-40). CPU is fine for correctness/gradient-value.
 - Exported pi mesh (gitignored): `data/mesh_pi/*.npy`; dump fixture (committed):
   `fesom_jax/tests/fixtures/pi_cdump.00000`.
 - C port (algorithmic SoT): `/home/a/a270088/port2/fesom2_port/src/` (branch
@@ -111,20 +115,26 @@ commit only when asked.
 
 ## LOCKED DECISIONS (do NOT re-litigate)
 1. Use case = hybrid ML params (swap points: vertical mixing PP/KPP, eddy flux GM/Redi).
+   The seam is now real: `fesom_jax/params.py` (`Params` pytree, threaded through `step`).
 2. Full-fidelity, bottom-up, not a toy. 3. **AD-safe by construction + early end-to-end
-gradient (THIS Phase) re-run at every gate — AD is never deferred.** 4. Mesh = index
-gather/scatter over `ops.py`. 5. Single-device + data-parallel now; mesh sharding Phase 8.
+   gradient (Phase 3, DONE) re-run at every gate — AD is never deferred.** 4. Mesh = index
+   gather/scatter over `ops.py`. 5. Single-device + data-parallel now; mesh sharding Phase 8.
 
 ## CRITICAL GOTCHAS (verified; full list in PORTING_LESSONS.md)
+- **AD masked-NaN rule (bit us 3×):** make masked-off lanes compute a FINITE value
+  (`where(d==0,1,d)` / double-`where` safe-sqrt) — a forward `where`/clip/mask does NOT stop a
+  `0·inf` NaN in the backward pass. Latest: eos `bvfreq`'s bottom-padding `1/zdiff`.
 - **`custom_linear_solve` splits forward (early-stop, dump-matching) from gradient (tight
-  `transpose_solve` ⇒ clean implicit-diff `S⁻¹`).** The CG warm-start uses `rtol_abs` =
-  `soltol·‖ssh_rhs‖` (the original rhs). The static linfs operator makes the SSH AD clean.
+  `transpose_solve` ⇒ clean implicit-diff `S⁻¹`).** The static linfs operator makes the SSH AD
+  clean. The gradient is now proven to flow through it end-to-end over the scan.
 - **AD kinks to keep the smoke test away from:** PP `max(N²,0)` + convective `max`; the
-  salinity floor `max(S,0.5)`; the upwind `|vflux|`/`|w|`. Stay smooth + modest-N.
-- **IC = constant + Gaussian T-blob** (`ic.initial_state`); **S=35 constant**. `step` needs
-  the static SSH `op` + a `stress_surf` (`forcing.surface_stress`, or zeros for rest).
-- **AD-safe divides:** masked lanes must compute FINITE values (`where(d==0,1,d)`), not rely
-  on a forward `where` to hide a 0·inf in the backward pass.
+  salinity floor `max(S,0.5)`; the upwind `|vflux|`/`|w|`; **NEW in Phase 4: the FCT/Zalesak
+  `min`/`max`/sign-select limiter** (the Task-4.1 research item). Stay smooth + modest-N.
+- **IC = constant + Gaussian T-blob** (`ic.initial_state`); **S=35 constant**. `step`/`integrate`
+  need the static SSH `op` (`ssh.build_ssh_operator`) + a `stress_surf` (`forcing.surface_stress`,
+  or zeros for rest) + optional `params` (`Params`, default = config constants).
+- **Differentiable time loop = `integrate.integrate` (checkpointed `lax.scan`)**, NOT the
+  Python `run` loop. Step 1 eager + scan 2..N; close over loop-invariants.
 
 ## WORKFLOW NOTES
 - Plan is authoritative; tick `[x]`; keep the Revision Log + lessons current.

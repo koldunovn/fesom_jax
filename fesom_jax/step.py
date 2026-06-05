@@ -39,6 +39,7 @@ import jax.numpy as jnp
 from . import ale, eos, momentum, pgf, pp, ssh, tracer_adv, tracer_diff
 from .config import DT_DEFAULT
 from .mesh import Mesh
+from .params import Params
 from .ssh import SSHOperator
 from .state import State
 
@@ -47,13 +48,20 @@ from .state import State
 S_FLOOR = 0.5
 
 
-def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, *,
-         dt: float = DT_DEFAULT, is_first_step: bool = False) -> State:
+def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
+         *, dt: float = DT_DEFAULT, is_first_step: bool = False) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
-    zeros for a rest test). ``is_first_step`` selects the AB2 first-step branch."""
+    zeros for a rest test). ``is_first_step`` selects the AB2 first-step branch.
+
+    ``params`` (a :class:`fesom_jax.params.Params`) carries the differentiable
+    physics tunables (the PP backgrounds ``k_ver``/``a_ver``). ``None`` ⇒
+    :meth:`Params.defaults` (the config constants — numerically identical to the
+    Phase-2 path). Pass a ``Params`` with traced leaves to take ``d(loss)/d(param)``."""
     st = state
+    if params is None:
+        params = Params.defaults()
 
     # 1 — EOS / hydrostatic pressure / N²
     density, hpressure, bvfreq = eos.compute_pressure_bv(mesh, st.T, st.S, st.hnode)
@@ -61,8 +69,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, *,
     # 3 — pressure-gradient force
     pgf_x, pgf_y = pgf.pressure_force_linfs(mesh, hpressure)
 
-    # 4 — PP vertical mixing
-    Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq)
+    # 4 — PP vertical mixing (k_ver/a_ver are the ML-hook seam)
+    Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq,
+                                  k_ver=params.k_ver, a_ver=params.a_ver)
 
     # 5 — momentum RHS (lagged eta_n, w_e, uv; shifts the OLD AB slot)
     uv_rhs, uv_rhsAB = momentum.compute_vel_rhs(
@@ -126,10 +135,12 @@ step_jit = jax.jit(step, static_argnames=("dt", "is_first_step"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
-        *, dt: float = DT_DEFAULT) -> State:
+        params: Params = None, *, dt: float = DT_DEFAULT) -> State:
     """Run ``n_steps`` jitted forward steps from ``state`` (a plain Python loop;
-    Phase 3 replaces this with a checkpointed ``lax.scan``). ``is_first_step`` is set
-    on the first iteration only (the AB2 first-step branch)."""
+    Phase 3 adds :func:`fesom_jax.integrate.integrate`, a checkpointed ``lax.scan``,
+    for the differentiable path). ``is_first_step`` is set on the first iteration
+    only (the AB2 first-step branch)."""
     for i in range(n_steps):
-        state = step_jit(state, mesh, op, stress_surf, dt=dt, is_first_step=(i == 0))
+        state = step_jit(state, mesh, op, stress_surf, params, dt=dt,
+                         is_first_step=(i == 0))
     return state

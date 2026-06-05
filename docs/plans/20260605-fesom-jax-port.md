@@ -432,29 +432,36 @@ constant); step 1 reproduces **every** per-kernel substep dump gate through the 
 - Create: `fesom_jax/integrate.py`
 - Create: `fesom_jax/tests/test_integrate.py`
 
-- [ ] wrap `step` in `jax.lax.scan` over N steps; apply `jax.checkpoint` (rematerialization) to the step fn
-- [ ] confirm forward result of the scan == the Phase-2 manual loop (climate-close)
-- [ ] memory sanity: N=200 pi steps backward pass fits in device memory with checkpointing
-- [ ] write `tests/test_integrate.py` (forward-equivalence)
-- [ ] run — must pass before next task
+- [x] wrap `step` in `jax.lax.scan` over N steps; apply `jax.checkpoint` (rematerialization) to the step fn — `fesom_jax/integrate.py` (`integrate`/`integrate_jit`). **Step 1 runs eagerly (`is_first_step=True`) OUTSIDE the scan; steps 2..N scan with `is_first_step=False` baked in** (uniform body, no traced bool). Loop-invariant `mesh`/`op`/`stress_surf`/`params` closed over (carry = just `State`).
+- [x] confirm forward result of the scan == the Phase-2 manual loop (climate-close) — **BIT-IDENTICAL** (`integrate`==`run`: uv ~4e-19, all else 0.0); checkpoint on==off forward exactly 0.0
+- [x] memory sanity: N=200 pi steps backward pass fits in device memory with checkpointing — `scripts/phase3_grad_memory.py` + `.sbatch` (GPU job 25378918, A100-40). **Checkpointed: grad finite, peak 4.23 GB / 31.8 GB (13%), 26 s. Un-checkpointed: OOM at 48.7 GB** (XLA couldn't remat below 28 GiB) ⇒ **checkpointing is load-bearing** for the backward pass.
+- [x] write `tests/test_integrate.py` (forward-equivalence) — scan==run (N=1,2,5,12); checkpoint forward-transparent; small-N backward finite + checkpoint-invariant
+- [x] run — must pass before next task — **test_integrate.py + test_gradient.py 12 passed (CPU)**
 
 #### Task 3.2: End-to-end gradient check
 
 **Files:**
 - Create: `fesom_jax/tests/test_gradient.py`
 
-- [ ] define a scalar loss (e.g. mean SST after N steps); choose the param/loss to stay in a **smooth regime** — verify the probe column never goes convective so the PP `max(Kv,0.1)` / `max(N²,0)` kinks don't bite (review Important #8)
-- [ ] reverse-mode `jax.grad` of loss w.r.t. a scalar parameter (PP `K_ver` background diffusivity)
-- [ ] **finite-difference check with a step-size SWEEP:** compute FD at `h ∈ {1e-4…1e-7}` (relative, central, float64), report the FD-convergence plateau, and assert `|grad_AD − grad_FD|/|grad_FD| < 1e-4` at the plateau — not at a single `h` (chaos floor below, truncation error above)
-- [ ] keep N modest for the smoke test (the forward model is mildly chaotic via scatter reassociation — see `GPU_FIDELITY.md` M5.8/M5.9; long windows amplify it). Note this as a known long-window gradient-stability risk
-- [ ] confirm gradient flows through the CG `custom_linear_solve` (perturb a param affecting the stiffness/RHS)
-- [ ] grad w.r.t. an initial-condition field (vector-valued) sanity check
-- [ ] write `tests/test_gradient.py` as the permanent AD gate
-- [ ] run — must pass before Phase 4
+- [x] define a scalar loss (e.g. mean SST after N steps); choose the param/loss to stay in a **smooth regime** — verify the probe column never goes convective so the PP `max(Kv,0.1)` / `max(N²,0)` kinks don't bite (review Important #8) — `loss = mean SST` over wet surface nodes; `test_smooth_regime` certifies the blob probe column stays **stratified** (bvfreq>0), `S`=35 (≫0.5 floor), no genuine convection (bvfreq only dips to ~-2e-14 FP-noise in the dead constant-T region, carrying no gradient)
+- [x] reverse-mode `jax.grad` of loss w.r.t. a scalar parameter (PP `K_ver` background diffusivity) — threaded as a traced **`Params` leaf** (`params.py`, the ML-hook seam) `step→pp.mixing_pp`; `params=None ⇒ defaults` keeps the 274-test suite bit-identical
+- [x] **finite-difference check with a step-size SWEEP:** compute FD at `h ∈ {1e-4…1e-7}` (relative, central, float64), report the FD-convergence plateau, and assert `|grad_AD − grad_FD|/|grad_FD| < 1e-4` at the plateau — not at a single `h` (chaos floor below, truncation error above) — swept `h∈{1e-3..1e-7}`; **plateau 5.9e-7 at `k_ver=1e-4`** (lifted off the ~eps·10 round-off floor); physical `k_ver=1e-5` gives 4.5e-5 + correct sign. ⚠️ plateau is at LARGE `h` (loss near-linear in k_ver ⇒ round-off dominates small `h`)
+- [x] keep N modest for the smoke test (the forward model is mildly chaotic via scatter reassociation — see `GPU_FIDELITY.md` M5.8/M5.9; long windows amplify it). Note this as a known long-window gradient-stability risk — **N=20, dt=100** (the validated 100-step-stable config); noted in the test docstring
+- [x] confirm gradient flows through the CG `custom_linear_solve` (perturb a param affecting the stiffness/RHS) — `test_grad_flows_through_cg`: `d/d(a_ver)` routes through the CG *within* a step (a_ver→Av→impl_vert_visc→du→ssh_rhs→CG), FD-confirmed; `k_ver` routes through it *across* steps
+- [x] grad w.r.t. an initial-condition field (vector-valued) sanity check — `d(loss)/d(T₀)` finite **everywhere** (incl. masked lanes — this exposed + now guards the eos `zdiff` backward-NaN trap), nonzero on wet, exactly 0 on below-bottom
+- [x] write `tests/test_gradient.py` as the permanent AD gate — 5 tests (k_ver sweep, physical point, CG-flow, IC-field, smooth-regime)
+- [x] run — must pass before Phase 4 — **test_gradient.py green (CPU)**
 
-**GATE 3 (DE-RISKING):** end-to-end gradient check passes; the hard AD patterns
-(scan+checkpoint, `custom_linear_solve`) are proven on the real model. *This is the gate
-that retires the project's biggest risk.*
+**GATE 3 — ✅ MET (2026-06-06):** end-to-end gradient passes on the assembled pi model.
+`integrate` (checkpointed `lax.scan`) reproduces the Phase-2 `run` loop **bit-identical**;
+`d(mean SST)/d(k_ver)` AD↔FD plateau **5.9e-7** (≪1e-4) with the gradient flowing through
+the CG `custom_linear_solve`; `d(loss)/d(T₀)` finite (after fixing the eos `bvfreq` `1/zdiff`
+backward-NaN trap — the masked-NaN hunt the gate was meant to surface); the N=200 backward
+fits device memory **only** with checkpointing (4.23 GB vs 48.7 GB OOM). The hard AD patterns
+(scan+checkpoint, `custom_linear_solve`, upwind/PP kinks) are **proven on the real model** —
+*the project's biggest risk is retired.* **Phase 3 complete; full suite 286 passing.** Then
+Phase 4 (FCT + opt_visc7 completion + pi 1000-step) — at which the tight multi-step `T/S` dump
+match becomes available.
 
 ---
 
@@ -838,3 +845,36 @@ physics.
     eager ~1e-12 (the loose multi-step/stability gates + Phase-3 scan use it).
   - **GATE 2 MET; Phase 2 complete.** Next: **Phase 3** (Task 3.1 `lax.scan`+checkpoint
     time loop; Task 3.2 end-to-end gradient smoke test — the project's biggest-risk gate).
+- **2026-06-06 — execution session 9** (Phase 3, Tasks 3.1 + 3.2: the AD de-risking gate →
+  **GATE 3, Phase 3 COMPLETE**). `fesom_jax/params.py` + `integrate.py` +
+  `tests/test_integrate.py` + `tests/test_gradient.py` + the eos `zdiff` fix (+12 tests;
+  **full suite 286 passing**). **The model is now proven differentiable end-to-end — the
+  project's biggest risk is retired.**
+  - **ML-hook seam (`params.py`):** a registered `Params` pytree (`k_ver`, `a_ver`) threaded
+    `step(...,params) → pp.mixing_pp(...,k_ver,a_ver)`; `params=None ⇒ Params.defaults()` (the
+    config constants). **Numerically transparent** — the pre-existing 274 tests stay
+    bit-identical. This is the first concrete swap-point (Phase 7 puts an NN here).
+  - **`integrate.py` (Task 3.1):** `step` wrapped in `lax.scan` + per-step `jax.checkpoint`.
+    **Step 1 runs eagerly (`is_first_step=True`) OUTSIDE the scan**, steps 2..N scan with
+    `is_first_step=False` baked in (uniform body, no traced bool); `mesh`/`op`/`stress_surf`/
+    `params` closed over (carry = just `State`). Forward == the Phase-2 `run` loop
+    **BIT-IDENTICAL** (uv ~4e-19, else 0.0); `checkpoint` on==off forward exactly 0.0.
+  - **⚠️ eos `bvfreq` backward-NaN trap (found + fixed):** `zdiff = Zd − Zp` is exactly 0 at
+    the **bottom-padding** lane (`Zp` tail duplicates `Z[-1]`), not just the surface (`k=0`).
+    `1/zdiff=inf` ⇒ `bv[:,bottom]=inf` forward, **clipped out of the output** (so all
+    Phase-0..2 forward gates passed) but `0·inf=NaN` in the *backward* pass → `d(loss)/d(T)`
+    NaN at 6280 masked lanes. Fix: `where(zdiff==0,1,zdiff)`. **`d/d(scalar k_ver)` was finite
+    while `d/d(T₀ field)` was NaN** — the IC-field gradient is the strictly stronger masked-NaN
+    probe (k_ver enters additively downstream of the trap). Lesson logged.
+  - **Gradient gate (Task 3.2, `test_gradient.py`):** loss = mean SST after N=20 (dt=100).
+    `d/d(k_ver)` AD↔FD step-size **sweep** → plateau **5.9e-7** at `k_ver=1e-4` (lifted off
+    the ~eps·10 round-off floor; the plateau is at LARGE `h` since the loss is near-linear in
+    k_ver); physical `k_ver=1e-5` → 4.5e-5 + correct sign. Gradient **flows through the CG**
+    (`d/d(a_ver)` within-step, `d/d(k_ver)` across-step, both FD-confirmed). `d(loss)/d(T₀)`
+    finite everywhere + 0 on masked lanes. Smooth regime certified (probe column stratified,
+    `S`=35, no genuine convection).
+  - **Memory sanity (GPU, job 25378918, A100-40):** checkpointed N=200 backward = **4.23 GB
+    (13%)**, finite grad; un-checkpointed **OOMs at 48.7 GB** ⇒ checkpointing load-bearing.
+  - **GATE 3 MET; Phase 3 complete.** Next: **Phase 4** (Task 4.1 FCT/Zalesak +
+    limiter-gradient decision; Task 4.2 opt_visc7 flow-aware + wsplit; Task 4.3 pi 1000-step +
+    AD re-check) — at which the tight multi-step `T/S` dump match becomes available.

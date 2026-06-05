@@ -69,9 +69,14 @@ def compute_vel_nodes(mesh: Mesh, uv):
     return uvnode
 
 
-def pp_mixing(mesh: Mesh, uvnode, bvfreq):
+def pp_mixing(mesh: Mesh, uvnode, bvfreq, *, k_ver=K_VER, a_ver=A_VER):
     """``(Kv, Av)`` from node velocity ``uvnode`` ``[nod2D,nl,2]`` and the
-    (post-smooth) ``bvfreq`` ``[nod2D,nl]``. Mirrors ``fesom_pp_mixing`` exactly."""
+    (post-smooth) ``bvfreq`` ``[nod2D,nl]``. Mirrors ``fesom_pp_mixing`` exactly.
+
+    ``k_ver``/``a_ver`` are the background tracer diffusivity / momentum viscosity.
+    They default to the config constants (``K_VER``/``A_VER`` — the Phase-2 path),
+    but accept **traced** values so ``d(loss)/d(k_ver)`` flows (the ML-hook seam,
+    :class:`fesom_jax.params.Params`)."""
     nl = mesh.nl
     Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
     dz = _shift_down(Zp) - Zp                              # Z[nz-1]-Z[nz] > 0
@@ -92,10 +97,10 @@ def pp_mixing(mesh: Mesh, uvnode, bvfreq):
     f_corners = ops.gather_nodes_to_elem(factor, mesh.elem_nodes)   # (elem2D,3,nl)
     f2mean = (f_corners * f_corners).sum(axis=1) / 3.0              # (elem2D,nl)
     emask = _interior_iface_mask(mesh.ulevels, mesh.nlevels, nl)
-    Av = jnp.where(emask, MIX_COEFF_PP * f2mean + A_VER, 0.0)
+    Av = jnp.where(emask, MIX_COEFF_PP * f2mean + a_ver, 0.0)
 
     # Kv = mix_coeff·factor³ + background (the Kv0_const branch)
-    Kv = jnp.where(nmask, MIX_COEFF_PP * factor ** 3 + K_VER, 0.0)
+    Kv = jnp.where(nmask, MIX_COEFF_PP * factor ** 3 + k_ver, 0.0)
     return Kv, Av
 
 
@@ -117,10 +122,11 @@ def mo_convect(mesh: Mesh, Kv, Av, bvfreq):
     return Kv, Av
 
 
-def mixing_pp(mesh: Mesh, uv, bvfreq):
+def mixing_pp(mesh: Mesh, uv, bvfreq, *, k_ver=K_VER, a_ver=A_VER):
     """Driver mirror of ``fesom_step.c:122-135``: node velocity → PP → convection.
-    Returns ``(Kv, Av, uvnode)`` — the substep-4 dump fields (+ uvnode for reuse)."""
+    Returns ``(Kv, Av, uvnode)`` — the substep-4 dump fields (+ uvnode for reuse).
+    ``k_ver``/``a_ver`` thread the differentiable backgrounds (default = config)."""
     uvnode = compute_vel_nodes(mesh, uv)
-    Kv, Av = pp_mixing(mesh, uvnode, bvfreq)
+    Kv, Av = pp_mixing(mesh, uvnode, bvfreq, k_ver=k_ver, a_ver=a_ver)
     Kv, Av = mo_convect(mesh, Kv, Av, bvfreq)
     return Kv, Av, uvnode

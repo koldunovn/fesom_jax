@@ -133,7 +133,14 @@ def pressure_bv(mesh: Mesh, T, S, hnode):
     Zd = _shift_down(Zp)                                  # Z[nz-1], edge-replicated
     zmean = (0.5 * (Zd + Zp))[None, :]
     zdiff = Zd - Zp
-    zdiff = zdiff.at[0].set(1.0)                          # nz=0 unused; avoid 0/0
+    # zdiff == 0 at BOTH unused interfaces — the surface (nz=0, edge-replicated) and
+    # the bottom padding (Zp duplicates Z[-1] in its tail) — where 1/zdiff would be
+    # inf. Both are clipped out of the forward bvfreq, but a forward inf still poisons
+    # the BACKWARD pass (0·inf = NaN flows to d/dT at the masked lanes — the classic
+    # masked-NaN trap, cf. tracer_diff's where(dZ==0,1,dZ)). Replace with 1.0 so the
+    # divide is finite both ways; the forward output is unchanged (these lanes are
+    # never read after the clip).
+    zdiff = jnp.where(zdiff == 0.0, 1.0, zdiff)
     bulk_up = _shift_down(b0) + zmean * (_shift_down(bpz) + zmean * _shift_down(bpz2))
     bulk_dn = b0 + zmean * (bpz + zmean * bpz2)
     rho_up_n = bulk_up * _shift_down(rhopot) / (bulk_up + 0.1 * zmean * _STATE_EQ_INT)

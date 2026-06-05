@@ -476,3 +476,76 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `lax.scan` entry, `static_argnames=(dt, is_first_step)` ⇒ 2 compiled variants) matches eager
   to ~1e-12 (FMA level), which is fine for the loose multi-step/stability gates. 100 steps:
   `max|uv|`~0.075, `|eta|`~0.35 m, no NaN, `S` exactly 35. (`step.step_jit`/`run`, Task 2.11.)
+
+## Phase 3 — AD smoke test (Tasks 3.1/3.2, GATE 3)
+
+- **[ad/eos] ⚠️ The `bvfreq` (N²) bottom-padding `1/zdiff` is a BACKWARD-ONLY NaN trap —
+  the forward gate passed for two phases while the gradient was NaN.** `zdiff = Zd − Zp` is
+  exactly 0 at **two** unused interfaces: the surface (`k=0`, edge-replicated) AND the
+  **bottom padding** (`Zp = concat([Z, Z[-1:]])` duplicates `Z[-1]` in its tail ⇒
+  `zdiff[bottom]=0`). `1/zdiff=inf` there ⇒ `bv[:,bottom]=inf` in the *forward* pass, but the
+  output `take_along_axis(bv, clip(k,lo,hi))` **clips those lanes away**, so the forward
+  bvfreq (and every Phase-0..2 gate) is correct. The backward pass, however, computes
+  `0·inf = NaN` (the masked lane's 0 cotangent × the inf local derivative) and it flows to
+  `d(loss)/d(T)` at exactly the `nl-2`/`nl-1` columns of *every* node (= 2·nod2D = 6280 lanes
+  on pi). The old fix `zdiff.at[0].set(1.0)` only patched the surface. Fix:
+  `zdiff = where(zdiff==0, 1, zdiff)` (covers both; forward unchanged — the lanes are clipped
+  out). Same class as `tracer_diff`'s `where(dZ==0,1,dZ)` and the eos unused-`nz=0` trap; the
+  rule "make masked-off lanes compute a FINITE value, don't trust the forward mask to hide a
+  backward NaN" bit a THIRD time. (`eos.pressure_bv`, Task 3.2.)
+
+- **[ad/method] ⚠️ `d/d(scalar param)` being finite does NOT prove `d/d(field)` is finite —
+  the IC-field gradient is the strictly stronger masked-NaN probe.** `d(loss)/d(k_ver)` was
+  finite (and FD-correct!) while `d(loss)/d(T₀)` was NaN, because the NaN lived in the
+  `T₀→eos→bvfreq` backward at the masked lanes, and `k_ver` enters **additively** downstream
+  (`Kv = mix·factor³ + k_ver` ⇒ `d/dk_ver` only needs `d(loss)/d(Kv)`, never `d(Kv)/d(bvfreq)`),
+  so it never traverses the poisoned sub-path. Earlier per-kernel grad checks differentiated
+  w.r.t. T at a *single wet node* and missed it. **Always include a `grad` w.r.t. a full IC
+  field (incl. the below-bottom padding) — it is the test that catches these.** (Task 3.2.)
+
+- **[scan/checkpoint] `integrate` (run step 1 eagerly with `is_first_step=True`, then
+  `lax.scan` steps 2..N with `is_first_step=False` baked in) == the Phase-2 `run` loop
+  BIT-IDENTICAL, and `jax.checkpoint` is forward-transparent (on==off exactly).** The
+  `is_first_step`-outside-the-scan pattern keeps the scan body uniform with no traced bool;
+  closing over the loop-invariant `mesh`/`op`/`stress_surf`/`params` keeps the carry minimal
+  (just `State`). `scan(jax.checkpoint(body))` differentiates correctly for closed-over
+  tracers (`scan` hoists them as consts and sums their per-step cotangents), so
+  `d(loss)/d(params)` accumulates over the window. Forward `integrate==run` to ~4e-19 (uv),
+  0.0 elsewhere; checkpoint on/off forward Δ = 0.0; same gradient with/without checkpoint.
+  (`integrate.py`, Task 3.1.)
+
+- **[ad/fd] The end-to-end FD floor is set by the loss's INTERMEDIATE-SUM magnitude (mean
+  SST ~10 ⇒ ~`eps·10` round-off), NOT by AD accuracy — and the plateau is at LARGE `h`.**
+  `d(mean SST)/d(k_ver)` is ~−2.6e-3, so the FD signal `g·2h·k₀` at `k₀=1e-5,h=1e-4` is
+  ~5e-12 vs a ~3e-15 round-off floor (SNR ~1700 ⇒ rel ~1.5e-4, marginal). Because the loss is
+  very *smooth/near-linear* in `k_ver` (tiny truncation), the sweep's best `h` is the LARGEST
+  (1e-3), and rel error *grows* as `h→0` (round-off): `[h=1e-3→6e-7, 1e-4→1e-5, 1e-5→1e-4,
+  1e-6→2e-3, 1e-7→5e-3]`. Two robust levers (both keep the gradient identical): evaluate at a
+  larger background `k_ver` (1e-4 ⇒ plateau 6e-7; 1e-3 ⇒ 4e-7) to lift the signal off the
+  floor, and/or a longer window. Subtracting a constant from the loss does NOT help (the
+  round-off is baked into the mean before the subtract). So the gate asserts the **plateau**
+  (min over the `h`-sweep) at a signal-lifted `k_ver=1e-4`, and only checks finite+sign+loose
+  -FD at the physical `k_ver=1e-5`. (`test_gradient.py`, Task 3.2.)
+
+- **[ad/ml-hook] The differentiable-parameter seam = a `Params` pytree threaded
+  `step(...,params) → pp.mixing_pp(...,k_ver,a_ver)`, with `params=None ⇒ Params.defaults()`
+  (the config constants) — numerically transparent (the 274-test suite stays bit-identical).**
+  This is the first concrete ML-hook (Phase 7 swaps the PP mixing for an NN here; its weights
+  join `Params`). `k_ver` routes through the CG `custom_linear_solve` *across* steps
+  (k_ver→Kv→diffusion→T→[next step]density→…→ssh_rhs→CG); `a_ver` routes through it *within* a
+  step (a_ver→Av→impl_vert_visc→du→ssh_rhs→CG) — both FD-confirmed, so the implicit-diff
+  transpose solve is proven on the assembled model. (`params.py`, `pp.py`, Task 3.2.)
+
+- **[scan/memory] Checkpointing is LOAD-BEARING for the backward pass — N=200 pi backward is
+  4.23 GB checkpointed vs 48.7 GB (OOM on A100-40) without.** Reverse-mode through the N-step
+  loop needs O(N · per-step intermediates) un-checkpointed; XLA's `hlo_rematerialization`
+  couldn't get it below 28 GiB and tried to alloc 48.7 GiB → `RESOURCE_EXHAUSTED`. With
+  per-step `jax.checkpoint` it is O(N · `State` carry) ≈ 4.23 GB (13% of the A100-40), compile
+  +run 26 s. For *much* longer windows switch to nested/policy checkpointing (O(√N)); per-step
+  remat suffices to N≥200. (`scripts/phase3_grad_memory.py`, GPU job 25378918, Task 3.1.)
+
+- **[xla] The host-assembled static scatters (mesh indices baked as constants) trigger XLA
+  constant-folding warnings (`scatter-add … taking > 2s`) at compile — benign, ~5 s each.**
+  The grad-of-scan compile constant-folds a few `f64[3140,48,2]` scatter-adds with constant
+  index operands; it's a compile-time/runtime trade-off, not a correctness issue (the run is
+  correct and fast). Ignore the `slow_operation_alarm` lines. (GPU job 25378918, Task 3.1.)
