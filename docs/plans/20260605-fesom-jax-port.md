@@ -397,11 +397,11 @@ files noted per task.
 - Create: `fesom_jax/tracer_diff.py`
 - Create: `fesom_jax/tests/test_tracers.py`
 
-- [ ] port **upwind** horizontal+vertical advection first (no FCT yet) — ref `fesom_tracer_adv.c`; watch the `edge_vflux` sign (FRESH_START §12 / §14.5) via a constant-advection test
-- [ ] port `diff_tracers_ale`: accumulate `del_ttf`, ALE reconstruction `T_new=(T·hnode+del_ttf)/hnode_new`, implicit vertical TDMA (per-node, 1 unknown) — ref `fesom_tracer_diff.c`, FRESH_START §5/§14.1
-- [ ] port thickness commit `hnode = hnode_new` (substep 16) — ref `fesom_ale.c:18`
-- [ ] write `tests/test_tracers.py`: compare `T`, `S` vs C dump substep 15/16; plus a **constant-tracer-stays-constant** advection test and a **pure-diffusion** smoothing test
-- [ ] run — must pass before next task
+- [x] port **upwind** horizontal+vertical advection (no FCT yet) — `fesom_jax/tracer_adv.py` (`adv_flux_hor`/`adv_flux_ver`/`flux2dtracer`/`ale_reconstruct`/`advect_one`). The 5 C level-zones collapse to a masked per-element `vflux` sum; upwind face `-½(T₁(v+|v|)+T₂(v−|v|))`; vertical uses `w_e=w`; AB2 `ttfAB` drives the flux, `values` the reconstruction. **Matches an independent numpy upwind loop ref bit-for-bit.** `edge_vflux` sign verified via constant-tracer-stays-constant (exact).
+- [x] port `diff_tracers_ale`: ALE reconstruction `T_new=(T·hnode+del_ttf)/hnode_new` (linfs: thickness term 0), implicit vertical TDMA (per-node, 1 unknown) — `fesom_jax/tracer_diff.py` (`impl_vert_diff`). `impl_vert_visc`'s per-NODE sibling + `area/areasvol` ratio + `hnode_new` mass diagonal; `gm=NULL`/`do_wimpl=0`/`bc_surface=0`/`sw_3d=0`. ⚠️ `where(dZ==0,1,dZ)` to keep `d/d(Kv)` finite (0·inf NaN trap). Conserves `Σ areasvol·hnode·T` ~1e-16.
+- [x] port thickness commit `hnode = hnode_new` + `helem=⅓Σ_vertices hnode` (substep 16) — `fesom_ale.c:18`, `ale.commit_thickness`
+- [x] write `tests/test_tracers.py`: ⚠️ **dump runs FCT, port runs upwind** → `S=35` (constant) matches the dump **bit-for-bit** (clean gate), `T` (blob) differs ~3e-7 = upwind−FCT antidiffusive gap (bounded `<1e-5`; tight `T` match is Phase 4). + numpy-upwind-ref (bit-exact), constant-tracer (exact), diffusion conservation+smoothing, AD (linear in T, finite in uv kink, `d/d(Kv)` vs FD, end-to-end `d(ΣT)/d(du)`). `hnode` (16) bit-for-bit; `helem`==`State.rest`
+- [x] run — must pass before next task — **test_tracers.py 20 passed; full suite 212 passed**
 
 #### Task 2.11: Assemble `step()` and run pi forward
 
@@ -782,3 +782,33 @@ physics.
     `uv=0`; end-to-end `d(Σw)/d(du)` flows `compute_ssh_rhs → custom_linear_solve →
     update_vel → compute_w`, finite & nonzero. Next: Task 2.10 (upwind tracers +
     diffusion + thickness commit, substeps 15–16).
+- **2026-06-05 — execution session 7** (Phase 2, Task 2.10: upwind tracers +
+  diffusion + thickness commit, substeps 15–16). `fesom_jax/tracer_adv.py` +
+  `tracer_diff.py` + `ale.commit_thickness` + `tests/test_tracers.py` (+20 tests;
+  **full suite 212 passed**). **The full single-step ocean chain (substeps 1–16) is
+  now ported** — only `step()` assembly (2.11) remains in Phase 2.
+  - **Upwind advection (15):** `tracer_adv.advect_one` — AB2 `ttfAB` drives the
+    horizontal upwind edge flux (the C's 5 level-zones collapse to a masked
+    per-element `vflux` sum; the per-cell term is the **negation** of `compute_w`'s)
+    + the vertical `w_e`-flux (edge-replicated `T_above` ⇒ surface `-w·T·area` for
+    free), `÷areasvol` assembly, then ALE reconstruction (`hnode_new=hnode` ⇒
+    `T += del_ttf/hnode`). **Matches a numpy upwind loop ref bit-for-bit.**
+  - **⚠️ Dump gate (FCT vs upwind):** the dump runs **FCT**, this runs **upwind**.
+    **`S=35` (constant) matches the dump bit-for-bit** (the transport divergence
+    cancels by discrete continuity — a constant tracer is preserved *exactly*); **`T`
+    (the blob) differs ~3e-7** = the limited antidiffusive flux. So `S` is the clean
+    step-1 gate, `T` is bounded (`<1e-5`) + verified vs the numpy ref; the tight `T`
+    match is a Phase-4 (FCT) gate. **Corrected** the REFERENCE_RUNS "step-1
+    horizontally constant" claim (only `S` is; the T-blob isn't).
+  - **Vertical diffusion (15):** `tracer_diff.impl_vert_diff` — `impl_vert_visc`'s
+    per-NODE 1-unknown sibling (+`area/areasvol` ratio, `hnode_new` mass diagonal).
+    `gm=NULL`/`do_wimpl=0`/`bc_surface=0` (no heat/water flux)/`sw_3d=0` (`USE_SW_PENE`
+    gated on `use_jra`, off for analytical). ⚠️ **`where(dZ==0,1,dZ)`** to stop the
+    Z-padding's exact 0 from poisoning `d/d(Kv)` (0·inf NaN, the eos-class trap).
+    Conserves `Σ areasvol·hnode·T` ~1e-16; smooths a vertical gradient.
+  - **Commit thickness (16):** `ale.commit_thickness` — `hnode:=hnode_new` +
+    `helem=⅓Σ_vertices hnode`. `hnode` dump **bit-for-bit**; `helem`==`State.rest`.
+  - **AD:** advection linear in T (AD==FD), kink-safe in `uv` (the `|vflux|` upwind
+    kink); diffusion `d/d(Kv)` matches FD; end-to-end `d(ΣT)/d(du)` through the whole
+    chain finite & nonzero. Next: Task 2.11 (assemble `step()`, rest-state +
+    100-step stability + snapshot → GATE 2).

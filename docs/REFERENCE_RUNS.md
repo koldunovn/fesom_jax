@@ -77,10 +77,18 @@ windows depending on the kernel:
   thickness):** upstream of tracer advection, so **match at every step** —
   independent of the upwind-vs-FCT choice.
 - **Substep 15 (T, S):** the C port runs **FCT**; JAX Phase 2 runs **upwind**.
-  At **step 1** the tracer field is horizontally constant so advection does
-  nothing → upwind == FCT == the dump (clean). From step 2 they diverge at the
-  scheme level; the **full multi-step T/S match is a Phase-4 (FCT) gate**. Phase-2
-  upwind is otherwise checked by the constant-tracer and pure-diffusion tests.
+  ⚠️ **CORRECTION (Task 2.10):** the IC is constant + a Gaussian **T-blob**, so `T`
+  is **not** horizontally constant — only `S=35` is. Consequences at **step 1** (uv
+  is the wind-driven velocity, so advection is active):
+  - **`S`** advects trivially (constant ⇒ the transport divergence cancels by
+    discrete continuity, and diffusion sees no gradient) ⇒ upwind == FCT == the dump
+    **bit-for-bit**. This is the clean step-1 tracer gate.
+  - **`T`** (the blob has horizontal+vertical gradients) ⇒ upwind ≠ FCT; the dump's
+    FCT `T` differs from upwind `T` by the limited antidiffusive flux (~3e-7 at
+    step 1). So the **tight `T` match is a Phase-4 (FCT) gate**; Phase-2 upwind `T` is
+    verified against an independent numpy upwind loop reference + the constant-tracer
+    property, and only *bounded* (`<1e-5`) against the dump.
+  From step 2 even `S` diverges at the scheme level. (`test_tracers.py`.)
 
 ## Secondary cross-check: the Fortran dump (NOT per-substep comparable)
 

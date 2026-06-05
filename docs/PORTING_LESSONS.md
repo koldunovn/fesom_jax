@@ -372,3 +372,63 @@ Cite the C source (`file:line`) or dump probe that proves it.
   advection, Task 2.10) and `w_i=0` confirms the Task-2.6 `impl_vert_visc` simplification
   (`w_i=0` ⇒ advective tridiagonal terms drop). `cfl_z`/`w_e`/`w_i`/`wvel_split` have no
   substep-13 dump → ported when consumed (Task 2.10/2.11), not here. (Task 2.9.)
+
+## Phase 2 — tracers (Task 2.10, substeps 15–16)
+
+- **[tracers/upwind] The horizontal upwind flux's 5 level-"zones" collapse to a masked
+  per-element sum.** The C (`adv_tra_hor_upw1`, `fesom_tracer_adv.c:212`) splits each edge's
+  column into 5 zones (el1-only-above / el2-only-above / both / el1-only-below /
+  el2-only-below) purely to walk the union of the two cells' level ranges — vectorized this
+  is just `vflux = mask₁·flux₁ + mask₂·flux₂` per level (each masked to `elem_layer_mask`).
+  ⚠️ The per-element flux is the **NEGATION** of `compute_w`/`compute_ssh_rhs`'s term: el1
+  uses `(u·dy₁ − v·dx₁)·h`, el2 `(v·dx₂ − u·dy₂)·h`. Upwind face value
+  `-½(T₁(vflux+|vflux|) + T₂(vflux−|vflux|))` (the `|vflux|` is an AD kink, finite-grad).
+  (`tracer_adv.adv_flux_hor`, Task 2.10.)
+
+- **[tracers] Advection fluxes use `ttfAB` (AB2-extrapolated), but the ALE reconstruction
+  updates `values` (T).** `init_tracers_AB_one` (`fesom_tracer_adv.c:174`) computes
+  `ttfAB = -(0.5+ε)·valuesold + (1.5+ε)·values` (ε=0.1) and saves `valuesold := values`. At
+  **step 1** `valuesold == values` (`ic` sets `T_old=T`) ⇒ `ttfAB == T`. Functional JAX:
+  `advect_one` returns `(T_new, T_old_new=T)`; the caller sets the next step's `T_old`. The
+  edge-replicated `T_above = T[nz-1]` makes the unified vertical formula reproduce the C's
+  surface flux `-w·T·area` at `nzmin` (½·2w·T). (`tracer_adv`, Task 2.10.)
+
+- **[tracers/constant] ⚠️ A constant tracer is preserved EXACTLY (bit-exact 0.0 on CPU) —
+  this is the discrete-continuity consistency, and the reason `S=35` is the clean step-1
+  gate.** The vertical divergence (via `w` = reverse-cumsum of the horizontal transport
+  divergence ÷area, so `w·area` reconstructs that very divergence) and the direct horizontal
+  edge scatter **cancel bit-exactly** because both reuse `ops.scatter_add` on the same edges
+  with exactly-negated per-edge values. (GPU may leave ~1e-12 if the two `segment_sum`s
+  reassociate differently — gate `S` at `kind="scatter"`.) (`test_tracers.py`, Task 2.10.)
+
+- **[tracers/dump] ⚠️ The C dump runs FCT; this port runs UPWIND. `S=35` (constant) matches
+  the dump bit-for-bit; `T` (the blob) differs by ~3e-7 = the limited antidiffusive flux —
+  the tight `T` match is a Phase-4 (FCT) gate.** So gate `S` vs the dump (tight), verify
+  upwind `T` against an independent numpy loop reference (bit-exact) + the constant-tracer
+  property, and only *bound* `T` vs the dump (`< 1e-5`). This **corrects** the REFERENCE_RUNS
+  "at step 1 the field is horizontally constant" claim — the **T-blob is not constant**; only
+  `S` is. (`test_tracers.py`, Task 2.10.)
+
+- **[tracers/diff] The vertical tracer diffusion is `impl_vert_visc`'s per-NODE 1-unknown
+  sibling**, with two differences: an extra `area[iface]/areasvol[layer]` geometric ratio on
+  the off-diagonals, and a **`hnode_new` mass diagonal** (`b = -a - c + hnode_new`, vs
+  momentum's `+1`). Phase-2 reductions (all verified): `gm=NULL` ⇒ no Redi `K33`; `do_wimpl=0`;
+  `bc_surface=0` (analytical forcing ⇒ zero heat/water/virtual-salt/relax-salt flux); `sw_3d=0`
+  (`USE_SW_PENE` is gated on `use_jra`, off for analytical — `fesom_main.c:992`); full-cell linfs
+  ⇒ `Z_n=Z`. Conserves `Σ areasvol·hnode·T` to ~1e-16; reuse `ops.tdma`.
+  (`tracer_diff.impl_vert_diff_one`, `fesom_tracer_diff.c:85`, Task 2.10.)
+
+- **[tracers/diff/AD] ⚠️ The `Z`-padding's exact 0 poisons `d/d(Kv)` (0·inf = NaN) — replace
+  `dZ==0` with 1.** `Zp = concat([Z, Z[-1:]])` makes `dZ_dn[nl-2] = Z[nl-2]−Z[nl-2] = 0` at an
+  always-masked lane; `c_full = …/dZ_dn` is `inf`/`NaN` there, which the forward `where`
+  masks but whose **infinite local derivative × the where's 0 cotangent = NaN** in the
+  backward pass (the masked value is finite, the *gradient* is not). Fix:
+  `dZ = where(dZ==0, 1, dZ)` so the masked lanes are finite both ways. Same class as the eos
+  unused-N²-level trap; `impl_vert_visc` has the same latent pattern but its `bot`-zeroing
+  dodges it. Diffusion is linear in T (AD==FD) and `d/d(Kv)` matches FD where resolvable
+  (FD underflows at the ~1e-5 gradient entries). (`tracer_diff`, Task 2.10.)
+
+- **[ale] `commit_thickness` (substep 16) = `hnode:=hnode_new` + `helem = ⅓Σ_vertices hnode`.**
+  Both static in linfs: the `hnode` node dump is bit-for-bit (like substep-13 `hnode_new`) and
+  the recomputed `helem` equals `State.rest().helem` exactly. (`fesom_ale.c:18`,
+  `ale.commit_thickness`, Task 2.10.)

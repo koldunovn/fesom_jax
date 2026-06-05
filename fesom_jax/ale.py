@@ -47,6 +47,24 @@ def thickness_linfs(hnode):
     return jnp.asarray(hnode)
 
 
+def commit_thickness(mesh: Mesh, hnode_new):
+    """Commit the ALE thickness (substep 16, ``fesom_ale_commit_thickness``,
+    ``fesom_ale.c:18``). Returns ``(hnode, helem)``:
+
+    * ``hnode = hnode_new`` (a copy; linfs ⇒ unchanged).
+    * ``helem`` = the per-element vertex mean ``(hnode[n0]+hnode[n1]+hnode[n2])/3``,
+      masked to ``elem_layer_mask``. In linfs this reproduces the static reference
+      thickness (all 3 vertices share the same full-cell ``hnode``).
+
+    The substep-16 node dump records ``hnode`` (bit-for-bit the static thickness, as
+    ``hnode_new`` was at substep 13)."""
+    hnode = jnp.asarray(hnode_new)
+    h3 = ops.gather_nodes_to_elem(hnode, mesh.elem_nodes)   # (elem2D, 3, nl)
+    helem = (h3[:, 0] + h3[:, 1] + h3[:, 2]) / 3.0
+    helem = ops.mask_below_bottom(helem, mesh.elem_layer_mask)
+    return hnode, helem
+
+
 def compute_w(mesh: Mesh, uv, helem):
     """Vertical velocity ``w`` ``[nod2D, nl]`` at interfaces (substep 13).
 
