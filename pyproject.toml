@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fesom-jax"
+version = "0.0.0"
+description = "Differentiable FESOM2 ocean model in JAX (for hybrid ML parameterizations)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "jax>=0.4.34",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# GPU build: CUDA 12 + cuDNN are pulled in as pip wheels (no system CUDA module
+# needed on Levante). Install with:  pip install -e ".[cuda,dev]"
+cuda = ["jax[cuda12]>=0.4.34"]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["fesom_jax*"]
+
+[tool.pytest.ini_options]
+testpaths = ["fesom_jax/tests"]

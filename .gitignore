@@ -1,0 +1,42 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.ipynb_checkpoints/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual envs (the project env lives in mambaforge/envs, not here) ---
+.venv/
+venv/
+env/
+
+# --- JAX persistent compilation cache ---
+.jax_cache/
+jax_cache/
+
+# --- Editors / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# --- Large / regenerated reference data ---
+# Mesh exports (Task 0.3) and NetCDF snapshots are reproducible from the C/Fortran
+# side; keep them out of git. Small per-substep probe dumps under
+# fesom_jax/tests/fixtures/ ARE committed (they are tiny and are the test oracle).
+*.npz
+*.nc
+*.npy
+!fesom_jax/tests/fixtures/**
+
+# --- C-exported mesh + other regenerated reference data ---
+/data/
+
+# --- SLURM job outputs ---
+scripts/*.out
+slurm-*.out
