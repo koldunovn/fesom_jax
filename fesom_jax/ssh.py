@@ -223,14 +223,19 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
 # ==========================================================================
 # Substep 9 — preconditioned CG solve
 # ==========================================================================
-def _pcg(matvec, precond, b, x0, soltol, maxiter):
+def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None):
     """Preconditioned CG, a literal port of ``fesom_ssh_solve_cg``
     (``fesom_ssh.c:384``). Stops at ``‖r‖/√N < soltol·‖b‖/√N`` (relative residual
     ``soltol``). ``x0`` is the initial guess; returns the (possibly early-stopped)
-    iterate. Zero-rhs short-circuits to 0, matching the C."""
+    iterate. Zero-rhs short-circuits to 0, matching the C.
+
+    ``rtol_abs`` overrides the (RMS) stop threshold directly — used for the
+    warm-started forward solve, where the C measures the residual against the
+    **original** ``‖ssh_rhs‖`` rather than the deflated ``‖b_eff‖`` (see
+    :func:`solve_ssh`)."""
     n = b.shape[0]
     s0 = jnp.sum(b * b)
-    rtol = soltol * jnp.sqrt(s0 / n)
+    rtol = (soltol * jnp.sqrt(s0 / n)) if rtol_abs is None else rtol_abs
 
     def run(_):
         r0 = b - matvec(x0)
@@ -290,8 +295,18 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, forward_tol: float = SOLTOL,
     # For x0=0 (step 1) b_eff = ssh_rhs and this is exactly the C's solve-from-zero.
     b_eff = ssh_rhs - matvec(x0)
 
+    # ⚠️ Warm-start fidelity (step ≥2): the C measures the CG residual against the
+    # ORIGINAL ‖ssh_rhs‖, not the deflated ‖b_eff‖. Because the inner residual
+    # ``b_eff − A·δ_k`` equals the full residual ``ssh_rhs − A·(x0+δ_k)``, stopping
+    # the inner solve at ``soltol·‖ssh_rhs‖`` replicates the C's warm-started
+    # early-stop exactly (a good warm start ⇒ b_eff already below threshold ⇒ 0
+    # iters ⇒ d_eta = x0). Deriving rtol from ‖b_eff‖ instead would over-converge.
+    nrhs = ssh_rhs.shape[0]
+    rtol_fwd = forward_tol * jnp.sqrt(jnp.sum(ssh_rhs * ssh_rhs) / nrhs)
+
     def solve(mv, b):           # forward: early-stopped (dump-matching)
-        return _pcg(mv, precond, b, jnp.zeros_like(b), forward_tol, maxiter)
+        return _pcg(mv, precond, b, jnp.zeros_like(b), forward_tol, maxiter,
+                    rtol_abs=rtol_fwd)
 
     def transpose_solve(mv, b):  # reverse cotangent: tight (accurate gradient)
         return _pcg(mv, precond, b, jnp.zeros_like(b), grad_tol, maxiter)

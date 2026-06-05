@@ -432,3 +432,47 @@ Cite the C source (`file:line`) or dump probe that proves it.
   Both static in linfs: the `hnode` node dump is bit-for-bit (like substep-13 `hnode_new`) and
   the recomputed `helem` equals `State.rest().helem` exactly. (`fesom_ale.c:18`,
   `ale.commit_thickness`, Task 2.10.)
+
+## Phase 2 — assembled step() (Task 2.11, GATE 2)
+
+- **[step/warmstart] ⚠️ The CG warm-start measures the residual against the ORIGINAL
+  `‖ssh_rhs‖`, NOT the deflated `‖b_eff‖` — this is the step-≥2 fidelity the ssh lesson
+  deferred to 2.11.** `solve_ssh` folds the warm start into `b_eff = ssh_rhs − A·x0` and
+  solves δ from 0, but the C's early-stop threshold is `soltol·‖ssh_rhs‖`. Since the inner
+  residual `b_eff − A·δ_k` equals the full residual `ssh_rhs − A·(x0+δ_k)`, passing
+  `rtol_abs = soltol·‖ssh_rhs‖/√N` to the inner PCG replicates the C's warm-started
+  early-stop exactly (a good warm start ⇒ `b_eff` already below threshold ⇒ 0 iters ⇒
+  `d_eta=x0`); deriving rtol from `‖b_eff‖` over-converges. **Verified LOAD-BEARING:** step-2
+  `d_eta` matches the dump 3–3000× better warm-started than from `x0=0`. (`ssh.solve_ssh`
+  `rtol_abs`, Task 2.11.)
+
+- **[step/multistep] ⚠️ A TIGHT multi-step dump match is impossible with upwind — `T`
+  diverges ~3e-7 at step 1 (upwind vs the dump's FCT) and cascades via `density` into every
+  T-dependent field at step ≥2** (density ~6e-8 → momentum/SSH ~1e-10, `ssh_rhs` ~1e-2 after
+  the `dx·helem~1e7` amplification). So **step 1 is the tight integration gate** (one `step()`
+  reproduces ALL per-kernel substep gates at the probes — confirms the order + threading),
+  and step ≥2 is gated by INVARIANTS instead: `S` stays **exactly 35** (constant-tracer
+  preservation — a sensitive AB2/threading check, a bug corrupts it), rest-state to machine
+  precision, climate-close SSH/velocity, 100-step stability. The tight multi-step `T/S` match
+  is a Phase-4 (FCT) gate. (`test_step_pi.py`, Task 2.11.)
+
+- **[step/threading] The between-step bookkeeping (the whole point of 2.11):** `hbar_old`
+  saved before `compute_hbar` overwrites `hbar`; `d_eta` carried as the next CG warm-start
+  (**never zeroed between steps** — `fesom_main.c:570`'s `memset(d_eta)` is a one-time
+  `do_sanity` CG self-test, NOT the time loop); `uv_rhsAB` (momentum) and `T_old`/`S_old`
+  (tracers, from `advect_one`) are the AB2 histories; `eta_n`/`w_e` feed `compute_vel_rhs`
+  **lagged** (previous step's). `is_first_step` only flips the AB2 `ff_step` (1.0 vs 1.6).
+  (`step.step`, `fesom_step.c`, Task 2.11.)
+
+- **[step/rest] Rest state (constant T/S, NO blob, zero wind) stays at rest to machine
+  precision** (`max|uv|`~2e-16 after 5 steps; T/S exactly constant). Constant T/S ⇒
+  horizontally constant density (depth-varying but identical per column) ⇒ PGF=0 ⇒ no flow;
+  advection/diffusion of a constant field = 0. The fundamental no-spurious-flow gate — use a
+  **zero** `stress_surf` (the analytical wind is nonzero). (`test_step_pi.py`, Task 2.11.)
+
+- **[step/jit] XLA FMA-contracts the EOS density polynomial ⇒ the jitted step's `density`
+  shifts ~1e-13 from the eager bit-exact value — past the `map` gate (1e-14).** So the TIGHT
+  bit-exact step-1 gates run on **eager** `step()`; the jitted `step_jit` (the production /
+  `lax.scan` entry, `static_argnames=(dt, is_first_step)` ⇒ 2 compiled variants) matches eager
+  to ~1e-12 (FMA level), which is fine for the loose multi-step/stability gates. 100 steps:
+  `max|uv|`~0.075, `|eta|`~0.35 m, no NaN, `S` exactly 35. (`step.step_jit`/`run`, Task 2.11.)
