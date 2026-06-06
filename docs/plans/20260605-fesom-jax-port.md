@@ -564,8 +564,15 @@ Split into focused sub-plans (one per subsystem), per the Phase-5 discipline.
   stable with the high-lat supercooling CAPPED at −1.91 °C + runoff active** (the two Phase-5
   findings resolved); gradient-gated (FD↔AD plateau 4.5e-10 + masked-NaN clean at scale).
   New modules: `ice.py`/`ice_thermo.py`/`ice_coupling.py`/`ice_evp.py`/`ice_adv.py`/`ice_step.py`.
-- **GM/Redi (6B — NEXT):** neutral slopes, tapering, bolus velocity (substep 14) — `fesom_gm.c`.
-  Own sub-plan; the **second ML-hook seam** (eddy fluxes). Scope by reading `fesom_gm.c` first.
+- **GM/Redi (6B — NEXT, sub-plan DRAFTED 2026-06-07):**
+  `docs/plans/20260607-fesom-jax-gmredi.md`. The mesoscale eddy parameterization = bolus
+  advection (GM) + neutral diffusion (Redi); the **second ML-hook seam** (eddy fluxes,
+  threaded through `params.py` now). ⚠️ NOT one substep-14 kernel — it threads the step at
+  **6 points** (`sw_alpha_beta` + the coefficient/bolus block + `fer_w` + the bolus
+  advection wrap + the Redi G7a/G7b explicit terms + the K33 implicit augmentation).
+  **Stateless** (recomputed each step from T/S/N² — no new State fields, unlike ice σ).
+  7-task data-flow ladder (G.1-G.7), each kernel dump-gated bit-exact. Scoped from a
+  first-hand read of `fesom_gm.c`.
 - **KPP (6C):** (FESOM1.4, lookup-table, mix_scheme_nmb=1) — `fesom_kpp.c`, FRESH_START §10.
   **Forward-only** (the NN-replacement target); verify via `kpp_dump_diff.py`-style probes.
   Own sub-plan; the **first ML-hook's alternative** (`pp.py` ↔ a `kpp.py` behind the seam).
@@ -995,3 +1002,16 @@ Split into focused sub-plans (one per subsystem), per the Phase-5 discipline.
   IC-gradient is stiff-but-finite — trainable gradients flow through the mixing seam). Suite
   ocean 376 + ice 47. **Next big phases: GM/Redi (6B, the 2nd ML-hook) + KPP (6C) — own
   sub-plans, scoped by reading `fesom_gm.c`/`fesom_kpp.c` first.**
+- **2026-06-07 — Phase 6B (GM/Redi) sub-plan DRAFTED.**
+  `docs/plans/20260607-fesom-jax-gmredi.md` (Tasks G.1-G.7). Scoped from a first-hand read of
+  `fesom_gm.c` (+ `.h`) and the `fesom_step.c`/`fesom_ale.c`/`fesom_tracer_diff.c`/`fesom_eos.c`
+  integration seams. **User-confirmed decisions:** (1) thread the GM eddy diffusivities
+  (`k_gm`/`redi_kmax`) through `params.py` **now** (the 2nd ML-hook seam, default=config ⇒
+  bit-identical, like `k_ver`/`a_ver`); (2) 7-task data-flow ladder, each kernel dump-gated.
+  **Key findings:** GM/Redi is **stateless** (no new State fields); threads the step at **6
+  points** (not just substep 14); **mixing-scheme-independent** (dump GM-ON, ice-OFF, PP); a
+  NEW all-node `fesom_gm_dump` C hook gates the intermediates; the active namelist is a small
+  subset (ODM95 taper + GMzexp depth scaling + resolution scaling + Redi=GM sync + Redi_Ktaper);
+  AD hazards are all established patterns. Wired behind a static `gm_cfg=None` (⇒ pi/Phase-5/ice
+  bit-identical, the `ice_cfg` precedent). **Execution begins at Task G.1** (`sw_alpha_beta` +
+  the `params.py` seam + `GMConfig` + the dump hook).

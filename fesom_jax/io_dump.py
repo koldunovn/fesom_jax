@@ -156,6 +156,41 @@ def find_record(
     return matches[0]
 
 
+def load_gm_dump(dirpath: Union[str, Path]) -> tuple[dict, dict]:
+    """Read a Phase-6B GM/Redi all-node dump (``fesom_gm_dump``, ``gm_meta.txt`` +
+    raw ``gm_<field>.f64`` blobs).
+
+    Returns ``(fields, meta)`` where ``meta = {N, E, nl, npes}`` and ``fields`` maps
+    each field name to a float64 array reshaped per the C row-major layout:
+    ``(rows, levels)`` when ``comp == 1`` (``(rows, 1)`` for the per-node scalars
+    ``fer_C``/``fer_scal``), ``(rows, levels, comp)`` when ``comp > 1`` (comp 0=x,
+    1=y; for the slopes comp 2=|s|). ``rows`` = ``N`` (node fields) or ``E``
+    (``fer_uv``). The JAX gate slices/masks these to its layer convention.
+    """
+    d = Path(dirpath)
+    meta_path = d / "gm_meta.txt"
+    if not meta_path.is_file():
+        raise FileNotFoundError(f"GM dump meta missing: {meta_path}")
+    lines = meta_path.read_text().splitlines()
+    header = dict(tok.split("=") for tok in lines[0].split())
+    meta = {k: int(header[k]) for k in ("N", "E", "nl", "npes")}
+
+    fields: dict = {}
+    for line in lines[1:]:
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, rows, levels, comp = line.split()
+        rows, levels, comp = int(rows), int(levels), int(comp)
+        raw = np.fromfile(d / f"gm_{name}.f64", dtype="<f8")
+        if raw.size != rows * levels * comp:
+            raise ValueError(
+                f"GM dump {name}: size {raw.size} != {rows}*{levels}*{comp}")
+        arr = raw.reshape(rows, levels, comp)
+        fields[name] = arr[..., 0] if comp == 1 else arr
+    return fields, meta
+
+
 def _summary_main(argv: list[str]) -> int:  # pragma: no cover - debug CLI
     if not argv:
         print("usage: python -m fesom_jax.io_dump <dumpfile> [more...]")

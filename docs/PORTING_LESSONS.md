@@ -1463,3 +1463,88 @@ Cite the C source (`file:line`) or dump probe that proves it.
   fix = `jax.clear_caches()` between probes, or one probe per job, or the A100-80. *Lesson: on a
   40 GB card, don't hold the whole forcing trajectory resident (stream it per step) and run one
   heavy backward per process.* (`core2_ice_stability_run.py`, `core2_ice_grad_gate.py`, Task 6.7.)
+
+## Phase 6B — GM/Redi (Task G.1 — sw_alpha_beta + the seam + the dump hook)
+
+- **[eos] `sw_alpha_beta` (McDougall 1987) is a bit-exact pointwise map — max|Δ|=0 vs the C over
+  all 3.7M CORE2 wet lanes, like `density`.** The two coefficients (`sw_beta` = the 10-term
+  saline-contraction polynomial; `sw_alpha = a_over_b·beta`, `a_over_b` the 11-term ratio) are
+  written **term-by-term** in the C (`fesom_eos.c:336-369`), NOT Horner — mirror that exact
+  left-to-right grouping and it matches bit-for-bit on CPU-eager (no FMA divergence; same
+  expectation as the JM `density`). Inputs `t1=T·1.00024`, `p1=|Z[nz]|` (pressure proxy), `s35=S−35`.
+  Smooth (no sqrt/divide) ⇒ trivially AD-finite, no guards. (`eos.compute_sw_alpha_beta`, G.1.)
+
+- **[eos/mesh] ⚠️ `mesh.Z` is `[nl-1]` (layer midpoints), NOT `[nl]` — pad to `[nl]` like
+  `pressure_bv` does.** `mesh.zbar` is the `[nl]` interface depths; `mesh.Z` (layer-centre depths)
+  has one fewer entry. The C indexes `Z[nz]` over the layer range `[nzmin, nzmax)` (max index
+  nl-2), so it never overflows; in vectorized JAX you must broadcast `Z` against `[N, nl]`, so pad
+  `Zp = concat([Z, Z[-1:]])` (the padded tail is below-bottom → masked out). Got a
+  `(N,48)+(1,47)` broadcast error until padded. (`eos.compute_sw_alpha_beta`, G.1.)
+
+- **[ad/ml-hook] The 2nd ML-hook seam (GM/Redi eddy diffusivities `k_gm`/`redi_kmax`) extends
+  `Params` with `dataclasses.field(default_factory=…)` defaults — so the old `Params(k_ver=,
+  a_ver=)` 2-arg construction stays valid AND the pytree round-trips.** Adding leaves to a
+  registered-dataclass pytree changes its structure; giving the new leaves config-constant
+  defaults (via `default_factory`, NOT a bare array default) keeps every existing constructor +
+  the 17-test gradient/integrate seam **bit-identical** (when GM is off the leaves are unused ⇒
+  `d/d(k_gm)=0`, finite). Mirror of how `k_ver`/`a_ver` seamed the 1st hook in Phase 3.
+  (`params.py`, `config.K_GM_MAX/REDI_KMAX`, G.1.)
+
+- **[verify] GM/Redi is STATELESS, so its dump hook just SNAPSHOTS the already-computed arrays
+  all-node — no re-run-on-copies (unlike the ice-thermo dump).** Every GM field (`sigma_xy`,
+  slopes, `fer_K`, `Ki`, `fer_gamma`, `fer_uv`, …) is recomputed each step from T/S/N², so after
+  the GM coefficient block (`fesom_step.c:124-130`) the `gm->*`/`dyn->fer_uv`/`aux->sw_*` arrays
+  are exactly the outputs — `fesom_gm_dump` `fwrite`s them as raw f64 blobs (C row-major) +
+  `gm_meta.txt`. **Dump the INPUTS too** (`T,S,bvfreq,hnode,hnode_new`) so ONE GM-ON dataset
+  (`data/gm_dump_core2/`, job 25397273) feeds the JAX kernels the C inputs and gates G.1-G.4
+  output-for-output. GM is mixing-independent ⇒ dump with `FESOM_MIX_SCHEME=PP` + ice OFF +
+  `FESOM_NO_GMREDI` dropped. Reader: `io_dump.load_gm_dump`. (`fesom_step.c fesom_gm_dump`, G.1.)
+
+## Phase 6B — GM/Redi (Task G.2 — neutral slopes)
+
+- **[gm] `compute_sigma_xy` is the `eos.smooth_nod3D` element→node area-weighted scatter, but
+  ÷Σarea (not 3·Σarea) and carrying the per-element ∇T/∇S.** Per node: ⟨∇_c T⟩ =
+  Σ_{el∋n}(area_el·∇_c T_el)/Σarea_el, then `sigma_xy = (-α⟨∇T⟩ + β⟨∇S⟩)·ρ0`. Vectorize: per-
+  element gradient `∇T_el = Σ_v gradient_sca[:,v]·T[elem_nodes[:,v]]` ((E,nl)), stack the 4 grads +
+  the area into one (E,nl,5) tensor, broadcast to the 3 vertices, ONE `ops.scatter_add` →
+  (N,nl,5), split → tx/ty/sx/sy/vol; `inv_vol = where(vol>0,1/vol,0)`. Bit-exact vs the C dump
+  (el-range ⊆ node-range ⇒ `elem_layer_mask` suffices, same as the smoother). (`gm.compute_sigma_xy`,
+  `fesom_gm.c:124`, G.2.)
+
+- **[gm/verify] ⚠️ `neutral_slope` (UNTAPERED) has enormous dynamic range — slopes reach ~1e5-1e6
+  where N²→the eps² floor — so gate it RELATIVE, never absolute.** `ro_z_inv = 2g/ρ/max(N²,eps²)`
+  with `eps²=2.5e-11` ⇒ `ro_z_inv` up to ~8e8, and `slope = sigma_xy·ro_z_inv` reaches ~3e5 at
+  weakly-stratified deep lanes. An absolute 1e-13 gate is meaningless there (max|val|~1e5); the
+  field is eager-bit-exact vs the C but a ~1e-15 *relative* shift = ~1e-10 absolute. Gate
+  `|Δ| ≤ atol + rtol·|ref|` (rtol=1e-12). The physically-consumed field is `slope_tapered` (the
+  taper kills these huge slopes). (`test_gm_slopes`, G.2.)
+
+- **[gm/fma] ⚠️ `slope_tapered = neutral_slope·√c1` has a `huge×tiny ≈ 0` lane (huge untapered
+  slope × taper→0) whose result ~1e-10 carries the huge factor's FMA noise (~4e-10 abs) — gate
+  isclose with a NEAR-ZERO ABSOLUTE FLOOR (atol≈1e-9), not pure-relative (rel>1 there).** And the
+  XLA FMA-contraction of `√(sx²+sy²)` is the density-lesson effect AGAIN: **eager is bit-exact
+  (max|Δ|=0) vs the C, but a fused path (jit, or eager under some process states) shifts it ~2e-16
+  relative (machine-ε)** — and WHICH of neutral_slope/slope_tapered shows it varies run-to-run with
+  the fusion decision. The lane IS ~zero slope (negligible Redi flux). (`test_gm_slopes`, G.2.)
+
+## Phase 6B — GM/Redi (Task G.3 — init_redi_gm + the 2nd ML-hook)
+
+- **[gm] `init_redi_gm` has two level-bound regimes — F1 uses the CONSERVATIVE bounds
+  (`ulevels_nod2D_max`/`nlevels_nod2D_min`), F2 the REGULAR (`ulevels_nod2D`/`nlevels_nod2D`).**
+  F1: resolution `scaling = min(√(area_surf·2/refscalresol²), 1)`, `fer_K_top=max(scaling·k_gm,
+  K_GM_min)`, `Ki_top=max(scaling·redi_kmax, K_GM_min)`, and the baroclinic wave speed
+  `cm = max(Σ_cons hnode·½(√bv0+√bv1)/π/K_GM_cm, K_GM_cmin)` (a depth REDUCTION over the
+  conservative range → `fer_C=cm²`, scatter/reduction class ~1e-15). F2: `zscaling =
+  clip(smin+(1−smin)e^{−|z|/zref}, smin, 1)`; `fer_K = fer_K_top·zscaling` on the **iface** range
+  (`node_iface_mask`); `Ki = Ki_top·½(zscaling[nz]+zscaling[nz+1])` on the **layer** range, then
+  the taper. For no-cavity CORE2 the conservative/regular *upper* bound collapses (ulevels≡1 ⇒
+  nzmin=0) but the *lower* differs (cm integrates only to the shallowest surrounding cell's
+  bottom). Verified map-class vs the dump. (`gm.init_redi_gm`, `fesom_gm.c:345`, G.3.)
+
+- **[gm/ad/ml-hook] The 2nd ML-hook gradient is LIVE: `d(Σfer_K)/d(k_gm)=2.03e6` (finite,
+  positive) flows through `init_redi_gm`.** `k_gm`/`redi_kmax` thread from `Params` →
+  `fer_K_top`/`Ki_top` = `max(scaling·k_gm, K_GM_min)`; `d/d(k_gm)=Σ scaling·zscaling` over the
+  iface range (the `max` unclamped at the default 1000). The `Redi_Ktaper`
+  `Ki·√c1 + Redi_Kmin·|√c1−1|` ⇒ where the taper kills c1 (unstable strat bv≤0, c1=0),
+  `Ki=Redi_Kmin=100` — matches the C. Same seam pattern as `k_ver`/`a_ver` (Phase 3); Phase 7
+  swaps the NN here. (`params.py`, `test_gm_coeffs`, G.3.)

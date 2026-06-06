@@ -12,7 +12,7 @@ a trainable NN; that NN's weights live here too (alongside / replacing the scala
 backgrounds), so the same ``grad(loss)(params)`` call trains them. Keep it a
 pytree (every field a leaf) so :func:`jax.grad` returns the same structure.
 
-Phase 3 carries just the PP vertical-mixing backgrounds:
+Phase 3 carried the PP vertical-mixing backgrounds (the **1st ML-hook**, mixing):
 
 * ``k_ver`` — background tracer vertical diffusivity [m²/s]  (the plan's gradient
   target; enters ``Kv = mix·factor³ + k_ver`` additively → ``dKv/dk_ver = 1``,
@@ -20,9 +20,20 @@ Phase 3 carries just the PP vertical-mixing backgrounds:
 * ``a_ver`` — background momentum vertical viscosity [m²/s]  (the sibling; enters
   ``Av`` and so the *within-step* CG path via ``impl_vert_visc``).
 
+Phase 6B adds the GM/Redi eddy-diffusivity ceilings (the **2nd ML-hook**, eddy
+fluxes — the parent plan's designated 2nd swap point):
+
+* ``k_gm`` — GM thickness-diffusivity ceiling [m²/s]  (enters ``init_redi_gm``'s
+  ``fer_K`` → the bolus streamfunction RHS → the bolus velocity);
+* ``redi_kmax`` — Redi isoneutral-diffusivity ceiling [m²/s]  (enters ``Ki`` → the
+  Redi neutral-diffusion flux + the K33 augmentation).
+
+Both GM leaves carry **defaults** (the config constants) so the Phase-2/3 two-field
+construction ``Params(k_ver=…, a_ver=…)`` stays valid and numerically identical
+(when ``gm_cfg is None`` the GM leaves are simply unused → ``d/d(k_gm)=0``).
+
 :meth:`Params.defaults` reproduces the config constants exactly (so passing
-``Params.defaults()`` is numerically identical to the un-parameterised Phase-2
-path — verified against the 274-test suite).
+``Params.defaults()`` is numerically identical to the un-parameterised path).
 """
 
 from __future__ import annotations
@@ -33,15 +44,21 @@ import jax
 import jax.numpy as jnp
 from jax import tree_util
 
-from .config import A_VER, K_VER
+from .config import A_VER, K_GM_MAX, K_VER, REDI_KMAX
 
 
 @dataclasses.dataclass(frozen=True)
 class Params:
-    """Differentiable physics parameters (a JAX pytree; both fields are leaves)."""
+    """Differentiable physics parameters (a JAX pytree; every field a leaf)."""
 
     k_ver: jax.Array  # background tracer vertical diffusivity [m²/s]
     a_ver: jax.Array  # background momentum vertical viscosity [m²/s]
+    # GM/Redi eddy diffusivities (2nd ML-hook, Phase 6B). Defaults so the older
+    # two-arg `Params(k_ver=, a_ver=)` construction is unchanged.
+    k_gm: jax.Array = dataclasses.field(
+        default_factory=lambda: jnp.asarray(K_GM_MAX, jnp.float64))
+    redi_kmax: jax.Array = dataclasses.field(
+        default_factory=lambda: jnp.asarray(REDI_KMAX, jnp.float64))
 
     @staticmethod
     def defaults() -> "Params":
@@ -50,9 +67,11 @@ class Params:
         return Params(
             k_ver=jnp.asarray(K_VER, jnp.float64),
             a_ver=jnp.asarray(A_VER, jnp.float64),
+            k_gm=jnp.asarray(K_GM_MAX, jnp.float64),
+            redi_kmax=jnp.asarray(REDI_KMAX, jnp.float64),
         )
 
 
 tree_util.register_dataclass(
-    Params, data_fields=["k_ver", "a_ver"], meta_fields=[]
+    Params, data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax"], meta_fields=[]
 )

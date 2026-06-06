@@ -65,6 +65,13 @@ K_VER = 1.0e-5  # background tracer vertical diffusivity [m²/s]
 A_VER = 1.0e-4  # background momentum vertical viscosity [m²/s]
 C_D = 0.0025  # bottom-drag coefficient
 
+# GM/Redi eddy diffusivity ceilings — the 2nd ML-hook seam (Phase 6B). These two
+# are the differentiable `params.py` leaves (default = the namelist.oce values);
+# the rest of the GM constant bundle lives in `gm.GMConfig`. Redi_Kmax auto-syncs
+# to K_GM_max in the C (fesom_gm.c:362). [m²/s].
+K_GM_MAX = 1000.0   # GM thickness-diffusivity ceiling (namelist K_GM_max)
+REDI_KMAX = 1000.0  # Redi isoneutral-diffusivity ceiling (auto-sync = K_GM_max)
+
 # Adams-Bashforth order for Coriolis (single-slot history — FRESH_START §14.4)
 AB_ORDER = 2
 

@@ -5,8 +5,12 @@ Literal, vectorized port of the C port's ``fesom_pressure_bv`` + the N² smoothe
 for the Phase-2 pi config: JM-EOS (``state_equation=1``), ``linfs`` (uses the
 ``hpressure`` linfs branch), no cavity (``nzmin=0``), ``use_density_ref=.false.``
 (→ ``density_ref ≡ density_0``), PP mixing (so ``dbsfc``/``MLD1`` are unused and
-skipped — they feed only KPP). ``sw_alpha_beta`` (substep 2) is GM/KPP-only →
-deferred to Phase 6.
+skipped — they feed only KPP).
+
+:func:`compute_sw_alpha_beta` (substep 2; McDougall 1987 thermal-expansion /
+saline-contraction coefficients) is added in **Phase 6B** — GM/Redi (and KPP)
+read ``sw_alpha``/``sw_beta``. It is a pure per-node polynomial map (sibling to
+:func:`jm_components`), ``fesom_eos.c:323-375``.
 
 Outputs (all ``[nod2D, nl]``, matching the substep-1 dump fields):
 
@@ -195,3 +199,66 @@ def compute_pressure_bv(mesh: Mesh, T, S, hnode, n_smooth: int = 1):
     density, hpressure, bvfreq = pressure_bv(mesh, T, S, hnode)
     bvfreq = smooth_nod3D(mesh, bvfreq, n_smooth)
     return density, hpressure, bvfreq
+
+
+# --- sw_alpha_beta (McDougall 1987) — substep 2, Phase 6B ----------------------
+# Verbatim from fesom_eos.c:336-369 (= oce_ale_pressure_bv.F90:2751-2846). The two
+# polynomials (saline contraction `beta`, the ratio `a_over_b`) are written term by
+# term in the C — NOT Horner — so we mirror that exact grouping (left-to-right `+`)
+# for bit-for-bit agreement. Pure per-node MAP, no sqrt/divide ⇒ trivially AD-finite.
+
+
+def compute_sw_alpha_beta(mesh: Mesh, T, S):
+    """Thermal-expansion (``sw_alpha``, 1/K) and saline-contraction (``sw_beta``,
+    1/(g/kg)) coefficients per node/level — McDougall (1987), ``fesom_eos.c:323``.
+
+    ``T``, ``S`` are ``[nod2D, nl]``. Pressure proxy ``p1 = |Z[nz]|`` (the static
+    layer-midpoint depth, broadcast over nodes; linfs full-cell ⇒ ``Z_3d_n = Z``).
+    Returns ``(sw_alpha, sw_beta)``, both ``[nod2D, nl]``, masked to the layer
+    range. Consumed by GM/Redi (:mod:`fesom_jax.gm`) and KPP (Phase 6C).
+    """
+    t1 = jnp.asarray(T) * 1.00024
+    s1 = jnp.asarray(S)
+    # Z is the (nl-1,) layer-midpoint depth; pad the invalid tail to (nl,) like
+    # pressure_bv (the padded lane is masked out below). p1 = |Z[nz]| broadcast.
+    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
+    p1 = jnp.abs(Zp)[None, :]                             # (1, nl) pressure proxy |Z|
+
+    t1_2 = t1 * t1
+    t1_3 = t1_2 * t1
+    t1_4 = t1_3 * t1
+    p1_2 = p1 * p1
+    p1_3 = p1_2 * p1
+    s35 = s1 - 35.0
+    s35_2 = s35 * s35
+
+    beta = (
+        0.785567e-3
+        - 0.301985e-5 * t1
+        + 0.555579e-7 * t1_2
+        - 0.415613e-9 * t1_3
+        + s35 * (-0.356603e-6 + 0.788212e-8 * t1
+                 + 0.408195e-10 * p1 - 0.602281e-15 * p1_2)
+        + s35_2 * (0.515032e-8)
+        + p1 * (-0.121555e-7 + 0.192867e-9 * t1 - 0.213127e-11 * t1_2)
+        + p1_2 * (0.176621e-12 - 0.175379e-14 * t1)
+        + p1_3 * (0.121551e-17)
+    )
+
+    a_over_b = (
+        0.665157e-1
+        + 0.170907e-1 * t1
+        - 0.203814e-3 * t1_2
+        + 0.298357e-5 * t1_3
+        - 0.255019e-7 * t1_4
+        + s35 * (0.378110e-2 - 0.846960e-4 * t1
+                 - 0.164759e-6 * p1 - 0.251520e-11 * p1_2)
+        + s35_2 * (-0.678662e-5)
+        + p1 * (0.380374e-4 - 0.933746e-6 * t1 + 0.791325e-8 * t1_2)
+        + p1_2 * t1_2 * (0.512857e-12)
+        - p1_3 * (0.302285e-13)
+    )
+
+    sw_beta = ops.mask_below_bottom(beta, mesh.node_layer_mask)
+    sw_alpha = ops.mask_below_bottom(a_over_b * beta, mesh.node_layer_mask)
+    return sw_alpha, sw_beta
