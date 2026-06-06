@@ -1196,3 +1196,270 @@ Cite the C source (`file:line`) or dump probe that proves it.
   one backward). ⚠️ A login/CPU node could **not** hold even the N=4 T₀ backward (the process
   was killed) → this is a GPU-only gate; the CPU suite runs the N=1 masked-NaN probe.
   (`scripts/core2_grad_gate.py` [3], job 25394380, Task 5.8.)
+
+# Phase 6 — Sea Ice (sub-plan `docs/plans/20260606-fesom-jax-phase6-seaice.md`)
+
+## Task 6.1 — ice state + cold-start IC + IceConfig
+
+- **[state] σ11/σ12/σ22 are PROGNOSTIC elastic-memory, NOT per-step scratch — they must be
+  carried in `State` across ocean steps.** The EVP subcycle's stress update reads the *prior*
+  σ (`si1 = det1·(σ11 + σ22 + dte·r1)`, `fesom_ice_evp.c:126-130`) and `EVPdynamics` only
+  zeros `inv_areamass/inv_mass/rhs_a/rhs_m` at the top (`:265-270`) — **never σ**. So σ
+  persists from the previous ocean step (the "elastic" memory of EVP). It joins
+  `a_ice/m_ice/m_snow/u_ice/v_ice/t_skin` as carried ice state. *Lesson: before adding an ice
+  field to `State`, check whether the C re-initializes it each step or carries it — σ and
+  t_skin (the Newton warm-start) carry; eps/ice_strength/the velocity rhs are per-step
+  scratch.* (`fesom_jax/state.py`, Task 6.1.)
+
+- **[config] ⚠️ `Tevp_inv = 3.0/ice_dt` is the `ice_setup` value (`fesom_ice.c:233`), NOT the
+  `evp_rheol_steps/ice_dt` written in the `fesom_ice_types.h:177` comment.** The comment is
+  stale; the code overrides it in setup (`Tevp_inv = 3.0/ice_dt`, with `ice_dt=500` ⇒ 0.006).
+  Also `dte = ice_dt/evp_rheol_steps` and `det1=det2=1/(1+0.5·Tevp_inv·dte)`. Encoded as
+  `IceConfig` derived properties so the one definition is the C setup value. *Lesson: when a C
+  struct comment and the setup code disagree, the SETUP code wins — grep the `*_setup`/`init`
+  for the actual assignment, don't trust the type-declaration comment.* (`fesom_jax/ice.py`
+  `IceConfig.Tevp_inv`, Task 6.1.)
+
+- **[state/inert] Adding the 9 inert ice fields to `State` keeps the ocean (pi + Phase-5
+  no-ice) path bit-identical — nothing reads them until Phase 6.** They default-zero in
+  `State.zeros` and flow through `lax.scan`/`grad` as extra zero leaves (more cotangent leaves,
+  all zero). The only test that broke was the explicit field-inventory assertion
+  (`test_state.py::test_zeros_shapes_and_dtype`) — a deliberate drift guard, updated to list
+  the new fields. *Lesson: a frozen-dataclass pytree tolerates additive inert fields with no
+  numeric change; the field-inventory test is the intended tripwire — update it, don't loosen
+  it.* (`fesom_jax/state.py`, Task 6.1.)
+
+- **[verify] The cold-start ice IC is C-verified TRANSITIVELY — no new C dump needed.** The
+  C `fesom_ice_initial_state` (`fesom_ice.c:246-277`) is a pure threshold rule of the IC
+  surface T (`SST<0 ⇒ a_ice=0.9` + hemisphere-split m_ice/m_snow), and the JAX PHC SST already
+  matches the C to ~1e-14 (Task 5.2). So the JAX IC matches the C's to the same tolerance; the
+  only sensitivity is nodes with `|SST|` within FP noise of 0 — **counted, found 0**
+  (`test_ice_ic.test_ic_threshold_not_fp_fragile`). Gated against an independent per-node loop
+  reference instead. *Lesson: when a kernel is a pure function of an already-dump-verified
+  field, verify it transitively (numpy ref + a threshold-fragility count) rather than spending
+  a SLURM C dump.* (`fesom_jax/tests/test_ice_ic.py`, Task 6.1.)
+
+- **[workflow] Probe re-pinning for the ice dumps is env-only (`FESOM_DUMP_PROBES`,
+  `fesom_dump.c:19-21`), and the incremental ice configs are env knobs
+  (`FESOM_NO_ICE_DYN/ADV/THERMO`) — no C edit to start dumping ice-ON.** Clone
+  `jobs/jax_step_dump_core2.sh`, flip the NO_ICE flags, set `FESOM_DUMP_PROBES` to ice
+  coverage. The per-substep `fesom_dump.c` does NOT capture ice thermo outputs
+  (flx_fw/flx_h/a/m/msnow/t_skin) — those need a small additive all-node dump hook modeled on
+  `fesom_bulk_dump` (Task 6.2). *Lesson: the Phase-5 dump harness already supports ice-ON via
+  env; the only C addition Phase 6 needs is per-kernel output dumps, not new gates.* (Task 6.1
+  prep for 6.2.)
+
+## Task 6.2 — ice thermodynamics
+
+- **[verify] The sea-ice thermodynamics is a per-node MAP (no scatter) and ports BIT-EXACT —
+  all 7 outputs match the C dump to MAP-class over all 126858 CORE2 nodes.** h/hsn/A ~1e-16,
+  t_skin 5.6e-14, fw 3.5e-19, **ehf rel 4e-10**, thdgr 4.5e-19. The only non-machine field is
+  `ehf` (rel 4e-10) — because `ehf = ahf + cl·(dhgrowth + …)` with `cl = rhoice·3.34e5 ≈ 3e8`
+  amplifies the ~1e-16 `h` reassociation into ~1e-10 W/m². The dedicated `fesom_ice_thermo_dump`
+  (re-runs `therm_ice` on copies → per-node inputs+outputs) makes it a pure feed-the-C-inputs
+  MAP gate; config-A (EVP+FCT off) isolates the thermo since the input a/m/snow == the cold-start
+  IC. *Lesson: a per-node kernel with a big multiplicative constant (cl) downstream loses a few
+  digits in the derived flux even when the prognostic is machine-exact — gate the flux on a
+  RELATIVE tolerance scaled by that constant, not an absolute one.* (`test_ice_thermo.py`,
+  job 25395803, Task 6.2.)
+
+- **[ad] Runoff activation is provable as an EXACT analytic gradient: `d(fw)/d(runoff) == 1`
+  on every node.** Runoff enters at one line (`prec = rain + runo + snow·(1-A)`,
+  `fesom_ice_thermo.c:318`) and `fw = prec + evap + fwice + fwsnw`, so `∂fw/∂runo ≡ 1`
+  identically — a cleaner gate than any FD. This is the Phase-6 mechanism that turns the
+  (Phase-5-inert) runoff back on: once `water_flux = -flx_fw` feeds the existing
+  `sss_runoff_fluxes` (Task 6.3), river freshwater reaches the salinity BC. *Lesson: when a
+  forcing enters a kernel linearly, gate its activation by the exact analytic derivative
+  (`grad == 1`), not a finite difference.* (`test_ice_thermo.test_runoff_activates`, Task 6.2.)
+
+- **[ad] The thermo AD surfaces (the fixed-5 skin-temp Newton, the 4-way albedo `where`, the
+  freezing/melt min/max, the masked divides) are all finite — and `d(ehf)/d(SST)` even gives a
+  clean FD↔AD plateau (~1e-16) because the thermo is NEAR-LINEAR in SST.** SST enters only via
+  `obudget` (smooth exp/pow) + `o2ihf` (linear in `T_oc - Tfrez`); the skin-temp Newton uses
+  `S_oc` (not `T_oc`), so varying SST is smooth (no kink) on an interior-ice subset where the
+  `max(qhst,0)`/`max(sh,0)`/`min(hsn,…)` melt clamps are inactive. Contrast the Task-5.8
+  finding (the *forced multi-step* model is non-smooth): the ISOLATED thermo kernel IS smooth in
+  SST, so a quantitative FD↔AD is well-posed here. The masked-NaN guards that mattered:
+  `con/hice` (`where(hice>0,hice,1)` — the ice-free class has thact≈0), `/rsss`, the Newton
+  `/A3`, `tfrez`'s `√(S³)`. *Lesson: "the model is non-smooth" is about the assembled forced
+  trajectory; an isolated per-node kernel can still be smooth in a chosen input — pick that
+  input + a kink-free node subset for the per-task FD↔AD.* (`test_ice_thermo.py`, Task 6.2.)
+
+- **[fidelity] The 7-class growth-rate loop sequentially refines the SAME skin temperature `t`
+  (each class's 5-iter Newton warm-starts from the previous class's result), and the
+  `thick>hmin` gate must mask `t`/`rhice`/`subli` — NOT skip the loop.** In JAX (no Python `if`
+  on traced `thick`) the loop runs for all nodes; the ice-free result is masked out
+  (`where(thick>hmin, looped, original)`), and `con/hice` is guarded so the ice-free lane (where
+  `thact≈0`) stays finite through the masked-out Newton. The snow-accumulation `_dhsngrowth`
+  baseline is captured AFTER the snowfall add (`fesom_ice_thermo.c:321-322`), so `dhsngrowth`
+  counts only melt, not the snowfall. *Lesson: a C `if(cond){ loop }` over a traced condition
+  becomes "run the loop unconditionally + `where`-mask the outputs + guard every divide for the
+  masked lane" — the masked lane still executes and still backprops.* (`fesom_jax/ice_thermo.py`
+  `therm_ice_cell`, Task 6.2.)
+
+## Task 6.3 — ice-ocean coupling (the runoff handoff)
+
+- **[fidelity] The ice-on `oce_fluxes` reuses the Phase-5 `sss_runoff_fluxes` virtual_salt +
+  relax_salt math VERBATIM but DROPS the standalone `water_flux += ⟨water_flux+runoff⟩` term.**
+  In ice-on, `water_flux = -flx_fw` (flx_fw already contains runoff via the thermo `prec`), so
+  the standalone freshwater-balance term would double-count. Implemented as a backward-compatible
+  `balance_water_flux=True` flag on `sss_runoff_fluxes` (default = the Phase-5 no-ice path,
+  unchanged; ice-on passes `False`). The Phase-5-verified salt-balance code is reused, not
+  re-derived. *Lesson: when a kernel splits into a no-ice and an ice-on variant that share most
+  math, add a default-preserving flag to the existing (verified) function rather than forking it
+  — the default keeps the old gate green, the flag is the only new surface to test.*
+  (`fesom_jax/sss_runoff.py` + `ice_coupling.py`, `fesom_ice_coupling.c:125-179`, Task 6.3.)
+
+- **[ad] The runoff handoff is provable as an EXACT gradient through thermo∘coupling:
+  `d(water_flux)/d(runoff) = -1` everywhere.** runoff →(thermo, `d(fw)/d(runo)=1`)→ flx_fw
+  →(coupling, `water_flux=-flx_fw`, `balance_water_flux=False` so no mean coupling)→ water_flux,
+  giving `∂water_flux/∂runo ≡ -1` (freshwater in). `virtual_salt = S_top·water_flux` with
+  `S_top>0` then makes river mouths freshen. ⚠️ Do NOT test freshening via
+  `d(Σvirtual_salt)/d(runoff)` — that entangles the area-weighted **global mean** (which flips
+  sign on large-area nodes, so only ~85% of river mouths show `<0`); the mean-free `water_flux`
+  gradient is the clean signal. *Lesson: gate a forcing handoff on the term WITHOUT the global-
+  mean coupling (here `water_flux`, not `virtual_salt`) — a summed-gradient through a
+  mean-subtracted field mixes in every node's area weight.* (`test_ice_coupling.py`, Task 6.3.)
+
+- **[verify] `ocean2ice` is free: `srfoce_u/v == uvnode[:,0]`.** The C `ocean2ice`
+  (`fesom_ice_coupling.c:84-110`) computes `u_w` as the area-weighted mean of the surrounding
+  elements' surface UV — which is **exactly** the recipe that already produced `State.uvnode`
+  (the C comment `:44-45` says so), and Phase-5 `core2_forcing` already taps `uvnode[:,0]` for
+  the bulk current. So `ocean2ice` is five taps (`T/S[:,0]`, `hbar`, `uvnode[:,0]`), no new
+  scatter. *Lesson: before porting a "compute X at nodes" coupling routine, check whether the
+  ocean step already computed X under another name — FESOM reuses `uvnode` for the surface
+  current.* (`fesom_jax/ice_coupling.py` `ocean2ice`, Task 6.3.)
+
+## Task 6.4 — EVP dynamics (the 120-subcycle scan)
+
+- **[ad] The EVP `Δ = √radicand` singularity is tamed by a double-`where` safe-sqrt THEN the
+  C's `max(Δ, delta_min)` clamp — keep `delta_min=1e-11`, do NOT raise it.** At `u_ice=0`
+  (every step's subcycle 0) ε=0 ⇒ radicand=0 ⇒ a bare `sqrt` gives a `1/√0=∞` backward even
+  though the clamp picks `delta_min` forward (the classic `0·inf` via the non-selected branch).
+  `_safe_sqrt(radicand)` returns 0 with a finite gradient, then `jnp.maximum(·, delta_min)`
+  reproduces the C value exactly. An EVP-port reflex is to bump `delta_min` to ~1e-8 for
+  "stability" — unnecessary here and it would break the bit-exact `Δ` match; the safe-sqrt is
+  the right fix. `d(Σσ²)/d(u_ice)` finite at u_ice=0 confirms it. *Lesson: a clamped sqrt
+  (`max(sqrt(x), c)`) still needs the double-`where` on `x` — the clamp protects the forward,
+  not the backward.* (`fesom_jax/ice_evp.py` `stress_tensor`, Task 6.4.)
+
+- **[ad/perf] The 120 EVP subcycles are a FIXED count → a `jax.checkpoint`ed `lax.scan` with
+  carry = (u_ice, v_ice, σ11, σ12, σ22).** σ is the elastic memory (carried, not re-zeroed);
+  the scan is checkpointed so the 120-deep backward rematerializes rather than storing every
+  subcycle (the inner-loop analog of the outer time-loop checkpointing). `Tevp_inv=3/ice_dt`,
+  `dte=ice_dt/120`, `det1=det2=1/(1+0.5·Tevp_inv·dte)`. *Lesson: a fixed inner solver loop is a
+  plain `scan` — checkpoint it so it doesn't blow the backward memory when nested in the outer
+  step scan (Task 6.7 will measure the combined cost).* (`fesom_jax/ice_evp.py` `evp_dynamics`,
+  Task 6.4.)
+
+- **[verify] Ice-free elements must be MASKED in BOTH `stress_tensor` (freeze σ) and
+  `stress2rhs` (no contribution), exactly as the C `if (ice_strength<=0) continue` skips them —
+  not just one.** `ice_strength=0` unless all 3 vertices have `m_ice>0 AND a_ice>0` (so
+  cavity + ice-edge elements are 0). If `stress_tensor` updated their σ (decaying it via det1)
+  while `stress2rhs` scattered it, the velocity rhs would pick up spurious stress at the ice
+  edge. Freezing σ where `ice_strength≤0` + zeroing the scatter contribution there matches the
+  C's double-skip. The step-0 σ/u_rhs gates are **bit-exact** (per-element/node maps, no
+  reassociation); only the END after 120 subcycles drifts to ~1e-9 (the accumulated
+  element→node scatter reassociation, max|u_ice|=0.21 ⇒ rel ~5e-9). *Lesson: when the C skips an
+  element in two consecutive loops, the JAX port must mask it in both — a `where` in the stress
+  update AND a `where` in the scatter.* (`fesom_jax/ice_evp.py`, `test_ice_evp.py`, Task 6.4.)
+
+## Task 6.5 — ice FCT advection (the 2-D Zalesak module)
+
+- **[reuse] The entire ice FCT ports CSR-FREE — every step is element gather/scatter, and it
+  matches the C BIT-EXACTLY (~1e-15).** The C uses the SSH-stiffness CSR (`rowptr`/`colind`)
+  for the mass-matrix product, the cluster bounds, and the flux sums — but all three have an
+  element-local form: (a) `(mm·X)[row] = Σ_{elem∋row} area/12·(X[row] + ΣX_elem)` (the FE
+  consistent-mass block `area/12·(I+11ᵀ)` scattered — its row sum is the node CV area, so
+  `mm·1 = area` falls out, and `mass_matrix_fill` is unnecessary); (b) the Zalesak cluster
+  min/max over a node's graph neighbours == `jax.ops.segment_min/max` over the elements
+  touching the node (on a triangle mesh, edge-neighbours == element-co-vertices); (c) the +/−
+  flux sums are element→node `scatter_add`. So no CSR is ported. The single-step FCT matched the
+  C to ~1e-15 (not the ~1e-12 scatter floor — the cold-start IC has little cancellation).
+  *Lesson: before porting a CSR-based FE kernel, check whether each sparse op (matvec, neighbour
+  min/max) has an element-local form — for a P1 triangle mesh they usually do, and the
+  element-scatter port is simpler AND avoids threading the CSR.* (`fesom_jax/ice_adv.py`,
+  job 25396145, Task 6.5.)
+
+- **[fidelity] Use the ice FCT's OWN limiter floor `1e-12` (`fesom_ice_fct.c:458`), NOT the
+  ocean FCT's `1e-16` — match each kernel's own constant.** The deep-read brief recommended
+  unifying on 1e-16 for "AD stability", but the golden rule wins: with 1e-16 the JAX limiter
+  ratio would differ from the C wherever the flux sum sits in (1e-16, 1e-12), breaking the
+  bit-exact dump match. 1e-12 is already a finite floor ⇒ NaN-safe; AD doesn't need it tighter.
+  Also: **no positivity clip** (the C doesn't) — the small antidiffusive overshoot past a_ice=0.9
+  (~0.0019) is FCT-physical and IDENTICAL in JAX and C; `cut_off` clamps a≤1 afterward. *Lesson:
+  a deep-read's "improve it" suggestion (tighter eps, add a clip) is subordinate to bit-exact
+  fidelity — port the C's constant, let the documented downstream guard (cut_off) do the
+  clamping.* (`fesom_jax/ice_adv.py` `_fem_fct`, `test_ice_adv.py`, Task 6.5.)
+
+## Task 6.6 — assemble the ice step
+
+- **[verify] The per-kernel gates are BIT-EXACT; the ASSEMBLED multi-kernel step is
+  climate-close (~1e-6) — the 120-subcycle EVP floor propagates.** Each ice kernel matches the
+  C to ~1e-15 (thermo, FCT) or step-0 bit-exact (EVP), but the EVP's END velocity carries a
+  ~1e-9 scatter-reassociation floor (120 subcycles, Task 6.4), and `u_ice` feeds ustar (thermo),
+  the ice-ocean stress (momentum) and the FCT — so the assembled step-1 post-step T/S match the
+  C dump at ~1e-6, NOT bit-exact. This is the right gate altitude: verify each kernel tight in
+  isolation (its own dump), accept climate-close for the assembled trajectory (the Phase-5
+  multi-step gates were ~1e-9 too). *Lesson: don't chase bit-exactness on an assembled step that
+  contains a reassociating iterative solver — gate the kernels tight, gate the assembly
+  climate-close.* (`fesom_jax/ice_step.py`, `test_ice_step.py`, Task 6.6.)
+
+- **[design] `ice_cfg` is a STATIC jit arg (an `IceConfig` NamedTuple — hashable), `None` ⇒ the
+  pi/Phase-5 path is bit-identical.** Threading the whole ice subsystem through `step`/`integrate`
+  needed exactly one new arg: `ice_cfg=None`. When `None`, the ice branch is a dead Python `if`
+  (no trace), so the 376 pi + 63 Phase-5 CORE2 gates are untouched; when an `IceConfig`, the ice
+  step runs and its prognostic a_ice/u_ice replace the static mask in the two existing couplings.
+  The `IceConfig` properties (`cc`/`cl`/`Tevp_inv`/…) bake in as trace-time constants. *Lesson:
+  gate a big new subsystem behind one static config arg defaulting to None — the old path stays
+  a compile-time dead branch (bit-identical), the new path is opt-in.* (`fesom_jax/step.py`
+  `step_jit`, Task 6.6.)
+
+- **[workflow] ⚠️ Do NOT run two heavy CPU-JAX processes on the login node at once — XLA's
+  CPU threadpool init (`pthread_create`) hits the per-user thread/process limit and one crashes
+  (a faulthandler dump at `PjRtCpuClient`, NOT a code bug).** A CPU stability-smoke launched
+  while the full pytest suite was running crashed both. The fix: run ONE CPU-JAX job at a time
+  (background the suite, don't launch a second), and put heavy runs on the GPU (separate node).
+  Also: `pytest … | tail` reports `tail`'s exit code (0) even when pytest crashes — grep the
+  output for "passed", don't trust the pipe's exit. *Lesson: serialize CPU-JAX on the login
+  node; verify a backgrounded suite by its "N passed" line, not the pipe exit code.* (Task 6.6.)
+
+## Task 6.7 — GATE 6: stability + gradient (PHASE 6 COMPLETE)
+
+- **[physics] ✅ SEA ICE CAPS THE SUPERCOOLING — the defining Phase-6 result.** The Phase-5
+  no-ice CORE2 run supercooled the high-lat SST without bound (−1.9 IC → −16.5 day 5 → −22.8
+  day 8 → max|vel|>3 blow-up ~day 8). WITH prognostic sea ice the thermo `o2ihf` (ocean→ice
+  heat flux) + the freezing point pin SST_min at **−1.91 °C** (the local freezing point) for the
+  whole 10-day run, which stays numerically stable (max|vel|=2.72<3, |SSH|<2.1, no NaN); ice
+  grows physically (m_ice→2.94 m, a=1.0, extent ~2.5e13 m², drift ~1 m/s). Both standing Phase-5
+  findings (supercooling, inert runoff) are now RESOLVED. *Lesson: the no-ice supercooling was
+  exactly the PHYSICAL gap the C-port-matched model predicted; porting the ice thermo (not any
+  numerical band-aid) is what fixes it — vindicating the "match the C, the limitation is real"
+  call.* (`scripts/core2_ice_stability_run.py`, job 25396309, Task 6.7.)
+
+- **[ad] The assembled-ice backward is AD-SAFE (masked-NaN clean) but the EVP IC-gradient is
+  STIFF (~1e16, finite) via `1/delta_min` — this is fine for the ML use case.** `d(SST)/d(T0)`
+  on the N=4 ice model is finite everywhere, exactly 0 on masked lanes, nonzero on wet (the
+  backward flows through the thermo Newton + the 120-subcycle EVP scan + the FCT limiter + every
+  masked guard). But the wet magnitude reaches ~1e16: `zeta = ice_strength/delta_clamped·Tevp_inv`
+  with `delta_min=1e-11` gives `zeta ~ 1e15` at rigid ice, and `d(stress)/d(eps) ~ zeta`
+  propagates that. This is the GENUINE plastic-rheology stiffness (the EVP is nearly
+  non-differentiable at rigid ice), not a bug — it's finite (the gate's criterion). For Phase-7
+  TRAINING the NN-parameter gradients flow through the `k_ver`/`a_ver` mixing seam — `d(SST)/
+  d(k_ver)` is well-conditioned (FD↔AD plateau **4.5e-10**) — NOT through the EVP `1/delta`. So
+  the stiff EVP IC-gradient is a documented characteristic, not a blocker; if a future objective
+  needs ice-dynamics gradients, raise `delta_min` for the gradient or `stop_gradient` the EVP.
+  *Lesson: a finite-but-huge gradient through a plastic/iterative solver is the solver's
+  conditioning, not a NaN bug — gate on finiteness, and confirm the ACTUAL trainable path (the
+  mixing seam) is well-conditioned separately.* (`scripts/core2_ice_grad_gate.py` [1]/[3],
+  job 25396293, Task 6.7.)
+
+- **[memory] Two CORE2-ice GPU memory traps on the A100-40: (a) stacking the per-step forcing,
+  (b) >1 N-step backward per process.** (a) `cf.stack(dates_for_steps(1728))` puts ALL 1728
+  steps × ~10 fields × nod2D × f8 ≈ **17.5 GB** of forcing resident on the GPU at once → the
+  model OOMs; fix = generate `cf.step_forcing(*dates[i])` per step in the loop (tiny). (b) the
+  grad gate ran 3 separate N=4 backwards (`d/d(k_ver)`, `d/d(T0)`, `d/d(m_ice0)`) in one process;
+  each compiles a fresh reverse graph (~26.5 GB peak) and they accumulate → the 3rd OOMs;
+  fix = `jax.clear_caches()` between probes, or one probe per job, or the A100-80. *Lesson: on a
+  40 GB card, don't hold the whole forcing trajectory resident (stream it per step) and run one
+  heavy backward per process.* (`core2_ice_stability_run.py`, `core2_ice_grad_gate.py`, Task 6.7.)

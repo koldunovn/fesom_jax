@@ -1,179 +1,135 @@
 # Next-session prompt — FESOM2 → JAX port
 
-Paste the block below to start the next session. **Phases 0–5 COMPLETE (GATEs 0/1/2/3/4/5).
-Phase 5 (CORE2 single-device) is DONE — the model runs the pi physics on the CORE2 mesh
-with PHC IC + real JRA55/SSS/runoff forcing, matches the C per-substep dump at step 1, is
-numerically stable for ~a week, and is differentiable end-to-end (gradient-gated). Phase 6
-(sea ice + GM/Redi + KPP) is NEXT and needs a sub-plan first.** Full suite **376 passing**
-(pi 313 + CORE2: `test_mesh_core2` 12, `test_phc_ic` 5, `test_jra55` 5, `test_forcing` 12,
-`test_sss_runoff` 9, `test_surface_bc` 7, `test_core2_step` 6, `test_gradient_core2` 3).
+Paste the block below to start the next session. **Phases 0–5 COMPLETE (GATEs 0–5) + Phase 6
+SEA ICE COMPLETE (GATE 6) — all committed on `main` (Phase 6 = 7 per-task commits 6.1–6.7).** The
+prognostic-ice CORE2 model (thermo + EVP + FCT + coupling on top of the Phase-5 ocean) runs
+**10 days stable with the high-lat supercooling CAPPED at −1.91 °C and runoff active** — the
+two standing Phase-5 findings RESOLVED. Each ice kernel is bit-exact vs an ice-ON C dump; the
+assembled step matches the C at step 1; gradient-gated (FD↔AD plateau 4.5e-10, masked-NaN clean
+at scale). **Next big phases: GM/Redi (6B, the 2nd ML-hook) → KPP (6C), each a new sub-plan.**
 
-Phase 5 delivered, in order (sub-plan Tasks 5.1–5.8): CORE2 mesh export (zero-code load +
-CW-orientation guard), PHC IC (numpy, ~1e-14), JRA55-do reader (numpy, bit-exact), L&Y09
-bulk (AD-safe, ~1e-13), SSS-restoring + runoff (numpy + AD-safe), the assembled CORE2 step
-(surface BCs wired, step-1 T/S **bit-exact** vs the C dump), the matched-C dump run +
-multi-day stability, and **GATE 5 — the gradient gate on a CORE2 slice** (the new bulk
-SST→flux / current→stress feedbacks AD↔FD ~1e-11; the assembled-model masked-NaN probe finite
-everywhere; the CG implicit-diff transpose residual 8.8e-14 on the CORE2 operator; the N=20
-checkpointed backward fits the A100 at 37.8 GB).
-
-**JAX committed on `main`** through Task 5.8. **CORE2 data artifacts live on `/work`** —
-`port_jax/data` is a **symlink** to `/work/ab0995/a270088/port_jax/data` (gitignored), holding
-`mesh_core2/`, `ic_core2/`, and the `{phc,jra,bulk,sss,step}_dump_core2/` C dumps. C-side dump
-additions are on the port2 `jax-mesh-export` branch; **C job scripts stay untracked** per user
-(port2 is otherwise the user's — no housekeeping). ⚠️ **Cheap C jobs: `-p compute
---time=00:30:00` (fast debug QOS); long C runs / JAX GPU: `-A ab0995_gpu -p gpu --gres=gpu:1`
-(or `-p gpu-devel`, 30 min).** SLURM job `.out` logs are gitignored (`scripts/*.out`).
+Suite = **ocean 376 + ice 47** (`test_ice_{ic,thermo,coupling,evp,adv,step}.py`). ⚠️ Run the
+ice tests as a SEPARATE group — the full 423-in-one-process exceeds the login-node RAM (the
+heavy assembled `test_ice_step` + the jit-cache of 400 prior tests; a pytest+JAX pattern, NOT a
+bug). Each file passes standalone; ocean-only (`--ignore` the 6 ice files) = 376; ice group = 47.
 
 ---
 
 We are porting the FESOM2 ocean model to JAX to build a **differentiable** ocean model for
-hybrid ML (trainable NN parameterizations for vertical mixing + mesoscale eddy fluxes,
-trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`. Max effort.
+hybrid ML (trainable NN parameterizations for vertical mixing + mesoscale eddy fluxes, trained
+end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`. Max effort.
+
+## Phase 6 sea ice is committed (7 per-task commits on `main`). C-side dump hooks live on the
+port2 `jax-mesh-export` branch (the user's to commit). The repo is clean except the stray
+untracked `scripts/fullsuite.log` (pre-existing, not ours).
 
 ## START HERE, in order
-1. **Parent plan (source of truth across phases):**
-   `docs/plans/20260605-fesom-jax-port.md` — decisions, the verification ladder, the
-   Revision Log, and the **Phase 6 outline**.
-2. **Phase-5 sub-plan (now COMPLETE — read for the CORE2 design + the runoff handoff):**
-   `docs/plans/20260606-fesom-jax-core2.md` — Tasks 5.1–5.8 all `[x]`. **Read especially
-   "Runoff handoff to Phase 6"** (the locked plan for activating runoff via the ice
-   freshwater budget — the reader + balance are already done and pure-in-`water_flux`).
-3. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the **Phase 5** entries
-   through **Task 5.8** (the no-ice-supercooling finding, the multi-step-non-smooth gradient
-   finding, the CG-residual / `d_eta⊥a_ver` insight, the bulk-seam smooth-subset FD, the
-   backward-memory numbers). **STANDING RULE: append a lesson per task.**
-4. **Project memory:** `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
+1. **Parent plan (source of truth across phases):** `docs/plans/20260605-fesom-jax-port.md`
+   — decisions, the verification ladder, the Revision Log, the **Phase 6 outline** (sea ice
+   ✅; GM/Redi 6B = NEXT; KPP 6C).
+2. **Phase-6 sea-ice sub-plan (COMPLETE — read for the ice design + the AD findings):**
+   `docs/plans/20260606-fesom-jax-phase6-seaice.md` — Tasks 6.1–6.7 all `[x]`, GATE 6 met.
+3. **Phase-5 CORE2 sub-plan:** `docs/plans/20260606-fesom-jax-core2.md` (the CORE2 model the
+   ice sits on).
+4. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the **Phase 6** entries
+   (the supercooling-cap result, the EVP-stiff-gradient, the element-based-CSR-free FCT, the
+   masked-NaN-in-both-loops rule, the GPU memory traps). **STANDING RULE: append a lesson per task.**
+5. **Project memory:** `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
 
 ## STATUS
-- **Phases 0–4 (GATEs 0–4):** full single-step pi model, checkpointed `lax.scan`, CG
-  `custom_linear_solve`, FCT + opt_visc7, pi 1000-step stable, `test_gradient.py` plateau
-  5.70e-7. All committed.
-- **Phase 5 (GATE 5) COMPLETE:** the pi physics (PP + **linfs** + FCT + opt_visc7, **no
-  GM/KPP/ice**) on the **CORE2 mesh** + PHC IC + JRA55/SSS/runoff, verified per-substep vs a
-  CORE2 C-port dump (Path A), numerically stable days 1–7, differentiable end-to-end and
-  gradient-gated (the new bulk feedbacks + the assembled-model masked-NaN + the CG residual +
-  the backward memory). Reusable forward driver `scripts/core2_stability_run.py` (A100
-  ~0.06 s/step); gradient gate `scripts/core2_grad_gate.py` (+`.sbatch`).
-- **Two standing Phase-5 findings Phase 6 resolves:** (1) ⚠️ **no-ice high-lat
-  supercooling** — without sea ice the SST supercools without bound (−22 °C by day 8) and the
-  sub-EOS-valid density destabilizes the dynamics at model day ~8; the C does the same through
-  the verified window, so it's PHYSICAL, capped by the ice in Phase 6. (2) **runoff is inert**
-  in the no-ice linfs run (it enters via ice thermo, which is off) — activates for free once
-  Phase 6 ports the ice freshwater budget (handoff plan locked in the sub-plan).
+- **Phases 0–5 (GATEs 0–5):** full pi model + CORE2 single-device (PP/linfs/FCT/opt_visc7 +
+  PHC IC + JRA55/SSS/runoff), committed on `main`.
+- **Phase 6 SEA ICE (GATE 6) COMPLETE, uncommitted.** New modules: `ice.py` (IceConfig +
+  cold-start IC), `ice_thermo.py` (5-iter Newton + freezing/albedo kinks), `ice_coupling.py`
+  (ocean2ice + oce_fluxes runoff handoff + stress blend), `ice_evp.py` (120-subcycle `lax.scan`),
+  `ice_adv.py` (2-D Zalesak FCT, **CSR-free / element-based**), `ice_step.py` (the assembled
+  step). `State` +9 ice fields (a/m/m_snow/u_ice/v_ice/t_skin + σ11/12/22, σ = EVP elastic
+  memory). `step.py`/`integrate.py` gained a static `ice_cfg` arg (`None` ⇒ pi/Phase-5
+  bit-identical; an `IceConfig` ⇒ the ice step runs before the ocean substeps). Reusable runs:
+  `scripts/core2_ice_stability_run.py` (+`_gpu.sh`, A100 ~0.08 s/step), `scripts/core2_ice_grad_gate.py`
+  (+`.sbatch`).
+- **The two Phase-5 findings RESOLVED:** supercooling capped (sea ice), runoff active (handoff).
 
-## IMMEDIATE WORK — Phase 6 (sea ice → GM/Redi → KPP). NEEDS A SUB-PLAN FIRST.
-Phase 6 is the next big phase; like Phase 5 it should start with a **sub-plan**
-(`docs/plans/<date>-fesom-jax-phase6.md`) scoped by **reading the C ice port** (the
-algorithmic source of truth), not the parent outline. Suggested order (confirm with the user):
+## IMMEDIATE WORK — Phase 6B (GM/Redi). NEEDS A SUB-PLAN FIRST.
+GM/Redi is the **second ML-hook seam** (mesoscale eddy fluxes — the bolus velocity + Redi
+neutral diffusion, substep 14). Like ice, start by **reading the C** (`fesom_gm.c` ~49 KB, the
+algorithmic spec) to scope what's actually there, then draft `docs/plans/<date>-fesom-jax-gmredi.md`
+with a task ladder + per-task dump gates. Suggested first moves:
+1. Read `fesom_gm.c` (+ `fesom_gm.h`, FRESH_START GM section) — neutral slopes, tapering
+   (Large et al.), the bolus velocity, the Redi rotation, how it enters substep 14
+   (`gm_bolus`) + the tracer advection/diffusion. Note the AD hazards (slope clipping/tapering
+   `min`/`max`, the safe divides) + the GM dump fields the C can emit.
+2. Decide whether GM needs new C dump hooks (probably yes — a per-node bolus/slope dump,
+   `fesom_bulk_dump`-style) or reuses the per-substep dump.
+3. Draft the sub-plan; gate each kernel bit-exact vs the C dump; re-run the gradient gate.
+The `params.py` seam already anticipates the eddy-flux swap point (Phase 7 puts an NN there).
 
-1. **Sea ice** (the high-value piece — caps supercooling, activates runoff, and is the path
-   to a physically realistic CORE2 run):
-   - **Thermodynamics** `fesom_ice_thermo.c` (the ice `obudget` / growth-melt) + the
-     ice-ocean freshwater + heat coupling `fesom_ice_coupling.c` (`flx_fw`, `water_flux =
-     −flx_fw` incl. runoff, the heat-flux ice blend). **This is what activates runoff** — see
-     the sub-plan handoff: feed `water_flux = −flx_fw` into the EXISTING
-     `sss_runoff.sss_runoff_fluxes` (pure in `water_flux`); `runoff_node` is already plumbed.
-   - **Dynamics** (the ice EVP momentum solver, if present in the C port) + advection.
-   - The static `a_ice` mask (Phase 5's `core2_forcing.ice_ic_aice`) becomes a **dynamic**
-     prognostic; the two `a_ice` couplings (shortwave-penetration gate + the momentum stress
-     blend) already exist in `core2_forcing.compute_surface_fluxes` — wire them to the
-     prognostic `a_ice`. **AD-safe by construction** (the ice thermo has freezing-point
-     `min`/`max` kinks + the EVP — guard every masked divide / safe-sqrt, re-run the gradient
-     gate).
-   - **Verify** with the proven recipe: a per-substep C dump at the **ice-ON** config (drop
-     `FESOM_NO_ICE_*`), gate JAX vs C at pinned probes incl. river-mouth nodes (runoff
-     freshening) and a high-lat ice node (supercooling now capped); multi-day stability with
-     the supercooling resolved.
-2. **GM/Redi** (mesoscale eddy fluxes — the SECOND ML-hook seam): port `fesom_gm*`/Redi from
-   the C; the `params.py` seam already anticipates the eddy-flux swap point.
-3. **KPP** (the other vertical-mixing scheme — the FIRST ML-hook's alternative): port from the
-   C; swap point is `pp.py` ↔ a `kpp.py` behind the `params.py` mixing seam.
-
-**First moves for Phase 6:** (1) read the C ice sources in `port2/fesom2_port/src/fesom_ice*.c`
-to scope what's actually there (the C port is the spec — match THAT, like Phase 5's linfs
-discovery). (2) Draft the Phase-6 sub-plan with a task ladder + per-task gates. (3) Decide the
-order with the user (ice first is the recommendation — it unblocks realistic SST + runoff).
-
-## THE PROVEN VERIFICATION RECIPE (still applies)
-Per-substep dump at pinned probes, truncate to `nlevels`, `verify.assert_close(col, rec,
-kind=…)` (`map`/`gather` 1e-15, `scatter`/`reduction` 1e-12; calibrate `atol`; **relative**
-for big intermediate fields like `ssh_rhs`~1e5 / `pressure`~5e5). A per-substep gate is only
-"tight" at **step 1** (shared inputs); downstream of the chaotic CG it diverges to ~1e-6 by
-step 3 — gate the multi-step trajectory on **robust global reductions** (SST-range, max-speed)
-vs a matched **C arbiter**. AD: any divide/sqrt whose denominator/arg can vanish in a masked
-lane must compute a FINITE value (`where(d==0,1,d)` / double-`where` safe-sqrt) — a forward
-`where` does NOT stop a 0·inf NaN backward. **Re-run the gradient gate at every GATE.**
-⚠️ **Phase-5 gradient lesson:** a clean FD↔AD plateau is only well-posed in **smooth regimes**;
-the multi-step *forced* trajectory is genuinely non-smooth in the physics params (active flux
-limiter + convective adjustment — sea ice adds freezing-point kinks), so validate FD↔AD at
-N=1 / on isolated seams / by the linear-solve residual, and lean on the (sub)gradient +
-masked-NaN finiteness for the full model.
+## THE PROVEN VERIFICATION RECIPE (still applies — used for all of Phase 6)
+Per-kernel: add a small all-node C dump hook (`fesom_*_dump`, env-gated, re-runs the kernel on
+copies → inputs+outputs) on the port2 `jax-mesh-export` branch; clone a `-p compute
+--time=00:30:00` dump job; feed JAX the C inputs → match outputs MAP/scatter-class
+(map/gather ~1e-15, scatter/reduction ~1e-12; per-node maps often bit-exact). **The C port is
+the spec — port 1:1.** AD: every divide/sqrt that can vanish in a masked lane must be FINITE
+(`where(d==0,1,d)` / double-`where` safe-sqrt). Re-run the gradient gate at the GATE: FD↔AD
+only in SMOOTH regimes (N=1 / isolated seams), lean on masked-NaN finiteness for the assembled
+model. **A C `if(cond) skip` over a traced cond → run unconditionally + `where`-mask the output
++ guard every divide for the masked lane** (and mask in BOTH loops if the C skips in two).
 
 ## KEY PATHS
 - Working repo (git `main`, local-only, no remote): `/home/a/a270088/port_jax`
-- **Env python (ALL python/pytest):**
-  `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python`
-  → `JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q` (~12 min; CORE2 tests skip if their
-  `data/` artifacts are absent). **netCDF4 + scipy + jax-cuda12 (GPU) installed.**
-- GPU via SLURM: `-A ab0995_gpu -p gpu --gres=gpu:1` (12 h) or `-p gpu-devel` (30 min). The
-  jitted CORE2 step is **~0.06 s on an A100**; the N=20 checkpointed gradient backward is
-  ~37.8 GB / ~230 s. ⚠️ a heavy backward (full T-field grad) **OOMs/CPU-kills on the login
-  node** — use the GPU (`scripts/core2_grad_gate.sbatch`).
-- CORE2 mesh: `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2`; PHC IC:
-  `/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc`; JRA55:
-  `/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/`; SSS `…/PHC2_salx.nc`, runoff
-  `…/CORE2_runoff.nc`; chl `…/Sweeney/Sweeney_2005.nc`.
-- CORE2 data (gitignored): **`data/` is a symlink → `/work/ab0995/a270088/port_jax/data`**.
-- C port (algorithmic SoT): `/home/a/a270088/port2/fesom2_port/src/`; built binary
-  `…/build/fesom_port`. C run-arg order: `<mesh> <out> <dt> <nsteps> <snap> <phc> <jra>`.
-  Build: `bash -lc 'source env.sh && make -C build fesom_port'` (incremental, ~30 s). **Ice
-  sources to read for Phase 6: `fesom_ice*.c` (thermo / coupling / dynamics).**
-- I (Claude) drive SLURM (acct ab0995 / ab0995_gpu). Cheap C dumps → `-p compute
-  --time=00:30:00` (debug). Long C / JAX-GPU → a real QOS. See memory
-  [[hpc-job-file-conventions]].
+- **Env python (ALL python/pytest):** `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python`
+  → `JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`. ⚠️ Run the **ice tests as a separate
+  group** (don't run all 423 in one process — login-node RAM). ⚠️ Only ONE CPU-JAX process at a
+  time on the login node (two → `pthread_create` OOM crash).
+- GPU via SLURM: `-A ab0995_gpu -p gpu --gres=gpu:1` (A100-40, ~31.8 GB usable) or `-p
+  gpu-devel`. The assembled ice step is ~0.06–0.08 s/step jitted on the A100. ⚠️ GPU memory
+  traps: don't `cf.stack()` a long forcing trajectory (stream per-step); run ONE N-step backward
+  per process (`jax.clear_caches()` between, or one probe per job).
+- CORE2 mesh `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2`; PHC `…/INITIAL/phc3.0/phc3.0_winter.nc`;
+  JRA55 `…/FORCING/JRA55-do-v1.4.0/`; SSS `…/PHC2_salx.nc`; runoff `…/CORE2_runoff.nc`; chl
+  `…/Sweeney/Sweeney_2005.nc`. CORE2 data (gitignored): `data/` is a symlink → `/work/.../port_jax/data`
+  (holds `mesh_core2/`, `ic_core2/`, and the `{phc,jra,bulk,sss,step,ice_thermo,ice_evp,ice_full}_dump_core2/`).
+- C port (algorithmic SoT): `/home/a/a270088/port2/fesom2_port/src/`. Build:
+  `bash -lc 'cd …/port2/fesom2_port && source env.sh && make -C build fesom_port'` (~30 s). C
+  run args: `<mesh> <out> <dt> <nsteps> <snap> <phc> <jra(year)>`. **GM source to read for 6B:
+  `fesom_gm.c`/`fesom_gm.h`.** Ice env knobs (now all OFF = the C default ice-ON): `FESOM_NO_GMREDI=1`
+  is the GM-off knob (for ice-only dumps); for GM dumps, drop it.
+- I (Claude) drive SLURM (acct ab0995 / ab0995_gpu). Cheap C dumps → `-p compute --time=00:30:00`.
 
 ## LOCKED DECISIONS (do NOT re-litigate)
-1. Use case = hybrid ML params (swap points: vertical mixing PP/KPP, eddy flux GM/Redi);
-   seam = `fesom_jax/params.py`. 2. Full-fidelity, bottom-up, match the C port 1:1. 3. AD-safe
-   by construction + gradient re-run at every gate. 4. Mesh = index gather/scatter over
-   `ops.py`. 5. Single-device + data-parallel now; mesh sharding Phase 8. 6. **Phase 5 = linfs
-   on CORE2, Path A; zstar/partial-cells are later C-side work (keep the `which_ale` seam).**
-   7. netCDF4 + scipy + jax-cuda12 in the env. 8. Phase 5 kept the C's **static `a_ice` mask**
-   (=0.9 where IC SST<0); **Phase 6 makes `a_ice` prognostic** (the couplings already exist in
-   `core2_forcing`). 9. **(Task 5.7) the no-ice high-lat supercooling is an accepted PHYSICAL
-   limitation** capped by Phase-6 sea ice. 10. **(Task 5.8) the gradient gate validates FD↔AD
-   in smooth regimes only** (the forced multi-step model is non-smooth in the physics params;
-   the AD is a valid sub-gradient — see the lesson).
+1. Use case = hybrid ML params (swap points: vertical mixing PP/KPP, eddy flux GM/Redi); seam =
+   `fesom_jax/params.py`. 2. Full-fidelity, bottom-up, match the C port 1:1. 3. AD-safe by
+   construction + gradient re-run at every gate. 4. Mesh = index gather/scatter over `ops.py`.
+   5. Single-device now; mesh sharding Phase 8. 6. linfs on CORE2 (zstar later, C-side first).
+   7. netCDF4 + scipy + jax-cuda12 in the env. 8. Phase 6 made `a_ice` PROGNOSTIC (the two
+   couplings — shortwave gate + stress blend — read it). 9. (Phase 6) the EVP IC-gradient is
+   stiff-but-finite (`1/delta_min`) — keep `delta_min=1e-11` (match C); trainable gradients use
+   the mixing seam, not the EVP. 10. (Phase 6) the assembled multi-kernel step is climate-close
+   (~1e-6, the EVP floor propagates) — gate KERNELS tight, the ASSEMBLY climate-close.
 
 ## CRITICAL GOTCHAS (full list in PORTING_LESSONS.md)
-- **The C port is the spec — port it 1:1 and verify by dump.** Phase 5's scope came from
-  reading `fesom_ale.c` (linfs-only), not the parent outline; do the same for Phase-6 ice.
-- **⚠️ "No ice" ≠ ice-free AND ≠ stable forever:** the static `a_ice=0.9` mask gates shortwave
-  + blends stress; the no-ice SST supercools without bound (−22 by day 8 → max|vel|>3 ~day 8).
-  Phase-6 sea ice caps it.
-- **⚠️ Runoff is INERT in the no-ice Phase-5 run by the C's design** (its local term lives in
-  ice thermo, off in Phase 5) — **Phase 6 activates it** via the locked handoff (feed
-  `water_flux=−flx_fw` incl. runoff into the existing `sss_runoff_fluxes`).
-- **⚠️ CORE2 step-1 `T_old`/`S_old` = const base 10/35, NOT PHC** (`core2_initial_state`).
-- **⚠️ `FESOM_BULK_FIXED_ITERS=1`** on the C reference (the M-O loop is non-convergent at calm
-  nodes; JAX runs fixed-5).
-- **AD masked-NaN rule (bit us 4×):** make masked lanes finite; a forward `where` doesn't stop
-  a backward 0·inf. The Phase-6 ice thermo (freezing-point min/max, EVP) is the next AD target.
-- **Eager CORE2 `step()` ≈ 32 s/step; jitted ≈ 3 s CPU / 0.06 s A100** → always jit; GPU for
-  any backward.
+- **The C port is the spec — port it 1:1 and verify by dump.** Phase-6 scope came from reading
+  `fesom_ice*.c`; do the same for `fesom_gm.c`.
+- **AD masked-NaN rule (bit us 5×):** make masked lanes finite; a forward `where` doesn't stop a
+  backward `0·inf`. GM slope tapering/clipping is the next AD target (safe divides + min/max).
+- **A finite-but-huge gradient through a plastic/iterative solver = conditioning, not a bug** —
+  gate on finiteness, confirm the trainable path (mixing seam) is well-conditioned separately.
+- **`ice_cfg=None` keeps the pi/Phase-5 path bit-identical** — a new subsystem behind one static
+  config arg defaulting to None is a dead compile-time branch when off.
+- **Element-based beats CSR for P1-triangle FE kernels** (the ice FCT mass-matvec + cluster
+  min/max went CSR-free via element gather/scatter) — check this for any GM FE assembly.
 - **netCDF4 import prints a benign `ndarray size changed` ABI warning** — harmless.
-- **config = the pi reference physics on CORE2:** linfs, PP, FCT, opt_visc=7, `use_wsplit=0`,
-  CG SSH (α=1), dt=500, PHC IC, JRA55+SSS+runoff + (Phase 5) the static ice mask.
+- **config = the pi+CORE2 reference physics:** linfs, PP, FCT, opt_visc=7, `use_wsplit=0`,
+  CG SSH (α=1), dt=500, PHC IC, JRA55+SSS+runoff, **prognostic sea ice** (Phase 6).
 
 ## WORKFLOW NOTES
-- Phase 6 needs its own sub-plan (authoritative for the phase); tick `[x]`, keep its Revision
-  Log + the lessons current. **Commit only when asked** (per-task commits on `main`). **C edits
-  → port2 branch `jax-mesh-export`, NEVER port2 main** (user); job scripts kept untracked
-  there; otherwise leave the port2 repo to the user (no housekeeping). **Large generated files
-  → `/work`** (the `data` symlink). Cheap C jobs → `-p compute --time=00:30:00`; long C /
-  JAX-GPU → a real QOS. All python/pytest via the env python. See memory
-  [[hpc-job-file-conventions]].
+- Phase 6B (GM/Redi) needs its own sub-plan (authoritative); tick `[x]`, keep its Revision Log +
+  the lessons current. **Commit only when asked** (per-task commits on `main`; Phase 6 ice is
+  pending a commit — ask first). **C edits → port2 branch `jax-mesh-export`, NEVER port2 main**;
+  job scripts kept untracked there. **Large generated files → `/work`** (the `data` symlink).
+  Cheap C jobs → `-p compute --time=00:30:00`; long C / JAX-GPU → a real QOS. All python/pytest
+  via the env python; ice tests as a separate group; one CPU-JAX at a time on the login node.
+  See memory [[hpc-job-file-conventions]].
 
-Confirm you've absorbed this, propose the Phase-6 sub-plan scope (read the C ice sources
-first), then proceed.
+Confirm you've absorbed this; ask the user whether to commit Phase 6 first; then propose the
+Phase-6B (GM/Redi) sub-plan scope (read `fesom_gm.c` first), and proceed.

@@ -555,16 +555,22 @@ into `docs/plans/<date>-fesom-jax-core2.md`.
 
 ### Phase 6 — Full Physics
 
-*(To be expanded into its own sub-plan.)* Outline:
+Split into focused sub-plans (one per subsystem), per the Phase-5 discipline.
 
-- **GM/Redi:** neutral slopes, tapering, bolus velocity (substep 14) — `fesom_gm.c`.
-- **KPP** (FESOM1.4, lookup-table version, mix_scheme_nmb=1) — `fesom_kpp.c`,
-  FRESH_START §10. **Forward-only** (no AD requirement; it's the NN-replacement target):
-  verify via `kpp_dump_diff.py`-style probe dumps.
-- **Sea ice:** EVP dynamics (data-dependent subcycle loop → `lax.fori_loop`/`scan`; the
-  coastal-BC + scatters), FCT, thermodynamics — `fesom_ice*.c`.
-- **GATE 6:** CORE2 multi-year climate stats vs C/Fortran within the C↔Fortran budget
-  (`eps_climate_compare_2yr.py`).
+- **Sea ice — ✅ COMPLETE (2026-06-06/07, GATE 6 met).** Sub-plan
+  `docs/plans/20260606-fesom-jax-phase6-seaice.md`. Thermodynamics + EVP dynamics (120 fixed
+  subcycles → checkpointed `lax.scan`) + FCT advection + coupling, all per-kernel bit-exact vs
+  the C ice-ON dumps; assembled prognostic-ice CORE2 step matches the C at step 1; **10 days
+  stable with the high-lat supercooling CAPPED at −1.91 °C + runoff active** (the two Phase-5
+  findings resolved); gradient-gated (FD↔AD plateau 4.5e-10 + masked-NaN clean at scale).
+  New modules: `ice.py`/`ice_thermo.py`/`ice_coupling.py`/`ice_evp.py`/`ice_adv.py`/`ice_step.py`.
+- **GM/Redi (6B — NEXT):** neutral slopes, tapering, bolus velocity (substep 14) — `fesom_gm.c`.
+  Own sub-plan; the **second ML-hook seam** (eddy fluxes). Scope by reading `fesom_gm.c` first.
+- **KPP (6C):** (FESOM1.4, lookup-table, mix_scheme_nmb=1) — `fesom_kpp.c`, FRESH_START §10.
+  **Forward-only** (the NN-replacement target); verify via `kpp_dump_diff.py`-style probes.
+  Own sub-plan; the **first ML-hook's alternative** (`pp.py` ↔ a `kpp.py` behind the seam).
+- **GATE 6 (sea ice) ✅ met;** the climate-stats GATE (CORE2 multi-year vs C/Fortran,
+  `eps_climate_compare_2yr.py`) is the cross-phase acceptance after GM/Redi + KPP land.
 
 ### Phase 7 — ML Hooks + Batch-Parallel Training
 
@@ -976,3 +982,16 @@ into `docs/plans/<date>-fesom-jax-core2.md`.
     suite 313 passed.** Next: **Phase 5 (CORE2 single-device)** — expand into a
     `docs/plans/<date>-fesom-jax-core2.md` sub-plan (zlevel ALE, PHC IC, JRA55 forcing, partial
     cells, the `w_i` advective terms in `impl_vert_visc` when use_wsplit turns on).
+- **2026-06-06 — Phase 5 (CORE2 single-device) COMPLETE, GATE 5 met.** Sub-plan
+  `docs/plans/20260606-fesom-jax-core2.md` (Tasks 5.1-5.8). The pi physics on the CORE2 mesh +
+  PHC IC + JRA55/SSS/runoff, per-substep dump-gated, stable days 1-7, gradient-gated. Two
+  standing findings: no-ice supercooling (physical) + inert runoff — both deferred to Phase 6.
+- **2026-06-06/07 — Phase 6 SEA ICE COMPLETE, GATE 6 met.** Sub-plan
+  `docs/plans/20260606-fesom-jax-phase6-seaice.md` (Tasks 6.1-6.7). Read the C `fesom_ice*.c`
+  (the spec); ported thermo + EVP (120-subcycle `lax.scan`) + FCT + coupling, each bit-exact vs
+  ice-ON C dumps; assembled prognostic-ice CORE2 step. **The two Phase-5 findings RESOLVED:**
+  10 days stable with the supercooling **capped at −1.91 °C** (sea ice) + runoff active (the
+  ice freshwater handoff). Gradient-gated (FD↔AD 4.5e-10 + masked-NaN clean at scale; the EVP
+  IC-gradient is stiff-but-finite — trainable gradients flow through the mixing seam). Suite
+  ocean 376 + ice 47. **Next big phases: GM/Redi (6B, the 2nd ML-hook) + KPP (6C) — own
+  sub-plans, scoped by reading `fesom_gm.c`/`fesom_kpp.c` first.**
