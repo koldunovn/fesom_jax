@@ -749,3 +749,38 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (max|uv|=1.8e-14, T/S bit-exact) — but note PGF=0 at rest doesn't test the `gradient_sca`
   *sign* (constant field ⇒ Σ∂N=0 regardless); that's exercised by the non-rest dump gate in
   Task 5.7. (Task 5.1.)
+
+- **[env] The fesom-jax env had NO Python NetCDF reader (netCDF4/xarray/h5py all missing);
+  the PHC + forcing files are NetCDF-4/HDF5 (scipy.io can't read them).** Installed
+  **netCDF4 via the env pip** (user-approved): `…/envs/fesom-jax/bin/python -m pip install
+  netCDF4`. numpy (2.4.6) and jax (0.10.1, x64) **unchanged**. ⚠️ A benign
+  `RuntimeWarning: numpy.ndarray size changed … Expected 16 … got 96` appears on `import
+  netCDF4` (its wheel was built against an older numpy ABI) — harmless, the data path is
+  correct (PHC matched the C to ~1e-14). Avoided **numba** (it pins numpy and could break
+  jax) by doing the GS extrap in optimized pure Python. (Task 5.2.)
+
+- **[phc/ic] The PHC IC is a faithful numpy port that matches the C to ~1e-14 (MAP class —
+  no scatter, so near-bit-exact like the EOS).** `phc_ic.load_phc_ic` mirrors `fesom_phc.c`
+  for npes=1/no-cavity: cyclic-pad lon, per-node bilinear bracket (`binarysearch_d` ported
+  literally — bracket indices match the C **exactly**), bilinear-horizontal + linear-vertical
+  interp onto `mesh.Z`, then `extrap_nod3D` + vertical fill + `ptheta`. The IC is
+  **non-differentiable setup** (host numpy, not JAX), cached to `data/ic_core2/{T,S}_ic.npy`;
+  `core2_initial_state` injects it via `dataclasses.replace`. (Task 5.2.)
+
+- **[phc/extrap] ⚠️ The land-extrapolation is SEQUENTIAL Gauss-Seidel (order-dependent) and
+  must be replicated as such — a Jacobi pass gives different values.** Each dummy ocean node
+  is filled ONCE with the mean of neighbours valid *at fill time*; a node filled earlier in a
+  sweep (lower index) is visible to later nodes that same sweep (`fesom_phc.c:318-342`). The
+  faithful + fast port: per layer, collect dummy nodes in **ascending index order**, sweep
+  updating the column **in place**, drop filled nodes, repeat until no progress (no numba
+  needed — only the few-thousand coastal dummies are iterated). Post-load surface matched the
+  C to ~1e-14 ⇒ the GS order was reproduced exactly. (Task 5.2.)
+
+- **[phc/verify] The C `phc_dump_*` is SURFACE-ONLY — the vertical interp + deep `ptheta`
+  are NOT directly gated by it.** `phc_dump_preextrap` (gid,T,S,bilin_i,bilin_j,lon,lat) and
+  `phc_dump_postload` (gid,T,S) cover only level 0 (where `ptheta`'s pressure ≈|Z[0]|~2.5 m is
+  near-zero). So `test_phc_ic` gates the surface tightly + checks the full field is physical;
+  the deep column is verified indirectly by the Task-5.7 per-substep density/EOS gate. Add a
+  full-column C dump for a few probes if 5.7 shows a depth mismatch. Also: `T_old`/`S_old`
+  (step-1 AB2 history) is provisionally = the PHC field; the exact `valuesold` is finalized in
+  5.7 against the dump (cf. the pi `T_old` base-vs-blob lesson). (Task 5.2.)

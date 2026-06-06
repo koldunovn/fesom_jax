@@ -59,6 +59,11 @@ Installed 2026-06-05 into mamba env `fesom-jax` (`pip install -e ".[cuda,dev]"`)
 - jax-cuda12-plugin / jax-cuda12-pjrt: **0.10.1**
 - CUDA (pip wheels): cuda-runtime **12.9.79**, cuBLAS 12.9.2.10, cuDNN **9.23.0.39**, nvcc 12.9.86
 - numpy **2.4.6**, scipy 1.17.1, pytest 9.0.3
+- **netCDF4 1.7.4** — added 2026-06-06 (Phase 5, Task 5.2) via
+  `…/envs/fesom-jax/bin/python -m pip install netCDF4` to read NetCDF-4 PHC/JRA55/SSS
+  inputs (scipy.io reads only NetCDF-3). numpy/jax unchanged. Benign import warning
+  `RuntimeWarning: numpy.ndarray size changed … Expected 16 … got 96` (older-numpy ABI in
+  the wheel; data path verified correct).
 - **CPU verified** (login node): `backend=cpu`, x64 `float64`, jitted float64 matmul OK;
   `pytest fesom_jax/tests/test_config.py` → 4 passed.
 - **GPU verified** (job 25374974, gpu-devel → `vader1`): `backend=gpu`,

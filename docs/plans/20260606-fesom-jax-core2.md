@@ -141,7 +141,19 @@ none expected (verify). Create: `data/mesh_core2/*.npy`; `tests/test_mesh_core2.
 `tests/test_phc_ic.py`. C (`port2`): add a few full-column probe dumps if vertical-fill
 verification needs it (cheap).
 
-- [ ] **numpy reader** (one-time, offline; NOT in the AD path — IC is setup, though the
+> **✅ DONE 2026-06-06.** `fesom_jax/phc_ic.py` (faithful numpy port of `fesom_phc.c`:
+> bilinear interp + **sequential GS** `extrap_nod3D` + vertical fill + `ptheta`) +
+> `build_and_cache_ic` + `core2_initial_state`. Verified vs the C dump (job 25386555,
+> `data/phc_dump_core2/`): **bracket indices EXACT**, pre-extrap surface **~1e-14**,
+> **post-load surface ~1e-14** (the order-dependent GS replicated exactly), 0 nodes off
+> by >1e-12. Cache `data/ic_core2/{T,S}_ic.npy` (T∈[−2.06,30.05]°C, S∈[5.63,41.12] wet).
+> `tests/test_phc_ic.py` = **5 passed**. **netCDF4 installed** into the env (user-approved;
+> numpy/jax unchanged). New `port2/jobs/jax_phc_dump_core2.sh`. ⚠️ The C dump is
+> surface-only → vertical interp/deep-ptheta verified indirectly (physical-range here +
+> the Task-5.7 density gate); add a full-column C dump if 5.7 shows a depth mismatch.
+> `T_old`/`S_old` step-1 AB2 history set = PHC fields for now; finalized in 5.7.
+
+- [x] **numpy reader** (one-time, offline; NOT in the AD path — IC is setup, though the
   produced field IS a valid grad target). Source: `phc3.0_winter.nc` under
   `…/INITIAL/phc3.0/` (**INITIAL, not FORCING**; `t_insitu=1`). Dims depth=33/lat=180/
   lon=360, vars `temp`(°C in-situ)/`salt`(psu), land=NaN, regular 1° geographic grid.
@@ -152,22 +164,21 @@ verification needs it (cheap).
   vertical-fill from above; final dummy→0 + below-`nlevels` zero + K→C; **`ptheta`**
   insitu→pot (`:66-83`). Cache `T_ic/S_ic [nod2D, nl]`; set `T,S,T_old,S_old` via
   `dataclasses.replace`.
-- [ ] ⚠️ **#1 fidelity risk — `extrap_nod3D` is sequential Gauss-Seidel, node-index ordered,
+- [x] ✅ **#1 fidelity risk CLEARED — `extrap_nod3D` is sequential Gauss-Seidel, node-index ordered,
   in-place** (`fesom_phc.c:318-342`): each dummy wet node filled **once**, value = mean of
   neighbors valid *at fill time* (multiplicity-weighted via `nod_in_elem2D`, no dedup). A
   vectorized Jacobi gives **different** values (not rounding) past the data frontier.
   Replicate the in-place sequential loop (numba/loop ok — one-time). Verify it *binds*.
-- [ ] **Gate (two-stage vs C dump):** the C emits `phc_dump_preextrap` (gid,T,S,bilin_i/j,
+- [x] **Gate (two-stage vs C dump):** the C emits `phc_dump_preextrap` (gid,T,S,bilin_i/j,
   lon,lat) + `phc_dump_postload` (surface) under `FESOM_EVP_DUMP_DIR`; diff harness
   `scripts/phc_dump_diff.py` exists. (a) pre-extrap surface T/S + bilin indices → bracket+
   bilinear @ **1e-15**; (b) post-load surface (post extrap+fill+ptheta) → **1e-12** (Jacobi
   fails this). Add a small full-column dump for a deep (>5500 m) + a coastal-extrap probe to
   verify vertical fill. Validate on the **pi** mesh first (near-global coverage, available
   now) before CORE2.
-- [ ] **Fallback if extrap parity stalls:** load the C-dumped T/S `.npy` directly (IC is
-  non-differentiable setup) and keep the numpy reimpl only for verification. Decide
-  explicitly; log.
-- [ ] run — must pass before Task 5.6. **Lesson:** append.
+- [~] **Fallback if extrap parity stalls:** NOT NEEDED — the numpy reimpl matched the C
+  to ~1e-14 (incl. the GS extrap), so we keep the in-repo numpy reader (no C-dump fallback).
+- [x] run — must pass before Task 5.6. **Lesson:** append. — **DONE: test_phc_ic 5 passed.**
 
 ### Task 5.3: JRA55 forcing reader (host numpy)
 
@@ -363,3 +374,11 @@ first. GM/KPP/ice are Phase 6.
   green. New `port2/jobs/jax_mesh_export_core2.sh`. Lessons logged (zero-code port, the
   244654 swap confirmation, eager ~32 s/step ⇒ use jit/GPU for 5.7). Next: **Task 5.2
   (PHC initial conditions)**.
+- **2026-06-06 — Task 5.2 DONE (PHC initial conditions).** `fesom_jax/phc_ic.py` — faithful
+  numpy port of `fesom_phc.c` (bilinear interp + sequential-GS `extrap_nod3D` + vertical
+  fill + Bryden-1973 `ptheta`); `build_and_cache_ic` + `core2_initial_state`. Verified vs the
+  C surface dumps (job 25386555): bracket indices EXACT, pre/post-load surface **~1e-14**
+  (GS replicated exactly — the #1 risk cleared). Cache `data/ic_core2/`; `test_phc_ic.py`
+  5 passed. **Env: netCDF4 installed** (user-approved; numpy 2.4.6 / jax 0.10.1 unchanged;
+  benign `ndarray size changed` ABI warning). New `port2/jobs/jax_phc_dump_core2.sh`.
+  Next: **Task 5.3 (JRA55 forcing reader)**.

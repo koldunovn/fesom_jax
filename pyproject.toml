@@ -11,6 +11,8 @@ requires-python = ">=3.11"
 dependencies = [
     "jax>=0.4.34",
     "numpy>=1.24",
+    "scipy>=1.10",       # host-side SSH stiffness assembly (ssh.build_ssh_operator)
+    "netCDF4>=1.6",      # NetCDF-4 PHC/JRA55/SSS readers (Phase 5)
 ]
 
 [project.optional-dependencies]
