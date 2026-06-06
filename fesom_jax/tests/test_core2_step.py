@@ -41,7 +41,12 @@ DUMP = ROOT / "data" / "step_dump_core2" / "core2_cdump.00000"
 DT = 500.0
 YEAR = 1958
 NSTEPS = 3
+# Node probes (the C dump's FESOM_DUMP_PROBES) — node fields (T, S, density, Kv,
+# pressure, d_eta, eta_n, hbar, ssh_rhs, w, hnode...) are recorded here.
 PROBES = [1001, 33778, 43828, 61202, 66921, 79663, 94122]
+# The incident-element gids the C dump pairs with each node probe — ELEMENT fields
+# (pgf_x/y, Av, uv_rhs_u/v, uv_u/v) are recorded here (fesom_dump.c s_elem_gid).
+ELEM_PROBES = [307, 747, 25954, 61526, 99096, 110065, 154575]
 
 pytestmark = pytest.mark.skipif(
     not (MESH_DIR.exists() and (IC_DIR / "T_ic.npy").exists() and DUMP.exists()),
@@ -75,12 +80,25 @@ def run3():
 
 
 def _maxabs(jax_arr, recs, step, sub, field, kind):
-    """Max |Δ| over the probe columns for one (step, substep, field)."""
+    """Max |Δ| over the NODE probe columns for one (step, substep, field)."""
     a = np.asarray(jax_arr)
     worst = 0.0
     for g in PROBES:
         r = io_dump.find_record(recs, step=step, substep=sub, probe_gid=g, field=field)
         col = a[g - 1] if a.ndim > 1 else np.atleast_1d(a[g - 1])
+        worst = max(worst, compare_column(col, r, kind=kind).max_abs)
+    return worst
+
+
+def _emaxabs(jax_arr, recs, step, sub, field, comp, kind="scatter"):
+    """Max |Δ| over the ELEMENT probe columns for an element field. ``comp`` picks
+    the component column from the ``(elem2D, nl, 2)`` array (0=u, 1=v); pass
+    ``None`` for a 2-D ``(elem2D, nl)`` field (pgf, Av)."""
+    a = np.asarray(jax_arr)
+    worst = 0.0
+    for g in ELEM_PROBES:
+        r = io_dump.find_record(recs, step=step, substep=sub, probe_gid=g, field=field)
+        col = a[g - 1] if comp is None else a[g - 1, :, comp]
         worst = max(worst, compare_column(col, r, kind=kind).max_abs)
     return worst
 
@@ -123,14 +141,62 @@ def test_step1_dynamics_sanity(run3):
     assert _maxabs(st1.Kv, recs, 1, 4, "Kv", "scatter") < 1e-12
 
 
-def test_tracers_evolution_steps23(run3):
-    """T/S stay scatter-class over steps 2–3 — the loop-carried forcing (jra date, AB2,
-    the step≥2 ice-ocean drag) threads correctly."""
+def test_step1_dynamics_per_substep(run3):
+    """Per-substep DYNAMICS on CORE2 reproduce the C dump at step 1 — bit-exact
+    class. JAX and C start from the identical PHC IC, so every substep input
+    matches and the only spread is FP reassociation. This makes explicit the
+    chain the 5.6 T/S gate exercised only transitively:
+    pressure → PGF → momentum-RHS/impl-visc → SSH-RHS → CG → update-vel → hbar →
+    eta → ALE-w → thickness. Element fields (pgf/Av/uv_rhs/uv) at the incident-
+    element probes, node fields at node probes.
+
+    Tolerances are calibrated from the deterministic CPU run: pre-solve fields are
+    ~0..1e-17, CG-derived fields ~1e-16..1e-14. ``pressure`` (~5e5 hydrostatic
+    integral) and ``ssh_rhs`` (~1e5 transport-divergence ×area/dt) are large-
+    magnitude, so their absolute floors scale up (~1e-11 *relative*)."""
+    _, st1 = run3["steps"][0]
+    recs = run3["recs"]
+    # substep 1 — hydrostatic pressure (large integral) — node
+    assert _maxabs(st1.hpressure, recs, 1, 1, "pressure", "scatter") < 1e-9
+    # substep 3 — pressure-gradient force (pre-solve, deterministic) — element
+    assert _emaxabs(st1.pgf_x, recs, 1, 3, "pgf_x", None) < 1e-12
+    assert _emaxabs(st1.pgf_y, recs, 1, 3, "pgf_y", None) < 1e-12
+    # substep 4 — element vertical viscosity Av (node Kv is in dynamics_sanity)
+    assert _emaxabs(st1.Av, recs, 1, 4, "Av", None) < 1e-12
+    # substep 7 — impl_vert_visc increment du (== st.uv_rhs) — element
+    assert _emaxabs(st1.uv_rhs, recs, 1, 7, "uv_rhs_u", 0) < 1e-12
+    assert _emaxabs(st1.uv_rhs, recs, 1, 7, "uv_rhs_v", 1) < 1e-12
+    # substep 8 — SSH RHS (large transport-divergence field) — node
+    assert _maxabs(st1.ssh_rhs, recs, 1, 8, "ssh_rhs", "scatter") < 5e-6
+    # substep 9 — CG SSH solution d_eta (warm-start 0 at step 1) — node
+    assert _maxabs(st1.d_eta, recs, 1, 9, "d_eta", "scatter") < 1e-11
+    # substep 10 — velocity after the barotropic SSH-gradient correction — element
+    assert _emaxabs(st1.uv, recs, 1, 10, "uv_u", 0) < 1e-11
+    assert _emaxabs(st1.uv, recs, 1, 10, "uv_v", 1) < 1e-11
+    # substeps 11/12 — hbar, eta_n — node
+    assert _maxabs(st1.hbar, recs, 1, 11, "hbar", "scatter") < 1e-11
+    assert _maxabs(st1.eta_n, recs, 1, 12, "eta_n", "scatter") < 1e-11
+    # substep 13 — ALE vertical velocity w + static linfs hnode_new; substep 16 hnode
+    assert _maxabs(st1.w, recs, 1, 13, "w", "scatter") < 1e-11
+    assert _maxabs(st1.hnode_new, recs, 1, 13, "hnode_new", "map") < 1e-12
+    assert _maxabs(st1.hnode, recs, 1, 16, "hnode", "map") < 1e-12
+
+
+def test_evolution_steps23(run3):
+    """T/S **and** the dynamics (uv, d_eta) stay scatter-class over steps 2–3 —
+    the loop-carried forcing (jra date, AB2 history, the warm-started CG, the
+    step≥2 ice-ocean drag) threads correctly. Unlike step 1 (bit-exact, identical
+    inputs), steps 2–3 inherit the prior step's ~1e-15 spread and the discrete CG
+    iteration count amplifies it to ~1e-9..1e-6 — bounded, not growing
+    catastrophically (the threading-correctness gate, not a tight match)."""
     recs = run3["recs"]
     for n in (2, 3):
         _, st = run3["steps"][n - 1]
         assert _maxabs(st.T, recs, n, 15, "T", "scatter") < 1e-6, f"T step {n}"
         assert _maxabs(st.S, recs, n, 15, "S", "scatter") < 1e-6, f"S step {n}"
+        assert _emaxabs(st.uv, recs, n, 10, "uv_u", 0) < 1e-4, f"uv_u step {n}"
+        assert _emaxabs(st.uv, recs, n, 10, "uv_v", 1) < 1e-4, f"uv_v step {n}"
+        assert _maxabs(st.d_eta, recs, n, 9, "d_eta", "scatter") < 1e-5, f"d_eta step {n}"
 
 
 def test_physical_and_finite(run3):

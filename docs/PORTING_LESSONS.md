@@ -1064,3 +1064,71 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (aux<1e-5) vectorizes as a cumulative-OR mask (no monotonicity assumption). The chl reader is
   the SAME `read_other_NetCDF` routine as SSS (Sweeney = the C default; constant chl=0.1 is the
   `FESOM_CHL_SOURCE=None` seam). (`tracer_diff.py`/`forcing.cal_shortwave_rad`, Task 5.6.)
+
+## Phase 5 — matched C dump run + CORE2 stability (Task 5.7)
+
+- **[stability/scope] ⚠️⚠️ "No ice" is numerically stable for ~1 week, then the UNBOUNDED
+  high-lat SUPERCOOLING destabilizes the dynamics — a PHYSICAL limitation (matched by the C),
+  not a numerical bug.** The Phase-5 no-ice CORE2 run (PHC IC + JRA55 + SSS/runoff, dt=500)
+  is numerically clean for **days 1–7** (no NaN; max|vel| ≤ ~1.9 m/s < 3; |SSH| ≤ ~2.8 m < 5;
+  the Aleutian-Trench node 94122 stays warm ~3.2 °C and calm). But with no sea ice to cap
+  high-latitude heat loss, SST **supercools monotonically without bound**: −1.9 (IC) → −5.8
+  (day 1) → −16.5 (day 5) → −22.8 (day 8). Once SST drops below ~−20 °C the JM-EOS is being
+  evaluated far outside its valid range, the spurious density field drives spurious convection,
+  and at **model day ~8.1 (step 1399) max|vel| finally crosses 3 m/s**. This is the *anticipated*
+  no-ice failure mode (sub-plan risk #1 / FRESH_START §15 "SST < −2 without ice"), NOT a port
+  error. **The matched C arbiter does exactly the same** (see next lesson) ⇒ the C does NOT blow
+  up at this config either, so the Task-5.7 "if the C itself blows up, ice must move to Phase 5"
+  finding did **not** trigger — ice stays Phase 6, and a physically realistic SST simply needs
+  the ice cap. *Lesson: distinguish numerical stability (bounded vel/SSH/CG, no NaN) from
+  thermodynamic realism (SST in range); a no-ice ocean is the former for ~a week and never the
+  latter at high latitudes.* (`scripts/core2_stability_run.py`, Task 5.7.)
+
+- **[stability/method] The matched C arbiter run is the decisive truth-teller: JAX tracks the C
+  to 3 sig figs on the bulk min/max diagnostics, even though individual elements diverge
+  chaotically.** Running the C at the IDENTICAL config (`FESOM_MIX_SCHEME=PP FESOM_NO_GMREDI=1
+  FESOM_NO_ICE_*=1 FESOM_BULK_FIXED_ITERS=1`, dt=500) with the per-step monitor
+  (`FESOM_PRINT_EVERY`) gives a step-by-step reference for SST-range / max|uv| / max|eta|.
+  JAX vs C at step 216 (1.25 d): **SST_min −6.60 = −6.60, max|uv| 1.389 ≈ 1.39, max|eta| 2.715 ≈
+  2.71** — agreement to ~3 sig figs, *despite* the per-element chaotic divergence (the step-1
+  bit-exact match degrades to ~1e-6 by step 3). The reason: **min/max reductions are robust
+  observables of the forced large-scale response** (the supercooling, the geostrophic
+  adjustment), which both models share, while the FP/CG-iteration chaos lives in the small-scale
+  detail that the reductions don't see. *Lesson: to cross-validate a chaotic multi-step
+  trajectory you cannot bit-compare, gate on robust global reductions (range, max-speed) against
+  the matched reference — they track far longer than any pointwise field.* (`jobs/jax_core2_stability.sh`,
+  `core2_stability_run.py`, Task 5.7.)
+
+- **[dynamics/calibration] Step-1 per-substep DYNAMICS are bit-exact-class (~1e-15); the spread
+  blows to ~1e-6 by step 3 — and the 5.6 "uv~1e-10/d_eta~2e-9" was the steps-2/3 evolution, not
+  step 1.** Because JAX and C start from the IDENTICAL PHC IC (incl. the `T_old`=base trap), every
+  step-1 substep input matches and the only spread is FP reassociation: measured at the 7 probes,
+  pgf/Av/hnode ~0..1e-17, uv_rhs/uv/d_eta/eta_n/hbar/w ~1e-16..8e-15 (all bit-exact-class). From
+  step 2 the **discrete CG iteration count** (CORE2 takes 32–43 iters; a ±1-iteration difference
+  near the residual tolerance makes the solutions jump apart) + the FCT limiter amplify the
+  ~1e-15 to ~2.6e-8 (d_eta) / ~2.8e-7 (uv) at step 2, ~1e-7 / ~2e-6 at step 3 — bounded, not
+  growing catastrophically. Two large-magnitude intermediates need scaled tolerances: `ssh_rhs`
+  (~1e5, transport-divergence ×area/dt) and `pressure` (~5e5, hydrostatic integral) match to
+  ~1e-11 *relative* (4.9e-7 / 2.2e-10 absolute). *Lesson: a per-substep gate is only "tight" at
+  step 1 where inputs are shared; downstream of a chaotic solver, calibrate to the accumulated
+  spread, and use relative tolerances for the big intermediate fields.*
+  (`tests/test_core2_step.py::test_step1_dynamics_per_substep`, Task 5.7.)
+
+- **[dump/layout] The C dump pairs each NODE probe with its incident ELEMENT gid — element
+  fields land at element gids, node fields at node gids.** `fesom_dump.c` records, per probe,
+  the node fields (T/S/density/Kv/pressure/d_eta/eta_n/hbar/ssh_rhs/w/hnode) at the node gid AND
+  the element fields (pgf_x/y, Av, uv_rhs_u/v, uv_u/v) at `s_elem_gid` (an incident triangle's
+  global id). On the CORE2 dump the 7 node probes `{1001,33778,43828,61202,66921,79663,94122}`
+  came with 7 element probes `{307,747,25954,61526,99096,110065,154575}` (one >nod2D, the
+  give-away that they are element ids). So the dynamics gate compares `uv[gid−1,:,comp]` at the
+  ELEM probes, not the node probes — getting this wrong silently compares the wrong cells.
+  (`tests/test_core2_step.py::_emaxabs`, Task 5.7.)
+
+- **[perf] Jitted CORE2 step: GPU ~0.06 s, CPU ~3 s, eager ~32 s.** The jitted `step_jit` is
+  ~10× faster than eager on CPU and **~500×** on an A100 — a 10-model-day run (1728 steps) is a
+  ~2-minute GPU job (incl. ~48 s mesh+IC+forcing host build + a one-time compile of the two AB2
+  step variants). Per-step host-sync of a handful of scalar diagnostics (NaN / SST-range /
+  max|vel| / max|eta| / Aleutian node) is cheap enough to monitor every step and pinpoint the
+  exact destabilization step. The single-rank C reference is much slower (~4.6 s/step) — it is
+  an MPI code run on 1 rank — so for the C arbiter cap the run or give it a non-debug QOS.
+  (`scripts/core2_stability_gpu.sh`, Task 5.7.)

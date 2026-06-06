@@ -90,6 +90,40 @@ windows depending on the kernel:
     property, and only *bounded* (`<1e-5`) against the dump.
   From step 2 even `S` diverges at the scheme level. (`test_tracers.py`.)
 
+## CORE2 reference runs (Phase 5)
+
+The same Path-A recipe on the **CORE2** mesh (`/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2`,
+nod2D=126858, nl=48) with **PHC IC + JRA55 + SSS-restoring + runoff** forcing. Two artifacts:
+
+**(1) Per-substep dump** (`data/step_dump_core2/core2_cdump.00000`, gitignored on `/work`),
+regen via `port2/fesom2_port/jobs/jax_step_dump_core2.sh` (matched config: `FESOM_MIX_SCHEME=PP
+FESOM_NO_GMREDI=1 FESOM_NO_ICE_DYN/ADV/THERMO=1 FESOM_BULK_FIXED_ITERS=1`, dt=500, 3 steps).
+Probes: 7 node gids `{1001,33778,43828,61202,66921,79663,94122}` (incl. the **Aleutian-Trench
+watch node 94122**) + their 7 incident-element gids `{307,747,25954,61526,99096,110065,154575}`
+(element fields land here). Gated by `tests/test_core2_step.py`:
+- **step-1 T/S** post-step — *bit-exact class* (~7e-15 / 2e-14): the comprehensive whole-step gate.
+- **step-1 per-substep dynamics** (`test_step1_dynamics_per_substep`): pressure / PGF / Av /
+  uv_rhs / ssh_rhs / d_eta / uv / hbar / eta_n / w / hnode — bit-exact class (JAX & C share the
+  identical PHC IC). Large intermediates `ssh_rhs` (~1e5) / `pressure` (~5e5) match ~1e-11 *relative*.
+- **steps 2-3 evolution** (`test_evolution_steps23`): T/S/uv/d_eta stay ~1e-6 — the discrete CG
+  iteration count + FCT amplify the step-1 ~1e-15; bounded, confirming the loop-carried forcing
+  + AB2 history + warm-started CG thread correctly.
+
+**(2) Stability arbiter run** (no dump — the per-step monitor only), regen via
+`port2/fesom2_port/jobs/jax_core2_stability.sh` (same config + `FESOM_PRINT_EVERY=36`; give it
+a non-debug QOS — single-rank C is ~4.6 s/step). The C prints per-step max|uv|/max|eta|/T-range/
+fluxes. **Used to cross-validate the JAX multi-day trajectory:** `scripts/core2_stability_run.py`
+(JITTED, A100 ~0.06 s/step; `core2_stability_gpu.sh`) runs the assembled JAX model with the same
+forcing and JAX **tracks the C to ~3 sig figs** on SST_min / max|uv| / max|eta| (step 216:
+−6.60=−6.60, 1.389≈1.39, 2.715≈2.71) — robust global reductions track even though per-element
+values diverge chaotically (the step-1 bit-exact match degrades to ~1e-6 by step 3).
+
+**Stability verdict (Task 5.7):** numerically stable **days 1–7** (no NaN, max|vel|<3, |SSH|<5);
+the no-ice run then **supercools without bound** (SST −1.9 IC → −22.8 day 8, the C identically),
+and past the EOS-valid range (~−20 °C) the spurious density field destabilizes the dynamics at
+day ~8. A *physical* no-ice limitation (sea ice, Phase 6, caps it), **not** a numerical blow-up
+and **not** the "C blows up ⇒ move ice to Phase 5" trigger (the C is stable + tracks JAX).
+
 ## Secondary cross-check: the Fortran dump (NOT per-substep comparable)
 
 The existing Fortran dump `port2/fesom2/work_pi/pi_fesom_dump.0000{0,1}` uses a

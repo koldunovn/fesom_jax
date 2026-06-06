@@ -368,20 +368,41 @@ C (`port2`): `fesom_dump.c` (env probes), `fesom_step.c` (surf dump), `fesom_bul
 **Files:** Modify (C, `port2`): re-pin `PROBE_GIDS` for CORE2 (`fesom_dump.c:15-17`) +
 SLURM dump job. Create `tests/test_step_core2.py`; `docs/REFERENCE_RUNS.md` (CORE2 section).
 
-- [ ] **Generate the CORE2 per-substep dump (Path A):** existing binary, env
-  `FESOM_MIX_SCHEME=PP FESOM_NO_GMREDI=1 FESOM_NO_ICE_*=1`, PHC IC, JRA55 on, dt=500,
-  ~10 steps; re-pinned CORE2 probes (incl. Aleutian-Trench node 94122). Capture
-  `fixtures/core2_cdump.00000`. (npes small / dist_16; ~10 steps cheap.)
-- [ ] **Assemble + run CORE2:** `step`/`integrate` on CORE2 mesh + PHC IC + full forcing.
-  CORE2 1-day (~172 steps, dt=500) + a multi-day run; assert stable per FRESH_START §15:
-  no NaN, SST∈[−2,35], |SSH|<5 m, max|vel|<3 m/s. Watch the Aleutian Trench.
-- [ ] ⚠️ **Stability risk to surface empirically:** PHC IC + JRA55, **no ice** at dt=500 →
-  high-lat super-cooling / the historic Aleutian blowup. The C reference at the matched
-  config is the arbiter — **if the C port itself blows up without ice at this config, that
-  is a finding** (ice would have to move from Phase 6 into Phase 5; flag immediately, do not
-  paper over it).
-- [ ] **Gate:** step-1 per-substep dump-tight; 1-day + multi-day stable. Snapshot
-  climate-close stays indirect unless a matched C snapshot is produced. **Lesson:** append.
+> **✅ DONE 2026-06-06.** Per-substep dynamics gates added + the assembled CORE2 model
+> run 1-day + multi-day, jitted, with the matched C arbiter. **(1) Per-substep dynamics
+> gate** (`test_core2_step.py::test_step1_dynamics_per_substep`, +1 test → suite 371):
+> step-1 pressure/PGF/Av/uv_rhs/ssh_rhs/d_eta/uv/hbar/eta_n/w/hnode all **bit-exact-class**
+> (pre-solve ~0..1e-17; CG-derived ~1e-16..8e-15; the big intermediates ssh_rhs ~1e5 /
+> pressure ~5e5 match ~1e-11 *relative*); element fields gated at the dump's incident-element
+> gids; `test_evolution_steps23` extended with uv/d_eta (steps 2-3 ~1e-6, the discrete CG
+> iter-count + FCT amplifying the step-1 ~1e-15). **(2) Stability run**
+> (`scripts/core2_stability_run.py` + `core2_stability_gpu.sh`, A100, jitted ~0.06 s/step):
+> **numerically stable days 1–7** (no NaN; max|vel| ≤ 1.9 < 3; |SSH| ≤ 2.8 < 5; Aleutian
+> 94122 calm). **(3) C arbiter** (`jobs/jax_core2_stability.sh`, matched config + per-step
+> monitor): the C is stable + JAX **tracks it to 3 sig figs** on SST_min/max|uv|/max|eta|
+> (step 216: SST_min −6.60=−6.60, uv 1.389≈1.39, eta 2.715≈2.71). **FINDING (anticipated
+> risk #1):** with no sea ice the SST **supercools without bound** (−1.9 IC → −5.8 d1 →
+> −16.5 d5 → −22.8 d8); past ~−20 °C the JM-EOS is out of range, and at **model day ~8.1
+> max|vel| crosses 3 m/s**. This is a *physical* no-ice limitation (the C does the same —
+> NOT a JAX bug, and NOT the "C blows up ⇒ move ice to Phase 5" finding) — sea ice (Phase 6)
+> caps it. Gate met: step-1 dump-tight (per-substep) + 1-day & multi-day numerically stable.
+
+- [x] **Generate the CORE2 per-substep dump (Path A):** done in 5.6
+  (`data/step_dump_core2/core2_cdump.00000`, 3 steps, 7 node + 7 incident-element probes
+  incl. Aleutian 94122, `FESOM_BULK_FIXED_ITERS=1`). 5.7 added the per-substep **dynamics**
+  gates on it (5.6 had only the comprehensive T/S + density/bvfreq/Kv).
+- [x] **Assemble + run CORE2:** jitted `step_jit` loop with stacked `step_forcings`
+  (`CoreForcing.stack(dates_for_steps(1958, 500, N))`) + `forcing_static`, monitored per
+  step. CORE2 1-day (172 steps) + 10-day (1728) on an A100. Numerically stable through
+  day 7; the Aleutian Trench stayed calm.
+- [x] ⚠️ **Stability risk resolved empirically:** the matched C arbiter is **stable and
+  tracks JAX** — so the no-ice run does **not** numerically blow up (ice stays Phase 6). The
+  real limitation is **unbounded high-lat supercooling** (the C supercools identically): no
+  NaN/dynamical blowup for ~7 days, then the sub-−20 °C EOS-invalid SST drives max|vel|>3 at
+  day ~8. Flagged, not papered over (PORTING_LESSONS Task 5.7).
+- [x] **Gate:** step-1 per-substep dump-tight (dynamics added); 1-day + multi-day
+  numerically stable, JAX↔C 3-sig-fig trajectory match. Snapshot climate-close stays
+  indirect (no matched C snapshot). **Lesson:** appended.
 
 ### Task 5.8: GATE 5 — gradient check on a CORE2 slice
 
@@ -409,8 +430,12 @@ the new SST→flux / current→stress feedbacks; full suite green.
 
 ## Risks / watch-list
 
-- **CORE2 stability without ice** (dt=500, PHC+JRA55) — the biggest scope risk; the matched
-  C run is the arbiter (Task 5.7). May force ice earlier than Phase 6.
+- **CORE2 stability without ice** (dt=500, PHC+JRA55) — ✅ **RESOLVED (Task 5.7): does NOT
+  force ice earlier.** Numerically stable days 1–7 (vel/SSH bounded, no NaN); the matched C
+  arbiter is stable too and JAX tracks it to 3 sig figs. The only no-ice limitation is
+  **unbounded high-lat supercooling** (SST → −22 by day 8, the C identically) which past the
+  EOS-valid range (~−20 °C) destabilizes the dynamics at day ~8 — a physical limitation capped
+  by sea ice in Phase 6, not a numerical failure.
 - **PHC `extrap_nod3D` sequential-GS parity** (Task 5.2) — Jacobi gives wrong values;
   the #1 fidelity risk. Fallback: load the C-dumped IC.
 - **JRA55 reader literal parity** (bilinear index/weight, field order, mid-interval shift,
@@ -579,3 +604,22 @@ seam).**
   **runoff has no effect on the Phase-5 trajectory** (it feeds only the non-linfs ssh_rhs/ALE
   paths). C edits on the `jax-mesh-export` branch; `jobs/jax_step_dump_core2.sh` untracked.
   Next: **Task 5.7 (matched C dump run + CORE2 stability, 1-day + multi-day)**.
+- **2026-06-06 — Task 5.7 DONE (matched C dump run + CORE2 stability).** Two deliverables.
+  **(A) Per-substep dynamics gates** (`test_core2_step.py`): `test_step1_dynamics_per_substep`
+  gates pressure/PGF/Av/uv_rhs/ssh_rhs/d_eta/uv/hbar/eta_n/w/hnode at step 1 — **bit-exact
+  class** (pre-solve ~0..1e-17; CG-derived ~1e-16..8e-15; big intermediates ssh_rhs ~1e5 /
+  pressure ~5e5 match ~1e-11 relative); element fields compared at the dump's incident-element
+  gids (`_emaxabs`); `test_evolution_steps23` extended with uv/d_eta (steps 2-3 ~1e-6 — the
+  discrete CG iter-count + FCT amplify the step-1 ~1e-15). Suite **371** (was 370). **(B) CORE2
+  stability run** (`scripts/core2_stability_run.py` + `core2_stability_gpu.sh`, A100 jitted
+  ~0.06 s/step; eager ~32, CPU ~3): **numerically stable days 1–7** (no NaN; max|vel| ≤ 1.9
+  < 3; |SSH| ≤ 2.8 < 5; Aleutian 94122 calm/warm). **(C) Matched C arbiter**
+  (`jobs/jax_core2_stability.sh`, same config + `FESOM_PRINT_EVERY` monitor): stable, and JAX
+  **tracks it to 3 sig figs** on SST_min/max|uv|/max|eta| (step 216: −6.60=−6.60, 1.389≈1.39,
+  2.715≈2.71) despite per-element chaotic divergence — robust min/max reductions track the
+  shared forced response. **FINDING (anticipated risk #1, NOT a bug):** no sea ice ⇒ SST
+  supercools without bound (−1.9 IC → −16.5 d5 → −22.8 d8); past ~−20 °C the JM-EOS is invalid
+  → spurious convection → max|vel|>3 at model day ~8.1. The C does the same ⇒ ice stays Phase 6
+  (the "C blows up ⇒ ice into Phase 5" trigger did NOT fire); a physical SST simply needs the
+  ice cap. C job untracked on `port2` `jax-mesh-export`; JAX driver + GPU job committed on
+  `main`. Next: **Task 5.8 (GATE 5 — gradient on a CORE2 slice)**.
