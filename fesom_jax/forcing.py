@@ -53,6 +53,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 
 from . import ops
+from .config import VCPW
 from .mesh import Mesh
 
 
@@ -280,3 +281,66 @@ def bulk_surface_fluxes(mesh: Mesh, u_air, v_air, shum, shortwave, longwave, Tai
     stress_surf = (sns[v[:, 0]] + sns[v[:, 1]] + sns[v[:, 2]]) / 3.0
     return BulkFluxes(cd=cd, ce=ce, ch=ch, heat_flux=heat_flux, water_flux=water_flux,
                       stress_node_surf=sns, stress_surf=stress_surf)
+
+
+def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None):
+    """Shortwave penetration — AD-safe port of ``fesom_cal_shortwave_rad``
+    (``oce_shortwave_pene.F90``, ``fesom_bulk.c:362-415``). Returns
+    ``(heat_flux_pene, sw_3d)``:
+
+    * ``heat_flux_pene`` = ``heat_flux + 0.54·(1−albw)·shortwave`` — the bulk heat flux
+      with the **visible** band (300–750 nm) added back, because that band penetrates
+      below the surface layer instead of heating it directly (``:387``).
+    * ``sw_3d`` ``[nod2D, nl]`` — the per-interface shortwave **temperature** flux
+      (K·m/s) the T tracer consumes as a divergence (Sweeney-2005 two-band exponential,
+      ``:389-413``). ``swsurf = 0.54·(1−albw)·shortwave/vcpw`` at ``nzmin``; below,
+      ``swsurf·(v1·e^{z/sc1} + v2·e^{z/sc2})`` until the first interface where the
+      attenuation drops below 1e-5 (or the bottom), then 0.
+
+    ``sw_3d`` depends only on the JRA ``shortwave`` (constant), the ``chl`` climatology
+    (constant) and the geometry ``zbar_3d_n`` — **not** on the model state — so it is a
+    per-step forcing constant with no AD path. The only differentiable effect is the
+    additive ``swsurf_W`` on ``heat_flux`` (a constant offset ⇒ ``d(heat_flux)/d(SST)``
+    from the bulk is preserved). ``open_water`` (``ulevels<=1`` and ice-free; all-True on
+    CORE2) gates the penetration: no penetration under cavity or sea ice."""
+    nl = mesh.nl
+    if open_water is None:
+        open_water = mesh.ulevels_nod2D <= 1
+
+    # visible shortwave into the ocean [W/m²]; 0.54 = visible part (300-750 nm).
+    swsurf_W = 0.54 * (1.0 - BULK_ALBW) * shortwave            # (nod2D,)
+    heat_flux_pene = jnp.where(open_water, heat_flux + swsurf_W, heat_flux)
+    swsurf = swsurf_W / VCPW                                   # W/m² → K·m/s
+
+    # Sweeney-2005 (Appendix A) two-band coefficients from chl (fesom_bulk.c:389-398).
+    cc = jnp.maximum(chl, 0.02)                                # limit from below
+    c = jnp.log10(cc)
+    c2 = c * c; c3 = c2 * c; c4 = c3 * c; c5 = c4 * c
+    v1 = 0.008 * c + 0.132 * c2 + 0.038 * c3 - 0.017 * c4 - 0.007 * c5
+    v2 = 0.679 - v1
+    v1 = 0.321 + v1
+    sc1 = 1.54 - 0.197 * c + 0.166 * c2 - 0.252 * c3 - 0.055 * c4 + 0.042 * c5
+    sc2 = 7.925 - 6.644 * c + 3.662 * c2 - 1.815 * c3 - 0.218 * c4 + 0.502 * c5
+
+    # per-interface attenuation aux[n, nz] = v1·e^{z/sc1} + v2·e^{z/sc2}, z≤0 (depth).
+    z = mesh.zbar_3d_n                                         # (nod2D, nl)
+    aux = (v1[:, None] * jnp.exp(z / sc1[:, None])
+           + v2[:, None] * jnp.exp(z / sc2[:, None]))
+
+    k = jnp.arange(nl)[None, :]
+    nzmin = (mesh.ulevels_nod2D - 1)[:, None]
+    nzmax = (mesh.nlevels_nod2D - 1)[:, None]
+    is_surf = k == nzmin
+    # Interior levels nz∈(nzmin, nzmax] walk down; the C breaks (and zeros) at the FIRST
+    # level where aux<1e-5 OR k==nzmax, leaving everything below 0 (the memset). A
+    # cumulative-OR of that trigger reproduces the first-occurrence break for any aux
+    # profile (no monotonicity assumption): a level is kept iff no trigger fired at or
+    # above it.
+    trigger = ((aux < 1.0e-5) | (k == nzmax)) & (k > nzmin)
+    triggered_by = jnp.cumsum(trigger.astype(jnp.int32), axis=1) > 0
+    keep = (k > nzmin) & ~triggered_by                        # interior, pre-trigger
+
+    sw_3d = jnp.where(is_surf, swsurf[:, None],
+                      jnp.where(keep, swsurf[:, None] * aux, 0.0))
+    sw_3d = jnp.where(open_water[:, None], sw_3d, 0.0)
+    return heat_flux_pene, sw_3d

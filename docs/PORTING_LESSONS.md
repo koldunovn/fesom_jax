@@ -971,3 +971,96 @@ Cite the C source (`file:line`) or dump probe that proves it.
   flux math handles the seasonal target. The C `fesom_sss_runoff_dump` saves+restores
   `water_flux` (the one field the step both reads and writes in place) so two month dumps in one
   run stay independent. (`jax_sss_dump_core2.sh`, `fesom_main.c` SSS-dump block, Task 5.5.)
+
+## Phase 5 — wire surface BCs + assemble CORE2 forcing (Task 5.6)
+
+- **[ice/scope] ⚠️⚠️ The C "no ice" run is NOT ice-free — it keeps a STATIC `a_ice` mask
+  that gates the surface fluxes.** `fesom_ice_initial_state` (`fesom_ice.c`, called
+  `fesom_main.c:792`) sets `a_ice = 0.9` wherever **(non-cavity & the PHC IC SST < 0)** — and
+  with `FESOM_NO_ICE_DYN/ADV/THERMO=1` the ice model never runs, so that mask is *frozen* for
+  the whole run (37089/126858 nodes on CORE2). It has **two** couplings in the no-ice path:
+  (1) **shortwave penetration is skipped where `a_ice>0`** (`fesom_bulk.c:381-382` —
+  `cal_shortwave_rad`); (2) **the wind stress is blended** `stress = ice_drag·a_ice +
+  atm·(1−a_ice)` with `ice_drag = ρ·Cd·|u_ice−u_w|·(u_ice−u_w)`, `u_ice=0` (static),
+  `u_w = uvnode[:,0]`, `ρ·Cd = FESOM_DENSITY_0·cd_oce_ice = 1030·5.5e-3` (`fesom_ice_coupling.c:
+  234-264`, `oce_fluxes_mom`). The **bulk itself does NOT gate on `a_ice`** (open-water fluxes
+  everywhere — verified: at an ice node the C heat_flux == the JAX open-water bulk). `ocean2ice`
+  runs even with ice off (so `u_w` updates each step → a step≥2 current→stress drag), but
+  thermo/`oce_fluxes` are skipped (so heat/water/salt are the bulk+sss values). **User decision
+  (2026-06-06): match the C — replicate the static mask** (not truly-ice-free). Symptom that
+  found it: JAX (assuming `a_ice=0`) mismatched the C heat_flux by **122 W/m²** at an Antarctic
+  node (the visible band `0.486·shortwave` it wrongly added under ice). *Lesson: "ice off" in a
+  coupled model rarely means `a_ice≡0` — grep every `a_ice` reader before assuming ice-free.*
+  (`core2_forcing.ice_ic_aice`/`compute_surface_fluxes`, Task 5.6.)
+
+- **[tracers/T_old] ⚠️ The CORE2 step-1 `T_old`/`S_old` (AB2 `valuesold`) is the CONSTANT
+  BASE 10/35, NOT the PHC field — the exact analog of the pi blob `T_old` trap.** The C order
+  (`fesom_main.c`): set `values = const 10/35` (`:413`) → run the rest-sanity `advect_one`
+  which saves `valuesold = values = 10/35` (`:724-756`, via `init_tracers_AB_one`) → **then**
+  `fesom_phc_load_ic` overwrites `values = PHC` but leaves `valuesold` (`:778`). So at step 1
+  `ttfAB = −(0.5+ε)·base + (1.5+ε)·PHC`, not `PHC`. `core2_initial_state` had `T_old=T=PHC` →
+  corrupted the step-1 FCT advection: post-step `T` was off **2.4e-3** (a *large fraction of the
+  one-step tendency*, surface-concentrated with an opposite-sign dipole at level 1). Fix:
+  `T_old = masked base 10`, `S_old = masked base 35`. *Lesson (3rd time, pi+CORE2): at step 1
+  `T_old ≠ T`; the IC's `valuesold` is whatever the last pre-IC-overwrite `advect_one` saved.*
+  (`phc_ic.core2_initial_state`, Task 5.6.)
+
+- **[bulk/fixed-iters] ⚠️ `FESOM_BULK_FIXED_ITERS=1` was honored ONLY by `fesom_bulk_dump`,
+  NOT by the time-loop `fesom_bulk_compute` (hardcoded `fixed_iters=0` = early-break).** So the
+  per-substep dump captured the *production early-break* bulk while JAX runs the AD-safe fixed-5
+  loop → at the non-convergent calm/cold nodes (Task 5.4) the heat_flux diverged **1.6e-4 W/m²**
+  (2.5e-7 rel on a 633 W/m² flux at an extreme-stability Arctic node). NOT an input difference:
+  the PHC SST matched 3.5e-15 and a 1e-13 wind perturbation only moved heat_flux 6e-12 (×60).
+  Fix: env-gate `fesom_bulk_compute` on `FESOM_BULK_FIXED_ITERS` too (`fesom_bulk.c:250-263,283`).
+  After it, heat_flux → **1.1e-13**. *Lesson: when a fidelity flag exists, grep that EVERY code
+  path which feeds the gate honors it — a dump-only flag silently leaves the real kernel on the
+  production branch.* (`fesom_bulk.c`, Task 5.6.)
+
+- **[forcing/method] The step-1 integrated `T`/`S` dump match is the COMPREHENSIVE CORE2 gate
+  — bit-exact (~7e-15) once all three bugs above are fixed.** Post-step `T`/`S` is the end of
+  the step and depends on every upstream kernel (EOS/PGF/PP/momentum/CG-SSH/ALE/FCT/vert-diff)
+  AND the new surface BCs, so a tight match validates the whole assembled step in one number —
+  no need for per-substep dynamics gates at 5.6 (those, with calibrated tolerances, are 5.7).
+  Verified bit-exact: density 2.3e-13, bvfreq 1e-16, Kv 0.0, uv ~1e-10, d_eta ~2e-9 (CORE2 CG
+  takes 43 iters vs pi's 3 → more reassociation), `w` 4e-12, **post-step T 7.1e-15 / S 2.1e-14**;
+  multi-step T/S stay ~1e-9 over steps 2-3 (the loop-carried jra date + AB2 + step≥2 ice drag
+  thread correctly). (`test_core2_step.py`, Task 5.6.)
+
+- **[runoff/scope] ⚠️ Runoff is INERT in the Phase-5 no-ice config — by the C's DESIGN, not a
+  bug. It works fully in the ice-on run.** The C routes runoff through **sea-ice thermo**, not
+  the standalone sbc (`fesom_sss_runoff.c:376-380` "Phase C3b: removed runoff subtraction;
+  runoff is now folded into `ice->flx_fw` inside `fesom_therm_ice`; subtracting again would
+  double-count"). Ice-ON path: `runoff → fesom_ice_thermo.c:318 prec=rain+runo+snow(1−A) →
+  :509 flx_fw → fesom_ice_coupling.c:139 water_flux=−flx_fw → :391 virtual_salt=rsss·water_flux
+  → bc_S` (river-mouth freshening that advects — what makes runoff "work"). With
+  `FESOM_NO_ICE_THERMO=1` (Phase 5) that block is gated off, so `water_flux` stays the **bulk
+  evap−prec** (no runoff), `virtual_salt = rsss·(evap−prec)`, and the balance
+  `water_flux += ⟨water_flux+runoff⟩` is inert in linfs (the only `water_flux` consumers are the
+  **non-linfs** `ssh_rhs`/ALE paths, `fesom_ssh.c:322-324`). ⇒ runoff has zero effect on the
+  Phase-5 trajectory (a known salty coastal/Arctic bias). **The port is faithful** (dump:
+  `virtual_salt` ~1e-20). *Lesson: trace where a forcing's LOCAL term actually lives before
+  declaring it "works/doesn't work" — runoff's local door is ice thermo, so "ice off" silently
+  removes it.* (User-flagged; user decision = keep matching the no-ice C run, with the Phase-6
+  activation plan locked.) (Task 5.6.)
+
+- **[runoff/phase6] Runoff "comes online" for free once Phase 6 ports the ice freshwater
+  budget — the reader + balance are done and the seam is pure.** No Phase-5 runoff code needs
+  revisiting: `sss_runoff.runoff_node` (reader, bit-exact) + `sss_runoff_fluxes(water_flux, …,
+  runoff_node, …)` (the balance, **pure in `water_flux`**) are already in place. Phase 6 only
+  adds (a) `fesom_ice_thermodynamics` folding runoff into `flx_fw`, (b) `fesom_ice_oce_fluxes`
+  setting `water_flux=−flx_fw`; then `core2_forcing.compute_surface_fluxes`'s ice-on branch
+  feeds `−flx_fw` (incl. runoff) into the EXISTING `sss_runoff_fluxes` instead of the bulk's
+  `evap−prec`. Verify ice-on with the dump recipe at river-mouth nodes; no double-count if the
+  C3b design is followed (runoff in `flx_fw`, sbc local-term stays removed). Full spec:
+  sub-plan "Runoff handoff to Phase 6". (Task 5.6.)
+
+- **[ad/forcing] The surface forcing adds three differentiable seams into the tracer/momentum
+  eqns, all AD-safe by construction.** `bc_T = −dt·heat_flux/vcpw` (SST→heat_flux via the bulk),
+  `bc_S = dt·(virtual_salt+relax_salt)` (SST→water_flux→virtual_salt + S_top→relax_salt), and
+  the ice-ocean drag `current→stress` (safe-sqrt for `|u_w|` at `u_w=0`). `sw_3d` is a per-step
+  forcing **constant** (depends only on JRA shortwave + chl climatology + geometry, not state),
+  so it carries no AD path — only its additive `swsurf_W` on `heat_flux` matters, and that's a
+  constant offset (preserves `d(heat_flux)/d(SST)`). `cal_shortwave_rad`'s data-dependent break
+  (aux<1e-5) vectorizes as a cumulative-OR mask (no monotonicity assumption). The chl reader is
+  the SAME `read_other_NetCDF` routine as SSS (Sweeney = the C default; constant chl=0.1 is the
+  `FESOM_CHL_SOURCE=None` seam). (`tracer_diff.py`/`forcing.cal_shortwave_rad`, Task 5.6.)

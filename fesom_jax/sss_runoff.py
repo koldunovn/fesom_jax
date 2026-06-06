@@ -53,6 +53,7 @@ from .config import RAD
 
 DEFAULT_SSS_PATH = "/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/PHC2_salx.nc"
 DEFAULT_RUNOFF_PATH = "/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/CORE2_runoff.nc"
+DEFAULT_CHL_PATH = "/pool/data/AWICM/FESOM2/FORCING/Sweeney/Sweeney_2005.nc"
 
 # surf_relax_S = 10 / (60·3600·24) = 1.929e-6 s⁻¹ (fesom_sss_runoff_init:305).
 SURF_RELAX_S = 10.0 / (60.0 * 3600.0 * 24.0)
@@ -204,6 +205,25 @@ def build_reader(mesh, sss_path: str = DEFAULT_SSS_PATH,
         [_read_other_netcdf(sss_path, "SALT", m, lon_mod, lat_mod, check_dummy=True)
          for m in range(1, 13)], axis=0)
     return SSSRunoffReader(Ssurf_clim=Ssurf_clim, runoff_node=runoff_node)
+
+
+def build_chl_clim(mesh, chl_path: str = DEFAULT_CHL_PATH) -> np.ndarray:
+    """Chlorophyll monthly climatology interpolated to mesh nodes — host numpy port of
+    the ``chl`` read in ``fesom_main.c:1111`` (``fesom_read_other_NetCDF(chl_file, "chl",
+    mi, …, /*check_dummy=*/1, /*do_onvert=*/1)``). The CORE2 default source is
+    ``Sweeney_2005.nc`` (``TIME=12, lat=180, lon=360`` — same format/routine as the SSS
+    climatology); ``FESOM_CHL_SOURCE`` defaults to Sweeney, so this is the matched config.
+
+    Returns ``chl_clim[12, nod2D]`` (mg/m³); index by ``m-1`` for 1-based month ``m``.
+    For the constant-chl alternative (``FESOM_CHL_SOURCE=None`` ⇒ ``FESOM_PHASE1_CHL_CONST
+    = 0.1``) just pass ``jnp.full(nod2D, 0.1)`` to :func:`fesom_jax.forcing.cal_shortwave_rad`
+    instead of this climatology — the seam is the ``chl`` argument."""
+    geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64) / RAD
+    lon_mod = np.where(geo[:, 0] < 0.0, geo[:, 0] + 360.0, geo[:, 0])
+    lat_mod = geo[:, 1].copy()
+    return np.stack(
+        [_read_other_netcdf(chl_path, "chl", m, lon_mod, lat_mod, check_dummy=True)
+         for m in range(1, 13)], axis=0)
 
 
 # --------------------------------------------------------------------------

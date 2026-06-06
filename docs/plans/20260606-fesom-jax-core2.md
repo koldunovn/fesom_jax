@@ -321,20 +321,47 @@ driver) + `tests/test_jra55.py`. C: probe-dump the 8 jra fields at a fixed (year
 
 ### Task 5.6: Wire surface BCs into the step + assemble CORE2 forcing
 
-**Files:** Modify `fesom_jax/tracer_diff.py`, `fesom_jax/step.py`, `fesom_jax/params.py`
-(forcing seam if useful) + tests.
+**Files:** Modify `fesom_jax/tracer_diff.py`, `fesom_jax/step.py`, `fesom_jax/integrate.py`,
+`fesom_jax/forcing.py`, `fesom_jax/sss_runoff.py`, `fesom_jax/phc_ic.py`; create
+`fesom_jax/core2_forcing.py`, `tests/test_surface_bc.py`, `tests/test_core2_step.py`.
+C (`port2`): `fesom_dump.c` (env probes), `fesom_step.c` (surf dump), `fesom_bulk.c`
+(`FESOM_BULK_FIXED_ITERS` in `fesom_bulk_compute`); `jobs/jax_step_dump_core2.sh`.
 
-- [ ] **Surface BCs** (currently `bc_surface=0`, Phase 2): in `tracer_diff` set
-  `bc_T = −dt·heat_flux/vcpw` (`fesom_tracer_diff.c:56`) and
-  `bc_S = dt·(virtual_salt + relax_salt)` (`:58-69`; linfs ⇒ `real_salt_flux=0`,
-  `is_nonlinfs=0`, so `water_flux` has no *direct* T/S BC — only via `virtual_salt`). Wire
-  the bulk `stress_surf` into momentum (replace pi's analytical wind path).
-- [ ] **Thread forcing through `step`/`integrate`:** SST tap `T[:,0]`, surface-current tap
-  `uvnode[:,0,:]` feed the bulk; the per-step jra atmo array + the month index are
-  loop-carried/closed-over. Keep `params=None ⇒ defaults` transparency intact for the
-  existing 313-test pi suite (CORE2 forcing must not perturb the pi gates).
-- [ ] **Gate:** per-substep CORE2 dump at step 1 (tight, all kernels via `step()`); SST/SSS
-  evolution vs C over a few steps. **Lesson:** append.
+> **✅ DONE 2026-06-06.** Surface BCs wired (`bc_T=−dt·heat_flux/vcpw`,
+> `bc_S=dt·(virtual_salt+relax_salt)`, shortwave penetration `sw_3d` divergence into T) +
+> the bulk/SSS/runoff/shortwave forcing assembled per step (`core2_forcing.py`:
+> bulk → sss_runoff → **ice stress blend** → cal_shortwave_rad). Verified vs a new CORE2
+> per-substep C dump (job 25391647, `data/step_dump_core2/`, 7 re-pinned probes incl.
+> Aleutian 94122, `FESOM_BULK_FIXED_ITERS=1`): **step-1 post-step T 7.1e-15 / S 2.1e-14**
+> (bit-exact — the comprehensive gate), surface forcing heat_flux 1.1e-13 / water_flux
+> 9e-22 / virtual_salt 2.7e-20 / relax_salt 9.5e-20 / sw_3d 8.5e-22; dynamics density
+> 2.3e-13 / uv 1e-10 / d_eta 2e-9 / w 4e-12; **steps 2-3 T/S ~1e-9** (threading). pi path
+> bit-identical (313 tests). `test_surface_bc.py` (7) + `test_core2_step.py` (5).
+> **chl = Sweeney monthly climatology** (the C default; constant-0.1 seam kept). **THREE
+> bugs found+fixed** (see the lessons): (1) the C "no-ice" run keeps a **static `a_ice=0.9`
+> mask** (IC SST<0) gating cal_shortwave penetration + the momentum stress blend — **user:
+> match it**; (2) step-1 `T_old`=constant base 10/35, NOT PHC (pi blob analog); (3)
+> `fesom_bulk_compute` didn't honor `FESOM_BULK_FIXED_ITERS` (early-break vs fixed-5 at calm
+> nodes). **Finding:** in linfs the balanced `water_flux` is inert ⇒ runoff doesn't affect
+> the Phase-5 trajectory.
+
+- [x] **Surface BCs** (was `bc_surface=0`, Phase 2): `tracer_diff.impl_vert_diff(±bc_T/bc_S/
+  sw_3d)` — `bc_T = −dt·heat_flux/vcpw`, `bc_S = dt·(virtual_salt + relax_salt)` (linfs ⇒
+  `real_salt_flux=0`, `is_nonlinfs=0`); `sw_3d` divergence into T (`fesom_tracer_diff.c:
+  298-308`). `cal_shortwave_rad` added to `forcing.py` (AD-safe, cumulative-OR break).
+  Bulk `stress_surf` (with the ice blend) replaces the analytical wind. Defaults `None` ⇒
+  the pi path bit-identical.
+- [x] **Thread forcing through `step`/`integrate`:** `core2_forcing.compute_surface_fluxes`
+  taps `T[:,0]`/`uvnode[:,0]`; the per-step jra atmosphere + month SSS/chl are the scanned
+  `xs` (`StepForcing`), the runoff/areasvol/ocean_area/`a_ice` closed over (`ForcingStatic`).
+  `step(..., step_forcing, forcing_static)` (lazy-imports `core2_forcing`); `params=None`
+  transparency intact.
+- [x] ✅ **Static ice mask (user decision: match the C).** `ice_ic_aice` replicates
+  `fesom_ice_initial_state` (`a_ice=0.9` where IC SST<0); gates shortwave penetration +
+  blends the stress (`ice_drag·a + atm·(1−a)`, `u_ice=0`, `ρ·Cd=1030·5.5e-3`).
+- [x] **Gate:** per-substep CORE2 dump at step 1 (bit-exact T/S 7e-15, all kernels) + SST/SSS
+  evolution steps 2-3 (~1e-9). **Lesson:** appended (the 3 bugs + the linfs-runoff-inert +
+  the AD-seam findings).
 
 ### Task 5.7: Matched C dump run + CORE2 stability
 
@@ -393,11 +420,66 @@ the new SST→flux / current→stress feedbacks; full suite green.
 - **`sw_3d` shortwave penetration** — confirm whether the matched C config has it on before
   deciding to port (Task 5.4).
 
+## Runoff handoff to Phase 6 (the deferred-runoff plan — user-required understanding)
+
+**Decision (2026-06-06, user):** Phase 5 keeps the C's no-ice config in which **runoff is
+inert** (Option 1), CONDITIONAL on a locked, complete plan for activating it later. Here it
+is. *Runoff is NOT broken — it works fully in the C's ice-on (production) run; the Phase-5
+no-ice config just doesn't exercise it, by the C's own design.*
+
+**Why it's inert in Phase 5 (the mechanism, C-verified):** the C deliberately routes runoff
+through **sea-ice thermodynamics**, not the standalone sbc (`fesom_sss_runoff.c:376-380`
+"Phase C3b: removed runoff subtraction… runoff is now folded into `ice->flx_fw` inside
+`fesom_therm_ice`… subtracting again here would double-count"). The full path (ice ON):
+
+```
+runoff_node ─▶ fesom_ice_thermo.c:318  prec = rain + runo + snow·(1−A)
+            ─▶ fesom_ice_thermo.c:509  flx_fw = prec + evap + fwice + fwsnw   (incl. runoff)
+            ─▶ fesom_ice_coupling.c:139 water_flux = −flx_fw                  (OVERWRITES the bulk evap−prec)
+            ─▶ fesom_sss_runoff.c:391   virtual_salt = rsss·water_flux        (now incl. runoff)
+            ─▶ bc_S = dt·(virtual_salt + relax_salt)  → linfs salinity BC → river-mouth freshening (advects)
+```
+
+With `FESOM_NO_ICE_THERMO=1` (Phase 5) that whole block is gated off, so `water_flux` stays
+the **bulk** `evap−prec` (no runoff) and `virtual_salt = rsss·(evap−prec)`; the standalone
+balance `water_flux += ⟨water_flux+runoff⟩` still runs but is **inert in linfs** (the only
+`water_flux` consumers are the non-linfs `ssh_rhs`/ALE paths). Net: runoff has **zero** effect
+on the Phase-5 linfs trajectory. (Consequence to accept for Phase 5: no river freshwater ⇒ a
+salty coastal/Arctic bias vs. a complete run.)
+
+**What is ALREADY done (needs no change for Phase 6):**
+- The runoff **reader** — `sss_runoff.runoff_node` (bit-exact, Task 5.5), carried in
+  `core2_forcing.ForcingStatic.runoff_node`.
+- The **salt/water balance** — `sss_runoff.sss_runoff_fluxes(water_flux, …, runoff_node, …)`
+  is **pure in `water_flux`** (Task 5.5, dump-verified). The global-mean balance already
+  consumes `runoff_node`.
+
+**What Phase 6 adds to activate runoff (the ONLY missing links):**
+1. Port `fesom_ice_thermodynamics` (the ice obudget) so it folds runoff into `flx_fw`
+   (`prec = rain + runo + …`) — this is part of "port sea ice" anyway.
+2. Port `fesom_ice_oce_fluxes` so it sets `water_flux = −flx_fw` (incl. runoff) + the
+   heat-flux ice blend — also part of porting sea ice.
+3. **The JAX seam is already clean:** in `core2_forcing.compute_surface_fluxes`, the ice-on
+   branch computes `flx_fw` and passes `water_flux = −flx_fw` into the EXISTING
+   `sss_runoff_fluxes` (instead of the bulk's `evap−prec`). No restructuring of the reader or
+   the balance — just feed a different `water_flux`. `runoff_node` is already plumbed.
+4. **No double-count:** follow the C3b design exactly (runoff lives in `flx_fw`; the sbc's
+   local `−runoff` term stays removed; the balance's `+runoff` is the global-mean term only).
+   Verify with the proven dump recipe (dump `flx_fw`/`water_flux`/`virtual_salt` at
+   river-mouth nodes, gate JAX vs the **ice-on** C run).
+
+**So:** runoff "comes online" automatically the moment Phase 6 ports the ice freshwater
+budget; nothing in the Phase-5 runoff code needs to be revisited or undone. If a future
+decision wants runoff in a *no-ice* run, that is a C-side change to the no-ice sbc branch
+(add the local runoff to `virtual_salt`) — match whatever the C is then made to do.
+
 ## Out of scope (deferred — NOT in the C reference)
 
 zlevel / zstar ALE, local-zstar fallback, partial cells, `Z_3d_n`, the `w_i` advective
 terms, GM/Redi, KPP, sea ice. zstar is the user's future intent and needs C-side changes
-first. GM/KPP/ice are Phase 6.
+first. GM/KPP/ice are Phase 6. **Runoff activates with the ice freshwater budget in Phase 6 —
+see "Runoff handoff to Phase 6" above (reader + balance already done; pure-in-`water_flux`
+seam).**
 
 ## Revision Log
 
@@ -479,3 +561,21 @@ first. GM/KPP/ice are Phase 6.
   `fesom_sss_runoff_dump` (gated `FESOM_SSS_DUMP_DIR`/`_DAY`/`_SEC`/`_MONTH`) +
   `jobs/jax_sss_dump_core2.sh`. `ref_sss_local=1`, `surf_relax_S=1.929e-6`; no legacy month
   +1. Next: **Task 5.6 (wire surface BCs into the step + assemble CORE2 forcing)**.
+- **2026-06-06 — Task 5.6 DONE (wire surface BCs + assemble CORE2 forcing).** New
+  `fesom_jax/core2_forcing.py` (the per-step driver: bulk → sss_runoff → ice stress blend →
+  cal_shortwave_rad → bc_T/bc_S/sw_3d/stress_surf; host readers + device AD-safe math).
+  `tracer_diff` gained `bc_T`/`bc_S`/`sw_3d`; `forcing` gained `cal_shortwave_rad`;
+  `sss_runoff` gained `build_chl_clim`; `step`/`integrate` thread `step_forcing`/
+  `forcing_static` (pi path `None` ⇒ bit-identical). Verified vs a new CORE2 per-substep C
+  dump (job 25391647, 7 probes incl. Aleutian 94122): **step-1 T 7.1e-15 / S 2.1e-14**
+  (bit-exact), surface forcing 1e-13..1e-22, steps 2-3 ~1e-9. `test_surface_bc.py` (7) +
+  `test_core2_step.py` (5). **chl = Sweeney monthly** (C default). **Three bugs found+fixed:**
+  (1) ⚠️ the C "no-ice" run keeps a **static `a_ice=0.9` mask** (`fesom_ice_initial_state`,
+  IC SST<0) that gates cal_shortwave penetration + blends the momentum stress — **user review
+  decision: match the C** (replicate the mask, not truly-ice-free); (2) step-1 `T_old` is the
+  **constant base 10/35**, not PHC (pi-blob analog); (3) `fesom_bulk_compute` ignored
+  `FESOM_BULK_FIXED_ITERS` (only the dump fn honored it) → fixed-5-vs-early-break divergence
+  at calm/cold nodes (now wired). **Finding:** the balanced `water_flux` is inert in linfs ⇒
+  **runoff has no effect on the Phase-5 trajectory** (it feeds only the non-linfs ssh_rhs/ALE
+  paths). C edits on the `jax-mesh-export` branch; `jobs/jax_step_dump_core2.sh` untracked.
+  Next: **Task 5.7 (matched C dump run + CORE2 stability, 1-day + multi-day)**.

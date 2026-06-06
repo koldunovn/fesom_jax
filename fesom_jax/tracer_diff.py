@@ -10,12 +10,29 @@ Phase-2 simplifications (all verified against the dump config):
 * **No GM/Redi** (``gm=NULL``) ⇒ the isoneutral ``K33`` augmentations ``Ty/Ty1`` ≡ 0.
 * **No implicit vertical advection** (``do_wimpl=0`` — the C sets it false for FCT
   *and* ``use_wsplit=0``).
-* **No surface flux** (``bc_surface=0``): analytical forcing has zero
-  heat/water/virtual-salt/relax-salt flux.
-* **No shortwave penetration**: ``USE_SW_PENE`` is gated on ``use_jra`` and the dump
-  uses analytical forcing ⇒ ``sw_3d=0``.
 * **Full-cell linfs** ⇒ ``zbar_n=zbar``, ``Z_n=Z`` (static mid-layer depths), exactly
   as :func:`~fesom_jax.momentum.impl_vert_visc`.
+
+Surface boundary condition (Phase 5, Task 5.6). The C adds a surface forcing
+increment to the RHS at ``tr[nzmin]`` (``bc_surface``, ``fesom_tracer_diff.c:44-72``)
+and, for the temperature tracer, a shortwave-penetration flux divergence per layer
+(``:298-308``):
+
+* ``bc_surf`` — a per-node ``[nod2D]`` increment added to the surface layer's RHS.
+  For linfs: ``bc_T = −dt·heat_flux/vcpw`` (T) and ``bc_S = dt·(virtual_salt +
+  relax_salt)`` (S); built by :mod:`fesom_jax.core2_forcing`. ``None`` ⇒ 0 (the pi
+  analytical path: zero heat/water/virtual-salt/relax-salt flux).
+* ``sw_3d`` — the per-node, per-layer shortwave flux ``[nod2D, nl]``
+  (:func:`fesom_jax.forcing.cal_shortwave_rad`), consumed by the **T** tracer only as
+  the divergence ``(sw[nz] − sw[nz+1]·area[nz+1]/areasvol[nz])·dt`` added to every
+  valid layer's RHS. ``None`` ⇒ skip (the pi path: ``USE_SW_PENE`` is gated on
+  ``use_jra``, off under analytical forcing ⇒ ``sw_3d=0``).
+
+With ``bc_surf=None`` and ``sw_3d=None`` the result is **bit-identical** to the
+Phase-2 path (the 313 pi gates must not move). ``sw_3d`` is a per-step forcing
+*constant* (it depends only on the JRA shortwave + chl climatology + geometry, not on
+the model state), so it introduces no new AD path; ``bc_surf`` carries the
+differentiable SST→heat_flux / SST·S_top→virtual/relax_salt seam into the TDMA.
 
 The tridiagonal (per node, layer ``nz``):
 
@@ -48,9 +65,15 @@ def _shift_up(x):
     return jnp.concatenate([x[..., 1:], jnp.zeros_like(x[..., :1])], axis=-1)
 
 
-def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT):
+def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT,
+                       bc_surf=None, sw_3d=None):
     """Per-node implicit vertical diffusion of one tracer. Returns the updated
-    tracer ``[nod2D, nl]`` (``diff_ver_part_impl_ale``, ``fesom_tracer_diff.c:85``)."""
+    tracer ``[nod2D, nl]`` (``diff_ver_part_impl_ale``, ``fesom_tracer_diff.c:85``).
+
+    ``bc_surf`` (``[nod2D]`` or ``None``) is the surface forcing increment added to the
+    surface layer's RHS (``bc_surface``, ``:290``). ``sw_3d`` (``[nod2D, nl]`` or
+    ``None``) is the shortwave flux whose per-layer divergence is added to every valid
+    layer's RHS (T tracer only, ``:298-308``). Both ``None`` ⇒ the Phase-2 path."""
     nl = mesh.nl
     Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])           # (nl,) static mid-depths
     # Layer-center spacings. The padded tail (and the unused k=0 of dZ_up) is exactly
@@ -84,12 +107,28 @@ def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT):
     # RHS = the explicit vertical-diffusion operator on T (the C's tr[nz]).
     rhs = jnp.where(valid, a * (T - _shift_down(T)) + c * (T - _shift_up(T)), 0.0)
 
+    # Surface BC: add bc_surf to the surface layer's RHS (only on non-degenerate
+    # columns — `surf & valid` excludes a single-interface node the C `continue`s).
+    if bc_surf is not None:
+        rhs = rhs + jnp.where(surf & valid, bc_surf[:, None], 0.0)
+
+    # Shortwave penetration (T only): the per-layer flux divergence
+    # (sw[nz] − sw[nz+1]·area[nz+1]/areasvol[nz])·dt, added to every valid layer.
+    if sw_3d is not None:
+        sw_div = (sw_3d - _shift_up(sw_3d) * (_shift_up(area) / safe_av)) * dt
+        rhs = rhs + jnp.where(valid, sw_div, 0.0)
+
     dT = ops.tdma(a, b, c, rhs)
     return T + ops.mask_below_bottom(dT, valid)
 
 
-def impl_vert_diff(mesh: Mesh, T, S, Kv, hnode_new, *, dt: float = DT_DEFAULT):
+def impl_vert_diff(mesh: Mesh, T, S, Kv, hnode_new, *, dt: float = DT_DEFAULT,
+                   bc_T=None, bc_S=None, sw_3d=None):
     """Diffuse both tracers with the same ``Kv`` (``fesom_impl_vert_diff_tracers``,
-    ``fesom_tracer_diff.c:338``). Returns ``(T_new, S_new)``."""
-    return (impl_vert_diff_one(mesh, T, Kv, hnode_new, dt=dt),
-            impl_vert_diff_one(mesh, S, Kv, hnode_new, dt=dt))
+    ``fesom_tracer_diff.c:338``). Returns ``(T_new, S_new)``.
+
+    ``bc_T``/``bc_S`` are the per-tracer surface BC increments (``None`` ⇒ 0); ``sw_3d``
+    is the shortwave flux applied to **T only** (``None`` ⇒ off). All ``None`` ⇒ the
+    Phase-2 pi path (bit-identical)."""
+    return (impl_vert_diff_one(mesh, T, Kv, hnode_new, dt=dt, bc_surf=bc_T, sw_3d=sw_3d),
+            impl_vert_diff_one(mesh, S, Kv, hnode_new, dt=dt, bc_surf=bc_S, sw_3d=None))

@@ -49,7 +49,8 @@ S_FLOOR = 0.5
 
 
 def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
-         *, dt: float = DT_DEFAULT, is_first_step: bool = False) -> State:
+         *, dt: float = DT_DEFAULT, is_first_step: bool = False,
+         step_forcing=None, forcing_static=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -58,10 +59,30 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     ``params`` (a :class:`fesom_jax.params.Params`) carries the differentiable
     physics tunables (the PP backgrounds ``k_ver``/``a_ver``). ``None`` ⇒
     :meth:`Params.defaults` (the config constants — numerically identical to the
-    Phase-2 path). Pass a ``Params`` with traced leaves to take ``d(loss)/d(param)``."""
+    Phase-2 path). Pass a ``Params`` with traced leaves to take ``d(loss)/d(param)``.
+
+    **CORE2 forcing (Phase 5).** Pass ``step_forcing`` (a
+    :class:`fesom_jax.core2_forcing.StepForcing`, this step's atmosphere + SSS/chl) and
+    ``forcing_static`` (the :class:`~fesom_jax.core2_forcing.ForcingStatic` constants) to
+    drive the **bulk + SSS/runoff + shortwave-penetration** surface BCs: the bulk
+    ``stress_surf`` replaces the passed ``stress_surf`` (momentum), and the per-node
+    ``bc_T``/``bc_S`` + ``sw_3d`` feed the tracer diffusion. The bulk taps the
+    start-of-step ``state.T[:,0]`` (SST) and ``state.uvnode[:,0]`` (surface current), so
+    the SST→flux / current→stress feedback is differentiable. ``step_forcing=None`` ⇒ the
+    pi analytical path (static ``stress_surf``, zero surface BCs) — **bit-identical** to
+    Phase 2 (the 313 pi gates must not move)."""
     st = state
     if params is None:
         params = Params.defaults()
+
+    # CORE2 surface forcing (None ⇒ pi path: keep the passed stress_surf, zero BCs).
+    bc_T = bc_S = sw_3d = None
+    if step_forcing is not None:
+        from . import core2_forcing            # lazy: keep netCDF deps off the pi path
+        sfx = core2_forcing.compute_surface_fluxes(
+            mesh, st, step_forcing, forcing_static, dt=dt)
+        stress_surf = sfx.stress_surf
+        bc_T, bc_S, sw_3d = sfx.bc_T, sfx.bc_S, sfx.sw_3d
 
     # 1 — EOS / hydrostatic pressure / N²
     density, hpressure, bvfreq = eos.compute_pressure_bv(mesh, st.T, st.S, st.hnode)
@@ -111,7 +132,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                                              hnode_new, st.T, st.T_old, dt=dt)
     S_adv, S_old = tracer_adv.advect_one_fct(mesh, uv, w_e, st.helem, st.hnode,
                                              hnode_new, st.S, st.S_old, dt=dt)
-    T_new, S_new = tracer_diff.impl_vert_diff(mesh, T_adv, S_adv, Kv, hnode_new, dt=dt)
+    T_new, S_new = tracer_diff.impl_vert_diff(mesh, T_adv, S_adv, Kv, hnode_new, dt=dt,
+                                              bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d)
     # salinity floor on wet layers only (below-bottom stays 0)
     S_new = jnp.where(mesh.node_layer_mask, jnp.maximum(S_new, S_FLOOR), S_new)
 
@@ -137,12 +159,19 @@ step_jit = jax.jit(step, static_argnames=("dt", "is_first_step"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
-        params: Params = None, *, dt: float = DT_DEFAULT) -> State:
+        params: Params = None, *, dt: float = DT_DEFAULT,
+        step_forcings=None, forcing_static=None) -> State:
     """Run ``n_steps`` jitted forward steps from ``state`` (a plain Python loop;
     Phase 3 adds :func:`fesom_jax.integrate.integrate`, a checkpointed ``lax.scan``,
     for the differentiable path). ``is_first_step`` is set on the first iteration
-    only (the AB2 first-step branch)."""
+    only (the AB2 first-step branch).
+
+    For CORE2, pass ``step_forcings`` (a :class:`~fesom_jax.core2_forcing.StepForcing`
+    with leading axis ``[n_steps]``) + ``forcing_static``; step ``i`` consumes
+    ``step_forcings[i]``. ``None`` ⇒ the pi analytical path."""
     for i in range(n_steps):
+        sf = None if step_forcings is None else jax.tree.map(lambda x: x[i], step_forcings)
         state = step_jit(state, mesh, op, stress_surf, params, dt=dt,
-                         is_first_step=(i == 0))
+                         is_first_step=(i == 0), step_forcing=sf,
+                         forcing_static=forcing_static)
     return state

@@ -330,16 +330,27 @@ def build_and_cache_ic(mesh, path: str = DEFAULT_PHC_PATH,
     return res
 
 
-def core2_initial_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR):
+def core2_initial_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR,
+                        base_T: float = 10.0, base_S: float = 35.0):
     """Build a CORE2 :class:`~fesom_jax.state.State` from the cached PHC IC: a rest
     state (uv=0, eta=0, ``hnode`` from ``zbar_3d_n``) with ``T``/``S`` set to the PHC
-    fields. ⚠️ ``T_old``/``S_old`` (the AB2 step-1 history) are set to the PHC fields
-    here as a default; the exact step-1 ``valuesold`` is finalized in Task 5.7 against
-    the per-substep dump (cf. the pi ``T_old`` lesson)."""
+    fields.
+
+    ⚠️ **``T_old``/``S_old`` (the AB2 step-1 history) are the CONSTANT BASE
+    (``base_T``/``base_S`` = 10/35), NOT the PHC field.** The C sets
+    ``values = constant 10/35`` (``fesom_main.c:413``), runs the rest-sanity
+    ``advect_one`` which saves ``valuesold = values = 10/35`` (``:724-756``), and only
+    THEN loads PHC into ``values`` (``:778``) — leaving ``valuesold`` at the base. So at
+    step 1 ``ttfAB = −(0.5+ε)·base + (1.5+ε)·PHC``, not ``PHC``. This is the CORE2 analog
+    of the pi ``T_old``-is-the-pre-blob-base lesson; using ``T_old=PHC`` corrupts the
+    step-1 FCT advection (~2e-3 in surface T)."""
     import jax.numpy as jnp
     from .state import State
     ic_dir = Path(ic_dir)
     T = jnp.asarray(np.load(ic_dir / "T_ic.npy"))
     S = jnp.asarray(np.load(ic_dir / "S_ic.npy"))
-    st = State.rest(mesh, T0=0.0, S0=0.0)
-    return dataclasses.replace(st, T=T, S=S, T_old=T, S_old=S)
+    mask = mesh.node_layer_mask
+    T_old = jnp.where(mask, base_T, 0.0)
+    S_old = jnp.where(mask, base_S, 0.0)
+    st = State.rest(mesh, T0=base_T, S0=base_S)            # hnode/helem from zbar_3d_n
+    return dataclasses.replace(st, T=T, S=S, T_old=T_old, S_old=S_old)

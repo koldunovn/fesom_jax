@@ -42,7 +42,7 @@ from .step import step
 
 def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
               params: Params = None, *, dt: float = DT_DEFAULT,
-              checkpoint: bool = True) -> State:
+              checkpoint: bool = True, step_forcings=None, forcing_static=None) -> State:
     """Integrate ``n_steps`` ocean timesteps from ``state`` via a checkpointed scan.
 
     Returns the final :class:`~fesom_jax.state.State`. Differentiable end-to-end
@@ -54,22 +54,46 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
     ``jax.jit`` pass them via ``static_argnames`` (see :data:`integrate_jit`). With
     ``checkpoint=False`` the body is not rematerialized — same forward value, but the
     backward pass stores all intermediates (the un-checkpointed baseline, for the
-    memory comparison). ``params=None`` ⇒ the config-constant baseline."""
+    memory comparison). ``params=None`` ⇒ the config-constant baseline.
+
+    **CORE2 forcing.** Pass ``step_forcings`` (a
+    :class:`~fesom_jax.core2_forcing.StepForcing` stacked with leading axis
+    ``[n_steps]``) + ``forcing_static`` to drive the bulk/SSS/shortwave surface BCs:
+    step 1 consumes ``step_forcings[0]`` (eager), the scan carries
+    ``step_forcings[1:]`` as ``xs``. ``None`` ⇒ the pi analytical path (unchanged)."""
     if params is None:
         params = Params.defaults()
 
-    # Step 1 eagerly (the AB2 first-step branch) so the scan body is uniform.
-    state = step(state, mesh, op, stress_surf, params, dt=dt, is_first_step=True)
+    if step_forcings is None:
+        # pi path (unchanged): static stress_surf, no per-step forcing, xs=None.
+        state = step(state, mesh, op, stress_surf, params, dt=dt, is_first_step=True)
+        if n_steps <= 1:
+            return state
+
+        def body(carry, _):
+            nxt = step(carry, mesh, op, stress_surf, params, dt=dt, is_first_step=False)
+            return nxt, None
+
+        body_fn = jax.checkpoint(body) if checkpoint else body
+        state, _ = lax.scan(body_fn, state, xs=None, length=n_steps - 1)
+        return state
+
+    # CORE2 path: step 1 eager with step_forcings[0]; scan the rest as xs.
+    sf0 = jax.tree.map(lambda x: x[0], step_forcings)
+    state = step(state, mesh, op, stress_surf, params, dt=dt, is_first_step=True,
+                 step_forcing=sf0, forcing_static=forcing_static)
     if n_steps <= 1:
         return state
 
-    # Scan steps 2..N with is_first_step=False baked in; close over the invariants.
-    def body(carry, _):
-        nxt = step(carry, mesh, op, stress_surf, params, dt=dt, is_first_step=False)
+    rest = jax.tree.map(lambda x: x[1:], step_forcings)
+
+    def body_core(carry, sf):
+        nxt = step(carry, mesh, op, stress_surf, params, dt=dt, is_first_step=False,
+                   step_forcing=sf, forcing_static=forcing_static)
         return nxt, None
 
-    body_fn = jax.checkpoint(body) if checkpoint else body
-    state, _ = lax.scan(body_fn, state, xs=None, length=n_steps - 1)
+    body_fn = jax.checkpoint(body_core) if checkpoint else body_core
+    state, _ = lax.scan(body_fn, state, xs=rest)
     return state
 
 
