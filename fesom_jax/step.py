@@ -50,7 +50,7 @@ S_FLOOR = 0.5
 
 def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
          *, dt: float = DT_DEFAULT, is_first_step: bool = False,
-         step_forcing=None, forcing_static=None) -> State:
+         step_forcing=None, forcing_static=None, ice_cfg=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -76,13 +76,24 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         params = Params.defaults()
 
     # CORE2 surface forcing (None ⇒ pi path: keep the passed stress_surf, zero BCs).
+    # ``ice_cfg`` (an IceConfig) ⇒ the Phase-6 PROGNOSTIC sea-ice step (ocean2ice → EVP → FCT
+    # → cut_off → thermo → oce_fluxes → stress blend → shortwave); else the Phase-5 static-ice
+    # surface fluxes. Both produce stress_surf + bc_T/bc_S/sw_3d for the ocean step below.
     bc_T = bc_S = sw_3d = None
+    ice_out = None
     if step_forcing is not None:
-        from . import core2_forcing            # lazy: keep netCDF deps off the pi path
-        sfx = core2_forcing.compute_surface_fluxes(
-            mesh, st, step_forcing, forcing_static, dt=dt)
-        stress_surf = sfx.stress_surf
-        bc_T, bc_S, sw_3d = sfx.bc_T, sfx.bc_S, sfx.sw_3d
+        if ice_cfg is not None:
+            from . import ice_step as _ice_step       # lazy: keep ice deps off the pi path
+            ice_out = _ice_step.ice_surface_step(
+                ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt)
+            stress_surf = ice_out.stress_surf
+            bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
+        else:
+            from . import core2_forcing            # lazy: keep netCDF deps off the pi path
+            sfx = core2_forcing.compute_surface_fluxes(
+                mesh, st, step_forcing, forcing_static, dt=dt)
+            stress_surf = sfx.stress_surf
+            bc_T, bc_S, sw_3d = sfx.bc_T, sfx.bc_S, sfx.sw_3d
 
     # 1 — EOS / hydrostatic pressure / N²
     density, hpressure, bvfreq = eos.compute_pressure_bv(mesh, st.T, st.S, st.hnode)
@@ -140,7 +151,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # 16 — commit thickness (hnode := hnode_new; helem = vertex mean)
     hnode, helem = ale.commit_thickness(mesh, hnode_new)
 
-    return dataclasses.replace(
+    new = dataclasses.replace(
         st,
         T=T_new, S=S_new, T_old=T_old, S_old=S_old,
         uv=uv, uv_rhs=du, uv_rhsAB=uv_rhsAB, uvnode=uvnode,
@@ -150,17 +161,24 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         density=density, hpressure=hpressure, bvfreq=bvfreq, Kv=Kv, Av=Av,
         pgf_x=pgf_x, pgf_y=pgf_y,
     )
+    # Phase 6: carry the updated prognostic ice state (the ice step ran before the ocean step).
+    if ice_out is not None:
+        new = dataclasses.replace(
+            new, a_ice=ice_out.a_ice, m_ice=ice_out.m_ice, m_snow=ice_out.m_snow,
+            u_ice=ice_out.u_ice, v_ice=ice_out.v_ice, t_skin=ice_out.t_skin,
+            sigma11=ice_out.sigma11, sigma12=ice_out.sigma12, sigma22=ice_out.sigma22)
+    return new
 
 
 # Jitted entry point (the Task-2.11 deliverable; also what Phase 3's lax.scan wraps).
 # ``mesh``/``op``/``state``/``stress_surf`` are pytree args; ``dt``/``is_first_step``
 # are static (the latter ⇒ two compiled variants: the step-1 AB2 branch and the rest).
-step_jit = jax.jit(step, static_argnames=("dt", "is_first_step"))
+step_jit = jax.jit(step, static_argnames=("dt", "is_first_step", "ice_cfg"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         params: Params = None, *, dt: float = DT_DEFAULT,
-        step_forcings=None, forcing_static=None) -> State:
+        step_forcings=None, forcing_static=None, ice_cfg=None) -> State:
     """Run ``n_steps`` jitted forward steps from ``state`` (a plain Python loop;
     Phase 3 adds :func:`fesom_jax.integrate.integrate`, a checkpointed ``lax.scan``,
     for the differentiable path). ``is_first_step`` is set on the first iteration
@@ -173,5 +191,5 @@ def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         sf = None if step_forcings is None else jax.tree.map(lambda x: x[i], step_forcings)
         state = step_jit(state, mesh, op, stress_surf, params, dt=dt,
                          is_first_step=(i == 0), step_forcing=sf,
-                         forcing_static=forcing_static)
+                         forcing_static=forcing_static, ice_cfg=ice_cfg)
     return state
