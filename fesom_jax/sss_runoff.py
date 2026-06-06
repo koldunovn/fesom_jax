@@ -244,7 +244,8 @@ def _area_mean(x, areasvol_surf, ocean_area):
 
 
 def sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,
-                      areasvol_surf, ocean_area, open_water=None) -> SSSFluxes:
+                      areasvol_surf, ocean_area, open_water=None,
+                      balance_water_flux=True) -> SSSFluxes:
     """AD-safe port of the ``oce_fluxes`` salt + water balance
     (``fesom_sss_runoff_step:382-440``). Pure, differentiable function:
 
@@ -257,6 +258,13 @@ def sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,
     The global-mean subtractions skip cavity nodes (``open_water=False``); on CORE2 there
     are none, so ``open_water`` defaults to all-True. ``virtual_salt`` uses the **bulk**
     (pre-balance) ``water_flux``, matching the C ordering (balance is step 4, last).
+
+    ``balance_water_flux`` — the no-ice (Phase-5 standalone ``fesom_sss_runoff_step``) path
+    adds the ``⟨water_flux + runoff⟩`` term (default ``True``). The **ice-on** path
+    (``fesom_ice_oce_fluxes``, ``fesom_ice_coupling.c:125-179``) does the virtual_salt +
+    relax_salt balancing but **NOT** this term — runoff is already inside ``flx_fw`` and
+    ``water_flux = -flx_fw`` is taken as-is. Pass ``False`` from the ice coupling. The
+    returned ``water_flux`` is then the input unchanged.
 
     All ops are smooth (multiply / sum / divide-by-constant ``ocean_area``); ``areasvol_surf``
     and ``ocean_area`` are strictly positive, so no AD guards are needed — ``d/d(water_flux)``
@@ -278,9 +286,11 @@ def sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,
                            relax_salt - _area_mean(relax_salt, areasvol_surf, ocean_area),
                            relax_salt)
 
-    # water balance (C:419-440) — add ⟨water_flux + runoff⟩ to every node.
-    flux = water_flux + runoff_node
-    water_flux_bal = water_flux + _area_mean(flux, areasvol_surf, ocean_area)
+    # water balance (C:419-440) — add ⟨water_flux + runoff⟩ to every node. The ice-on path
+    # (balance_water_flux=False) skips it (runoff is already inside flx_fw → water_flux).
+    if balance_water_flux:
+        flux = water_flux + runoff_node
+        water_flux = water_flux + _area_mean(flux, areasvol_surf, ocean_area)
 
     return SSSFluxes(virtual_salt=virtual_salt, relax_salt=relax_salt,
-                     water_flux=water_flux_bal)
+                     water_flux=water_flux)
