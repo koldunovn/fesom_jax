@@ -1,10 +1,10 @@
 # Next-session prompt — FESOM2 → JAX port
 
 Paste the block below to start the next session. **Phases 0–4 COMPLETE (GATEs 0/1/2/3/4).
-Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1–5.6 DONE;
-Task 5.7 (matched C dump run + CORE2 stability, 1-day + multi-day) is NEXT.** Full suite
-**370 passing** (pi 313 + CORE2 additions: `test_surface_bc.py` +7, `test_core2_step.py` +5,
-and the earlier 5.1–5.5 tests).
+Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1–5.7 DONE;
+Task 5.8 (GATE 5 — gradient on a CORE2 slice) is NEXT and is the LAST Phase-5 task.** Full
+suite **371 passing** (pi 313 + CORE2 additions: `test_surface_bc.py` +7, `test_core2_step.py`
++6 incl. the new Task-5.7 per-substep dynamics gate, and the 5.1–5.5 module tests).
 
 The pi model is fully ported, dump-gated, jitted, differentiable end-to-end, 1000-step
 stable. Phase 5 runs that same physics (PP + **linfs** + FCT + opt_visc7, **no GM/KPP/ice**)
@@ -12,26 +12,25 @@ on the **CORE2 mesh** with PHC initial conditions and real JRA55+SSS+runoff forc
 verified per-substep against a CORE2 C-port dump (**Path A**). DONE: CORE2 mesh exported +
 loads zero-code (CW-orientation guard); **PHC IC** ported (numpy, ~1e-14); **JRA55-do
 reader** ported (numpy, **bit-exact**); **L&Y09 bulk** ported (AD-safe, ~1e-13);
-**SSS-restoring + runoff** ported (numpy + AD-safe); and **Task 5.6 — the assembled CORE2
-step**: surface BCs (`bc_T`/`bc_S`/`sw_3d`) + the bulk/SSS/shortwave/ice-mask forcing wired
-into `step`/`integrate`, verified vs a new per-substep CORE2 C dump at **step-1 post-step T
-7.1e-15 / S 2.1e-14 (bit-exact)**, steps 2-3 ~1e-9. **The full single-device CORE2 model now
-runs and matches the C per-substep.** Task 5.7 = generate the matched multi-step dump + run
-1-day/multi-day for stability; Task 5.8 = GATE 5 (gradient on a CORE2 slice).
+**SSS-restoring + runoff** ported (numpy + AD-safe); **Task 5.6 — the assembled CORE2 step**
+(surface BCs wired, step-1 post-step T/S **bit-exact** vs the C dump); and now **Task 5.7 —
+the matched C dump run + CORE2 stability**: per-substep **dynamics** gates added (step-1
+bit-exact class), and the full assembled model run **jitted** 1-day + multi-day, cross-checked
+against a matched C arbiter. **The single-device CORE2 model now runs, matches the C
+per-substep at step 1, and is numerically stable for ~a week** (the only no-ice limitation is
+unbounded high-lat supercooling, shared with the C — see the finding). Task 5.8 = GATE 5
+(gradient on a CORE2 slice + the new SST→flux / current→stress feedbacks).
 
-**JAX committed on `main`** through Task 5.6 (`7ca598f` Task 5.6, `d906750` 5.5, `c1aa677`
-5.4, `5ab28af` 5.3, `d4fcdb2` 5.2, `4b34f6a` 5.1). C-side dump additions on the port2
-`jax-mesh-export` branch through Task 5.6 (`cfb4b5e` Task 5.6 — `fesom_dump.c` env probes,
-`fesom_step.c` surf dump, `fesom_bulk.c` `FESOM_BULK_FIXED_ITERS` in `fesom_bulk_compute`;
-`78b1df1` 5.5) — ⚠️ **keep all C commits on that branch, never on port2 main**
-(user); port2 is otherwise the user's — no housekeeping. **CORE2 data artifacts live on
-`/work`** — `port_jax/data` is a **symlink** to `/work/ab0995/a270088/port_jax/data`
-(gitignored; user rule "large files on /work not /home"). New C job scripts live **untracked**
-in `port2/fesom2_port/jobs/` (`jax_*_core2.sh`, incl. `jax_step_dump_core2.sh`). The C dump
-hooks (`dump_jra_fields`, `fesom_bulk_dump`, `fesom_sss_runoff_dump`, the per-substep
-`fesom_dump.c` + the new surface-forcing records in `fesom_step.c`) are dump-only, env-gated.
-⚠️ **Cheap C jobs: use `-p compute --time=00:30:00` (fast debug QOS), not `-p shared`** (~16 s
-to start vs minutes).
+**JAX committed on `main`** through Task 5.7 (`50373ef` Task 5.7, `7ca598f` 5.6, `d906750` 5.5,
+`c1aa677` 5.4, `5ab28af` 5.3, `d4fcdb2` 5.2, `4b34f6a` 5.1). C-side dump additions on the
+port2 `jax-mesh-export` branch through Task 5.6 (`cfb4b5e`). **Task 5.7 added NO C source
+changes** — only a new untracked job script `port2/fesom2_port/jobs/jax_core2_stability.sh`
+(the stability arbiter; ⚠️ **C job scripts stay untracked** per user; port2 is otherwise the
+user's — no housekeeping). **CORE2 data artifacts live on `/work`** — `port_jax/data` is a
+**symlink** to `/work/ab0995/a270088/port_jax/data` (gitignored). ⚠️ **Cheap C jobs:
+`-p compute --time=00:30:00` (fast debug QOS); a LONG C run (the stability arbiter, ~4.6 s/step
+single-rank) needs a non-debug QOS (`--time=02:30:00`). JAX GPU jobs: `-A ab0995_gpu -p gpu
+--gres=gpu:1`.**
 
 ---
 
@@ -42,148 +41,126 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
 ## START HERE, in order
 1. **Phase-5 sub-plan (source of truth for Phase 5):**
    `docs/plans/20260606-fesom-jax-core2.md` — the scope correction (§0), Path A, the task
-   ladder 5.1–5.8 with per-task gates, the 5 module research briefs, risks. **Tasks 5.1–5.6
-   are ticked DONE; 5.7 is next.**
+   ladder 5.1–5.8 with per-task gates. **Tasks 5.1–5.7 are ticked DONE; 5.8 is next (the
+   final Phase-5 task).**
 2. **Main plan:** `docs/plans/20260605-fesom-jax-port.md` — decisions, the verification
    ladder, the Revision Log. Phase 5 there is the outline; the sub-plan supersedes it.
-3. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the **Phase 5** entries:
-   the linfs-not-zlevel scope rule, the **pi↔CORE2 orientation trap**, the netCDF4 env note,
-   the PHC sequential-GS extrap, the JRA cancellation/bit-exact-gather trap, the bulk
-   fixed-5≠early-break finding, the SSS **Jacobi-fill-vectorizes** + **÷ocean_area crushes the
-   global-mean** lessons, the "no invented modeling choice" rule, and the **Task 5.6** entries:
-   the **static-ice-mask** ("no ice" ≠ ice-free), the **`T_old`-is-base** trap, the
-   **`fesom_bulk_compute` fixed-iters** flag, and the **runoff-inert-in-no-ice** finding +
-   the Phase-6 runoff activation spec. **STANDING RULE: append a lesson per task.**
+3. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the **Phase 5** entries
+   through **Task 5.7** (the no-ice-supercooling-is-physical finding, the C-arbiter
+   3-sig-fig-tracking method, the step-1-bit-exact-vs-steps-2/3-diverge calibration, the
+   dump node/element probe layout, the GPU/CPU/eager timings). **STANDING RULE: append a
+   lesson per task.**
 4. **Project memory:** `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
-5. For 5.7: the **assembled CORE2 model is `fesom_jax/core2_forcing.py`** (the per-step driver:
-   `build_core_forcing(mesh, year, sst_ic=…)` → `CoreForcing`; `compute_surface_fluxes`) +
-   `step(..., step_forcing, forcing_static)` / `integrate(..., step_forcings, forcing_static)`.
-   Build the IC with `phc_ic.core2_initial_state` (⚠️ **`T_old`=const base 10/35, not PHC**).
-   `dates_for_steps(1958, 500, N)` gives the per-step `(year,day,sec,month)`. The step-1 gate
-   lives in `tests/test_core2_step.py`; the dump is `data/step_dump_core2/core2_cdump.00000`
-   (regen via `port2/jobs/jax_step_dump_core2.sh`). For 5.7: run **JITTED** `run`/`integrate`
-   (eager CORE2 step ~32 s) for 1-day (~172 steps) + multi-day; watch the Aleutian Trench
-   (node 94122). The C `fesom_dump.c` now reads `FESOM_DUMP_PROBES` (re-pin per run) and dumps
-   the surface forcing at `DUMP_SUB_INIT`.
+5. For 5.8: the **gradient gate is `tests/test_gradient.py`** (pi: `d(mean SST)/d(k_ver)` &
+   `d(.../d(a_ver)` AD↔FD plateau through the CG `custom_linear_solve` + `d(loss)/d(T₀)`
+   finite incl. masked lanes). The **assembled CORE2 model** is `core2_forcing.py` +
+   `step(..., step_forcing, forcing_static)` / `integrate(..., step_forcings, forcing_static)`
+   (checkpointed `lax.scan`, `integrate_jit`). Build the IC with
+   `phc_ic.core2_initial_state(mesh, IC_DIR)` (⚠️ `T_old`=const base 10/35) and the forcing
+   with `core2_forcing.build_core_forcing(mesh, 1958, sst_ic=state.T[:,0])` +
+   `cf.stack(dates_for_steps(1958, 500, N))`. The new Phase-5 differentiable seams are in
+   `forcing.bulk_surface_fluxes` (`d(heat_flux)/d(SST)`, `d(stress)/d(current)`) — all
+   AD-safe by construction (double-`where` safe-sqrt). A reusable forward driver +
+   monitor is `scripts/core2_stability_run.py` (jitted; A100 ~0.06 s/step).
 
 ## STATUS
-- **Phases 0–4 (GATEs 0–4):** full single-step pi model (`step.py`, substeps 1–16),
-  checkpointed `lax.scan` (`integrate.py`), CG `custom_linear_solve`, FCT + opt_visc7,
-  pi 1000-step stable, `test_gradient.py` plateau 5.70e-7. All committed.
+- **Phases 0–4 (GATEs 0–4):** full single-step pi model (`step.py`), checkpointed `lax.scan`
+  (`integrate.py`), CG `custom_linear_solve`, FCT + opt_visc7, pi 1000-step stable,
+  `test_gradient.py` plateau 5.70e-7. All committed.
 - **Phase 5 — scope (user-confirmed, do NOT re-litigate):** the C port (`fesom2_port`) is a
-  **deliberately simplified** FESOM — **linfs-only, full-cell, no cavities**. So Phase 5 =
-  pi physics on the CORE2 mesh + PHC IC + JRA55/SSS/runoff. **NOT zlevel/zstar/partial-cells/
-  w_i** (absent from the C port). **zstar is future work** — keep a `which_ale` design seam,
-  don't port it now. Reference = **Path A** (per-substep CORE2 C dump at the matched config:
-  `FESOM_MIX_SCHEME=PP FESOM_NO_GMREDI=1 FESOM_NO_ICE_*=1`, dt=500).
-- **Task 5.1 DONE:** CORE2 mesh exported (`data/mesh_core2/`, job 25386129) — `load_mesh`
-  works **zero-code**. **Orientation guard added** (`mesh.check_cw_orientation`): the C
-  `orient_cw` swapped 244654/244659 CORE2 elements CCW→CW; the guard raises on any non-CW mesh.
-  `test_mesh_core2.py` (12) + `test_step_core2.py` rest-state (max|uv|=1.8e-14).
-- **Task 5.2 DONE:** `fesom_jax/phc_ic.py` — faithful numpy port of `fesom_phc.c` (bilinear +
-  **sequential-GS** `extrap_nod3D` + `ptheta`); matches the C surface dump to **~1e-14**. Cache
-  `data/ic_core2/{T,S}_ic.npy`; `core2_initial_state` builds the State. `test_phc_ic.py` (5).
-- **Task 5.3 DONE:** `fesom_jax/jra55.py` — faithful numpy port of `fesom_jra55.c` (julday +
-  mid-interval-shift time grid + shared bilinear stencil + wind g2r rotation). Verified vs a C
-  all-node dump (job 25388630): **6 scalar fields bit-exact**, wind ~3.5e-15. `test_jra55.py` (5).
-  ⚠️ **#1 trap:** the time-interp cancels two ~2.4e6 Julian-day numbers → a folded-weight gather's
-  ~1e-13 reassociation blew to ~6e-8; fixed by a **bit-identical `(s·dx)·dy` divide-at-end gather**.
-- **Task 5.4 DONE:** `fesom_jax/forcing.py` — AD-safe port of `fesom_bulk.c`
-  (`ncar_ocean_fluxes_mode` fixed-5 unrolled + `obudget` + `bulk_surface_fluxes`, node→elem
-  mean-of-3). Verified vs a C `bulk_dump_*` dump (job 25389451): **cd/ce/ch ~1e-17, heat_flux
-  ~6e-13, stress ~5e-16**. `test_forcing.py` (10). ⚠️ **fixed-5 ≠ early-break at calm nodes**
-  (`ch` up to 88%, but heat_flux ≤7 W/m² at ~4 nodes); JAX runs fixed-5 vs a **fixed-5** C dump
-  (`FESOM_BULK_FIXED_ITERS=1`). `USE_SW_PENE=1` ⇒ shortwave penetration deferred to **5.6**
-  (`heat_flux = qns−qsr`, pre-penetration).
-- **Task 5.5 DONE:** `fesom_jax/sss_runoff.py` — numpy readers (`interp_2d_field` **lat-clamp /
-  lon-cyclic-wrap** bilinear + the 30-cell **Jacobi** missing-fill via
-  `scipy.ndimage.uniform_filter`) → `Ssurf_clim[12,nod2D]` + `runoff_node[nod2D]` (/1000); +
-  AD-safe `sss_runoff_fluxes` (`virtual_salt=S_top·water_flux`, `relax_salt=
-  surf_relax_S·(Ssurf−S_top)`, each minus its **area-weighted global mean**; then
-  `water_flux += ⟨water_flux+runoff⟩`). Verified vs a new C `sss_dump_*` all-node dump (job
-  25390216, year 1958, `data/sss_dump_core2/`) at 2 months — m1 (Jan/day1) + m4 (Apr/day100
-  **month crossing**): **runoff bit-exact** (max|Δ|=0), **Ssurf bit-exact at 105148/126858**
-  ocean-bracket nodes (95p ~3.6e-14, max 2.8e-12 at ~35 coastal fill nodes),
-  **virtual_salt/relax_salt/water_flux ~1e-20** (fed the C's own inputs, the ÷`ocean_area`=3.6e14
-  crushes the global-mean reduction). Both AD seams flow. `test_sss_runoff.py` (9).
-  `ref_sss_local=1`, `surf_relax_S=1.929e-6`; **no legacy month +1**. New C `fesom_sss_runoff_dump`
-  + `jax_sss_dump_core2.sh`.
-- **Task 5.6 DONE:** the **assembled CORE2 step**. `fesom_jax/core2_forcing.py` (per-step driver:
-  bulk → sss_runoff → **ice stress blend** → `cal_shortwave_rad` → `bc_T`/`bc_S`/`sw_3d`/
-  `stress_surf`); `tracer_diff` gained `bc_T`/`bc_S`/`sw_3d`; `forcing` gained `cal_shortwave_rad`;
-  `step`/`integrate` thread `step_forcing`/`forcing_static` (pi path `None` ⇒ **bit-identical**).
-  Verified vs a new per-substep CORE2 C dump (job 25391647, 7 probes incl. Aleutian 94122,
-  `FESOM_BULK_FIXED_ITERS=1`): **step-1 post-step T 7.1e-15 / S 2.1e-14** (bit-exact — the
-  comprehensive gate), surface forcing 1e-13..1e-22, dynamics density 2.3e-13 / uv 1e-10 /
-  d_eta 2e-9, steps 2-3 T/S ~1e-9. `test_surface_bc.py` (7) + `test_core2_step.py` (5).
-  **chl = Sweeney monthly** (C default; constant-0.1 seam kept). ⚠️ **THREE bugs found+fixed**
-  (full detail in PORTING_LESSONS.md): (1) the C "no-ice" run keeps a **static `a_ice=0.9` mask**
-  (IC SST<0) gating cal_shortwave penetration + the momentum stress blend — **user decision:
-  match it** (`ice_ic_aice`); (2) step-1 `T_old`=const base 10/35, NOT PHC; (3) `fesom_bulk_compute`
-  didn't honor `FESOM_BULK_FIXED_ITERS`. **Finding: runoff is inert in linfs** (the balanced
-  `water_flux` feeds only non-linfs paths).
+  **deliberately simplified** FESOM — **linfs-only, full-cell, no cavities**. Phase 5 = pi
+  physics on CORE2 + PHC IC + JRA55/SSS/runoff. **NOT zlevel/zstar/partial-cells/w_i** (absent
+  from the C port; zstar = future work, keep the `which_ale` seam, don't port now). Reference =
+  **Path A** (per-substep CORE2 C dump at `FESOM_MIX_SCHEME=PP FESOM_NO_GMREDI=1
+  FESOM_NO_ICE_*=1 FESOM_BULK_FIXED_ITERS=1`, dt=500).
+- **Tasks 5.1–5.6 DONE** (see the sub-plan Revision Log for the per-task detail): mesh export
+  (zero-code load + CW-orientation guard), PHC IC (~1e-14), JRA55 reader (bit-exact), L&Y09
+  bulk (AD-safe ~1e-13), SSS/runoff (numpy readers + AD-safe balance), and the assembled CORE2
+  step (surface BCs wired; step-1 post-step **T 7.1e-15 / S 2.1e-14 bit-exact**; the static
+  `a_ice` mask + `T_old`=base + `FESOM_BULK_FIXED_ITERS` bugs found & fixed).
+- **Task 5.7 DONE — matched C dump run + CORE2 stability.** Two parts:
+  - **Per-substep dynamics gates** (`test_core2_step.py`, +1 test): step-1 pressure / PGF / Av /
+    uv_rhs / ssh_rhs / d_eta / uv / hbar / eta_n / w / hnode are **bit-exact class** (JAX & C
+    share the PHC IC; pre-solve ~0..1e-17, CG-derived ~1e-16..8e-15; the big intermediates
+    `ssh_rhs`~1e5 / `pressure`~5e5 match ~1e-11 *relative*). Element fields gated at the dump's
+    **incident-element** gids (`_emaxabs`). `test_evolution_steps23` extended (uv/d_eta steps
+    2-3 ~1e-6 — the discrete CG iter-count + FCT amplify the step-1 ~1e-15; bounded).
+  - **Stability run** (`scripts/core2_stability_run.py` + `core2_stability_gpu.sh`, A100 jitted
+    ~0.06 s/step): **numerically stable days 1–7** (no NaN; max|vel| ≤ 1.9 < 3; |SSH| ≤ 2.8 < 5;
+    Aleutian 94122 calm/warm). The matched **C arbiter** (`jobs/jax_core2_stability.sh`) is
+    stable too, and JAX **tracks it to 3 sig figs** on SST_min/max|uv|/max|eta| (step 216:
+    −6.60=−6.60, 1.389≈1.39, 2.715≈2.71).
+  - ⚠️ **FINDING (anticipated risk #1, NOT a bug):** with no sea ice the SST **supercools
+    without bound** (−1.9 IC → −16.5 day 5 → −22.8 day 8); past the JM-EOS-valid range
+    (~−20 °C) the spurious density field destabilizes the dynamics at **model day ~8.1**
+    (max|vel|>3). **The C does the same** ⇒ the no-ice run does NOT numerically blow up, ice
+    stays Phase 6, and a physically realistic SST simply needs the ice cap. The "C blows up ⇒
+    move ice to Phase 5" trigger did **not** fire.
 
-## IMMEDIATE WORK — Task 5.7 onward (the sub-plan has the full ladder + gates)
-**5.6 is DONE** (assembled step + surface forcing, step-1 bit-exact vs the C dump). Remaining:
-- **5.7 matched C dump run + CORE2 stability:**
-  - **Per-substep dump already exists** (`data/step_dump_core2/core2_cdump.00000`, 3 steps,
-    7 probes incl. Aleutian 94122). For more steps / more probes: edit `FESOM_DUMP_PROBES` +
-    `FESOM_DUMP_MAXSTEPS` + `NSTEPS` in `port2/jobs/jax_step_dump_core2.sh` and resubmit
-    (`-p compute --time=00:30:00`). Extend `test_core2_step.py`'s per-substep dynamics gates
-    (uv/d_eta/w with calibrated tolerances — d_eta ~2e-9 since CORE2 CG takes ~43 iters).
-  - **Assemble + run CORE2 1-day + multi-day:** `integrate`/`run` with stacked `step_forcings`
-    (`CoreForcing.stack(dates_for_steps(1958, 500, N))`) + `forcing_static`. ⚠️ **Use the
-    JITTED `run`/`integrate`** — eager CORE2 step ~32 s/step. 1-day = ~172 steps; assert stable
-    per FRESH_START §15 (no NaN, SST∈[−2,35], |SSH|<5 m, max|vel|<3 m/s). **Watch the Aleutian
-    Trench (node 94122).** GPU sbatch if CPU is too slow.
-  - ⚠️ **Stability risk:** PHC IC + JRA55 + the static ice mask, no ice physics, dt=500. The
-    matched C run is the arbiter — if the C itself blows up, that's a finding (the static
-    `a_ice` mask damps high-lat wind stress, so it's somewhat protective; see the 5.6 lessons).
-  - **Gate:** step-1 dump-tight (done); 1-day + multi-day stable. **Lesson:** append.
-- **5.8 GATE 5 — gradient on a CORE2 slice:** re-run `test_gradient.py` on a small CORE2 slice
-  (`d(SST)/d(k_ver)` AD↔FD plateau through the CG; `d(loss)/d(T₀)` finite incl. masked lanes) +
-  the **NEW** Phase-5 feedbacks `d(heat_flux)/d(SST)` and `d(stress)/d(current)` (the bulk +
-  the ice-ocean drag seams — AD-safe by construction, see the 5.6 AD lesson). Confirm the
-  checkpointed backward fits the A100 at CORE2 scale (drop N or O(√N) nesting; pi N=200 was
-  4.23 GB). GPU sbatch. **Lesson:** append.
+## IMMEDIATE WORK — Task 5.8 (GATE 5; the LAST Phase-5 task)
+**5.8 GATE 5 — gradient check on a CORE2 slice** (sub-plan has the full gate). GPU sbatch
+(`-A ab0995_gpu -p gpu --gres=gpu:1`; model the job on `scripts/phase3_grad_memory.sbatch` /
+`core2_stability_gpu.sh`):
+- **Re-run the permanent AD gate on a CORE2 slice (small N):** `d(mean SST)/d(k_ver)` AD↔FD
+  plateau (signal-lifted `k_ver`) flowing through the CG `custom_linear_solve`; `d(loss)/d(T₀)`
+  finite everywhere incl. masked lanes (the strong masked-NaN probe). Use a **small step count**
+  and (if memory needs) a CORE2 sub-slice / O(√N) nested checkpointing.
+- **NEW Phase-5 differentiable feedbacks:** `d(heat_flux)/d(SST)` and `d(stress)/d(surface_
+  current)` AD vs FD (the bulk's differentiable seam — the whole point of real forcing for
+  hybrid ML). Stay clear of the bulk's `where`/safe-sqrt kinks (modest perturbations). ⚠️ keep
+  the perturbations in the **EOS-valid SST range** (the no-ice supercooling means a long CORE2
+  forward pushes SST out of range; for the gradient gate use a short window / shallow slice).
+- **Memory:** CORE2 is ~40× pi nodes → confirm the checkpointed N-step backward fits the
+  A100 (the pi N=200 backward was 4.23 GB; expect to drop N or use O(√N) nesting). GPU sbatch.
+- **Gate:** full suite green (pi 313 + CORE2 additions); the CORE2-slice AD↔FD plateau passes
+  incl. the new SST→flux / current→stress feedbacks. **Lesson:** append.
 
-**First moves for 5.7:** (1) decide dump scope (more steps/probes? edit the job + resubmit).
-(2) Build the multi-step forcing: `cf = build_core_forcing(mesh, 1958, sst_ic=state.T[:,0])`,
-`sfs = cf.stack(dates_for_steps(1958, 500, N))`, then `integrate(state, mesh, op, None, N,
-step_forcings=sfs, forcing_static=cf.static)` — but **jit it** (wrap in `integrate_jit` /
-`run`). (3) 1-day stability assertions + the Aleutian watch. (4) Extend `test_core2_step.py`
-with the per-substep dynamics gates (calibrated). The pattern is proven; 5.7 is mostly
-runtime/stability + tolerance calibration, not new physics.
+**GATE 5 (acceptance):** CORE2 reproduces the C per-substep dump at step 1 within tolerance
+(✅ done); runs 1-day + multi-day stable (✅ done — numerically, with the documented no-ice
+supercooling limitation); **the gradient gate passes on a CORE2 slice incl. the new feedbacks
+(← 5.8, remaining)**; full suite green.
+
+**First moves for 5.8:** (1) read `tests/test_gradient.py` (the pi gate to extend). (2) Pick a
+small CORE2 slice / short window that keeps SST in the EOS-valid range. (3) Add a CORE2-slice
+variant of the AD↔FD plateau through the CG + the two new bulk feedbacks. (4) GPU sbatch for
+the memory-bound backward. The pattern is proven (pi GATE 4); 5.8 is mostly scale + the two
+new seams.
 
 ## THE PROVEN VERIFICATION RECIPE (still applies)
-Per-substep dump at pinned probes (or all-node), truncate to `nlevels`, `verify.assert_close(col,
-rec, kind=…)` (`map`/`gather` 1e-15, `scatter`/`reduction` 1e-12; calibrate `atol`). When a
-kernel is fed the C's own upstream values (the bulk's `T_oc`, the SSS dump's `S_top`/`water_flux`),
-the gate isolates that kernel → MAP-class. AD: any divide/sqrt whose denominator/arg can vanish in
-a masked lane must compute a FINITE value (`where(d==0,1,d)` / double-`where` safe-sqrt) — a
-forward `where` does NOT stop a 0·inf NaN backward. Re-run `test_gradient.py` at GATE 5. New
-Phase-5 invariants: **mesh CW-orientation is guarded at load**; **the C port is the spec — port it
-1:1 and verify by dump, don't invent a modeling choice.**
+Per-substep dump at pinned probes, truncate to `nlevels`, `verify.assert_close(col, rec,
+kind=…)` (`map`/`gather` 1e-15, `scatter`/`reduction` 1e-12; calibrate `atol`; use **relative**
+for big intermediate fields like `ssh_rhs`~1e5 / `pressure`~5e5). A per-substep gate is only
+"tight" at **step 1** (shared inputs); downstream of the chaotic CG it diverges to ~1e-6 by
+step 3 — gate the multi-step trajectory on **robust global reductions** (SST-range, max-speed)
+against the matched **C arbiter** instead (tracks to 3 sig figs). AD: any divide/sqrt whose
+denominator/arg can vanish in a masked lane must compute a FINITE value (`where(d==0,1,d)` /
+double-`where` safe-sqrt) — a forward `where` does NOT stop a 0·inf NaN backward. Re-run
+`test_gradient.py` at GATE 5. Phase-5 invariants: **mesh CW-orientation guarded at load**;
+**the C port is the spec — port it 1:1 and verify by dump**; **distinguish numerical stability
+(bounded vel/SSH/CG, no NaN) from thermodynamic realism (the no-ice run is the former for ~a
+week, never the latter at high lat).**
 
 ## KEY PATHS
 - Working repo (git `main`, local-only, no remote): `/home/a/a270088/port_jax`
 - **Env python (ALL python/pytest):**
   `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python`
-  → `JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q` (~8 min; CORE2 tests skip if their
-  `data/` artifacts are absent). **netCDF4 + scipy installed.** GPU via SLURM (`-A ab0995_gpu
-  -p gpu`/`gpu-devel`).
+  → `JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q` (~9.5 min; CORE2 tests skip if their
+  `data/` artifacts are absent). **netCDF4 + scipy installed; jax-cuda12 (GPU) installed.**
+- GPU via SLURM: `-A ab0995_gpu -p gpu --gres=gpu:1` (12 h) or `-p gpu-devel` (30 min);
+  the env's jitted CORE2 step is **~0.06 s on an A100** (vs ~3 s CPU, ~32 s eager).
 - CORE2 mesh: `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2`; PHC IC:
   `/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc`; JRA55:
   `/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/`; SSS `…/PHC2_salx.nc`, runoff
-  `…/CORE2_runoff.nc`; **chl (5.6): `/pool/data/AWICM/FESOM2/FORCING/Sweeney/Sweeney_2005.nc`**.
+  `…/CORE2_runoff.nc`; chl `…/Sweeney/Sweeney_2005.nc`.
 - CORE2 data (gitignored): **`data/` is a symlink → `/work/ab0995/a270088/port_jax/data`**.
-  Holds `mesh_core2/`, `ic_core2/`, `phc_dump_core2/`, `jra_dump_core2/`, `bulk_dump_core2/`,
-  `sss_dump_core2/`. C-side jobs (untracked in port2): `port2/fesom2_port/jobs/jax_*.sh`.
+  Holds `mesh_core2/`, `ic_core2/`, `{phc,jra,bulk,sss,step}_dump_core2/`. C-side jobs
+  (untracked in port2): `port2/fesom2_port/jobs/jax_*.sh` (incl. `jax_step_dump_core2.sh`,
+  `jax_core2_stability.sh`).
 - C port (algorithmic SoT): `/home/a/a270088/port2/fesom2_port/src/`; built binary
   `…/build/fesom_port`. C run-arg order: `<mesh> <out> <dt> <nsteps> <snap> <phc> <jra>`.
   Build: `bash -lc 'source env.sh && make -C build fesom_port'` (incremental, ~30 s).
-- I (Claude) drive the C SLURM jobs (`sbatch`, acct ab0995): use **`-p compute --time=00:30:00`**
-  (fast debug QOS, ~16 s to start) — NOT `-p shared`. Dumps run ~20–25 s. See memory
+- I (Claude) drive SLURM (acct ab0995 / ab0995_gpu). Cheap C dumps → `-p compute
+  --time=00:30:00` (debug). LONG C runs / JAX GPU → a real QOS. See memory
   [[hpc-job-file-conventions]].
 
 ## LOCKED DECISIONS (do NOT re-litigate)
@@ -191,39 +168,36 @@ Phase-5 invariants: **mesh CW-orientation is guarded at load**; **the C port is 
    seam = `fesom_jax/params.py`. 2. Full-fidelity, bottom-up, match the C port 1:1. 3. AD-safe
    by construction + gradient re-run at every gate. 4. Mesh = index gather/scatter over
    `ops.py`. 5. Single-device + data-parallel now; mesh sharding Phase 8. 6. **Phase 5 = linfs
-   on CORE2, Path A; zstar/partial-cells/GM/KPP/ice-model are later.** 7. **netCDF4 + scipy in
-   the env.** 8. **(2026-06-06, user) Phase 5 keeps the C's static `a_ice` mask** (=0.9 where
-   IC SST<0; gates shortwave penetration + the momentum stress blend) — i.e. **match the C's
-   "no-ice" run, NOT a truly ice-free ocean.** chl = **Sweeney monthly** (the C default).
+   on CORE2, Path A; zstar/partial-cells/GM/KPP/ice-model are later.** 7. **netCDF4 + scipy +
+   jax-cuda12 in the env.** 8. **(2026-06-06) Phase 5 keeps the C's static `a_ice` mask** (=0.9
+   where IC SST<0; gates shortwave penetration + the momentum stress blend) — match the C's
+   "no-ice" run, NOT a truly ice-free ocean. chl = **Sweeney monthly** (the C default).
+9. **(2026-06-06, Task 5.7) The no-ice run's high-lat supercooling is an accepted PHYSICAL
+   limitation** (the C does it identically; sea ice in Phase 6 caps it) — the stability gate is
+   **numerical** (no NaN, bounded vel/SSH), not thermodynamic.
 
 ## CRITICAL GOTCHAS (full list in PORTING_LESSONS.md)
 - **The C port is linfs-only / full-cell / no-cavity — match THAT, not real-FESOM.** zlevel
   lives only in the Fortran; the parent outline's zlevel/partial-cells/w_i are out of scope.
 - **⚠️ "No ice" ≠ ice-free:** the C keeps a **static `a_ice=0.9` mask** (IC SST<0, 37089 nodes)
-  that (a) skips shortwave penetration and (b) blends the wind stress (`ice_drag·a+atm·(1−a)`,
-  `u_ice=0`). Replicated in `core2_forcing` (`ice_ic_aice`). Missing it = 122 W/m² heat_flux
-  error at Antarctic nodes.
-- **⚠️ CORE2 step-1 `T_old`/`S_old` = const base 10/35, NOT PHC** (the C sanity-advect saves
-  `valuesold=base` before PHC overwrites `values`). `core2_initial_state` handles it; don't
-  "fix" it to PHC.
-- **⚠️ `FESOM_BULK_FIXED_ITERS` must be honored by `fesom_bulk_compute`** (not just the dump fn)
-  — now wired. The per-substep reference run sets it; JAX runs fixed-5.
+  gating shortwave penetration + blending the wind stress. Replicated in `core2_forcing`
+  (`ice_ic_aice`). **AND "no ice" ≠ stable forever:** the no-ice SST supercools without bound
+  (−22 by day 8) → max|vel|>3 at day ~8 (EOS-invalid regime). Physical, matched by the C.
+- **⚠️ CORE2 step-1 `T_old`/`S_old` = const base 10/35, NOT PHC** (`core2_initial_state`
+  handles it; don't "fix" to PHC).
+- **⚠️ `FESOM_BULK_FIXED_ITERS=1`** must be set on the C reference (the M-O loop is
+  non-convergent at calm nodes; JAX runs fixed-5).
 - **pi↔CORE2 orientation:** CORE2 raw mesh is ~all CCW; `load_mesh` asserts CW (Aleutian guard).
 - **AD masked-NaN rule (bit us 4×):** make masked lanes finite; a forward `where` doesn't stop
-  a backward 0·inf. (`cal_shortwave_rad`'s `sw_3d` is a constant ⇒ no AD path; the bc_T/bc_S +
-  ice-ocean drag ARE differentiable seams, all safe-sqrt-guarded.)
-- **Eager CORE2 `step()` ≈ 32 s/step on CPU** → use jitted `run`/`integrate` or GPU for 5.7.
-- **Runoff is INERT in the no-ice Phase 5 — by the C's design, not a bug** (the C routes
-  runoff through ice thermo → `flx_fw` → `water_flux` → `virtual_salt`; ice off ⇒ that door is
-  shut; the balanced `water_flux` feeds only non-linfs paths). It works fully in the ice-on run
-  + the reader/balance are done. **User decision: keep matching the no-ice C run**; runoff
-  activates for free in Phase 6 (the seam is pure-in-`water_flux`). **Full spec: sub-plan
-  "Runoff handoff to Phase 6"** (READ before touching runoff). Phase-5 SST/SSS forcing = bc_T
-  (heat) + bc_S (virtual_salt=rsss·(evap−prec) + relax_salt).
+  a backward 0·inf. The new bulk feedbacks (`d(heat_flux)/d(SST)`, `d(stress)/d(current)`) are
+  the 5.8 AD targets — all double-`where` safe-sqrt-guarded.
+- **Eager CORE2 `step()` ≈ 32 s/step; jitted ≈ 3 s CPU / 0.06 s A100** → always jit; GPU for 5.8.
+- **The C dump pairs each node probe with its incident ELEMENT gid** — element fields
+  (pgf/Av/uv_rhs/uv) are at element gids, node fields at node gids (`_emaxabs` vs `_maxabs`).
+- **Runoff is INERT in the no-ice Phase 5 — by the C's design** (folded through ice thermo,
+  which is off; the balanced `water_flux` feeds only non-linfs paths). Activates for free in
+  Phase 6. **Full spec: sub-plan "Runoff handoff to Phase 6".**
 - **netCDF4 import prints a benign `ndarray size changed` ABI warning** — harmless.
-- **CORE2 stability risk** (dt=500, PHC+JRA, no ice physics): the matched C run is the arbiter
-  (Task 5.7). The static `a_ice` mask damps high-lat wind stress (somewhat protective). Watch
-  the Aleutian Trench (global elem 194724; vertex node gid 94122).
 - **config = the pi reference physics on CORE2:** linfs, PP, FCT, opt_visc=7, `use_wsplit=0`,
   CG SSH (α=1), dt=500, PHC IC, JRA55+SSS+runoff + the static ice mask.
 
@@ -232,7 +206,7 @@ Phase-5 invariants: **mesh CW-orientation is guarded at load**; **the C port is 
   current. **Commit only when asked** (per-task commits on `main`). **C edits → port2 branch
   `jax-mesh-export`, NEVER port2 main** (user); job scripts kept untracked there; otherwise leave
   the port2 repo to the user (no housekeeping). **Large generated files → `/work`** (the `data`
-  symlink handles it). Cheap C jobs → `-p compute --time=00:30:00`. All python/pytest via the env
-  python. See memory [[hpc-job-file-conventions]].
+  symlink). Cheap C jobs → `-p compute --time=00:30:00`; long C / JAX-GPU → a real QOS. All
+  python/pytest via the env python. See memory [[hpc-job-file-conventions]].
 
-Confirm you've absorbed this, tell me which task you're starting (5.7), then proceed.
+Confirm you've absorbed this, tell me which task you're starting (5.8), then proceed.
