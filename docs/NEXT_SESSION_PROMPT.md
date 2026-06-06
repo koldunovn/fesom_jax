@@ -1,149 +1,150 @@
 # Next-session prompt — FESOM2 → JAX port
 
-Paste the block below to start the next session. **Phases 0–4 COMPLETE (GATEs 0/1/2/3/4).**
-The full single-step pi ocean model is ported, dump-gated, jitted, **proven differentiable
-end-to-end** (checkpointed `lax.scan`, CG `custom_linear_solve` gradient, FD-checked
-`d(loss)/d(K_ver)`, N=200 backward fits GPU memory), runs the **live pi physics** — **FCT
-(Zalesak) advection** + **opt_visc=7 flow-aware biharmonic** + the **wsplit machinery**
-(off, matching the reference config) — matches the per-substep C dump tightly (FCT `T`
-1.8e-15; step-2 element viscosity ~1e-17), is **pi 1000-step stable** (`S` exactly 35, bounded
-uv/eta, no NaN), and the gradient gate stays green with the full physics live (plateau 5.70e-7).
-**Full suite 313 passing.** The next milestone is **Phase 5 — CORE2 single-device**, which the
-plan says to **expand into its own sub-plan** (`docs/plans/<date>-fesom-jax-core2.md`) before
-coding.
+Paste the block below to start the next session. **Phases 0–4 COMPLETE (GATEs 0/1/2/3/4).
+Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1 + 5.2 DONE.**
+Full suite **334 passing**.
 
-**All of Phase 4 (Tasks 4.1 FCT, 4.2 opt_visc7+wsplit, 4.3 1000-step) is committed on `main`**
-(the "Phase 4 complete (GATE 4)" commit). The `port2` C source is clean/committed (the temp
-FCT-intermediate dumps in `fesom_step.c` were reverted — working tree matches the committed
-`d51dca4` dump writer); `jobs/jax_cdump_dbg.sh` (pure-advection `FESOM_NO_TRDIFF=1` debug dump)
-remains **untracked** in `port2` (kept as a working-tree helper, not committed among port2's
-other dev artifacts).
+The pi model is fully ported, dump-gated, jitted, differentiable end-to-end, 1000-step
+stable. Phase 5 runs that same physics (PP + **linfs** + FCT + opt_visc7, **no GM/KPP/ice**)
+on the **CORE2 mesh** with PHC initial conditions and real JRA55+SSS+runoff forcing,
+verified per-substep against a CORE2 C-port dump (**Path A**). So far: the CORE2 mesh is
+exported + loads zero-code (with a new **clockwise-orientation guard**), and the **PHC IC**
+is ported (numpy) and matches the C to ~1e-14.
+
+**Everything committed on `main`** (`d4fcdb2` Task 5.2, `4b34f6a` Task 5.1). CORE2 data
+artifacts are **gitignored** (`data/mesh_core2/`, `data/ic_core2/`, `data/phc_dump_core2/`).
+New C-side job scripts live **untracked** in `port2/fesom2_port/jobs/`
+(`jax_mesh_export_core2.sh`, `jax_phc_dump_core2.sh`).
 
 ---
 
-We are porting the FESOM2 ocean model to JAX to build a **differentiable** ocean
-model for hybrid ML (trainable NN parameterizations for vertical mixing and mesoscale
-eddy fluxes, trained end-to-end). This continues a multi-session effort. Work from
-`/home/a/a270088/port_jax`. Use max effort.
+We are porting the FESOM2 ocean model to JAX to build a **differentiable** ocean model for
+hybrid ML (trainable NN parameterizations for vertical mixing + mesoscale eddy fluxes,
+trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`. Max effort.
 
 ## START HERE, in order
-1. **Read the plan (source of truth):**
-   `/home/a/a270088/port_jax/docs/plans/20260605-fesom-jax-port.md` — decisions, the
-   verification ladder, per-task gates, Revision Log. **Phase 4 is done (GATE 4 met);
-   Phase 5 is the next section** (currently an outline to expand into a sub-plan).
-2. **Read the lessons log (every session):** `docs/PORTING_LESSONS.md` — esp. the AD
-   entries (the eos `bvfreq` `1/zdiff` backward-NaN trap; the safe-sqrt / safe-divide
-   masked-NaN rule; `custom_linear_solve` forward-vs-gradient split; the FCT subgradient
-   `flux_eps`; the "verify which BRANCH the test inputs exercise" viscosity lesson; the
-   wsplit-off-is-the-reference-config note). **STANDING RULE: append a lesson per task.**
-3. **Read the project memory:**
-   `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
-4. For Phase 5: skim `port2/FRESH_START.md` §2/§4/§6/§9/§14 (CORE2 mesh rotation +
-   CW orientation + partial cells; zlevel ALE; JRA55 + bulk; CORE2 default params), and
-   the C modules `fesom_ale.c` (zlevel branch), `fesom_phc.c`, `fesom_jra55.c`,
-   `fesom_bulk.c`, `fesom_sss_runoff.c`. Skim `fesom_jax/integrate.py` +
-   `fesom_jax/tests/test_gradient.py` (the permanent AD gate — re-run at every later gate).
+1. **Phase-5 sub-plan (source of truth for Phase 5):**
+   `docs/plans/20260606-fesom-jax-core2.md` — the scope correction (§0), Path A, the task
+   ladder 5.1–5.8 with per-task gates, the 5 module research briefs, risks. **Tasks 5.1 +
+   5.2 are ticked DONE.**
+2. **Main plan:** `docs/plans/20260605-fesom-jax-port.md` — decisions, the verification
+   ladder, the Revision Log. Phase 5 there is the outline; the sub-plan supersedes it.
+3. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the **Phase 5** entries:
+   the linfs-not-zlevel scope rule, the **pi↔CORE2 orientation trap**, the netCDF4 env note,
+   the PHC sequential-GS extrap, the "no invented modeling choice" rule. **STANDING RULE:
+   append a lesson per task.**
+4. **Project memory:** `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
+5. For 5.3–5.5: read `port2/fesom2_port/src/fesom_jra55.c`, `fesom_bulk.c` (5.3/5.4) and
+   `fesom_sss_runoff.c` (5.5). The sub-plan's task bodies already hold detailed per-module
+   briefs (functions, formulas, gotchas, AD-safe guards, suggested gate).
 
-## STATUS — Phases 0/1/2/3/4 COMPLETE (GATEs 0/1/2/3/4); all committed on `main`
-- **Phase 0/1/2 (GATE 0/1/2):** env, verify harness, pi mesh export, the C-port per-substep
-  dump oracle (`pi_cdump.00000`); `mesh.py`/`state.py`/`ops.py`; the full single-step ocean
-  chain (substeps 1–16) in **`step.py`** (`step`/`step_jit`/`run`), each dump-gated.
-- **Phase 3 (GATE 3 — the AD de-risking gate):** `params.py` (the `Params` ML-hook seam),
-  `integrate.py` (checkpointed `lax.scan`, step-1 eager outside), `test_gradient.py` (the
-  permanent AD gate); eos `bvfreq` backward-NaN fix; N=200 backward = 4.23 GB checkpointed.
-- **Phase 4 (GATE 4 — pi fully stable) — DONE THIS BLOCK:**
-  - **Task 4.1 (FCT):** `tracer_adv.advect_one_fct` + `zalesak_limit` (MFCT/QR4C HO,
-    `compute_fct_lo`, `fill_up_dn_grad`); limiter AD = **subgradient** (`docs/LIMITER_GRADIENTS.md`,
-    NaN-safe via `flux_eps`). FCT `T` vs dump **1.8e-15** after the step-1 `T_old`=pre-blob-base
-    IC fix (`ic.py`).
-  - **Task 4.2 (opt_visc7 + wsplit):** the flow-aware biharmonic was **already fully ported in
-    2.5** — this CLOSED its verification gap (the dump never reaches the flow-aware regime:
-    edge-velocity-diff ≤8e-4 ≪ the |du|>0.03 onset; added a strong-flow synthetic test for BOTH
-    the γ1 and quadratic γ2 branches + a step-2 substep-6 `uv_rhs` dump gate ~1e-17). Ported
-    `ale.compute_cfl_z` + `compute_wvel_split` (CORE2-ready); **`use_wsplit=0` in the reference
-    config** ⇒ the split is the identity (`w_e=w, w_i=0`, transparent), wired into `step.py`
-    (populates `State.cfl_z`). ⚠️ `impl_vert_visc`'s `w_i` advective terms stay dropped (a Phase-5
-    item, only needed at `use_wsplit=1`).
-  - **Task 4.3 (1000-step + AD re-check):** `test_1000_step_stability` — pi 1000 steps stable
-    (~48 s; no NaN, max|uv|=0.17, max|eta|=0.63 m, `S` exactly 35, T∈[10.0,14.98], max
-    `cfl_z`=2.8e-3 ≪ maxcfl). `test_gradient.py` green with the full physics live (plateau 5.70e-7).
-- **Full suite: 313 passing** (`JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`; ~5 min;
-  the 1000-step + 100-step tests + the gradient FD sweeps dominate the time).
+## STATUS
+- **Phases 0–4 (GATEs 0–4):** full single-step pi model (`step.py`, substeps 1–16),
+  checkpointed `lax.scan` (`integrate.py`), CG `custom_linear_solve`, FCT + opt_visc7,
+  pi 1000-step stable, `test_gradient.py` plateau 5.70e-7. All committed.
+- **Phase 5 — scope (user-confirmed, do NOT re-litigate):** the C port (`fesom2_port`) is a
+  **deliberately simplified** FESOM — **linfs-only, full-cell, no cavities**. So Phase 5 =
+  pi physics on the CORE2 mesh + PHC IC + JRA55/SSS/runoff. **NOT zlevel/zstar/partial-cells/
+  w_i** (absent from the C port; the parent outline was wrong to list them). **zstar is future
+  work** — keep a `which_ale` design seam, don't port it now. **SSS/runoff = faithful 1:1 C
+  port** (no §9-shorthand alternative). Reference = **Path A** (per-substep CORE2 C dump at the
+  matched config: `FESOM_MIX_SCHEME=PP FESOM_NO_GMREDI=1 FESOM_NO_ICE_*=1`, dt=500).
+- **Task 5.1 DONE:** CORE2 mesh exported (`data/mesh_core2/`, job 25386129) — `load_mesh`
+  works **zero-code** (full-cell ⇒ global zbar/Z valid; ragged masks handle per-node depth).
+  **Orientation guard added** (`mesh.check_cw_orientation` runs in `load_mesh`): the C
+  `orient_cw` swapped **244654/244659** CORE2 elements CCW→CW (export log) before geometry;
+  the guard raises on any non-CW mesh (guards the historical Aleutian wrong-sign blow-up).
+  `test_mesh_core2.py` (12) + `test_step_core2.py` rest-state (max|uv|=1.8e-14).
+- **Task 5.2 DONE:** `fesom_jax/phc_ic.py` — faithful numpy port of `fesom_phc.c` (bilinear
+  interp + **sequential-GS** `extrap_nod3D` + `ptheta`); matches the C surface dump to
+  **~1e-14** (brackets exact). Cache `data/ic_core2/{T,S}_ic.npy`; `core2_initial_state`
+  builds the State. `test_phc_ic.py` (5). **netCDF4 pip-installed** into the env.
 
-## IMMEDIATE WORK — Phase 5 (CORE2 single-device): FIRST expand the sub-plan
-The plan's Phase 5 is an **outline** — per the project's discipline, **expand it into
-`docs/plans/<date>-fesom-jax-core2.md` first** (task granularity + per-task gates), then execute.
-Outline (from the main plan) — port, each verified against a CORE2 reference, AD re-checked:
-- **CORE2 mesh specifics:** rotation auto-detect, CW element orientation (`test_tri`), partial
-  cells, `nlevels_nod2D_min` (K_v⁻) — FRESH_START §2/§4/§14.
-- **zlevel ALE** (surface-layer thickness change; local-zstar fallback) — `fesom_ale.c`. This
-  also brings back the **`w_i` advective terms in `impl_vert_visc`** if `use_wsplit` is on.
-- **PHC initial conditions** (bilinear interp + extrap + vertical fill) — `fesom_phc.c`.
-- **JRA55 forcing** reader (bilinear→mesh, time interp, L&Y09 bulk) — `fesom_jra55.c`,
-  `fesom_bulk.c`, FRESH_START §9.
-- **SSS restoring + runoff** (additive virtual freshwater flux) — `fesom_sss_runoff.c`.
-- **GATE 5:** CORE2 1-day (172 steps, dt=500) and 10-day climate-close to C; gradient check
-  on a CORE2 slice. (Will likely need a new C-port dump + a CORE2 mesh export, like Tasks 0.3/0.4.)
+## IMMEDIATE WORK — Task 5.3 onward (the sub-plan has the full ladder + gates)
+- **5.3 JRA55 reader** (host numpy, netCDF4): files
+  `/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/{var}.{YEAR}.nc`, field order
+  **uas,vas,huss,rsds,rlds,tas,prra,prsn** (`fesom_jra55.h:50-59`); cyclic-lon +2, lat-flip;
+  bilinear stencil built ONCE on **geographic** coords; 3-hourly time-interp; **wind g2r
+  rotation** (Euler 50/15/−90); units (Tair K→°C, prec /1000). Gate: dump the 8 jra fields vs
+  C `fesom_jra55_step`.
+- **5.4 L&Y09 bulk** (AD-safe JAX): `ncar_ocean_fluxes_mode` (**fixed 5 iters, unrolled** — drop
+  the data-dependent break) + `obudget`; `heat_flux/water_flux/stress`; node→elem simple
+  mean-of-3; albw=0.1; relative-wind in coeffs but absolute `ug` in obudget (preserve). The
+  **differentiable SST→flux / current→stress feedback** lives here. Safe-sqrt / `where` guards.
+- **5.5 SSS restoring + runoff** (numpy readers + AD-safe JAX): match `fesom_sss_runoff.c`
+  exactly (virtual_salt + relax_salt into the S surface BC; runoff via the global-mean term in
+  the no-ice path); `ref_sss_local=1`, `surf_relax_S=1.929e-6`; month index no legacy `+1`.
+- **5.6 wire surface BCs** into `tracer_diff` (`bc_T=−dt·heat_flux/vcpw`,
+  `bc_S=dt·(virtual_salt+relax_salt)`; currently `bc_surface=0`) + bulk `stress_surf`→momentum.
+- **5.7 matched C dump + stability:** generate the CORE2 per-substep dump (re-pin
+  `PROBE_GIDS` in `fesom_dump.c` incl. an Aleutian node, e.g. 94122); assemble + run CORE2
+  1-day (~172 steps, dt=500) + multi-day; assert stable. ⚠️ **Use the JITTED `run`/`integrate`
+  (or GPU)** — an eager CORE2 step is ~32 s on CPU. Finalize `T_old`/`S_old` (step-1 AB2)
+  against the dump.
+- **5.8 GATE 5:** gradient check on a CORE2 slice (+ the new d(heat_flux)/d(SST),
+  d(stress)/d(current) feedbacks); confirm checkpointed backward fits the GPU at CORE2 scale.
 
-**Open question for the user before Phase 5:** confirm the CORE2 reference path — do we extend
-the `port2` C dump writer to a CORE2 config (the tightest gate, mirrors Path A), or compare to
-an existing Fortran CORE2 run (climate-level only)? This drives the verification ladder for Phase 5.
+**First moves for 5.3:** read `fesom_jra55.c`/`fesom_bulk.c`; stand up a JRA55 forcing-dump
+job (clone `jax_phc_dump_core2.sh`, set a JRA55 year, dump `jra->{8 fields}` + bulk
+heat/water/stress) to verify against.
 
 ## THE PROVEN VERIFICATION RECIPE (still applies)
-Dump gate at the pinned probes (node `1001,1500,2000,2500,3000`; elem `1757,2656,3688,
-4604,5575`), truncate to `nlevels`, `verify.assert_close(col, rec, kind=…)` (`map`/`gather`
-1e-15, `scatter`/`reduction` 1e-12; calibrate `atol`). AD-check with the **double-`where`
-safe-sqrt** for `sqrt(x→0)` and **`where(d==0,1,d)` / `where(a>0,a,1)`** for any divide whose
-denominator can vanish in a masked lane (the forward `where` does NOT stop a 0·inf NaN in the
-backward pass). **Re-run `test_gradient.py` at every gate**, and always grad w.r.t. a full IC
-field (the strongest masked-NaN probe). For end-to-end FD checks, sweep `h` and assert the
-**plateau**. ⚠️ **NEW (Task 4.2): instrument WHICH data-dependent branch a test input exercises**
-— a "ported + tested" kernel can silently skip a coefficient regime if the test inputs are too
-mild (the flow-aware viscosity γ2 branch). For a deferred "trivial-at-rest" element gate, re-gate
-it at step ≥2 once the trajectory is dump-tight. Append lessons; tick the plan; commit only when asked.
+Per-substep dump at pinned probes, truncate to `nlevels`, `verify.assert_close(col, rec,
+kind=…)` (`map`/`gather` 1e-15, `scatter`/`reduction` 1e-12; calibrate `atol`). AD: any
+divide/sqrt whose denominator/arg can vanish in a masked lane must compute a FINITE value
+(`where(d==0,1,d)` / double-`where` safe-sqrt) — a forward `where` does NOT stop a 0·inf NaN
+backward. Re-run `test_gradient.py` at GATE 5. New Phase-5 invariants: **mesh CW-orientation
+is guarded at load**; **the C port is the spec — port it 1:1 and verify by dump, don't invent
+a modeling choice** (FRESH_START is a description, not an alternative).
 
 ## KEY PATHS
 - Working repo (git `main`, local-only, no remote): `/home/a/a270088/port_jax`
 - **Env python (ALL python/pytest):**
   `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python`
-  → `JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q`. **For GPU runs** (the N=200 backward
-  memory gate, 1000-step timings, future CORE2) use SLURM: `sbatch scripts/phase3_grad_memory.sbatch`
-  (acct `ab0995_gpu`, `-p gpu`/`gpu-devel`, A100-40). CPU is fine for correctness/gradient-value
-  (pi 1000 steps = ~48 s on CPU).
-- Exported pi mesh (gitignored): `data/mesh_pi/*.npy`; dump fixture (committed):
-  `fesom_jax/tests/fixtures/pi_cdump.00000`.
-- C port (algorithmic SoT): `/home/a/a270088/port2/fesom2_port/src/` (branch
-  `jax-mesh-export`). Kokkos (`GPU_FIDELITY.md` M5.8/M5.9 long-window chaos notes):
-  `/home/a/a270088/port_kokkos/`.
+  → `JAX_PLATFORMS=cpu … -m pytest fesom_jax/tests/ -q` (~7 min; CORE2 tests skip if their
+  `data/` artifacts are absent). **netCDF4 is now installed** (Phase 5). GPU via SLURM
+  (`-A ab0995_gpu -p gpu`/`gpu-devel`).
+- CORE2 mesh: `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2`; PHC IC:
+  `/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc`; JRA55:
+  `/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/`; SSS `…/PHC2_salx.nc`, runoff
+  `…/CORE2_runoff.nc`.
+- Exported CORE2 mesh / IC / C dumps (gitignored): `data/mesh_core2/`, `data/ic_core2/`,
+  `data/phc_dump_core2/`. C-side jobs (untracked in port2): `port2/fesom2_port/jobs/jax_*.sh`.
+- C port (algorithmic SoT): `/home/a/a270088/port2/fesom2_port/src/`; built binary
+  `…/build/fesom_port` (NL read from the mesh, handles pi+CORE2). C run-arg order:
+  `<mesh> <out> <dt> <nsteps> <snap> <phc> <jra>` (phc=argv6 triggers PHC IC, t_insitu=1).
+- I (Claude) drive the C SLURM jobs (`sbatch`, acct ab0995, `shared`); they're cheap (mesh
+  export 17 s, PHC dump 16 s).
 
 ## LOCKED DECISIONS (do NOT re-litigate)
-1. Use case = hybrid ML params (swap points: vertical mixing PP/KPP, eddy flux GM/Redi).
-   The seam is real: `fesom_jax/params.py` (`Params` pytree, threaded through `step`).
-2. Full-fidelity, bottom-up, not a toy. 3. **AD-safe by construction + early end-to-end
-   gradient re-run at every gate — AD is never deferred.** 4. Mesh = index gather/scatter
-   over `ops.py`. 5. Single-device + data-parallel now; mesh sharding Phase 8.
+1. Use case = hybrid ML params (swap points: vertical mixing PP/KPP, eddy flux GM/Redi);
+   seam = `fesom_jax/params.py`. 2. Full-fidelity, bottom-up, match the C port 1:1. 3. AD-safe
+   by construction + gradient re-run at every gate. 4. Mesh = index gather/scatter over
+   `ops.py`. 5. Single-device + data-parallel now; mesh sharding Phase 8. 6. **Phase 5 = linfs
+   on CORE2, Path A; zstar/partial-cells/GM/KPP/ice are later.** 7. **netCDF4 in the env** for
+   NetCDF-4 readers.
 
-## CRITICAL GOTCHAS (verified; full list in PORTING_LESSONS.md)
-- **AD masked-NaN rule (bit us 4×):** make masked-off lanes compute a FINITE value
-  (`where(d==0,1,d)` / double-`where` safe-sqrt) — a forward `where`/clip/mask does NOT stop a
-  `0·inf` NaN in the backward pass. (eos `bvfreq`, `tracer_diff`/qr4c `1/zdiff`, the visc safe-sqrt.)
-- **`custom_linear_solve` splits forward (early-stop, dump-matching) from gradient (tight
-  `transpose_solve`).** The static linfs operator makes the SSH AD clean; proven end-to-end.
-- **AD kinks to keep the smoke test away from:** PP `max(N²,0)` + convective `max`; the
-  salinity floor `max(S,0.5)`; the upwind `|vflux|`/`|w|`; the FCT/Zalesak limiter (subgradient,
-  NaN-safe via `flux_eps`). Stay smooth + modest-N (N=20 in `test_gradient.py`).
-- **config = the pi reference run:** linfs ALE, PP mixing, FCT tracers, opt_visc=7
-  (γ0/γ1/γ2=0.003/0.1/0.285, Laplacian add-on γ_h=0), **`use_wsplit=0`** (⇒ `w_e=w`, `w_i=0`),
-  CG SSH (`α=1`), analytical wind (double-averaged), dt=100, constant T=10 + Gaussian T-blob,
-  S=35. `step`/`integrate` need the static SSH `op` (`ssh.build_ssh_operator`) + a `stress_surf`
-  (`forcing.surface_stress`, or zeros for rest) + optional `params` (`Params`).
-- **Differentiable time loop = `integrate.integrate` (checkpointed `lax.scan`)**, NOT the
-  Python `run` loop. Step 1 eager + scan 2..N; close over loop-invariants.
+## CRITICAL GOTCHAS (full list in PORTING_LESSONS.md)
+- **The C port is linfs-only / full-cell / no-cavity — match THAT, not real-FESOM.** zlevel
+  lives only in the Fortran; the parent outline's zlevel/partial-cells/w_i are out of scope.
+- **pi↔CORE2 orientation:** CORE2 raw mesh is ~all CCW; the C `orient_cw` normalizes to CW
+  before geometry. `load_mesh` now asserts CW (guards the Aleutian wrong-sign blow-up).
+- **AD masked-NaN rule (bit us 4×):** make masked lanes finite; a forward `where` doesn't stop
+  a backward 0·inf.
+- **Eager CORE2 `step()` ≈ 32 s/step on CPU** (~40× pi nodes, super-linear) → use jitted
+  `run`/`integrate` or GPU for 5.7; `build_ssh_operator` itself is cheap (0.3 s).
+- **PHC dump is surface-only** → vertical interp/deep-ptheta verified indirectly (5.7 density
+  gate); `T_old`/`S_old` step-1 AB2 history finalized in 5.7.
+- **CORE2-without-ice stability risk** (dt=500, PHC+JRA, no ice): the matched C run is the
+  arbiter — if the C port itself blows up without ice, that's a finding (ice would move into
+  Phase 5). Watch the Aleutian Trench (global elem 194724; vertex node gid 94122).
+- **netCDF4 import prints a benign `ndarray size changed` ABI warning** — harmless.
+- **config = the pi reference physics on CORE2:** linfs, PP, FCT, opt_visc=7, `use_wsplit=0`,
+  CG SSH (α=1), dt=500, PHC IC, JRA55+SSS+runoff.
 
 ## WORKFLOW NOTES
-- Plan is authoritative; tick `[x]`; keep the Revision Log + lessons current. Expand Phases 5–8
-  into sub-plans when reached (Phase 5 is next).
-- Commit only when asked. C/Fortran edits go on the `port2` branch `jax-mesh-export`.
-- All python/pytest via the env python above.
+- The sub-plan is authoritative for Phase 5; tick `[x]`, keep its Revision Log + the lessons
+  current. Commit only when asked (per-task commits on `main`). C edits → port2 (branch
+  `jax-mesh-export`); job scripts kept untracked there. All python/pytest via the env python.
 
-Confirm you've absorbed this, tell me which task you're starting, then proceed.
+Confirm you've absorbed this, tell me which task you're starting (5.3), then proceed.
