@@ -52,6 +52,40 @@ def test_arrays_equal_export_bit_for_bit(mesh):
         assert np.array_equal(got, expect), f"{field}: values differ from export"
 
 
+def test_orientation_all_cw(mesh):
+    """Every pi triangle is clockwise — the C ``orient_cw`` convention the JAX
+    geometry (``gradient_sca``) and antisymmetric edge fluxes assume. This is the
+    pi↔CORE2 trap: CORE2's raw mesh is ~all CCW and only matches after the C
+    swap, so the invariant must hold on every loaded mesh."""
+    r = meshmod.check_cw_orientation(mesh.coord_nod2D, mesh.elem_nodes)
+    assert r.shape == (mesh.elem2D,)
+    assert (r < 0).all(), f"{int((r >= 0).sum())} non-CW pi triangles"
+
+
+def test_orientation_guard_catches_ccw():
+    """A CCW or degenerate triangle must raise, so a bad CORE2 export fails
+    loudly at load instead of silently flipping the SSH-stiffness sign mid-run
+    (the historical Aleutian-Trench blow-up)."""
+    coord = np.array([[0.0, 0.0], [0.1, 0.0], [0.0, 0.1],   # 0,1,2
+                      [1.0, 0.0], [1.1, 0.0], [1.0, 0.1],   # 3,4,5
+                      [2.0, 0.0], [2.1, 0.0], [2.2, 0.0]])  # 6,7,8 collinear
+    cw = np.array([[0, 2, 1]], dtype=np.int32)              # r = -0.01  (CW)
+    ccw = np.array([[3, 4, 5]], dtype=np.int32)             # r = +0.01  (CCW)
+    degen = np.array([[6, 7, 8]], dtype=np.int32)           # r = 0      (degenerate)
+    meshmod.check_cw_orientation(coord, cw)                 # CW-only: OK
+    with pytest.raises(ValueError, match="CCW or degenerate"):
+        meshmod.check_cw_orientation(coord, np.vstack([cw, ccw]))
+    with pytest.raises(ValueError, match="CCW or degenerate"):
+        meshmod.check_cw_orientation(coord, np.vstack([cw, degen]))
+
+
+def test_load_mesh_orientation_check_is_default(mesh):
+    """``load_mesh`` runs the guard by default (the fixture already loaded it);
+    ``check_orientation=False`` is the inspect-only escape hatch."""
+    m2 = load_mesh(DEFAULT_PI_MESH_DIR, check_orientation=False)
+    assert m2.elem2D == mesh.elem2D  # the (CW) pi mesh loads fine either way
+
+
 def test_dtypes(mesh):
     int_fields = {
         "coast_flag", "nlevels_nod2D", "nlevels_nod2D_min", "ulevels_nod2D",

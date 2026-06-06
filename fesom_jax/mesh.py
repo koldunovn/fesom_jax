@@ -43,6 +43,8 @@ import jax.numpy as jnp
 import numpy as np
 from jax import tree_util
 
+from .config import CYCLIC_LENGTH_RAD
+
 # Repo-relative default: <repo>/data/mesh_pi  (this file is <repo>/fesom_jax/mesh.py)
 DEFAULT_PI_MESH_DIR = Path(__file__).resolve().parents[1] / "data" / "mesh_pi"
 
@@ -145,6 +147,56 @@ def level_masks(ulevels, nlevels, nl: int):
 
 
 # --------------------------------------------------------------------------
+# Orientation invariant (the pi↔CORE2 trap)
+# --------------------------------------------------------------------------
+def check_cw_orientation(coord_nod2D, elem_nodes, *,
+                         cyclic_length_rad: float = CYCLIC_LENGTH_RAD):
+    """Verify every triangle is **clockwise (CW)** in the rotated (lon,lat) plane,
+    mirroring the C port's ``orient_cw`` (``fesom_mesh.c:430-459``): per element
+    ``r = bx*cy - by*cx`` after a cyclic-length wrap of the lon components, where
+    ``b = v2-v1``, ``c = v3-v1``. The C swaps v2↔v3 whenever ``r > 0`` so that
+    **all** elements end up CW (``r < 0``) *before* any geometry is derived.
+
+    Why this is a hard load-time gate, not a comment: FESOM normalizes pi
+    **and** CORE2 to CW, but the derived ``gradient_sca`` / SSH-stiffness sign
+    and the antisymmetric edge fluxes assume that convention. CORE2's raw mesh is
+    almost entirely CCW (~244654/244659 elements swapped, FRESH_START §4); if a
+    mesh export ever reaches the JAX side **without** ``orient_cw`` (a different
+    reader path, a partition artifact, a regression), the kernels silently flip
+    sign → the historical CORE2 Aleutian-Trench blow-up (FRESH_START §4/§11/§14.8).
+    The JAX kernels were validated against the uniformly-CW pi export, so we
+    enforce CW on every loaded mesh and fail loudly otherwise.
+
+    Returns the per-element signed cross product ``r`` (numpy; all ``< 0`` when
+    CW). Raises ``ValueError`` if any element is CCW or degenerate (``r >= 0``).
+    """
+    coord = np.asarray(coord_nod2D)
+    en = np.asarray(elem_nodes)
+    half = 0.5 * cyclic_length_rad
+    n0, n1, n2 = en[:, 0], en[:, 1], en[:, 2]
+    ax, ay = coord[n0, 0], coord[n0, 1]
+    bx = coord[n1, 0] - ax
+    by = coord[n1, 1] - ay
+    cx = coord[n2, 0] - ax
+    cy = coord[n2, 1] - ay
+    bx = np.where(bx > half, bx - cyclic_length_rad, bx)
+    bx = np.where(bx < -half, bx + cyclic_length_rad, bx)
+    cx = np.where(cx > half, cx - cyclic_length_rad, cx)
+    cx = np.where(cx < -half, cx + cyclic_length_rad, cx)
+    r = bx * cy - by * cx
+    bad = int((r >= 0).sum())
+    if bad:
+        idx = np.nonzero(r >= 0)[0][:10].tolist()
+        raise ValueError(
+            f"mesh orientation: {bad}/{r.size} triangle(s) are CCW or degenerate "
+            f"(r >= 0); FESOM requires all clockwise. The mesh export must run "
+            f"orient_cw (fesom_mesh.c:430) BEFORE deriving gradient_sca. "
+            f"first bad elem ids: {idx}, max r = {float(r.max()):.3e}"
+        )
+    return r
+
+
+# --------------------------------------------------------------------------
 # Loader
 # --------------------------------------------------------------------------
 def _read_meta_txt(path: Path) -> dict[str, float]:
@@ -165,12 +217,17 @@ def _as_device(a: np.ndarray) -> jax.Array:
     return jnp.asarray(a.astype(np.float64))
 
 
-def load_mesh(mesh_dir: str | Path = DEFAULT_PI_MESH_DIR) -> Mesh:
+def load_mesh(mesh_dir: str | Path = DEFAULT_PI_MESH_DIR,
+              *, check_orientation: bool = True) -> Mesh:
     """Load a C-exported mesh directory into a :class:`Mesh` pytree.
 
     ``mesh_dir`` holds one ``<name>.npy`` per array plus ``meta.txt`` of scalar
     counts (see ``docs/MESH_EXPORT_LAYOUT.md``). Indices are taken as-is
     (already 0-based); the four ragged-level masks are derived on load.
+
+    ``check_orientation`` (default True) asserts every triangle is clockwise via
+    :func:`check_cw_orientation` — the pi↔CORE2 trap; set False only to *inspect*
+    a deliberately non-CW mesh.
     """
     mesh_dir = Path(mesh_dir)
     if not mesh_dir.is_dir():
@@ -187,6 +244,9 @@ def load_mesh(mesh_dir: str | Path = DEFAULT_PI_MESH_DIR) -> Mesh:
         for f in dataclasses.fields(Mesh)
         if not f.metadata.get("static") and not f.name.endswith("_mask")
     }
+
+    if check_orientation:
+        check_cw_orientation(arrays["coord_nod2D"], arrays["elem_nodes"])
 
     node_layer, node_iface = level_masks(
         arrays["ulevels_nod2D"], arrays["nlevels_nod2D"], nl

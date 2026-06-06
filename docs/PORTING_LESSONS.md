@@ -684,3 +684,68 @@ Cite the C source (`file:line`) or dump probe that proves it.
   on the FD chaos floor; `test_gradient.py` stays at N=20 by design). "Climate-close to C" at
   1000 steps stays **indirect** (no C 1000-step pi snapshot — the dump is 10 steps); the tight
   step-1..10 FCT dump match + S-exact + boundedness are the stand-in. (`test_step_pi.py`, Task 4.3.)
+
+## Phase 5 — CORE2 (scoping + pre-port guards)
+
+- **[scope] ⚠️ The C port is a DELIBERATELY SIMPLIFIED FESOM: linfs-only, full-cell, no
+  cavities — match THAT, not real-FESOM/Fortran features the parent outline mentions.** The
+  parent plan's Phase-5 outline listed "zlevel ALE / local-zstar / partial cells / re-enable
+  w_i" — **none exist in the C port** (`fesom_ale.c` is linfs-only; the zlevel algorithm is
+  only in the Fortran `oce_ale.F90`; `fesom_mesh.c:617-634` sets `zbar_3d_n[n,nz]=zbar[nz]`
+  with no `Z_3d_n`; `use_wsplit=0` + FCT ⇒ `w_i≡0`). FRESH_START §14.7 even says
+  `which_ALE='zlevel'` **"but we will use linfs."** Per the golden rule the C port governs:
+  **Phase 5 = pi physics (PP/linfs/FCT/opt_visc7) on the CORE2 mesh + PHC IC + JRA55/SSS/runoff.**
+  zstar/partial-cells are future and need C-side work first. *Lesson: when the plan outline
+  and the C reference disagree, the C reference wins — verify against it before proposing
+  scope, don't propagate the outline.* (Caught when a research read showed `fesom_ale.c`
+  linfs-only; user flagged the zlevel error directly.)
+
+- **[mesh/orientation] ⚠️ Triangle orientation is the pi↔CORE2 trap — CW is a CHECKED
+  load-time invariant now, not an assumption.** The C `orient_cw` (`fesom_mesh.c:430-459`)
+  computes `r = bx*cy − by*cx` (cyclic-wrapped) and swaps v2↔v3 whenever `r>0`, forcing
+  **every** triangle CW, and runs at `fesom_mesh_read:1193` **before** any geometry is
+  derived (`elem_area`@1219, `gradient_sca`@~1230). So both pi and CORE2 export in the same
+  CW convention; `elem_area` is `abs` (orientation-free) and `edge_cross_dxdy` is
+  centroid-based (orientation-free) — the only orientation-sensitive exported array is
+  `gradient_sca` (post-swap ⇒ CW). CORE2's RAW mesh is ~all CCW (~244654/244659 swapped,
+  FRESH_START §4); historically a missing swap ⇒ wrong SSH-stiffness sign ⇒ the
+  Aleutian-Trench blow-up (§11/§14.8). Added `mesh.check_cw_orientation` + a `load_mesh`
+  guard (raises on any `r≥0`) + tests; **pi verified 5839/5839 CW**. This makes a bad CORE2
+  export fail loudly at load (Task 5.1) instead of diverging mid-run. (`mesh.py`,
+  `test_mesh.py`, this session.)
+
+- **[scope/discipline] ⚠️ Don't invent a "modeling choice" where the rule is "port the C
+  exactly."** Phase-5 SSS/runoff was first framed as "match C-literal vs FRESH_START §9's
+  shorthand" — a false choice (same error-class as the zlevel slip). The C `fesom_sss_runoff.c`
+  mirrors the Fortran sbc and is validated (no SSS problems), so the discipline is a faithful
+  1:1 port gated by the dump; §9's `water_flux += (S−Sclim)·v` / `−= runoff` is a *simplified
+  description*, not an alternative. (In the no-ice Phase-5 path runoff enters only via the
+  global-mean balance — the local term is in ice thermo, off here; the dump gate confirms
+  JAX == the C-port-no-ice run.) *Lesson: FRESH_START is a description; the C port is the
+  spec. No menu — port it and verify by dump.* (Task 5.5; user flagged.)
+
+- **[mesh/CORE2] The CORE2 mesh port was genuinely ZERO JAX-code — the design held.**
+  `load_mesh('data/mesh_core2')` worked unchanged: it reads `nl` from `meta.txt` and the four
+  ragged masks already encode per-node variable depth (the only real pi→CORE2 mesh
+  difference); full-cell ⇒ global `zbar`/`Z` stays valid so eos/ssh/pp/ale need nothing.
+  `test_mesh_core2.py` (12) reuses the pi structural invariants verbatim + pins CORE2 counts
+  (nod2D=126858, elem2D=244659, edge2D=371644, nl=48). The export at `npes==1` is cheap
+  (job 25386129: 17 s, peak **5.6 GB** — the 32 G request was overkill, 8 G would do; NL is
+  read from `aux3d.out`, not compile-time, so the same `build/fesom_port` exports pi and
+  CORE2). (Task 5.1.)
+
+- **[mesh/orientation] Empirical confirmation: CORE2 `orient_cw` swapped 244654/244659
+  elements to CW** (job log) — exactly FRESH_START §4. So CORE2's raw mesh really is ~all
+  CCW and the C normalization is load-bearing; the `check_cw_orientation` guard added to
+  `load_mesh` re-verifies it survived export→load (CORE2: all 244659 CW). This is the
+  concrete payoff of making CW a checked invariant rather than an assumption. (Task 5.1.)
+
+- **[perf] ⚠️ An EAGER `step()` on CORE2 is ~32 s/step on CPU (~160× pi for ~40× the nodes
+  — super-linear, the CG + eager/host-scatter overhead).** So CORE2 rest-state/smoke tests
+  use a small step count, and real CORE2 correctness/stability work (Task 5.7) must use the
+  **jitted** `run`/`integrate` (amortized compile) and/or GPU — not eager. `build_ssh_operator`
+  itself is cheap on CORE2 (0.3 s; host scipy COO for ~1.5M entries). The CORE2 rest-state
+  gate (`test_step_core2.py`) confirms `step()` produces no spurious flow on the big mesh
+  (max|uv|=1.8e-14, T/S bit-exact) — but note PGF=0 at rest doesn't test the `gradient_sca`
+  *sign* (constant field ⇒ Σ∂N=0 regardless); that's exercised by the non-rest dump gate in
+  Task 5.7. (Task 5.1.)
