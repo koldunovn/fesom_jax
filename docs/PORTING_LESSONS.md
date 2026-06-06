@@ -1068,8 +1068,9 @@ Cite the C source (`file:line`) or dump probe that proves it.
 ## Phase 5 — matched C dump run + CORE2 stability (Task 5.7)
 
 - **[stability/scope] ⚠️⚠️ "No ice" is numerically stable for ~1 week, then the UNBOUNDED
-  high-lat SUPERCOOLING destabilizes the dynamics — a PHYSICAL limitation (matched by the C),
-  not a numerical bug.** The Phase-5 no-ice CORE2 run (PHC IC + JRA55 + SSS/runoff, dt=500)
+  high-lat SUPERCOOLING destabilizes the dynamics — a PHYSICAL limitation (the C supercools +
+  tracks JAX identically through the verified ~day 2.3 window), not a numerical bug.** The
+  Phase-5 no-ice CORE2 run (PHC IC + JRA55 + SSS/runoff, dt=500)
   is numerically clean for **days 1–7** (no NaN; max|vel| ≤ ~1.9 m/s < 3; |SSH| ≤ ~2.8 m < 5;
   the Aleutian-Trench node 94122 stays warm ~3.2 °C and calm). But with no sea ice to cap
   high-latitude heat loss, SST **supercools monotonically without bound**: −1.9 (IC) → −5.8
@@ -1077,9 +1078,11 @@ Cite the C source (`file:line`) or dump probe that proves it.
   evaluated far outside its valid range, the spurious density field drives spurious convection,
   and at **model day ~8.1 (step 1399) max|vel| finally crosses 3 m/s**. This is the *anticipated*
   no-ice failure mode (sub-plan risk #1 / FRESH_START §15 "SST < −2 without ice"), NOT a port
-  error. **The matched C arbiter does exactly the same** (see next lesson) ⇒ the C does NOT blow
-  up at this config either, so the Task-5.7 "if the C itself blows up, ice must move to Phase 5"
-  finding did **not** trigger — ice stays Phase 6, and a physically realistic SST simply needs
+  error. **The matched C arbiter supercools + tracks JAX identically through the verified window
+  (~day 2.3 / step 396; see next lesson — the longer C run was cancelled, so the day-8 figures
+  are JAX's, shared by the mechanism)** ⇒ the C does NOT numerically blow up at this config
+  either, so the Task-5.7 "if the C itself blows up, ice must move to Phase 5" finding did
+  **not** trigger — ice stays Phase 6, and a physically realistic SST simply needs
   the ice cap. *Lesson: distinguish numerical stability (bounded vel/SSH/CG, no NaN) from
   thermodynamic realism (SST in range); a no-ice ocean is the former for ~a week and never the
   latter at high latitudes.* (`scripts/core2_stability_run.py`, Task 5.7.)

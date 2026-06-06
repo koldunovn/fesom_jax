@@ -119,10 +119,12 @@ forcing and JAX **tracks the C to ~3 sig figs** on SST_min / max|uv| / max|eta| 
 values diverge chaotically (the step-1 bit-exact match degrades to ~1e-6 by step 3).
 
 **Stability verdict (Task 5.7):** numerically stable **days 1–7** (no NaN, max|vel|<3, |SSH|<5);
-the no-ice run then **supercools without bound** (SST −1.9 IC → −22.8 day 8, the C identically),
-and past the EOS-valid range (~−20 °C) the spurious density field destabilizes the dynamics at
-day ~8. A *physical* no-ice limitation (sea ice, Phase 6, caps it), **not** a numerical blow-up
-and **not** the "C blows up ⇒ move ice to Phase 5" trigger (the C is stable + tracks JAX).
+the no-ice run then **supercools without bound** (JAX SST −1.9 IC → −22.8 day 8; the matched C
+tracks this to 3 sig figs through the **verified window ~day 2.3 / step 396**, same mechanism —
+the longer C run was cancelled, so the day-8 value is JAX's), and past the EOS-valid range
+(~−20 °C) the spurious density field destabilizes the dynamics at day ~8. A *physical* no-ice
+limitation (sea ice, Phase 6, caps it), **not** a numerical blow-up and **not** the "C blows up
+⇒ move ice to Phase 5" trigger (the C is stable + tracks JAX through the verified window).
 
 ## Secondary cross-check: the Fortran dump (NOT per-substep comparable)
 

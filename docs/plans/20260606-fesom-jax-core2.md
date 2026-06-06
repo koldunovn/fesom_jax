@@ -383,9 +383,10 @@ SLURM dump job. Create `tests/test_step_core2.py`; `docs/REFERENCE_RUNS.md` (COR
 > (step 216: SST_min −6.60=−6.60, uv 1.389≈1.39, eta 2.715≈2.71). **FINDING (anticipated
 > risk #1):** with no sea ice the SST **supercools without bound** (−1.9 IC → −5.8 d1 →
 > −16.5 d5 → −22.8 d8); past ~−20 °C the JM-EOS is out of range, and at **model day ~8.1
-> max|vel| crosses 3 m/s**. This is a *physical* no-ice limitation (the C does the same —
-> NOT a JAX bug, and NOT the "C blows up ⇒ move ice to Phase 5" finding) — sea ice (Phase 6)
-> caps it. Gate met: step-1 dump-tight (per-substep) + 1-day & multi-day numerically stable.
+> max|vel| crosses 3 m/s**. This is a *physical* no-ice limitation (the C supercools + tracks
+> JAX identically through the verified ~day 2.3 window, so it's shared physics — NOT a JAX bug,
+> and NOT the "C blows up ⇒ move ice to Phase 5" finding) — sea ice (Phase 6) caps it. Gate met:
+> step-1 dump-tight (per-substep) + 1-day & multi-day numerically stable.
 
 - [x] **Generate the CORE2 per-substep dump (Path A):** done in 5.6
   (`data/step_dump_core2/core2_cdump.00000`, 3 steps, 7 node + 7 incident-element probes
@@ -397,7 +398,8 @@ SLURM dump job. Create `tests/test_step_core2.py`; `docs/REFERENCE_RUNS.md` (COR
   day 7; the Aleutian Trench stayed calm.
 - [x] ⚠️ **Stability risk resolved empirically:** the matched C arbiter is **stable and
   tracks JAX** — so the no-ice run does **not** numerically blow up (ice stays Phase 6). The
-  real limitation is **unbounded high-lat supercooling** (the C supercools identically): no
+  real limitation is **unbounded high-lat supercooling** (the C supercools identically through
+  the verified ~day 2.3 window): no
   NaN/dynamical blowup for ~7 days, then the sub-−20 °C EOS-invalid SST drives max|vel|>3 at
   day ~8. Flagged, not papered over (PORTING_LESSONS Task 5.7).
 - [x] **Gate:** step-1 per-substep dump-tight (dynamics added); 1-day + multi-day
@@ -433,9 +435,11 @@ the new SST→flux / current→stress feedbacks; full suite green.
 - **CORE2 stability without ice** (dt=500, PHC+JRA55) — ✅ **RESOLVED (Task 5.7): does NOT
   force ice earlier.** Numerically stable days 1–7 (vel/SSH bounded, no NaN); the matched C
   arbiter is stable too and JAX tracks it to 3 sig figs. The only no-ice limitation is
-  **unbounded high-lat supercooling** (SST → −22 by day 8, the C identically) which past the
-  EOS-valid range (~−20 °C) destabilizes the dynamics at day ~8 — a physical limitation capped
-  by sea ice in Phase 6, not a numerical failure.
+  **unbounded high-lat supercooling** (JAX SST → −22 by day 8; the matched C tracks JAX to
+  3 sig figs and supercools the same through the **verified window ~day 2.3 / step 396** — the
+  longer C run was cancelled, so the day-8 figure itself is JAX's, shared by the mechanism)
+  which past the EOS-valid range (~−20 °C) destabilizes the dynamics at day ~8 — a physical
+  limitation capped by sea ice in Phase 6, not a numerical failure.
 - **PHC `extrap_nod3D` sequential-GS parity** (Task 5.2) — Jacobi gives wrong values;
   the #1 fidelity risk. Fallback: load the C-dumped IC.
 - **JRA55 reader literal parity** (bilinear index/weight, field order, mid-interval shift,
@@ -619,7 +623,8 @@ seam).**
   2.715≈2.71) despite per-element chaotic divergence — robust min/max reductions track the
   shared forced response. **FINDING (anticipated risk #1, NOT a bug):** no sea ice ⇒ SST
   supercools without bound (−1.9 IC → −16.5 d5 → −22.8 d8); past ~−20 °C the JM-EOS is invalid
-  → spurious convection → max|vel|>3 at model day ~8.1. The C does the same ⇒ ice stays Phase 6
+  → spurious convection → max|vel|>3 at model day ~8.1. The C supercools + tracks JAX
+  identically through the verified ~day 2.3 window (step 396) ⇒ ice stays Phase 6
   (the "C blows up ⇒ ice into Phase 5" trigger did NOT fire); a physical SST simply needs the
   ice cap. C job untracked on `port2` `jax-mesh-export`; JAX driver + GPU job committed on
   `main`. Next: **Task 5.8 (GATE 5 — gradient on a CORE2 slice)**.

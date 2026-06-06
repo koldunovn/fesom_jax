@@ -93,8 +93,10 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
   - ⚠️ **FINDING (anticipated risk #1, NOT a bug):** with no sea ice the SST **supercools
     without bound** (−1.9 IC → −16.5 day 5 → −22.8 day 8); past the JM-EOS-valid range
     (~−20 °C) the spurious density field destabilizes the dynamics at **model day ~8.1**
-    (max|vel|>3). **The C does the same** ⇒ the no-ice run does NOT numerically blow up, ice
-    stays Phase 6, and a physically realistic SST simply needs the ice cap. The "C blows up ⇒
+    (max|vel|>3). **The C supercools + tracks JAX identically through the verified ~day 2.3
+    window (step 396; the longer C run was cancelled, so the day-8 figures are JAX's, shared by
+    the mechanism)** ⇒ the no-ice run does NOT numerically blow up, ice stays Phase 6, and a
+    physically realistic SST simply needs the ice cap. The "C blows up ⇒
     move ice to Phase 5" trigger did **not** fire.
 
 ## IMMEDIATE WORK — Task 5.8 (GATE 5; the LAST Phase-5 task)
@@ -173,8 +175,9 @@ week, never the latter at high lat).**
    where IC SST<0; gates shortwave penetration + the momentum stress blend) — match the C's
    "no-ice" run, NOT a truly ice-free ocean. chl = **Sweeney monthly** (the C default).
 9. **(2026-06-06, Task 5.7) The no-ice run's high-lat supercooling is an accepted PHYSICAL
-   limitation** (the C does it identically; sea ice in Phase 6 caps it) — the stability gate is
-   **numerical** (no NaN, bounded vel/SSH), not thermodynamic.
+   limitation** (the C supercools identically through the verified ~day 2.3 window; sea ice in
+   Phase 6 caps it) — the stability gate is **numerical** (no NaN, bounded vel/SSH), not
+   thermodynamic.
 
 ## CRITICAL GOTCHAS (full list in PORTING_LESSONS.md)
 - **The C port is linfs-only / full-cell / no-cavity — match THAT, not real-FESOM.** zlevel
@@ -182,7 +185,8 @@ week, never the latter at high lat).**
 - **⚠️ "No ice" ≠ ice-free:** the C keeps a **static `a_ice=0.9` mask** (IC SST<0, 37089 nodes)
   gating shortwave penetration + blending the wind stress. Replicated in `core2_forcing`
   (`ice_ic_aice`). **AND "no ice" ≠ stable forever:** the no-ice SST supercools without bound
-  (−22 by day 8) → max|vel|>3 at day ~8 (EOS-invalid regime). Physical, matched by the C.
+  (−22 by day 8) → max|vel|>3 at day ~8 (EOS-invalid regime). Physical; the C tracks JAX
+  identically through the verified ~day 2.3 window.
 - **⚠️ CORE2 step-1 `T_old`/`S_old` = const base 10/35, NOT PHC** (`core2_initial_state`
   handles it; don't "fix" to PHC).
 - **⚠️ `FESOM_BULK_FIXED_ITERS=1`** must be set on the C reference (the M-O loop is
