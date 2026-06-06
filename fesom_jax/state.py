@@ -74,6 +74,19 @@ class State:
     pgf_x: jax.Array        # (elem2D,nl) pressure-gradient force x (layer)
     pgf_y: jax.Array        # (elem2D,nl) pressure-gradient force y (layer)
 
+    # --- sea ice (Phase 6, surface-only 2-D) — fesom_ice ---
+    # Prognostic ice state carried across steps. All default-zero ⇒ the ocean-only
+    # (pi / Phase-5 no-ice) path is bit-identical (nothing reads these until Phase 6).
+    a_ice: jax.Array        # (nod2D,) ice concentration [0..1]
+    m_ice: jax.Array        # (nod2D,) ice volume per area [m]
+    m_snow: jax.Array       # (nod2D,) snow volume per area [m]
+    u_ice: jax.Array        # (nod2D,) ice velocity x [m/s]
+    v_ice: jax.Array        # (nod2D,) ice velocity y [m/s]
+    t_skin: jax.Array       # (nod2D,) ice surface (skin) temperature [°C] (Newton warm-start)
+    sigma11: jax.Array      # (elem2D,) EVP stress σ11 [N/m] — ELASTIC MEMORY across steps
+    sigma12: jax.Array      # (elem2D,) EVP stress σ12 (not re-zeroed each step)
+    sigma22: jax.Array      # (elem2D,) EVP stress σ22
+
     # ---- constructors -----------------------------------------------------
     @classmethod
     def zeros(cls, mesh: Mesh) -> "State":
@@ -93,6 +106,8 @@ class State:
             hnode=Z(n, nl), hnode_new=Z(n, nl), helem=Z(e, nl), hbar=Z(n), hbar_old=Z(n),
             density=Z(n, nl), hpressure=Z(n, nl), bvfreq=Z(n, nl), Kv=Z(n, nl),
             Av=Z(e, nl), pgf_x=Z(e, nl), pgf_y=Z(e, nl),
+            a_ice=Z(n), m_ice=Z(n), m_snow=Z(n), u_ice=Z(n), v_ice=Z(n), t_skin=Z(n),
+            sigma11=Z(e), sigma12=Z(e), sigma22=Z(e),
         )
 
     @classmethod

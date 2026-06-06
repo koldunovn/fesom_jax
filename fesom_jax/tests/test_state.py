@@ -38,6 +38,9 @@ def _expected_shapes(mesh):
         "hbar": (n,), "hbar_old": (n,),
         "density": (n, nl), "hpressure": (n, nl), "bvfreq": (n, nl), "Kv": (n, nl),
         "Av": (e, nl), "pgf_x": (e, nl), "pgf_y": (e, nl),
+        # sea ice (Phase 6, surface-only 2-D)
+        "a_ice": (n,), "m_ice": (n,), "m_snow": (n,), "u_ice": (n,), "v_ice": (n,),
+        "t_skin": (n,), "sigma11": (e,), "sigma12": (e,), "sigma22": (e,),
     }
 
 
