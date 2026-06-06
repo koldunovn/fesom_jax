@@ -784,3 +784,65 @@ Cite the C source (`file:line`) or dump probe that proves it.
   full-column C dump for a few probes if 5.7 shows a depth mismatch. Also: `T_old`/`S_old`
   (step-1 AB2 history) is provisionally = the PHC field; the exact `valuesold` is finalized in
   5.7 against the dump (cf. the pi `T_old` base-vs-blob lesson). (Task 5.2.)
+
+## Phase 5 — JRA55 forcing reader (Task 5.3)
+
+- **[jra/fidelity] ⚠️⚠️ THE Task-5.3 trap: the C time-interp `field = rdate·coef_a + coef_b`
+  CATASTROPHICALLY CANCELS, so a ~1e-13 reassociation in the bilinear gather blows up to ~1e-8
+  in the interpolated field — the gather must be BIT-IDENTICAL to the C, not just "1e-13
+  close."** `nc_time` is in **Julian days since year 0001** (~2.436e6 for 1958), and
+  `coef_b = d1 − coef_a·nc_time[t0]`, so `field = rdate·coef_a + coef_b` subtracts two ~2.4e6
+  numbers to get an O(1) result — a ~`coef_a·nc_time·eps` ≈ `164·2.4e6·2.2e-16` ≈ 1e-7 abs
+  rounding floor. BOTH C and JAX incur it, but they land on *different* sides unless `d1`/`d2`
+  (hence `coef_a`/`coef_b`) are bit-identical. My first gather folded `1/denom` into the weights
+  (`Σ wₖsₖ`, `wₖ=dxₖdyₖ/denom`) — algebraically equal to the C's `(Σ sₖ·dxₖ·dyₖ)/denom` but
+  ~1e-13 off by reassociation → the interp field came out **~6e-8** off the C (and the error
+  *correlated with* `|coef_a|`, max error at the max-`coef_a` node — the smoking gun). Fix:
+  compute each corner term as **`(s·dx)·dy` in the C's multiply order**, sum A→D left-to-right,
+  **divide the sum by `denom` at the end** (store per-corner `dx,dy` + a per-node `denom`, not a
+  folded weight). Result: the 6 scalar fields are **bit-exact (max|diff|=0 over all 126858
+  nodes, both dates)**; only the wind carries ~3.5e-15 (the g2r `sin`/`cos`). *Lesson: when a
+  downstream formula cancels large numbers, the usual "fold the constant in" optimization is
+  WRONG — the division placement is load-bearing; replicate the C's exact op order.*
+  (`jra55._build_stencil`/`_gather`, `fesom_jra55.c:480-516`, Task 5.3.)
+
+- **[jra/method] The verification recipe that surfaced it: a step-1 *boundary* dump alone is a
+  WEAK gate — add an *interior* dump that exercises genuine time interpolation.** At (day1,sec0)
+  `rdate < nc_time[0]` ⇒ the `t_indx` boundary branch sets `coef_a=0`, so `field = d1` (just the
+  bilinear gather, no cancellation) — it matched at ~1e-13 even with the folded-weight gather,
+  hiding the bug. The (day100, 12:00) interior dump (genuine 2-slice interp + a `getcoeffld`
+  cache refresh) is where the cancellation bites and the ~6e-8 error showed. The C dump job
+  writes BOTH (`FESOM_JRA_DUMP_DIR` + `FESOM_JRA_DUMP_DAY`/`_SEC`). General: for any
+  time/space-interpolated reader, gate at an *interior* point, not just the t=0 boundary where
+  the scheme degenerates. (`jobs/jax_jra_dump_core2.sh`, `dump_jra_fields` in `fesom_main.c`,
+  Task 5.3.)
+
+- **[jra/traps] Three literal-parity traps the port had to honor (all dump-confirmed).**
+  (1) **Field order is uas,vas,huss,rsds,rlds,tas,prra,prsn** — `tas` (air temp) is the **6th**
+  field, NOT 3rd (`fesom_jra55.h:50`); a naïve alphabetical/physical ordering silently swaps
+  T_air with humidity. (2) **Interp on GEOGRAPHIC coords, rotate the wind AFTER** — the bilinear
+  bracket uses `geo_coord_nod2D/RAD` (deg, only a `<0`→`+360` wrap, no `>360` wrap unlike PHC),
+  but the (uas,vas) result is then `fesom_vector_g2r`-rotated into the **model** frame (Euler
+  50/15/−90); scalars are NOT rotated. (3) **Per-field mid-interval time shift** (`nm_nc_tmid=0`):
+  instantaneous fields (uas/tas) are sampled on the 3-h marks, flux fields (prra) on the
+  half-marks, and the shift `nc_time[i]=½(t[i+1]+t[i])` gives each field its **own** `nc_time`,
+  so `getcoeffld` is per-field (not shared) even though the *spatial* stencil is shared (all 8
+  files share one 640×320 grid → build the gather once). (`jra55.py`, `fesom_jra55.c`, Task 5.3.)
+
+- **[jra/config] `flip_lat = 0` for JRA55-do v1.4.0** — `lat` is stored **ascending**
+  (−89.57→89.57), so the C's north→south flip (`fesom_jra55.c:270`) is inert here. The reader
+  implements it faithfully anyway (per-field, applied to both `nc_lat` and each data slice) so a
+  future N→S-stored field still works; just don't expect the flip path to be exercised by the
+  CORE2 gate. `Nlon=640+2=642` (cyclic halo), `Nlat=320`, `Ntime=2920` (3-hourly), cal=gregorian.
+  (Task 5.3.)
+
+- **[jra/scope] The reader is host-numpy, non-differentiable SETUP (like `phc_ic`) — the
+  differentiable SST→flux / current→stress seam is the bulk (Task 5.4), not here.** Output is 8
+  per-node physics-unit arrays (`u_wind`/`v_wind` rotated, `Tair` °C, `prec_*` m/s) that become
+  per-step *device constants*. A simple per-field `getcoeffld` cache (refresh only when `rdate`
+  leaves `[nc_time[t_indx], nc_time[t_indx_p1]]`, `fesom_jra55_step:651`) avoids re-reading the
+  640×320 slices every step; the cache is a pure optimization (no effect on the result — the
+  coefficients depend only on `rdate`'s bracket, not on call history, so a fresh reader == a
+  sequentially-advanced one). netCDF4 reads use `set_auto_maskandscale(False)` to get the raw
+  float32 the C's `nc_get_vara_float` sees (JRA has no scale/offset; bit-exact promotion to f64).
+  (`jra55.JRA55Reader`, Task 5.3.)

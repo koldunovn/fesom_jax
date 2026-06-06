@@ -185,24 +185,37 @@ verification needs it (cheap).
 **Files:** Create `fesom_jax/jra55.py` (numpy reader + bilinear stencil + time/cache
 driver) + `tests/test_jra55.py`. C: probe-dump the 8 jra fields at a fixed (year,day,sec).
 
-- [ ] **Reader** mirroring `fesom_jra55.c`: files
+> **✅ DONE 2026-06-06.** `fesom_jax/jra55.py` — faithful numpy port of `fesom_jra55.c`
+> (julday/binarysearch/time-grid transform + per-field mid-interval shift + shared bilinear
+> stencil + per-field `getcoeffld` cache + `fesom_jra55_step` + **wind g2r rotation**).
+> Verified vs the C dump (job 25388630, year 1958, `data/jra_dump_core2/`) at **two** dates —
+> (day1,sec0) boundary + (day100,12:00) interior: **6 scalar fields BIT-EXACT** (max|diff|=0
+> over all 126858 nodes, both dates), wind **~3.5e-15** (g2r `sin`/`cos` libm). `test_jra55.py`
+> = **5 passed**. **#1 trap cleared:** the C time-interp `field=rdate·coef_a+coef_b` cancels two
+> ~2.4e6 Julian-day numbers → a folded-weight gather's ~1e-13 reassociation blew up to ~6e-8;
+> fixed by a **bit-identical** `(s·dx)·dy`-order + divide-at-end gather. C-side: `dump_jra_fields`
+> in `fesom_main.c` (gated `FESOM_JRA_DUMP_DIR`) + `jobs/jax_jra_dump_core2.sh` (untracked,
+> port2). `flip_lat=0` (lat ascending); field order uas,vas,huss,rsds,rlds,**tas**,prra,prsn.
+
+- [x] **Reader** mirroring `fesom_jra55.c`: files
   `…/FORCING/JRA55-do-v1.4.0/{var}.{YEAR}.nc`, field order **uas,vas,huss,rsds,rlds,tas,
   prra,prsn** (`fesom_jra55.h:50-59` — note `tas` is 6th); source grid read from file dims
   (320×640), cyclic-lon **+2 halo** (`:154`), lat-flip if stored −90→90 (`:271-279`). Build
   the bilinear stencil **once** (4 src indices + 4 weights per node — shared by all 8
   fields) on **geographic** coords (`:295,458`); time-grid via `julday`+rebase+**mid-interval
   shift** (`nm_nc_tmid=0`, `:262-268`); 2-slice raw cache + linear time-interp (`:683-700`).
-- [ ] **Wind g2r rotation** (`:692-694`, `fesom_vector_g2r` `fesom_mesh.c:169-192`): rotate
+- [x] **Wind g2r rotation** (`:692-694`, `fesom_vector_g2r` `fesom_mesh.c:169-192`): rotate
   (uas,vas) geographic→model-rotated per node (Euler 50/15/−90), magnitude-preserving;
   scalars NOT rotated. Unit conv: Tair K→°C, prra/prsn /1000 → m/s (`:698-700`).
-- [ ] **Cache strategy:** keep 2 raw 3-hourly slices (×8×nod2D×8B ≈ 13 MB/slice on CORE2),
-  refresh every ~3 model-hours; output `[nod2D, 8]` device-constant per step. Do **not**
-  precompute all ~2920 records to nodes (~24 GB).
-- [ ] **Gate:** dump `jra->{u_wind,v_wind,Tair,shum,shortwave,longwave,prec_rain,prec_snow}`
-  at all nodes for a fixed (year,day,sec) vs C `fesom_jra55_step` — map/gather ~1e-13 (the
-  bilinear gather; literal index/weight parity required).
-- [ ] run — must pass before Task 5.4. **Lesson:** append (geographic-vs-rotated coord trap,
-  field-order trap, mid-interval shift).
+- [x] **Cache strategy:** per-field `getcoeffld` cache refreshing only when `rdate` leaves the
+  current `[t_indx, t_indx_p1]` bracket (a pure optimization — the result depends only on the
+  bracket, not call history). Output a `JRAFields` of 8 `[nod2D]` numpy arrays per step (→ jnp
+  device constants in the 5.6 driver). Do **not** precompute all ~2920 records.
+- [x] **Gate:** dump `jra->{u_wind,v_wind,Tair,shum,shortwave,longwave,prec_rain,prec_snow}`
+  at all nodes for a fixed (year,day,sec) vs C `fesom_jra55_step` — achieved **bit-exact**
+  scalars + ~3.5e-15 wind (tighter than the ~1e-13 target). Two dates (boundary + interior).
+- [x] run — must pass before Task 5.4. **Lesson:** appended (the cancellation/bit-exact-gather
+  trap, the interior-vs-boundary gate, field-order/geographic-vs-rotated/mid-shift traps).
 
 ### Task 5.4: L&Y09 bulk formulae (AD-safe JAX)
 
@@ -382,3 +395,16 @@ first. GM/KPP/ice are Phase 6.
   5 passed. **Env: netCDF4 installed** (user-approved; numpy 2.4.6 / jax 0.10.1 unchanged;
   benign `ndarray size changed` ABI warning). New `port2/jobs/jax_phc_dump_core2.sh`.
   Next: **Task 5.3 (JRA55 forcing reader)**.
+- **2026-06-06 — Task 5.3 DONE (JRA55 forcing reader).** `fesom_jax/jra55.py` — faithful numpy
+  port of `fesom_jra55.c` (julday/binarysearch + per-field time-grid transform with the
+  mid-interval shift + shared bilinear stencil + per-field `getcoeffld` cache + `step` + the
+  g2r wind rotation). Verified vs a new C all-node dump (job 25388630, year 1958,
+  `data/jra_dump_core2/`) at two dates (day1/sec0 boundary + day100/12:00 interior): **6 scalar
+  fields bit-exact** (max|diff|=0, all 126858 nodes), wind ~3.5e-15. `test_jra55.py` 5 passed.
+  **#1 fidelity trap cleared:** the C time-interp `field=rdate·coef_a+coef_b` cancels two ~2.4e6
+  Julian-day numbers, so a folded-`1/denom` bilinear gather's ~1e-13 reassociation amplified to
+  ~6e-8 — fixed by a **bit-identical** `(s·dx)·dy`-order + divide-at-end gather; the interior
+  dump (not just the t=0 boundary, which degenerates to `field=d1`) is what exposed it. C-side:
+  `dump_jra_fields` in `fesom_main.c` (gated `FESOM_JRA_DUMP_DIR` + `_DAY`/`_SEC`) +
+  `port2/jobs/jax_jra_dump_core2.sh` (untracked). `flip_lat=0` (lat ascending); field order
+  uas,vas,huss,rsds,rlds,**tas**,prra,prsn. Next: **Task 5.4 (L&Y09 bulk formulae, AD-safe)**.

@@ -1,20 +1,23 @@
 # Next-session prompt — FESOM2 → JAX port
 
 Paste the block below to start the next session. **Phases 0–4 COMPLETE (GATEs 0/1/2/3/4).
-Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1 + 5.2 DONE.**
-Full suite **334 passing**.
+Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1 + 5.2 + 5.3 DONE.**
+Full suite **339 passing**.
 
 The pi model is fully ported, dump-gated, jitted, differentiable end-to-end, 1000-step
 stable. Phase 5 runs that same physics (PP + **linfs** + FCT + opt_visc7, **no GM/KPP/ice**)
 on the **CORE2 mesh** with PHC initial conditions and real JRA55+SSS+runoff forcing,
 verified per-substep against a CORE2 C-port dump (**Path A**). So far: the CORE2 mesh is
-exported + loads zero-code (with a new **clockwise-orientation guard**), and the **PHC IC**
-is ported (numpy) and matches the C to ~1e-14.
+exported + loads zero-code (with a new **clockwise-orientation guard**), the **PHC IC** is
+ported (numpy, ~1e-14), and the **JRA55-do reader** is ported (numpy) and matches a C all-node
+dump **bit-exact** (6 scalar fields) / ~3.5e-15 (wind rotation).
 
-**Everything committed on `main`** (`d4fcdb2` Task 5.2, `4b34f6a` Task 5.1). CORE2 data
-artifacts are **gitignored** (`data/mesh_core2/`, `data/ic_core2/`, `data/phc_dump_core2/`).
-New C-side job scripts live **untracked** in `port2/fesom2_port/jobs/`
-(`jax_mesh_export_core2.sh`, `jax_phc_dump_core2.sh`).
+**Everything committed on `main`** (`d4fcdb2` Task 5.2, `4b34f6a` Task 5.1; Task 5.3 commit
+pending). CORE2 data artifacts are **gitignored** (`data/mesh_core2/`, `data/ic_core2/`,
+`data/phc_dump_core2/`, `data/jra_dump_core2/`). New C-side job scripts live **untracked** in
+`port2/fesom2_port/jobs/` (`jax_mesh_export_core2.sh`, `jax_phc_dump_core2.sh`,
+`jax_jra_dump_core2.sh`). The C `dump_jra_fields` + its call site (in `fesom_main.c`, branch
+`jax-mesh-export`) are a dump-only addition (gated on `FESOM_JRA_DUMP_DIR`).
 
 ---
 
@@ -26,7 +29,7 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
 1. **Phase-5 sub-plan (source of truth for Phase 5):**
    `docs/plans/20260606-fesom-jax-core2.md` — the scope correction (§0), Path A, the task
    ladder 5.1–5.8 with per-task gates, the 5 module research briefs, risks. **Tasks 5.1 +
-   5.2 are ticked DONE.**
+   5.2 + 5.3 are ticked DONE.**
 2. **Main plan:** `docs/plans/20260605-fesom-jax-port.md` — decisions, the verification
    ladder, the Revision Log. Phase 5 there is the outline; the sub-plan supersedes it.
 3. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the **Phase 5** entries:
@@ -34,9 +37,10 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
    the PHC sequential-GS extrap, the "no invented modeling choice" rule. **STANDING RULE:
    append a lesson per task.**
 4. **Project memory:** `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
-5. For 5.3–5.5: read `port2/fesom2_port/src/fesom_jra55.c`, `fesom_bulk.c` (5.3/5.4) and
+5. For 5.4–5.5: read `port2/fesom2_port/src/fesom_bulk.c` (5.4) and
    `fesom_sss_runoff.c` (5.5). The sub-plan's task bodies already hold detailed per-module
-   briefs (functions, formulas, gotchas, AD-safe guards, suggested gate).
+   briefs (functions, formulas, gotchas, AD-safe guards, suggested gate). `fesom_jra55.c`
+   (5.3) is done — `fesom_jax/jra55.py` is the ported reader the bulk consumes.
 
 ## STATUS
 - **Phases 0–4 (GATEs 0–4):** full single-step pi model (`step.py`, substeps 1–16),
@@ -59,14 +63,18 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
   interp + **sequential-GS** `extrap_nod3D` + `ptheta`); matches the C surface dump to
   **~1e-14** (brackets exact). Cache `data/ic_core2/{T,S}_ic.npy`; `core2_initial_state`
   builds the State. `test_phc_ic.py` (5). **netCDF4 pip-installed** into the env.
+- **Task 5.3 DONE:** `fesom_jax/jra55.py` — faithful numpy port of `fesom_jra55.c` (julday +
+  per-field time-grid transform with the **mid-interval shift** + shared bilinear stencil +
+  per-field `getcoeffld` cache + **wind g2r rotation**, Euler 50/15/−90). Verified vs a new C
+  all-node dump (job 25388630, year 1958, `data/jra_dump_core2/`) at two dates
+  (day1/sec0 + day100/12:00): **6 scalar fields bit-exact** (max|diff|=0, all 126858 nodes),
+  wind **~3.5e-15**. `test_jra55.py` (5). ⚠️ **#1 trap:** the C time-interp
+  `field=rdate·coef_a+coef_b` cancels two ~2.4e6 Julian-day numbers → a folded-`1/denom` gather's
+  ~1e-13 reassociation blew to ~6e-8; fixed by a **bit-identical `(s·dx)·dy` + divide-at-end
+  gather**. Field order uas,vas,huss,rsds,rlds,**tas**,prra,prsn; interp on geographic coords,
+  rotate wind after; `flip_lat=0`. New `dump_jra_fields` in `fesom_main.c` + `jax_jra_dump_core2.sh`.
 
-## IMMEDIATE WORK — Task 5.3 onward (the sub-plan has the full ladder + gates)
-- **5.3 JRA55 reader** (host numpy, netCDF4): files
-  `/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/{var}.{YEAR}.nc`, field order
-  **uas,vas,huss,rsds,rlds,tas,prra,prsn** (`fesom_jra55.h:50-59`); cyclic-lon +2, lat-flip;
-  bilinear stencil built ONCE on **geographic** coords; 3-hourly time-interp; **wind g2r
-  rotation** (Euler 50/15/−90); units (Tair K→°C, prec /1000). Gate: dump the 8 jra fields vs
-  C `fesom_jra55_step`.
+## IMMEDIATE WORK — Task 5.4 onward (the sub-plan has the full ladder + gates)
 - **5.4 L&Y09 bulk** (AD-safe JAX): `ncar_ocean_fluxes_mode` (**fixed 5 iters, unrolled** — drop
   the data-dependent break) + `obudget`; `heat_flux/water_flux/stress`; node→elem simple
   mean-of-3; albw=0.1; relative-wind in coeffs but absolute `ug` in obudget (preserve). The
@@ -84,9 +92,12 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
 - **5.8 GATE 5:** gradient check on a CORE2 slice (+ the new d(heat_flux)/d(SST),
   d(stress)/d(current) feedbacks); confirm checkpointed backward fits the GPU at CORE2 scale.
 
-**First moves for 5.3:** read `fesom_jra55.c`/`fesom_bulk.c`; stand up a JRA55 forcing-dump
-job (clone `jax_phc_dump_core2.sh`, set a JRA55 year, dump `jra->{8 fields}` + bulk
-heat/water/stress) to verify against.
+**First moves for 5.4:** read `fesom_bulk.c` (`ncar_ocean_fluxes_mode` + `obudget` +
+`fesom_bulk_compute`); extend the existing `jax_jra_dump_core2.sh` to also dump
+`Cd/Ce/Ch` + `heat_flux/water_flux/stress_node_surf/stress_surf` after `fesom_bulk_compute`
+(the bulk reads the JRA fields the 5.3 reader now reproduces bit-exact, plus SST `T[:,0]` +
+surface current `uvnode[:,0]`). The JRA reader output (`jra55.JRAFields`) feeds the bulk;
+this is where the **differentiable** SST→flux / current→stress seam lives.
 
 ## THE PROVEN VERIFICATION RECIPE (still applies)
 Per-substep dump at pinned probes, truncate to `nlevels`, `verify.assert_close(col, rec,
@@ -147,4 +158,4 @@ a modeling choice** (FRESH_START is a description, not an alternative).
   current. Commit only when asked (per-task commits on `main`). C edits → port2 (branch
   `jax-mesh-export`); job scripts kept untracked there. All python/pytest via the env python.
 
-Confirm you've absorbed this, tell me which task you're starting (5.3), then proceed.
+Confirm you've absorbed this, tell me which task you're starting (5.4), then proceed.
