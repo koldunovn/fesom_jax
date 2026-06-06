@@ -233,3 +233,106 @@ def test_grad_flows_du_to_w(mesh, chain):
     g = np.asarray(jax.grad(loss)(du))
     assert np.all(np.isfinite(g))
     assert np.max(np.abs(g)) > 0
+
+
+# --------------------------------------------------------------------------
+# 6. Task 4.2 — vertical CFL + explicit/implicit w split (wsplit)
+#
+# use_wsplit=0 in the pi/CORE2-d1800 reference config (fesom_constants.h:56), so the
+# split is the identity (w_e=w, w_i=0) on the dump-matching path — and indeed the pi
+# CFL never approaches maxcfl=1.0 (max cfl_z ~1e-4). cfl_z is verified against the
+# literal C loop; the ACTIVE split branch (the part the dump can't reach) is verified
+# against the numpy reference with a synthetic super-critical CFL.
+# --------------------------------------------------------------------------
+def _cfl_z_ref(mesh, w, hnode_new, dt):
+    """Transcription of ``fesom_ale_compute_cflz`` (``fesom_ale.c:204``): per layer add
+    ``|w_top|·dt/h`` to its top interface and ``|w_bot|·dt/h`` to its bottom interface."""
+    uln, nln = np.asarray(mesh.ulevels_nod2D), np.asarray(mesh.nlevels_nod2D)
+    w, h = np.asarray(w), np.asarray(hnode_new)
+    cfl = np.zeros((mesh.nod2D, mesh.nl))
+    for n in range(mesh.nod2D):
+        for nz in range(uln[n] - 1, nln[n] - 1):           # layer loop
+            hh = h[n, nz]
+            if hh <= 0.0:
+                continue
+            cfl[n, nz] += abs(w[n, nz]) * dt / hh
+            cfl[n, nz + 1] += abs(w[n, nz + 1]) * dt / hh
+    return cfl
+
+
+def _wvel_split_ref(mesh, w, cfl_z, use_wsplit, maxcfl):
+    """Transcription of ``fesom_ale_compute_wvel_split`` (``fesom_ale.c:241``)."""
+    uln, nln = np.asarray(mesh.ulevels_nod2D), np.asarray(mesh.nlevels_nod2D)
+    w, cfl = np.asarray(w), np.asarray(cfl_z)
+    inv_maxcfl = 1.0 / max(maxcfl, 1e-12)
+    w_e, w_i = np.zeros_like(w), np.zeros_like(w)
+    for n in range(mesh.nod2D):
+        for nz in range(uln[n] - 1, nln[n] - 1 + 1):       # interface loop, INCLUSIVE
+            ww, c = w[n, nz], cfl[n, nz]
+            if use_wsplit and c > maxcfl:
+                dd = max(c - maxcfl, 0.0) * inv_maxcfl
+                inv = 1.0 / (1.0 + dd)
+                w_e[n, nz], w_i[n, nz] = ww * inv, ww * dd * inv
+            else:
+                w_e[n, nz], w_i[n, nz] = ww, 0.0
+    return w_e, w_i
+
+
+def test_cfl_z_matches_reference(mesh, chain):
+    """cfl_z (vectorized) == the literal C loop, on the real step-1 w."""
+    _, _, _, w, hnode_new = chain
+    cfl = np.asarray(ale.compute_cfl_z(mesh, w, hnode_new, dt=DT))
+    ref = _cfl_z_ref(mesh, w, hnode_new, DT)
+    m = np.asarray(mesh.node_iface_mask)
+    assert np.allclose(cfl[m], ref[m], atol=1e-15, rtol=1e-12)
+    assert np.max(np.abs(cfl)) > 0                          # nonzero (w is wind-driven)
+
+
+def test_wvel_split_identity_when_off(mesh, chain):
+    """use_wsplit=0 (the reference config) ⇒ w_e=w, w_i=0 — the dump-matching identity."""
+    _, _, _, w, hnode_new = chain
+    cfl = ale.compute_cfl_z(mesh, w, hnode_new, dt=DT)
+    w_e, w_i = ale.compute_wvel_split(mesh, w, cfl, use_wsplit=False)
+    assert np.array_equal(np.asarray(w_e), np.asarray(w))
+    assert np.all(np.asarray(w_i) == 0.0)
+
+
+def test_wvel_split_active_matches_reference(mesh):
+    """The ACTIVE split (use_wsplit=1) vs the numpy reference, with a synthetic
+    super-critical CFL that straddles maxcfl (some interfaces split, some don't)."""
+    n = np.arange(mesh.nod2D)[:, None]
+    k = np.arange(mesh.nl)[None, :]
+    imask = np.asarray(mesh.node_iface_mask)
+    w = jnp.where(jnp.asarray(imask),
+                  jnp.asarray(0.1 * np.cos(0.3 * k + 0.01 * n)), 0.0)
+    cfl = jnp.where(jnp.asarray(imask),                     # ranges ~0.5..2.5, crosses 1.0
+                    jnp.asarray(1.5 + 1.0 * np.sin(0.2 * k + 0.013 * n)), 0.0)
+    w_e, w_i = ale.compute_wvel_split(mesh, w, cfl, use_wsplit=True, maxcfl=1.0)
+    re, ri = _wvel_split_ref(mesh, w, cfl, use_wsplit=True, maxcfl=1.0)
+    we, wi = np.asarray(w_e), np.asarray(w_i)
+    assert np.allclose(we[imask], re[imask], atol=1e-15, rtol=1e-13)
+    assert np.allclose(wi[imask], ri[imask], atol=1e-15, rtol=1e-13)
+    # load-bearing: the split must be genuinely active AND inactive across interfaces
+    assert np.any((wi != 0.0)[imask]), "split never activated — raise the synthetic CFL"
+    assert np.any((we == np.asarray(w))[imask] & (np.asarray(cfl) <= 1.0)[imask])
+    # explicit + implicit recovers the total w where split is active (w_e+w_i == w)
+    assert np.allclose((we + wi)[imask], np.asarray(w)[imask], atol=1e-14)
+
+
+def test_wvel_split_gradient_finite(mesh):
+    """AD through the active split is finite (the 1/(1+dd) is smooth, dd≥0; the
+    cfl>maxcfl select is a measure-zero kink) — w_e+w_i must also stay = w."""
+    n = np.arange(mesh.nod2D)[:, None]
+    k = np.arange(mesh.nl)[None, :]
+    imask = jnp.asarray(np.asarray(mesh.node_iface_mask))
+    w0 = jnp.where(imask, jnp.asarray(0.1 * np.cos(0.3 * k + 0.01 * n)), 0.0)
+    cfl0 = jnp.where(imask, jnp.asarray(1.5 + 1.0 * np.sin(0.2 * k + 0.013 * n)), 0.0)
+
+    def loss(w, cfl):
+        w_e, w_i = ale.compute_wvel_split(mesh, w, cfl, use_wsplit=True, maxcfl=1.0)
+        return jnp.sum(w_e) + jnp.sum(w_i * w_i)
+
+    gw, gc = jax.grad(loss, argnums=(0, 1))(w0, cfl0)
+    assert np.all(np.isfinite(np.asarray(gw)))
+    assert np.all(np.isfinite(np.asarray(gc)))
+    assert np.max(np.abs(np.asarray(gc))) > 0              # cfl-dependence is real

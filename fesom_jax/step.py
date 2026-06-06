@@ -1,9 +1,9 @@
 """Single forward ocean step — the Phase-2 pi timestep (Task 2.11).
 
 Wires the ported substep kernels into one ``step(state, mesh, op, stress_surf)``
-mirroring the C driver ``fesom_step.c`` (linfs ALE, PP mixing, upwind tracers, CG
-SSH, no GM/KPP/ice, analytical wind). This is **integration + state-threading**, not
-new physics — every kernel is already dump-gated in its own module/test.
+mirroring the C driver ``fesom_step.c`` (linfs ALE, PP mixing, FCT tracers, CG SSH,
+no GM/KPP/ice, analytical wind). This is **integration + state-threading**, not new
+physics — every kernel is already dump-gated in its own module/test.
 
 The substep order (Phase 2, ``gm=ice=0``):
 
@@ -18,8 +18,8 @@ The substep order (Phase 2, ``gm=ice=0``):
     10 momentum.update_vel            (uv)
     11 ssh.compute_hbar               (ssh_rhs_old, hbar)      ← hbar_old = prev hbar
     12 ssh.eta_n_update               (eta_n)
-    13 ale.thickness_linfs + compute_w(hnode_new, w);  w_e=w, w_i=0  (use_wsplit=0)
-    15 tracer_adv.advect_one ×2 + tracer_diff.impl_vert_diff + salinity floor
+    13 ale.thickness_linfs + compute_w + compute_cfl_z + wvel_split (use_wsplit=0 ⇒ w_e=w)
+    15 tracer_adv.advect_one_fct ×2 + tracer_diff.impl_vert_diff + salinity floor
     16 ale.commit_thickness           (hnode, helem)
 
 State threading that matters (verified by the multi-step dump gate, not step 1 alone):
@@ -98,17 +98,19 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     ssh_rhs_old, hbar = ssh.compute_hbar(mesh, uv, st.helem, hbar_old, dt=dt)
     eta_n = ssh.eta_n_update(mesh, st.eta_n, hbar, hbar_old)
 
-    # 13 — ALE: static hnode_new + vertical velocity (use_wsplit=0 ⇒ w_e=w, w_i=0)
+    # 13 — ALE: static hnode_new + vertical velocity; vertical CFL + explicit/implicit
+    #      split. use_wsplit=0 in the pi reference config ⇒ the split is the identity
+    #      (w_e=w, w_i=0); cfl_z is computed every step as in the C (populates State).
     hnode_new = ale.thickness_linfs(st.hnode)
     w = ale.compute_w(mesh, uv, st.helem)
-    w_e = w
-    w_i = jnp.zeros_like(w)
+    cfl_z = ale.compute_cfl_z(mesh, w, hnode_new, dt=dt)
+    w_e, w_i = ale.compute_wvel_split(mesh, w, cfl_z)
 
-    # 15 — upwind tracer advection (T then S) + implicit vertical diffusion
-    T_adv, T_old = tracer_adv.advect_one(mesh, uv, w_e, st.helem, st.hnode, hnode_new,
-                                         st.T, st.T_old, dt=dt)
-    S_adv, S_old = tracer_adv.advect_one(mesh, uv, w_e, st.helem, st.hnode, hnode_new,
-                                         st.S, st.S_old, dt=dt)
+    # 15 — FCT tracer advection (T then S) + implicit vertical diffusion
+    T_adv, T_old = tracer_adv.advect_one_fct(mesh, uv, w_e, st.helem, st.hnode,
+                                             hnode_new, st.T, st.T_old, dt=dt)
+    S_adv, S_old = tracer_adv.advect_one_fct(mesh, uv, w_e, st.helem, st.hnode,
+                                             hnode_new, st.S, st.S_old, dt=dt)
     T_new, S_new = tracer_diff.impl_vert_diff(mesh, T_adv, S_adv, Kv, hnode_new, dt=dt)
     # salinity floor on wet layers only (below-bottom stays 0)
     S_new = jnp.where(mesh.node_layer_mask, jnp.maximum(S_new, S_FLOOR), S_new)
@@ -120,7 +122,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         st,
         T=T_new, S=S_new, T_old=T_old, S_old=S_old,
         uv=uv, uv_rhs=du, uv_rhsAB=uv_rhsAB, uvnode=uvnode,
-        w=w, w_e=w_e, w_i=w_i,
+        w=w, w_e=w_e, w_i=w_i, cfl_z=cfl_z,
         eta_n=eta_n, d_eta=d_eta, ssh_rhs=ssh_rhs, ssh_rhs_old=ssh_rhs_old,
         hnode=hnode, hnode_new=hnode_new, helem=helem, hbar=hbar, hbar_old=hbar_old,
         density=density, hpressure=hpressure, bvfreq=bvfreq, Kv=Kv, Av=Av,

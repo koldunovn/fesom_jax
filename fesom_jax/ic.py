@@ -90,10 +90,21 @@ def tracer_T_blob(
 
 def initial_state(mesh: Mesh, T0: float = 10.0, S0: float = 35.0, blob: bool = True) -> State:
     """Phase-2 pi initial state: rest thickness + constant ``T0``/``S0`` (masked to
-    wet layers) + the default T-blob. ``T_old``/``S_old`` initialise to the same."""
+    wet layers) + the default T-blob.
+
+    ⚠️ ``T_old``/``S_old`` (the AB2 ``valuesold``) are the **pre-blob constant base**
+    (``T0``/``S0``), NOT the blob field. The C sets ``valuesold`` to the constant IC
+    (``fesom_main.c``): the blob is added to ``values`` *only* (``:748``), *after* a
+    rest-state ``advect_one(T)`` sanity check (``:721``) has already saved
+    ``valuesold = values = T0 = 10``. So at step 1 the AB2 extrapolation is
+    ``ttfAB = -(0.5+ε)·T0 + (1.5+ε)·(T0+blob)`` — **not** ``ttfAB = T``. This is
+    load-bearing for the step-1 tracer advection match (the FCT ``T`` dump gate fails
+    by ~3e-7 if ``T_old`` is the blob field instead of the base). ``S`` is constant so
+    ``S_old`` is immaterial (the C leaves it 0 — the sanity advect only runs on T —
+    but a constant tracer is preserved for any ``S_old``); base ``S0`` is the clean,
+    dump-reproducing choice. See ``docs/PORTING_LESSONS.md``."""
     st = State.rest(mesh, T0, S0)
-    T = jnp.where(mesh.node_layer_mask, st.T, 0.0)
-    S = jnp.where(mesh.node_layer_mask, st.S, 0.0)
-    if blob:
-        T = tracer_T_blob(mesh, T, **BLOB_DEFAULTS)
-    return dataclasses.replace(st, T=T, S=S, T_old=T, S_old=S)
+    T_base = jnp.where(mesh.node_layer_mask, st.T, 0.0)
+    S_base = jnp.where(mesh.node_layer_mask, st.S, 0.0)
+    T = tracer_T_blob(mesh, T_base, **BLOB_DEFAULTS) if blob else T_base
+    return dataclasses.replace(st, T=T, S=S_base, T_old=T_base, S_old=S_base)

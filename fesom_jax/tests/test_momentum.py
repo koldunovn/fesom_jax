@@ -319,6 +319,53 @@ def test_visc_filter_synthetic_matches_reference(mesh):
     assert np.max(np.abs(out[m] - np.asarray(uv_rhs)[m])) > 0
 
 
+def _flow_aware_edge_stats(mesh, uv):
+    """Per-edge ``|du| = |uv[el1]-uv[el2]|`` and the C branch selection at each
+    interior valid edge/level — used to assert which flow-aware terms a test fires.
+
+    The opt_visc=7 coefficient is ``sqrt(max(g0, max(g1·|du|, g2·|du|²))·len)``; the
+    flow-aware branch is active where ``max(g1·|du|, g2·|du|²) > g0`` (else it is the
+    constant-coefficient biharmonic), and the quadratic g2 term dominates where
+    ``g2·|du|² > g1·|du|`` (i.e. ``|du| > g1/g2 ≈ 0.351``)."""
+    uv = np.asarray(uv)
+    et = np.asarray(mesh.edge_tri)
+    interior = (et[:, 0] >= 0) & (et[:, 1] >= 0)
+    e1 = np.where(interior, et[:, 0], 0)
+    e2 = np.where(interior, et[:, 1], 0)
+    lm = np.asarray(mesh.elem_layer_mask)
+    du = uv[e1] - uv[e2]
+    mag = np.sqrt(du[..., 0] ** 2 + du[..., 1] ** 2)
+    valid = interior[:, None] & lm[e1] & lm[e2]
+    mm = mag[valid]
+    flow_aware = np.maximum(_G1 * mm, _G2 * mm ** 2) > _G0
+    g2_wins = _G2 * mm ** 2 > _G1 * mm
+    return mm, flow_aware, g2_wins
+
+
+def test_visc_filter_flow_aware_branches_vs_reference(mesh):
+    """The flow-aware coefficient (g1·|du| and the quadratic g2·|du|²) — the part of
+    opt_visc=7 the pi dump can NOT reach (dump edge-velocity differences stay ≤8e-4 over
+    all 10 steps, far below the |du|>0.03 flow-aware onset) and the moderate ``_synthetic``
+    test only reaches in the g1 branch. Drive a strong synthetic flow (amplitude ~2 m/s)
+    so BOTH the linear g1 and quadratic g2 branches bind, and verify the kernel against
+    the independent numpy reference there (which is where the flow-aware ``max`` matters)."""
+    e = np.arange(mesh.elem2D)[:, None]
+    k = np.arange(mesh.nl)[None, :]
+    uv = jnp.where(mesh.elem_layer_mask[..., None], jnp.asarray(
+        np.stack([2.0 * np.cos(0.3 * k + 0.01 * e),
+                  1.5 * np.sin(0.2 * k - 0.013 * e)], -1)), 0.0)
+    uv_rhs = jnp.zeros((mesh.elem2D, mesh.nl, 2))
+    out = np.asarray(momentum.visc_filt_bidiff(mesh, uv, uv_rhs, dt=DT))
+    ref = _bidiff_ref(mesh, uv, uv_rhs, DT)
+    m = np.asarray(mesh.elem_layer_mask)
+    # flow-aware coefficients amplify ~50× the constant-g0 floor → looser rtol than g0
+    assert np.allclose(out[m], ref[m], rtol=1e-10, atol=1e-9)
+    # load-bearing: BOTH flow-aware branches must actually be selected here
+    _, flow_aware, g2_wins = _flow_aware_edge_stats(mesh, uv)
+    assert flow_aware.mean() > 0.5, f"g1 flow-aware inactive ({flow_aware.mean():.2f})"
+    assert g2_wins.sum() > 0, "quadratic g2 branch never selected — raise the amplitude"
+
+
 def test_visc_filter_gradient_ad_vs_fd(mesh):
     """AD through the flow-aware biharmonic at nonzero flow (smooth regime; the
     safe-sqrt keeps it finite even at the |∇u|=0 kink)."""

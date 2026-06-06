@@ -549,3 +549,138 @@ Cite the C source (`file:line`) or dump probe that proves it.
   The grad-of-scan compile constant-folds a few `f64[3140,48,2]` scatter-adds with constant
   index operands; it's a compile-time/runtime trade-off, not a correctness issue (the run is
   correct and fast). Ignore the `slow_operation_alarm` lines. (GPU job 25378918, Task 3.1.)
+
+## Phase 4 — FCT (Task 4.1, GATE-4 forward)
+
+- **[ic] ⚠️⚠️ THE bug that ate the session: the C's step-1 `valuesold` (AB2 `T_old`) is the
+  **pre-blob base constant T=10**, NOT the blob field.** `fesom_ic_tracers_constant` sets only
+  `values` (`fesom_ic.c:62`); `valuesold` is `calloc`'d to 0 (`fesom_tracers.c:17`). Then
+  `fesom_main.c:721` runs a rest-state `advect_one(T)` *sanity check* whose `init_tracers_AB_one`
+  saves `valuesold = values = 10` — and ONLY THEN (`:748`) is the blob added to `values`. So at
+  step 1, `T_old=10` (base), `values=10+blob`, and the AB2 extrapolation is
+  `ttfAB = -(0.5+ε)·10 + (1.5+ε)·(10+blob)`, **not** `ttfAB = values`. Our `ic.initial_state`
+  set `T_old=T` (the blob) — wrong. **This was mis-attributed for two phases as the
+  "upwind−FCT gap" (~3e-7).** It contaminated BOTH upwind and FCT at step 1; the FCT `T` dump
+  match jumps from 3.4e-7 → **1.8e-15** once `T_old` is the base. `S` (constant) is insensitive
+  (a constant tracer is preserved for any `S_old`), which is why `S=35` matched all along and
+  hid the bug. Fix: `ic.py` sets `T_old`/`S_old` to the masked pre-blob base. **Lesson: at step
+  1, `T_old` need not equal `T`; chase a "gap" to its first principles before labelling it a
+  scheme difference.** (`ic.py`, Task 4.1.)
+
+- **[verify/method] ⚠️ A "faithful port" that matches your own numpy reference can STILL be
+  wrong — they can share an INPUT bug. Dump the C's intermediates.** JAX FCT == numpy-C-ref
+  FCT to ~1e-10 (stage-by-stage), and BOTH disagreed with the dump by 3e-7. The shared error
+  was not in the formula (verified the qr4c against the C *and* the Fortran `oce_adv_tra_ver.F90`
+  line-for-line — identical) but in the `ttfAB` *input* (the `T_old` bug above). The decisive
+  move: add temporary `fesom_dump_record_node` calls in the C for the FCT intermediates
+  (`fct_LO`, `adv_flux_ver` after the limiter) right after the T-advection (before S overwrites
+  the scratch), rebuild, run with `FESOM_NO_TRDIFF=1` (isolates advection from diffusion). The
+  C's `adf_v[surface] = -5.6e4` while ours was 0 (at step 1 `ttfAB=values` ⇒ surface adf=0) —
+  working backward `adf=-(ttfAB-values)·W·area` gave `T_old=10`, cracking it. (Task 4.1.)
+
+- **[fct] The FCT structure: `T_new = LO + limited(HO − LO)`. LO fluxes use `values` (T), HO
+  uses `ttfAB`, the element/up-dn gradient uses `values`.** Driver `fesom_tracer_advect_one_fct`
+  (`:1199`): (2) LO upwind fluxes from **values** (NOT ttfAB — unlike the upwind-only driver);
+  (3) `compute_fct_LO` = the upwind ALE solution; (4) HO with `init_zero=0` ⇒ `adf := HO − LO`
+  (horizontal MFCT 3rd-order `num_ord=0`, vertical QR4C 4th-order `num_ord=1`); (5) Zalesak
+  limit; (6) `flux2dtracer_fct` adds the LO transition `-T·hnode + LO·hnode_new` + the limited
+  antidiff divergence; (8) reconstruct. The algebra collapses to `T_new = LO + antidiff_div/
+  areasvol/hnode_new`. For pi: no cavities (`ulevels≡1`), single rank (`myDim_edge2D==edge2D`).
+  (`tracer_adv.advect_one_fct`, Task 4.1.)
+
+- **[fct] A constant tracer is preserved by FCT (the gradients vanish ⇒ HO==LO, antidiff=0).**
+  `tracer_gradient_elements` of a constant is 0 (∑∂N/∂x = 0, partition-of-unity), so the MFCT
+  reconstruction `Tmean1=Tmean2=const` ⇒ HO flux == LO flux ⇒ `adf=0`, and the limiter clips
+  nothing ⇒ `T_new = LO = const`. This is why `S=35` is the clean bit-for-bit FCT gate, exactly
+  as in upwind. (Task 4.1.)
+
+- **[fct/AD] The Zalesak limiter is differentiated as a SUBGRADIENT (option a) — finite & NaN
+  -safe because the C's `flux_eps=1e-16` floors every limiter ratio.** `min(1, fct_ttf_max/
+  (fct_plus·dt/area/hnode + flux_eps))` is always finite (`fct_plus≥0` ⇒ denom `≥ flux_eps`);
+  when the antidiff flux vanishes the ratio is large-but-finite and `min` picks the constant 1
+  with a 0 cotangent on a *finite* value — no `0·inf`. The `±bignumber=±1e3` padding (a2) is
+  finite, so the `max`/`min`/`segment_max`/`segment_min` reductions never see inf. So unlike the
+  CG (which needed a separate tight `transpose_solve`), the limiter needs NO special AD
+  machinery — the forward `flux_eps` is the whole fix. Plateau `d(SST)/d(k_ver)` = 5.7e-7
+  (≈ the upwind 5.9e-7 — the limiter is inactive in the smooth blob, so the subgradient == FD
+  there). Decision + rejected alternatives (b smooth-relax, c stop_gradient) documented in
+  `docs/LIMITER_GRADIENTS.md`. (`tracer_adv.zalesak_limit`, Task 4.1.)
+
+- **[fct/qr4c] The vertical 4th-order QR4C `Z`-stencil denominators vanish at the bottom-pad
+  level (`Zp=concat([Z,Z[-1:]])` ⇒ `Z[nz-1]−Z[nz]=0`) — guard with `where(d==0,1,d)` (the
+  recurring masked-divide rule, 4th time).** The masked-out interior formula is unused forward
+  but `0·inf=NaN` in the backward pass without the guard. Same class as the eos `bvfreq` and
+  `tracer_diff` `1/zdiff` traps. (`tracer_adv._z_stencil`/`adv_flux_ver_ho`, Task 4.1.)
+
+- **[fct/method] Test the limiter where it's ACTIVE — the dump's smooth step-1 leaves it
+  inactive.** The real blob is well-resolved ⇒ no overshoots ⇒ the limiter clips nothing ⇒ the
+  dump verifies only the HO flux, not the min/max/sign-select limiter logic. Added a synthetic
+  **sharp tracer + ×5000 velocity** test vs the numpy FCT reference that forces the limiter to
+  bind — the strong check for the limiter branch. (`test_FCT_limiter_active_vs_numpy_reference`,
+  Task 4.1.)
+
+- **[fct/diff] Fixing `T_old` also closed the deferred Phase-2 tight multi-step `T/S` gate AND
+  dump-verified the blob diffusion.** With FCT + the IC fix, `step()`'s substep-15 `T` matches
+  the committed dump to 1.8e-15 (was the "Phase-4 deferred" gate), and the step-2 SSH fields
+  (`d_eta`/`hbar`/`eta_n`) — which cascaded the old `T` error through density — now match to
+  <1e-11 (was gated loose at 1e-7). The vertical tracer diffusion on a *non-constant* field
+  (only ever property-tested in Phase 2) is now confirmed correct by the tight `T` dump match.
+  (`test_step_pi.py`, Task 4.1.)
+
+## Phase 4 — opt_visc7 verify + wsplit (Task 4.2)
+
+- **[verify/method] ⚠️ "Ported AND tested" ≠ "every coefficient regime tested" — check the
+  branch-selection statistics, not just that the test is green.** The opt_visc=7 flow-aware
+  biharmonic was fully ported in Task 2.5, but its flow-aware branch was effectively unverified:
+  a diagnostic (run `step()` 10 steps, count edges with `max(γ1·|du|, γ2·|du|²) > γ0`) showed
+  **0 flow-aware-active edges at every dump step** — pi's edge-velocity differences grow only
+  8e-5→8e-4, all ≪ the |du|>0.03 γ1-onset, so the dump can ONLY ever test the constant-γ0
+  biharmonic. The existing `_synthetic` test (uv amp 0.1) *did* reach the γ1 branch (51% of
+  edges) but **never** the quadratic γ2 (needs |du|>γ1/γ2=0.351; synthetic max 0.219). Moral:
+  when a kernel has data-dependent branches, instrument which branch the test inputs actually
+  exercise; a passing test over a too-mild input silently skips a code path. Fix: a strong-flow
+  (~2 m/s) synthetic test that binds BOTH branches, with an explicit `assert g2_wins.sum() > 0`.
+  (`test_momentum.test_visc_filter_flow_aware_branches_vs_reference`, Task 4.2.)
+
+- **[config] `use_wsplit=0` in the pi/CORE2-d1800 reference config (`fesom_constants.h:56`), so
+  `w_e=w, w_i=0` IS the dump-matching path — porting the split is CORE2-readiness, not pi
+  correctness.** The vertical-velocity CFL splitter was disabled in the reference runs (it seeded
+  a Fortran day-92 barotropic blow-up). Two consequences: (1) the step-1 substep-15 `T` 1.8e-15
+  match already *proved* `w_e=w` (tracer advection reads `w_e`); (2) pi's max `cfl_z`~1e-4 ≪
+  maxcfl=1.0, so the split would be the identity even if turned on at pi velocities. So
+  `compute_wvel_split` is ported faithfully but its active branch is verified only via a
+  synthetic super-critical CFL vs the numpy ref — wiring it into `step()` is numerically
+  transparent (every gate + the gradient plateau 5.70e-7 unchanged). ⚠️ The implicit part `w_i`
+  feeds `impl_vert_visc`'s advective tridiagonal terms, which the Phase-2 kernel drops under the
+  `w_i=0` simplification — re-enabling those is a Phase-5 item, gated on `use_wsplit=1`.
+  (`ale.compute_wvel_split`, `step.py`, Task 4.2.)
+
+- **[ale/cfl] `cfl_z` is an interface field built from BOTH adjacent layers' `|w|·dt/h` — the
+  "above" layer must be ZERO-padded at the surface (not edge-replicated).** The C accumulates
+  per layer onto its top (`+=|w[nz]|·dt/h[nz]`) and bottom (`+=|w[nz+1]|·dt/h[nz]`) interfaces,
+  so `cfl_z[i] = |w[i]|·dt·(1/h[i] + 1/h[i-1])` with the surface/bottom interfaces getting one
+  term. Vectorized: `below = inv_h` (layer i), `above = shift_down_zero(inv_h)` (layer i-1, 0 at
+  i=0 since no layer is above the surface). Using the momentum `_shift_down` (edge-replicate)
+  here would wrongly double-count the surface layer. The `dt/h` divide is AD-guarded with the
+  usual `where(h>0, h, 1)` masked-finite pattern. (`ale.compute_cfl_z`, `fesom_ale.c:204`, Task 4.2.)
+
+- **[verify/method] A rest-trivial element gate becomes a real gate at step ≥2 once the
+  trajectory is dump-tight.** The substep-6 `uv_rhs` (viscosity) dump gate was trivial at step 1
+  (uv=0 ⇒ the biharmonic adds nothing, substep6==substep5). With FCT making the multi-step
+  trajectory tight (Task 4.1), reconstructing substeps 1–6 from the post-step-1 state and
+  comparing to the step-2 dump gives a real end-to-end viscosity gate — matched **~1e-17**
+  (gather class; the small wind-driven velocities keep it in the constant-γ0 regime, ~1e-9
+  viscous contribution). General: deferred "trivial-at-rest" element gates unlock at the first
+  nonzero-flow step *after* the trajectory is verified tight against the dump.
+  (`test_step_pi.test_step2_uv_rhs_visc_matches_dump`, Task 4.2.)
+
+- **[step/stability] pi 1000 steps (dt=100, full physics) is stable in ~48 s, and the
+  vertical CFL stays ≪ maxcfl over the whole window (max `cfl_z`=2.8e-3 ≪ 1.0) — so the
+  use_wsplit=0 config is self-consistent long-window, not just at the dump's 10 steps.** The
+  jitted `run` amortizes compile so 1000 steps cost ~2.5× the 100-step test, not 10× (~48 s vs
+  ~20 s). Over 1000 steps: no NaN, max|uv|=0.17, max|eta|=0.63 m, **S exactly 35** (bit-exact —
+  the strongest long-window AB2/threading regression guard), T∈[10.0,14.98]. The AD gate is NOT
+  re-run at 1000 steps (the model is mildly chaotic via scatter reassociation — long windows sit
+  on the FD chaos floor; `test_gradient.py` stays at N=20 by design). "Climate-close to C" at
+  1000 steps stays **indirect** (no C 1000-step pi snapshot — the dump is 10 steps); the tight
+  step-1..10 FCT dump match + S-exact + boundedness are the stand-in. (`test_step_pi.py`, Task 4.3.)

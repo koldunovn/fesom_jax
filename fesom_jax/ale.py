@@ -32,7 +32,13 @@ import jax.numpy as jnp
 from jax import lax
 
 from . import ops
+from .config import DT_DEFAULT, USE_WSPLIT, WSPLIT_MAXCFL
 from .mesh import Mesh
+
+
+def _shift_down_zero(x):
+    """``out[..., k] = x[..., k-1]``, **zero**-padded at ``k=0`` (no edge-replicate)."""
+    return jnp.concatenate([jnp.zeros_like(x[..., :1]), x[..., :-1]], axis=-1)
 
 
 def thickness_linfs(hnode):
@@ -122,3 +128,59 @@ def compute_w(mesh: Mesh, uv, helem):
     safe_area = jnp.where(mesh.area > 0.0, mesh.area, 1.0)
     w = w / safe_area
     return ops.mask_below_bottom(w, mesh.node_iface_mask)
+
+
+def compute_cfl_z(mesh: Mesh, w, hnode_new, *, dt=DT_DEFAULT):
+    """Vertical CFL number at interfaces ``cfl_z`` ``[nod2D, nl]`` (``fesom_ale_compute_cflz``,
+    ``fesom_ale.c:204``). Each interface accumulates ``|w|·dt/h`` from the layers above and
+    below it::
+
+        cfl_z[i] = |w[i]|·dt·( [layer i  valid]/h[i]  +  [layer i-1 valid]/h[i-1] )
+
+    so the surface/bottom interfaces get a single term and interior interfaces get both
+    (matching the C ``+=`` accumulation over each layer's top/bottom faces). ``h`` is the
+    layer thickness ``hnode_new``; the C skips ``h<=0`` layers, mirrored by the layer mask.
+
+    Only consumed by :func:`compute_wvel_split` when ``use_wsplit`` is on (off for the pi
+    reference config), but computed every step as in the C so ``State.cfl_z`` is populated."""
+    h = hnode_new
+    safe_h = jnp.where(h > 0.0, h, 1.0)
+    inv_h = jnp.where(mesh.node_layer_mask & (h > 0.0), dt / safe_h, 0.0)  # layer field
+    below = inv_h                       # layer i (below interface i)
+    above = _shift_down_zero(inv_h)     # layer i-1 (above interface i); 0 at i=0
+    cfl = jnp.abs(w) * (below + above)
+    return ops.mask_below_bottom(cfl, mesh.node_iface_mask)
+
+
+def compute_wvel_split(mesh: Mesh, w, cfl_z, *, use_wsplit=USE_WSPLIT,
+                       maxcfl=WSPLIT_MAXCFL):
+    """Split the vertical velocity ``w`` into explicit ``w_e`` and implicit ``w_i`` parts
+    (``fesom_ale_compute_wvel_split``, ``fesom_ale.c:241``). Returns ``(w_e, w_i)``.
+
+    Where the vertical CFL exceeds ``maxcfl`` the excess is moved to the implicit part so
+    the explicit advection stays CFL-stable::
+
+        dd  = max(cfl_z − maxcfl, 0) / maxcfl
+        w_e = w / (1 + dd),   w_i = w · dd / (1 + dd)      (cfl_z > maxcfl)
+        w_e = w,              w_i = 0                        (otherwise)
+
+    **``use_wsplit`` is 0 in the pi (and CORE2 dt=1800) reference config**
+    (``fesom_constants.h:56`` — the split seeded a Fortran day-92 blow-up), so this is the
+    identity ``(w, 0)`` on the dump-matching path; the active branch is exercised by the
+    synthetic high-CFL test. AD-safe: ``dd ≥ 0`` ⇒ ``1+dd ≥ 1`` (no zero divide), and the
+    static ``maxcfl = 1.0`` floors the ``1/maxcfl``.
+
+    ⚠️ ``w_i`` (the implicit part) feeds the ``impl_vert_visc`` advective tridiagonal terms,
+    which the Phase-2 kernel drops under the ``w_i=0`` (``use_wsplit=0``) simplification —
+    re-enabling those terms is a Phase-5/CORE2 item, needed only when ``use_wsplit`` is on."""
+    if not use_wsplit:
+        return jnp.asarray(w), jnp.zeros_like(w)
+    inv_maxcfl = 1.0 / max(maxcfl, 1e-12)            # static (maxcfl is a Python float)
+    dd = jnp.maximum(cfl_z - maxcfl, 0.0) * inv_maxcfl
+    inv_1_dd = 1.0 / (1.0 + dd)                      # dd ≥ 0 ⇒ always finite
+    split = cfl_z > maxcfl
+    w_e = jnp.where(split, w * inv_1_dd, w)
+    w_i = jnp.where(split, w * dd * inv_1_dd, 0.0)
+    w_e = ops.mask_below_bottom(w_e, mesh.node_iface_mask)
+    w_i = ops.mask_below_bottom(w_i, mesh.node_iface_mask)
+    return w_e, w_i

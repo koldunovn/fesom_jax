@@ -474,11 +474,11 @@ match becomes available.
 - Create: `docs/LIMITER_GRADIENTS.md`
 - Modify: `fesom_jax/tests/test_tracers.py`
 
-- [ ] port high-order + Zalesak limiter (`fct_plus/minus`, local min/max bounds, sign-dependent flux selection) — ref `fesom_tracer_adv.c:814+`, FRESH_START §12
-- [ ] **RESEARCH ITEM:** decide & document the limiter-gradient strategy in `docs/LIMITER_GRADIENTS.md` — options: (a) subgradient as-is, (b) smooth min/max relaxation, (c) `stop_gradient` on the limiter coefficients (treat the limited flux mask as fixed in the backward pass). Implement the chosen one.
-- [ ] forward verification: FCT `T/S` vs C dump substep 15 (≤1e-12)
-- [ ] gradient check with the chosen limiter strategy (must be finite + finite-diff-consistent where smooth)
-- [ ] run — must pass before next task
+- [x] port high-order + Zalesak limiter (`fct_plus/minus`, local min/max bounds, sign-dependent flux selection) — ref `fesom_tracer_adv.c:814+`, FRESH_START §12 — `tracer_adv.advect_one_fct` (MFCT 3rd-order hor + QR4C 4th-order ver + `compute_fct_lo` + `fill_up_dn_grad` + `zalesak_limit` + `flux2dtracer_fct`); wired into `step.py`. **⚠️ Found+fixed THE bug**: the C step-1 `T_old` = pre-blob base T=10 (NOT the blob), mis-attributed 2 phases as the "upwind−FCT gap" — `ic.py`.
+- [x] **RESEARCH ITEM:** decide & document the limiter-gradient strategy in `docs/LIMITER_GRADIENTS.md` — **(a) subgradient as-is** chosen: NaN-safe (the C `flux_eps=1e-16` floors every limiter ratio), FD-consistent where smooth, forward unchanged; (b) smooth-relax + (c) stop_gradient rejected (b changes the forward / fails the dump gate; c biases the gradient). Plain `jnp` VJP.
+- [x] forward verification: FCT `T/S` vs C dump substep 15 — **TIGHT: `T` matches 1.8e-15** (was 3.4e-7 under the `T_old` bug), `S` bit-for-bit; + an independent numpy FCT reference (smooth **and** a synthetic limiter-ACTIVE case)
+- [x] gradient check with the chosen limiter strategy — `test_gradient.py` green with FCT live: `d(SST)/d(k_ver)` plateau **5.7e-7** (≪1e-4), flows through the CG **and** the limiter; `d/d(T₀)` finite everywhere (no limiter/qr4c masked-NaN)
+- [x] run — must pass before next task — **test_tracers.py 35 / test_step_pi.py 67 / test_gradient.py 5; full suite green**
 
 #### Task 4.2: Complete opt_visc=7 (flow-aware biharmonic) + wsplit
 
@@ -489,25 +489,53 @@ match becomes available.
 > does not re-port a different scheme.
 
 **Files:**
-- Modify: `fesom_jax/momentum.py`, `fesom_jax/ale.py`
-- Modify: tests
+- Modify: `fesom_jax/ale.py`, `fesom_jax/step.py`
+- Modify: `fesom_jax/tests/test_momentum.py`, `test_ale.py`, `test_step_pi.py`
 
-- [ ] complete the flow-aware terms of `visc_filt_bidiff` (opt_visc=7, visc_gamma0=0.003 — FRESH_START §14.7) to match the live C kernel
-- [ ] port `use_wsplit` vertical-velocity splitting (wsplit_maxcfl=1.0)
-- [ ] forward verification vs Fortran dumps (substep 13 `w` is a node field → direct; substep 6 `uv_rhs` is element → element dump / indirect)
-- [ ] run — must pass before next task
+- [x] flow-aware terms of `visc_filt_bidiff` (opt_visc=7, γ0/γ1/γ2 = 0.003/0.1/0.285) —
+  **were already fully ported in Task 2.5** (the `max(γ0, max(γ1·|du|, γ2·|du|²))` flow-aware
+  `max` is present + matches the C). The gap was **verification, not code**: the dump can't
+  reach the flow-aware regime (max edge-velocity-diff ≤8e-4 over all 10 steps ≪ the |du|>0.03
+  γ1-onset / |du|>0.351 γ2-onset; **flow-aware-active = 0 edges** every step), and the moderate
+  `_synthetic` test (amp 0.1) only reaches the γ1 branch (51% of edges). Added
+  `test_visc_filter_flow_aware_branches_vs_reference` (strong synthetic flow ~2 m/s exercising
+  BOTH γ1 and the quadratic γ2 branch vs the numpy ref, with a load-bearing branch-selection assert).
+- [x] `use_wsplit` vertical-velocity splitting (wsplit_maxcfl=1.0) — `ale.compute_cfl_z` +
+  `ale.compute_wvel_split` (faithful to `fesom_ale.c:204,241`), wired into `step.py` (computes
+  `cfl_z` every step → `State.cfl_z`). **`use_wsplit=0` in the reference config** (`fesom_constants.h:56`)
+  ⇒ the split is the **identity** (`w_e=w, w_i=0`) on the dump-matching path (numerically
+  transparent — all gates + the gradient plateau 5.70e-7 unchanged); pi's CFL never nears
+  maxcfl (max `cfl_z`~1e-4) so it's inactive even if turned on. The active branch is verified
+  vs the numpy ref with a synthetic super-critical CFL. ⚠️ `impl_vert_visc`'s `w_i` advective
+  tridiagonal terms stay dropped (correct at `w_i=0`) — re-enabling them is a Phase-5 item.
+- [x] forward verification vs dumps: substep-13 `w` (node, already green); **substep-6 `uv_rhs`
+  (element) now gated at step 2** — `test_step2_uv_rhs_visc_matches_dump` (real wind-driven flow,
+  FCT made the trajectory tight) matches the dump **~1e-17** (the step-1 gate was rest-trivial).
+- [x] run — **full suite green** (test_ale 21, the 2 new viscosity gates, gradient plateau 5.70e-7)
 
 #### Task 4.3: pi 1000-step stability + AD re-check
 
 **Files:**
 - Modify: `fesom_jax/tests/test_step_pi.py`, `fesom_jax/tests/test_gradient.py`
 
-- [ ] run pi 1000 steps at dt=100; assert stable; snapshot climate-close to C
-- [ ] re-run the Phase-3 gradient gate with FCT + backscatter active
-- [ ] run — must pass before Phase 5
+- [x] run pi 1000 steps at dt=100; assert stable — `test_1000_step_stability` (~48 s,
+  jitted `run`): no NaN, max|uv|=0.17, max|eta|=0.63 m, **S exactly 35** over the whole
+  window (bit-exact threading), T∈[10.0, 14.98] (blob ~+5°C, bounded). Max `cfl_z`=2.8e-3
+  ≪ maxcfl=1.0 ⇒ wsplit would stay inactive even at 1000 steps (use_wsplit=0 self-consistent).
+  ⚠️ "snapshot climate-close to C" stays **indirect** (no C 1000-step pi snapshot exists —
+  same as the Phase-2 deferral): verified instead by the tight step-1..10 dump match (FCT),
+  the S-exact invariant, bounded/stable fields, and the step-2 element gate.
+- [x] re-run the Phase-3 gradient gate with FCT + opt_visc7 active — `test_gradient.py`
+  green with the full pi physics (FCT limiter + opt_visc7 + the wsplit machinery live):
+  `d(SST)/d(k_ver)` plateau **5.70e-7** (≪1e-4), flows through the CG, `d/d(T₀)` finite.
+  ("backscatter" in the old wording was a misnomer — the C runs opt_visc=7 biharmonic.)
+- [x] run — full suite **313 passed**
 
-**GATE 4:** pi 1000 steps stable & climate-close; gradient check still passes with full pi
-physics.
+**GATE 4 — ✅ MET (2026-06-06):** pi 1000 steps stable (no NaN; bounded |uv|/|eta|; S exactly
+35; T bounded; CFL ≪ maxcfl); the gradient gate still passes with the full pi physics (FCT +
+opt_visc7) live — plateau 5.70e-7, flowing through the CG. Climate-close-to-C stays indirect
+(no C 1000-step snapshot). **Phase 4 complete.** Next: Phase 5 (CORE2 single-device) — expand
+into `docs/plans/<date>-fesom-jax-core2.md`.
 
 ---
 
@@ -878,3 +906,73 @@ physics.
   - **GATE 3 MET; Phase 3 complete.** Next: **Phase 4** (Task 4.1 FCT/Zalesak +
     limiter-gradient decision; Task 4.2 opt_visc7 flow-aware + wsplit; Task 4.3 pi 1000-step +
     AD re-check) — at which the tight multi-step `T/S` dump match becomes available.
+- **2026-06-06 — execution session 10** (Phase 4, **Task 4.1: FCT (Zalesak) advection +
+  the limiter-gradient decision**). `tracer_adv.advect_one_fct` + `zalesak_limit` (+ MFCT/QR4C
+  HO fluxes, `compute_fct_lo`, `fill_up_dn_grad`) wired into `step.py`; `ic.py` `T_old` fix;
+  `docs/LIMITER_GRADIENTS.md`; +15 FCT tests. **Full suite green** (the only Phase-4-changed
+  gate, `test_step1_T_is_upwind_fct_gap`, was rewritten to the now-tight `T` gate).
+  - **FCT port:** the dump's live scheme — `T_new = LO + limited(HO − LO)`. LO = upwind ALE
+    (from `values`); HO = MFCT 3rd-order horizontal (`num_ord=0`, element + up/dn-triangle
+    gradient from `values`) + QR4C 4th-order vertical (`num_ord=1`, `ttfAB`); the **Zalesak
+    limiter** clips the antidiffusive `HO − LO` to introduce no new extrema. Verified
+    stage-by-stage against a literal numpy-C reference (`fct_LO`/`tr_xy`/`eud`/`adf_h`/`adf_v`
+    all ≤1e-10), and the qr4c against BOTH the C and the Fortran `oce_adv_tra_ver.F90`.
+  - **⚠️⚠️ THE bug (cost the session): the C's step-1 `T_old` (AB2 `valuesold`) is the pre-blob
+    base T=10, NOT the blob field.** `valuesold` is `calloc`'d 0; a rest-state `advect_one(T)`
+    *sanity check* (`fesom_main.c:721`) saves `valuesold = values = 10` BEFORE the blob is added
+    to `values` (`:748`). So `ttfAB = -(0.5+ε)·10 + (1.5+ε)·(10+blob)`, not `ttfAB = values`.
+    Our `ic.py` set `T_old=T` (blob) — wrong, and **mis-attributed for two phases as the
+    "upwind−FCT gap" (~3e-7)**. Fixing it: FCT `T` vs the dump jumps **3.4e-7 → 1.8e-15**. `S`
+    (constant) is insensitive to `S_old`, which hid it. The decisive diagnostic was dumping the
+    C's `adf_v` intermediate (`-5.6e4` at the surface where ours was 0 ⇒ back-solve `T_old=10`).
+  - **Limiter-gradient decision — (a) subgradient as-is** (`docs/LIMITER_GRADIENTS.md`): the C
+    `flux_eps=1e-16` floors every limiter ratio finite ⇒ the plain `jnp` min/max/where/`segment_*`
+    VJP is NaN-safe (no `0·inf`), forward-faithful, and FD-consistent where smooth — unlike (b)
+    smooth-relax (changes the forward) or (c) stop_gradient (biases the gradient). The qr4c
+    `Z`-stencil bottom-pad divide needs the `where(d==0,1,d)` guard (the recurring masked-divide
+    rule, 4th time).
+  - **Gates:** FCT `T/S` vs dump **TIGHT** (`T` 1.8e-15, `S` bit-exact) at all 5 probes; an
+    independent numpy FCT ref (smooth **and** a synthetic limiter-ACTIVE case — the dump's smooth
+    blob leaves the limiter inactive); `test_gradient.py` green with FCT live (`d(SST)/d(k_ver)`
+    plateau **5.7e-7**, flows through CG + limiter, `d/d(T₀)` finite). **Bonus:** the `T_old` fix
+    closed the deferred Phase-2 tight multi-step `T` gate (`step()` substep-15 `T` 1.8e-15 vs the
+    committed dump) AND dump-verified the blob vertical diffusion + the step-2 SSH cascade
+    (now <1e-11, was gated 1e-7).
+  - **GATE-4 forward (tracers) MET.** Next: **Task 4.2** (complete opt_visc=7 flow-aware terms +
+    `use_wsplit`), then **Task 4.3** (pi 1000-step stability + AD re-check) → GATE 4.
+- **2026-06-06 — execution session 11** (Phase 4, **Task 4.2: complete opt_visc=7 flow-aware
+  biharmonic + `use_wsplit`**). `ale.compute_cfl_z`/`compute_wvel_split` + `step.py` wiring +
+  6 new tests (test_momentum +1, test_step_pi +1, test_ale +4). **Full suite green; gradient
+  plateau 5.70e-7 unchanged.** No new pi physics was actually needed — the work was *closing
+  verification gaps* and *adding CORE2-ready machinery*.
+  - **opt_visc=7 flow-aware viscosity was ALREADY fully ported in Task 2.5** (γ0/γ1/γ2 =
+    0.003/0.1/0.285, the `max(γ0, max(γ1·|du|, γ2·|du|²))` flow-aware `max` present + matching
+    the C line-for-line). The review-finding's "if Task 2.5 did a basic version" hedge resolves
+    to "it did the full version." The real gap was **coverage**: a diagnostic showed
+    **flow-aware-active = 0 edges** at every one of the 10 dump steps (max edge-velocity-diff
+    grows 8e-5→8e-4 ≪ the |du|>0.03 γ1-onset), and the existing `_synthetic` test (amp 0.1)
+    only reaches the γ1 branch (51% of edges, **never** the quadratic γ2, which needs |du|>0.351).
+    Added `test_visc_filter_flow_aware_branches_vs_reference` (strong synthetic flow ~2 m/s,
+    BOTH branches bind, vs the numpy ref + a branch-selection load-bearing assert) and a step-2
+    substep-6 `uv_rhs` dump gate (`test_step2_uv_rhs_visc_matches_dump`, ~1e-17 — the step-1 gate
+    was rest-trivial; FCT made step-2 tight, unlocking it).
+  - **`use_wsplit` ported but OFF (the reference config).** `fesom_constants.h:56` sets
+    `use_wsplit=0` (the split seeded a Fortran day-92 blow-up), so `w_e=w, w_i=0` IS the
+    dump-matching path — and the step-1 substep-15 `T` 1.8e-15 match already confirmed it. Ported
+    `compute_cfl_z` (`fesom_ale.c:204`) + `compute_wvel_split` (`:241`) faithfully (CORE2-ready),
+    wired into `step.py` (populates `State.cfl_z`); the split is the **identity** at use_wsplit=0
+    (numerically transparent — every gate + the gradient unchanged), and pi's max `cfl_z`~1e-4 ≪
+    maxcfl=1.0 means it'd be inactive even if on. Active branch verified vs the numpy ref with a
+    synthetic super-critical CFL + an AD-finite gate. ⚠️ `impl_vert_visc`'s `w_i` advective
+    tridiagonal terms remain dropped (correct at `w_i=0`) — a Phase-5/CORE2 item.
+  - **Task 4.2 DONE.**
+  - **Task 4.3 (pi 1000-step stability + AD re-check) → GATE 4 MET.** `test_1000_step_stability`:
+    pi 1000 steps at dt=100 (full physics — FCT + opt_visc7 + wsplit machinery) is stable in
+    ~48 s — no NaN, max|uv|=0.17, max|eta|=0.63 m, **S exactly 35** over the window, T∈[10.0,14.98],
+    and max `cfl_z`=2.8e-3 ≪ maxcfl=1.0 (wsplit inactive even long-window). AD re-check: the
+    permanent `test_gradient.py` runs with the full pi physics live and stays green (plateau
+    5.70e-7, flows through the CG). Climate-close-to-C stays indirect (no C 1000-step pi snapshot;
+    the tight step-1..10 dump match + S-exact + boundedness stand in). **Phase 4 complete; full
+    suite 313 passed.** Next: **Phase 5 (CORE2 single-device)** — expand into a
+    `docs/plans/<date>-fesom-jax-core2.md` sub-plan (zlevel ALE, PHC IC, JRA55 forcing, partial
+    cells, the `w_i` advective terms in `impl_vert_visc` when use_wsplit turns on).

@@ -1,21 +1,21 @@
 """Task 2.11 gate — the assembled forward step on pi (GATE 2).
 
 * **Step-1 integration:** one `step()` reproduces every per-kernel substep dump gate
-  at the probes (density/bvfreq/ssh_rhs/d_eta/uv/hbar/eta_n/w/hnode/S tight; T is the
-  upwind−FCT gap). Confirms the substep order + step-1 state are wired correctly.
+  at the probes (density/bvfreq/ssh_rhs/d_eta/uv/hbar/eta_n/w/hnode/T/S all tight —
+  **T is now tight too** since Phase 4 wired FCT in). Confirms the substep order +
+  step-1 state are wired correctly.
 * **Rest state:** constant T/S (no blob) + zero wind ⇒ the model stays at rest to
   machine precision (no spurious flow), T/S exactly constant.
 * **Multi-step history threading:** S stays exactly 35 over many steps (constant-tracer
   preservation ⇒ AB2/threading is correct); the physical SSH/velocity fields stay
-  climate-close to the dump (the residual is the upwind−FCT T cascade, not a bug); the
-  **CG warm-start is load-bearing** (step-2 d_eta matches the dump far better warm-started
-  than from zero — the C never zeros d_eta between steps).
+  climate-close to the dump; the **CG warm-start is load-bearing** (step-2 d_eta matches
+  the dump far better warm-started than from zero — the C never zeros d_eta between steps).
 * **100-step stability:** no NaN, bounded `|uv|`/`|eta|`, S exactly constant.
 
-⚠️ A **tight multi-step** dump match is impossible here because the dump runs FCT and
-this runs upwind — T diverges ~3e-7 at step 1 and cascades (via density) into every
-T-dependent field at step ≥2. That tight match is a Phase-4 (FCT) gate; here step ≥2 is
-gated climate-close + by the exact-S / rest / stability invariants.
+The Phase-4 FCT port (+ the IC `T_old` fix — `valuesold` is the pre-blob base, not the
+blob) closed the Phase-2 upwind−FCT `T` gap, so step-1 `T` (and the step-2 fields it
+cascades into) now match the dump tightly. The jitted-step `density` FMA shift (~1e-13)
+means the per-step tight bit-gates run on **eager** `step()`.
 """
 
 import dataclasses
@@ -24,10 +24,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from fesom_jax import forcing, ic, ssh, verify
+from fesom_jax import eos, forcing, ic, momentum, pgf, pp, ssh, verify
 from fesom_jax import step as stepmod
 from fesom_jax.io_dump import find_record
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
+from fesom_jax.params import Params
 from fesom_jax.state import State
 
 NODE_PROBES = [1001, 1500, 2000, 2500, 3000]
@@ -45,6 +46,7 @@ NODE_GATES = [
     ("eta_n", 12, "eta_n", "scatter", 1e-12),
     ("w", 13, "w", "scatter", 1e-12),
     ("hnode", 16, "hnode", "map", None),
+    ("T", 15, "T", "scatter", None),
     ("S", 15, "S", "scatter", None),
 ]
 
@@ -100,9 +102,9 @@ def test_step1_uv_matches_dump(load_dump, mesh, traj, gid, dfield, ci):
                         atol=1e-13)
 
 
-def test_step1_T_is_upwind_fct_gap(load_dump, mesh, traj):
-    """T (substep 15) is bounded near the FCT dump (the upwind−FCT gap, ~3e-7) — not
-    a tight gate (Phase-4 FCT), but confirms advection ran."""
+def test_step1_T_matches_dump_tight(load_dump, mesh, traj):
+    """T (substep 15) matches the FCT dump **tightly** (Phase-4: FCT is now the port's
+    advection, so the old upwind−FCT gap is closed). Eager `step()` lands ~1.8e-15."""
     recs = load_dump("pi_cdump.00000")
     T = np.asarray(traj[0].T)
     worst = 0.0
@@ -110,7 +112,7 @@ def test_step1_T_is_upwind_fct_gap(load_dump, mesh, traj):
         rec = find_record(recs, step=1, substep=15, field="T", probe_gid=gid)
         n = rec.nlevels
         worst = max(worst, np.abs(T[gid - 1, :n] - np.asarray(rec.values)[:n]).max())
-    assert 1e-12 < worst < 1e-5
+    assert worst < 1e-11, f"FCT T step-1 |Δ|={worst:.2e} (expected tight)"
 
 
 # --------------------------------------------------------------------------
@@ -142,9 +144,10 @@ def test_salinity_exactly_preserved_multistep(mesh, traj):
         assert np.max(np.abs(np.asarray(st.S)[m] - 35.0)) == 0.0
 
 
-def test_step2_physical_fields_climate_close(load_dump, mesh, traj):
-    """At step 2 the SSH/velocity fields match the dump climate-close (the ~1e-10
-    residual is the upwind−FCT T cascade through density, not a threading bug)."""
+def test_step2_physical_fields_match_dump(load_dump, mesh, traj):
+    """At step 2 the SSH fields match the dump **tightly** — with FCT the step-1 `T`
+    matches (1.8e-15), so density at step 2 matches and the SSH solve no longer carries
+    the old upwind−FCT cascade. (d_eta/hbar/eta_n are the ÷area-suppressed tight class.)"""
     recs = load_dump("pi_cdump.00000")
     st2 = traj[1]
     for field, dfield in [("d_eta", "d_eta"), ("hbar", "hbar"), ("eta_n", "eta_n")]:
@@ -154,7 +157,39 @@ def test_step2_physical_fields_climate_close(load_dump, mesh, traj):
             rec = find_record(recs, step=2, substep={"d_eta": 9, "hbar": 11,
                               "eta_n": 12}[dfield], field=dfield, probe_gid=gid)
             worst = max(worst, abs(arr[gid - 1] - rec.values[0]))
-        assert worst < 1e-7, f"{field} step-2 |Δ|={worst:.2e}"
+        assert worst < 1e-11, f"{field} step-2 |Δ|={worst:.2e}"
+
+
+def test_step2_uv_rhs_visc_matches_dump(load_dump, mesh, traj):
+    """Substep-6 (biharmonic viscosity) `uv_rhs` at **step 2** — an element field the
+    step-1 gate can only check at rest (uv=0 ⇒ viscosity adds nothing). With FCT making
+    the multi-step trajectory tight, step 2 has a real wind-driven velocity field, so this
+    is the first end-to-end dump gate on opt_visc=7 acting on nonzero flow.
+
+    pi velocities are small (|du_edge| ≤ ~1e-4 at step 2), so this exercises the
+    *constant-coefficient* biharmonic regime (`max(g0, inner)=g0`); the flow-aware g1/g2
+    branches are verified separately against the numpy reference at strong synthetic flow
+    (`test_momentum.test_visc_filter_flow_aware_branches_vs_reference`)."""
+    recs = load_dump("pi_cdump.00000")
+    st1 = traj[0]                                   # state after step 1 = input to step 2
+    pr = Params.defaults()
+    _, hpressure, _ = eos.compute_pressure_bv(mesh, st1.T, st1.S, st1.hnode)
+    pgf_x, pgf_y = pgf.pressure_force_linfs(mesh, hpressure)
+    uv_rhs, _ = momentum.compute_vel_rhs(
+        mesh, st1.uv, st1.uv_rhsAB, st1.eta_n, pgf_x, pgf_y, st1.w_e, st1.hnode,
+        is_first_step=False, dt=DT)
+    uv_rhs6 = np.asarray(momentum.visc_filt_bidiff(mesh, st1.uv, uv_rhs, dt=DT))
+    pre = np.asarray(uv_rhs)
+    changed, worst = 0.0, 0.0
+    for gid in ELEM_PROBES:
+        for dfield, ci in [("uv_rhs_u", 0), ("uv_rhs_v", 1)]:
+            rec = find_record(recs, step=2, substep=6, field=dfield, probe_gid=gid)
+            n = rec.nlevels
+            worst = max(worst, np.abs(uv_rhs6[gid - 1, :n, ci] - rec.values[:n]).max())
+            changed = max(changed, np.abs(uv_rhs6[gid - 1, :n, ci]
+                                          - pre[gid - 1, :n, ci]).max())
+    assert worst < 1e-12, f"step-2 substep-6 uv_rhs |Δ|={worst:.2e}"
+    assert changed > 0.0, "viscosity made no change to uv_rhs at step 2"
 
 
 def test_warm_start_is_load_bearing(load_dump, mesh, op, traj):
@@ -197,3 +232,24 @@ def test_100_step_stability(mesh, op, stress):
     assert np.max(np.abs(eta)) < 5.0         # |eta| < 5 m
     assert np.max(np.abs(S[m] - 35.0)) == 0.0   # S exactly constant
     assert 9.0 < T[m].min() and T[m].max() < 20.0   # T bounded (blob ~+5°C)
+
+
+def test_1000_step_stability(mesh, op, stress):
+    """Task 4.3 / GATE 4: pi 1000 steps at dt=100 with the full pi physics (FCT +
+    opt_visc7 + the wsplit machinery) stays stable — no NaN, bounded |uv|/|eta|, S
+    **exactly** 35 over the whole window, T bounded. ~48 s (the jitted `run` amortizes
+    compile across the 1000 steps). The vertical CFL stays ≪ maxcfl=1.0 throughout, so
+    the (disabled) wsplit would be inactive even if turned on — consistent with the
+    use_wsplit=0 reference config. The long-window AD-stability risk is tracked
+    separately by `test_gradient.py` (run at a modest N to stay off the chaos floor)."""
+    st = stepmod.run(ic.initial_state(mesh), mesh, op, stress, 1000, dt=DT)
+    uv, eta = np.asarray(st.uv), np.asarray(st.eta_n)
+    T, S, cfl = np.asarray(st.T), np.asarray(st.S), np.asarray(st.cfl_z)
+    m = np.asarray(mesh.node_layer_mask)
+    assert not (np.isnan(uv).any() or np.isnan(eta).any() or np.isnan(T).any()
+                or np.isnan(S).any())
+    assert np.max(np.abs(uv)) < 0.5             # well below the ~0.3 CFL cap
+    assert np.max(np.abs(eta)) < 5.0            # |eta| < 5 m
+    assert np.max(np.abs(S[m] - 35.0)) == 0.0   # S exactly constant over 1000 steps
+    assert 9.0 < T[m].min() and T[m].max() < 20.0   # T bounded (blob ~+5°C)
+    assert np.max(np.abs(cfl)) < 1.0            # CFL ≪ maxcfl ⇒ wsplit inactive (self-consistent)
