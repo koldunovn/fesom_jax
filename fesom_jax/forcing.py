@@ -283,6 +283,20 @@ def bulk_surface_fluxes(mesh: Mesh, u_air, v_air, shum, shortwave, longwave, Tai
                       stress_node_surf=sns, stress_surf=stress_surf)
 
 
+BULK_CD_ATM_ICE = 1.2e-3   # atm-ice drag (fesom_constants.h:112; == config.CD_ATM_ICE)
+
+
+def atm_ice_stress(u_air, v_air, u_ice, v_ice):
+    """Atmosphere→ice momentum stress — the EVP wind forcing (``fesom_bulk.c:329-333``):
+    ``tau = Cd_atm_ice·rho_air·|u_air - u_ice|·(u_air - u_ice)``. Returns ``(tau_x, tau_y)``
+    each ``[nod2D]``. Same bulk form as the atm-ocean stress but wind RELATIVE TO ICE and the
+    constant atm-ice drag. ``_safe_speed`` keeps ``d/d(u_ice)`` finite at ``Δu=0``."""
+    dux = u_air - u_ice
+    dvy = v_air - v_ice
+    mag = _safe_speed(dux, dvy) * BULK_RHOAIR
+    return BULK_CD_ATM_ICE * mag * dux, BULK_CD_ATM_ICE * mag * dvy
+
+
 def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None):
     """Shortwave penetration — AD-safe port of ``fesom_cal_shortwave_rad``
     (``oce_shortwave_pene.F90``, ``fesom_bulk.c:362-415``). Returns
