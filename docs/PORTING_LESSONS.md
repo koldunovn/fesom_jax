@@ -917,3 +917,57 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `/home/.../data/...`) transparently land on `/work`. `.gitignore` needs **both** `/data` (the
   symlink) and `/data/` (a plain dir) — the trailing-slash form alone does not ignore a symlink.
   (User-flagged, Task 5.4.)
+
+## Phase 5 — SSS restoring + CORE2 runoff (Task 5.5)
+
+- **[sss/fill] ⚠️ The 30-cell missing-value fill is JACOBI (reads the ORIGINAL field), NOT
+  sequential Gauss-Seidel like PHC's `extrap_nod3D` — so it VECTORIZES.** The C copies
+  `ncdata → ncdata_temp` first, and every missing cell reads its neighbours from
+  `ncdata_temp` (never modified during the fill loop), so fills do **not** cascade ⇒
+  order-independent. A `scipy.ndimage.uniform_filter` box-mean (expand `k=1..30`, fill each
+  cell at the SMALLEST k whose `(2k+1)²` window — clamped at the grid edge with
+  `mode='constant',cval=0`, NOT cyclic — holds ≥1 valid cell) reproduces it. The `/count`
+  crushes the box-sum reassociation: **105148/126858 SSS nodes bit-exact, ~35 coastal
+  fill-bracket nodes ~1e-12** (the window straddles a land-extrapolated cell). Contrast PHC's
+  extrap which *is* sequential GS and had to be replicated in index order (Task 5.2). *Lesson:
+  read whether a fill reads from a frozen copy (Jacobi → vectorize) or in-place (GS → replicate
+  order) before porting it.* (`sss_runoff._fill_missing_expand`, `fesom_sss_runoff.c:207-239`.)
+
+- **[sss/interp] `interp_2d_field` is a THIRD distinct bilinear routine — lat CLAMPS, lon
+  CYCLIC-WRAPS — not the JRA `extrp`-flag stencil nor PHC's ±halo padding.** Out-of-range
+  latitude pins to the boundary grid value (clamp `y`, weight 1 on the edge node); out-of-range
+  longitude wraps across the 0/360 seam with gap `lon[0]+(360−lon[last])` (here 1.0° between
+  359.5 and 0.5). Ported as `clip(y)+searchsorted` (lat) + a 3-branch in-range/below/above
+  select (lon); the corner blend keeps the C's `(s·rt_lon1+s·rt_lon2)·rt_lat` order. **Runoff
+  bit-exact, SSS bit-exact at the 105k ocean-bracket nodes** ⇒ the bracket+blend is exact for
+  any node not touching a filled cell. Each forcing reader has its own interpolation routine —
+  do not assume one stencil fits all. (`sss_runoff._interp_2d_field`, `fesom_sss_runoff.c:34-113`.)
+
+- **[sss/fidelity] The salt/water balance matched the C to ~1e-20 — the global-mean's
+  ÷`ocean_area` crushes the reduction back to MAP-class (the hbar/w ÷area lesson again).**
+  `virtual_salt = S_top·water_flux − ⟨·⟩`, `⟨x⟩ = Σ(x·areasvol_surf)/ocean_area`. Fed the C's
+  own `S_top`/`water_flux`, the multiply is bit-exact; the only JAX↔C difference is the
+  area-weighted global mean. The integral `Σ(x·area)` ~1e9 (x~1e-6, area~3e9, ×1.3e5 nodes) so
+  the ~1e-7 sum reassociation, ÷`ocean_area`=3.6e14, lands at **~1e-21**. So a reduction
+  divided by a huge constant area gates TIGHT (~1e-20), not at the loose 1e-12 reduction floor —
+  measure at the output. The flux math is fed the dump's own inputs (apples-to-apples, like the
+  bulk's `T_oc`), isolating it from the reader. (`sss_runoff.sss_runoff_fluxes`,
+  `test_sss_runoff.py`, `fesom_sss_runoff.c:382-440`.)
+
+- **[sss/config] ⚠️ `ref_sss_local=1` (rsss = LOCAL S_top, not 34.7) + NO legacy month +1 —
+  both are C-comment-documented traps; port them, don't reinvent.** The CORE2 namelist sets
+  `ref_sss_local=.true.`, so the virtual-salt reference salinity is the per-node surface
+  salinity, NOT the constant `ref_sss=34.7` (using 34.7 over-strengthens the flux where SSS is
+  low → Arctic freshwater bias — `fesom_sss_runoff.c:298-307`). And the monthly SSS read fires
+  on the FIRST step of the new month (where `month_now` is already M+1), so there is **no `+1`**
+  (the legacy Fortran fired on the LAST step of month M and added +1; keeping it would skip a
+  month — `:351-359`). `surf_relax_S = 10/(60·3600·24) = 1.929e-6 s⁻¹`. (Task 5.5.)
+
+- **[sss/method] The month-CROSSING dump (m4 = Apr/day100) is the real gate; m1 (Jan/day1)
+  alone is the trivial first-month case.** Same shape as the JRA interior-vs-boundary lesson:
+  m1 just reads SALT month 1 at the first step. The m4 dump steps jra to day100 (April),
+  **recomputes the bulk** `water_flux`, and reads SALT **month 4** — exercising a different SSS
+  slice + a different (April) bulk input, confirming the reader picks the right month and the
+  flux math handles the seasonal target. The C `fesom_sss_runoff_dump` saves+restores
+  `water_flux` (the one field the step both reads and writes in place) so two month dumps in one
+  run stay independent. (`jax_sss_dump_core2.sh`, `fesom_main.c` SSS-dump block, Task 5.5.)

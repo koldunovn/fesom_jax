@@ -270,7 +270,26 @@ driver) + `tests/test_jra55.py`. C: probe-dump the 8 jra fields at a fixed (year
 **Files:** Create `fesom_jax/sss_runoff.py` (numpy readers + AD-safe JAX flux math) +
 `tests/test_sss_runoff.py`.
 
-- [ ] **Port `fesom_sss_runoff.c` exactly — it already mirrors the Fortran sbc, no
+> **✅ DONE 2026-06-06.** `fesom_jax/sss_runoff.py` — faithful numpy readers
+> (`interp_2d_field` bilinear with **lat-clamp / lon-cyclic-wrap** + the 30-cell
+> expanding missing-fill via `scipy.ndimage.uniform_filter`) producing
+> `Ssurf_clim[12, nod2D]` + `runoff_node[nod2D]` (/1000), plus the **AD-safe** JAX flux
+> math `sss_runoff_fluxes` (`virtual_salt = S_top·water_flux`, `relax_salt =
+> surf_relax_S·(Ssurf−S_top)`, each minus its area-weighted global mean; then
+> `water_flux += ⟨water_flux + runoff⟩` over all nodes). Verified vs a new C `sss_dump_*`
+> all-node dump (job 25390216, year 1958, `data/sss_dump_core2/`) at 2 months — m1 (Jan,
+> day1) + m4 (Apr, day100 **month crossing**): **runoff bit-exact** (max|Δ|=0 all 126858);
+> **Ssurf bit-exact at 105148/126858 ocean-bracket nodes** (95p ~3.6e-14, max 2.8e-12 at
+> ~35 coastal/fill-bracket nodes — the 30-cell-mean reduction); **virtual_salt/relax_salt/
+> water_flux ~1e-20..1e-22** (the global-mean reductions barely reassociate — the
+> ÷`ocean_area`=3.6e14 crushes them; the flux math is fed the C's own
+> `(S_top, water_flux_in, Ssurf, runoff)`, so it's apples-to-apples MAP-class). The two
+> differentiable seams flow (`d/d(water_flux)`=SST→flux via the bulk, `d/d(S_top)`=restoring).
+> `test_sss_runoff.py` = **9 passed**. New C `fesom_sss_runoff_dump` (gated
+> `FESOM_SSS_DUMP_DIR`/`_DAY`/`_SEC`/`_MONTH`) + `jobs/jax_sss_dump_core2.sh` (untracked,
+> port2). `ref_sss_local=1`, `surf_relax_S=1.929e-6`; **no legacy month +1**.
+
+- [x] **Port `fesom_sss_runoff.c` exactly — it already mirrors the Fortran sbc, no
   invented modeling choice.** (SSS/runoff is validated in the C port — no SSS problems —
   so the discipline is a faithful 1:1 port, gated by the dump; do NOT substitute
   FRESH_START §9's `water_flux += (S−S_clim)·v` / `water_flux −= runoff` *shorthand*, which
@@ -279,25 +298,26 @@ driver) + `tests/test_jra55.py`. C: probe-dump the 8 jra fields at a fixed (year
   **no-ice** path (Phase 5) runoff enters only via the global-mean water balance (the local
   runoff term lives in ice thermo, which is off here). The per-substep dump gate confirms
   JAX == the C-port-no-ice run; faithfulness is *verified*, not assumed.
-- [ ] **numpy readers** (one-time): SSS `PHC2_salx.nc` (`SALT` time=12/lat=180/lon=360,
+- [x] **numpy readers** (one-time): SSS `PHC2_salx.nc` (`SALT` time=12/lat=180/lon=360,
   psu, missing=−99 → 30-cell expanding-neighborhood fill) → precompute **all 12 months** to
   nodes `Ssurf_clim[12, nod2D]`; runoff `CORE2_runoff.nc` (`Foxx_o_roff`, single record,
   (kg/s)/m² → /1000 m/s) → `runoff_node[nod2D]` once. Port `interp_2d_field` + missing-fill
   **literally** (bilinear cyclic-lon; scipy/xarray will miss tolerance).
-- [ ] **AD-safe JAX flux math** (`fesom_sss_runoff.c:384-440`), pure fn of
+- [x] **AD-safe JAX flux math** (`fesom_sss_runoff.c:384-440`), pure fn of
   `(S_top, water_flux, Ssurf_month, runoff_node, areasvol_surf, ocean_area, masks)`:
   `rsss = S_top` (**`ref_sss_local=1`**, not 34.7); `virtual_salt = rsss·water_flux`;
   `relax_salt = surf_relax_S·(Ssurf−S_top)`; subtract the **area-weighted global mean** of
   each (non-cavity nodes only) — `integrate_nod_2D(x)/ocean_area = Σ(mask·x·areasvol_surf)/
   ocean_area`; then `water_flux += mean(water_flux + runoff)` (**all** nodes, no cavity
   skip — the asymmetry is real, `:422-440`).
-- [ ] ⚠️ **Traps:** signs (`virtual_salt=rsss·water_flux` with water_flux>0=ocean loses FW;
+- [x] ⚠️ **Traps:** signs (`virtual_salt=rsss·water_flux` with water_flux>0=ocean loses FW;
   `relax_salt` removes salt when model too salty); the month index — fire on first step of
   new month, **no legacy `+1`** (`:351-365`); `S_top` masked-finite before the reduction.
-- [ ] **Gate:** dump `Ssurf/runoff/virtual_salt/relax_salt/water_flux` (post-balance) vs C
+- [x] **Gate:** dump `Ssurf/runoff/virtual_salt/relax_salt/water_flux` (post-balance) vs C
   at step 1 + after a month crossing (map/gather 1e-15 for the multiplies; reduction 1e-12
-  for the global-mean).
-- [ ] run — must pass before Task 5.6. **Lesson:** append.
+  for the global-mean). — **DONE: 2 months (m1 Jan, m4 Apr-crossing); runoff bit-exact,
+  Ssurf bit-exact at 105148/126858, flux math ~1e-20.**
+- [x] run — must pass before Task 5.6. **Lesson:** appended. — **DONE: test_sss_runoff 9 passed.**
 
 ### Task 5.6: Wire surface BCs into the step + assemble CORE2 forcing
 
@@ -444,3 +464,18 @@ first. GM/KPP/ice are Phase 6.
   `dump_jra_fields` in `fesom_main.c` (gated `FESOM_JRA_DUMP_DIR` + `_DAY`/`_SEC`) +
   `port2/jobs/jax_jra_dump_core2.sh` (untracked). `flip_lat=0` (lat ascending); field order
   uas,vas,huss,rsds,rlds,**tas**,prra,prsn. Next: **Task 5.4 (L&Y09 bulk formulae, AD-safe)**.
+- **2026-06-06 — Task 5.5 DONE (SSS restoring + runoff).** `fesom_jax/sss_runoff.py` —
+  faithful numpy readers (`interp_2d_field` lat-clamp/lon-cyclic-wrap bilinear +
+  `read_other_NetCDF` 30-cell expanding missing-fill via `scipy.ndimage.uniform_filter`)
+  → `Ssurf_clim[12, nod2D]` + `runoff_node[nod2D]` (/1000); + the AD-safe JAX flux math
+  `sss_runoff_fluxes` (virtual_salt/relax_salt with area-weighted global-mean subtraction +
+  the water balance). Verified vs a new C all-node dump (job 25390216, year 1958,
+  `data/sss_dump_core2/`) at 2 months (m1 Jan/day1 + m4 Apr/day100 month-crossing): **runoff
+  bit-exact** (max|Δ|=0); **Ssurf bit-exact at 105148/126858 ocean-bracket nodes** (95p
+  ~3.6e-14, max 2.8e-12 at ~35 coastal/fill-bracket nodes); **virtual_salt/relax_salt/
+  water_flux ~1e-20..1e-22** (the global-mean reductions barely reassociate — fed the C's own
+  inputs, the ÷`ocean_area`=3.6e14 crushes the integral). Both differentiable seams flow
+  (`d/d(water_flux)`, `d/d(S_top)`). `test_sss_runoff.py` 9 passed. New C
+  `fesom_sss_runoff_dump` (gated `FESOM_SSS_DUMP_DIR`/`_DAY`/`_SEC`/`_MONTH`) +
+  `jobs/jax_sss_dump_core2.sh`. `ref_sss_local=1`, `surf_relax_S=1.929e-6`; no legacy month
+  +1. Next: **Task 5.6 (wire surface BCs into the step + assemble CORE2 forcing)**.
