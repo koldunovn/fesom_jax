@@ -1,8 +1,9 @@
 # Next-session prompt — FESOM2 → JAX port
 
 Paste the block below to start the next session. **Phases 0–4 COMPLETE (GATEs 0/1/2/3/4).
-Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1 + 5.2 + 5.3 + 5.4 DONE.**
-Full suite **passing** (pi 313 + CORE2 additions; `test_forcing.py` +10).
+Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1 + 5.2 + 5.3 + 5.4 DONE;
+Task 5.5 (SSS restoring + runoff) is NEXT.** Full suite **349 passing** (pi 313 + CORE2 additions,
+incl. `test_forcing.py` +10).
 
 The pi model is fully ported, dump-gated, jitted, differentiable end-to-end, 1000-step
 stable. Phase 5 runs that same physics (PP + **linfs** + FCT + opt_visc7, **no GM/KPP/ice**)
@@ -14,16 +15,18 @@ dump **bit-exact**, and the **L&Y09 bulk** is ported (AD-safe JAX) and matches a
 bulk dump to **~1e-17 (coeffs) / ~6e-13 (heat) / ~5e-16 (stress)** — the differentiable
 SST→flux / current→stress seam.
 
-**Everything committed on `main`** (`5ab28af` Task 5.3, `d4fcdb2` Task 5.2, `4b34f6a` Task 5.1;
-Task 5.4 commit pending). **CORE2 data artifacts now live on `/work`** —
-`port_jax/data` is a **symlink** to `/work/ab0995/a270088/port_jax/data` (gitignored via both
-`/data` and `/data/`; user rule "large files on /work not /home"). New C-side job scripts live
-**untracked** in `port2/fesom2_port/jobs/` (`jax_mesh_export_core2.sh`, `jax_phc_dump_core2.sh`,
-`jax_jra_dump_core2.sh`, `jax_bulk_dump_core2.sh`). The C `dump_jra_fields` + `fesom_bulk_dump`
-+ the `ncar_ocean_fluxes_mode` `fixed_iters` param (in `fesom_bulk.c`/`fesom_main.c`, branch
-`jax-mesh-export`) are dump-only additions (gated on `FESOM_JRA_DUMP_DIR`/`FESOM_BULK_DUMP_DIR`).
-⚠️ **Cheap C jobs: use `-p compute --time=00:30:00` (fast debug QOS), not `-p shared`** (~16 s
-to start vs minutes).
+**Everything committed on `main`** (`c1aa677` Task 5.4, `5ab28af` Task 5.3, `d4fcdb2` Task 5.2,
+`4b34f6a` Task 5.1). The C-side dump additions are committed on the **port2 `jax-mesh-export`
+branch** (`4ffc542` Task 5.4) — ⚠️ **keep all C commits on that branch, never on port2 main**
+(user); the port2 repo is otherwise the user's — don't do housekeeping there. **CORE2 data
+artifacts now live on `/work`** — `port_jax/data` is a **symlink** to
+`/work/ab0995/a270088/port_jax/data` (gitignored via both `/data` and `/data/`; user rule "large
+files on /work not /home"). New C-side job scripts live **untracked** in `port2/fesom2_port/jobs/`
+(`jax_mesh_export_core2.sh`, `jax_phc_dump_core2.sh`, `jax_jra_dump_core2.sh`,
+`jax_bulk_dump_core2.sh`). The C `dump_jra_fields` + `fesom_bulk_dump` + the
+`ncar_ocean_fluxes_mode` `fixed_iters` param (in `fesom_bulk.c`/`fesom_main.c`) are dump-only
+additions (gated on `FESOM_JRA_DUMP_DIR`/`FESOM_BULK_DUMP_DIR`). ⚠️ **Cheap C jobs: use
+`-p compute --time=00:30:00` (fast debug QOS), not `-p shared`** (~16 s to start vs minutes).
 
 ---
 
@@ -35,7 +38,7 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
 1. **Phase-5 sub-plan (source of truth for Phase 5):**
    `docs/plans/20260606-fesom-jax-core2.md` — the scope correction (§0), Path A, the task
    ladder 5.1–5.8 with per-task gates, the 5 module research briefs, risks. **Tasks 5.1 +
-   5.2 + 5.3 are ticked DONE.**
+   5.2 + 5.3 + 5.4 are ticked DONE; 5.5 is next.**
 2. **Main plan:** `docs/plans/20260605-fesom-jax-port.md` — decisions, the verification
    ladder, the Revision Log. Phase 5 there is the outline; the sub-plan supersedes it.
 3. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the **Phase 5** entries:
@@ -43,10 +46,11 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
    the PHC sequential-GS extrap, the "no invented modeling choice" rule. **STANDING RULE:
    append a lesson per task.**
 4. **Project memory:** `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
-5. For 5.4–5.5: read `port2/fesom2_port/src/fesom_bulk.c` (5.4) and
-   `fesom_sss_runoff.c` (5.5). The sub-plan's task bodies already hold detailed per-module
-   briefs (functions, formulas, gotchas, AD-safe guards, suggested gate). `fesom_jra55.c`
-   (5.3) is done — `fesom_jax/jra55.py` is the ported reader the bulk consumes.
+5. For 5.5: read `port2/fesom2_port/src/fesom_sss_runoff.c` (`fesom_sss_runoff_init` readers +
+   `fesom_sss_runoff_step` flux math). The sub-plan's task body holds the detailed per-module
+   brief (functions, formulas, gotchas, AD-safe guards, suggested gate). `fesom_bulk.c` (5.4) is
+   done — `fesom_jax/forcing.py` (`bulk_surface_fluxes`) is the AD-safe bulk producing the
+   `water_flux` the SSS/runoff math consumes.
 
 ## STATUS
 - **Phases 0–4 (GATEs 0–4):** full single-step pi model (`step.py`, substeps 1–16),
@@ -138,13 +142,17 @@ a modeling choice** (FRESH_START is a description, not an alternative).
   `/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc`; JRA55:
   `/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/`; SSS `…/PHC2_salx.nc`, runoff
   `…/CORE2_runoff.nc`.
-- Exported CORE2 mesh / IC / C dumps (gitignored): `data/mesh_core2/`, `data/ic_core2/`,
-  `data/phc_dump_core2/`. C-side jobs (untracked in port2): `port2/fesom2_port/jobs/jax_*.sh`.
+- CORE2 mesh / IC / C dumps (gitignored): **`data/` is a symlink → `/work/ab0995/a270088/port_jax/data`**
+  (large files on /work, not /home — user rule). Holds `mesh_core2/`, `ic_core2/`,
+  `phc_dump_core2/`, `jra_dump_core2/`, `bulk_dump_core2/`. C-side jobs (untracked in port2):
+  `port2/fesom2_port/jobs/jax_*.sh`.
 - C port (algorithmic SoT): `/home/a/a270088/port2/fesom2_port/src/`; built binary
   `…/build/fesom_port` (NL read from the mesh, handles pi+CORE2). C run-arg order:
   `<mesh> <out> <dt> <nsteps> <snap> <phc> <jra>` (phc=argv6 triggers PHC IC, t_insitu=1).
-- I (Claude) drive the C SLURM jobs (`sbatch`, acct ab0995, `shared`); they're cheap (mesh
-  export 17 s, PHC dump 16 s).
+  Build: `bash -l configure.sh` (or `cd build && make` after `source env.sh`).
+- I (Claude) drive the C SLURM jobs (`sbatch`, acct ab0995): use **`-p compute --time=00:30:00`**
+  (fast debug QOS, ~16 s to start) — NOT `-p shared`. They're cheap (mesh export 17 s, dumps ~20 s).
+  See memory [[hpc-job-file-conventions]].
 
 ## LOCKED DECISIONS (do NOT re-litigate)
 1. Use case = hybrid ML params (swap points: vertical mixing PP/KPP, eddy flux GM/Redi);
@@ -169,12 +177,19 @@ a modeling choice** (FRESH_START is a description, not an alternative).
   arbiter — if the C port itself blows up without ice, that's a finding (ice would move into
   Phase 5). Watch the Aleutian Trench (global elem 194724; vertex node gid 94122).
 - **netCDF4 import prints a benign `ndarray size changed` ABI warning** — harmless.
+- **L&Y09 bulk: fixed-5 ≠ early-break at calm nodes** (the M-O loop is non-convergent; `ch` up
+  to 88%, but heat_flux ≤7 W/m² at ~4 nodes — bounded). JAX uses **fixed-5** (AD-safe); **set
+  `FESOM_BULK_FIXED_ITERS=1` on any C bulk reference** (Task 5.7). `heat_flux = qns−qsr` is
+  pre-shortwave-penetration (Task 5.6 removes the 0.54-visible band + builds `sw_3d`).
 - **config = the pi reference physics on CORE2:** linfs, PP, FCT, opt_visc=7, `use_wsplit=0`,
   CG SSH (α=1), dt=500, PHC IC, JRA55+SSS+runoff.
 
 ## WORKFLOW NOTES
 - The sub-plan is authoritative for Phase 5; tick `[x]`, keep its Revision Log + the lessons
-  current. Commit only when asked (per-task commits on `main`). C edits → port2 (branch
-  `jax-mesh-export`); job scripts kept untracked there. All python/pytest via the env python.
+  current. **Commit only when asked** (per-task commits on `main`). **C edits → port2 branch
+  `jax-mesh-export`, NEVER port2 main** (user); job scripts kept untracked there; otherwise leave
+  the port2 repo to the user (no housekeeping). **Large generated files → `/work`** (the `data`
+  symlink handles it). Cheap C jobs → `-p compute --time=00:30:00`. All python/pytest via the env
+  python. See memory [[hpc-job-file-conventions]].
 
-Confirm you've absorbed this, tell me which task you're starting (5.4), then proceed.
+Confirm you've absorbed this, tell me which task you're starting (5.5), then proceed.
