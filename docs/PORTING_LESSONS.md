@@ -846,3 +846,74 @@ Cite the C source (`file:line`) or dump probe that proves it.
   sequentially-advanced one). netCDF4 reads use `set_auto_maskandscale(False)` to get the raw
   float32 the C's `nc_get_vara_float` sees (JRA has no scale/offset; bit-exact promotion to f64).
   (`jra55.JRA55Reader`, Task 5.3.)
+
+## Phase 5 — L&Y09 open-water bulk formulae (Task 5.4)
+
+- **[bulk/AD] ⚠️⚠️ "Drop the early break, run a fixed N, the result is IDENTICAL" was WRONG —
+  it is a small but real, bounded divergence, and the sub-plan's "post-convergence iters are
+  no-ops" claim is corrected.** The L&Y09 Monin-Obukhov coefficient loop (`ncar_ocean_fluxes_mode`,
+  `fesom_bulk.c:89-172`) does **not** robustly converge at near-calm nodes: the C production
+  breaks on `|Δcd|/(cd+1e-8)<1e-4`, but that "convergence" is a transient slowdown, so continuing
+  to a fixed 5 iters lands elsewhere. Measured on CORE2 (year 1958): **`ch` differs by up to ~88%**
+  fixed-5-vs-early-break at the calmest tropical nodes (`cd`/`ce` up to ~4.5%). The saving grace is
+  it's **physically bounded**: `ch`/`ce` only enter the `ug`-scaled sensible/latent terms, so the
+  heat_flux impact is **≤7.2 W/m² at ~4 nodes** (mean ~2e-4; <0.1 W/m² for 126848/126858 nodes),
+  stress ≤~4e-3 N/m². *Decision: JAX runs fixed-5 (the AD-safe analog of the C's ≤5-iter cap — a
+  data-dependent `while`-break is not reverse-mode differentiable), and is verified against a
+  **fixed-5** C dump, not the early-break production. The residual vs production is this bounded,
+  documented effect.* *Lesson: never assume "iterate-to-fixed-point" tolerates extra iterations —
+  a capped non-convergent solver (M-O, sea-ice EVP, some EOS inversions) gives genuinely different
+  answers per iteration count; measure the divergence, bound its PHYSICAL impact (not the raw
+  coefficient %), and make the reference match your iteration scheme.* (`forcing.ncar_ocean_fluxes_mode`,
+  `test_forcing.test_earlybreak_drop_is_physically_bounded`, Task 5.4.)
+
+- **[bulk/method] The fix: a `fixed_iters` env-gated C dump so JAX-fixed-5 is compared to
+  C-fixed-5 (apples-to-apples), separately bounding fixed-5-vs-production.** Added an
+  `int fixed_iters` param to the C `ncar_ocean_fluxes_mode` (skips the break) + a `fesom_bulk_dump`
+  (gated `FESOM_BULK_DUMP_DIR`) that runs fixed-5 and dumps `cd/ce/ch + heat_flux/water_flux/
+  stress_node + elem stress`, **plus** the early-break `cd_eb/ce_eb/ch_eb` columns and the exact
+  `T_oc` (so the JAX forward gate is fed the C's own SST and isolates the bulk from the ~1e-14
+  PHC-IC residual). Result: **JAX-fixed-5 == C-fixed-5 to ~1e-17 (cd/ce/ch), ~6e-13 (heat_flux),
+  ~5e-16 (stress)** over all 126858 nodes — essentially bit-exact (MAP-class, like the EOS). For
+  Task 5.7 the matched per-substep reference must set `FESOM_BULK_FIXED_ITERS=1` or the calm-node
+  coefficients won't match. (`fesom_bulk_dump`, `jax_bulk_dump_core2.sh`, Task 5.4.)
+
+- **[bulk/AD] The AD-safe rewrite of `x2 = sqrt(|1−16ζ|); if(x2<1) x2=1` is
+  `sqrt(max(|1−16ζ|,1))` — bit-identical to the C AND smooth through the ζ=1/16 singularity.**
+  The naïve port hits `sqrt(0)` at ζ=1/16 (inf derivative ⇒ `0·inf` NaN backward even though the
+  forward floors x2 to 1). Folding the floor INSIDE the sqrt argument (`max(arg,1)`) means: for
+  arg≥1 it's `sqrt(arg)` (==C, and arg≥1 ⇒ ζ away from 1/16 ⇒ the abs is smooth there); for arg<1
+  it's the constant `sqrt(1)=1` (==C's floor, gradient 0). One expression kills the kink, the abs
+  kink, AND matches the C exactly — cleaner than a double-`where` safe-sqrt. The relative-wind `u`
+  and stress `mag` still need the double-`where` safe-sqrt (their `sqrt(Δu²)` arg vanishes when
+  wind==current, and that lane IS on the `current→stress` gradient path). The `copysign` step
+  selectors (cd_n10 hi/lo-wind switch, the stab switch) are ported **literally** via `jnp.copysign`
+  (gradient 0, exact at ±0) — not `where(>0)`, which mishandles `−0.0`. (`forcing._psi`/`_safe_speed`/
+  `_cd_n10`, `fesom_bulk.c:99-160`, Task 5.4.)
+
+- **[bulk/fidelity] The deliberate Fortran wind mismatch is load-bearing and was preserved.**
+  The exchange coefficients (`ncar_ocean_fluxes_mode`) and the wind stress use the **relative**
+  wind `|u_atm − u_ocn|` (floored at 0.3); but `obudget`'s `ug` (the sensible/latent multiplier)
+  uses the **absolute** wind `|u_atm|` (`fesom_bulk.c:283`, mirroring `ice_thermo_oce.F90`). A
+  synthetic-current dump mode (`current_mode=1`, an 8-entry exact-decimal table indexed by
+  `(gid−1)%8`, reproduced bit-for-bit in JAX) exercises this: it moves the coefficients/stress via
+  the relative wind while `ug` stays absolute, and validates the `current→stress` feedback that the
+  zero-current IC state can't (uvnode=0 at setup). Also: `albw=0.1` (CORE2 `namelist.ice`, NOT the
+  LY2004 0.066), bulk gravity `9.80` (NOT config.G=9.81), and `heat_flux = qns − qsr` is the
+  bulk_compute output **before** shortwave-penetration removal (a Task-5.6 step; `USE_SW_PENE=1` in
+  the C). (`forcing.bulk_surface_fluxes`/`obudget`, Task 5.4.)
+
+- **[workflow] Cheap C dump jobs schedule far faster on `-p compute --time≤30:00` (debug QOS)
+  than on `-p shared`.** The bulk dump sat minutes pending on `shared` (Priority); resubmitted to
+  `compute` with a 30-min walltime it started in ~16 s (DKRZ Levante's short-walltime compute jobs
+  land in the fast debug/devel QOS). Use `-p compute --nodes=1 --ntasks=1 --time=00:30:00 -A ab0995`
+  (drop `--mem` — compute nodes are exclusive) for the 17–25 s mesh/IC/dump jobs. (User-flagged;
+  `jax_bulk_dump_core2.sh`, Task 5.4.) [[fesom-jax-port]]
+
+- **[workflow] Large generated artifacts go on `/work`, not `/home`** (user standing rule).
+  `port_jax/data/` (499 M: mesh export, IC, C dumps) was moved to
+  `/work/ab0995/a270088/port_jax/data` with a `data → /work/...` **symlink** at the repo root, so
+  all relative-path code (`Path(__file__).parents[2]/"data"`) and the C job scripts (which write to
+  `/home/.../data/...`) transparently land on `/work`. `.gitignore` needs **both** `/data` (the
+  symlink) and `/data/` (a plain dir) — the trailing-slash form alone does not ignore a symlink.
+  (User-flagged, Task 5.4.)

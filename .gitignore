@@ -35,6 +35,9 @@ jax_cache/
 !fesom_jax/tests/fixtures/**
 
 # --- C-exported mesh + other regenerated reference data ---
+# Large artifacts live on /work (gitignored); `data` is a symlink to
+# /work/ab0995/a270088/port_jax/data. Match BOTH the dir and the symlink.
+/data
 /data/
 
 # --- SLURM job outputs ---

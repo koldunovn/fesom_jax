@@ -221,30 +221,49 @@ driver) + `tests/test_jra55.py`. C: probe-dump the 8 jra fields at a fixed (year
 
 **Files:** Modify `fesom_jax/forcing.py` (add bulk) + `tests/test_forcing.py`.
 
-- [ ] **`ncar_ocean_fluxes_mode`** (`fesom_bulk.c:49`): neutral 10 m coeffs LY2009 11a/b,
-  then the Monin-Obukhov stability loop — **run a FIXED 5 iterations, unrolled / `lax.scan`,
-  drop the data-dependent early break** (`:171`; post-convergence iters are no-ops →
-  identical result, AD-safe). Relative wind `|u_atm−u_ocn|` floored at 0.3 (`:70-73`).
-- [ ] **`obudget`** (`:187`): sat-humid `b=3.8e-3·exp(17.27·t/(t+237.3))`; LWout=−ε·σ·(t+273.15)⁴;
+> **✅ DONE 2026-06-06.** `fesom_jax/forcing.py` — AD-safe port of `fesom_bulk.c`
+> (`ncar_ocean_fluxes_mode` fixed-5 unrolled + `obudget` + `bulk_surface_fluxes` with the
+> node→elem mean-of-3). Verified vs a new C `bulk_dump_*` all-node dump (job 25389451,
+> `data/bulk_dump_core2/`) at 3 configs — d1z (day1, zero curr), inz (day100/noon, zero curr),
+> ins (day100/noon, synthetic curr): **cd/ce/ch ~1e-17, heat_flux ~6e-13, stress ~5e-16** over
+> all 126858 nodes (essentially bit-exact, MAP-class). `test_forcing.py` = **10 passed**
+> (forward gate ×3 + elem stress ×3 + synthetic-current active + early-break-bound + AD-finiteness
+> + ordering). ⚠️ **FINDING — the "drop the break ⇒ identical" assumption was WRONG:** the M-O
+> loop doesn't robustly converge at calm nodes, so fixed-5 vs early-break diverges (`ch` up to
+> **~88%** at the calmest tropical nodes); but the **physical** impact is bounded — heat_flux
+> ≤7.2 W/m² at ~4 nodes (mean 2e-4; <0.1 W/m² for 126848/126858), stress ≤4e-3 N/m². JAX runs
+> fixed-5 (AD-safe) verified vs a **fixed-5** C dump (`FESOM_BULK_FIXED_ITERS`); Task 5.7 must
+> set that flag on the per-substep reference. New C: `fixed_iters` param + `fesom_bulk_dump` +
+> `jax_bulk_dump_core2.sh`. `USE_SW_PENE=1` in the C ⇒ shortwave penetration is ON → it's a
+> Task-5.6 sub-item (heat_flux here = `qns−qsr`, pre-penetration).
+
+- [x] **`ncar_ocean_fluxes_mode`** (`fesom_bulk.c:49`): neutral 10 m coeffs LY2009 11a/b,
+  then the Monin-Obukhov stability loop — **run a FIXED 5 iterations, unrolled, drop the
+  data-dependent early break** (`:171`, AD-safe: a `while`-break is not reverse-mode diff'able).
+  Relative wind `|u_atm−u_ocn|` floored at 0.3 (`:70-73`). ⚠️ **CORRECTION to the original claim
+  "post-convergence iters are no-ops → identical":** they are NOT — the loop is non-convergent at
+  calm nodes (see the DONE note; `ch` up to ~88% fixed-5-vs-early-break). The fix is to verify vs
+  a fixed-5 C dump, and bound the (small) physical residual vs the early-break production.
+- [x] **`obudget`** (`:187`): sat-humid `b=3.8e-3·exp(17.27·t/(t+237.3))`; LWout=−ε·σ·(t+273.15)⁴;
   sensible/latent/evap; `qns=−(LWin+LWout+sens+lat)`; constants (`:21-39`) ρ_air=1.3,
   cp=1005, L=2.501e6, σ=5.67e-8, ε=0.97, **albw=0.1** (CORE2, not 0.066). ⚠️ stress/coeffs
   use **relative** wind but `obudget`'s `ug` uses **absolute** wind (`:283`) — deliberate
-  Fortran mismatch, preserve it.
-- [ ] **Outputs** (`:291-342`): `heat_flux[nod]=qns−qsr`, `water_flux[nod]=evap−prra−prsn`,
+  Fortran mismatch, **preserved** (validated by the synthetic-current dump mode).
+- [x] **Outputs** (`:291-342`): `heat_flux[nod]=qns−qsr`, `water_flux[nod]=evap−prra−prsn`,
   `stress_node_surf=Cd·ρ_air·|Δu|·Δu` (relative wind), then node→elem **simple mean-of-3**
   (`:332-342`; NOT the pi area-weighted double-average). Cavity nodes zeroed (none on CORE2).
-- [ ] ⚠️ **AD-safe guards:** `sqrt(Δu²+Δv²)` (floor inside, or safe-sqrt — kink at 0);
-  `x2=sqrt(|1−16ζ|)` singular at ζ=1/16 (`:99,115,132`); replace `copysign` step-switches
-  with `jnp.where`; divides by `ustar²`/`tv`/`cd+1e-8` are structurally nonzero. The
-  **SST→heat_flux and current→stress feedback is differentiable** and lives here.
-- [ ] **Gate:** dump `Cd/Ce/Ch` (`fesom_bulk.c`) + `heat_flux/water_flux/stress_node_surf/
-  stress_surf` after `fesom_bulk_compute` vs C (~1e-12). + a finite-iter-vs-C-early-break
-  equivalence check.
-- [ ] **Defer** `cal_shortwave_rad` / `sw_3d` penetration (`fesom_bulk.c:355`) — needs chl
-  climatology + 3-D plumbing; gate whether the CORE2 reference run has it on
-  (`USE_SW_PENE` is gated on `use_jra` → likely ON; if so it's a Task-5.6 sub-item, else
-  skip). Confirm against the C config before porting.
-- [ ] run — must pass before Task 5.6. **Lesson:** append.
+- [x] ⚠️ **AD-safe guards:** `u`/`mag` use a double-`where` safe-sqrt (the `current→stress`
+  gradient at Δu=0 is otherwise `0·inf` NaN); `x2=sqrt(|1−16ζ|)` (singular at ζ=1/16) is
+  `sqrt(max(|1−16ζ|,1))` — bit-identical to the C floor AND smooth; `copysign` step-switches
+  ported **literally** via `jnp.copysign` (exact at ±0, gradient 0). The **SST→heat_flux and
+  current→stress feedback is differentiable** and lives here (AD-finiteness gated).
+- [x] **Gate:** dump `Cd/Ce/Ch` + `heat_flux/water_flux/stress_node_surf/stress_surf` after
+  the bulk vs C — achieved ~1e-17 (coeffs) / ~6e-13 (heat) / ~5e-16 (stress), well inside 1e-12.
+  + the finite-5-vs-C-early-break check (recast as a **bounded-divergence** gate, per the finding).
+- [~] **Defer** `cal_shortwave_rad` / `sw_3d` penetration (`fesom_bulk.c:355`) — **confirmed ON**
+  (`FESOM_PHASE1_USE_SW_PENE=1`). heat_flux here is the pre-penetration `qns−qsr`; the 0.54-visible
+  removal + `sw_3d` column build is a **Task-5.6 sub-item** (needs chl + 3-D plumbing).
+- [x] run — must pass before Task 5.6. **Lesson:** appended (5 bulk lessons + 2 workflow). — **DONE: test_forcing 10 passed.**
 
 ### Task 5.5: SSS restoring + runoff + oce_fluxes balance
 
@@ -395,6 +414,23 @@ first. GM/KPP/ice are Phase 6.
   5 passed. **Env: netCDF4 installed** (user-approved; numpy 2.4.6 / jax 0.10.1 unchanged;
   benign `ndarray size changed` ABI warning). New `port2/jobs/jax_phc_dump_core2.sh`.
   Next: **Task 5.3 (JRA55 forcing reader)**.
+- **2026-06-06 — Task 5.4 DONE (L&Y09 bulk formulae, AD-safe).** `fesom_jax/forcing.py` —
+  `ncar_ocean_fluxes_mode` (fixed-5 unrolled) + `obudget` + `bulk_surface_fluxes` (node→elem
+  mean-of-3). Verified vs a new C `bulk_dump_*` all-node dump (job 25389451, year 1958) at 3
+  configs (zero + synthetic current, day1 + day100/noon): **cd/ce/ch ~1e-17, heat_flux ~6e-13,
+  stress ~5e-16** over all 126858 nodes. `test_forcing.py` 10 passed. ⚠️ **The sub-plan's
+  "drop the break ⇒ identical result" assumption was WRONG** — the M-O loop is non-convergent
+  at calm nodes (`ch` diverges up to **88%** fixed-5-vs-early-break), but the **physical** impact
+  is bounded (heat_flux ≤7.2 W/m² at ~4 nodes; <0.1 W/m² for 126848/126858). JAX runs fixed-5
+  (AD-safe; a data-dependent `while`-break is not reverse-mode diff'able) verified against a
+  **fixed-5** C dump via a new `FESOM_BULK_FIXED_ITERS` env gate; **Task 5.7's per-substep
+  reference must set that flag.** AD-safe `x2=sqrt(max(|1−16ζ|,1))` (bit-identical + smooth through
+  ζ=1/16), double-`where` safe-sqrt for `u`/`mag`, literal `jnp.copysign` switches; the deliberate
+  relative-vs-absolute wind mismatch preserved + validated by a synthetic-current dump mode.
+  `USE_SW_PENE=1` confirmed ⇒ sw penetration deferred to Task 5.6 (heat_flux = pre-pene `qns−qsr`).
+  C: `fixed_iters` param + `fesom_bulk_dump` (+`T_oc`/early-break columns) + `jax_bulk_dump_core2.sh`.
+  **Artifacts moved to `/work`** (`data → /work/.../port_jax/data` symlink; user rule). Next:
+  **Task 5.5 (SSS restoring + runoff)**.
 - **2026-06-06 — Task 5.3 DONE (JRA55 forcing reader).** `fesom_jax/jra55.py` — faithful numpy
   port of `fesom_jra55.c` (julday/binarysearch + per-field time-grid transform with the
   mid-interval shift + shared bilinear stencil + per-field `getcoeffld` cache + `step` + the

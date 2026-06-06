@@ -1,23 +1,29 @@
 # Next-session prompt — FESOM2 → JAX port
 
 Paste the block below to start the next session. **Phases 0–4 COMPLETE (GATEs 0/1/2/3/4).
-Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1 + 5.2 + 5.3 DONE.**
-Full suite **339 passing**.
+Phase 5 (CORE2 single-device) IN PROGRESS — sub-plan created; Tasks 5.1 + 5.2 + 5.3 + 5.4 DONE.**
+Full suite **passing** (pi 313 + CORE2 additions; `test_forcing.py` +10).
 
 The pi model is fully ported, dump-gated, jitted, differentiable end-to-end, 1000-step
 stable. Phase 5 runs that same physics (PP + **linfs** + FCT + opt_visc7, **no GM/KPP/ice**)
 on the **CORE2 mesh** with PHC initial conditions and real JRA55+SSS+runoff forcing,
 verified per-substep against a CORE2 C-port dump (**Path A**). So far: the CORE2 mesh is
 exported + loads zero-code (with a new **clockwise-orientation guard**), the **PHC IC** is
-ported (numpy, ~1e-14), and the **JRA55-do reader** is ported (numpy) and matches a C all-node
-dump **bit-exact** (6 scalar fields) / ~3.5e-15 (wind rotation).
+ported (numpy, ~1e-14), the **JRA55-do reader** is ported (numpy) and matches a C all-node
+dump **bit-exact**, and the **L&Y09 bulk** is ported (AD-safe JAX) and matches a C all-node
+bulk dump to **~1e-17 (coeffs) / ~6e-13 (heat) / ~5e-16 (stress)** — the differentiable
+SST→flux / current→stress seam.
 
-**Everything committed on `main`** (`d4fcdb2` Task 5.2, `4b34f6a` Task 5.1; Task 5.3 commit
-pending). CORE2 data artifacts are **gitignored** (`data/mesh_core2/`, `data/ic_core2/`,
-`data/phc_dump_core2/`, `data/jra_dump_core2/`). New C-side job scripts live **untracked** in
-`port2/fesom2_port/jobs/` (`jax_mesh_export_core2.sh`, `jax_phc_dump_core2.sh`,
-`jax_jra_dump_core2.sh`). The C `dump_jra_fields` + its call site (in `fesom_main.c`, branch
-`jax-mesh-export`) are a dump-only addition (gated on `FESOM_JRA_DUMP_DIR`).
+**Everything committed on `main`** (`5ab28af` Task 5.3, `d4fcdb2` Task 5.2, `4b34f6a` Task 5.1;
+Task 5.4 commit pending). **CORE2 data artifacts now live on `/work`** —
+`port_jax/data` is a **symlink** to `/work/ab0995/a270088/port_jax/data` (gitignored via both
+`/data` and `/data/`; user rule "large files on /work not /home"). New C-side job scripts live
+**untracked** in `port2/fesom2_port/jobs/` (`jax_mesh_export_core2.sh`, `jax_phc_dump_core2.sh`,
+`jax_jra_dump_core2.sh`, `jax_bulk_dump_core2.sh`). The C `dump_jra_fields` + `fesom_bulk_dump`
++ the `ncar_ocean_fluxes_mode` `fixed_iters` param (in `fesom_bulk.c`/`fesom_main.c`, branch
+`jax-mesh-export`) are dump-only additions (gated on `FESOM_JRA_DUMP_DIR`/`FESOM_BULK_DUMP_DIR`).
+⚠️ **Cheap C jobs: use `-p compute --time=00:30:00` (fast debug QOS), not `-p shared`** (~16 s
+to start vs minutes).
 
 ---
 
@@ -73,12 +79,20 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
   ~1e-13 reassociation blew to ~6e-8; fixed by a **bit-identical `(s·dx)·dy` + divide-at-end
   gather**. Field order uas,vas,huss,rsds,rlds,**tas**,prra,prsn; interp on geographic coords,
   rotate wind after; `flip_lat=0`. New `dump_jra_fields` in `fesom_main.c` + `jax_jra_dump_core2.sh`.
+- **Task 5.4 DONE:** `fesom_jax/forcing.py` — AD-safe port of `fesom_bulk.c`
+  (`ncar_ocean_fluxes_mode` fixed-5 unrolled + `obudget` + `bulk_surface_fluxes`, node→elem
+  mean-of-3). Verified vs a C `bulk_dump_*` dump (job 25389451, `data/bulk_dump_core2/`) at
+  3 configs (zero + synthetic current, day1 + day100/noon): **cd/ce/ch ~1e-17, heat_flux ~6e-13,
+  stress ~5e-16** over all 126858 nodes. `test_forcing.py` (10). ⚠️ **FINDING:** the sub-plan's
+  "drop the early break ⇒ identical result" claim was WRONG — the M-O loop is non-convergent at
+  calm nodes (`ch` up to **88%** fixed-5-vs-early-break) but the **physical** impact is bounded
+  (heat_flux ≤7.2 W/m² at ~4 nodes). JAX runs fixed-5 (AD-safe) vs a **fixed-5** C dump via a new
+  `FESOM_BULK_FIXED_ITERS` env gate. AD-safe `x2=sqrt(max(|1−16ζ|,1))` + double-`where` safe-sqrt
+  (`u`/`mag`) + literal `jnp.copysign` switches; relative-vs-absolute wind mismatch preserved
+  (synthetic-current dump mode). `USE_SW_PENE=1` ⇒ shortwave penetration deferred to 5.6
+  (heat_flux = pre-pene `qns−qsr`). New `fesom_bulk_dump` + `jax_bulk_dump_core2.sh`.
 
-## IMMEDIATE WORK — Task 5.4 onward (the sub-plan has the full ladder + gates)
-- **5.4 L&Y09 bulk** (AD-safe JAX): `ncar_ocean_fluxes_mode` (**fixed 5 iters, unrolled** — drop
-  the data-dependent break) + `obudget`; `heat_flux/water_flux/stress`; node→elem simple
-  mean-of-3; albw=0.1; relative-wind in coeffs but absolute `ug` in obudget (preserve). The
-  **differentiable SST→flux / current→stress feedback** lives here. Safe-sqrt / `where` guards.
+## IMMEDIATE WORK — Task 5.5 onward (the sub-plan has the full ladder + gates)
 - **5.5 SSS restoring + runoff** (numpy readers + AD-safe JAX): match `fesom_sss_runoff.c`
   exactly (virtual_salt + relax_salt into the S surface BC; runoff via the global-mean term in
   the no-ice path); `ref_sss_local=1`, `surf_relax_S=1.929e-6`; month index no legacy `+1`.
@@ -88,16 +102,21 @@ trained end-to-end). Multi-session effort. Work from `/home/a/a270088/port_jax`.
   `PROBE_GIDS` in `fesom_dump.c` incl. an Aleutian node, e.g. 94122); assemble + run CORE2
   1-day (~172 steps, dt=500) + multi-day; assert stable. ⚠️ **Use the JITTED `run`/`integrate`
   (or GPU)** — an eager CORE2 step is ~32 s on CPU. Finalize `T_old`/`S_old` (step-1 AB2)
-  against the dump.
+  against the dump. ⚠️ **Set `FESOM_BULK_FIXED_ITERS=1` on the reference dump run** — else the
+  bulk coefficients won't match JAX at calm nodes (the early-break finding from 5.4).
 - **5.8 GATE 5:** gradient check on a CORE2 slice (+ the new d(heat_flux)/d(SST),
   d(stress)/d(current) feedbacks); confirm checkpointed backward fits the GPU at CORE2 scale.
 
-**First moves for 5.4:** read `fesom_bulk.c` (`ncar_ocean_fluxes_mode` + `obudget` +
-`fesom_bulk_compute`); extend the existing `jax_jra_dump_core2.sh` to also dump
-`Cd/Ce/Ch` + `heat_flux/water_flux/stress_node_surf/stress_surf` after `fesom_bulk_compute`
-(the bulk reads the JRA fields the 5.3 reader now reproduces bit-exact, plus SST `T[:,0]` +
-surface current `uvnode[:,0]`). The JRA reader output (`jra55.JRAFields`) feeds the bulk;
-this is where the **differentiable** SST→flux / current→stress seam lives.
+**First moves for 5.5:** read `fesom_sss_runoff.c` (`fesom_sss_runoff_init` readers +
+`fesom_sss_runoff_step` flux math); SSS `PHC2_salx.nc` (12-month, 30-cell expanding-neighbour
+fill) → `Ssurf_clim[12,nod2D]`, runoff `CORE2_runoff.nc` (single record, /1000 → m/s) →
+`runoff_node[nod2D]`, ported as host-numpy readers (like `phc_ic`/`jra55`). The AD-safe JAX flux
+math (`virtual_salt=rsss·water_flux` with `rsss=S_top`/`ref_sss_local=1`; `relax_salt=
+surf_relax_S·(Ssurf−S_top)`; subtract the area-weighted global mean; `water_flux += mean(...)`)
+consumes the bulk `water_flux` (Task 5.4) + `S[:,0]`. Gate vs a new C `sss_runoff` dump (extend
+the `FESOM_BULK_DUMP_DIR` pattern; dump after `fesom_sss_runoff_step`). Then **5.6** wires
+`bc_T`/`bc_S`/`stress_surf` into the step. The bulk `forcing.bulk_surface_fluxes` →
+`BulkFluxes(heat_flux, water_flux, stress_surf, …)` is the 5.6 input.
 
 ## THE PROVEN VERIFICATION RECIPE (still applies)
 Per-substep dump at pinned probes, truncate to `nlevels`, `verify.assert_close(col, rec,
