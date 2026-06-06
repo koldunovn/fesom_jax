@@ -1135,3 +1135,64 @@ Cite the C source (`file:line`) or dump probe that proves it.
   exact destabilization step. The single-rank C reference is much slower (~4.6 s/step) — it is
   an MPI code run on 1 rank — so for the C arbiter cap the run or give it a non-debug QOS.
   (`scripts/core2_stability_gpu.sh`, Task 5.7.)
+
+## Phase 5 — CORE2-slice gradient gate (Task 5.8, GATE 5)
+
+- **[ad/scope] ⚠️⚠️ The multi-step FORCED CORE2 trajectory is genuinely NON-SMOOTH in the
+  physics parameters — a clean FD↔AD plateau is only well-posed in SMOOTH regimes, NOT over
+  the full forced model.** pi's clean `d(mean SST)/d(k_ver)` plateau (5.70e-7) works because
+  the smooth Gaussian blob keeps the FCT Zalesak limiter AND the convective adjustment
+  (`max(N²,0)` / instabmix) **dormant**. Under real CORE2 forcing (PHC fronts +
+  supercooling-driven convection) those kinks are **active**, so the loss is genuinely
+  non-smooth in `k_ver` at the FD scale: the N=20 `d(mean SST)/d(k_ver)` FD does **not**
+  plateau (AD=+33.5; FD swings −15.1 → +6.4 → +222 → +37 across h=1e-2…1e-6; min rel 9.7e-2).
+  The AD is a valid **(sub)gradient** (the smallest-h FD ≈ +37 is the closest); FD *across* a
+  kink ≠ the slope. So the quantitative FD↔AD gate runs where the assembled model **is**
+  smooth: **N=1** `d(mean SST)/d(k_ver)` (plateau **7.5e-10**) — at step 1 `uv=0` ⇒ the PP
+  shear term vanishes ⇒ `Kv = k_ver` *additively* on stable columns (the convective mask is
+  fixed by the IC density, so `k_ver` can't move it) — plus the isolated bulk seams + the
+  linear-solve residual. The multi-step CG/FCT/EOS machinery is pi-proven (identical code) and
+  AD-safe on CORE2 (the masked-NaN probe). *Lesson: re-validating a gradient by FD needs a
+  smooth regime; a forced realistic trajectory exercises kinks (flux limiters, convective
+  adjustment) that a synthetic smooth IC hides — match the FD regime to what is smooth, and
+  lean on the (sub)gradient + masked-NaN finiteness for the non-smooth full model. This is the
+  long-anticipated "model is mildly chaotic ⇒ test_gradient stays short/smooth" lesson, now
+  shown to be STRONG (not mild) under real forcing.* (`scripts/core2_grad_gate.py` [1]/[4],
+  job 25394380, Task 5.8.)
+
+- **[ad/observable] ⚠️ To FD-probe a sub-path's gradient the observable must actually DEPEND
+  on the parameter — the barotropic SSH `d_eta` is PHYSICALLY INSENSITIVE to `a_ver`
+  (`d(Σd_eta²)/d(a_ver) ≈ −7e-17`, correctly ~0, AD agrees — not a bug).** `d_eta` solves the
+  *depth-integrated* transport divergence (set by the wind stress + bathymetry); `a_ver` only
+  redistributes momentum **vertically**, conserving the column integral, so `d_eta ⊥ a_ver`.
+  And `k_ver` doesn't reach the CG in one step (it enters the *final* vertical diffusion,
+  downstream of the solve). So no obvious single-step param-gradient probes the CG transpose on
+  CORE2. Verify the CG implicit-diff **directly by the residual**: for `f(b)=½‖S⁻¹b‖²`,
+  `∇f = S⁻¹·d_eta`, so the AD cotangent must SOLVE `S·g_ad = d_eta` — `‖S·g_ad − d_eta‖/‖d_eta‖
+  = 8.8e-14` confirms the tight transpose reached the true `S⁻¹` on the 40×-bigger CORE2 matrix.
+  A residual check is **strictly stronger** than matching another run of the same `_pcg` (a
+  non-converging / wrong-preconditioner solver passes *that*). *Lesson: choose a parameter the
+  observable depends on; verify a linear solver's implicit-diff by the residual `S·g − cotangent`,
+  not a parameter sweep.* (`test_gradient_core2.test_grad_cg_transpose_core2`, Task 5.8.)
+
+- **[ad/bulk-seam] The NEW Phase-5 differentiable forcing seams are AD-correct to ~1e-11
+  (FD↔AD), well-conditioned because the bulk is a per-node pure map.** `d(Σheat_flux)/d(SST)`
+  plateau **5.3e-11** (physical sign **+**: warmer ocean ⇒ more heat loss ⇒ larger upward
+  `heat_flux`), `d(Σstress)/d(u_current)` **3.6e-12**. Sum the directional derivative over a
+  SMOOTH node subset (`|SST−Tair|>1`, `1<|Δu|<30`): the bulk has kinks at SST=Tair (the initial
+  `stab` switch), **ζ_u≈0** (the in-loop neutral `stab` switch + the `ψ` branch flip), u10=33
+  (drag switch) and Δu=0 (the safe-sqrt); nodes straddling a kink corrupt the large-h FD
+  (rel ~4e-3 at h=1e-2), but the straddler count scales with h, so the **min-over-h plateau**
+  lands kink-free at h≈1e-6. *Lesson: for a kinky per-node map, take the directional FD over a
+  smooth node subset and sweep h — the plateau lives at the small-h end where the straddlers
+  vanish.* (`test_forcing.test_ad_vs_fd_heat_flux_sst` / `_stress_current`, Task 5.8.)
+
+- **[ad/memory] The checkpointed N=20 CORE2 backward peaks at 37.8 GB on an A100 — fits the
+  80 GB card (59%); on a 40 GB card it's at the limit (drop to ~N=10 or use O(√N) nesting).**
+  (pi N=200 was 4.23 GB; CORE2 ≈ 40× nodes × 1/10 the steps ⇒ ~9× ⇒ ~38 GB, consistent.) The
+  masked-NaN probe `d(mean SST)/d(T₀)` at N=20 is finite everywhere, **exactly 0** on the
+  below-bottom masked lanes and nonzero (5.5e-3) on wet — the strong AD-safety gate now on the
+  *assembled CORE2 model* (the new bulk seams + the eos/tracer_diff/FCT masked-divide guards in
+  one backward). ⚠️ A login/CPU node could **not** hold even the N=4 T₀ backward (the process
+  was killed) → this is a GPU-only gate; the CPU suite runs the N=1 masked-NaN probe.
+  (`scripts/core2_grad_gate.py` [3], job 25394380, Task 5.8.)

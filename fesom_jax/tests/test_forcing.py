@@ -225,3 +225,110 @@ def test_ad_finite_sst_and_current(setup):
     # both feedbacks are genuinely active (not all-zero)
     assert float(jnp.max(jnp.abs(g_sst))) > 1.0     # ~ -d(net heat)/dSST, O(10) W/m²/K
     assert float(jnp.max(jnp.abs(g_cur))) > 1e-3
+
+
+# --------------------------------------------------------------------------
+# Task 5.8 (GATE 5): the NEW Phase-5 differentiable seams — AD vs FD.
+# ``test_ad_finite_sst_and_current`` (above) gates *finiteness* incl. the safe-sqrt
+# lanes; these gate the *value* of the gradient against central finite differences.
+# The bulk is a per-node pure map (no time loop, no CG), so the AD↔FD check is clean
+# and well-conditioned — provided the linearization point + perturbation stay clear
+# of the bulk's kinks: the stab switch at SST==Tair (a derivative jump, since the
+# sensible term ∝ ch·(Tair−SST) is continuous but its slope jumps with ch), the
+# u10=33 m/s drag switch, the in-loop neutral switch at ζ_u≈0 (stab + the ψ branch),
+# and the relative-wind safe-sqrt at Δu=0. We sum the directional derivative over a
+# SMOOTH subset of nodes (|SST−Tair|>1, 1<|Δu|<30) and sweep the FD step h. A few nodes
+# straddle the ζ_u≈0 kink at LARGE h, but the straddler count scales with h, so by
+# h≈1e-6 it vanishes — hence we assert the *plateau* (min over h), which lands at the
+# small-h, kink-free, well-conditioned end.
+# --------------------------------------------------------------------------
+H_SWEEP = (1e-2, 1e-3, 1e-4, 1e-5, 1e-6)
+
+
+def _smooth_mask(jraf, c):
+    """Nodes comfortably off every bulk kink (so the per-node feedback is smooth):
+    SST well away from Tair (stab switch), and a relative wind well above the 0.3
+    floor / safe-sqrt kink and below the 33 m/s drag switch."""
+    sst = c[:, C_TOC]
+    tair = np.asarray(jraf.Tair)
+    du = np.asarray(jraf.u_wind) - c[:, C_UW]
+    dv = np.asarray(jraf.v_wind) - c[:, C_VW]
+    rel = np.hypot(du, dv)
+    return (np.abs(sst - tair) > 1.0) & (rel > 1.0) & (rel < 30.0)
+
+
+def _fd_sweep_dir(f, eps0):
+    """Central relative FD of ``f(eps)`` about eps=0, swept over :data:`H_SWEEP`.
+    Returns ``(g_ad, [(h, g_fd, rel)…])``; ``eps0`` must be a jnp scalar 0.0."""
+    import jax
+    g_ad = float(jax.grad(f)(eps0))
+    rows = []
+    for h in H_SWEEP:
+        g_fd = float((f(eps0 + h) - f(eps0 - h)) / (2.0 * h))
+        rel = abs(g_ad - g_fd) / max(abs(g_fd), 1e-300)
+        rows.append((h, g_fd, rel))
+    return g_ad, rows
+
+
+def test_ad_vs_fd_heat_flux_sst(setup, capsys):
+    """``d(Σ heat_flux)/d(SST)`` AD vs central FD over the smooth-node subset. The
+    feedback is the heart of the SST→flux coupling for hybrid ML. Asserts: the
+    FD-converged plateau < 1e-6, the gradient is finite, and the **physical sign**
+    (warmer ocean ⇒ larger upward (loss) heat_flux ⇒ ``d(Σheat_flux)/d(SST) > 0``)."""
+    import jax.numpy as jnp
+    from fesom_jax import forcing
+    mesh = setup["mesh"]
+    jraf, c = setup["jra"]["ins"], setup["cdump"]["ins"]
+    args = (jnp.asarray(jraf.u_wind), jnp.asarray(jraf.v_wind), jnp.asarray(jraf.shum),
+            jnp.asarray(jraf.shortwave), jnp.asarray(jraf.longwave), jnp.asarray(jraf.Tair),
+            jnp.asarray(jraf.prec_rain), jnp.asarray(jraf.prec_snow))
+    T0 = jnp.asarray(c[:, C_TOC])
+    uw0, vw0 = jnp.asarray(c[:, C_UW]), jnp.asarray(c[:, C_VW])
+    sm = jnp.asarray(_smooth_mask(jraf, c))
+    assert int(jnp.sum(sm)) > 1000, "smooth-node subset too small for a meaningful gate"
+
+    def f(eps):                                  # perturb SST at the smooth nodes only
+        T = T0 + eps * sm
+        hf = forcing.bulk_surface_fluxes(mesh, *args, T_surf=T, u_w=uw0, v_w=vw0).heat_flux
+        return jnp.sum(jnp.where(sm, hf, 0.0))
+
+    g_ad, rows = _fd_sweep_dir(f, jnp.asarray(0.0))
+    with capsys.disabled():
+        print(f"\n  d(Σheat_flux)/d(SST) AD = {g_ad:+.6e}  (W/m² per K, {int(jnp.sum(sm))} nodes)")
+        for h, g_fd, rel in rows:
+            print(f"    h={h:.0e}  FD={g_fd:+.6e}  rel|AD-FD|={rel:.2e}")
+    assert np.isfinite(g_ad)
+    assert g_ad > 0.0, f"expected d(Σheat_flux)/d(SST) > 0 (warmer ⇒ more loss), got {g_ad:+.3e}"
+    plateau = min(rel for _, _, rel in rows)
+    assert plateau < 1e-6, f"heat_flux/SST FD plateau rel err {plateau:.2e} ≥ 1e-6"
+
+
+def test_ad_vs_fd_stress_current(setup, capsys):
+    """``d(Σ stress)/d(surface current)`` AD vs central FD over the smooth-node subset
+    — the current→stress coupling (the wind-stress feedback for hybrid ML). The
+    relative-wind ``|Δu|`` is kept > 1 m/s so we are off the Δu=0 safe-sqrt kink.
+    Asserts the FD-converged plateau < 1e-6 and a finite, active gradient."""
+    import jax.numpy as jnp
+    from fesom_jax import forcing
+    mesh = setup["mesh"]
+    jraf, c = setup["jra"]["ins"], setup["cdump"]["ins"]
+    args = (jnp.asarray(jraf.u_wind), jnp.asarray(jraf.v_wind), jnp.asarray(jraf.shum),
+            jnp.asarray(jraf.shortwave), jnp.asarray(jraf.longwave), jnp.asarray(jraf.Tair),
+            jnp.asarray(jraf.prec_rain), jnp.asarray(jraf.prec_snow))
+    T0 = jnp.asarray(c[:, C_TOC])
+    uw0, vw0 = jnp.asarray(c[:, C_UW]), jnp.asarray(c[:, C_VW])
+    sm = jnp.asarray(_smooth_mask(jraf, c))
+
+    def f(eps):                                  # perturb the zonal current u_w at smooth nodes
+        uw = uw0 + eps * sm
+        sns = forcing.bulk_surface_fluxes(mesh, *args, T_surf=T0, u_w=uw, v_w=vw0).stress_node_surf
+        return jnp.sum(jnp.where(sm[:, None], sns, 0.0))
+
+    g_ad, rows = _fd_sweep_dir(f, jnp.asarray(0.0))
+    with capsys.disabled():
+        print(f"\n  d(Σstress)/d(u_current) AD = {g_ad:+.6e}  ({int(jnp.sum(sm))} nodes)")
+        for h, g_fd, rel in rows:
+            print(f"    h={h:.0e}  FD={g_fd:+.6e}  rel|AD-FD|={rel:.2e}")
+    assert np.isfinite(g_ad) and g_ad != 0.0
+    plateau = min(rel for _, _, rel in rows)
+    assert plateau < 1e-6, f"stress/current FD plateau rel err {plateau:.2e} ≥ 1e-6"
