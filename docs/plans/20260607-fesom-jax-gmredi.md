@@ -262,23 +262,27 @@ constants cross-checked in `fesom_gm.c`):
 > The GM core: a per-node TDMA for the streamfunction `Γ` (`∂z(C·∂z Γ) − N²·Γ = (g/ρ₀)·∇σ·K_GM`),
 > 2 components sharing the matrix; then the element bolus velocity. Reuse `ops.tdma` (grad-verified).
 
-- [ ] **`fer_solve_gamma`** (`fesom_gm.c:492-612`): build `zbar_n`/`Z_n` on `hnode_new` (linfs ⇒
-  `zbar_n=zbar`); tridiag on the **inner** (conservative) bounds — top/bottom Dirichlet
-  (`a=c=0,b=1`), body `a=fc·zinv1·zinv`, `c=fc·zinv2·zinv`, `b=−a−c−max(bvfreq,1e-8)` (`fc=fer_C`,
-  `zinv*` from z-differences); RHS `tr_{x,y}=(g/ρ0)·0.5(σ_up+σ_dn)·fer_K`. Solve **both
-  components** with the shared matrix via `ops.tdma` (vectorized over nodes, stack the 2 RHS).
-  Pad below-bottom rows to identity (the established TDMA-padding lesson). Γ=0 on degenerate columns.
-- [ ] **`fer_gamma2vel`** (`fesom_gm.c:1035-1077`): per element/level,
-  `fer_uv[c,nz,el] = (1/3)·Σ_v(Γ[c,nz,v] − Γ[c,nz+1,v])/helem` (gather Γ to the 3 vertices,
-  interface-difference, ÷`helem`). **safe-divide** `where(helem>0, …, 0)` (the C `if(h>0)`).
-- [ ] ⚠️ **AD-safe guards:** the `bvfreq` floor (`max(·,1e-8)`); the `zinv` z-difference divides
-  (guard masked lanes `where(dz==0,1,dz)`); the `1/helem` guard. The TDMA grad is the
-  ops.tdma-verified primitive.
-- [ ] **Gate:** `fer_gamma` (2c, node) + `fer_uv` (2c, element) vs the G.1 dump (TDMA ~1e-13,
-  gamma2vel MAP ~1e-15). Independent numpy Thomas-sweep ref for the matrix.
-- [ ] **AD:** `d(Σfer_uv)/d(T)` through the TDMA finite (incl. masked); FD↔AD on a smooth node.
-- [ ] run — must pass before G.5. **Lesson:** append (the 2-component shared TDMA, the inner-vs-
-  outer bounds, the gamma2vel ÷helem).
+> **✅ DONE 2026-06-07.** `gm.fer_solve_gamma` + `gm.fer_gamma2vel`. ⚠️ Full-cell linfs ⇒
+> `zbar_n=zbar`, `Z_n=Z` are STATIC (verified `hnode_new == zbar thickness`, max|Δ|=0), so the
+> tridiagonal geometry is a precomputed constant × `fer_C`; the 2 components share `(a,b,c)` (two
+> `ops.tdma` calls); body on the conservative inner bounds, Dirichlet/padding rows `b=1` →
+> full-column `ops.tdma` reproduces the C's bounded Thomas. Verified vs the G.1 dump (all-node):
+> **`fer_gamma` ~8.9e-15** (sequential Thomas ≈ bit-exact), **`fer_uv` ~1.1e-16**, chained ~2e-16.
+> AD through the TDMA finite + nonzero. `test_gm_bolus.py` = **4 passed**. 2 lessons. **The whole
+> GM coefficient+bolus pipeline (G.1-G.4) is now done** — `fer_uv` from T/S.
+
+- [x] **`fer_solve_gamma`** (`fesom_gm.c:492-612`): static `zbar_n=zbar`/`Z_n=Z` geometry; tridiag
+  on the inner (conservative) bounds — Dirichlet `b=1` at endpoints, body `a=fc·zinv_if[nz-1]·
+  zinv_mid`, `c=fc·zinv_if[nz]·zinv_mid`, `b=−a−c−max(bvfreq,1e-8)`; RHS `tr=(g/ρ0)·0.5(σ_up+σ_dn)·
+  fer_K`. Both components via two `ops.tdma` (shared matrix). Γ=0 on degenerate/below-bottom.
+- [x] **`fer_gamma2vel`** (`fesom_gm.c:1035-1077`): `fer_uv[c,nz,el]=(1/3)·Σ_v(Γ[c,nz,v]−
+  Γ[c,nz+1,v])/helem` (gather Γ→vertices, interface-difference, safe ÷helem). `helem=⅓Σ_v hnode`.
+- [x] ⚠️ **AD-safe guards:** `bvfreq` floor; the static geometry (finite); the `1/helem` guard.
+  TDMA grad is the ops.tdma-verified primitive.
+- [x] **Gate:** `fer_gamma` ~8.9e-15 + `fer_uv` ~1.1e-16 vs the dump (Thomas≈bit-exact, gather).
+- [x] **AD:** `d(Σfer_uv²)/d(sigma_xy)` through the TDMA finite + nonzero.
+- [x] run — **DONE** (test_gm_bolus 4 passed). **Lesson:** appended (the static-geometry TDMA, the
+  shared-matrix 2-component solve, the gamma2vel ÷helem).
 
 ### Task G.5: Bolus advection wiring + `fer_w`
 

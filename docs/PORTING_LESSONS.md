@@ -1548,3 +1548,21 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `Ki·√c1 + Redi_Kmin·|√c1−1|` ⇒ where the taper kills c1 (unstable strat bv≤0, c1=0),
   `Ki=Redi_Kmin=100` — matches the C. Same seam pattern as `k_ver`/`a_ver` (Phase 3); Phase 7
   swaps the NN here. (`params.py`, `test_gm_coeffs`, G.3.)
+
+## Phase 6B — GM/Redi (Task G.4 — streamfunction TDMA + bolus velocity)
+
+- **[gm] `fer_solve_gamma`'s tridiagonal geometry is a STATIC precomputed constant in full-cell
+  linfs (`zbar_n=zbar`, `Z_n=Z`) — verified `hnode_new == zbar thickness` bit-exact (max|Δ|=0).**
+  So `a[nz]=fer_C·(1/(zbar[nz-1]−zbar[nz]))·(1/(Z[nz-1]−Z[nz]))`, `c` similarly with the lower
+  iface spacing, `b=−a−c−max(N²,1e-8)` — only `fer_C`/`bvfreq`/`fer_K`/`sigma_xy` vary per node.
+  Build the body coefficients on `[nzmin+1,nzmax)` (conservative inner bounds), set the
+  Dirichlet/padding rows to `b=1, a=c=d=0` (→ Γ=0), and the full-column `ops.tdma` reproduces the
+  C's bounded Thomas sweep exactly. The two components (x,y) SHARE the matrix → two `ops.tdma`
+  calls with the same `(a,b,c)`. **`fer_gamma` matched ~8.9e-15** (sequential Thomas ≈ bit-exact).
+  (`gm.fer_solve_gamma`, `fesom_gm.c:492`, G.4.)
+
+- **[gm] `fer_gamma2vel` (bolus velocity) is a gather + interface-difference ÷helem — ~1e-16,
+  essentially bit-exact.** `fer_uv(c,nz,el) = (1/3)·(Σ_v Γ[v,nz,c] − Σ_v Γ[v,nz+1,c])/helem`:
+  gather Γ to the 3 vertices, sum, difference adjacent interfaces, ÷`helem` (safe-divide
+  `where(h>0,h,1)`), mask to `elem_layer_mask & h>0`. `helem` (static linfs) = `⅓Σ_v hnode` =
+  `gather_nodes_to_elem(hnode).mean(axis=1)`. (`gm.fer_gamma2vel`, `fesom_gm.c:1035`, G.4.)

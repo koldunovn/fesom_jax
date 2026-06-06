@@ -230,4 +230,75 @@ def init_redi_gm(mesh: Mesh, bvfreq, hnode_new, fer_tapfac, params, cfg: GMConfi
     return fer_K, Ki, fer_C, fer_scal
 
 
-# fer_solve_gamma + fer_gamma2vel (G.4) land next.
+# ============================================================================
+# G.4 — fer_solve_gamma (fesom_gm.c:492-612)
+# ============================================================================
+def fer_solve_gamma(mesh: Mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg: GMConfig):
+    """Per-node 1-D TDMA for the GM streamfunction Γ:
+    ``∂z(C·∂z Γ) − N²·Γ = (g/ρ₀)·∇σ·K_GM``. The two horizontal components (x, y)
+    share the matrix. Solved on the CONSERVATIVE (inner) level range with Dirichlet
+    Γ=0 at the conservative top/bottom; 0 outside.
+
+    Full-cell linfs ⇒ ``zbar_n = zbar``, ``Z_n = Z`` are static (verified
+    hnode_new == zbar thickness, max|Δ|=0), so the tridiagonal geometry is a
+    precomputed constant; only ``fer_C``/``bvfreq``/``fer_K``/``sigma_xy`` vary.
+    Returns ``fer_gamma`` ``(N, nl, 2)``. ``fesom_gm.c:492``.
+    """
+    nl = mesh.nl
+    r = cfg.g / cfg.rho_ref
+
+    # --- static tridiagonal geometry (zbar_n=zbar, Z_n=Z in linfs) -----------
+    zbar = mesh.zbar                                       # (nl,)
+    Z = mesh.Z                                             # (nl-1,)
+    zinv_if = 1.0 / (zbar[:-1] - zbar[1:])                 # (nl-1,) 1/(zbar[k]-zbar[k+1])
+    zinv_mid = 1.0 / (Z[:-1] - Z[1:])                      # (nl-2,) 1/(Z[nz-1]-Z[nz]), nz∈[1,nl-1)
+    # body nz∈[1,nl-1): a∝zinv_if[nz-1]·zinv_mid[nz], c∝zinv_if[nz]·zinv_mid[nz]
+    Ga = jnp.zeros(nl).at[1:nl - 1].set(zinv_if[: nl - 2] * zinv_mid)
+    Gc = jnp.zeros(nl).at[1:nl - 1].set(zinv_if[1:nl - 1] * zinv_mid)
+
+    fc = fer_C[:, None]                                    # (N,1)
+    a = fc * Ga[None, :]                                   # (N,nl)
+    c = fc * Gc[None, :]
+    bv_floor = jnp.maximum(bvfreq, cfg.gamma_bv_floor)     # max(N²,1e-8)
+    b_body = -a - c - bv_floor
+
+    # body mask = [nzmin+1, nzmax) with nzmin=ulevels_max-1, nzmax=nlevels_min-1.
+    k = jnp.arange(nl)[None, :]
+    nzmin = (mesh.ulevels_nod2D_max - 1)[:, None]
+    nzmax = (mesh.nlevels_nod2D_min - 1)[:, None]
+    body = (k > nzmin) & (k < nzmax)
+    a = jnp.where(body, a, 0.0)
+    c = jnp.where(body, c, 0.0)
+    b = jnp.where(body, b_body, 1.0)                       # Dirichlet/pad rows: b=1, d=0 → Γ=0
+
+    # RHS: tr = r·½(σ[nz-1]+σ[nz])·fer_K, on the body.
+    sx, sy = sigma_xy[:, :, 0], sigma_xy[:, :, 1]
+    sx_up = jnp.concatenate([sx[:, :1], sx[:, :-1]], axis=1)   # σ[nz-1]
+    sy_up = jnp.concatenate([sy[:, :1], sy[:, :-1]], axis=1)
+    tr_x = jnp.where(body, r * 0.5 * (sx_up + sx) * fer_K, 0.0)
+    tr_y = jnp.where(body, r * 0.5 * (sy_up + sy) * fer_K, 0.0)
+
+    gamma_x = ops.tdma(a, b, c, tr_x)
+    gamma_y = ops.tdma(a, b, c, tr_y)
+    return jnp.stack([gamma_x, gamma_y], axis=-1)         # (N,nl,2)
+
+
+# ============================================================================
+# G.4 — fer_gamma2vel (fesom_gm.c:1035-1077)
+# ============================================================================
+def fer_gamma2vel(mesh: Mesh, fer_gamma, helem):
+    """Element bolus velocity from the streamfunction interface differences:
+    ``fer_uv(c,nz,el) = (1/3)·Σ_v(Γ(c,nz,v) − Γ(c,nz+1,v)) / helem(nz,el)``.
+    Returns ``fer_uv`` ``(E, nl, 2)``, masked to the element layer range.
+    ``fesom_gm.c:1035``.
+    """
+    nl = mesh.nl
+    g_elem = ops.gather_nodes_to_elem(fer_gamma, mesh.elem_nodes)   # (E,3,nl,2)
+    g_sum = g_elem.sum(axis=1)                             # (E,nl,2) Σ_v Γ
+    diff = g_sum[:, : nl - 1, :] - g_sum[:, 1:nl, :]       # (E,nl-1,2) Γ[nz]−Γ[nz+1]
+    diff = jnp.pad(diff, ((0, 0), (0, 1), (0, 0)))         # (E,nl,2); bottom level 0
+    h = helem                                              # (E,nl)
+    safe_h = jnp.where(h > 0.0, h, 1.0)
+    valid = mesh.elem_layer_mask & (h > 0.0)              # (E,nl)
+    fer_uv = (1.0 / 3.0) * diff / safe_h[:, :, None]
+    return jnp.where(valid[:, :, None], fer_uv, 0.0)
