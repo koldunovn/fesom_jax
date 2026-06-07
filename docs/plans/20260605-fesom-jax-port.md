@@ -1015,3 +1015,15 @@ Split into focused sub-plans (one per subsystem), per the Phase-5 discipline.
   AD hazards are all established patterns. Wired behind a static `gm_cfg=None` (⇒ pi/Phase-5/ice
   bit-identical, the `ice_cfg` precedent). **Execution begins at Task G.1** (`sw_alpha_beta` +
   the `params.py` seam + `GMConfig` + the dump hook).
+- **2026-06-07 — Phase 6B GM/Redi Tasks G.1–G.6 COMPLETE (the whole physics), committed on `main`**
+  (`c587b83` G.1-3, `2e43ed9` G.4, `c3886e9` G.5, `dbf40ca` G.6). Every GM kernel dump-verified vs
+  a new GM-ON all-node CORE2 dump (`fesom_gm_dump`+`fesom_redi_blob` on port2 `jax-mesh-export`):
+  `sw_alpha_beta` bit-exact; neutral slopes map-class; `init_redi_gm` (`d/d(k_gm)=2.03e6` — the 2nd
+  ML-hook gradient LIVE); the streamfunction TDMA 8.9e-15 + bolus velocity 1.1e-16; the
+  `gm_diagnostics` driver `fer_uv` end-to-end 2.2e-16; the Redi terms — G7a 1.78e-15, **G7b's
+  5-branch edge loop 1.07e-14** (the 5→3-case collapse), K33 ("augment Kv"). New modules
+  `gm.py`/`gm_redi.py` + `eos.compute_sw_alpha_beta` + the `params.py` 2nd-ML-hook seam
+  (`k_gm`/`redi_kmax`). Compute-node test runner `scripts/run_suite.sbatch` adopted (the CORE2
+  backprop tests hang on the login node). **Only Task G.7 remains** (assemble into `step.py` behind
+  `gm_cfg=None` + multi-day GPU stability + gradient re-check with `d/d(k_gm)` = GATE 6B). Handoff
+  in `docs/NEXT_SESSION_PROMPT.md`.
