@@ -15,7 +15,7 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --hint=nomultithread
 #SBATCH --mem=200G
-#SBATCH --time=00:30:00
+#SBATCH --time=00:45:00
 #SBATCH -o /home/a/a270088/port_jax/scripts/run_suite.%j.out
 #SBATCH -e /home/a/a270088/port_jax/scripts/run_suite.%j.out
 
