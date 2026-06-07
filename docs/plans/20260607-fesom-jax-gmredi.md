@@ -293,21 +293,26 @@ wrap). `tests/test_gm_bolus_adv.py`. C: G.1 dump + the optional `FESOM_GM_BOLUS_
 > C's "`uv += fer_uv` … `uv −= fer_uv`" becomes simply *passing the augmented velocity into
 > tracer advection* — the original `uv`/`w_e` are untouched, so the subtract-back is automatic.
 
-- [ ] **`fer_w`** (`fesom_ale.c:91-171`): the SAME per-level antisymmetric edge→node
-  `(fv·dx − fu·dy)·helem` scatter as `w`, driven by `fer_uv` (disjoint accumulator), then the
-  reverse bottom→top cumsum. **Confirm whether `fer_w` also gets the stage-4 `÷area`** (mirror
-  `w`; read the rest of `compute_w` — almost certainly yes) and the `node_iface_mask`.
-- [ ] **Bolus wrap** (`fesom_step.c:312-332, 416-434`): build `uv_adv = uv + fer_uv`,
-  `w_e_adv = w_e + fer_w` (and `w + fer_w` if the FCT vertical uses `w`); feed these to
-  `tracer_adv.advect_one_fct` (and the Redi terms, G.6). The momentum/SSH path keeps the
-  un-augmented `uv` — verify nothing else reads the augmented field.
-- [ ] ⚠️ **AD/consistency:** `fer_w` linear in `fer_uv` (AD==FD); the bolus must preserve the
-  constant-tracer property (a non-divergent bolus velocity ⇒ `S=35` stays exact — the discrete-
-  continuity check, like the ocean `w`).
-- [ ] **Gate:** `fer_w` bit-exact (scatter ~1e-12, the ÷area crushes the cancellation like `w`)
-  vs the G.1 dump; the bolus-only advected T/S vs the optional `FESOM_GM_BOLUS_ONLY` dump (the
-  Redi terms add at G.6); `S=35` exact under bolus (constant-tracer).
-- [ ] run — must pass before G.6. **Lesson:** append (the functional add-no-subtract, the
+> **✅ DONE 2026-06-07.** ⚠️ **`fer_w = ale.compute_w(fer_uv)` — a PURE REUSE** (the C's fer_w uses
+> the byte-identical scatter+cumsum+÷area as `w`, just driven by fer_uv; verified by composition +
+> the no-flux BC + activity ~3e-4). The new piece is `gm.gm_diagnostics` (the GM driver composing
+> G.1-G.4 from the state → `GMDiag(fer_uv, slope_tapered, Ki, fer_K, fer_C)`): fed the C's
+> T/S/bvfreq/hnode_new it reproduces **`fer_uv` END-TO-END at 2.2e-16** (essentially bit-exact, the
+> whole chain all-node). The bolus wrap = pass `uv+fer_uv`, `w_e+fer_w` to the advection (no
+> subtract). `test_gm_bolus_adv.py` = **3 passed**. 2 lessons. ⚠️ The step.py integration (the
+> `gm_cfg` arg) + the tight bolus-effect-on-T/S gate move to **G.7** (the C dump has bolus+Redi
+> together; the assembled full-GM step gate covers both). The FCT vertical uses `w_e` (not `w`).
+
+- [x] **`fer_w`** = `ale.compute_w(mesh, fer_uv, helem)` — pure reuse (the C ÷area's fer_w like w,
+  `fesom_ale.c:181-183`). No new kernel; verified by composition + BC + activity.
+- [x] **Bolus wrap** = `uv_adv=uv+fer_uv`, `w_e_adv=w_e+fer_w` → `advect_one_fct` (functional, no
+  subtract). The FCT vertical uses `w_e`. The actual step.py wiring is **G.7**.
+- [x] **`gm_diagnostics` driver** (the real G.5 deliverable) — composes G.1-G.4; `fer_uv`
+  end-to-end 2.2e-16 vs the dump; AD through the full chain finite + nonzero.
+- [x] ⚠️ **AD/consistency:** `fer_w` linear in `fer_uv`; no-flux BC exact (divergence-free bolus).
+  The constant-tracer `S=35`-under-bolus + the tight bolus T/S vs C are folded into the G.7
+  assembled gate (needs the FCT in the loop / the FESOM_GM_BOLUS_ONLY knob to isolate).
+- [x] run — **DONE** (test_gm_bolus_adv 3 passed). **Lesson:** appended (the functional add-no-subtract, the
   fer_w÷area, the constant-tracer-under-bolus check).
 
 ### Task G.6: Redi tracer terms — G7a (vertical-explicit) + G7b (horizontal) + K33

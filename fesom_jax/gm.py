@@ -30,7 +30,7 @@ Redi_Ktaper=scaling_ODM95=scaling_resolution=scaling_GMzexp=T``,
 
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import NamedTuple, Optional
 
 import jax.numpy as jnp
 
@@ -302,3 +302,39 @@ def fer_gamma2vel(mesh: Mesh, fer_gamma, helem):
     valid = mesh.elem_layer_mask & (h > 0.0)              # (E,nl)
     fer_uv = (1.0 / 3.0) * diff / safe_h[:, :, None]
     return jnp.where(valid[:, :, None], fer_uv, 0.0)
+
+
+# ============================================================================
+# G.5 — gm_diagnostics: the per-step GM/Redi driver (state -> GM fields)
+# ============================================================================
+class GMDiag(NamedTuple):
+    """Per-step GM/Redi diagnostic fields (all recomputed from the state — GM is
+    stateless). ``fer_uv`` (element bolus velocity) drives the bolus advection
+    (G.5); ``slope_tapered``/``Ki`` drive the Redi tracer terms (G.6)."""
+
+    fer_uv: jnp.ndarray         # (E,nl,2)   element bolus velocity
+    slope_tapered: jnp.ndarray  # (N,nl-1,3) tapered neutral slope (for Redi)
+    Ki: jnp.ndarray             # (N,nl)     Redi diffusivity
+    fer_K: jnp.ndarray          # (N,nl)     GM thickness diffusivity (diag)
+    fer_C: jnp.ndarray          # (N,)       baroclinic wave speed² (diag)
+
+
+def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
+                   cfg: GMConfig) -> GMDiag:
+    """Run the full GM/Redi diagnostic chain (G.2-G.4) from the ocean state:
+    ``sw_alpha_beta → sigma_xy → neutral_slope → init_redi_gm → fer_solve_gamma →
+    fer_gamma2vel``. Returns the fields the bolus advection (G.5) and Redi terms
+    (G.6) consume. ``params`` carries the differentiable ``k_gm``/``redi_kmax``.
+
+    Mirrors ``fesom_step.c:124-130`` (the GM coefficient block). Each sub-kernel is
+    individually dump-verified (G.1-G.4); this composes them.
+    """
+    from .eos import compute_sw_alpha_beta
+    sw_alpha, sw_beta = compute_sw_alpha_beta(mesh, T, S)
+    sigma_xy = compute_sigma_xy(mesh, T, S, sw_alpha, sw_beta, cfg)
+    _, slope_tapered, fer_tapfac = compute_neutral_slope(mesh, sigma_xy, bvfreq, cfg)
+    fer_K, Ki, fer_C, _ = init_redi_gm(mesh, bvfreq, hnode_new, fer_tapfac, params, cfg)
+    fer_gamma = fer_solve_gamma(mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg)
+    fer_uv = fer_gamma2vel(mesh, fer_gamma, helem)
+    return GMDiag(fer_uv=fer_uv, slope_tapered=slope_tapered, Ki=Ki,
+                  fer_K=fer_K, fer_C=fer_C)

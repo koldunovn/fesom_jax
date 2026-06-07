@@ -1566,3 +1566,23 @@ Cite the C source (`file:line`) or dump probe that proves it.
   gather Γ to the 3 vertices, sum, difference adjacent interfaces, ÷`helem` (safe-divide
   `where(h>0,h,1)`), mask to `elem_layer_mask & h>0`. `helem` (static linfs) = `⅓Σ_v hnode` =
   `gather_nodes_to_elem(hnode).mean(axis=1)`. (`gm.fer_gamma2vel`, `fesom_gm.c:1035`, G.4.)
+
+## Phase 6B — GM/Redi (Task G.5 — the GM driver + the bolus vertical velocity)
+
+- **[gm] ⚠️ `fer_w = ale.compute_w(fer_uv)` — a PURE REUSE of the dump-verified `compute_w`, no new
+  kernel.** The C computes the bolus vertical velocity with the byte-identical edge→node
+  transport-divergence scatter + reverse-cumsum + ÷area as `w`, just driven by `fer_uv` instead of
+  `uv` (`fesom_ale.c:124-152,166-186` — `c2` mirrors `c1`). So `fer_w = compute_w(mesh, fer_uv,
+  helem)`; verified by composition (compute_w bit-exact vs the `w` dump in test_ale + fer_uv
+  ~1e-16 in G.4) + the no-flux BC (`fer_w[nzmax]=0` exact, the bolus is divergence-free/
+  streamfunction-derived) + activity (max|fer_w|~3e-4). The C wraps tracer advection with
+  `uv+=fer_uv; w_e+=fer_w` and subtracts after; in functional JAX just PASS `uv+fer_uv`,
+  `w_e+fer_w` into the advection — the carried `uv`/`w_e` are untouched, so the subtract-back is
+  automatic. (`gm`, `fesom_step.c:312-332`, G.5.)
+
+- **[gm] `gm_diagnostics` composes G.1-G.4 (sw_alpha_beta→sigma_xy→neutral_slope→init_redi_gm→
+  fer_solve_gamma→fer_gamma2vel) and reproduces `fer_uv` END-TO-END at 2.2e-16** (essentially
+  bit-exact) fed the C's T/S/bvfreq/hnode_new — the strongest GM gate (the whole chain, all-node).
+  It returns `(fer_uv, slope_tapered, Ki, fer_K, fer_C)` — `fer_uv` drives the bolus (G.5),
+  `slope_tapered`/`Ki` the Redi terms (G.6). `d(Σfer_uv²)/d(T)` through the full chain (incl. the
+  TDMA) finite + nonzero. (`gm.gm_diagnostics`, G.5.)
