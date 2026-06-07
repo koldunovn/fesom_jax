@@ -1660,3 +1660,57 @@ Cite the C source (`file:line`) or dump probe that proves it.
   device_get sync), so the full 1728-step (10-day) run finishes in ~4 min. *Lesson: verify a
   parameterization is doing work with a matched ON/OFF run on a physical diagnostic (front
   sharpness), not just "it ran stably".* (`scripts/core2_gm_stability_run.py`, jobs 25402379/80, G.7.)
+
+## Phase 6C — KPP (planning + research; the pivot to finish the full model)
+
+- **[process/pivot] After GATE 6B the user redirected: finish the full FUNCTIONING model (KPP) BEFORE
+  the Phase-7a parameter-tuning on-ramp.** Phase 7a was scoped (the `calibrate.py` seam + the
+  perfect-model `k_gm` twin) and two facts were verified before the pivot — preserved in
+  `docs/plans/20260607-fesom-jax-paramtune.md`: (1) **`optax 0.2.8` installed clean** (pip dry-run
+  confirmed jax/jaxlib 0.10.1 untouched; only `optax`+`absl-py` added); (2) **the `k_gm` twin is
+  well-posed** — `gm.py:198` `k_top=max(scaling·k_gm, k_gm_min=2.0)` has **only a lower floor, no
+  upper clamp at `k_gm_max=1000`**, so injecting `k_gm=1500` is unclamped, `fer_K ∝ k_gm` linearly.
+  *Lesson: when the user redirects mid-scope, capture the in-flight design + any verified de-risking
+  into a deferred plan so zero work is lost; don't just drop it.*
+
+- **[kpp/framing] ⚠️ KPP is the *real* FESOM2 CORE2 default mixing scheme (`mix_scheme='KPP'`,
+  `mix_scheme_nmb=1`); the JAX port has been running the OPT-IN PP (`pp.py`, `nmb=2`) all along.** The
+  C dispatch (`fesom_step.c:257` KPP / `:259` PP, selected by `FESOM_MIX_SCHEME`; default KPP since
+  `8d0cdbc`) and the GM/Redi sub-plan (`20260607-fesom-jax-gmredi.md:49-51`) both confirm it — the GM
+  dump ran on `FESOM_MIX_SCHEME=PP` to match the JAX port. So **every JAX gate to date is PP-vs-PP**;
+  porting KPP brings the model to the production config. *Lesson: verify which branch the "default"
+  config actually selects — the reduced-namelist port matched PP because that's what the dumps used,
+  not because PP is the model's default.*
+
+- **[kpp/validation] CONTROLLED REPLAY is the load-bearing validation technique for forcing-amplifying
+  kernels.** The C KPP port found a **live-run** dump diffs at **~52 % of nodes** vs Fortran — NOT an
+  algebra bug, but the **step-1 surface-forcing transient** (a known C↔Fortran flux mismatch)
+  perturbing `bfsfc`/`ustar` at ~every node, which `blmix` amplifies (`f1 ∝ bfsfc/ustar⁴`). A
+  whole-field live diff is uninterpretable. The fix: **inject the reference-dumped INPUTS into the
+  kernel under test, diff only its OUTPUTS** → isolates algebra from forcing noise → bit-faithful
+  (C hit max|Δ|=3.18e-13). The JAX port must adopt this per-kernel (K.2–K.7), gating against the
+  **C** (the JAX SoT, already Fortran-validated K0–K11, climate RMS 0.005–0.013 °C). The end-to-end
+  check is the **climate gate**: JAX-KPP ≈ C-KPP ≪ the genuine PP↔KPP scheme gap (~0.085 °C, ~18×).
+
+- **[kpp/ad] KPP is the kink-heaviest scheme yet — it has STRUCTURAL discreteness PP/GM did not.** The
+  AD bar stays "no NaN/Inf in backward, finite incl. masked lanes" + a clean gradient where one
+  physically exists. Inventory + treatments (full list in `…-kpp.md` §4): (1) **`ustar =
+  sqrt(sqrt(|τ|/ρ₀))`** double-sqrt — ∞ backward slope at zero wind, and `ustar` sits in many
+  denominators (`u*⁴` in `f1`, `u*³` in `hmonob`) → `_safe_sqrt`, the #1 priority. (2) the **OBL depth
+  `kbl`** chosen by a thresholded bulk-Ri search (+ the `wscale` `int()` bin index, `caseA` sign) is
+  discrete → vectorize as a masked first-crossing, **`stop_gradient` the integer index** but keep the
+  **`hbl` interpolation weight differentiable** ("which level" discrete, "where within" smooth — same
+  treatment as the FCT/upwind kinks). (3) the **`EPSLN=1e-40` denominators** stop Inf but NOT gradient
+  blow-up (`d(1/den)/d ~ 1/den²` is huge at 1e-40) → replace with **physical floors** on the
+  physically-small ones (`/(Rib_k−Rib_km1+ε)`, `bfsfc/u*⁴`, `hekman/max(|f|,ε)`). *Lesson: `+1e-40`
+  is a forward-Inf guard, not an AD guard — audit every such denominator for backward conditioning.*
+
+- **[kpp/seam] The C KPP port is DONE + validated → port FROM it, mirror its K0–K11 decomposition, and
+  the only missing JAX input is `dbsfc`.** Input audit at the seam (`step.py:130`): `bvfreq` ✓,
+  `eos.compute_sw_alpha_beta` ✓ (GM added it), `heat_flux`/`water_flux`/`stress_node_surf`/`sw_3d` ✓
+  (in the CORE2 forcing, thread them to the call), `uvnode` ✓ (reuse `pp.compute_vel_nodes`) — but
+  **`dbsfc` (the EOS surface-buoyancy difference, `Ritop=zk·dbsfc`) is NOT computed under PP**
+  (`eos.py:7` says so) → **add it in K.5** (mirror `fesom_eos.c`). KPP follows the `gm_cfg`/`ice_cfg`
+  static-config gate exactly (`kpp_cfg=None ⇒ PP bit-identical`); it is STATELESS (no new `State`
+  fields, like GM); double diffusion + nonlocal flux are GATE-ONLY for CORE2. (Phase 6C planning,
+  `docs/plans/20260607-fesom-jax-kpp.md`.)

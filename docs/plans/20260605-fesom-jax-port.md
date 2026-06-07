@@ -576,15 +576,30 @@ Split into focused sub-plans (one per subsystem), per the Phase-5 discipline.
   **10 days stable + GM smooths fronts** (front|∇T| ~6% lower than GM-OFF); **gradient-gated —
   the 2nd ML-hook `d/d(k_gm)` plateau 3.5e-6 (well-conditioned) + masked-NaN clean.** New modules
   `gm.py`/`gm_redi.py` + `eos.compute_sw_alpha_beta`. Wired behind `gm_cfg=None` (bit-identical).
-- **KPP (6C):** (FESOM1.4, lookup-table, mix_scheme_nmb=1) — `fesom_kpp.c`, FRESH_START §10.
-  **Forward-only** (the NN-replacement target); verify via `kpp_dump_diff.py`-style probes.
-  Own sub-plan; the **first ML-hook's alternative** (`pp.py` ↔ a `kpp.py` behind the seam).
+- **KPP (6C) — ⏳ NEXT (sub-plan written 2026-06-07, `docs/plans/20260607-fesom-jax-kpp.md`).** The
+  K-Profile Parameterization vertical mixing (`mix_scheme_nmb=1`) — `fesom_kpp.c` (1046 lines).
+  **⚠️ KPP is the *real* FESOM2 CORE2 default mixing scheme; the JAX port currently runs the opt-in PP
+  (`pp.py`, `nmb=2`)** — so porting KPP completes the model to the actual production config (the user's
+  2026-06-07 goal: finish the full functioning model before Phase 7a). The C port is **already
+  done + Fortran-validated** (`port2/.../20260524-kpp-vertical-mixing.md`, K0–K11, climate RMS
+  0.005–0.013 °C) → port from it, dump-gate against it. The **first ML-hook's alternative** behind the
+  mixing seam (`pp.py` ↔ `kpp.py`, gated `kpp_cfg=None ⇒ PP bit-identical`, mirroring `gm_cfg`/`ice_cfg`).
+  11-task ladder K.0–K.11 mirroring the C decomposition; **controlled replay** = the load-bearing
+  validation technique (live-run diffs at ~52 % of nodes from the step-1 forcing transient); kink-heaviest
+  scheme yet (safe-sqrt `ustar`, `stop_gradient` the discrete OBL level `kbl`, meaningful floors) →
+  AD-safe by construction + a masked-NaN gradient gate (not purely forward-only). **GATE 6C** = forward
+  fidelity (per-kernel replay-faithful + climate ≈ C KPP, distinct from PP) + masked-NaN-clean gradient.
 - **GATE 6 (sea ice) ✅ met;** the climate-stats GATE (CORE2 multi-year vs C/Fortran,
   `eps_climate_compare_2yr.py`) is the cross-phase acceptance after GM/Redi + KPP land.
 
 ### Phase 7a — Differentiable Parameter Tuning / Calibration (the on-ramp; user-requested 2026-06-07)
 
-*(To be expanded into its own sub-plan.)* **Use the differentiable port to CALIBRATE physics
+**⏸️ DEFERRED until after Phase 6C (KPP) — design preserved in the sub-plan
+`docs/plans/20260607-fesom-jax-paramtune.md`** (the `calibrate.py` seam + the perfect-model `k_gm`
+twin recipe + the verified de-risking: `optax` installed clean, `k_gm` unclamped ⇒ twin well-posed).
+The user's 2026-06-07 call: finish the full functioning model (KPP) first, then tune. Outline below.
+
+**Use the differentiable port to CALIBRATE physics
 parameters (in GM, sea ice, mixing, …) against a target, and push the optimum back into the
 operational Fortran model.** This is the *same `params.py` ML-hook seam* — but the trainable leaves
 are the existing physical constants, not NN weights — so it is a **small extension, not a restructure**.
@@ -1095,3 +1110,17 @@ written to the namelist, in Fortran; the perfect-model twin recovers the injecte
   gradient blow-up): spin up forward (no AD) → short-window adjoint at equilibrium + gradient-free
   EKI for the slow mean. First experiment = the perfect-model `k_gm` twin. **Next phases: 7a
   (tuning) and/or 6C (KPP).**
+- **2026-06-07 — Pivot: finish the full functioning model (Phase 6C KPP) BEFORE Phase 7a (user's
+  call).** Phase 7a was scoped (the `calibrate.py` seam + the perfect-model `k_gm` twin, with `optax`
+  installed clean + the `k_gm`-unclamped well-posedness verified) but DEFERRED — design preserved in
+  the new sub-plan `docs/plans/20260607-fesom-jax-paramtune.md`. **Phase 6C (KPP) sub-plan written:**
+  `docs/plans/20260607-fesom-jax-kpp.md`. Research surfaced the key framing — **KPP (`mix_scheme_nmb=1`)
+  is the *real* FESOM2 CORE2 default; the JAX port has been running the opt-in PP** (`pp.py`, `nmb=2`),
+  so all gates so far are PP-vs-PP. Porting KPP brings the model to the actual production config. The C
+  KPP port is **already done + Fortran-validated** (`port2/.../20260524-kpp-vertical-mixing.md`, K0–K11,
+  climate RMS 0.005–0.013 °C) → port from it, dump-gate against it via **controlled replay** (inject
+  C-dumped kernel inputs → isolate algebra from the step-1 forcing transient that perturbs ~52 % of
+  nodes). KPP is the kink-heaviest scheme (discrete OBL-depth `kbl` search, double-sqrt `ustar`,
+  `EPSLN=1e-40` denominators) → AD-safe by construction (safe-sqrt, `stop_gradient` the index,
+  meaningful floors) + a masked-NaN gradient gate. 11-task ladder K.0–K.11. Handoff in
+  `docs/NEXT_SESSION_PROMPT.md`.
