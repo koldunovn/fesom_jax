@@ -1965,3 +1965,32 @@ Cite the C source (`file:line`) or dump probe that proves it.
   table build — keep it on the static cfg). This is the Phase-7a pattern preview: KPP's `Ricr`/
   `visc_sh_limit`/backgrounds become tuning targets by lifting them from the static `KppConfig` into the
   traced `Params`. (`core2_kpp_grad_gate.py` [Kbg], K.10.)
+
+## Sea-ice climate bias (Phase 6 follow-up — first real multi-year climate comparison)
+
+- **[🎯big] Step-level bit-faithfulness does NOT guarantee a matching multi-year CLIMATE — run the
+  end-to-end comparison.** Every gate through GATE 6C was step-level/per-kernel (controlled replay,
+  step-1 bit-faithful). The FIRST annual-mean comparison vs the C-port-KPP + Fortran-KPP refs (via
+  `m32_climate_compare.py`) found JAX-vs-C SST **0.49 °C RMS / −0.15 °C bias** vs the **0.005–0.014 °C**
+  inter-reference budget (C-vs-Fortran, Kokkos-CUDA-vs-C) — a ~35–100× excess. **Lesson:** add a climate
+  comparison to the acceptance gate; "≈ C at step 1" ≠ "≈ C climate". The C/Fortran/CUDA references
+  agree to ~0.01 °C, so that IS the achievable bar — a from-scratch vectorized port is NOT exempt.
+  (`core2_kpp_climate_run.py`, `kpp_bias_map.py`.)
+
+- **[ice/diagnostic] The bias localized cleanly: high-lat marginal sea-ice only; open ocean
+  (−45..+45°) matches C to the bit-faithful 0.006–0.024 °C ⇒ KPP/dynamics/open-ocean-forcing are
+  SOUND.** Surface-trapped (gone by 200 m), in the seasonal-ice seas (Okhotsk/Bering). The fingerprint:
+  `m_ice` **flips sign by hemisphere** (Arctic too thin −0.15 m, Antarctic too thick +0.27 m) while
+  `a_ice` is high at both poles. Opposite-sign-N/S ⇒ first suspect was a hemisphere-dependent term
+  (Coriolis `∝sin lat` / metric `∝tan lat`), but the **entire EVP dynamics + `metric_factor` (max|Δ|=0
+  vs `tan(rot_lat)/R`) + Coriolis are bit-faithful to C** — RULED OUT. So it's THERMO/FORCING acting on
+  two regimes (perennial vs seasonal ice). **Lesson:** opposite-N/S is a strong localizer; spatial +
+  lat-band maps (`kpp_bias_map.py`) beat global RMS for diagnosis. (Investigation plan
+  `docs/plans/20260607-fesom-jax-seaice-climate-bias.md`.)
+
+- **[⚠️blind-spot] Cold-start step-1 gates can't see velocity/shear-dependent bugs.** At step 1
+  `uv=u_ice=0` ⇒ shear/`dVsq`/strain = 0, so KPP shear-Ri, the EVP metric terms (`mfac·v̄` etc.), and
+  any drift-dependent path are multiplied by zero and pass trivially. The EVP `metric_factor` value was
+  only exercised *within* step 1's 120 subcycles (u builds up) — but a thermo/forcing offset that needs
+  the spun-up circulation stays invisible for months. **Add a later-step (nonzero-velocity) dump-gate
+  and a climate comparison.** (Phase 6/6C gates, the sea-ice bias.)
