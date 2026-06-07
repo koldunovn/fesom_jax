@@ -56,7 +56,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-from . import eos, ops
+from . import eos, ops, pp
 from .config import DENSITY_0, G, VCPW
 from .config import A_VER as _A_VER
 from .config import K_VER as _K_VER
@@ -190,19 +190,21 @@ def _safe_sqrt(x):
 # K.1 — wm/ws turbulent-velocity-scale lookup tables (fesom_kpp.c:140-165)
 # ============================================================================
 @functools.lru_cache(maxsize=None)
-def build_wscale_tables(cfg: KppConfig):
-    """Build the ``wmt``/``wst`` ``(nni+2, nnj+2)`` velocity-scale lookup tables —
-    the literal port of the ``fesom_kpp_init`` table build (``fesom_kpp.c:140-165``).
+def _build_wscale_tables_np(cfg: KppConfig):
+    """Host (numpy) build of the ``wmt``/``wst`` ``(nni+2, nnj+2)`` velocity-scale lookup
+    tables — the literal port of the ``fesom_kpp_init`` table build (``fesom_kpp.c:140-165``).
 
-    **Constant data** (a function only of the static :class:`KppConfig`), so it is
-    built once on the host (numpy, ``lru_cache``d on ``cfg``) and **no gradient flows
-    through the table values** — the differentiable part of the lookup is the bilinear
-    interpolation weight in :func:`wscale`. Returns ``(wmt, wst)`` as ``jnp.float64``
-    arrays (concrete constants ⇒ baked into the jit).
+    **Constant data** (a function only of the static :class:`KppConfig`), built once on
+    the host and ``lru_cache``d on ``cfg``. Returns **numpy** arrays (trace-independent —
+    the jnp conversion is the un-cached :func:`build_wscale_tables` wrapper, so each jit
+    trace bakes its OWN constant rather than reusing a trace-bound array from the cache —
+    the latter leaks across traces, ``UnexpectedTracerError``). No gradient flows through
+    the table values; the differentiable part of the lookup is the bilinear interpolation
+    weight in :func:`wscale`.
 
     Index convention matches the C ``KPP_TBL(i,j) = i*(nnj+2)+j`` (``i`` = zehat row,
     ``j`` = ustar column). The fractional ``pow(·, 1/3)`` / ``pow(·, 1/4|1/2)`` bases
-    are clamped ``≥0`` for the **discarded** ``jnp.where`` lanes (the *kept* lane of
+    are clamped ``≥0`` for the **discarded** ``np.where`` lanes (the *kept* lane of
     each branch has the base ``>0`` — verified analytically: in ``zeta≤zetas`` the
     ``conas·u³−concs·zehat`` base ``≥70·|zehat|>0``; ``conam·u³−concm·zehat>0`` for
     ``zehat<0``; ``1−conc2·zeta``/``1−conc3·zeta>0`` since ``zeta<0``) ⇒ the clamp is
@@ -234,6 +236,19 @@ def build_wscale_tables(cfg: KppConfig):
 
     wmt = np.where(zehat >= 0.0, wm_stable, wm_unstable)
     wst = np.where(zehat >= 0.0, wm_stable, ws_unstable)
+    return wmt, wst
+
+
+def build_wscale_tables(cfg: KppConfig):
+    """The :func:`wscale` lookup tables ``(wmt, wst)`` as ``jnp.float64`` constants.
+
+    A thin wrapper over the ``lru_cache``d numpy build :func:`_build_wscale_tables_np`:
+    the ``jnp.asarray`` conversion is **deliberately NOT cached** so each jit trace bakes
+    its own constant. (Caching the jnp arrays themselves — as the first version did —
+    leaks the first trace's tracer-bound array into the next trace, e.g. the eager step-1
+    vs the scan body, or ``is_first_step`` True→False ⇒ ``UnexpectedTracerError``. The
+    expensive host build stays cached; only the cheap host→device cast repeats per trace.)"""
+    wmt, wst = _build_wscale_tables_np(cfg)
     return jnp.asarray(wmt), jnp.asarray(wst)
 
 
@@ -754,3 +769,64 @@ def assemble_mixing(mesh: Mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffK
 
     Av = _node_to_elem_visc(mesh, viscA, cfg)
     return diffKt, Av, viscA, diffKt, diffKs, ghats
+
+
+# ============================================================================
+# K.8 — assembled KPP driver: the single mixing-seam entry point
+# ============================================================================
+def mixing_kpp(mesh: Mesh, uv, bvfreq, dbsfc, sw_alpha, sw_beta, S,
+               heat_flux, water_flux, stress_node_surf, sw_3d, hnode, cfg: KppConfig):
+    """Assembled KPP vertical-mixing driver — the mirror of ``fesom_kpp_mixing``
+    (``fesom_kpp.c:784-939``) preceded by ``compute_vel_nodes`` and followed by the
+    shared ``mo_convect`` (the ``fesom_step.c:251-264`` dispatch). Returns
+    ``(Kv, Av, uvnode)`` — the **same triple** :func:`fesom_jax.pp.mixing_pp` returns,
+    so KPP is a drop-in at the :mod:`fesom_jax.step` mixing seam (substep 4).
+
+    Chains the K.1–K.7 kernels in the C driver's data-flow order::
+
+        compute_vel_nodes → ri_iwmix → ddmix-gate → prestep(dVsq/ustar/Bo) →
+        bldepth(hbl/kbl/bfsfc/caseA) → blmix(blmc/dkm1/ghats) → enhance(@kbl-1) →
+        assemble_mixing(smooth_blmc + combine + node→elem Av) → mo_convect
+
+    ``mo_convect`` is applied here (not in the caller) so the returned ``(Kv, Av)`` are
+    **post-convection**, matching the C's ``DUMP_SUB_MIXING=4`` probe (which records
+    ``aux->Kv``/``aux->Av`` after ``fesom_mo_convect``, ``fesom_step.c:264-268``) and the
+    :func:`fesom_jax.pp.mixing_pp` contract. ``ghats`` is computed but **not** routed
+    into the tracer flux (``use_kpp_nonlclflx=False`` in CORE2 — the locked gate).
+
+    Inputs from the step seam (all the C-driver inputs): ``uv`` ``[elem2D,nl,2]`` (→
+    ``uvnode``); ``bvfreq`` ``[N,nl]`` (post-smooth N²); ``dbsfc`` ``[N,nl]``
+    (:func:`fesom_jax.eos.compute_dbsfc`); ``sw_alpha``/``sw_beta`` ``[N,nl]``
+    (:func:`fesom_jax.eos.compute_sw_alpha_beta`); ``S`` ``[N,nl]`` (salinity);
+    ``heat_flux``/``water_flux`` ``[N]`` (post-shortwave-penetration / balanced surface
+    fluxes); ``stress_node_surf`` ``[N,2]`` (the **ice-blended** node wind stress, =
+    ``forcing->stress_node_surf`` at KPP time, ``fesom_main.c:1073-1075``); ``sw_3d``
+    ``[N,nl]`` (penetrating shortwave temperature flux); ``hnode`` ``[N,nl]`` (layer
+    thicknesses at mixing time, = ``st.hnode`` — pre-commit).
+    """
+    assert_no_double_diffusion(cfg)              # CORE2 gate (port the gate, defer body)
+    wmt, wst = build_wscale_tables(cfg)          # const lookup tables (lru_cache'd → jnp)
+    uvnode = pp.compute_vel_nodes(mesh, uv)      # element→node velocity (fesom_step.c:251)
+
+    # 3 — interior shear-Ri + background mixing (the "dcol" the BL profile matches to)
+    viscA, diffKt, diffKs = ri_iwmix(mesh, uvnode, bvfreq, cfg)
+    # 2 — pre-step surface forcing (dVsq shear re surface, ustar, Bo)
+    dVsq, ustar, Bo = prestep(mesh, uvnode, stress_node_surf, heat_flux, water_flux,
+                              sw_alpha, sw_beta, S, cfg)
+    # 5 — OBL depth + level + bfsfc/stable/caseA
+    hbl, kbl, bfsfc, stable, caseA = bldepth(
+        mesh, dVsq, ustar, Bo, bvfreq, dbsfc, sw_3d, sw_alpha, wmt, wst, cfg)
+    # 6 — boundary-layer coeffs (cubic shape) + dkm1 + ghats
+    blmcM, blmcT, blmcS, ghats, dkm1 = blmix(
+        mesh, hnode, viscA, diffKt, diffKs, hbl, bfsfc, stable, caseA, kbl,
+        ustar, wmt, wst, cfg)
+    # 7 — enhance the BL coeffs at kbl-1
+    blmcM, blmcT, blmcS, ghats = enhance(
+        mesh, blmcM, blmcT, blmcS, ghats, dkm1, viscA, diffKt, diffKs, hbl, caseA, kbl, cfg)
+    # 8 — smooth_blmc (3-sweep) + combine + node→elem Av; Kv = combined diffKt (T-channel)
+    Kv, Av, *_ = assemble_mixing(
+        mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffKs, kbl, cfg)
+
+    # shared convective adjustment (fesom_step.c:264 — applied after PP or KPP)
+    Kv, Av = pp.mo_convect(mesh, Kv, Av, bvfreq)
+    return Kv, Av, uvnode

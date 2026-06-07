@@ -200,10 +200,13 @@ def test_stress_blend_vs_reference(coupling):
         sns[n, 1] = sy * a[n] + atm[n, 1] * (1 - a[n])
     en = np.asarray(mesh.elem_nodes)
     ref = (sns[en[:, 0]] + sns[en[:, 1]] + sns[en[:, 2]]) / 3.0
-    got = ice_coupling.ice_oce_fluxes_mom(
+    got, got_node = ice_coupling.ice_oce_fluxes_mom(
         mesh, jnp.asarray(a), jnp.asarray(ui), jnp.asarray(vi),
         jnp.asarray(uw), jnp.asarray(vw), jnp.asarray(atm), jnp.asarray(ow), cfg)
     assert np.max(np.abs(np.asarray(got) - ref)) < 1e-13
+    # the node-blended stress (KPP ustar input) matches the per-node numpy ref, and the
+    # element stress is its 3-vertex mean
+    assert np.max(np.abs(np.asarray(got_node) - sns)) < 1e-13
 
 
 # --------------------------------------------------------------------------

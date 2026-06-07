@@ -92,6 +92,7 @@ class SurfaceFluxes(NamedTuple):
     bc_T: jnp.ndarray               # (nod2D,)  −dt·heat_flux/vcpw  [°C·... surface incr]
     bc_S: jnp.ndarray               # (nod2D,)  dt·(virtual_salt+relax_salt)
     sw_3d: jnp.ndarray              # (nod2D, nl) shortwave temperature flux [K·m/s]
+    stress_node_surf: jnp.ndarray   # (nod2D, 2) ice-blended NODE wind stress (KPP ustar)
     heat_flux: jnp.ndarray          # (nod2D,)  post-shortwave-penetration [W/m²]
     water_flux: jnp.ndarray         # (nod2D,)  balanced (inert in linfs) [m/s]
     virtual_salt: jnp.ndarray       # (nod2D,)  [psu·m/s]
@@ -153,7 +154,7 @@ def compute_surface_fluxes(mesh: Mesh, state: State, sf: StepForcing,
 
     return SurfaceFluxes(
         stress_surf=stress_surf, bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d,
-        heat_flux=heat_flux, water_flux=sss.water_flux,
+        stress_node_surf=sns_b, heat_flux=heat_flux, water_flux=sss.water_flux,
         virtual_salt=sss.virtual_salt, relax_salt=sss.relax_salt)
 
 

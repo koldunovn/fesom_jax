@@ -576,19 +576,20 @@ Split into focused sub-plans (one per subsystem), per the Phase-5 discipline.
   **10 days stable + GM smooths fronts** (front|∇T| ~6% lower than GM-OFF); **gradient-gated —
   the 2nd ML-hook `d/d(k_gm)` plateau 3.5e-6 (well-conditioned) + masked-NaN clean.** New modules
   `gm.py`/`gm_redi.py` + `eos.compute_sw_alpha_beta`. Wired behind `gm_cfg=None` (bit-identical).
-- **KPP (6C) — ⏳ NEXT (sub-plan written 2026-06-07, `docs/plans/20260607-fesom-jax-kpp.md`).** The
-  K-Profile Parameterization vertical mixing (`mix_scheme_nmb=1`) — `fesom_kpp.c` (1046 lines).
-  **⚠️ KPP is the *real* FESOM2 CORE2 default mixing scheme; the JAX port currently runs the opt-in PP
-  (`pp.py`, `nmb=2`)** — so porting KPP completes the model to the actual production config (the user's
-  2026-06-07 goal: finish the full functioning model before Phase 7a). The C port is **already
-  done + Fortran-validated** (`port2/.../20260524-kpp-vertical-mixing.md`, K0–K11, climate RMS
-  0.005–0.013 °C) → port from it, dump-gate against it. The **first ML-hook's alternative** behind the
-  mixing seam (`pp.py` ↔ `kpp.py`, gated `kpp_cfg=None ⇒ PP bit-identical`, mirroring `gm_cfg`/`ice_cfg`).
-  11-task ladder K.0–K.11 mirroring the C decomposition; **controlled replay** = the load-bearing
-  validation technique (live-run diffs at ~52 % of nodes from the step-1 forcing transient); kink-heaviest
-  scheme yet (safe-sqrt `ustar`, `stop_gradient` the discrete OBL level `kbl`, meaningful floors) →
-  AD-safe by construction + a masked-NaN gradient gate (not purely forward-only). **GATE 6C** = forward
-  fidelity (per-kernel replay-faithful + climate ≈ C KPP, distinct from PP) + masked-NaN-clean gradient.
+- **KPP (6C) — ✅ COMPLETE, GATE 6C MET (2026-06-07; sub-plan `docs/plans/20260607-fesom-jax-kpp.md`,
+  K.0–K.11 all `[x]`).** The K-Profile Parameterization vertical mixing (`mix_scheme_nmb=1`,
+  `fesom_kpp.c` 1046 lines) — the **real FESOM2 CORE2 default**; the JAX port now runs it (the opt-in PP
+  remains via `kpp_cfg=None`). `fesom_jax/kpp.py` (`KppConfig` + `build_wscale_tables`/`wscale`/`ri_iwmix`/
+  `bldepth`/`blmix`/`enhance`/`assemble_mixing` + the `mixing_kpp` driver) wired at the `step.py` mixing
+  seam behind `kpp_cfg` (the `gm_cfg`/`ice_cfg` precedent — `kpp_cfg=None ⇒ PP byte-identical`). Ported
+  from the **done + Fortran-validated** C (`port2/.../20260524-kpp-vertical-mixing.md`); **controlled
+  replay** was the load-bearing per-kernel gate (K.2–K.7 ~1e-12). Forward fidelity: the assembled step is
+  **bit-faithful** to the C (K.8 — the JAX forcing is a validated 1:1 port of the C's, so no JAX↔C
+  transient); KPP+GM+ice **stable over 10 days** + climate **distinct from PP** (SST RMS 0.13 °C, the
+  genuine scheme difference) (K.9). AD (kink-heaviest scheme — safe-sqrt `ustar`, `stop_gradient` the
+  discrete `kbl`, physical floors): **masked-NaN-clean `d(loss)/d(T0)`** through the assembled model +
+  a well-conditioned additive `d/d(K_bg)` (K.10). **The full functioning FESOM2 CORE2 model
+  (KPP + GM/Redi + sea ice) now runs in JAX → Phase 7a (parameter tuning) is next.**
 - **GATE 6 (sea ice) ✅ met;** the climate-stats GATE (CORE2 multi-year vs C/Fortran,
   `eps_climate_compare_2yr.py`) is the cross-phase acceptance after GM/Redi + KPP land.
 

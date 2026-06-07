@@ -4,7 +4,10 @@
 **Predecessors:** `docs/plans/20260606-fesom-jax-core2.md` (Phase 5 ocean, GATE 5) +
 `docs/plans/20260606-fesom-jax-phase6-seaice.md` (sea ice, GATE 6) +
 `docs/plans/20260607-fesom-jax-gmredi.md` (GM/Redi, GATE 6B).
-**Created:** 2026-06-07. **Status:** ⏳ NOT STARTED (K.0–K.11 planned; this is the next session's work).
+**Created:** 2026-06-07. **Status:** ✅ **COMPLETE — GATE 6C MET (2026-06-07).** K.0–K.11 all `[x]`:
+the full KPP port (per-kernel controlled-replay bit-faithful, the assembled step bit-faithful to the C,
+KPP+GM+ice stable + distinct from PP, masked-NaN-clean gradient). The full functioning FESOM2 CORE2
+model (KPP + GM/Redi + sea ice) now runs in JAX. **Next phase: 7a** (differentiable parameter tuning).
 **Scope (user-confirmed 2026-06-07):** **KPP only** — the K-Profile Parameterization vertical mixing,
 i.e. the *real* FESOM2 CORE2 default mixing scheme. This **completes the full functioning model**
 (the user's stated goal: finish the physically-complete model before the Phase-7a parameter-tuning
@@ -292,24 +295,41 @@ is the template; `port2/.../docs/plans/completed/20260524-kpp-vertical-mixing.md
   combine `max(interior,blmc)` within BL + zero `ghats` below; node→elem `Av` + bottom-fill + `minmix`;
   `Kv=diffKt`). **Gate (controlled replay):** viscA/viscAE **2.2e-16**, diffKt/diffKs **6.7e-16**,
   ghats exact, Kv==diffKt; AD finite. **K.1→K.7 = the complete KPP forward chain.** (`test_kpp_enhance.py`.)
-- [ ] **K.8 — wire KPP into the step (single Kv; nonlocal GATED OFF).** Gate `step.py:130`:
-  `if kpp_cfg is not None: Kv,Av = kpp.mixing_kpp(…)` else the PP path. Thread `heat_flux/water_flux/
-  stress_node_surf/sw_3d/sw_alpha/sw_beta/dbsfc/uvnode` to the call; `mo_convect` after (shared).
-  `Kv→tracer diff (+GM K33)`, `Av→momentum`. **Gate:** PP byte-identical when `kpp_cfg=None`
-  (regression); assembled step-1 `Kv/Av/hbl` vs C KPP dump = the expected forcing-transient sanity
-  match.
-- [ ] **K.9 — end-to-end climate + stability.** Assembled CORE2 **KPP+GM+ice** forward (extend
-  `core2_gm_stability_run.py` with `--mixing kpp`, or a `core2_kpp_stability_run.py`): N-day stable;
-  SST/SSS climate **matches the C KPP** and is **distinct from JAX PP** (the discriminating check, §3).
-  GPU job (mirror `core2_gm_stability_gpu.sh`). **Gate:** stable + climate ≈ C KPP ≪ PP↔KPP gap.
-- [ ] **K.10 — AD-safety gradient gate + acceptance (GATE 6C AD half).** Masked-NaN gradient gate on
-  the assembled KPP model (`d(loss)/d(T0)` finite everywhere incl. masked lanes — mirror
-  `core2_gm_grad_gate.py`, add `--mixing kpp`) + a well-conditioned KPP-tunable gradient
-  (`d/d(visc_sh_limit)` or `d/d(K_bg)`, additive). **Gate:** `KPP_GRAD_GATE_OK` (finite/nonzero,
-  masked-NaN clean) + suite green.
-- [ ] **K.11 — docs + memory + commit + next-session.** Tick this plan; Revision Log; per-task lessons
-  in `PORTING_LESSONS.md`; update parent-plan Phase 6C → COMPLETE; refresh memory; write the next
-  `NEXT_SESSION_PROMPT.md` (→ Phase 7a parameter tuning, the preserved `…-paramtune.md` plan).
+- [x] **K.8 — wire KPP into the step (single Kv; nonlocal GATED OFF).** ✅ `kpp.mixing_kpp`
+  (compute_vel_nodes → ri_iwmix → ddmix-gate → prestep → bldepth → blmix → enhance → assemble →
+  `mo_convect`) returns `(Kv,Av,uvnode)` — the **same triple `pp.mixing_pp` does** (drop-in).
+  `step.py` substep 4 now dispatches `if kpp_cfg is not None: kpp.mixing_kpp(…) else pp.mixing_pp(…)`;
+  threaded `heat_flux/water_flux/stress_node_surf/sw_3d` from the forcing block + `sw_alpha/sw_beta/
+  dbsfc` from EOS + `uvnode/hnode`; `Kv→tracer diff (+GM K33)`, `Av→momentum`. Added the **node-blended
+  `stress_node_surf`** (the C `forcing->stress_node_surf` at KPP time = `fesom_main.c:1073-1075`
+  `oce_fluxes_mom` writeback) to `core2_forcing.SurfaceFluxes` + `ice_step.IceStepOut`
+  (`ice_oce_fluxes_mom` now returns `(stress_surf, sns)`). KPP **raises on the pi path** (needs
+  forcing — locked decision 7). **Gate (7 tests, `test_kpp_step.py`):** because the JAX forcing is a
+  validated 1:1 port of the C forcing (Phase 5), there is **no JAX↔C step-1 forcing transient** (the
+  ~52 % is *C↔Fortran*) ⇒ the assembled KPP step is **BIT-FAITHFUL**, not just a sanity match —
+  `stress_node_surf` **4.4e-16**, Kv/Av @ probes (post-mo_convect) **1.7e-21/0.0**, all-nodes
+  pre-mo_convect diffKt/viscA/viscAE **2.7–4.2e-12**, hbl/ustar all-nodes **9.5e-9/6.0e-17**, KPP
+  Kv distinct from PP (17×), `mixing_kpp` d/dT finite+nonzero (24 s login-node backward); PP
+  byte-identical when `kpp_cfg=None` (dead branch + full-suite regression).
+- [x] **K.9 — end-to-end climate + stability.** ✅ `core2_kpp_stability_run.py` (+ `…_gpu.sh`) runs the
+  full production **KPP+GM+ice** + a matched **PP+GM+ice** baseline (`--mixing both`). A100, 1728 steps
+  (10 days, ~0.10 s/step): **both stable** (KPP worst |vel|=1.885, PP 2.843 m/s; coldest SST −1.91 °C
+  capped; |SSH|≈2 m; ice m≈2.7 m bounded). **Discriminating check (§3) — PASS:** KPP↔PP surface
+  **SST RMS=0.129 °C, SSS RMS=0.063 psu** (the genuine scheme difference, ~the C-class C-PP-vs-KPP
+  0.085 °C). So **JAX-KPP ≈ C-KPP (1e-12, the K.8 bit-faithful step gate) ≪ JAX-PP↔KPP gap (0.13 °C)** —
+  ~11 orders of separation; "JAX-KPP ≈ C-KPP" is the *step-level* bit-faithfulness (a multi-day field
+  diverges by FP chaos regardless). `KPP_STABILITY_GATE_OK`.
+- [x] **K.10 — AD-safety gradient gate + acceptance (GATE 6C AD half).** ✅ `core2_kpp_grad_gate.py`
+  (+ `.sbatch`), A100. **[3] masked-NaN `d(mean SST)/d(T0)` through the assembled KPP model** (N=4,
+  KPP-isolated) — **non-finite=0, wet max|g|=6.97e-05, masked max|g|=0.0** (CLEAN — the load-bearing
+  gate) + 28 GB peak (44 %). **[Kbg] well-conditioned KPP-tunable** `d(mean Kv)/d(K_bg)`=+0.9952,
+  **plateau 1.1e-11** (the additive interior-diffusivity seam — `KppConfig` static ⇒ traced via
+  `_replace(k_bg=·)` through the chain with prebuilt tables). `KPP_GRAD_GATE_OK`.
+- [x] **K.11 — docs + memory + commit + next-session.** ✅ Plan ticked (K.0–K.11 `[x]`); Revision Log +
+  per-task lessons (`PORTING_LESSONS.md`, incl. the K.8/K.9 lru_cache tracer-leak trap); parent-plan
+  Phase 6C → COMPLETE + GATE 6C met; memory refreshed ([[fesom-jax-port]]); `NEXT_SESSION_PROMPT.md`
+  rewritten → **Phase 7a** (differentiable parameter tuning, `…-paramtune.md`). **GATE 6C met → the
+  full functioning FESOM2 CORE2 model (KPP+GM/Redi+ice) is complete in JAX.**
 
 **Compute notes (same as GM):** heavy / full-suite / any CORE2 BACKWARD → `sbatch` (compute node) or
 a GPU job — the login node hangs on CORE2 backprop (RAM thrash). Quick CPU forward smokes (≤ few steps)
@@ -335,6 +355,33 @@ functioning model is complete** → Phase 7a (differentiable parameter tuning,
 ---
 
 ## Revision Log
+
+- **2026-06-07 — K.9–K.11 DONE → GATE 6C MET. The full functioning model is complete.** **K.9**
+  (`core2_kpp_stability_run.py`, A100): KPP+GM+ice AND a matched PP+GM+ice baseline both stable over
+  10 days; KPP↔PP SST/SSS RMS = 0.129 °C / 0.063 psu (the genuine scheme difference, ~the C-class
+  0.085 °C — RESOLVED), so JAX-KPP ≈ C-KPP (1e-12, K.8) ≪ PP↔KPP gap (0.13 °C). **K.10**
+  (`core2_kpp_grad_gate.py`, A100): the masked-NaN `d(mean SST)/d(T0)` through the assembled KPP model
+  is CLEAN (non-finite=0, wet 7e-5, masked 0.0, 28 GB peak) + the additive KPP-tunable `d/d(K_bg)`
+  plateaus at 1.1e-11 — `KPP_GRAD_GATE_OK`. **A real bug was caught + fixed mid-K.9:** `build_wscale_tables`
+  was `@lru_cache` returning *jnp* arrays → the cached trace-1 tracers leaked into trace 2
+  (`UnexpectedTracerError`, eager step-1 vs scan body / `is_first_step` True→False); fixed by caching
+  the numpy build + casting to jnp fresh per trace; added a 2-step jitted regression test. **K.11:**
+  plan/lessons/parent-plan/memory updated; `NEXT_SESSION_PROMPT.md` → Phase 7a. Full suite 482→483
+  green (the new leak-regression test). **The full FESOM2 CORE2 model (KPP+GM/Redi+ice) runs in JAX.**
+
+- **2026-06-07 — K.8 DONE (KPP wired into the step) — BIT-FAITHFUL, not just a sanity match.**
+  `kpp.mixing_kpp` assembles the K.1–K.7 chain (compute_vel_nodes → ri_iwmix → ddmix-gate → prestep →
+  bldepth → blmix → enhance → assemble → shared `mo_convect`) into one driver returning `(Kv,Av,uvnode)`
+  — a drop-in for `pp.mixing_pp` at `step.py` substep 4 behind `kpp_cfg`. Threaded the forcing/EOS
+  inputs; added the node-blended `stress_node_surf` (the KPP `ustar` input — the C `oce_fluxes_mom`
+  writeback, always run even ice-off, `fesom_main.c:1073-1075`) to `SurfaceFluxes`/`IceStepOut`
+  (`ice_oce_fluxes_mom` → `(stress_surf, sns)`). **Key finding:** the plan anticipated a ~52 %
+  forcing-transient diff, but that is the *C↔Fortran* transient — the JAX forcing is a validated 1:1
+  port of the **C** forcing (Phase 5), so JAX-vs-C has **no** transient and the assembled step is
+  bit-faithful: stress 4.4e-16, Kv/Av @ probes 1.7e-21/0.0, all-nodes (pre-mo_convect) diffKt/viscA/
+  viscAE 2.7–4.2e-12, hbl/ustar 9.5e-9/6.0e-17, KPP Kv 17× distinct from PP, `mixing_kpp` d/dT
+  finite+nonzero. 7 new tests (`test_kpp_step.py`) — **29 KPP tests total.** KPP raises on the pi path
+  (locked decision 7). **Next: K.9 climate/stability + K.10 grad gate** (SLURM GPU/compute jobs).
 
 - **2026-06-07 — K.6–K.7 DONE (blmix + enhance/assembly) → the complete KPP forward chain.** `kpp.blmix`
   matched the C's hardest replay (blmc 1.9–3.0e-13, dkm1 2.6e-14, ghats rel ~3.7e-14); `kpp.enhance` +

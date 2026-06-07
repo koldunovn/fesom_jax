@@ -39,6 +39,7 @@ class IceStepOut(NamedTuple):
     bc_T: jnp.ndarray               # (nod2D,)
     bc_S: jnp.ndarray               # (nod2D,)
     sw_3d: jnp.ndarray              # (nod2D,nl)
+    stress_node_surf: jnp.ndarray   # (nod2D,2) ice-blended NODE wind stress (KPP ustar)
     # diagnostics (for the dump gate)
     heat_flux: jnp.ndarray
     water_flux: jnp.ndarray
@@ -100,7 +101,7 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         fs.areasvol_surf, fs.ocean_area, open_water)
 
     # --- oce_fluxes_mom: ice-ocean stress blend (prognostic a_ice/u_ice) ---
-    stress_surf = ice_coupling.ice_oce_fluxes_mom(
+    stress_surf, stress_node_surf = ice_coupling.ice_oce_fluxes_mom(
         mesh, th.a_ice, u_ice, v_ice, srf.u, srf.v, bulk.stress_node_surf, open_water, cfg)
 
     # --- shortwave penetration (open-water-only gate on the prognostic a_ice) ---
@@ -114,6 +115,7 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
 
     return IceStepOut(
         stress_surf=stress_surf, bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d,
+        stress_node_surf=stress_node_surf,
         heat_flux=heat_flux, water_flux=icef.water_flux,
         virtual_salt=icef.virtual_salt, relax_salt=icef.relax_salt,
         a_ice=th.a_ice, m_ice=th.m_ice, m_snow=th.m_snow,

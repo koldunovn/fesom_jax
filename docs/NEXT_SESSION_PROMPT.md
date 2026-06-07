@@ -1,145 +1,105 @@
-# Next-session prompt — FESOM2 → JAX port (Phase 6C: KPP vertical mixing — finish the full model)
+# Next-session prompt — FESOM2 → JAX port (Phase 7a: differentiable parameter tuning / calibration)
 
-> **⚡ PROGRESS UPDATE (2026-06-07): K.0–K.7 DONE — the COMPLETE KPP forward chain is ported,
-> committed, and controlled-replay bit-faithful + AD-finite (22 tests).** Commits: `c8e94ec` (K.0–K.5)
-> + `ef1ca73` (K.6–K.7) on port_jax `main`; `fdcaefa` (dump job + sw_3d/sw_alpha) on port2 `jax-mesh-export`.
-> `fesom_jax/kpp.py` has KppConfig + build_wscale_tables + wscale + ri_iwmix + ddmix gate + prestep +
-> bldepth + blmix + enhance + assemble_mixing; `eos.compute_dbsfc` added; `io_dump` has KPP readers;
-> `kpp_cfg=None` threaded (PP bit-identical). **RESUME AT K.8** (assemble `kpp.mixing_kpp` =
-> blmix→enhance→combine into one driver + wire into `step.py` substep 4 behind `kpp_cfg`, thread
-> heat/water flux + stress + sw_3d + sw_alpha/beta + dbsfc + uvnode; `Kv`→tracer diff +GM K33,
-> `Av`→momentum; PP byte-identical when `kpp_cfg=None`) → K.9 climate + K.10 grad gate (SLURM GPU/compute)
-> → K.11 docs. The plan `docs/plans/20260607-fesom-jax-kpp.md` (K.0–K.7 `[x]`) + memory `[[fesom-jax-port]]`
-> + `docs/PORTING_LESSONS.md` (per-task K.* entries) are the current record. The §0–§6 below is the
-> original full briefing — still the source of truth for K.8–K.11.
-
----
-
-
-Paste the block below to start the next session. **Phases 0–6 COMPLETE (GATEs 0–6) + Phase 6B GM/Redi
-COMPLETE (GATE 6B).** The user's 2026-06-07 decision: **finish the full functioning model — port KPP
-(Phase 6C) — BEFORE the Phase-7a parameter-tuning on-ramp** (which is scoped + deferred, design saved
-in `docs/plans/20260607-fesom-jax-paramtune.md`). **KPP is the *real* FESOM2 CORE2 default mixing
-scheme; the JAX port currently runs the opt-in PP (`pp.py`)** — so porting KPP brings the model to the
-actual production config. The C KPP port is **already done + Fortran-validated**, so we port from it and
-dump-gate against it.
+> **⚡ MILESTONE (2026-06-07): GATE 6C MET — the FULL functioning FESOM2 CORE2 model now runs in JAX,
+> differentiable end-to-end.** KPP vertical mixing (the *real* CORE2 default) + GM/Redi eddies +
+> prognostic sea ice. Phase 6C (KPP) is COMPLETE: `fesom_jax/kpp.py` (KppConfig + the 7 kernels +
+> `mixing_kpp` driver) wired at the `step.py` mixing seam behind `kpp_cfg` (`None ⇒ PP byte-identical`).
+> **29 KPP tests:** K.2–K.7 per-kernel controlled-replay bit-faithful vs the C; **K.8 the assembled step
+> bit-faithful** (Kv/Av@probes 1.7e-21, all-nodes 4e-12 — the JAX forcing is a validated 1:1 port of the
+> C's, so there is no JAX↔C transient); **K.9** KPP+GM+ice 10-day stable + climate distinct from PP
+> (SST RMS 0.13 °C); **K.10** masked-NaN `d(SST)/d(T0)` clean + additive `d/d(K_bg)` plateau 1.1e-11.
+> Suite 483 green. **Phase 6C plan `docs/plans/20260607-fesom-jax-kpp.md` (K.0–K.11 `[x]`) + memory
+> `[[fesom-jax-port]]` + `docs/PORTING_LESSONS.md` are the record.** **RESUME AT Phase 7a Task 7a.1**
+> (the `calibrate.py` seam + the perfect-model `k_gm` twin) — the §0–§6 below is the full briefing.
 
 ---
 
 We are porting the FESOM2 ocean model to JAX to build a **differentiable** ocean model for hybrid ML
 (trainable NN parameterizations + parameter calibration). Multi-session effort. Work from
-`/home/a/a270088/port_jax`. Max effort.
+`/home/a/a270088/port_jax`. Max effort. **The forward model is now COMPLETE** (pi + CORE2 + sea ice +
+GM/Redi + KPP); this phase turns differentiability into a **calibration** capability.
 
 ## START HERE, in order
-1. **Phase 6C sub-plan (source of truth — READ FULLY):** `docs/plans/20260607-fesom-jax-kpp.md` — §0
-   scope (why KPP = the real default; the 8-stage driver map), §1 the verified CORE2 KPP config, §2 the
-   seam + the input-availability audit (`dbsfc` is the one thing to add), §3 the **controlled-replay**
-   validation strategy, §4 the **AD-safety kink inventory + treatments** (the crux), §5 the **K.0–K.11
-   task ladder**, §6 GATE 6C.
-2. **The C source (algorithmic SoT — port from this):** `/home/a/a270088/port2/fesom2_port/src/fesom_kpp.c` (1046 lines) + `fesom_kpp.h`. The driver `fesom_kpp_mixing` (`:770-924`); the C plan
-   `port2/.../docs/plans/completed/20260524-kpp-vertical-mixing.md` (K0–K11 — the proven decomposition
-   this mirrors; the controlled-replay technique is documented there).
-3. **The reference config:** `port2/.../docs/kpp_reference_namelists/` (`namelist.oce`/`.tra` +
-   `PROVENANCE.md`) — `mix_scheme='KPP'`, `Ricr=0.3`, `visc_sh_limit=diff_sh_limit=5e-3`, etc.
-4. **The seam to mirror:** `fesom_jax/pp.py` (the PP path KPP replaces) + `fesom_jax/step.py:130` (the
-   mixing call site) + how `gm_cfg`/`ice_cfg` are threaded as static args (`step.py:53,227`,
-   `integrate.py:46,110`) — KPP copies this `kpp_cfg=None ⇒ PP bit-identical` pattern.
-5. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the GM/Redi Task G.* entries +
-   the new KPP-pivot entry. **STANDING RULE: append a lesson per task.**
-6. **Deferred (do NOT start):** `docs/plans/20260607-fesom-jax-paramtune.md` (Phase 7a — after GATE 6C).
-   **Project memory:** `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`.
+1. **Phase 7a sub-plan (source of truth — READ FULLY):** `docs/plans/20260607-fesom-jax-paramtune.md` —
+   §0 the already-verified de-risking (DON'T re-check: `optax 0.2.8` installed clean / jax untouched; the
+   `k_gm` twin is well-posed — `gm.py` `k_top=max(scaling·k_gm, k_gm_min)` is a lower floor ONLY, no
+   upper clamp ⇒ `fer_K ∝ k_gm` linear, smooth bowl over [800,1500]; tune a single θ driving BOTH
+   `k_gm=θ` and `redi_kmax=θ`, the C auto-sync). §1 the `calibrate.py` seam (`optimize` + `grid_scan`).
+   §2 **Task 7a.1 — the perfect-model `k_gm` twin** (the first experiment). §3 the task ladder
+   7a.1→7a.4 + the Fortran transfer. §4 GATE 7a.
+2. **The seam this calibrates:** `fesom_jax/params.py` (`Params` pytree, the ML-hook leaves) +
+   `scripts/core2_gm_grad_gate.py` (the `d/d(k_gm)` plateau 3.5e-6 — the gradient 7a descends) +
+   `fesom_jax/integrate.py` (the checkpointed differentiable `lax.scan`). The KPP tunables
+   (`Ricr`/`visc_sh_limit`/`K_bg`) are NEW 7a targets — K.10 already showed `d/d(K_bg)` is clean
+   (plateau 1.1e-11); to make a `KppConfig` field trainable, lift it from the static config into the
+   traced `Params` (the K.10 `_replace(k_bg=·)` trick is the preview).
+3. **Lessons (every session):** `docs/PORTING_LESSONS.md` — esp. the Phase-7-relevant ones: FD↔AD
+   plateaus are only well-posed in SMOOTH regimes (validate at N=1 / isolated seams — the forced
+   multi-step model is non-smooth in the physics params); **do NOT backprop through the multi-decade
+   spin-up** (memory + chaotic-gradient blow-up). **STANDING RULE: append a lesson per task.**
+4. **Project memory:** `/home/a/a270088/.claude/projects/-home-a-a270088-port-jax/memory/`
+   ([[fesom-jax-port]], [[porting-lessons-log]], [[hpc-job-file-conventions]]).
 
 ## STATUS
-- **Phases 0–6 + 6B (GATEs 0–6 + 6B):** full pi + CORE2 + sea ice + GM/Redi, committed on `main`,
-  **453-test suite green.** Both ML hooks live (`k_ver`/`a_ver` mixing + `k_gm`/`redi_kmax` eddy).
-- **Mixing today:** `pp.mixing_pp` (`step.py:130`) → `(Kv, Av, uvnode)`; `Kv`→tracer diff (+GM K33),
-  `Av`→momentum. This is the **opt-in PP** scheme. KPP slots **exactly here** behind `kpp_cfg`.
-- **`optax` 0.2.8 is installed** in the env (clean — jax untouched; for Phase 7a, not needed for KPP).
+- **Phases 0–6 + 6B + 6C ALL COMPLETE (GATEs 0–6, 6B, 6C).** The full CORE2 model (PP **and** KPP
+  mixing, GM/Redi, prognostic ice, linfs/FCT/opt_visc7) runs + is differentiable. Suite = ocean 436 +
+  ice 47 = **483 green** (`sbatch scripts/run_suite.sbatch`, two chunks; full set in one process OOMs
+  the login node — a known pytest+JAX jit-cache pattern, not a bug).
+- **Both ML hooks live + FD-verified:** 1st (mixing) `k_ver`/`a_ver`; 2nd (eddy) `k_gm`/`redi_kmax`.
+  KPP adds `Ricr`/`visc_sh_limit`/`K_bg` as further mixing-seam targets (`d/d(K_bg)` plateau 1.1e-11).
+- **`optax 0.2.8` installed clean** (jax untouched). The calibration loop is "an objective + an
+  optimizer loop + a target" away — a small extension, not a restructure.
 
-## IMMEDIATE WORK — Phase 6C Task K.0: scaffold `kpp_cfg` + generate the C KPP reference dumps
-Start with the no-behavior-change scaffolding (the §5 K.0 task):
-1. **New `fesom_jax/kpp.py`** with `KppConfig(NamedTuple)` holding the §1 constants (port the derived
-   `Vtc/cg/deltaz/deltau` **verbatim from `fesom_kpp.c:130-138`** — research had a minor disagreement on
-   their form; trust the C). Mirror `GMConfig` (`gm.py:42`).
-2. **Thread `kpp_cfg=None`** through `step.py` (`:53`, `:227` static_argnames) and `integrate.py`
-   (`:46`, `:110`, the eager step-1 + scan body) — exactly like `gm_cfg`. **`kpp_cfg=None` ⇒ the PP
-   path, byte-identical** (regression: `sbatch scripts/run_suite.sbatch`, 453 green).
-3. **Generate the C KPP reference dumps:** a `port2/jobs/jax_kpp_dump_core2.sh` (mirror
-   `jax_gm_dump_core2.sh`) run with `FESOM_MIX_SCHEME=KPP` + `FESOM_KPP_DUMP_DIR` (per-node `hbl/bfsfc/
-   ustar/Bo/kbl` + element `viscAE`) + the main `DUMP_SUB_MIXING=4` (`Kv`/`Av` at probe nodes) + the
-   per-kernel replay inputs (`FESOM_KPP_REPLAY_DIR`) → `data/kpp_dump_core2/…`. The C dump+replay
-   harness already exists (validated K0–K11) — this is **running** it, not writing C. ⚠️ **C edits →
-   port2 `jax-mesh-export`, NEVER port2 main** (the user's strict rule).
-
-Then **K.1–K.7 port each kernel AD-safe + controlled-replay dump-gate vs C** (`init`→`wscale`→
-`ri_iwmix`→`ddmix` gate→`bldepth`→`blmix`→`enhance`/assembly), **K.8** wire into the step, **K.9**
-climate/stability, **K.10** the gradient gate. See the sub-plan §5.
-
-## VALIDATION = CONTROLLED REPLAY (the load-bearing technique — sub-plan §3)
-A **live-run** KPP dump diffs at **~52 % of nodes** vs the reference — NOT an algebra bug, but the
-**step-1 surface-forcing transient** (a known C↔Fortran flux mismatch) perturbing `bfsfc`/`ustar` at
-nearly every node, which `blmix` amplifies (`f1 ∝ bfsfc/u*⁴`). So **don't** trust a whole-field live
-diff. **Per kernel (K.2–K.7): inject the C-dumped INPUTS into the JAX kernel, compare its OUTPUTS to
-the C-dumped outputs** (~1e-12; the C hit 3.18e-13 libm-ULP). The end-to-end check is the **climate
-gate (K.9):** JAX-KPP climate ≈ C-KPP (RMS 0.005–0.013 °C class) AND distinct from JAX-PP (the genuine
-scheme difference ≈ 0.085 °C, ~18× the residual).
-
-## AD-SAFETY — KPP is the kink-heaviest scheme (sub-plan §4 has the full inventory + treatments)
-Bar = **no NaN/Inf in the backward, finite everywhere incl. masked lanes** (hard) + a well-conditioned
-gradient where one physically exists (bonus). Top treatments: (1) **`ustar = sqrt(sqrt(|τ|/ρ₀))`** →
-project `_safe_sqrt` (∞ backward slope at zero wind; `ustar` is in many denominators — the #1 AD
-priority); (2) the **discrete OBL level `kbl`** (bulk-Ri threshold search) → vectorize as a masked
-first-crossing, **`stop_gradient` the integer index** but keep the **`hbl` interpolation weight
-differentiable**; same for the `wscale` `int()` bin index + `caseA`; (3) replace the **`EPSLN=1e-40`
-denominators** that sit on *physically-small* quantities (the `hbl` interp `/(Rib_k−Rib_km1+ε)`,
-`f1=bfsfc/u*⁴`, `hekman/max(|f|,ε)`) with **physical floors** (1e-40 stops Inf but not gradient
-blow-up). **Gradient gate (K.10):** masked-NaN-clean `d(loss)/d(T0)` through the assembled KPP model +
-`d/d(visc_sh_limit)` or `d/d(K_bg)` (additive ⇒ clean plateau). Don't require a smooth plateau through
-`kbl`.
-
-## GATE 6C (acceptance)
-KPP selectable via `kpp_cfg`; **PP byte-identical when `kpp_cfg=None`** (suite green); **every kernel
-K.2–K.7 controlled-replay bit-faithful (~1e-12) vs the C**; assembled CORE2 **KPP+GM+ice stable** + the
-**climate matches the C KPP** and is distinct from PP; **masked-NaN-clean gradient** + a well-conditioned
-KPP-tunable gradient. **Then the full functioning model is complete → Phase 7a** (parameter tuning).
+## IMMEDIATE WORK — Phase 7a Task 7a.1: `calibrate.py` + the perfect-model `k_gm` twin
+1. **New `fesom_jax/calibrate.py`** — the optimizer half of the ML-hook seam, generic over a pytree of
+   tunable leaves: `optimize(loss_fn, init, optimizer, *, n_iters, on_step, stop_fn)` (jit
+   `value_and_grad` once, host loop) + `grid_scan(loss_fn, base, leaf, values)` (the forward-only
+   misfit-bowl probe — CONFIRM the minimum sits at the injected θ before trusting the descent). The exact
+   signatures are in §1 of the plan. **Unit test** `tests/test_calibrate.py` (fast, no CORE2 — a 1-D
+   quadratic bowl: Adam recovers the known minimum; keeps the suite green).
+2. **The perfect-model `k_gm` twin (the first experiment, a script not a test):** generate a short CORE2
+   reference trajectory at `k_gm=θ*` (e.g. 1200), then from a wrong `k_gm₀` (e.g. 800) descend
+   `d(misfit)/d(θ)` with `optax.adam` until θ→θ*. First `grid_scan` to confirm the bowl minimum is at θ*
+   (well-posed, unclamped). GPU job (mirror `core2_gm_grad_gate.sbatch`). **Gate:** θ recovered to a few
+   %, monotone misfit decrease.
+3. Then **7a.2** (the `Params`-expansion pattern for N tunables + a real-obs misfit), **7a.3** (short-
+   window-adjoint-AT-EQUILIBRIUM tuning + a gradient-free **EKI** baseline for the slow mean — NOT a
+   spin-up backprop), **7a.4** (export the optimum to the Fortran `namelist.oce` `K_GM_max`/`Redi_Kmax`
+   and confirm the Fortran run improves). See §3.
 
 ## KEY PATHS
 - Working repo (git `main`, local-only, no remote): `/home/a/a270088/port_jax`.
 - **Env python (ALL python/pytest):** `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python`
   → `JAX_PLATFORMS=cpu … -m pytest`. ⚠️ **Heavy / full-suite + any CORE2 BACKWARD → `sbatch
   scripts/run_suite.sbatch` (compute node) or a GPU job** — CORE2 backprop HANGS on the login node (RAM
-  thrash). Quick CPU forward-smokes (≤ few steps) + the **per-kernel replay gates** (small, isolated)
-  run on the login node.
-- GPU via SLURM: `-A ab0995_gpu -p gpu --gres=gpu:1` (A100-80GB last run). Stream forcing per step
-  (don't `cf.stack` a long trajectory → OOM); one N-step backward per process (`jax.clear_caches()`);
-  GPU steady-state ~0.09 s/step.
-- C/Fortran (algorithmic SoT): `/home/a/a270088/port2/fesom2_port/src/` (`fesom_kpp.c`/`.h`). Build:
-  `bash -lc 'cd …/port2/fesom2_port && source env.sh && make -C build fesom_port'`. KPP dump env:
-  `FESOM_MIX_SCHEME=KPP`, `FESOM_KPP_DUMP_DIR`, `FESOM_KPP_REPLAY_DIR`. **C edits → port2
-  `jax-mesh-export`, NEVER port2 main.**
-- KPP reference namelists: `port2/.../docs/kpp_reference_namelists/`. CORE2 mesh
-  `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2`; PHC `…/phc3.0_winter.nc`; JRA55
-  `…/JRA55-do-v1.4.0/`; `data/` symlink → `/work/.../port_jax/data` (dumps live here).
+  thrash). Quick CPU forward-smokes (≤ few steps) + small isolated backwards run on the login node.
+- GPU via SLURM: `-A ab0995_gpu -p gpu --gres=gpu:1` (A100-80GB; KPP+GM+ice ~0.10 s/step; the K.10
+  N=4 KPP backward = 28 GB / 44 %). Stream forcing per step (don't stack a long trajectory → OOM);
+  one N-step backward per process (`jax.clear_caches()`).
+- The full model is selected by passing `kpp_cfg=KppConfig()` + `gm_cfg=GMConfig()` + `ice_cfg=IceConfig()`
+  together to `step`/`integrate` (the real CORE2 production config); `…=None` ⇒ that feature off,
+  byte-identical. The pi path keeps PP (KPP needs forcing → raises on the pi path).
+- C/Fortran SoT: `/home/a/a270088/port2/fesom2_port/src/`. **C edits → port2 `jax-mesh-export`, NEVER
+  port2 main.** Fortran KPP validation run: `/scratch/a/a270088/fortran_2yr_dt1800`. CORE2 mesh
+  `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2`; PHC `…/phc3.0_winter.nc`; JRA55 `…/JRA55-do-v1.4.0/`.
 - I (Claude) drive SLURM (acct ab0995 / ab0995_gpu).
 
 ## LOCKED DECISIONS (do NOT re-litigate)
-1. Hybrid-ML use case; mixing seam = `pp.py` ↔ `kpp.py` behind `kpp_cfg` (KPP = the 1st ML-hook's
-   physics alternative). 2. Full-fidelity, match the C 1:1, dump-gate (controlled replay for KPP).
-   3. AD-safe by construction + a masked-NaN gradient gate (KPP is kink-heavy — `stop_gradient` the
-   discrete `kbl`, safe-sqrt `ustar`, physical floors over `EPSLN`). 4. `kpp_cfg=None`/`gm_cfg=None`/
-   `ice_cfg=None`/`params=None` ⇒ bit-identical. 5. KPP is **STATELESS** (recomputed each step, no new
-   `State` fields — like GM). 6. CORE2-faithful = port only `mix_scheme_nmb==1`: **double diffusion +
-   nonlocal flux GATED OFF** (port the gate, defer the body). 7. KPP is a **CORE2 forced-path feature**
-   (needs surface forcing → pi path keeps PP). 8. Full-model run = `kpp_cfg + gm_cfg + ice_cfg` together
-   (the real CORE2 production config). 9. **Phase 7a is DEFERRED** until GATE 6C.
+1. Hybrid-ML use case; the calibration seam = `params.py` (the SAME ML-hook, trainable leaves = physical
+   constants instead of NN weights). 2. Full-fidelity model is DONE — 7a is a small extension (objective
+   + optimizer + target), not a restructure. 3. Tune θ→BOTH `k_gm`/`redi_kmax` (the C auto-sync); the
+   twin is unclamped/well-posed. 4. `params=None`/`kpp_cfg=None`/`gm_cfg=None`/`ice_cfg=None` ⇒
+   bit-identical. 5. **Do NOT backprop through the multi-decade spin-up** — spin up FORWARD (no AD) →
+   short-window adjoint at equilibrium → gradient-free EKI for the slow mean. 6. FD↔AD only in smooth
+   regimes (N=1 / isolated seams). 7. The end goal = push the optimum into the operational Fortran
+   `namelist.oce` (scalar transfer = zero Fortran code).
 
 ## WORKFLOW NOTES
-- Tick `[x]` in the sub-plan, keep the Revision Logs + lessons current. **Commit per-task on `main`
+- Tick `[x]` in the 7a sub-plan, keep the Revision Logs + lessons current. **Commit per-task on `main`
   when asked.**
-- After GATE 6C, Phase 7a (`…-paramtune.md`) resumes — KPP's `Ricr`/`visc_sh_limit`/backgrounds become
-  additional mixing-seam tuning targets.
+- The KPP constants (`Ricr`/`visc_sh_limit`/`K_bg`/backgrounds) are now additional calibration targets
+  alongside `k_gm`/`k_ver` — lift a `KppConfig` field into `Params` to make it trainable (K.10 preview).
 - See memory [[fesom-jax-port]], [[porting-lessons-log]], [[hpc-job-file-conventions]].
 
-Confirm you've absorbed this; then proceed with Phase 6C Task K.0 (scaffold `kpp_cfg` bit-identical +
-generate the C KPP reference dumps), then port the kernels K.1→K.10 in data-flow order, controlled-replay
-dump-gating each. If anything about the C source or the seam is ambiguous, read the C and ask.
+Confirm you've absorbed this; then proceed with Phase 7a Task 7a.1 (`calibrate.py` + the perfect-model
+`k_gm` twin). If anything about the seam or the twin set-up is ambiguous, read the plan §0–§2 and ask.

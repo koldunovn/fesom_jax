@@ -36,7 +36,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from . import ale, eos, gm, gm_redi, momentum, pgf, pp, ssh, tracer_adv, tracer_diff
+from . import ale, eos, gm, gm_redi, kpp, momentum, pgf, pp, ssh, tracer_adv, tracer_diff
 from .config import DT_DEFAULT
 from .mesh import Mesh
 from .params import Params
@@ -90,8 +90,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     (substep 4): KPP recomputes the OBL profile each step from N²/forcing and emits the same
     ``(Kv, Av)`` PP does. Like GM/Redi it is **stateless** (no new ``State`` fields) and, like
     ice, a **CORE2 forced-path feature** (it needs ``heat_flux``/``water_flux``/wind stress →
-    ``ustar``/``Bo`` → the OBL depth). ``kpp_cfg=None`` ⇒ the existing PP branch,
-    **byte-identical**. Wiring lands in Task K.8; through K.0 the arg is threaded but unused."""
+    ``ustar``/``Bo`` → the OBL depth, so it raises on the pi path). It recomputes the OBL
+    profile each step (:func:`fesom_jax.kpp.mixing_kpp`) and emits the same ``(Kv, Av)`` PP
+    does → ``Kv`` feeds the tracer vertical diffusion (still augmented by GM's K33 when
+    ``gm_cfg`` is on) and ``Av`` the momentum viscosity. ``kpp_cfg=None`` ⇒ the existing PP
+    branch, **byte-identical** (a dead branch — no trace)."""
     st = state
     if params is None:
         params = Params.defaults()
@@ -101,6 +104,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # → cut_off → thermo → oce_fluxes → stress blend → shortwave); else the Phase-5 static-ice
     # surface fluxes. Both produce stress_surf + bc_T/bc_S/sw_3d for the ocean step below.
     bc_T = bc_S = sw_3d = None
+    # KPP surface-forcing inputs (Phase 6C; None on the pi path ⇒ KPP unavailable, by design).
+    heat_flux = water_flux = stress_node_surf = None
     ice_out = None
     if step_forcing is not None:
         if ice_cfg is not None:
@@ -109,12 +114,16 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt)
             stress_surf = ice_out.stress_surf
             bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
+            heat_flux, water_flux = ice_out.heat_flux, ice_out.water_flux
+            stress_node_surf = ice_out.stress_node_surf
         else:
             from . import core2_forcing            # lazy: keep netCDF deps off the pi path
             sfx = core2_forcing.compute_surface_fluxes(
                 mesh, st, step_forcing, forcing_static, dt=dt)
             stress_surf = sfx.stress_surf
             bc_T, bc_S, sw_3d = sfx.bc_T, sfx.bc_S, sfx.sw_3d
+            heat_flux, water_flux = sfx.heat_flux, sfx.water_flux
+            stress_node_surf = sfx.stress_node_surf
 
     # 1 — EOS / hydrostatic pressure / N²
     density, hpressure, bvfreq = eos.compute_pressure_bv(mesh, st.T, st.S, st.hnode)
@@ -136,9 +145,24 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # 3 — pressure-gradient force
     pgf_x, pgf_y = pgf.pressure_force_linfs(mesh, hpressure)
 
-    # 4 — PP vertical mixing (k_ver/a_ver are the ML-hook seam)
-    Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq,
-                                  k_ver=params.k_ver, a_ver=params.a_ver)
+    # 4 — vertical mixing. kpp_cfg ⇒ KPP (the real CORE2 default); else PP (k_ver/a_ver
+    #     are the ML-hook seam). Both emit (Kv, Av, uvnode) post-mo_convect (the shared
+    #     convective adjustment, fesom_step.c:264) ⇒ KPP is a drop-in. KPP is a forced-path
+    #     feature (needs ustar/Bo) ⇒ it requires CORE2 surface forcing (locked decision 7).
+    if kpp_cfg is not None:
+        if heat_flux is None:
+            raise ValueError(
+                "KPP (kpp_cfg) requires CORE2 surface forcing (step_forcing): it needs "
+                "heat_flux/water_flux/stress_node_surf/sw_3d for ustar/Bo/bfsfc. The pi "
+                "analytical path has no surface forcing — keep kpp_cfg=None there.")
+        sw_alpha, sw_beta = eos.compute_sw_alpha_beta(mesh, st.T, st.S)
+        dbsfc = eos.compute_dbsfc(mesh, st.T, st.S)
+        Kv, Av, uvnode = kpp.mixing_kpp(
+            mesh, st.uv, bvfreq, dbsfc, sw_alpha, sw_beta, st.S,
+            heat_flux, water_flux, stress_node_surf, sw_3d, st.hnode, kpp_cfg)
+    else:
+        Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq,
+                                      k_ver=params.k_ver, a_ver=params.a_ver)
 
     # 5 — momentum RHS (lagged eta_n, w_e, uv; shifts the OLD AB slot)
     uv_rhs, uv_rhsAB = momentum.compute_vel_rhs(

@@ -90,7 +90,10 @@ def ice_oce_fluxes_mom(mesh: Mesh, a_ice, u_ice, v_ice, u_w, v_w,
                        stress_node_atm, open_water, cfg: IceConfig = IceConfig()):
     """Blend the atm-ocean and ice-ocean surface stress and average to elements
     (``fesom_ice_oce_fluxes_mom``). ``stress_node_atm`` is the bulk ``stress_node_surf``
-    ``[nod2D,2]``; returns ``stress_surf`` ``[elem2D,2]``. Prognostic ``u_ice``."""
+    ``[nod2D,2]``; returns ``(stress_surf [elem2D,2], stress_node_surf [nod2D,2])`` — the
+    element stress (momentum) and the **node-blended** stress written back in place by the
+    C (``forcing->stress_node_surf``, ``fesom_ice_coupling.c:230``), which KPP reads for
+    ``ustar`` (``fesom_kpp.c:827``). Prognostic ``u_ice``."""
     rho_cd = DENSITY_0 * cfg.cd_oce_ice
     du = u_ice - u_w
     dv = v_ice - v_w
@@ -103,4 +106,5 @@ def ice_oce_fluxes_mom(mesh: Mesh, a_ice, u_ice, v_ice, u_w, v_w,
     blend_y = jnp.where(open_water, sic_y * a_ice + atm_y * (1.0 - a_ice), atm_y)
     sns = jnp.stack([blend_x, blend_y], axis=-1)
     ev = mesh.elem_nodes
-    return (sns[ev[:, 0]] + sns[ev[:, 1]] + sns[ev[:, 2]]) / 3.0
+    stress_surf = (sns[ev[:, 0]] + sns[ev[:, 1]] + sns[ev[:, 2]]) / 3.0
+    return stress_surf, sns

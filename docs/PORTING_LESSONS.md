@@ -1879,3 +1879,89 @@ Cite the C source (`file:line`) or dump probe that proves it.
   most lanes + the smoother reassociating identically single-rank. AD finite. **K.1→K.7 = the complete
   KPP forward chain, all controlled-replay bit-faithful + AD-finite.** (`kpp.enhance`/`assemble_mixing`,
   `fesom_kpp.c:588-924`, `test_kpp_enhance.py`, K.7.)
+
+## Phase 6C — KPP (Task K.8 — wire KPP into the assembled step)
+
+- **[kpp/🎯headline] The wired KPP step is BIT-FAITHFUL to the C, not the "sanity match" the plan
+  expected — because the ~52 % step-1 forcing transient is a *C↔Fortran* artifact, and the JAX forcing
+  is a validated 1:1 port of the *C* forcing (Phase 5).** Running one assembled JAX KPP CORE2 step
+  (PHC IC + JRA55 1958, KPP/GM-off/ice-off, dt=500) vs the C dumps: stress_node_surf 4.4e-16, Kv/Av @
+  probes (post-mo_convect) 1.7e-21/0.0, all-nodes pre-mo_convect diffKt/viscA/viscAE 2.7–4.2e-12,
+  hbl/ustar all-nodes 9.5e-9/6.0e-17. **Lesson:** before assuming a documented forcing-transient diff
+  applies, check WHOSE forcing the reference used — a per-kernel replay isolates algebra from forcing,
+  but here the *driver-level* gate is ALSO bit-faithful because both sides share the (ported) forcing.
+  Don't pre-loosen a gate on a borrowed caveat. (`test_kpp_step.py`, K.8.)
+
+- **[kpp/⚠️seam] The stress KPP reads for `ustar` is the ICE-BLENDED node stress, not the raw bulk
+  stress — and `oce_fluxes_mom` runs even with ice dynamics OFF.** `forcing->stress_node_surf` is
+  written by `fesom_bulk_compute` (raw) then OVERWRITTEN in place by `fesom_ice_oce_fluxes_mom`
+  (blended: `sic·a_ice + atm·(1−a_ice)`, `fesom_ice_coupling.c:230-252`), which `fesom_main.c:1073-1075`
+  calls unconditionally (only `FESOM_NO_WIND` skips it). The dump used the static-ice mask (a_ice=0.9
+  where IC SST<0, u_ice=0), so the blend is active at cold nodes. The JAX `compute_surface_fluxes`
+  already computed this blend (`sns_b`) for the element `stress_surf` but only exported the element
+  mean — K.8 exports the node `sns_b` as `SurfaceFluxes.stress_node_surf` (and `ice_oce_fluxes_mom`
+  now returns `(stress_surf, sns)`, threaded through `IceStepOut`). Verified vs the C `iceforce` dump
+  (cols 8–9 = the final blended `stress_node_surf`) at 4.4e-16. (`core2_forcing.py`, `ice_step.py`,
+  `ice_coupling.py`, K.8.)
+
+- **[kpp] `mixing_kpp` mirrors `pp.mixing_pp`'s contract — `(Kv,Av,uvnode)` post-mo_convect — so KPP is
+  a one-line drop-in at the step seam.** The C does compute_vel_nodes + (PP|KPP) + shared `mo_convect`
+  in the step driver (`fesom_step.c:251-264`); the JAX `mixing_pp` already bundled compute_vel_nodes +
+  mo_convect, so `mixing_kpp` does too (it imports `pp` for both — no cycle: pp has no kpp dep). The
+  `DUMP_SUB_MIXING=4` probe is POST-mo_convect, so bundling mo_convect keeps the gate honest. KPP is a
+  CORE2 forced-path feature → it **raises** on the pi path (no `step_forcing` ⇒ no heat/water/stress);
+  the raise is at trace time (`kpp_cfg` is static) so it's clean. `kpp_cfg=None` ⇒ the PP branch is a
+  dead `if` (no trace) ⇒ byte-identical. (`kpp.mixing_kpp`, `step.py` substep 4, K.8.)
+
+- **[kpp/ad] The assembled-driver backward (`d/dT` through all of `mixing_kpp`) is finite + nonzero and
+  runs in ~24 s on the LOGIN node** — the per-kernel safe-sqrt/stop-grad/physical-floor treatments
+  compose cleanly through the full chain incl. compute_vel_nodes (element→node scatter), smooth_nod3D,
+  and mo_convect. A single-kernel backward is light (unlike the full multi-step CORE2 trajectory
+  backward, which RAM-thrashes the login node) — so a driver-level AD smoke fits in the suite; the
+  full assembled-STEP masked-NaN grad gate is K.10 (SLURM). T enters via N²/dbsfc/α/β.
+  (`test_kpp_step.py`, K.8.)
+
+- **[kpp/⚠️jax-trap] `@lru_cache` returning *jnp* arrays leaks tracers across jit traces — cache the
+  numpy build, cast to jnp FRESH per call.** `build_wscale_tables` was `@lru_cache` and returned
+  `jnp.asarray(wmt), jnp.asarray(wst)`. The FIRST `step_jit` trace (is_first_step=True) called it,
+  creating trace-bound `DynamicJaxprTracer`s that the cache stored; the SECOND trace (is_first_step=
+  False, or the eager step-1 vs the `lax.scan` body in `integrate`) reused those cached arrays →
+  `UnexpectedTracerError: a reference to an intermediate value ... escaped the scope`. The fix: split
+  into `_build_wscale_tables_np` (`@lru_cache`, returns **numpy** — trace-independent) + a thin
+  uncached `build_wscale_tables` wrapper doing `jnp.asarray` (each trace bakes its OWN constant; the
+  expensive host build stays cached, only the cheap host→device cast repeats). **Why it hid through
+  K.1–K.8:** the kernel tests + the K.8 step test all ran a SINGLE eager trace (no cross-trace reuse);
+  the bug is jit/scan-trace specific and only the K.9 multi-step `step_jit` run (is_first_step True→
+  False) first surfaced it. **Lesson:** a one-step forward gate is necessary but not sufficient — add
+  a 2-step *jitted* smoke (both `is_first_step` variants) to exercise the second trace, and never
+  cache device arrays keyed on a static config. (`kpp.build_wscale_tables`,
+  `test_kpp_step.py::test_kpp_two_jitted_steps_no_leak`, K.8/K.9.)
+
+## Phase 6C — KPP (Tasks K.9 + K.10 — climate/stability + the gradient gate → GATE 6C)
+
+- **[kpp] The end-to-end "JAX-KPP ≈ C-KPP" claim lives at the STEP level (K.8, 1e-12), NOT a multi-day
+  field diff — the multi-day gate is stability + the distinct-from-PP scheme signal.** KPP+GM+ice ran
+  10 days stable (worst |vel|=1.885 m/s, SST capped −1.91 °C, ice bounded) AND a matched PP+GM+ice
+  baseline gave a surface SST/SSS RMS of 0.129 °C / 0.063 psu vs the KPP run — the genuine scheme
+  difference (~the C-class C-PP-vs-KPP 0.085 °C). So the discriminating chain is **JAX-KPP ≈ C-KPP
+  (1e-12, the bit-faithful step) ≪ JAX-PP↔KPP gap (0.13 °C)** — ~11 orders of separation. A multi-day
+  *field* comparison to the C diverges by FP chaos regardless of correctness (the Task-5.8 finding), so
+  don't gate on it; gate on the step-level fidelity + the physical scheme signal. (`core2_kpp_stability_run.py`,
+  K.9.)
+
+- **[kpp/ad] The masked-NaN `d(mean SST)/d(T0)` through the ASSEMBLED multi-step KPP model is clean
+  (non-finite=0, masked max|g|=0.0, wet 7e-5) — the kink-heaviest scheme survives the assembled
+  backward.** The per-kernel AD treatments (safe-sqrt ustar/Vtsq, stop-grad kbl + differentiable hbl
+  interp, f1/gat1/dat1 physical floors, the smooth_blmc/node→elem linear ops) compose through the
+  4-step checkpointed scan backward at CORE2 scale (28 GB peak on the A100, 44 %). Do NOT require a
+  smooth plateau through the discrete kbl — the bar is finite-everywhere + a well-conditioned gradient
+  where one physically exists. (`core2_kpp_grad_gate.py` [3], K.10.)
+
+- **[kpp/ad] A static-NamedTuple config field can still be a gradient target — `cfg._replace(field=
+  traced)` traces it through any kernel that reads `cfg.field` directly (no hashing).** The KPP-tunable
+  gradient `d(mean Kv)/d(K_bg)` = +0.9952 (additive interior diffusivity ⇒ FD plateau 1.1e-11) was
+  taken by replacing the one `KppConfig` field with a traced scalar and running the mixing chain with
+  the wscale tables PREBUILT from the static cfg (the only consumer that hashes cfg is the lru_cache'd
+  table build — keep it on the static cfg). This is the Phase-7a pattern preview: KPP's `Ricr`/
+  `visc_sh_limit`/backgrounds become tuning targets by lifting them from the static `KppConfig` into the
+  traced `Params`. (`core2_kpp_grad_gate.py` [Kbg], K.10.)
