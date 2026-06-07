@@ -236,11 +236,19 @@ class SSSFluxes(NamedTuple):
     water_flux: jnp.ndarray         # bulk water_flux + ⟨water_flux + runoff⟩ (m/s)
 
 
-def _area_mean(x, areasvol_surf, ocean_area):
+def _area_mean(x, areasvol_surf, ocean_area, *, owned_mask=None, axis_name=None):
     """``integrate_nod_2D(x)/ocean_area`` (``:270-284``, ``:393``): area-weighted global
     mean ``Σ(x·areasvol_surf)/ocean_area``. A reduction (~1e-12). Summed over **all**
-    interior nodes (the C integrate carries no cavity mask)."""
-    return jnp.sum(x * areasvol_surf) / ocean_area
+    interior nodes (the C integrate carries no cavity mask).
+
+    Phase 8: when ``owned_mask`` is given (sharded path, S.7 threads it in) the sum is
+    an owned-node sum + ``psum`` over devices via :func:`reductions.global_sum`. The
+    default (``owned_mask=None``) is the **exact** single-device ``jnp.sum`` ⇒ the
+    ``npes==1`` path is byte-identical to ``v1.0``."""
+    if owned_mask is None:
+        return jnp.sum(x * areasvol_surf) / ocean_area
+    from . import reductions
+    return reductions.global_sum(x * areasvol_surf, owned_mask, axis_name) / ocean_area
 
 
 def sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,

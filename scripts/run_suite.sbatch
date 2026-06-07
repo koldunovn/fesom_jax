@@ -32,6 +32,13 @@ ICE_FILES="test_ice_adv test_ice_coupling test_ice_evp test_ice_ic test_ice_step
 IGNORE=""
 for f in $ICE_FILES; do IGNORE="$IGNORE --ignore=fesom_jax/tests/$f.py"; done
 
+# Phase-8 sharding tests use shard_map collectives ⇒ need CPU fake-devices; they
+# run as a SEPARATE group with --xla_force_host_platform_device_count=4 (and SKIP
+# cleanly in the 1-device ocean group). Ignore them in ocean so they only run there.
+SHARD_FILES="fesom_jax/tests/test_halo.py"
+for f in fesom_jax/tests/test_*_sharded.py; do [ -e "$f" ] && SHARD_FILES="$SHARD_FILES $f"; done
+for f in $SHARD_FILES; do IGNORE="$IGNORE --ignore=$f"; done
+
 echo "=== node $(hostname)  $(date) ==="
 echo "=== OCEAN group (incl. heavy CORE2 tests) ==="
 $PY -m pytest fesom_jax/tests/ -q -p no:cacheprovider $IGNORE
@@ -43,5 +50,11 @@ $PY -m pytest fesom_jax/tests/test_ice_*.py -q -p no:cacheprovider
 ICE=$?
 
 echo ""
-echo "=== SUMMARY: ocean rc=$OCEAN  ice rc=$ICE ==="
-[ $OCEAN -eq 0 ] && [ $ICE -eq 0 ] && echo "ALL GREEN" || echo "FAILURES (see above)"
+echo "=== SHARDING group (4 CPU fake-devices) ==="
+XLA_FLAGS=--xla_force_host_platform_device_count=4 \
+    $PY -m pytest $SHARD_FILES -q -p no:cacheprovider
+SHARD=$?
+
+echo ""
+echo "=== SUMMARY: ocean rc=$OCEAN  ice rc=$ICE  shard rc=$SHARD ==="
+[ $OCEAN -eq 0 ] && [ $ICE -eq 0 ] && [ $SHARD -eq 0 ] && echo "ALL GREEN" || echo "FAILURES (see above)"
