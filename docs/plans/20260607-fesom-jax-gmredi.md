@@ -3,7 +3,7 @@
 **Parent plan:** `docs/plans/20260605-fesom-jax-port.md` (Phase 6 outline — GM/Redi = 6B).
 **Predecessors:** `docs/plans/20260606-fesom-jax-core2.md` (Phase 5 ocean, GATE 5) +
 `docs/plans/20260606-fesom-jax-phase6-seaice.md` (sea ice, GATE 6).
-**Created:** 2026-06-07. **Status:** DRAFT (no tasks started).
+**Created:** 2026-06-07. **Status:** ✅ COMPLETE (G.1–G.7 done, GATE 6B met 2026-06-07).
 **Scope (user-confirmed 2026-06-07):** **GM/Redi only** (the mesoscale eddy parameterization).
 KPP is the separate Phase-6C sub-plan. **Decisions (user-confirmed):** (1) **thread the GM/Redi
 eddy diffusivities through `params.py` now** — the parent plan's 2nd ML-hook seam, default=config
@@ -356,27 +356,40 @@ augmentation in `impl_vert_diff`). `tests/test_gm_redi.py`. C: G.1 dump (full GM
 full wiring); create `scripts/core2_gm_stability_run.py` (+ `_gpu.sh`), `scripts/core2_gm_grad_gate.py`
 (+ `.sbatch`). `tests/test_gm_step.py`.
 
-- [ ] **Wire GM into the step** behind a static `gm_cfg=None` arg (mirror `ice_cfg`): when given,
+> **✅ DONE 2026-06-07 (GATE 6B MET).** `gm_cfg=None` static arg wired into `step.py`/`integrate.py`
+> (the `ice_cfg` precedent) — GM block after EOS (`gm_diagnostics`), `fer_w=compute_w(fer_uv)`, bolus
+> wrap (`uv+fer_uv`/`w_e+fer_w` into advection, functional ⇒ no subtract-back), Redi G7a+G7b per T&S
+> reading the **pre-step `st.T`/`st.S`** (= the `T_old` RETURNED by `advect_one_fct`, NOT `st.T_old`),
+> K33 augmenting Kv. **Assembled gate: post-step T/S vs the GM-ON dump = T 7.1e-15 / S 2.1e-14**
+> (BIT-EXACT class, not climate-close — GM is deterministic; this CLOSES K33's tight gate). `gm_cfg=
+> None` **bit-identical** (full suite **453 green**: 406 ocean + 47 ice). **Stability: 10 days stable**
+> GM+ice (max|vel| 2.84<3, SST capped −1.91, no NaN) + **GM smooths fronts** (10-day front|∇T| 7.42e-6
+> ON vs 7.89e-6 OFF, ~6% growing). **Gradient gate `GM_GRAD_GATE_OK`:** the 2nd ML-hook `d(SST)/
+> d(k_gm)` plateau **3.5e-6** (well-conditioned, NOT stiff), `d/d(k_ver)` 5.8e-10, masked-NaN `d/d(T0)`
+> clean; backward 37 GB/64 GB @ N=4. `test_gm_step.py` = **4 passed**. 4 lessons appended. **Phase 6B
+> GM/Redi COMPLETE — the 2nd ML-hook seam established + the whole physics ported & gated.**
+
+- [x] **Wire GM into the step** behind a static `gm_cfg=None` arg (mirror `ice_cfg`): when given,
   after EOS/`sw_alpha_beta`/smooth, run the GM coefficient block (G.2→G.4) → `fer_uv`/`fer_w`;
   feed the bolus-augmented velocity to tracer advection (G.5); apply the Redi terms (G.6) + K33.
   `gm_cfg=None` ⇒ pi/Phase-5/ice paths **bit-identical** (the dead-branch precedent). Thread
-  `gm_cfg` through `step_jit`'s `static_argnames` and the `lax.scan` body.
-- [ ] **Assembled gate (step 1):** the full GM-ON CORE2 dump at step 1 — post-step T/S match the
-  C (the per-kernel gates G.2-G.6 are the bit-exact ones; the assembled step may be climate-close
-  ~1e-9 if any scatter floor propagates, like the ice assembly — gate kernels tight, assembly
-  climate-close per locked decision #10). pi + Phase-5 + ice bit-identical with `gm_cfg=None`.
-- [ ] **Multi-day stability** (GPU): the assembled **CORE2 + GM/Redi + sea ice** model (the full
-  production config) runs multi-day stable — GM should *reduce* spurious convection / smooth
-  fronts (a sanity sign the eddy flux is doing physical work), bounded vel/SSH/T/S, no NaN.
-  Compare to a matched GM-ON C arbiter trajectory (a few diagnostics to 3 sig figs).
-- [ ] **Gradient gate (GATE 6B):** re-run the permanent AD gate with GM live — `d(SST)/d(k_ver)`
-  still plateaus; **the new `d(SST)/d(k_gm)` 2nd-hook target** FD↔AD plateau in a smooth regime
-  (proves the eddy-flux gradient path, like `k_ver` proved the mixing path); the masked-NaN
-  `d(SST)/d(T₀)` finite everywhere + 0 on masked + nonzero on wet (the GM slopes/TDMA/Redi all
-  AD-safe). Measure backward memory (GM adds a per-step TDMA + scatters; budget the A100).
-- [ ] run — full suite green (ocean + ice + GM tests; ice as a separate group). **Lesson:** append
-  (the assembled-GM fidelity class, the 2nd-hook gradient plateau, the GM backward memory, any
-  climate-sanity signal).
+  `gm_cfg` through `step_jit`'s `static_argnames` and the `lax.scan` body. **DONE** — `hnode_new`
+  hoisted (static linfs, shared by GM+Redi); Redi reads `st.T`/`st.S` (the returned `T_old`).
+- [x] **Assembled gate (step 1):** the full GM-ON CORE2 dump at step 1 — post-step T/S match the
+  C. **TIGHT (bit-exact class): T 7.1e-15 / S 2.1e-14** (GM is deterministic ⇒ no scatter floor
+  like the ice EVP; this CLOSES K33's tight gate). Step-2 evolution scatter-class 1.2e-9 (bounded).
+  pi + Phase-5 + ice **bit-identical** with `gm_cfg=None` (suite 453 green).
+- [x] **Multi-day stability** (GPU): the assembled **CORE2 + GM/Redi + sea ice** model **10 days
+  stable** (max|vel| 2.84<3, |SSH|<2.1, SST capped −1.91, m_ice bounded, no NaN). **GM smooths
+  fronts** — front|∇T| 7.42e-6 (ON) vs 7.89e-6 (OFF), a ~6% reduction growing monotonically over
+  the 10 days (the eddy flux is doing physical work). Within-step dynamics GM-independent.
+- [x] **Gradient gate (GATE 6B):** `GM_GRAD_GATE_OK` — `d(SST)/d(k_ver)` plateau 5.8e-10 (mixing
+  hook still smooth with GM live); **the new `d(SST)/d(k_gm)` 2nd-hook target plateau 3.5e-6**
+  (the eddy-flux gradient path — WELL-CONDITIONED, not stiff); masked-NaN `d(SST)/d(T₀)` finite
+  everywhere + 0 on masked + nonzero wet (GM slopes/TDMA/Redi AD-safe). Backward 37 GB/64 GB @ N=4.
+- [x] run — full suite **453 green** (406 ocean + 47 ice; ice a separate group). **Lesson:** 4
+  appended (the assembled-GM bit-exact fidelity class, the pre-step-tracer Redi threading, the
+  2nd-hook well-conditioned gradient, the GM front-smoothing physical-work signal).
 
 **GATE 6B (acceptance):** the CORE2 model (PP/linfs/FCT/opt_visc7 + PHC IC + JRA55/SSS/runoff +
 sea ice + **GM/Redi**) reproduces the C GM-ON per-kernel dumps (each kernel bit-exact, G.1-G.6;
@@ -439,3 +452,31 @@ mEVP/zstar. **KPP** (Phase 6C) + the spatial-NN eddy flux (Phase 7) get their ow
   `data/gm_dump_core2/` (inputs T/S/bvfreq/hnode + all GM outputs; **seeds G.2-G.4**);
   `io_dump.load_gm_dump` reader. `test_sw_alpha_beta.py` 6 passed; 4 lessons appended. Next: Task
   G.2 (neutral slopes — `compute_sigma_xy` + `compute_neutral_slope`, gated by this dump).
+- **2026-06-07 — Tasks G.2–G.6 DONE** (the whole GM/Redi physics — see each task's `✅ DONE` note +
+  the parent-plan roll-up): neutral slopes (map-class, huge-dynamic-range relative gate); the
+  coefficient builder `init_redi_gm` (`d/d(k_gm)=2.03e6` — the 2nd ML-hook LIVE); the streamfunction
+  TDMA 8.9e-15 + bolus velocity 1.1e-16; the `gm_diagnostics` driver (`fer_uv` end-to-end 2.2e-16);
+  the Redi terms — G7a 1.78e-15, **G7b's 5→3-case edge loop 1.07e-14**, K33 (augment Kv). Committed
+  `c587b83`/`2e43ed9`/`c3886e9`/`dbf40ca`.
+- **2026-06-07 — Task G.7 DONE, GATE 6B MET — Phase 6B COMPLETE.** GM/Redi assembled into `step.py`/
+  `integrate.py` behind a static `gm_cfg=None` arg (the `ice_cfg` precedent; `None` ⇒ bit-identical,
+  suite **453 green**). **Assembled gate bit-exact (T 7.1e-15 / S 2.1e-14** vs `gm_step_dump_core2` —
+  GM is deterministic ⇒ no ice-EVP-style floor; this closes K33's tight gate). **10-day GM+ice
+  stability** (max|vel| 2.84, SST capped −1.91) + **GM smooths fronts** (front|∇T| 7.42e-6 ON vs
+  7.89e-6 OFF). **Gradient `GM_GRAD_GATE_OK`**: the 2nd ML-hook `d/d(k_gm)` plateau **3.5e-6**
+  (well-conditioned), `d/d(k_ver)` 5.8e-10, masked-NaN `d/d(T0)` clean; backward 37 GB/64 GB @ N=4.
+  ⚠️ Redi reads the **pre-step `st.T`/`st.S`** (the returned `T_old`), not `st.T_old` (step ≥2
+  differ). 4 lessons appended. **Next: Phase 6C (KPP) and/or Phase 7a (differentiable parameter
+  tuning — `k_gm`/`k_ver`/etc. → namelist; the perfect-model twin first); see the parent plan.**
+
+## Forward pointer — GM/Redi as a parameter-tuning target (Phase 7a)
+
+`k_gm`/`redi_kmax` are not just the NN-swap seam — they are the **first calibration targets** for the
+differentiable port (Phase 7a in the parent plan). The GATE-6B gradient is clean (`d/d(k_gm)` plateau
+3.5e-6, well-conditioned), so a gradient-based tune is well-posed. **First experiment (a perfect-model
+twin):** run CORE2 with `k_gm=1500`, save SST/SSS; from `k_gm=800` descend `d(misfit)/d(k_gm)` to
+recover ~1500 — proves the optimizer loop end-to-end. ⚠️ This is a SHORT-WINDOW machinery test;
+physically-meaningful tuning to the *equilibrated* GM state must NOT backprop through the multi-decade
+spin-up (memory + chaotic-gradient blow-up) — spin up forward (no AD), then short-window adjoint
+anchored at equilibrium, and/or gradient-free EKI over forward runs. Tuned scalars/profiles drop
+straight into the Fortran `namelist.oce` (`K_GM_max`/`Redi_Kmax`) with zero Fortran code.

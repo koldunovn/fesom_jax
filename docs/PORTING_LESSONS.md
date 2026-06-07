@@ -1613,3 +1613,50 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (`FESOM_REDI_DUMP_DIR`) dumps `T_old/T_pre/T_g7a/T_g7b/tr_xy/tr_z` all-node ⇒ gate `T_pre+G7a==
   T_g7a`, `T_g7a+G7b==T_g7b` exactly (the dt is `fesom_phase1_dt`=the runtime 500, NOT a separate
   constant). (`fesom_step.c fesom_redi_blob`, `test_gm_redi`, G.6.)
+
+## Phase 6B — GM/Redi (Task G.7 — assemble + GATE 6B)
+
+- **[gm/step] ⚠️ The assembled GM/Redi step is BIT-EXACT class (7e-15), NOT climate-close — because
+  GM/Redi is fully deterministic (no EVP-like reassociation floor).** The full GM-ON CORE2 step-1
+  post-step T/S match the C GM-ON substep dump (`gm_step_dump_core2`) at **T 7.1e-15 / S 2.1e-14** —
+  the same bit-exact class as the per-kernel G.1-G.6 gates, NOT the ice assembly's ~1e-6 (whose
+  120-subcycle EVP END velocity carries a ~1e-9 floor, Task 6.6). The whole chain — bolus advection
+  + G7a + G7b + K33 — is pure map/scatter, so it composes without an iterative-solver floor. This
+  also **CLOSES K33's tight gate**: K33 had no isolated dump (G.6 only sanity-checked it); the
+  assembled 7e-15 match is its tight validation. Step 2 is scatter-class (1.2e-9, the CG iter-count
+  amplifying step-1's spread, bounded). *Lesson: gate an assembled step at the altitude of its
+  LEAST-deterministic kernel — bit-exact if all-deterministic (GM), climate-close if it contains a
+  reassociating iterative solver (ice EVP).* (`test_gm_step.py`, G.7.)
+
+- **[gm/step] ⚠️ The Redi G7a/G7b read the PRE-step tracer = `st.T`/`st.S` (the `T_old` RETURNED by
+  `advect_one_fct`), NOT the AB2 history `st.T_old`.** The C's `valuesold` at Redi time is what
+  `init_tracers_AB_one` saved DURING this step's advect call = the pre-step `values` = `st.T` (which
+  `advect_one_fct` returns as `T_old_new`). `st.T_old` (the carry going IN) is the PREVIOUS step's
+  pre-step T — different at step ≥2. At step 1 they coincide, so a single-step gate would NOT catch
+  the bug; the step-2 evolution gate (1.2e-9, bounded) is what confirms it. The bolus wrap is
+  functional: pass `uv+fer_uv`, `w_e+fer_w` into advection (the carried uv/w_e untouched ⇒ the C's
+  post-diffusion subtract-back is automatic); `hnode_new` is hoisted once after EOS (static linfs)
+  so the GM block (substep 2) and the Redi reconstruction (substep 15) share it; K33 augments Kv
+  before `impl_vert_diff` (no diffusion-kernel change). `gm_cfg=None` ⇒ a dead Python branch ⇒
+  bit-identical (the `ice_cfg` precedent; the full 453-test suite stays green). (`step.py`, G.7.)
+
+- **[gm/ad/ml-hook] ✅ The 2nd ML-hook gradient `d(SST)/d(k_gm)` is WELL-CONDITIONED (clean FD↔AD
+  plateau 3.5e-6), NOT stiff — the risk-list worry was unfounded.** The eddy-flux hook plateau is
+  the textbook V-shape (truncation error at large h, round-off at small, min at h=1e-5), unlike the
+  EVP's `1/delta_min` stiffness (~1e16, Task 6.7). Both ML hooks are now training-ready end-to-end on
+  the assembled CORE2 model: `d/d(k_ver)` plateau 5.8e-10, `d/d(k_gm)` 3.5e-6, masked-NaN `d/d(T0)`
+  finite everywhere / 0 on dry / nonzero wet (the backward flows through the GM slopes safe-sqrt,
+  the streamfunction TDMA, the Redi scatters). Backward memory at N=4 CORE2 GM-ON = **37 GB / 64 GB**
+  (the per-step GM TDMA + Redi scatters add to the backward; the A100-80 is comfortable, the -40
+  would be tight at N=4). (`scripts/core2_gm_grad_gate.py`, job 25402381, G.7.)
+
+- **[gm/physics] ✅ GM does PHYSICAL WORK — it smooths fronts: 10-day front |∇T| 7.42e-6 (GM-ON) vs
+  7.89e-6 (GM-OFF), a ~6% reduction that GROWS monotonically (d1 6.72/6.82 → d10 7.42/7.89).** The
+  bolus advection + Redi neutral diffusion flatten isopycnals (the eddy parameterization is active,
+  not inert). Both runs 10-day stable (max|vel| 2.84/2.72 < 3, SST capped −1.91 by the ice thermo,
+  no NaN). The within-step DYNAMICS (SSH, |vel|) are GM-INDEPENDENT — identical between GM-ON/OFF —
+  because the bolus only redistributes tracers and is subtracted back before momentum/SSH; GM acts
+  purely on T/S. GPU steady-state is ~0.09 s/step (the 8-9 s I saw at s1/s2 was compile + the first
+  device_get sync), so the full 1728-step (10-day) run finishes in ~4 min. *Lesson: verify a
+  parameterization is doing work with a matched ON/OFF run on a physical diagnostic (front
+  sharpness), not just "it ran stably".* (`scripts/core2_gm_stability_run.py`, jobs 25402379/80, G.7.)

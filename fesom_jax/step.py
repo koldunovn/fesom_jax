@@ -36,7 +36,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from . import ale, eos, momentum, pgf, pp, ssh, tracer_adv, tracer_diff
+from . import ale, eos, gm, gm_redi, momentum, pgf, pp, ssh, tracer_adv, tracer_diff
 from .config import DT_DEFAULT
 from .mesh import Mesh
 from .params import Params
@@ -50,7 +50,7 @@ S_FLOOR = 0.5
 
 def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
          *, dt: float = DT_DEFAULT, is_first_step: bool = False,
-         step_forcing=None, forcing_static=None, ice_cfg=None) -> State:
+         step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -70,7 +70,18 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     start-of-step ``state.T[:,0]`` (SST) and ``state.uvnode[:,0]`` (surface current), so
     the SST→flux / current→stress feedback is differentiable. ``step_forcing=None`` ⇒ the
     pi analytical path (static ``stress_surf``, zero surface BCs) — **bit-identical** to
-    Phase 2 (the 313 pi gates must not move)."""
+    Phase 2 (the 313 pi gates must not move).
+
+    **GM/Redi (Phase 6B).** ``gm_cfg`` (a :class:`fesom_jax.gm.GMConfig`, static/hashable —
+    the ``ice_cfg`` precedent) turns on the mesoscale eddy parameterization: after EOS the
+    GM coefficient/bolus block (:func:`fesom_jax.gm.gm_diagnostics`) builds the eddy bolus
+    velocity ``fer_uv`` + the Redi diffusivities ``slope_tapered``/``Ki``; the bolus
+    augments the tracer-advecting velocity (``uv+fer_uv``, ``w_e+fer_w``), the Redi explicit
+    terms (G7a vertical + G7b horizontal) add to the post-advection tracer, and the K33
+    isoneutral term augments ``Kv`` in the vertical diffusion. GM/Redi is **stateless** (no
+    new ``State`` fields — recomputed each step from T/S/N²). The differentiable ceilings
+    ``k_gm``/``redi_kmax`` enter via ``params`` (the 2nd ML-hook seam). ``gm_cfg=None`` ⇒
+    a dead branch (no trace) ⇒ the pi/Phase-5/ice path is **bit-identical**."""
     st = state
     if params is None:
         params = Params.defaults()
@@ -97,6 +108,20 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 1 — EOS / hydrostatic pressure / N²
     density, hpressure, bvfreq = eos.compute_pressure_bv(mesh, st.T, st.S, st.hnode)
+
+    # ALE thickness is static in full-cell linfs (hnode_new == hnode, a memcpy). Compute
+    # it once here so the GM coefficient block (substep 2) and the Redi reconstruction
+    # (substep 15) share it; the pi/Phase-5 None path is unchanged (a pure hoist).
+    hnode_new = ale.thickness_linfs(st.hnode)
+
+    # 2 — GM/Redi coefficient + bolus block (fesom_step.c:227-231, after EOS). gm_cfg=None
+    #     ⇒ skipped (a dead branch ⇒ the path is bit-identical). When a GMConfig: the eddy
+    #     bolus velocity fer_uv + the Redi diffusivities slope_tapered/Ki (k_gm/redi_kmax
+    #     from params = the 2nd ML-hook). GM/Redi is stateless ⇒ recomputed from T/S/N².
+    gm_diag = None
+    if gm_cfg is not None:
+        gm_diag = gm.gm_diagnostics(mesh, st.T, st.S, bvfreq, hnode_new, st.helem,
+                                    params, gm_cfg)
 
     # 3 — pressure-gradient force
     pgf_x, pgf_y = pgf.pressure_force_linfs(mesh, hpressure)
@@ -130,20 +155,46 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     ssh_rhs_old, hbar = ssh.compute_hbar(mesh, uv, st.helem, hbar_old, dt=dt)
     eta_n = ssh.eta_n_update(mesh, st.eta_n, hbar, hbar_old)
 
-    # 13 — ALE: static hnode_new + vertical velocity; vertical CFL + explicit/implicit
-    #      split. use_wsplit=0 in the pi reference config ⇒ the split is the identity
-    #      (w_e=w, w_i=0); cfl_z is computed every step as in the C (populates State).
-    hnode_new = ale.thickness_linfs(st.hnode)
+    # 13 — ALE: vertical velocity; vertical CFL + explicit/implicit split (hnode_new is
+    #      static, hoisted above). use_wsplit=0 in the reference config ⇒ the split is the
+    #      identity (w_e=w, w_i=0); cfl_z is computed every step as in the C (populates State).
     w = ale.compute_w(mesh, uv, st.helem)
     cfl_z = ale.compute_cfl_z(mesh, w, hnode_new, dt=dt)
     w_e, w_i = ale.compute_wvel_split(mesh, w, cfl_z)
 
-    # 15 — FCT tracer advection (T then S) + implicit vertical diffusion
-    T_adv, T_old = tracer_adv.advect_one_fct(mesh, uv, w_e, st.helem, st.hnode,
+    # 13a — GM bolus wrap (fesom_step.c:422-438): feed the bolus-augmented velocity to the
+    #       tracer advection. fer_w reuses compute_w driven by fer_uv. In functional JAX the
+    #       carried uv/w_e are untouched, so the C's post-diffusion subtract-back is automatic.
+    uv_adv, w_e_adv = uv, w_e
+    if gm_diag is not None:
+        fer_w = ale.compute_w(mesh, gm_diag.fer_uv, st.helem)
+        uv_adv = uv + gm_diag.fer_uv
+        w_e_adv = w_e + fer_w
+
+    # 15 — FCT tracer advection (T then S) + Redi explicit terms + implicit vert diffusion
+    T_adv, T_old = tracer_adv.advect_one_fct(mesh, uv_adv, w_e_adv, st.helem, st.hnode,
                                              hnode_new, st.T, st.T_old, dt=dt)
-    S_adv, S_old = tracer_adv.advect_one_fct(mesh, uv, w_e, st.helem, st.hnode,
+    S_adv, S_old = tracer_adv.advect_one_fct(mesh, uv_adv, w_e_adv, st.helem, st.hnode,
                                              hnode_new, st.S, st.S_old, dt=dt)
-    T_new, S_new = tracer_diff.impl_vert_diff(mesh, T_adv, S_adv, Kv, hnode_new, dt=dt,
+
+    # 15a/b — Redi neutral diffusion (fesom_step.c:468-499). The G7a (vertical-explicit) +
+    #         G7b (horizontal-edge) gradients read the PRE-step tracer (st.T/st.S = the C
+    #         `valuesold` saved during advection), and the deltas apply to the post-advection
+    #         T_adv/S_adv. K33 augments Kv before the vertical diffusion (no diffusion-kernel
+    #         change — impl_vert_diff already builds a∝Kv[nz], c∝Kv[nz+1]).
+    Kv_eff = Kv
+    if gm_diag is not None:
+        slope_tap, Ki = gm_diag.slope_tapered, gm_diag.Ki
+        T_adv = (T_adv
+                 + gm_redi.diff_ver_part_redi_expl(mesh, st.T, slope_tap, Ki, hnode_new, dt=dt)
+                 + gm_redi.diff_part_hor_redi(mesh, st.T, slope_tap, Ki, st.hnode, hnode_new,
+                                              st.helem, dt=dt))
+        S_adv = (S_adv
+                 + gm_redi.diff_ver_part_redi_expl(mesh, st.S, slope_tap, Ki, hnode_new, dt=dt)
+                 + gm_redi.diff_part_hor_redi(mesh, st.S, slope_tap, Ki, st.hnode, hnode_new,
+                                              st.helem, dt=dt))
+        Kv_eff = Kv + gm_redi.k33_augmentation(mesh, slope_tap, Ki)
+    T_new, S_new = tracer_diff.impl_vert_diff(mesh, T_adv, S_adv, Kv_eff, hnode_new, dt=dt,
                                               bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d)
     # salinity floor on wet layers only (below-bottom stays 0)
     S_new = jnp.where(mesh.node_layer_mask, jnp.maximum(S_new, S_FLOOR), S_new)
@@ -173,12 +224,12 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 # Jitted entry point (the Task-2.11 deliverable; also what Phase 3's lax.scan wraps).
 # ``mesh``/``op``/``state``/``stress_surf`` are pytree args; ``dt``/``is_first_step``
 # are static (the latter ⇒ two compiled variants: the step-1 AB2 branch and the rest).
-step_jit = jax.jit(step, static_argnames=("dt", "is_first_step", "ice_cfg"))
+step_jit = jax.jit(step, static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         params: Params = None, *, dt: float = DT_DEFAULT,
-        step_forcings=None, forcing_static=None, ice_cfg=None) -> State:
+        step_forcings=None, forcing_static=None, ice_cfg=None, gm_cfg=None) -> State:
     """Run ``n_steps`` jitted forward steps from ``state`` (a plain Python loop;
     Phase 3 adds :func:`fesom_jax.integrate.integrate`, a checkpointed ``lax.scan``,
     for the differentiable path). ``is_first_step`` is set on the first iteration
@@ -191,5 +242,5 @@ def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         sf = None if step_forcings is None else jax.tree.map(lambda x: x[i], step_forcings)
         state = step_jit(state, mesh, op, stress_surf, params, dt=dt,
                          is_first_step=(i == 0), step_forcing=sf,
-                         forcing_static=forcing_static, ice_cfg=ice_cfg)
+                         forcing_static=forcing_static, ice_cfg=ice_cfg, gm_cfg=gm_cfg)
     return state

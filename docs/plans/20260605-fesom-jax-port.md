@@ -564,20 +564,70 @@ Split into focused sub-plans (one per subsystem), per the Phase-5 discipline.
   stable with the high-lat supercooling CAPPED at −1.91 °C + runoff active** (the two Phase-5
   findings resolved); gradient-gated (FD↔AD plateau 4.5e-10 + masked-NaN clean at scale).
   New modules: `ice.py`/`ice_thermo.py`/`ice_coupling.py`/`ice_evp.py`/`ice_adv.py`/`ice_step.py`.
-- **GM/Redi (6B — NEXT, sub-plan DRAFTED 2026-06-07):**
+- **GM/Redi — ✅ COMPLETE (2026-06-07, GATE 6B met).** Sub-plan
   `docs/plans/20260607-fesom-jax-gmredi.md`. The mesoscale eddy parameterization = bolus
   advection (GM) + neutral diffusion (Redi); the **second ML-hook seam** (eddy fluxes,
-  threaded through `params.py` now). ⚠️ NOT one substep-14 kernel — it threads the step at
-  **6 points** (`sw_alpha_beta` + the coefficient/bolus block + `fer_w` + the bolus
+  `k_gm`/`redi_kmax` threaded through `params.py`). ⚠️ NOT one substep-14 kernel — it threads
+  the step at **6 points** (`sw_alpha_beta` + the coefficient/bolus block + `fer_w` + the bolus
   advection wrap + the Redi G7a/G7b explicit terms + the K33 implicit augmentation).
-  **Stateless** (recomputed each step from T/S/N² — no new State fields, unlike ice σ).
-  7-task data-flow ladder (G.1-G.7), each kernel dump-gated bit-exact. Scoped from a
-  first-hand read of `fesom_gm.c`.
+  **Stateless** (recomputed each step from T/S/N² — no new State fields, unlike ice σ). 7-task
+  ladder (G.1-G.7), each kernel dump-gated bit-exact; **assembled GM step bit-exact (7e-15) vs
+  the C GM-ON dump** (GM is deterministic — no ice-EVP floor, so it closes K33's gate too);
+  **10 days stable + GM smooths fronts** (front|∇T| ~6% lower than GM-OFF); **gradient-gated —
+  the 2nd ML-hook `d/d(k_gm)` plateau 3.5e-6 (well-conditioned) + masked-NaN clean.** New modules
+  `gm.py`/`gm_redi.py` + `eos.compute_sw_alpha_beta`. Wired behind `gm_cfg=None` (bit-identical).
 - **KPP (6C):** (FESOM1.4, lookup-table, mix_scheme_nmb=1) — `fesom_kpp.c`, FRESH_START §10.
   **Forward-only** (the NN-replacement target); verify via `kpp_dump_diff.py`-style probes.
   Own sub-plan; the **first ML-hook's alternative** (`pp.py` ↔ a `kpp.py` behind the seam).
 - **GATE 6 (sea ice) ✅ met;** the climate-stats GATE (CORE2 multi-year vs C/Fortran,
   `eps_climate_compare_2yr.py`) is the cross-phase acceptance after GM/Redi + KPP land.
+
+### Phase 7a — Differentiable Parameter Tuning / Calibration (the on-ramp; user-requested 2026-06-07)
+
+*(To be expanded into its own sub-plan.)* **Use the differentiable port to CALIBRATE physics
+parameters (in GM, sea ice, mixing, …) against a target, and push the optimum back into the
+operational Fortran model.** This is the *same `params.py` ML-hook seam* — but the trainable leaves
+are the existing physical constants, not NN weights — so it is a **small extension, not a restructure**.
+The machinery is already proven: the `Params` pytree (`params=None ⇒ bit-identical`), the checkpointed
+differentiable `integrate`, and **FD-verified gradients** (`d/d(k_ver)` 5.8e-10, `d/d(k_gm)` 3.5e-6,
+masked-field `d/d(T0)` clean). What's missing is only an objective + an optimizer loop + a target.
+
+**Three Fortran-transfer tiers (increasing work):**
+1. **Scalar / depth-profile → Fortran `namelist.oce` — ZERO Fortran code (the killer app).** Tune
+   `K_GM_max`/`Redi_Kmax`/`K_GM_min`/`GMzexp_*`/background diffusivities in JAX → write the optimum
+   into the namelist → run operational Fortran. The port becomes an **offline calibration engine**.
+2. **2D/3D parameter FIELD → Fortran reads a netCDF.** Make the `Params` leaf a `[nod2D]`/`[nod2D,nl]`
+   array (JAX: ~0 structural change — array leaves already differentiate); Fortran: a modest
+   field-read + use-per-cell (~tens of lines/param; FESOM already reads many 2D fields).
+3. **NN parameterization → Fortran inference** (= the Phase-7 goal). Export weights; hand-code the
+   small-MLP forward in Fortran (~150 lines) or wire FTorch/SmartSim (~1-2 wk incl. build system).
+
+**⚠️ The decades-spin-up problem (do NOT backprop through it).** The fully-developed GM/eddy state
+takes years-to-decades; a multi-decade adjoint is infeasible on BOTH counts — memory (a decade ≈ 630k
+steps; even O(√N) checkpointing → >150 GB) AND, decisively, **chaotic gradient blow-up** (adjoint
+sensitivity grows exponentially past the Lyapunov time; the MITgcm-adjoint reason long-time adjoints
+are run over *months*, not decades). The architecture instead **decouples spin-up from gradient**:
+- **spin up FORWARD, no AD** (the stability run already is this; or use the Fortran/C model) to
+  (near-)equilibrium — cheap, no memory/chaos issue;
+- **tune with SHORT-window adjoint anchored at the equilibrated state** (days-to-months — memory +
+  chaos OK), minimizing the short-window drift / obs-misfit;
+- **for the slow equilibrated mean, use gradient-free Ensemble Kalman Inversion (EKI)** over forward
+  runs (no adjoint, no chaos, embarrassingly parallel via `vmap`). The diff. port still serves the
+  fast/short-window adjoint + the cheap batched forwards EKI needs.
+
+**Well-conditioned first targets** (clean gradients shown): `k_gm`/`redi_kmax` (GM eddy — sets ACC /
+stratification), `k_ver`/`a_ver` (mixing — SST/MLD), the GM depth/resolution scalings (`GMzexp_zref`,
+`refscalresol`). Ice *thermo* params tunable; ⚠️ EVP *rheology* params are stiff (`1/delta_min` ~1e16,
+Task 6.7) — `stop_gradient` the EVP or use EKI for those.
+
+**Task ladder (draft):** (7a.1) **perfect-model twin** — inject `k_gm=1500`, recover from 800 by
+gradient descent over a SHORT window (proves the optaxc/loss loop end-to-end; ~1 day). (7a.2) the
+`Params`-expansion pattern for N tunables + a misfit (reference-run first, then real obs SST/SSS/ice).
+(7a.3) short-window-adjoint-at-equilibrium tuning + an EKI baseline for the slow mean. (7a.4) export
+the optimum to `namelist.oce` and confirm the **Fortran** run reproduces the JAX-predicted improvement
+(the config-match caveat: tune for the config you'll run — the port is the reduced default-namelist
+physics). **GATE 7a:** a tuned scalar (e.g. `k_gm`) measurably reduces a defined misfit in JAX AND,
+written to the namelist, in Fortran; the perfect-model twin recovers the injected value.
 
 ### Phase 7 — ML Hooks + Batch-Parallel Training
 
@@ -1027,3 +1077,21 @@ Split into focused sub-plans (one per subsystem), per the Phase-5 discipline.
   backprop tests hang on the login node). **Only Task G.7 remains** (assemble into `step.py` behind
   `gm_cfg=None` + multi-day GPU stability + gradient re-check with `d/d(k_gm)` = GATE 6B). Handoff
   in `docs/NEXT_SESSION_PROMPT.md`.
+- **2026-06-07 — Phase 6B GM/Redi COMPLETE (Task G.7, GATE 6B met).** GM/Redi wired into `step.py`/
+  `integrate.py` behind a static `gm_cfg=None` arg (the `ice_cfg` precedent — bit-identical when
+  None; the **453-test suite is green**: 406 ocean + 47 ice). **Assembled GM step bit-exact (T
+  7.1e-15 / S 2.1e-14** vs the GM-ON substep dump — GM is deterministic, no ice-EVP reassociation
+  floor, so the assembly is bit-exact-class not climate-close, and this CLOSES K33's tight gate).
+  **10-day GM+ice stability** (max|vel| 2.84, SST capped −1.91, no NaN) + **GM smooths fronts**
+  (front|∇T| 7.42e-6 ON vs 7.89e-6 OFF, growing). **Gradient `GM_GRAD_GATE_OK`:** the 2nd ML-hook
+  `d/d(k_gm)` plateau **3.5e-6 (well-conditioned — not stiff)**, `d/d(k_ver)` 5.8e-10, masked-NaN
+  `d/d(T0)` clean; backward 37 GB/64 GB @ N=4 CORE2. ⚠️ Redi reads the **pre-step `st.T`/`st.S`**
+  (the returned `T_old`), not `st.T_old`. New: `test_gm_step.py`, `scripts/core2_gm_stability_run.py`
+  +`_gpu.sh`, `scripts/core2_gm_grad_gate.py`+`.sbatch`; 4 lessons. **Both ML hooks now training-ready.**
+- **2026-06-07 — Phase 7a (Differentiable Parameter Tuning) added to the plan (user-requested).**
+  Use the diff. port to calibrate physics params (GM/ice/mixing) against a target and push the
+  optimum back to the Fortran `namelist.oce` (scalar = zero Fortran code) — the SAME `params.py`
+  seam, a small extension. ⚠️ Do NOT backprop through the multi-decade spin-up (memory + chaotic
+  gradient blow-up): spin up forward (no AD) → short-window adjoint at equilibrium + gradient-free
+  EKI for the slow mean. First experiment = the perfect-model `k_gm` twin. **Next phases: 7a
+  (tuning) and/or 6C (KPP).**

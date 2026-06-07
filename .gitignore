@@ -43,3 +43,4 @@ jax_cache/
 # --- SLURM job outputs ---
 scripts/*.out
 slurm-*.out
+fullsuite.log

@@ -533,6 +533,14 @@ albedo, `l_snow=false` synthetic snow, cavities. **GM/Redi** (Phase 6B) and **KP
 (Phase 6C) get their own sub-plans (scope each by reading `fesom_gm.c` / `fesom_kpp.c`
 first, like this one). zstar/partial-cells remain C-side future work.
 
+**Parameter-tuning note (Phase 7a — see the parent plan).** The differentiable port can
+calibrate ice parameters too: the **thermo** constants (albedos, snow/ice conductivity, the
+o2ihf transfer, the freezing-point slope) are reasonable gradient-tuning targets. ⚠️ The **EVP
+rheology** params (`delta_min`, `Tevp`, `ice_strength` P*/C) route through the stiff
+`1/delta_min` (~1e16 IC-gradient, Task 6.7) — finite but ill-conditioned for gradient descent;
+tune those with **gradient-free EKI** (forward runs only) or `stop_gradient` the EVP. Any tuned
+scalar maps to the Fortran `namelist.ice` with zero Fortran code.
+
 ## Revision Log
 
 - **2026-06-06 — created** (Phase-6 sea-ice sub-plan). Scope **= sea ice only**
