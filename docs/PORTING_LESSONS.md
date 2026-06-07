@@ -2302,3 +2302,34 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (gitignored, ~1 MB each) like the dumps. The serial `npes==1` `partition_ssh_operator` is byte-equal to
   the dense operator (rows/cols/vals), and the serial sharded solve reproduces the dense `d_eta` — the
   no-op invariant proving the sharded code path collapses to the single-device model.
+
+## Phase 8 — sharding (Task S.7 part 1 — device-mesh placement + local reconstruction)
+
+- **[reconstruct-local-mesh] Run the UNMODIFIED `step` under `shard_map` by reconstructing a per-device
+  LOCAL `Mesh` with `Lmax` STATIC sizes.** The kernels use `mesh.nod2D`/`elem2D`/`edge2D` only as
+  `segment_sum` `num_segments` / array-shape bounds (audited — `myDim_edge2D` is `build_ssh_operator`-only,
+  not a step kernel), so setting the reconstructed mesh's static sizes to the LOCAL `Lmax` makes every
+  scatter allocate `[Lmax]` and the kernels run on each device's shard with **zero code change**. The
+  omitted node→elem CSR (`nod_in_elem2D`, S.2 — IC-only) is a step-unused dummy. Pass the `Mesh` to
+  `shard_map` as a "folded" container — `Lmax` static meta + `[P*Lmax_kind, …]` leaves + a `Mesh`-shaped
+  `PartitionSpec` tree (`'p'` for entity fields, `()` for replicated `zbar`/`Z` + the CSR dummy) — and
+  inside the body it IS a valid local `Mesh`. `npes==1` reconstruction is array-equal to the dense `Mesh`
+  for every step-read field ⇒ the whole step under `shard_map` is **byte-identical** to dense (`max|Δ|=0`).
+
+- **[🎯check_vma-false] `shard_map(..., check_vma=False)` is REQUIRED to run the unmodified kernels.**
+  JAX 0.10's `shard_map` tracks "varying manual axes": a value derived from a sharded input is typed
+  `{V:p}`. The kernels' tridiagonal-solve (Thomas) and FCT `lax.scan`s init their carry with a CONSTANT
+  `jnp.zeros` (NOT varying) while the body produces a varying carry → the strict check rejects the
+  `float64[n]` vs `float64[n]{V:p}` carry-type mismatch ("manual axis types do not match"). `check_vma=False`
+  treats every value conservatively as per-device-varying (always correct here — no cross-device replication
+  to exploit inside a `shard_map` body), so the scans lower unchanged. ⚠️ Contrast S.6: the CG `while_loop`
+  lowered with `check_vma=True` (default) because ALL its carries derive from the sharded `b` (uniformly
+  varying). The constant-carry scan is the case that needs the relaxation — reach for it whenever an
+  unmodified body has a `lax.scan`/`while_loop` seeded by a literal.
+
+- **[interior-match-diagnostic] Without exchanges, the deep-interior owned nodes already match single
+  device — a cheap proof the local kernels are correct on real shards.** On CORE2 `dist_2`, 58 % of owned
+  nodes match the dense full-step `T` to 1e-10 with NO halo exchanges (their multi-substep stencil never
+  reaches a halo lane); the boundary 42 % is the halo footprint the exchanges (rest of S.7) refresh. So a
+  multi-device step that LOWERS + matches on the interior validates the placement + the per-shard kernel
+  correctness independently of the exchange wiring — debug the plumbing before the boundary.

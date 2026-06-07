@@ -53,7 +53,17 @@
   on the real CORE2 KPP+GM+ice config (127/130 iters, N==1 identical, margin ~10 orders over reassociation;
   no pinning needed). 9 tests pass on CPU fake-devices + real 4×A100. The `halo=None` path is byte-identical
   `v1.0`. The exchange convention/global_dot/SSHHalo are the templates S.7 reuses for the whole step.
-- **S.7 wire `shard_map`** (`integrate_sharded.py` + `step.py`). Device-mesh placement (reshape the S.2
+- **S.7 wire `shard_map`** — ⏳ **PART 1 DONE** (Revision Log #9): `integrate_sharded.py` does the
+  device-mesh placement + per-device local `Mesh`/`State`/`SSHOperator` reconstruction; the UNMODIFIED step
+  runs under `shard_map` (needs `check_vma=False`), npes==1 == dense byte-identically, npes==2 lowers + 58%
+  interior owned nodes match (no exchanges). **PART 2 (next):** insert the ~13 ocean halo exchanges via an
+  `_exch(field, kind)` closure + split the 5 fused kernels (`visc_filt_bidiff` exch `Uc/Vc` 'elem' between
+  its 2 scatter stages; `advect_one_fct` exch `fct_LO` after `compute_fct_lo` + `zalesak_limit` exch
+  `fct_plus/fct_minus`; the CG split is done in S.6; ice EVP/FCT) + route `_area_mean`/ice reductions through
+  `owned_mask`; thread the S.6 `SSHHalo` into `solve_ssh`. **Gate behind a static arg** (`halo_ctx=None` ⇒
+  the branch is not traced ⇒ byte-identical `v1.0`). Then the per-substep CORE2 N-vs-1 gate (ocean → +KPP →
+  +GM → +ice). The full-step `shard_map` compile is ~2 min, so validate each exchange/split incrementally.
+- **(S.7 original placement text)** (`integrate_sharded.py` + `step.py`). Device-mesh placement (reshape the S.2
   `[P,Lmax,…]` arrays to `[P*Lmax,…]`, `PartitionSpec('p')`); **split the 5 fused kernels**
   (`FUSED_KERNELS_NEEDING_SPLIT`); interleave `halo_exchange` at the `halo_points` post-exchange points;
   thread `owned_mask`/`axis_name` into the reduction sites. **Gate behind a STATIC arg** (like

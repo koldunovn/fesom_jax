@@ -346,9 +346,12 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 - Modify: `fesom_jax/step.py` (insert the `halo_points` exchanges at the C's exchange points)
 - Create: `fesom_jax/tests/test_step_sharded.py`
 
-- [ ] device-mesh placement: put the sharded `Mesh`/`SSHOperator` (S.2) + `State`/`step_forcings` (S.2b)
-      on a 1-D `jax.sharding.Mesh('p')` with `PartitionSpec('p')` on the leading device axis; `shard_map`
-      the body.
+- [x] device-mesh placement: `integrate_sharded.py` folds the sharded `Mesh`/`SSHOperator` (S.2/S.6) +
+      `State` (S.2b) to `[P*Lmax]` `PartitionSpec('p')` and reconstructs the per-device LOCAL `Mesh`/`State`/
+      `SSHOperator` (LOCAL `Lmax` static sizes; CSR dummy) inside `shard_map`, running the UNMODIFIED `step`.
+      🎯 needs `check_vma=False` (the tridiagonal/FCT `scan`s have constant initial carries). **npes==1
+      whole step == dense byte-identically; npes==2 lowers + 58% deep-interior owned nodes match (no
+      exchanges) ⇒ the local kernels are correct on real shards.**
 - [ ] **split the fused kernels** flagged in S.4 (review #5) so the intra-kernel exchange seam is exposed:
       `momentum.visc_filt_bidiff` (`u_b/v_b` ‖ then `u_c/v_c`), ocean + `ice_adv` FCT (`fct_LO` ‖ then
       `fct_plus/minus`); the CG split is in S.6. Each split must be a no-op single-device.
@@ -452,6 +455,24 @@ multi-rank port is functional (`MPI_PORT_REPORT.md`: "dist_8 partition correctne
 long-run drift = chaotic Allreduce-order, not a per-substep bug → validates the per-substep gate choice).
 Task ladder S.1→S.10: reader → sharded-mesh → exchange primitive → scatter gate → reductions → CG → wire
 `shard_map` → AD gate → the 2–4 device GATE → docs.
+
+### #9 — S.7 part 1: device-mesh placement + local reconstruction DONE (2026-06-07)
+Built `fesom_jax/integrate_sharded.py` (fold `ShardedMesh`/`State`/`ShardedSSHOperator` → `[P*Lmax]`
+`PartitionSpec('p')`; reconstruct the per-device LOCAL `Mesh`/`State`/`SSHOperator` inside `shard_map` with
+LOCAL `Lmax` static sizes + a step-unused CSR dummy; run the UNMODIFIED `step`) + `tests/test_step_sharded.py`
+(**3 passed**: reconstruction + npes==1 no-op + npes==2 interior-match). **Two discoveries.** (1) The kernels
+use `mesh.nod2D/elem2D/edge2D` only as `num_segments`/shape bounds (`myDim_edge2D` is operator-build-only), so
+a local `Mesh` with `Lmax` static sizes runs the kernels per-shard with ZERO code change; the **npes==1 whole
+step under `shard_map` == dense byte-identically** (`max|Δ|=0`). (2) 🎯 `shard_map(check_vma=False)` is
+required — the tridiagonal-solve / FCT `lax.scan`s carry CONSTANT initial carries (non-"varying") that JAX
+0.10's varying-manual-axes typing rejects against the varying body output; relaxing it lowers the unmodified
+kernels (contrast S.6's CG, which lowered with the default because its carries all derive from the sharded
+`b`). **npes==2 lowers and 58% of owned nodes (deep interior) match single-device with NO exchanges** — the
+local kernels are proven correct on real shards; the boundary 42% is the halo footprint the exchanges refresh.
+Committed (a770000). NEXT (S.7 part 2): the ~13 ocean halo exchanges + the 5 fused-kernel splits
+(`visc_filt_bidiff` exch `Uc/Vc`; `advect_one_fct`/`zalesak_limit` exch `fct_LO`+`fct_plus/minus`) +
+reduction routing in `step.py`, gated behind a static arg (`None` ⇒ byte-identical), then the per-substep
+CORE2 N-vs-1 gate (ocean → +KPP → +GM → +ice).
 
 ### #8 — S.6 distributed CG solve DONE (2026-06-07)
 Built the distributed SSH CG in `ssh.py` (`partition_ssh_operator` + `SSHHalo` + `ShardedSSHOperator`;
