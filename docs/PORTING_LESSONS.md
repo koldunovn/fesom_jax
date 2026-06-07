@@ -1994,3 +1994,58 @@ Cite the C source (`file:line`) or dump probe that proves it.
   only exercised *within* step 1's 120 subcycles (u builds up) — but a thermo/forcing offset that needs
   the spun-up circulation stays invisible for months. **Add a later-step (nonzero-velocity) dump-gate
   and a climate comparison.** (Phase 6/6C gates, the sea-ice bias.)
+
+## Sea-ice climate bias — ROOT CAUSE (2026-06-07): `ice_dt` desynced from the ocean `dt`
+
+- **[🎯ROOT-CAUSE] The high-lat sea-ice climate bias was NOT a kernel port bug — it was a CONFIG
+  desync: the climate run stepped the ocean at `dt=1800` but built `IceConfig()` with the default
+  `ice_dt=500`, so the ENTIRE ice subsystem integrated 3.6× too slowly.** `IceConfig.ice_dt`
+  defaults to 500 (a build-time placeholder the docstring says to override per-run); the C
+  `fesom_ice_setup` instead DERIVES it (`ice_dt = ice_ave_steps*dt`, `fesom_ice.c:231`). With the
+  desync, every ice rate is wrong at once: thermo growth/melt (`rhow*ice_dt`, `o2ihf*ice_dt/cl`),
+  FCT transport (`vol*ice_dt*…` in `_tg_rhs`), and EVP timing (`dte=ice_dt/120`, `Tevp_inv=3/ice_dt`).
+  The ice "clock" ran at 500/1800 = 0.28× real time ⇒ sluggish, under-evolved ice. **Fix:**
+  `cfg = cfg._replace(ice_dt=cfg.ice_ave_steps*dt)` at the top of `ice_surface_step` — derive it from
+  the ocean `dt` so the desync is structurally impossible (`ice_step.py`). **VERIFIED (re-run, 1958):
+  SST RMS 0.490→0.0107 °C (46×), m_ice RMS 0.196→0.0030, polar bands 0.71–0.77→0.009–0.017 — now
+  INSIDE the 0.005–0.014 °C inter-reference budget at all latitudes. The whole high-lat bias was this
+  one config line.**
+
+- **[⚠️why-masked] The bug hid through ALL of Phase 6/6B/6C because every gate ran at `dt=500`,
+  where `ice_dt=500` is COINCIDENTALLY correct.** The step dump gates (`test_ice_step`/`test_kpp_step`,
+  `DT=500`), the kernel dumps (the C dump runs used dt=500), and EVERY stability/grad script
+  (`core2_{ice,gm,kpp}_stability_run`, `core2_ice_grad_gate` — all `DT=500.0`) sat exactly on the one
+  timestep where the default is right. The `dt=1800` climate run (the Fortran-KPP timestep) was the
+  FIRST thing to run the ice off its default ⇒ the first to expose it. **Lesson: a config field with a
+  default that is only valid for ONE value of another field is a latent footgun — gate at ≥2 distinct
+  values of the coupling field (here dt), or derive the dependent field so it can't desync.** The
+  `_replace` fix is a no-op at dt=500 (so all 55 ice/step tests stay green) and only bites at dt≠500.
+
+- **[ice/fingerprint→cause] The opposite-sign-N/S `m_ice` fingerprint is explained by sluggish ice
+  relaxing toward an IC seeded with the OPPOSITE asymmetry from equilibrium.** The cold-start IC
+  (`fesom_ice.c:246-280`, `ice.ice_initial_state`) seeds SH `m_ice=2.0` THICKER than NH `m_ice=1.0`;
+  the true (C) 2-yr climate is the reverse — NH 1.06 > SH 0.89. A 3.6×-too-slow ice is pulled toward
+  the IC ⇒ too THIN in the NH (1.0→0.91 vs C 1.06) and too THICK in the SH (2.0→1.15 vs C 0.89) =
+  the observed opposite sign; the retained concentration ⇒ `a_ice` high at BOTH poles ⇒ cold
+  surface-trapped SST in the marginal-ice seas. **Lesson: "opposite-sign by hemisphere" need not be a
+  hemisphere-dependent TERM — it can be a uniform rate error acting on an asymmetric IC.** This is
+  why the metric/Coriolis hunt (`∝sin lat`/`∝tan lat`) was the wrong tree: those were bit-faithful;
+  the asymmetry lived in the IC, not the physics. (Investigation plan §0/§1.)
+
+- **[audit/method] Ruling out EVERY kernel is what forced the search up to the config/threading
+  level — the negative result was the signal.** A full static re-audit (this session) confirmed
+  `ice_thermo`↔`fesom_ice_thermo.c`, the FCT `ice_adv`↔`fesom_ice_fct.c` (TG-RHS, the `_mm_times`
+  CSR-mass reconstruction, low/high-order solves, the full Zalesak limiter), the EVP `evp_setup`
+  (`ice_strength` incl. the load-bearing `0.5`, `inv_mass`, `inv_areamass`), `ice_coupling`
+  (`ocean2ice`/`ice_oce_fluxes`/`_mom`), and `atm_ice_stress`/bulk are ALL faithful, AND every
+  `IceConfig` constant matches `fesom_ice.c:53-111` (incl. `h0=h0_s=0.5` ⇒ `lid_clo` is NOT
+  hemisphere-split). When the kernels are all faithful and a systematic bias remains, the bug is in
+  the WIRING (what dt/state each kernel is fed), not the algebra. (Sea-ice bias investigation.)
+
+- **[ice/threading] Minor (NOT the bias): JAX's `srfoce_u/v` is one extra step lagged vs the C.**
+  `ocean2ice` reads the carried `state.uvnode[:,0]`, which substep-4 computed from the PREVIOUS
+  step's input `uv`; the C `fesom_ocean2ice` recomputes the area-weighted node velocity fresh from
+  the current `dyn->uv`. So the ice sees `uv_out(N-2)` where the C sees `uv_out(N-1)` — a ~30-min lag
+  at dt=1800. `compute_vel_nodes` IS the C's exact area-weighted incident-surface-element recipe, so
+  the only diff is the lag, not the recipe. Left as-is (sub-dominant); revisit if a residual remains
+  after the `ice_dt` fix. (`ice_coupling.ocean2ice`, `step.py` uvnode threading.)

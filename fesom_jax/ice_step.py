@@ -63,6 +63,13 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     :class:`core2_forcing.StepForcing` (atmosphere + month SSS/chl); ``fs`` the
     :class:`core2_forcing.ForcingStatic` (runoff/areas/open_water). ``boundary_node`` (the
     coastal mask) is precomputed once if given, else derived from ``mesh``."""
+    # ⚠️ The ice timestep MUST track the ocean dt (C ``fesom_ice_setup``: ``ice_dt =
+    # ice_ave_steps*dt``, fesom_ice.c:231). ``IceConfig.ice_dt`` is only a build-time default
+    # (500 s) — if the run's ocean dt differs (e.g. the dt=1800 climate run) and ice_dt is left
+    # at 500, EVERY ice rate (thermo growth/melt ×ice_dt, FCT transport ×ice_dt, EVP dte/Tevp_inv)
+    # runs at the wrong timestep ⇒ the ice evolves 3.6× too slowly ⇒ a high-lat climate bias.
+    # Deriving it from dt here makes the desync impossible regardless of the passed cfg.
+    cfg = cfg._replace(ice_dt=cfg.ice_ave_steps * dt)
     open_water = fs.open_water
     geo_lat = jnp.asarray(mesh.geo_coord_nod2D)[:, 1]
 

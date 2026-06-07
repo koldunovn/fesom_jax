@@ -1,10 +1,18 @@
 # FESOM2 → JAX Port — Sea-ice climate-bias investigation (Phase 6 follow-up)
 
-**Created:** 2026-06-07. **Status:** ⏳ OPEN — the first real multi-year climate comparison (after KPP
-landed) revealed a **high-latitude sea-ice climate bias** in the assembled CORE2 model. KPP itself is
-sound; the bias is a **prognostic sea-ice (Phase 6)** issue, surfaced now because every prior gate was
-step-level/per-kernel — this is the first end-to-end climate diff. **Investigate BEFORE Phase 7a**
-(you want the forward climate to match C before calibrating).
+**Created:** 2026-06-07. **Status:** ✅ RESOLVED + VERIFIED (2026-06-07, both years). The high-lat sea-ice bias was **NOT a kernel port bug**: the climate run
+stepped the ocean at `dt=1800` but built `IceConfig()` with the default `ice_dt=500`, so the entire ice
+subsystem (thermo rates, FCT transport, EVP `dte`/`Tevp_inv`) integrated **3.6× too slowly**. A full
+static re-audit cleared every ice kernel + constant (see §1 UPDATE); the bug was the **`ice_dt`↔`dt`
+desync**. Fix: derive `ice_dt = ice_ave_steps·dt` inside `ice_surface_step` (mirrors C
+`fesom_ice_setup`). **Masked for all of Phase 6/6B/6C because every prior gate ran at `dt=500`**, where
+`ice_dt=500` is coincidentally correct — the `dt=1800` climate run was the first to expose it. See the
+Revision Log (2026-06-07 #2) + `[[porting-lessons-log]]` (the `ice_dt` ROOT-CAUSE section).
+
+> **Original framing (kept for the record):** ⏳ OPEN — the first real multi-year climate comparison
+> (after KPP landed) revealed a **high-latitude sea-ice climate bias** in the assembled CORE2 model.
+> KPP itself is sound; the bias is a **prognostic sea-ice (Phase 6)** issue, surfaced now because every
+> prior gate was step-level/per-kernel — this is the first end-to-end climate diff.
 
 **Parent:** `docs/plans/20260605-fesom-jax-port.md`. **Predecessors:** Phase 6 sea ice
 (`20260606-fesom-jax-phase6-seaice.md`, GATE 6) + Phase 6C KPP (`20260607-fesom-jax-kpp.md`, GATE 6C —
@@ -134,3 +142,28 @@ cycle). Audit, most-likely first:
   marginal-sea-ice bias (sst RMS 0.49 °C / −0.15 °C, all high-lat; `m_ice` opposite-sign N/S). Ruled
   out KPP/open-ocean (bit-faithful budget), config, and the entire EVP dynamics/metric/Coriolis
   (bit-faithful; `metric_factor` max|Δ|=0). Next: ice thermo → forcing → advection audit.
+- **2026-06-07 #2 — ROOT CAUSE FOUND + FIXED.** The audit cleared every remaining ice kernel
+  (`ice_thermo`, FCT `ice_adv` incl. the Zalesak limiter, EVP `evp_setup` strength/mass, `ice_coupling`,
+  `atm_ice_stress`/bulk) AND all `IceConfig` constants — all bit-faithful to the C, `h0=h0_s=0.5`
+  (so `lid_clo` is not the asymmetry). With the kernels clean, the bias localized to the **wiring**:
+  the climate run (`core2_kpp_climate_run.py:180`, all the `core2_*` scripts) builds `IceConfig()`
+  with the **default `ice_dt=500`** while stepping the ocean at **`dt=1800`** ⇒ the ice integrates
+  3.6× too slowly (`ice_dt` feeds thermo `×ice_dt`, FCT `×ice_dt`, EVP `dte`/`Tevp_inv`). **Masked
+  because every prior gate ran at `dt=500`** (step tests + all stability/grad scripts), where the
+  default is coincidentally right. The opposite-sign `m_ice` is the sluggish ice relaxing toward the IC
+  (seeded SH `m_ice=2.0` thicker than NH `1.0`, the reverse of the C equilibrium NH 1.06 > SH 0.89);
+  `a_ice` high at both poles = retained concentration ⇒ cold SST. **Fix:**
+  `cfg = cfg._replace(ice_dt=cfg.ice_ave_steps*dt)` at the top of `ice_surface_step` (mirrors C
+  `fesom_ice_setup`; no-op at dt=500 ⇒ all 55 ice/step tests stay green). **Before** (buggy, year 1958,
+  `kpp_bias_map.py`): SST bias −0.150/RMS 0.490; bands [+45,+66)=−0.324/0.770, [+66,+90)=−0.357/0.712,
+  [−90,−60)=−0.068/0.211. **AFTER (verified, year 1958, `data/kpp_climate_2yr_fix/`, GPU job 25406976):
+  SST bias −0.0004 / RMS 0.0107 °C — a 46× drop, INSIDE the inter-reference budget (0.005–0.014 °C).
+  Bands: [+45,+66)=0.0165, [+66,+90)=0.0093, [−90,−60)=0.0031 (was 0.77/0.71/0.21 → 45–80× better);
+  tropics unchanged (0.0064→0.0057). m_ice RMS 0.196→0.0030 (opposite-sign fingerprint erased);
+  a_ice RMS 0.072→0.0027. Hotspots are now ordinary coastal SST-gradient nodes (Korea Strait, Kola)
+  at ~0.3 °C, not the Okhotsk/Bering ice seas.** ⇒ ROOT CAUSE CONFIRMED; the full ice climate now
+  matches C to the bit-faithful budget everywhere incl. the poles. **1959 corroborates (even tighter):
+  SST RMS 0.0071, m_ice RMS 0.0012, a_ice RMS 0.0006; all SST bands < 0.011 °C (Arctic 0.0029,
+  Antarctic 0.0056) — no growing drift, the ice has spun into agreement with C.** Run = GPU job
+  25406976, `exit 0`, 24/24 months. The `srfoce_u/v` 1-step lag is sub-dominant and clearly not
+  material at this residual. **ISSUE CLOSED → Phase 7a (param tuning) unblocked.**
