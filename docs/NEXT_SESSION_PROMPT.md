@@ -1,5 +1,21 @@
 # Next-session prompt — FESOM2 → JAX port (Phase 6C: KPP vertical mixing — finish the full model)
 
+> **⚡ PROGRESS UPDATE (2026-06-07): K.0–K.7 DONE — the COMPLETE KPP forward chain is ported,
+> committed, and controlled-replay bit-faithful + AD-finite (22 tests).** Commits: `c8e94ec` (K.0–K.5)
+> + `ef1ca73` (K.6–K.7) on port_jax `main`; `fdcaefa` (dump job + sw_3d/sw_alpha) on port2 `jax-mesh-export`.
+> `fesom_jax/kpp.py` has KppConfig + build_wscale_tables + wscale + ri_iwmix + ddmix gate + prestep +
+> bldepth + blmix + enhance + assemble_mixing; `eos.compute_dbsfc` added; `io_dump` has KPP readers;
+> `kpp_cfg=None` threaded (PP bit-identical). **RESUME AT K.8** (assemble `kpp.mixing_kpp` =
+> blmix→enhance→combine into one driver + wire into `step.py` substep 4 behind `kpp_cfg`, thread
+> heat/water flux + stress + sw_3d + sw_alpha/beta + dbsfc + uvnode; `Kv`→tracer diff +GM K33,
+> `Av`→momentum; PP byte-identical when `kpp_cfg=None`) → K.9 climate + K.10 grad gate (SLURM GPU/compute)
+> → K.11 docs. The plan `docs/plans/20260607-fesom-jax-kpp.md` (K.0–K.7 `[x]`) + memory `[[fesom-jax-port]]`
+> + `docs/PORTING_LESSONS.md` (per-task K.* entries) are the current record. The §0–§6 below is the
+> original full briefing — still the source of truth for K.8–K.11.
+
+---
+
+
 Paste the block below to start the next session. **Phases 0–6 COMPLETE (GATEs 0–6) + Phase 6B GM/Redi
 COMPLETE (GATE 6B).** The user's 2026-06-07 decision: **finish the full functioning model — port KPP
 (Phase 6C) — BEFORE the Phase-7a parameter-tuning on-ramp** (which is scoped + deferred, design saved
