@@ -36,7 +36,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from . import ale, eos, gm, gm_redi, kpp, momentum, pgf, pp, ssh, tracer_adv, tracer_diff
+from . import ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh, tracer_adv, tracer_diff
 from .config import DT_DEFAULT
 from .mesh import Mesh
 from .params import Params
@@ -51,7 +51,7 @@ S_FLOOR = 0.5
 def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
          *, dt: float = DT_DEFAULT, is_first_step: bool = False,
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
-         kpp_cfg=None) -> State:
+         kpp_cfg=None, halo_ctx=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -99,6 +99,17 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     if params is None:
         params = Params.defaults()
 
+    # Phase 8 (S.7): the halo-exchange closure. ``halo_ctx=None`` ⇒ the identity ⇒ the
+    # dead branch is not traced ⇒ byte-identical ``v1.0``; a :class:`~fesom_jax.halo.HaloCtx`
+    # (built inside ``shard_map``) inserts the broadcast halo refreshes at the C's
+    # exchange points (``halo_points.OCEAN_SCHEDULE``) + the CG's ``SSHHalo`` (S.6).
+    if halo_ctx is None:
+        _exch = lambda f, kind: f                       # noqa: E731
+        _ssh_halo = None
+    else:
+        _exch = halo_ctx.exchange
+        _ssh_halo = halo_ctx.ssh_halo
+
     # CORE2 surface forcing (None ⇒ pi path: keep the passed stress_surf, zero BCs).
     # ``ice_cfg`` (an IceConfig) ⇒ the Phase-6 PROGNOSTIC sea-ice step (ocean2ice → EVP → FCT
     # → cut_off → thermo → oce_fluxes → stress blend → shortwave); else the Phase-5 static-ice
@@ -127,6 +138,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 1 — EOS / hydrostatic pressure / N²
     density, hpressure, bvfreq = eos.compute_pressure_bv(mesh, st.T, st.S, st.hnode)
+    density = _exch(density, "nod")
+    hpressure = _exch(hpressure, "nod")
+    bvfreq = _exch(bvfreq, "nod")
 
     # ALE thickness is static in full-cell linfs (hnode_new == hnode, a memcpy). Compute
     # it once here so the GM coefficient block (substep 2) and the Redi reconstruction
@@ -144,6 +158,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 3 — pressure-gradient force
     pgf_x, pgf_y = pgf.pressure_force_linfs(mesh, hpressure)
+    pgf_x = _exch(pgf_x, "elem")
+    pgf_y = _exch(pgf_y, "elem")
 
     # 4 — vertical mixing. kpp_cfg ⇒ KPP (the real CORE2 default); else PP (k_ver/a_ver
     #     are the ML-hook seam). Both emit (Kv, Av, uvnode) post-mo_convect (the shared
@@ -163,38 +179,57 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     else:
         Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq,
                                       k_ver=params.k_ver, a_ver=params.a_ver)
+    uvnode = _exch(uvnode, "nod")
+    Kv = _exch(Kv, "nod")
+    Av = _exch(Av, "elem")
 
-    # 5 — momentum RHS (lagged eta_n, w_e, uv; shifts the OLD AB slot)
+    # 5 — momentum RHS (lagged eta_n, w_e, uv; shifts the OLD AB slot). Embeds
+    #     momentum_adv_scalar, which exchanges its node uvnode_rhs internally (S.7).
     uv_rhs, uv_rhsAB = momentum.compute_vel_rhs(
         mesh, st.uv, st.uv_rhsAB, st.eta_n, pgf_x, pgf_y, st.w_e, st.hnode,
-        is_first_step=is_first_step, dt=dt)
+        is_first_step=is_first_step, dt=dt, exch=_exch)
+    uv_rhs = _exch(uv_rhs, "elem")
+    uv_rhsAB = _exch(uv_rhsAB, "elem")
 
-    # 6 — biharmonic horizontal viscosity
-    uv_rhs = momentum.visc_filt_bidiff(mesh, st.uv, uv_rhs, dt=dt)
+    # 6 — biharmonic horizontal viscosity (splits internally to exchange u_b/v_b)
+    uv_rhs = momentum.visc_filt_bidiff(mesh, st.uv, uv_rhs, dt=dt, exch=_exch)
+    uv_rhs = _exch(uv_rhs, "elem")
 
     # 7 — implicit vertical viscosity → increment du (the C keeps it in uv_rhs)
     du = momentum.impl_vert_visc(mesh, st.uv, uv_rhs, Av, stress_surf, dt=dt)
+    du = _exch(du, "elem")
 
     # 8 — SSH RHS (transport divergence of uv + du)
     ssh_rhs = ssh.compute_ssh_rhs(mesh, st.uv, du, st.helem)
+    ssh_rhs = _exch(ssh_rhs, "nod")
 
-    # 9 — CG solve, warm-started from the previous step's d_eta (0 at step 1)
-    d_eta = ssh.solve_ssh(op, ssh_rhs, x0=st.d_eta)
+    # 9 — CG solve, warm-started from the previous step's d_eta (0 at step 1). The CG
+    #     exchanges pp/rr internally per iteration (S.6, via _ssh_halo); refresh d_eta after.
+    d_eta = ssh.solve_ssh(op, ssh_rhs, x0=st.d_eta, halo=_ssh_halo)
+    d_eta = _exch(d_eta, "nod")
 
     # 10 — velocity update (du + barotropic SSH-gradient correction)
     uv = momentum.update_vel(mesh, st.uv, du, d_eta, dt=dt)
+    uv = _exch(uv, "elem")
 
     # 11 — hbar (save hbar_old first); 12 — eta_n blend
     hbar_old = st.hbar
     ssh_rhs_old, hbar = ssh.compute_hbar(mesh, uv, st.helem, hbar_old, dt=dt)
+    ssh_rhs_old = _exch(ssh_rhs_old, "nod")
+    hbar = _exch(hbar, "nod")
     eta_n = ssh.eta_n_update(mesh, st.eta_n, hbar, hbar_old)
+    eta_n = _exch(eta_n, "nod")
 
     # 13 — ALE: vertical velocity; vertical CFL + explicit/implicit split (hnode_new is
     #      static, hoisted above). use_wsplit=0 in the reference config ⇒ the split is the
     #      identity (w_e=w, w_i=0); cfl_z is computed every step as in the C (populates State).
     w = ale.compute_w(mesh, uv, st.helem)
+    w = _exch(w, "nod")
     cfl_z = ale.compute_cfl_z(mesh, w, hnode_new, dt=dt)
+    cfl_z = _exch(cfl_z, "nod")
     w_e, w_i = ale.compute_wvel_split(mesh, w, cfl_z)
+    w_e = _exch(w_e, "nod")
+    w_i = _exch(w_i, "nod")
 
     # 13a — GM bolus wrap (fesom_step.c:422-438): feed the bolus-augmented velocity to the
     #       tracer advection. fer_w reuses compute_w driven by fer_uv. In functional JAX the
@@ -205,11 +240,14 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         uv_adv = uv + gm_diag.fer_uv
         w_e_adv = w_e + fer_w
 
-    # 15 — FCT tracer advection (T then S) + Redi explicit terms + implicit vert diffusion
+    # 15 — FCT tracer advection (T then S) + Redi explicit terms + implicit vert diffusion.
+    #      advect_one_fct exchanges fct_LO + fct_plus/minus internally (S.7 splits).
     T_adv, T_old = tracer_adv.advect_one_fct(mesh, uv_adv, w_e_adv, st.helem, st.hnode,
-                                             hnode_new, st.T, st.T_old, dt=dt)
+                                             hnode_new, st.T, st.T_old, dt=dt, exch=_exch)
     S_adv, S_old = tracer_adv.advect_one_fct(mesh, uv_adv, w_e_adv, st.helem, st.hnode,
-                                             hnode_new, st.S, st.S_old, dt=dt)
+                                             hnode_new, st.S, st.S_old, dt=dt, exch=_exch)
+    T_adv = _exch(T_adv, "nod")
+    S_adv = _exch(S_adv, "nod")
 
     # 15a/b — Redi neutral diffusion (fesom_step.c:468-499). The G7a (vertical-explicit) +
     #         G7b (horizontal-edge) gradients read the PRE-step tracer (st.T/st.S = the C
@@ -232,9 +270,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                                               bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d)
     # salinity floor on wet layers only (below-bottom stays 0)
     S_new = jnp.where(mesh.node_layer_mask, jnp.maximum(S_new, S_FLOOR), S_new)
+    T_new = _exch(T_new, "nod")        # refresh halo for next step's EOS/FCT/Redi reads
+    S_new = _exch(S_new, "nod")
 
     # 16 — commit thickness (hnode := hnode_new; helem = vertex mean)
     hnode, helem = ale.commit_thickness(mesh, hnode_new)
+    hnode = _exch(hnode, "nod")
+    helem = _exch(helem, "elem")
 
     new = dataclasses.replace(
         st,

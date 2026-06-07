@@ -355,14 +355,20 @@ def fill_up_dn_grad(mesh: Mesh, tr_xy):
 
 
 def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
-                  dt: float = DT_DEFAULT):
+                  dt: float = DT_DEFAULT, exch=None):
     """Zalesak flux limiter (``oce_tra_adv_fct``, ``fesom_tracer_adv.c:851``).
     Limits the antidiffusive fluxes ``adf_h``/``adf_v`` so ``T_new = LO + limited``
     introduces no new local extrema. Returns ``(adf_h_lim, adf_v_lim)``.
 
     The min/max/sign-select kinks are differentiated as subgradients (the default
     ``jnp`` VJP); the ``flux_eps`` floor keeps every ratio finite so the backward
-    pass is NaN-free. See ``docs/LIMITER_GRADIENTS.md``."""
+    pass is NaN-free. See ``docs/LIMITER_GRADIENTS.md``.
+
+    ``exch`` (Phase 8, S.7): the node antidiffusive sums ``fct_plus``/``fct_minus`` are
+    edge→node scatters, so the **halo** sums are incomplete until refreshed; the C
+    exchanges them before the per-node limiter ratios (``oce_adv_tra_fct.F90:401``).
+    ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``."""
+    _exch = exch if exch is not None else (lambda f, kind: f)
     nl = mesh.nl
     nlm = mesh.node_layer_mask
 
@@ -407,6 +413,10 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     nh = jnp.stack([jnp.minimum(adf_h, 0.0), jnp.minimum(-adf_h, 0.0)], axis=1)
     fct_plus = pos_v + ops.scatter_add(ph, mesh.edges, mesh.nod2D)
     fct_minus = neg_v + ops.scatter_add(nh, mesh.edges, mesh.nod2D)
+
+    # S.7 intra-kernel exchange: refresh halo fct_plus/fct_minus before the limiter.
+    fct_plus = _exch(fct_plus, "nod")
+    fct_minus = _exch(fct_minus, "nod")
 
     # b2: per-node limiter factors in [0, 1]
     a = mesh.areasvol
@@ -455,26 +465,34 @@ def flux2dtracer_fct(mesh: Mesh, T, LO, adf_h, adf_v, hnode, hnode_new, *,
 
 
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
-                   *, dt: float = DT_DEFAULT):
+                   *, dt: float = DT_DEFAULT, exch=None):
     """One tracer's FCT advection + ALE reconstruction
     (``fesom_tracer_advect_one_fct``, ``fesom_tracer_adv.c:1199``). Returns
     ``(T_new, T_old_new)`` with ``T_old_new = T`` (the AB2 ``valuesold`` save).
 
     LO fluxes & the element/up-dn gradient are built from **values** (T); the HO
-    fluxes use the AB2-extrapolated ``ttfAB`` (== T at step 1)."""
+    fluxes use the AB2-extrapolated ``ttfAB`` (== T at step 1).
+
+    ``exch`` (Phase 8, S.7): the Zalesak FCT has two intra-kernel halo exchanges (the C
+    ``oce_adv_tra_*.F90``): the low-order field ``LO`` after the LO solve (read at the
+    halo by the limiter's per-node cluster max/min), and ``fct_plus/fct_minus`` inside
+    :func:`zalesak_limit`. ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``."""
+    _exch = exch if exch is not None else (lambda f, kind: f)
     ttfAB, T_old_new = tracer_ab(T, T_old)
     # 2 — LO upwind fluxes from values
     flux_h_lo = adv_flux_hor(mesh, uv, helem, T)
     flux_v_lo = adv_flux_ver(mesh, w_e, T)
     # 3 — low-order ALE solution
     LO = compute_fct_lo(mesh, flux_h_lo, flux_v_lo, T, hnode, hnode_new, dt=dt)
+    LO = _exch(LO, "nod")        # S.7: the limiter clusters LO over surrounding cells
     # 4 — antidiffusive fluxes HO − LO
     tr_xy = tracer_gradient_elements(mesh, T)
+    tr_xy = _exch(tr_xy, "elem")  # S.7: eXDim halo elem gradients are read by fill_up_dn_grad
     eud = fill_up_dn_grad(mesh, tr_xy)
     adf_h = adv_flux_hor_ho(mesh, uv, helem, ttfAB, eud) - flux_h_lo
     adf_v = adv_flux_ver_ho(mesh, w_e, ttfAB) - flux_v_lo
-    # 5 — Zalesak limit
-    adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, hnode_new, dt=dt)
+    # 5 — Zalesak limit (exchanges fct_plus/fct_minus internally)
+    adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, hnode_new, dt=dt, exch=exch)
     # 6-7 — assemble del_ttf  8 — reconstruct (T_new = LO + limited antidiff)
     del_ttf = flux2dtracer_fct(mesh, T, LO, adf_h, adf_v, hnode, hnode_new, dt=dt)
     T_new = ale_reconstruct(mesh, T, del_ttf, hnode, hnode_new)

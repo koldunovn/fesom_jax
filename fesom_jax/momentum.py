@@ -99,12 +99,19 @@ def _horizontal_adv(mesh: Mesh, uv):
     return ops.scatter_add(vals, mesh.edges, mesh.nod2D)                 # (nod2D, nl, 2)
 
 
-def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode):
+def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
     """Momentum advection on scalar control volumes (momadv_opt=2). Returns the
     contribution added to ``uv_rhsAB`` at elements, ``[elem2D, nl, 2]``.
 
     Vertical ``w·∂u/∂z`` (element→node scatter + flux divergence) + horizontal
-    (edge→node scatter), divided by ``areasvol``, then vertex→element averaged."""
+    (edge→node scatter), divided by ``areasvol``, then vertex→element averaged.
+
+    ``exch`` (Phase 8, S.7): the per-node advection ``un_u``/``un_v`` are SCATTER
+    results (incomplete on the halo), and the final vertex→element average gathers them
+    at the cell's 3 vertices (incl. HALO nodes) — so the C exchanges the node field
+    (``uvnode_rhs``) before that gather (the Kokkos SYNC_MAP substep-4 D21 bracket).
+    ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``."""
+    _exch = exch if exch is not None else (lambda f, kind: f)
     lm_e = mesh.elem_layer_mask
     lm_n = mesh.node_layer_mask
 
@@ -127,6 +134,8 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode):
     inv_av = 1.0 / jnp.where(lm_n, mesh.areasvol, 1.0)
     un_u = jnp.where(lm_n, (vert_u + horiz[:, :, 0]) * inv_av, 0.0)
     un_v = jnp.where(lm_n, (vert_v + horiz[:, :, 1]) * inv_av, 0.0)
+    un_u = _exch(un_u, "nod")        # S.7: scatter result, gathered to cells below
+    un_v = _exch(un_v, "nod")
 
     # --- vertex → element: area·mean(3 vertices) ------------------------------
     cu3 = ops.gather_nodes_to_elem(un_u, mesh.elem_nodes).sum(axis=1) / 3.0   # (elem2D,nl)
@@ -137,7 +146,7 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode):
 
 
 def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
-                    *, is_first_step, dt=DT_DEFAULT):
+                    *, is_first_step, dt=DT_DEFAULT, exch=None):
     """``(uv_rhs, uv_rhsAB_new)`` element fields ``[elem2D, nl, 2]``.
 
     ``uv``, ``w_e``, ``hnode`` and ``eta_n`` are the *previous-step* state (lagged,
@@ -166,7 +175,7 @@ def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
     uv_rhsAB_new = jnp.stack([new_AB_u, new_AB_v], axis=-1)
 
     # (4) + momentum advection into the AB slot
-    uv_rhsAB_new = uv_rhsAB_new + momentum_adv_scalar(mesh, uv, w_e, hnode)
+    uv_rhsAB_new = uv_rhsAB_new + momentum_adv_scalar(mesh, uv, w_e, hnode, exch=exch)
 
     # (5) assemble:  uv_rhs = dt·(rhs + uv_rhsAB·ff_step)/area
     ff_step = 1.0 if is_first_step else _AB2
@@ -207,11 +216,18 @@ def _bidiff_edge_terms(mesh: Mesh, uv):
     return el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef
 
 
-def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT):
+def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None):
     """Biharmonic flow-aware horizontal viscosity (opt_visc=7), two edge→element
     scatter stages added into ``uv_rhs``. Returns the updated ``uv_rhs``
     ``[elem2D, nl, 2]``. Mirror of ``fesom_visc_filt_bidiff`` (``fesom_momentum.c:654``).
+
+    ``exch`` (Phase 8, S.7): a ``(field, kind) → field`` halo-exchange callable. The
+    bilaplacian is a 2-ring element operator, so stage 2 (which gathers ``Uc/Vc`` at the
+    edge's two cells) needs the **halo** ``Uc/Vc`` refreshed — the C exchanges them
+    between the stages (``oce_dyn.F90:367``). ``exch=None`` (single device) ⇒ the
+    identity ⇒ byte-identical to ``v1.0``.
     """
+    _exch = exch if exch is not None else (lambda f, kind: f)
     el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef = _bidiff_edge_terms(mesh, uv)
 
     # Stage 1: U_c[el1] -= u1·coef, U_c[el2] += u1·coef  (antisymmetric scatter)
@@ -219,6 +235,10 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT):
     dv = jnp.where(emask, v1 * coef, 0.0)
     Uc = ops.scatter_add(jnp.stack([-du, du], axis=1), mesh.edge_tri, mesh.elem2D)
     Vc = ops.scatter_add(jnp.stack([-dv, dv], axis=1), mesh.edge_tri, mesh.elem2D)
+
+    # S.7 intra-kernel exchange: refresh halo Uc/Vc before stage 2 gathers them.
+    Uc = _exch(Uc, "elem")
+    Vc = _exch(Vc, "elem")
 
     # Stage 2: update = -dt·coef·(U_c[el1]-U_c[el2]) + viLapl·u1, scatter /area
     coef2 = -dt * coef

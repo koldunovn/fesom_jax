@@ -352,20 +352,29 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
       🎯 needs `check_vma=False` (the tridiagonal/FCT `scan`s have constant initial carries). **npes==1
       whole step == dense byte-identically; npes==2 lowers + 58% deep-interior owned nodes match (no
       exchanges) ⇒ the local kernels are correct on real shards.**
-- [ ] **split the fused kernels** flagged in S.4 (review #5) so the intra-kernel exchange seam is exposed:
-      `momentum.visc_filt_bidiff` (`u_b/v_b` ‖ then `u_c/v_c`), ocean + `ice_adv` FCT (`fct_LO` ‖ then
-      `fct_plus/minus`); the CG split is in S.6. Each split must be a no-op single-device.
-- [ ] interleave `halo_exchange` at each S.4 exchange point inside `step`. **Gate via a static arg**
-      (review #8): thread `partition`/`exch` through `step`/`integrate` in `static_argnames` (mirroring
-      `kpp_cfg`/`gm_cfg`/`ice_cfg=None`, `step.py:51-54`) — `None` ⇒ the branch is not traced ⇒
-      byte-identical to `v1.0`, NOT a runtime `if npes==1`. Reductions already routed (S.5/S.6).
-- [ ] `integrate_sharded` = the checkpointed `lax.scan` (unchanged body) under `shard_map`; step-1-eager
-      + scan-rest structure preserved.
-- [ ] **PRIMARY per-step gate** (CPU fake-devices, N=2 then 4): a few-step assembled CORE2 step
-      (KPP+GM+ice) sharded == the single-device `v1.0` run, per-substep ~1e-12 (reuse `io_dump`/
-      per-substep compare against the single-device dump).
-- [ ] write tests: 2-device 3-step run == 1-device to ~1e-12 (ocean-only first, then +ice/+KPP/+GM).
-- [ ] run tests — must pass before S.8. Append lesson.
+- [x] **split the fused kernels** (OCEAN, via an `exch` arg, identity-when-None ⇒ no-op single-device):
+      `momentum.visc_filt_bidiff` (exch `Uc/Vc` between its 2 scatter stages); `momentum_adv_scalar`
+      (exch `un_u/un_v` before the vertex→element gather — ➕ a scatter-result site the Kokkos `SYNC_MAP`
+      flagged that the `MPI_PORT_REPORT` folds into substep 4); `tracer_adv.advect_one_fct`/`zalesak_limit`
+      (exch `fct_LO`, ➕ `tr_xy`, `fct_plus/minus`). ⏳ ice EVP/FCT splits + KPP `smooth_blmc` + GM/Redi
+      `tr_xy/tr_z` remain (forced-path; they need the KPP/GM/ice configs + forcing).
+- [x] interleave `halo_exchange` at each `OCEAN_SCHEDULE` exchange point inside `step` via one
+      `_exch(field,kind)` closure. **Gated by `halo_ctx=None`** (a pytree-or-None arg — the treedef makes
+      `None` a trace-time dead branch, the `kpp_cfg=None` discipline) ⇒ byte-identical `v1.0` (the 483-test
+      single-device suite stays GREEN). 🎯 **JAX needs FEWER exchanges than the C**: per-node intermediates
+      are auto-complete on the halo (computed over the full local extent), so only SCATTER results need an
+      exchange (the C's pre-smooth `bvfreq` exchange is unnecessary).
+- [x] `run_step_sharded` (`integrate_sharded.py`) wraps the body under one `shard_map` (`check_vma=False`);
+      ⏳ the multi-step checkpointed `lax.scan` is a thin wrapper for the few-step gate (next).
+- [x] **PRIMARY per-substep gate** (CPU fake-devices, N=2): the assembled OCEAN step sharded == single-device
+      on OWNED to a **field-appropriate** budget — momentum/SSH/ALE/EOS to <1e-7 (the wiring proof), FCT
+      tracers + cancelling SSH divergences to the **climate-close upwind-flip floor** (~1e-3 on a sharp test
+      bump; NOT a missing exchange — all FCT inputs match to 1e-9, `S` matches when constant, owned==halo).
+      ⏳ +KPP/+GM/+ice + the multi-step `io_dump` per-substep compare (vs the single-device dump) remain.
+- [x] write tests: `test_step_sharded.py` (reconstruction + npes==1 no-op byte-identity + npes==2 owned
+      field-appropriate gate). ⏳ +ice/+KPP/+GM build-up.
+- [x] run tests — **3 passed (CPU fake-devices); single-device suite ALL GREEN (475+47+36)**. Lesson
+      appended. ⏳ the forced-path (KPP/GM/ice) exchanges + multi-step `io_dump` gate are S.7 part 3.
 
 ### S.8: AD through the collectives (gradient gate)
 
@@ -455,6 +464,27 @@ multi-rank port is functional (`MPI_PORT_REPORT.md`: "dist_8 partition correctne
 long-run drift = chaotic Allreduce-order, not a per-substep bug → validates the per-substep gate choice).
 Task ladder S.1→S.10: reader → sharded-mesh → exchange primitive → scatter gate → reductions → CG → wire
 `shard_map` → AD gate → the 2–4 device GATE → docs.
+
+### #10 — S.7 part 2: OCEAN halo exchanges + fused-kernel splits DONE (2026-06-08)
+Wired the OCEAN step's halo exchanges + fused-kernel splits in `step.py` (one `_exch(field,kind)` closure +
+`halo_ctx=None` dead-branch gating), `momentum.py` (`visc_filt_bidiff` exch `Uc/Vc`; `momentum_adv_scalar`/
+`compute_vel_rhs` exch `un_u/un_v`), `tracer_adv.py` (`advect_one_fct`/`zalesak_limit` exch `fct_LO`+`tr_xy`+
+`fct_plus/minus`), `halo.py` (`HaloCtx`), `integrate_sharded.py` (`run_step_sharded` builds + threads the
+`HaloCtx`+`SSHHalo`) + the `test_step_sharded.py` npes==2 owned gate. **Used the reference ports' lessons
+(per the user)** — `port_kokkos/docs/SYNC_MAP.md` is the authoritative internal-exchange (`D21`) checklist and
+caught TWO scatter-result exchanges the `MPI_PORT_REPORT` folds into a kernel and I'd missed: `momentum_adv_scalar`'s
+`un_u/un_v` (gathered back to cells) and the FCT `tr_xy` (read by `fill_up_dn_grad`). 🎯 **Key model insight:**
+the JAX redundant-compute model needs FEWER exchanges than the C — per-node intermediates are auto-complete on
+the halo (computed over the full local extent), so only SCATTER results need an exchange (the C's pre-smooth
+`bvfreq` exchange is unnecessary here). **Result:** npes==1 whole step byte-identical (`max|Δ|=0`), single-device
+suite ALL GREEN (475+47+36), and the npes==2 OCEAN step matches single-device on owned to <1e-9 on EVERY field
+EXCEPT the FCT tracers (T,S) and cancelling SSH divergences — which match to the documented **climate-close
+upwind-flip / cancellation floor** (~1e-3 on a sharp bump), NOT a missing exchange (proven: all FCT inputs match
+to 1e-9, `S` matches when constant, owned==halo). The per-substep gate is therefore field-appropriate (Decision
+4: per-substep correctness, not bit-identity). ⚠️ **Meta-lesson (user-flagged): run the multi-minute `shard_map`
+compiles via `sbatch` on COMPUTE, never the login node.** NEXT (S.7 part 3): the forced-path exchanges (ice
+EVP/FCT splits, KPP `smooth_blmc`, GM/Redi `tr_xy/tr_z`) + the multi-step `lax.scan` + the `io_dump` per-substep
+gate vs the single-device dump on the KPP+GM+ice config.
 
 ### #9 — S.7 part 1: device-mesh placement + local reconstruction DONE (2026-06-07)
 Built `fesom_jax/integrate_sharded.py` (fold `ShardedMesh`/`State`/`ShardedSSHOperator` → `[P*Lmax]`

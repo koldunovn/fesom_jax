@@ -53,16 +53,20 @@
   on the real CORE2 KPP+GM+ice config (127/130 iters, N==1 identical, margin ~10 orders over reassociation;
   no pinning needed). 9 tests pass on CPU fake-devices + real 4×A100. The `halo=None` path is byte-identical
   `v1.0`. The exchange convention/global_dot/SSHHalo are the templates S.7 reuses for the whole step.
-- **S.7 wire `shard_map`** — ⏳ **PART 1 DONE** (Revision Log #9): `integrate_sharded.py` does the
-  device-mesh placement + per-device local `Mesh`/`State`/`SSHOperator` reconstruction; the UNMODIFIED step
-  runs under `shard_map` (needs `check_vma=False`), npes==1 == dense byte-identically, npes==2 lowers + 58%
-  interior owned nodes match (no exchanges). **PART 2 (next):** insert the ~13 ocean halo exchanges via an
-  `_exch(field, kind)` closure + split the 5 fused kernels (`visc_filt_bidiff` exch `Uc/Vc` 'elem' between
-  its 2 scatter stages; `advect_one_fct` exch `fct_LO` after `compute_fct_lo` + `zalesak_limit` exch
-  `fct_plus/fct_minus`; the CG split is done in S.6; ice EVP/FCT) + route `_area_mean`/ice reductions through
-  `owned_mask`; thread the S.6 `SSHHalo` into `solve_ssh`. **Gate behind a static arg** (`halo_ctx=None` ⇒
-  the branch is not traced ⇒ byte-identical `v1.0`). Then the per-substep CORE2 N-vs-1 gate (ocean → +KPP →
-  +GM → +ice). The full-step `shard_map` compile is ~2 min, so validate each exchange/split incrementally.
+- **S.7 wire `shard_map`** — ⏳ **PARTS 1+2 DONE** (Revision Log #9, #10). Part 1: `integrate_sharded.py`
+  device-mesh placement + local reconstruction (`check_vma=False`; npes==1 == dense byte-identical). Part 2:
+  the OCEAN halo exchanges + fused-kernel splits are wired (one `_exch(field,kind)` closure; `halo_ctx=None`
+  dead-branch ⇒ byte-identical `v1.0`; splits in `visc_filt_bidiff`/`momentum_adv_scalar`/`advect_one_fct`/
+  `zalesak_limit`; `SSHHalo` threaded into `solve_ssh`). 🎯 **the Kokkos `SYNC_MAP` is the authoritative
+  internal-exchange checklist** — it caught `un_u`+`tr_xy`; and the JAX redundant-compute model needs FEWER
+  exchanges than the C (per-node intermediates auto-complete on the halo; only SCATTER results need one). The
+  npes==2 OCEAN step matches single-device on owned to <1e-9 on all fields except the FCT tracers /
+  cancelling SSH divergences, which hit the **climate-close upwind-flip floor** (~1e-3, NOT a missing
+  exchange). **PART 3 (next):** the FORCED-PATH exchanges — ice EVP/FCT splits, KPP `smooth_blmc`, GM/Redi
+  `tr_xy/tr_z` — + route `_area_mean`/ice reductions through `owned_mask` + the multi-step `lax.scan` + the
+  `io_dump` per-substep gate vs the single-device dump on the KPP+GM+ice config (N=2 then 4). ⚠️ **run the
+  ~2 min `shard_map` compiles via `sbatch` on COMPUTE, never the login node** (`scripts/test_step_sharded.sbatch`
+  is the pattern); only the host-side numpy stencil checks belong on login.
 - **(S.7 original placement text)** (`integrate_sharded.py` + `step.py`). Device-mesh placement (reshape the S.2
   `[P,Lmax,…]` arrays to `[P*Lmax,…]`, `PartitionSpec('p')`); **split the 5 fused kernels**
   (`FUSED_KERNELS_NEEDING_SPLIT`); interleave `halo_exchange` at the `halo_points` post-exchange points;

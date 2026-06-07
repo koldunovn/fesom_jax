@@ -31,10 +31,11 @@ from jax.sharding import PartitionSpec
 
 from . import halo
 from . import step as stepmod
+from .halo import HaloCtx
 from .mesh import Mesh
 from .shard_mesh import (CONN_FIELDS, EDGE_FIELDS, ELEM_FIELDS, NODE_FIELDS,
                          REPLICATED_FIELDS, ShardedMesh)
-from .ssh import SSHOperator, ShardedSSHOperator
+from .ssh import SSHHalo, SSHOperator, ShardedSSHOperator
 from .state import State
 
 _P = PartitionSpec("p")          # sharded on the device axis (folded leading dim)
@@ -130,35 +131,68 @@ def unfold_state(folded: State, P: int) -> State:
 # --------------------------------------------------------------------------
 # The shard_map wrapper (npes==1 no-op scaffold; halo/splits are the rest of S.7)
 # --------------------------------------------------------------------------
+def _halo_arrays(sm: ShardedMesh) -> tuple[dict, dict]:
+    """Fold the per-kind exchange maps + the node owned-mask to ``[P*Lmax_kind]``
+    ``shard_map`` inputs + their all-``'p'`` spec dict."""
+    ha: dict = {}
+    for k in ("nod", "elem", "edge"):
+        src_dev, src_lane = sm.exchange[k]
+        ha[f"sd_{k}"] = _fold(src_dev).astype(jnp.int32)
+        ha[f"sl_{k}"] = _fold(src_lane).astype(jnp.int32)
+    ha["owned_nod"] = _fold(sm.owned_mask["nod"])
+    return ha, {k: _P for k in ha}
+
+
 def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      stress_p, *, dt: float, is_first_step: bool, npes: int,
-                     params=None, step_forcing=None, forcing_static=None,
-                     ice_cfg=None, gm_cfg=None, kpp_cfg=None) -> State:
+                     wire_halo: bool = True, params=None, step_forcing=None,
+                     forcing_static=None, ice_cfg=None, gm_cfg=None,
+                     kpp_cfg=None) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
-    return the ``[P, Lmax, …]`` next State. **Halo exchanges are NOT yet wired** — this
-    is correct for ``npes==1`` (no halo; the no-op invariant) and is the placement
-    scaffold the exchange-insertion (rest of S.7) builds on. ``step_forcing`` /
-    ``stress_p`` must already be partitioned to ``[P, Lmax, …]``."""
+    return the ``[P, Lmax, …]`` next State.
+
+    ``wire_halo`` (default True): build the per-device :class:`~fesom_jax.halo.HaloCtx`
+    (the exchange maps + the S.6 :class:`~fesom_jax.ssh.SSHHalo`) and thread it into the
+    step ⇒ the broadcast halo refreshes fire at the C's exchange points. ``wire_halo=False``
+    passes ``halo_ctx=None`` (the dead-branch dense path — every exchange is the identity)
+    for the ``npes==1`` byte-identity no-op. ``step_forcing``/``stress_p`` must already be
+    partitioned to ``[P, Lmax, …]``.
+
+    ``check_vma=False`` is required (the kernels' tridiagonal-solve / FCT ``lax.scan``s
+    carry CONSTANT initial carries — non-"varying" under ``shard_map``'s varying-manual-axes
+    typing — while their bodies produce per-device-varying outputs; relaxing it treats every
+    value conservatively as per-device-varying, always correct here, so the kernels lower)."""
     fm, fm_spec = folded_mesh(sm)
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
     fstress = _fold(stress_p)
     jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    n_global = sm.nod2D
 
-    in_specs = (fm_spec, fs_spec, fop_spec, _P)
+    if not wire_halo:
+        def body0(m, s, o, stress):
+            return stepmod.step(s, m, o, stress, params, dt=dt,
+                                is_first_step=is_first_step, step_forcing=step_forcing,
+                                forcing_static=forcing_static, ice_cfg=ice_cfg,
+                                gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, halo_ctx=None)
+        out = jax.shard_map(body0, mesh=jmesh, in_specs=(fm_spec, fs_spec, fop_spec, _P),
+                            out_specs=fs_spec, check_vma=False)(fm, fs, fop, fstress)
+        return unfold_state(out, npes)
 
-    def body(m, s, o, stress):
+    ha, ha_spec = _halo_arrays(sm)
+
+    def body(m, s, o, stress, h):
+        exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
+        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
+                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p")
+        ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
+                      owned_mask={"nod": h["owned_nod"]})
         return stepmod.step(s, m, o, stress, params, dt=dt,
                             is_first_step=is_first_step, step_forcing=step_forcing,
                             forcing_static=forcing_static, ice_cfg=ice_cfg,
-                            gm_cfg=gm_cfg, kpp_cfg=kpp_cfg)
+                            gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, halo_ctx=ctx)
 
-    # check_vma=False: the kernels' tridiagonal-solve / FCT lax.scans carry CONSTANT
-    # initial carries (jnp.zeros) — non-"varying" under shard_map's varying-manual-axes
-    # typing — while their bodies produce per-device-varying outputs. The strict VMA
-    # check rejects the mismatch; relaxing it treats every value conservatively as
-    # per-device-varying (always correct here — there is no cross-device replication to
-    # exploit inside the body), so the unmodified kernels lower unchanged.
-    out = jax.shard_map(body, mesh=jmesh, in_specs=in_specs, out_specs=fs_spec,
-                        check_vma=False)(fm, fs, fop, fstress)
+    out = jax.shard_map(body, mesh=jmesh,
+                        in_specs=(fm_spec, fs_spec, fop_spec, _P, ha_spec),
+                        out_specs=fs_spec, check_vma=False)(fm, fs, fop, fstress, ha)
     return unfold_state(out, npes)

@@ -32,6 +32,8 @@ JAX automatically and grad-checked in the tests.
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -39,6 +41,29 @@ from jax import lax
 from jax.sharding import Mesh, PartitionSpec
 
 DEFAULT_AXIS = "p"
+
+
+@dataclasses.dataclass(frozen=True)
+class HaloCtx:
+    """The per-device sharding context threaded into :func:`fesom_jax.step.step` (S.7),
+    **constructed inside** ``shard_map``. ``exch`` maps a kind (``'nod'``/``'elem'``/
+    ``'edge'``) to its ``(src_dev, src_lane)`` ``[Lmax]`` exchange map;
+    :meth:`exchange` is the broadcast halo refresh the step inserts at the C's
+    exchange points. ``ssh_halo`` is the S.6 :class:`~fesom_jax.ssh.SSHHalo` for the CG;
+    ``owned_mask`` (``{kind: [Lmax]}``) feeds the distributed reductions. ``halo_ctx=None``
+    in ``step`` is the dense single-device path (every exchange is an identity no-op ⇒
+    byte-identical ``v1.0``)."""
+
+    exch: dict           # {kind: (src_dev [Lmax], src_lane [Lmax])}
+    axis_name: str
+    ssh_halo: object     # ssh.SSHHalo (kept opaque to avoid a circular import)
+    owned_mask: dict     # {kind: [Lmax] bool}
+
+    def exchange(self, field, kind: str):
+        """Broadcast-refresh ``field``'s halo lanes from their owners (a no-op on
+        interior + pad lanes), for the given entity ``kind``."""
+        src_dev, src_lane = self.exch[kind]
+        return halo_exchange(field, src_dev, src_lane, self.axis_name)
 
 
 def halo_exchange(field, src_dev, src_lane, axis_name: str = DEFAULT_AXIS):

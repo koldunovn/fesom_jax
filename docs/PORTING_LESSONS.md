@@ -2333,3 +2333,58 @@ Cite the C source (`file:line`) or dump probe that proves it.
   reaches a halo lane); the boundary 42 % is the halo footprint the exchanges (rest of S.7) refresh. So a
   multi-device step that LOWERS + matches on the interior validates the placement + the per-shard kernel
   correctness independently of the exchange wiring — debug the plumbing before the boundary.
+
+## Phase 8 — sharding (Task S.7 part 2 — interleave the halo exchanges + split the fused kernels)
+
+- **[🎯JAX-redundant-compute-needs-FEWER-exchanges-than-C] In the JAX sharding model the kernels run over
+  the FULL local extent `[0,Lmax)`, so per-NODE intermediates are auto-complete on the halo — only SCATTER
+  results need an exchange.** This is the key divergence from the C MPI port. The C computes per-node fields
+  over OWNED entities only (`myDim`) and must EXCHANGE every intermediate a downstream kernel reads at the
+  halo (e.g. it exchanges the raw `bvfreq` BEFORE `smooth_nod3D`). In JAX, a per-node field like raw `bvfreq`
+  = f(T,S at the node) is computed for owned AND halo lanes (T/S halos are fresh), so it is already complete
+  on the halo — **no pre-smooth exchange needed**. The exchanges that ARE needed are exactly where a kernel
+  produces an incomplete-on-halo value (a SCATTER over edges/elements, whose halo entity's contributing
+  edges aren't all local) and a LATER kernel reads it at the halo (a gather-to-element or a per-node
+  cluster). So the C `§4` loop-bound rule ("who reads this into the halo?") still applies, but the
+  "producing loop covers `myDim+eDim`" half is automatic — only the scatter-result exchanges remain.
+
+- **[🎯use-the-Kokkos-SYNC_MAP] The reference ports' per-substep exchange map is the authoritative checklist
+  — read it BEFORE wiring, not after debugging.** `port_kokkos/docs/SYNC_MAP.md` lists every substep's
+  internal-exchange (`D21`) bracket. It caught two scatter-result exchanges the `MPI_PORT_REPORT` table folds
+  into a kernel and I had missed: (1) `momentum_adv_scalar`'s node advection `un_u/un_v` (a scatter), gathered
+  back to elements at the cell vertices — needs a `nod` exchange before the gather; (2) the FCT element tracer
+  gradient `tr_xy` (wrong on eXDim halo elements), read by `fill_up_dn_grad` — needs an `elem` exchange. Both
+  are the "scatter/incomplete value read at the halo" pattern. The per-field N-vs-1 diagnostic (diff every
+  State field owned-and-halo) localizes a missing one in one run; the reference map prevents needing the run.
+
+- **[🎯FCT-upwind-flip-is-climate-close-NOT-a-bug] The Zalesak FCT amplifies the ~1e-12 input reassociation to
+  ~1e-3 on the tracer via UPWIND FLIPS — the documented "climate-close, not bit-identical" non-determinism,
+  not a missing exchange.** After all exchanges were wired, the N-vs-1 step matched to <1e-9 on EVERY field
+  except the FCT tracers (T,S) and the heavily-**cancelling** SSH divergences (`ssh_rhs`/`ssh_rhs_old`).
+  Three independent proofs it is NOT a halo gap: (a) the per-field diagnostic showed ALL FCT *inputs*
+  (`uv,w_e,helem,hnode,T_old`) match to 1e-9 on owned AND halo — a missing exchange would diverge an input's
+  halo; (b) `S` (constant in the test ⇒ zero advection) matches to <1e-9 while `T` (with a gradient) does
+  not — the error is advection-magnitude-dependent; (c) the owned and halo errors are EQUAL (a boundary
+  exchange bug makes the halo worse). Mechanism: the upwind flux `±0.5(vflux±|vflux|)·Tmean` flips which face
+  value it takes when `vflux` (the edge volume flux) crosses zero, and a 1e-12 reassociation near a zero-flux
+  edge flips it ⇒ an O(1) flux swing. The C and Kokkos ports both accept this (`SCATTER_STRATEGY.md` D22:
+  "Serial bit-identical, OpenMP/CUDA climate-close"). So the per-substep gate is **field-appropriate**:
+  momentum/SSH/ALE/EOS to the clean reassociation floor (<1e-7, the proof the wiring is right), FCT tracers
+  + cancellation fields to the flip/cancellation budget (scales DOWN with the velocity/gradient, so it is far
+  smaller on a physical field than on a sharp test bump). This IS Phase 8's bar (Decision 4: per-substep
+  correctness, not bit-identity — "the C port sees the same chaotic Allreduce-order divergence").
+
+- **[exch-closure-gating] One `_exch(field, kind)` closure threads every exchange; `halo_ctx=None` ⇒ the
+  identity ⇒ byte-identical `v1.0`.** `step` builds `_exch = halo_ctx.exchange` (sharded) or `lambda f,k: f`
+  (dense), inserts `field = _exch(field, kind)` after each producing kernel (the `OCEAN_SCHEDULE` posts), and
+  passes `exch=_exch` into the fused kernels that split (`visc_filt_bidiff` exch `Uc/Vc`; `momentum_adv_scalar`
+  exch `un_u/un_v`; `advect_one_fct` exch `fct_LO`+`tr_xy`, `zalesak_limit` exch `fct_plus/minus`). The
+  `None`→identity makes every insertion a structural no-op ⇒ the 483-test single-device suite stays GREEN
+  (dump gates byte-identical). Over-exchanging is harmless (refreshing an unread halo is a no-op), so insert
+  the WHOLE schedule and let the per-field N-vs-1 diagnostic flag any genuinely-missing one.
+
+- **[⚠️compute-node-not-login] Run every multi-minute `shard_map` compile via `sbatch` on a COMPUTE node,
+  NOT the login node.** The full assembled step under `shard_map` is a ~2 min compile + GBs of RAM; iterating
+  it on the shared login node (`levante0`, ~40 users, RAM-limited, one-CPU-JAX-process) is antisocial and can
+  be killed. Only the lightweight host-side numpy checks (stencil/connectivity audits) belong on login. The
+  slower `sbatch` debug cycle (queue + run) is the correct cost; batch several diagnostics into one job.

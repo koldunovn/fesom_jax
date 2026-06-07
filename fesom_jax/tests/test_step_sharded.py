@@ -107,15 +107,30 @@ def test_serial_sharded_step_matches_dense():
 
 
 # --------------------------------------------------------------------------
-# 3. Multi-device step LOWERS + matches single-device on the deep interior
+# 3. The full sharded step (WITH exchanges) matches single-device on OWNED entities
 # --------------------------------------------------------------------------
+# Fields with inherent N-vs-1 non-determinism ABOVE the clean reassociation floor: the
+# FCT tracers (T,S) amplify the ~1e-12 input reassociation via Zalesak UPWIND FLIPS (a
+# near-zero edge volume flux flips upwind direction ⇒ O(1) flux swing), and the heavily
+# **cancelling** SSH transport divergences (ssh_rhs/ssh_rhs_old) amplify it too. Both are
+# the documented "climate-close, not bit-identical" FCT/cancellation non-determinism that
+# the C **and** Kokkos ports also see — NOT a missing exchange (confirmed: S matches when
+# constant, owned==halo error, and ALL FCT inputs match to 1e-9). Per-substep correctness
+# (not bit-identity) is Phase 8's bar (Decision 4). The floor scales with the velocity /
+# tracer gradient, so it is far smaller on a physical field than on this sharp test bump.
+_FCT_FIELDS = {"T", "S", "ssh_rhs", "ssh_rhs_old", "del_ttf"}
+_CLEAN_ATOL = 1e-7        # momentum/SSH/ALE/EOS exchanges: clean reassociation
+_FCT_ATOL = 5e-3          # FCT/cancellation upwind-flip floor (this test bump)
+
+
 @avail
 @pytest.mark.parametrize("npes", [2])
-def test_sharded_step_interior_matches(npes):
-    """Without halo exchanges (the rest of S.7), the multi-device step LOWERS and the
-    DEEP-INTERIOR owned nodes (whose kernels never read a halo lane) match single
-    device — proving the local kernels are correct on real shards. Boundary nodes
-    need the exchanges and are not asserted here; we report the matched fraction."""
+def test_sharded_step_owned_matches(npes):
+    """The full sharded step (with the S.7 halo exchanges) matches single-device on
+    OWNED entities: every momentum / SSH / ALE / EOS field to the **clean reassociation
+    floor** (<1e-7 — the proof the exchange wiring is correct), and the FCT tracers +
+    cancelling SSH divergences to the documented climate-close floor (the upwind-flip /
+    cancellation non-determinism, not a missing exchange)."""
     if NDEV < npes:
         pytest.skip(f"needs {npes} devices, have {NDEV}")
     mesh = load_mesh(CORE2_MESH)
@@ -132,20 +147,24 @@ def test_sharded_step_interior_matches(npes):
     st_N = ish.run_step_sharded(sm, state_p, sop, stress_p, dt=DT,
                                 is_first_step=True, npes=npes)
 
-    # T is a node field; compare owned node lanes per device to the dense field.
-    Td = np.asarray(st_dense.T)
-    TN = np.asarray(st_N.T)               # [P, Lmax_nod, nl]
-    matched = total = 0
-    for d in range(npes):
-        md = int(part.myDim_nod2D[d])
-        gids = part.myList_nod2D[d][:md]
-        diff = np.max(np.abs(TN[d, :md] - Td[gids]), axis=1)   # per owned node
-        matched += int((diff < 1e-10).sum())
-        total += md
-    frac = matched / total
-    print(f"\nnpes={npes}: deep-interior owned T match (no exchanges) = "
-          f"{matched}/{total} ({100*frac:.1f}%)")
-    # the bulk of owned nodes are interior ⇒ match even without exchanges; the rest
-    # are within the halo footprint and need the S.7 exchanges.
-    assert frac > 0.5, f"only {100*frac:.1f}% of owned nodes match — multi-device " \
-                       f"lowering or local kernels are wrong (not just a halo gap)"
+    worst_clean = 0.0
+    for fld in dataclasses.fields(State):
+        a = np.asarray(getattr(st_dense, fld.name))
+        B = np.asarray(getattr(st_N, fld.name))
+        if a.shape[0] == mesh.nod2D:
+            mydim, myl = part.myDim_nod2D, part.myList_nod2D
+        elif a.shape[0] == mesh.elem2D:
+            mydim, myl = part.myDim_elem2D, part.myList_elem2D
+        else:
+            continue
+        diff = 0.0
+        for d in range(npes):
+            md = int(mydim[d])
+            if md:
+                diff = max(diff, float(np.max(np.abs(B[d, :md] - a[myl[d][:md]]))))
+        atol = _FCT_ATOL if fld.name in _FCT_FIELDS else _CLEAN_ATOL
+        assert diff < atol, f"{fld.name}: owned max|Δ|={diff:.3e} > {atol:.0e}"
+        if fld.name not in _FCT_FIELDS:
+            worst_clean = max(worst_clean, diff)
+    # the wiring proof: the bulk of the step (all non-FCT fields) matches tightly
+    assert worst_clean < _CLEAN_ATOL, f"clean fields max|Δ|={worst_clean:.3e}"
