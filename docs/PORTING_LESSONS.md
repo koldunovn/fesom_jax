@@ -1845,3 +1845,37 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `sw_alpha`** (bldepth reads them live — not previously dumped) so the controlled-replay has ALL its
   inputs; surgical C edit + rebuild + rerun (1 min). (`eos.compute_dbsfc`, `fesom_eos.c:138`,
   `jax_kpp_dump_core2.sh`, K.5.)
+
+## Phase 6C — KPP (Task K.6 — blmix, the C's hardest replay)
+
+- **[kpp] `blmix` vectorizes as "per-node scalars → cubic-over-interfaces" and matched the C's hardest
+  replay: blmc 1.9–3.0e-13 (the C hit 3.18e-13), dkm1 2.6e-14.** Per node (via gathers at the discrete
+  matching level): `kn = min(kbl − int(caseA), nzmax-1)` (stop-grad), the one-sided slope
+  `½(dvdz+|dvdz|) = max(dvdz,0)` (AD-safe kink), `gat1=visch/(hbl+ε)/(w+ε)`, `dat1=min(−slope/(w+ε)+f1·visch,
+  0)` with `f1=stable·conc1·bfsfc/(u*⁴+ε)`. Then the cubic `blmc = hbl·w·sig·(1+sig·G)`, `G=a1+a2·gat1+a3·dat1`,
+  over the BL interfaces `nz∈[nzmin+1, min(kbl-1,nzmax-1)]` (a masked range). Channel cross-wiring:
+  blmcM←dcol ch0 (viscA)/wm, blmcT←dcol ch1 (diffKt)/ws, blmcS←dcol ch2 (diffKs)/ws. `dcol` = the
+  ri_iwmix outputs directly (their nzmax edge-copy already gives `dcol[nzmax]=dcol[nzmax-1]`); `hnode`
+  is passed in (a State field, static full-cell linfs ⇒ the GM dump's hnode for the replay). `dkm1` at
+  kbl-1 uses σ from zbar (not Z). (`kpp.blmix`, `fesom_kpp.c:449`, K.6.)
+
+- **[kpp/⚠️verify] `ghats` has the GM huge-dynamic-range signature — gate RELATIVE.** `ghats =
+  (1−stable)·cg/(ws·hbl+ε)` reaches ~2e3 where the velocity scale `ws→0`, so its absolute residual
+  (7.5e-11) carries that magnitude × FMA noise = relative ~3.7e-14 (bit-faithful). Gate
+  `|Δ|≤atol+rtol·|ref|` (the `test_gm_slopes` neutral-slope pattern), not absolute. `ghats` is
+  COMPUTED but CORE2 zeroes it outside the BL in the combine and never wires it into the tracer flux
+  (`use_kpp_nonlclflx=False`). AD finite through all of blmix. (`test_kpp_blmix.py`, K.6.)
+
+## Phase 6C — KPP (Task K.7 — enhance + smooth_blmc + combine + node→elem)
+
+- **[kpp] The KPP driver tail is BIT-EXACT (viscA/viscAE 2.2e-16, diffKt/diffKs 6.7e-16, ghats 0.0) —
+  better than the scatter-class ~1e-12.** `enhance` modifies blmc at the SINGLE interface kbl-1 per
+  node (a masked `where(k==kbl-1, blend, blmc)` update; `delta=(hbl+zbar[kbl-1])/(zbar[kbl-1]−zbar[kbl])`,
+  blend = `om·interior + delta·(om²·dkm1 + delta²·dkmp5)`, `dkmp5=caseA·interior+(1−caseA)·blmc`) and
+  scales ghats[kbl-1] by (1−caseA). `smooth_blmc` = `eos.smooth_nod3D(channel, 3)` — the SAME
+  N²-smoother, 3 sweeps. `combine` = `max(interior_ri, smoothed_blmc)` within the BL (nz<kbl), ghats=0
+  below; `Av` = 3-vertex node→elem mean + bottom-fill + `minmix` floor; `Kv = diffKt` (T-channel, both
+  T&S in CORE2). The bit-exactness comes from the combine's `max` picking the deterministic interior in
+  most lanes + the smoother reassociating identically single-rank. AD finite. **K.1→K.7 = the complete
+  KPP forward chain, all controlled-replay bit-faithful + AD-finite.** (`kpp.enhance`/`assemble_mixing`,
+  `fesom_kpp.c:588-924`, `test_kpp_enhance.py`, K.7.)

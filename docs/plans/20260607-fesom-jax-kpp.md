@@ -281,17 +281,17 @@ is the template; `port2/.../docs/plans/completed/20260524-kpp-vertical-mixing.md
   integer kbl + differentiable hbl weight, Ekman/MO clamp, `caseA`. **Extended the C dump
   (jax-mesh-export) with `sw_3d`+`sw_alpha`** for the replay. **Gate (controlled replay):** hbl 6.5e-12,
   **kbl 0/126858 mismatches**, bfsfc 8.6e-23, stable/caseA EXACT; AD finite. (`test_kpp_bldepth.py`.)
-- [ ] **K.6 — `blmix`: BL coeffs + cubic shape + `dkm1` + `ghats`.** `kpp_blmix` (`:449-579`): base
-  velocity scales; matching level `kn` (stop-grad); interior value+one-sided slope at `hbl`
-  (`2·max(dvdz,0)`); `gat1/dat1` match (`dat1=min(dat1,0)`, `f1=bfsfc/(u*⁴+δ)`); cubic shape over
-  interfaces → `blmc[3]`; `dkm1` at `kbl-1`; `ghats` (computed, **gated off**). **Gate (controlled
-  replay — THE key K6 technique):** inject C `bldepth/prestep/ri` inputs → `blmc_m/t/s,dkm1,ghats` vs
-  C ~1e-12 (C hit 3.18e-13).
-- [ ] **K.7 — `enhance` + `smooth_blmc` + combine + node→elem.** `kpp_enhance` (`:588-621`, blend at
-  `kbl-1`); `smooth_blmc` 3-sweep (linear, AD-safe); combine `max(interior,blmc)` within BL + zero
-  `ghats` below (`:867-886`); node→element mean → `Av` + bottom-fill + `minmix` surface floor
-  (`:896-910`); `Kv = diffK` ch0 (`:918`). **Gate (controlled replay):** final
-  `viscA/diffKt/diffKs/ghats` + element `viscAE` vs C ~1e-12.
+- [x] **K.6 — `blmix`: BL coeffs + cubic shape + `dkm1` + `ghats`.** ✅ `kpp.blmix` (`:449-579`):
+  per-node scalars (kn stop-grad, one-sided slope `max(dvdz,0)`, `gat1/dat1` w/ `dat1≤0`,
+  `f1=bfsfc/(u*⁴+δ)`) → cubic `G(σ)` over `[nzmin+1,kbl-1]` → `blmc[3]`; `dkm1` at `kbl-1` (σ from
+  zbar); `ghats` (computed, gated off). hnode passed in (static linfs ⇒ GM-dump hnode for replay).
+  **Gate (controlled replay):** blmc **1.9–3.0e-13** (C hit 3.18e-13), dkm1 2.6e-14, ghats rel ~3.7e-14
+  (huge-range → relative gate); AD finite. (`test_kpp_blmix.py`.)
+- [x] **K.7 — `enhance` + `smooth_blmc` + combine + node→elem.** ✅ `kpp.enhance` (blend at `kbl-1`,
+  masked single-interface update) + `kpp.assemble_mixing` (`smooth_blmc`=`eos.smooth_nod3D(·,3)`;
+  combine `max(interior,blmc)` within BL + zero `ghats` below; node→elem `Av` + bottom-fill + `minmix`;
+  `Kv=diffKt`). **Gate (controlled replay):** viscA/viscAE **2.2e-16**, diffKt/diffKs **6.7e-16**,
+  ghats exact, Kv==diffKt; AD finite. **K.1→K.7 = the complete KPP forward chain.** (`test_kpp_enhance.py`.)
 - [ ] **K.8 — wire KPP into the step (single Kv; nonlocal GATED OFF).** Gate `step.py:130`:
   `if kpp_cfg is not None: Kv,Av = kpp.mixing_kpp(…)` else the PP path. Thread `heat_flux/water_flux/
   stress_node_surf/sw_3d/sw_alpha/sw_beta/dbsfc/uvnode` to the call; `mo_convect` after (shared).
@@ -335,6 +335,16 @@ functioning model is complete** → Phase 7a (differentiable parameter tuning,
 ---
 
 ## Revision Log
+
+- **2026-06-07 — K.6–K.7 DONE (blmix + enhance/assembly) → the complete KPP forward chain.** `kpp.blmix`
+  matched the C's hardest replay (blmc 1.9–3.0e-13, dkm1 2.6e-14, ghats rel ~3.7e-14); `kpp.enhance` +
+  `kpp.assemble_mixing` (smooth_blmc 3-sweep + combine + node→elem Av) BIT-EXACT (viscA/viscAE 2.2e-16,
+  diffKt/diffKs 6.7e-16, ghats exact, Kv==diffKt). 8 more tests green (`test_kpp_blmix.py`,
+  `test_kpp_enhance.py`) — **22 KPP tests total, K.1→K.7 all controlled-replay bit-faithful + AD-finite.**
+  All gateable with the existing dumps (no new C edits). **Next: K.8 — wire `kpp.mixing_kpp` into
+  `step.py`** (assemble blmix→enhance→combine into a single driver, thread the forcing/dbsfc inputs;
+  `Kv→tracer diff +GM K33`, `Av→momentum`; PP byte-identical when `kpp_cfg=None`), then K.9 climate +
+  K.10 grad gate (both need SLURM GPU/compute jobs — a fresh-session boundary).
 
 - **2026-06-07 — K.1–K.5 DONE (tables → wscale → ri_iwmix → ddmix gate → pre-step/dbsfc/bldepth).**
   All controlled-replay dump-gated vs the C + AD-finite, 14 new tests green (`test_kpp_wscale.py`,

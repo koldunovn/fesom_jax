@@ -56,6 +56,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
+from . import eos, ops
 from .config import DENSITY_0, G, VCPW
 from .config import A_VER as _A_VER
 from .config import K_VER as _K_VER
@@ -540,3 +541,216 @@ def bldepth(mesh: Mesh, dVsq, ustar, Bo, bvfreq, dbsfc, sw_3d, sw_alpha, wmt, ws
     dzup = zbar_km1 - zbar_k
     caseA = _heaviside(jnp.abs(zbar_k) - 0.5 * dzup - hbl)
     return hbl, kbl, bfsfc_f, stable_f, caseA
+
+
+# ============================================================================
+# K.6 — blmix: BL coeffs blmc[3] + dkm1[3] + ghats (fesom_kpp.c:449-579)
+# ============================================================================
+def blmix(mesh: Mesh, hnode, viscA, diffKt, diffKs, hbl, bfsfc, stable, caseA, kbl,
+          ustar, wmt, wst, cfg: KppConfig):
+    """Boundary-layer mixing coefficients — literal port of ``kpp_blmix``
+    (``fesom_kpp.c:449-579``). Matches the interior diffusivities (the ``ri_iwmix``
+    ``viscA``/``diffKt``/``diffKs`` = ``dcol``) to the surface-layer scaling at ``hbl``
+    via the ``caseA``-selected level ``kn``, the cubic shape ``G(σ)``, and
+    :func:`wscale`, producing ``blmc[3]`` (momentum/T/S) over the BL interfaces
+    ``[nzmin+1, kbl-1]`` + ``dkm1[3]`` at ``kbl-1`` + ``ghats`` (computed; CORE2 gates
+    it off in the combine).
+
+    Channels: ``blmc``/``dkm1`` comp 0=momentum (from ``viscA``/``wm``), 1=T (from
+    ``diffKt``/``ws``), 2=S (from ``diffKs``/``ws``) — note the C cross-wiring
+    (T←dcol ch1, S←dcol ch2). The matching level ``kn`` and the cubic loop bound are
+    discrete ⇒ ``stop_gradient``ed; the one-sided slope ``½(dvdz+|dvdz|)=max(dvdz,0)``
+    is an AD-safe kink. Skipped nodes (``nlevels<3`` or ``nlevels-ulevels<2``) get
+    ``blmc=dkm1=ghats=0``.
+
+    All inputs are the C controlled-replay fields: ``viscA``/``diffKt``/``diffKs``
+    ``[N,nl]`` (ri_iwmix outputs), ``hbl``/``bfsfc``/``stable``/``caseA``/``ustar``
+    ``[N]``, ``kbl`` ``[N]`` int. Returns ``(blmc_m, blmc_t, blmc_s [N,nl], ghats
+    [N,nl], dkm1 [N,3])``."""
+    nl = mesh.nl
+    N = viscA.shape[0]
+    Zabs = jnp.abs(jnp.concatenate([mesh.Z, mesh.Z[-1:]]))[None, :]   # |Z| (1,nl)
+    zbar = mesh.zbar_3d_n                                  # (N,nl) signed
+    k = jnp.arange(nl).reshape(1, -1)
+    nzmin = mesh.ulevels_nod2D - 1
+    nzmax = mesh.nlevels_nod2D - 1
+    nzmin_c, nzmax_c = nzmin.reshape(-1, 1), nzmax.reshape(-1, 1)
+    hbl_c = hbl.reshape(-1, 1)
+    us_full = jnp.broadcast_to(ustar.reshape(-1, 1), (N, nl))
+
+    def gcol(arr, idx):                                    # gather (N,) at per-node idx
+        return jnp.take_along_axis(arr, idx.reshape(-1, 1), axis=1)[:, 0]
+
+    # --- dthick (interface thicknesses): interior ½(h[nz-1]+h[nz]); nzmin ½h[nzmin];
+    #     nzmax ½h[nzmax-1] ------------------------------------------------------
+    dthick = 0.5 * (_shift_down(hnode) + hnode)
+    dthick = jnp.where(k == nzmin_c, 0.5 * gcol(hnode, nzmin).reshape(-1, 1), dthick)
+    dthick = jnp.where(k == nzmax_c, 0.5 * gcol(hnode, nzmax - 1).reshape(-1, 1), dthick)
+
+    # dcol = the ri_iwmix outputs (already carry the nzmax←nzmax-1 edge copy).
+    dcol = (viscA, diffKt, diffKs)
+
+    # --- velocity scales at hbl (gat1/dat1 use these) ---------------------------
+    sigma_h = stable + (1.0 - stable) * cfg.epsilon_kpp
+    wm_h, ws_h = wscale(cfg, wmt, wst, cfg.vonk * sigma_h * hbl * bfsfc, ustar)
+
+    # --- caseA-selected matching level kn (discrete ⇒ stop_gradient) ------------
+    ca = (caseA + cfg.epsln).astype(jnp.int32)            # 0/1
+    kn = jnp.minimum(kbl - ca, nzmax - 1)
+    knm1 = jnp.maximum(kn - 1, nzmin)
+    knp1 = jnp.minimum(kn + 1, nzmax)
+    kn, knm1, knp1 = (lax.stop_gradient(x) for x in (kn, knm1, knp1))
+
+    delhat = gcol(jnp.broadcast_to(Zabs, (N, nl)), kn) - hbl   # |Z[kn]| − hbl
+    dth_kn = gcol(dthick, kn)
+    dth_knp1 = gcol(dthick, knp1)
+    R = 1.0 - delhat / dth_kn
+
+    def slope_valh(ch):
+        d_kn = gcol(ch, kn)
+        dvdzup = (gcol(ch, knm1) - d_kn) / dth_kn
+        dvdzdn = (d_kn - gcol(ch, knp1)) / dth_knp1
+        slope = 0.5 * ((1.0 - R) * (dvdzup + jnp.abs(dvdzup))
+                       + R * (dvdzdn + jnp.abs(dvdzdn)))
+        return slope, d_kn + slope * delhat                # (viscp,visch) etc.
+
+    viscp, visch = slope_valh(dcol[0])
+    difsp, difsh = slope_valh(dcol[2])                     # S ← dcol ch2
+    diftp, difth = slope_valh(dcol[1])                     # T ← dcol ch1
+
+    f1 = stable * cfg.conc1 * bfsfc / (ustar ** 4 + cfg.epsln)
+
+    def gat_dat(valh, slope, w):
+        gat1 = valh / (hbl + cfg.epsln) / (w + cfg.epsln)
+        dat1 = jnp.minimum(-slope / (w + cfg.epsln) + f1 * valh, 0.0)
+        return gat1, dat1
+
+    gat1m, dat1m = gat_dat(visch, viscp, wm_h)
+    gat1s, dat1s = gat_dat(difsh, difsp, ws_h)
+    gat1t, dat1t = gat_dat(difth, diftp, ws_h)
+
+    def cubic(sig, w, gat1, dat1):
+        a1, a2, a3 = sig - 2.0, 3.0 - 2.0 * sig, sig - 1.0
+        G = a1 + a2 * gat1[:, None] + a3 * dat1[:, None]
+        return hbl_c * w * sig * (1.0 + sig * G)
+
+    # --- BL coeffs at interfaces nz ∈ [nzmin+1, min(kbl-1, nzmax-1)] -------------
+    valid_node = ((mesh.nlevels_nod2D >= 3)
+                  & (mesh.nlevels_nod2D - mesh.ulevels_nod2D >= 2)).reshape(-1, 1)
+    cubic_mask = ((k >= nzmin_c + 1) & (k <= nzmax_c - 1) & (k < kbl.reshape(-1, 1))
+                  & valid_node)
+    sig = Zabs / (hbl_c + cfg.epsln)                       # (N,nl)
+    sigma = stable.reshape(-1, 1) * sig + (1.0 - stable.reshape(-1, 1)) * jnp.minimum(
+        sig, cfg.epsilon_kpp)
+    wm, ws = wscale(cfg, wmt, wst, cfg.vonk * sigma * hbl_c * bfsfc.reshape(-1, 1), us_full)
+    blmcM = jnp.where(cubic_mask, cubic(sig, wm, gat1m, dat1m), 0.0)
+    blmcT = jnp.where(cubic_mask, cubic(sig, ws, gat1t, dat1t), 0.0)
+    blmcS = jnp.where(cubic_mask, cubic(sig, ws, gat1s, dat1s), 0.0)
+    ghats = jnp.where(cubic_mask,
+                      (1.0 - stable.reshape(-1, 1)) * cfg.cg / (ws * hbl_c + cfg.epsln), 0.0)
+
+    # --- dkm1 at kbl-1 (σ from zbar, not Z) -------------------------------------
+    sig1 = jnp.abs(gcol(zbar, kbl - 1)) / (hbl + cfg.epsln)
+    sigma1 = stable * sig1 + (1.0 - stable) * jnp.minimum(sig1, cfg.epsilon_kpp)
+    wm1, ws1 = wscale(cfg, wmt, wst, cfg.vonk * sigma1 * hbl * bfsfc, ustar)
+
+    def cubic1(w, gat1, dat1):
+        a1, a2, a3 = sig1 - 2.0, 3.0 - 2.0 * sig1, sig1 - 1.0
+        return hbl * w * sig1 * (1.0 + sig1 * (a1 + a2 * gat1 + a3 * dat1))
+
+    vn = valid_node[:, 0]
+    dkm1 = jnp.stack([jnp.where(vn, cubic1(wm1, gat1m, dat1m), 0.0),
+                      jnp.where(vn, cubic1(ws1, gat1t, dat1t), 0.0),
+                      jnp.where(vn, cubic1(ws1, gat1s, dat1s), 0.0)], axis=1)   # (N,3) M/T/S
+    return blmcM, blmcT, blmcS, ghats, dkm1
+
+
+# ============================================================================
+# K.7 — enhance (blend at kbl-1) + smooth_blmc + combine + node→elem (Av)
+# ============================================================================
+def enhance(mesh: Mesh, blmcM, blmcT, blmcS, ghats, dkm1, viscA, diffKt, diffKs,
+            hbl, caseA, kbl, cfg: KppConfig):
+    """Enhance the BL coeffs at the ``kbl-1`` interface — literal port of
+    ``kpp_enhance`` (``fesom_kpp.c:588-621``). Blends the interior (``caseA``)
+    coefficient, the BL coefficient, and ``dkm1`` at ``k=kbl-1`` with the fractional
+    position ``delta = (hbl + zbar[kbl-1])/(zbar[kbl-1]−zbar[kbl])``; also scales
+    ``ghats[kbl-1]`` by ``(1−caseA)``. Modifies only the single ``kbl-1`` interface per
+    node. Returns the updated ``(blmcM, blmcT, blmcS, ghats)``."""
+    nl = mesh.nl
+    zbar = mesh.zbar_3d_n
+    kk = kbl - 1                                           # k = kbl-1 (≥0)
+
+    def gcol(arr, idx):
+        return jnp.take_along_axis(arr, idx.reshape(-1, 1), axis=1)[:, 0]
+
+    zk = gcol(zbar, kk)
+    zk1 = gcol(zbar, kk + 1)
+    delta = (hbl + zk) / (zk - zk1)
+    om = 1.0 - delta
+    om2, d2 = om * om, delta * delta
+
+    def blend(interior, blmc, dk):
+        intr = gcol(interior, kk)
+        blc = gcol(blmc, kk)
+        dkmp5 = caseA * intr + (1.0 - caseA) * blc
+        dstar = om2 * dk + d2 * dkmp5
+        return om * intr + delta * dstar                  # (N,)
+
+    newM = blend(viscA, blmcM, dkm1[:, 0])
+    newT = blend(diffKt, blmcT, dkm1[:, 1])
+    newS = blend(diffKs, blmcS, dkm1[:, 2])
+
+    k = jnp.arange(nl).reshape(1, -1)
+    at_kk = (k == kk.reshape(-1, 1))
+    blmcM = jnp.where(at_kk, newM.reshape(-1, 1), blmcM)
+    blmcT = jnp.where(at_kk, newT.reshape(-1, 1), blmcT)
+    blmcS = jnp.where(at_kk, newS.reshape(-1, 1), blmcS)
+    ghats = jnp.where(at_kk, ghats * (1.0 - caseA).reshape(-1, 1), ghats)
+    return blmcM, blmcT, blmcS, ghats
+
+
+def _node_to_elem_visc(mesh: Mesh, viscA, cfg: KppConfig):
+    """Element viscosity ``Av`` = 3-vertex mean of the (combined) node ``viscA`` on
+    the element layer range, bottom-filled at ``nzmax``, surface-floored at ``minmix``
+    (``fesom_kpp.c:911-924``). Same node→elem scatter as :func:`pp.pp_mixing`'s Av."""
+    nl = mesh.nl
+    corners = ops.gather_nodes_to_elem(viscA, mesh.elem_nodes)   # (E,3,nl)
+    Av = corners.sum(axis=1) / 3.0
+    k = jnp.arange(nl).reshape(1, -1)
+    nzmin = (mesh.ulevels - 1).reshape(-1, 1)
+    nzmax = (mesh.nlevels - 1).reshape(-1, 1)
+    Av = jnp.take_along_axis(Av, jnp.clip(k, nzmin, nzmax - 1), axis=1)   # bottom-fill nzmax←nzmax-1
+    Av = jnp.where(k == nzmin, jnp.maximum(Av, cfg.minmix), Av)           # surface floor
+    return jnp.where(mesh.elem_iface_mask, Av, 0.0)
+
+
+def assemble_mixing(mesh: Mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffKs, kbl,
+                    cfg: KppConfig):
+    """smooth_blmc (3-sweep) + combine + node→elem — the KPP driver tail
+    (``fesom_kpp.c:875-918``). Each ``blmc`` channel is smoothed 3× with the
+    area-weighted node-patch smoother (:func:`eos.smooth_nod3D`); within the BL
+    (``nz<kbl``) the interior ``viscA``/``diffKt``/``diffKs`` are raised to the smoothed
+    ``blmc`` (``max``), and ``ghats`` is zeroed below the BL; the node ``viscA`` is then
+    averaged to the element ``Av`` (+ bottom fill + ``minmix`` floor). ``Kv`` = the
+    combined ``diffKt`` (the T-channel, used for BOTH T and S in CORE2).
+
+    Returns ``(Kv [N,nl], Av [E,nl], viscA, diffKt, diffKs, ghats)`` — the final
+    module-gate fields."""
+    blmcM = eos.smooth_nod3D(mesh, blmcM, 3)
+    blmcT = eos.smooth_nod3D(mesh, blmcT, 3)
+    blmcS = eos.smooth_nod3D(mesh, blmcS, 3)
+
+    k = jnp.arange(mesh.nl).reshape(1, -1)
+    nzmin = (mesh.ulevels_nod2D - 1).reshape(-1, 1)
+    nzmax = (mesh.nlevels_nod2D - 1).reshape(-1, 1)
+    kblc = kbl.reshape(-1, 1)
+    interior = (k >= nzmin + 1) & (k <= nzmax - 1)
+    in_bl = interior & (k < kblc)
+    below_bl = interior & (k >= kblc)
+    viscA = jnp.where(in_bl, jnp.maximum(viscA, blmcM), viscA)
+    diffKt = jnp.where(in_bl, jnp.maximum(diffKt, blmcT), diffKt)
+    diffKs = jnp.where(in_bl, jnp.maximum(diffKs, blmcS), diffKs)
+    ghats = jnp.where(below_bl, 0.0, ghats)
+
+    Av = _node_to_elem_visc(mesh, viscA, cfg)
+    return diffKt, Av, viscA, diffKt, diffKs, ghats
