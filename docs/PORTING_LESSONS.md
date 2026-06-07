@@ -2049,3 +2049,256 @@ Cite the C source (`file:line`) or dump probe that proves it.
   at dt=1800. `compute_vel_nodes` IS the C's exact area-weighted incident-surface-element recipe, so
   the only diff is the lag, not the recipe. Left as-is (sub-dominant); revisit if a residual remains
   after the `ice_dt` fix. (`ice_coupling.ocean2ice`, `step.py` uvnode threading.)
+
+## Phase 8 — sharding (Task S.1 — the `dist_<NP>` partition reader)
+
+- **[🎯ownership-asymmetry] Only NODES are uniquely partitioned; ELEMENTS and EDGES are redundantly
+  owned at partition boundaries.** Verified on CORE2 `dist_2`: `Σ_d myDim_nod2D == nod2D` exactly
+  (126858, interior lists disjoint), but `Σ_d myDim_elem2D = 245221 > elem2D = 244659` (overlap 562)
+  and `Σ_d myDim_edge2D = 372225 > 371644` (overlap 581). A boundary element whose 3 vertices span
+  two ranks sits in the **interior** (`myDim`, not the halo) of *both* ranks — that IS the "redundant
+  compute over the halo" model (both ranks compute it; the broadcast then only needs to refresh the
+  outer halo). **Load-bearing for S.5:** a reduction over elements/edges must assign each shared
+  entity a UNIQUE owner (e.g. lowest-rank, or a precomputed owner flag) — naively summing over
+  `myDim` double-counts the boundary. Node reductions (CG dots, `integrate_nod_2D`) are safe. The
+  global counts are therefore `max(gid)+1` (the id space is dense `[0,count)`), NOT `Σ myDim`.
+
+- **[index-conventions] `dist_<NP>` is 1-based Fortran; shift to 0-based — but NOT every field.**
+  Confirmed by reading how `fesom_halo.c` consumes each: `rPE`/`sPE` are MPI **rank** ids fed
+  straight to `MPI_Isend`/`MPI_Irecv` (`:166,182`) ⇒ already 0-based, **no shift**; `rlist`/`slist`
+  are LOCAL field indices used as `[...]-1` (`:178,196`) ⇒ shift; `rptr`/`sptr` are 1-based cumulative
+  offsets (`rptr[0]==1`) ⇒ shift so `rptr[0]==0` and `rlist[rptr[k]:rptr[k+1]]` slices cleanly;
+  `myList_*` are 1-based gids ⇒ shift. After the shift: `rlist` ∈ `[myDim, myDim+eDim)` (the halo
+  lanes a rank receives into), `slist` ∈ `[0, myDim)` (the interior lanes it sends). Getting the
+  rPE/sPE shift wrong (subtracting 1 from a rank id) is a silent off-by-one that only surfaces as a
+  wrong neighbour at exchange time — read the *consumer* (`fesom_halo.c`), not just the file, to know
+  which fields are indices vs ids.
+
+- **[reader-design] Mirror `fscanf(" %d")` with a tokenise-once `_IntStream`, not `np.loadtxt`.**
+  `rpart.out`/`my_list`/`com_info` are free-format (whitespace == newline, ragged rows), and the C
+  reads a known *count* of ints per block then stops — `np.loadtxt` (regular columns) can't model
+  that, but `f.read().split()` + a cursor + `np.array(tok[i:i+n], int32)` does, and the slice-parse
+  keeps even the 63k-entry `myList` blocks to one numpy call. `rpart.out` actually holds
+  `npes + npes counts + nod2D owner-ids`; the C reads only the first `1+npes` (builds the vestigial
+  `part[]` prefix, never indexed downstream) and ignores the per-node owner vector — mirror that.
+
+- **[pytree-ragged] A registered-pytree dataclass can hold ragged per-rank data as `tuple`-of-arrays.**
+  `Partition` is read for all `npes` ranks in one process (vs the C's per-rank `mype`), so per-rank
+  `myList`/`com` are ragged. Storing them as `npes`-long tuples of numpy arrays (counts as rectangular
+  `[npes]` arrays) flattens cleanly: `tree_flatten` recurses into the tuples and the nested (also
+  registered) `ComStruct`, yielding all arrays as leaves, with the global scalar counts as static
+  meta. It is **host metadata** (consumed by S.2's numpy build), never device-put — registering it is
+  house-style + lets `tree_map` work, not a correctness need. The serial `npes==1` `synth_serial`
+  (identity `myList=arange`, empty coms) makes the sharded path reduce to the dense model.
+
+## Phase 8 — sharding (Task S.2 — sharded-mesh build + export)
+
+- **[exchange-as-gather] For the gate, the broadcast exchange is an `all_gather` + per-lane gather,
+  encoded as `(src_dev, src_lane)` `[P,Lmax]` per kind — no `slist`/`rlist` segment bookkeeping.**
+  A halo lane reads its owner's *interior* value; an **interior lane reads itself (identity)** — that
+  is exactly the C broadcast (owner→halo overwrite, interior untouched). Built from a `_owner_map`
+  (global id → lowest-id interior owner + that owner's interior lane), NOT from the `com_struct`:
+  halo lanes are *by construction* `[myDim:myDim+eDim)` (FESOM's `myList` order), so `rlist` only
+  *reorders* them by neighbour — irrelevant to a gather that refreshes every halo lane from its owner.
+  Verified gid-consistent on dist_4 (every halo lane's owner gid == the lane's gid; halo never
+  self-owned). `ragged_all_to_all` (the scalable form that *does* need the segments) is a perf
+  follow-up; the `com_struct` stays in `Partition` for it.
+
+- **[interior-identity] Never refresh interior lanes — only halo.** Elements/edges are redundantly
+  owned (S.1), so a boundary element is interior on ≥2 devices; each computes it independently
+  (~1e-15 apart from FP reassociation). Refreshing interior from a canonical owner would impose one
+  device's value on the others — a deviation from the C (which leaves them independent). The
+  identity-on-interior rule keeps the N-vs-1 gate clean: each device's owned copy = its own compute =
+  the 1-device value to ~1e-12. Halo source choice among redundant interior owners is immaterial
+  (same value to ~1e-15).
+
+- **[omit-CSR] `nod_in_elem2D` (the node→elem CSR) is used ONLY by the host PHC IC builder
+  (`phc_ic.py`), never a step kernel** (grep-confirmed) — so it is **omitted** from the per-device
+  bundle. S.2b builds the IC on the host then partitions the result, so the ragged-CSR pad (the one
+  genuinely awkward field to shard) is never needed. Audit "who reads this field" before paying to
+  shard it.
+
+- **[pad-for-AD] Pad value by dtype: float→`1.0`, int→`0`, connectivity→`-1`, bool→`False`.**
+  Floats pad to **nonzero** (1.0) not 0 so a masked pad lane that feeds a denominator (`1/area`,
+  `1/elem_area`) stays finite — the masked-NaN AD rule, now on the device-pad axis. The gathered masks
+  are `False` on pad lanes, so a padded "entity" is fully masked regardless; the pad value only
+  matters for finiteness of unmasked intermediates. Connectivity pads `-1` (the existing boundary
+  sentinel); owned elements carry **no** `-1` (their 3 vertices are all local — 0 sentinels in
+  `elem_nodes[:myDim]` on dist_4), so no owned output depends on a sentinel gather (S.2's safety
+  proof). Only halo/eXDim lanes carry `-1`, and those are masked / refreshed.
+
+- **[noop-invariant] The `npes==1` sharded mesh is array-equal to the dense `Mesh`** (all non-static,
+  non-CSR fields, squeezing the `P=1` axis) — the additive-sharding guarantee. `g2l` is the identity
+  `arange` at `npes==1`, so connectivity remap is a no-op; replicated `zbar`/`Z` are kept global.
+  This test is the cheap proof that the single-device path is structurally untouched.
+
+## Phase 8 — sharding (Task S.2b — partition State / forcing / IC)
+
+- **[same-Lmax] State and mesh MUST pad to the same `Lmax`** — factor a single `local_sizes(partition)`
+  used by both `build_sharded_mesh` and `partition_state`. Then the state's pad lanes `[n_local:Lmax]`
+  coincide exactly with the mesh's invalid (mask-`False`) lanes ⇒ the padded state is provably inert
+  (masked out of every owned computation). If the two derived `Lmax` independently they could drift and
+  a "padded" state lane could land on a *valid* mesh lane — a silent corruption. One source of truth.
+
+- **[detect-leading-dim] Shard a pytree field by DETECTING its entity axis (size == nod2D / elem2D),
+  not a hardcoded node/elem list.** `State`'s 40 fields are node- or elem-leading; `StepForcing` is
+  `[nod2D]` for one step but `[n_steps, nod2D]` when scanned. A size-match finds the node axis in both
+  (the `n_steps`-vs-`nod2D` sizes never collide), so one `_shard_along_axis(arr, ml, Lmax, axis)`
+  handles single + stacked + node + elem uniformly and survives a field-list change.
+
+- **[host-IC] Build the IC globally on the host, then `partition_state` — do NOT port a distributed IC.**
+  `State.rest` / PHC IC / ice cold-start all already produce a *global* `State`; gathering it to
+  per-device padded form is a pure reshape. This **sidesteps the C's PHC `extrap_nod3D` per-sweep halo
+  exchange** (a startup cost the C pays because it builds the IC already-distributed) — the same
+  host-build trick used for the SSH operator. The serial-`npes==1` `partition_state` is array-equal to
+  the dense `State` (the no-op invariant), so the single-device IC path is untouched.
+
+- **[forcing-pytrees] `ForcingStatic`/`StepForcing` are `NamedTuple`s ⇒ already JAX pytrees** (no
+  registration needed). Partition them field-by-field: node fields gather to `[P, Lmax_nod]`, the scalar
+  `ocean_area` stays replicated (it becomes a `psum` over owned nodes in S.5), and a scanned stack
+  `[n_steps, nod2D]` → `[P, n_steps, Lmax_nod]` (node axis sharded, `n_steps` preserved for the scan).
+
+## Phase 8 — sharding (Task S.3 — broadcast halo-exchange primitive + identity gate)
+
+- **[shard_map-convention] Fold the device axis INTO the leading dim — `[P*Lmax, …]` sharded
+  `PartitionSpec('p')`, NOT `[P, Lmax, …]`.** `shard_map` keeps a sharded axis at its *local* size: a
+  `[P, Lmax]` global with `P('p')` gives each device `[1, Lmax]` (a stray size-1 axis the body must
+  squeeze everywhere). Reshaping to `[P*Lmax, …]` and sharding `P('p')` gives each device `[Lmax, …]`
+  directly — so the step body (S.7) operates on the natural `[Lmax, …]` shape **unchanged**. The
+  `(P, Lmax)`-stacked S.2 arrays just `.reshape(P*Lmax, …)` at device-placement.
+
+- **[exchange=all_gather+gather] The broadcast exchange is `all_gather` then a per-lane gather** —
+  `g = all_gather(field, 'p', axis=0); out = g[src_dev, src_lane]`. The fancy index on `g`'s leading
+  two axes (`[P, Lmax]`) handles `[Lmax]`, `[Lmax,nl]`, `[Lmax,nl,2]` in one line (trailing axes ride
+  along). Interior lanes are identity (`src_dev=self`, `src_lane=self`), halo lanes read their owner's
+  interior — exactly the C `fesom_halo_exchange` (owner→halo overwrite, interior untouched). `src_lane`
+  is always `≥0`, so the exchange gather NEVER hits a sentinel (no masked-NaN risk inside the
+  collective). `all_gather` is the simplest verifiable collective and correct for 2–4 devices;
+  `ragged_all_to_all` (the scalable form, needing the `com_struct` slist/rlist) is a perf follow-up.
+
+- **[identity-gate] Ported `fesom_halo_identity_test`**: set owned lanes to their gid, halo to the
+  sentinel, exchange, assert every halo lane now carries its owner's gid (+ corruption recovery — clobber
+  a halo lane, re-exchange, restored). Passes for all 3 kinds (nod/elem/elem-full) × {2,4} devices and a
+  multi-level field. The exchange is **linear** in `field` (gather is linear); its vjp is the reverse
+  exchange (`all_gather` transpose = reduce-scatter `psum`, gather transpose = scatter-add → halo
+  cotangents flow additively back to owners) — JAX handles it automatically; FD-grad-checked on interior
+  AND halo lanes.
+
+- **[fake-device-gate] Collective tests need ≥2 CPU fake-devices, set at process start
+  (`XLA_FLAGS=--xla_force_host_platform_device_count=N`) BEFORE jax init** — so they `pytest.skip` in
+  the default 1-device suite and run as a separate `run_suite.sbatch` SHARDING group (4 devices). The
+  host-side foundation (`partit`/`shard_mesh`/`partition_state`) needs no fake-devices (pure numpy +
+  pytrees) and stays in the ocean group. A 4-device process can test `dist_2` too (subset the mesh to
+  `jax.devices()[:2]`).
+
+## Phase 8 — sharding (Task S.4 — exchange schedule + scatter gate)
+
+- **[🎯loop-bound-verified] The `PORTING_LESSONS §4` halo-bound rule HOLDS for the JAX sharding — a
+  LOCAL scatter gives each OWNED entity its complete sum, no special loop bound.** Verified on dist_4:
+  every owned node has ALL its incident edges AND incident elements in its local list, and every owned
+  element has all its `edge_tri`-contributing edges local (0 violations). So a kernel run over a device's
+  local (owned+halo) entities with the existing `segment_sum` produces, on **owned** entities, the SAME
+  sum as the global single-device kernel (modulo FP reassociation ~1e-13). The post-kernel broadcast is
+  needed ONLY to refresh the (incomplete) HALO copies for the next kernel — it does not fix owned values.
+  Confirmed by the scatter gate: owned edge→node and edge→element scatters match the global to 1e-11
+  *before* any broadcast; the broadcast then makes the halo match too. This is why the C "redundant
+  compute over `myDim+eDim(+eXDim)` + broadcast" model is correct, and why no JAX kernel scatter needs a
+  change for sharding — only the local connectivity (S.2) + the post-kernel exchange (S.7).
+
+- **[schedule-as-data] The per-substep exchange schedule is a DATA module (`halo_points.py`), not inline
+  code** — ported from the C `MPI_PORT_REPORT.md` "Halo exchanges per timestep" table (ocean, ~30
+  exchanges) + the `fesom_exchange_nod2D` call sites in `fesom_ice_{evp,fct,coupling,thermo}.c`. Each
+  `Exch` records (substep, field, kind, **post/intra**, C-ref). S.7 iterates the `post` ones as simple
+  inserts; the `intra` ones need a kernel split (recorded in `FUSED_KERNELS_NEEDING_SPLIT`).
+
+- **[intra-kernel-splits] FIVE fused JAX kernels exchange MID-kernel ⇒ must be split in S.7:**
+  `momentum.visc_filt_bidiff` (the bilaplacian exchanges `u_b/v_b` then `u_c/v_c` mid-kernel),
+  `tracer_adv.advect_one_fct` + the `ice_adv` FCT (Zalesak exchanges `fct_LO` then `plus/minus` around
+  the limiter), `ssh._pcg` (CG exchanges `pp`/`rr` per iteration — S.6), and the **EVP subcycle**
+  (`u_ice/v_ice` exchanged INSIDE the 120-step `lax.scan` — a collective *inside* `scan` under
+  `shard_map`, which must lower/transpose). A fused 2nd stage that reads a halo-stale 1st stage gives an
+  owned-node boundary error — the C's hardest surface; splitting exposes the seam.
+
+- **[elem-full=superset] The `all_gather` exchange refreshes the FULL local elem extent
+  (`eDim+eXDim`), so one `'elem'` map serves both the C's `elem2D` and `elem2D_full` exchanges.** A
+  superset refresh is always correct for the N-vs-1 gate (no kernel relies on a *stale* halo); only the
+  per-substep C-N dump diff (S.9c) would need the exact `eDim`-only intermediate, restricting the refresh
+  to `[myDim:myDim+eDim]`.
+
+## Phase 8 — sharding (Task S.5 — distributed reductions)
+
+- **[all-node-reductions] Every per-step reduction is NODE-based, so the S.1 element/edge
+  redundant-ownership caveat does NOT bite the reductions.** `_area_mean` (virtual-salt / relax-salt /
+  water-flux balances) and the CG dots are all sums over nodes; `ocean_area` is `Σ areasvol_surf` over
+  nodes. Nodes are uniquely owned, so `owned_mask` (`i<myDim`) IS the unique-owner mask ⇒ owned-node sum
+  + `psum` is exact. (`ice_coupling.ice_oce_fluxes` routes through `sss_runoff._area_mean` — there is one
+  reduction primitive, not two.) If a future element/edge reduction appears, it would need the
+  min-owner mask, not `owned_mask`.
+
+- **[reduction-gating] `global_sum(vals, owned_mask, axis_name=None)` — `axis_name=None` ⇒ plain masked
+  sum (single-device), a real `axis_name` ⇒ owned-sum + `jax.lax.psum`.** Routing `_area_mean` through it
+  with `owned_mask=None` default keeps the `npes==1` graph the **exact** `jnp.sum(x·area)/ocean_area`
+  (byte-identical — the 9 sss tests + the dead-branch discipline confirm); S.7 threads the real
+  `owned_mask`/`axis_name` through the step's call chain. `psum` is only valid inside `shard_map` (it
+  needs the mapped axis), so the `None` path is mandatory off the sharded path, not just an optimization.
+
+- **[psum-out-spec] A `psum`'d scalar is replicated across devices ⇒ `shard_map` `out_specs=PartitionSpec()`
+  (empty)** returns it directly (all devices hold the same total). 2/4-device owned-sum + `psum` matches
+  the single-device global sum to ~1e-12 (reduction reassociation), and a deliberately-corrupted halo
+  value leaves the result unchanged (masked) — the owned-mask correctness check.
+
+## Phase 8 — sharding (Task S.6 — distributed CG solve)
+
+- **[🎯operator-loop-bound-by-VALUE] The SSH stiffness stencil EXCEEDS the node halo — but every excess
+  owned-row entry is EXACTLY zero, so a local matvec is still exact on owned rows.** Unlike the S.4
+  *scatter* loop-bound (which held topologically), the global `S`/`M⁻¹` operator has owned-row columns
+  *outside* the local node list (11664 entries on dist_2, 20466 on dist_4). Keeping only
+  (row-local ∧ col-local) entries would silently DROP them — but **all of them have exactly-zero stiffness
+  AND preconditioner value** (the operator deliberately keeps the full topological pattern incl. numeric
+  zeros, `fesom_ssh.c`; the far "wing" columns reached through eXDim-halo elements are all zeros, and the
+  MITgcm precond is `∝ S[i,j]` so it is zero wherever `S` is). So `(S_local·x)[i] == (S·x)[i]` EXACTLY for
+  owned `i` (the dropped terms are `0·x = 0`). `partition_ssh_operator` **asserts no NONZERO owned-row entry
+  is dropped** — a mesh/config that ever violated it fails loudly instead of corrupting the owned matvec.
+  Lesson: the operator analog of the loop-bound must be checked on VALUES, not just topology — "is the
+  stencil inside the halo?" can be *no* and the scheme still correct because the overshoot is numeric zero.
+
+- **[fold-exchange-into-matvec] Fold the halo exchange INTO `ssh_matvec`/`ssh_precond` ⇒ the `_pcg` body is
+  structurally UNCHANGED (only the dots → `global_dot`, `n` → global count).** The C's per-iteration
+  schedule ("exchange `pp` before each SpMV, `rr` after the residual update") maps EXACTLY: the matvec
+  broadcast-exchanges its input (`pp`) before the local SpMV; the precond exchanges its input (`rr`) right
+  before its SpMV — which is exactly *after* `r = r − α·Ap`. So the CG loop needs no per-step exchange
+  plumbing: the matvec/precond closures carry the `SSHHalo`, and `custom_linear_solve`'s `matvec` refreshes
+  the halo automatically every SpMV. The carry vectors' halo lanes are **scratch** (refreshed inside
+  matvec/precond, never trusted); only OWNED lanes are the real state, masked into every dot. The dense
+  path (`halo=None`) guards the exchange behind `if halo is not None` and the dots default to `jnp.sum`
+  (`reduce=None`) ⇒ the **exact `v1.0` graph** (43 single-device ssh tests stay green, dump ~1e-18 + AD).
+
+- **[🔴iteration-count-robust] CORE2 CG = 127 iters (cold) / 130 (warm) — NOT pi's ≈3 — yet the count is
+  robustly device-deterministic, and `d_eta` matches to MACHINE PRECISION.** The `ssh.py` docstring's
+  "≈3 iters, cond≈800" is **pi**; the real CORE2 operator (dt=1800, nod2D=126858) is far stiffer and the
+  loose `soltol=1e-5` stop lands deep in the trajectory. Captured the residual-vs-threshold margin on the
+  REAL KPP+GM+ice rhs (`scripts/capture_core2_ssh_rhs.py`): consecutive residuals near the stop cross the
+  threshold by only a factor **~1.09** (tightest margin: the last *above* iterate sits 0.93 % above `rtol`)
+  — but that is **~10 orders of magnitude** above the ~1e-15 `psum` reassociation, so the count CANNOT
+  drift. Verified N==1 iteration count (127/130 on 2 and 4 devices) AND owned `d_eta` agreeing to
+  **~3e-16 abs (1e-15 rel)** — far tighter than the 1e-12 budget, because (a) each owned row's local
+  `segment_sum` is over the same nonzero terms in the same order (bit-identical per row) and (b) the
+  contracting CG damps the ~1e-15 dot-reassociation. The residual RMS divides by the GLOBAL node count
+  (`halo.n_global`), not `b.shape[0]` (= local `Lmax`) — getting that wrong would shift `rtol` per device.
+
+- **[collective-in-while_loop-lowers] `all_gather` + `psum` inside a `lax.while_loop` inside
+  `custom_linear_solve` inside `shard_map` LOWERS and runs (review #4 resolved).** The data-dependent CG
+  trip count is safe because the `psum`'d residual is identical on every device (no deadlock — all devices
+  exit the loop on the same iteration). `custom_linear_solve(symmetric=True)` reuses the (exchange+SpMV)
+  matvec as its own transpose; that matvec represents the symmetric global `S` on owned lanes, so the
+  implicit-diff cotangent (`S⁻¹·x̄` via the tight `transpose_solve`, also sharded) is structurally intact —
+  the gradient is gated in S.8, *not* AD-through-the-`while_loop`. Confirmed on 4 CPU fake-devices (~54 s,
+  9 tests) and an early real-4×A100 run (the formal multi-GPU gate is S.9).
+
+- **[capture-realistic-rhs] Gate the distributed CG on a CAPTURED real-config rhs, not a synthetic one.**
+  The iteration-count margin is a property of the operator (mesh+dt) AND the rhs spectrum (config), so the
+  fixture is `ssh_rhs` read straight off `state.ssh_rhs` after a real assembled `step()` (KPP+GM+ice,
+  dt=1800) — 2 steps give the cold-start (`x0=0`) and warm-start (`x0=d_eta_step1`) cases. Saved on `/work`
+  (gitignored, ~1 MB each) like the dumps. The serial `npes==1` `partition_ssh_operator` is byte-equal to
+  the dense operator (rows/cols/vals), and the serial sharded solve reproduces the dense `d_eta` — the
+  no-op invariant proving the sharded code path collapses to the single-device model.

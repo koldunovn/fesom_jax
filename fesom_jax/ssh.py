@@ -43,7 +43,9 @@ import scipy.sparse as sp
 from jax import lax, tree_util
 
 from .config import DT_DEFAULT, G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
+from .halo import halo_exchange
 from .mesh import Mesh
+from .reductions import global_dot
 
 # Tolerance for the *gradient* (transpose) solve — tight so the implicit-diff
 # cotangent ``S⁻¹·x̄`` is accurate, independent of the loose forward ``soltol``.
@@ -75,6 +77,137 @@ tree_util.register_dataclass(
     data_fields=["rows", "cols", "stiff_vals", "precond_vals", "diag"],
     meta_fields=["n_nodes"],
 )
+
+
+# ==========================================================================
+# Distributed CG context + partitioned operator (Phase 8, Task S.6)
+# ==========================================================================
+@dataclasses.dataclass(frozen=True)
+class SSHHalo:
+    """Per-device node halo-exchange context for the distributed CG, **carried
+    inside** ``shard_map``. ``src_dev``/``src_lane`` are the
+    :class:`~fesom_jax.shard_mesh.ShardedMesh` node exchange map (``[Lmax_nod]``);
+    ``owned_mask`` (``[Lmax_nod]`` bool, True on ``[0:myDim)``) selects the owned
+    lanes for the CG dot-products; ``n_global`` is the global ``nod2D`` (so the
+    residual RMS ``√(Σr²/n)`` divides by the GLOBAL count, identical to single
+    device — the load-bearing iteration-count invariant). Passing ``halo=None`` to
+    the solver is the dense single-device path."""
+
+    src_dev: jax.Array       # (Lmax_nod,) i4
+    src_lane: jax.Array      # (Lmax_nod,) i4
+    owned_mask: jax.Array    # (Lmax_nod,) bool
+    n_global: int = dataclasses.field(metadata={"static": True})
+    axis_name: str = dataclasses.field(default="p", metadata={"static": True})
+
+
+tree_util.register_dataclass(
+    SSHHalo,
+    data_fields=["src_dev", "src_lane", "owned_mask"],
+    meta_fields=["n_global", "axis_name"],
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class ShardedSSHOperator:
+    """Per-device padded SSH operator (host numpy ``[P, …]`` arrays). Each device's
+    slice is a LOCAL-indexed COO matvec: ``rows``/``cols`` reference local node lanes
+    ``[0, Lmax_nod)``, ``stiff_vals``/``precond_vals`` are the kept ``S`` / ``M⁻¹``
+    entries, padded to a common ``nnz_max`` with zero-value entries (``row=col=0,
+    val=0`` ⇒ scatter ``0`` to lane 0 ⇒ inert). Reconstruct one device's
+    :class:`SSHOperator` (``n_nodes=Lmax_nod``) inside the ``shard_map`` body."""
+
+    rows: np.ndarray          # [P, nnz_max] i4  local row (node) lane
+    cols: np.ndarray          # [P, nnz_max] i4  local col (node) lane
+    stiff_vals: np.ndarray    # [P, nnz_max] f8
+    precond_vals: np.ndarray  # [P, nnz_max] f8
+    diag: np.ndarray          # [P, Lmax_nod] f8  (gathered; unused at runtime)
+    P: int
+    nnz_max: int
+    Lmax_nod: int
+
+
+def partition_ssh_operator(op: SSHOperator, partition) -> ShardedSSHOperator:
+    """Partition the static global :class:`SSHOperator` by node ownership.
+
+    For each device keep the structural entries whose **row AND column are local
+    nodes** (interior+halo), remapped to local lanes; the matvec is then a local
+    ``segment_sum`` into ``[Lmax_nod]``. Owned rows are EXACT because the operator
+    loop-bound holds: every dropped owned-row entry (column outside the node halo)
+    has **exactly zero** value (verified on CORE2 dist_2/dist_4 — the operator keeps
+    the topological pattern incl. numeric zeros, and the far "wing" columns are all
+    zeros). The build **asserts** no NONZERO owned-row entry is dropped, so a mesh /
+    config that ever violated it would fail loudly rather than silently corrupt the
+    owned matvec. ``partition.npes == 1`` (``synth_serial``) is the identity remap ⇒
+    the per-device operator equals the dense one (the no-op invariant).
+    """
+    from .shard_mesh import local_sizes
+
+    rows_g = np.asarray(op.rows)
+    cols_g = np.asarray(op.cols)
+    sv_g = np.asarray(op.stiff_vals)
+    pv_g = np.asarray(op.precond_vals)
+    diag_g = np.asarray(op.diag)
+    N = op.n_nodes
+    P = partition.npes
+    nonzero = (sv_g != 0.0) | (pv_g != 0.0)
+
+    _, Lmax = local_sizes(partition)
+    Lmax_nod = Lmax["nod"]
+
+    sel_rows, sel_cols, sel_sv, sel_pv, nnz = [], [], [], [], []
+    diag_PL = np.full((P, Lmax_nod), 1.0, dtype=np.float64)
+    for d in range(P):
+        ml = np.asarray(partition.myList_nod2D[d])
+        md = int(partition.myDim_nod2D[d])
+        n_local = ml.size
+        g2l = np.full(N, -1, dtype=np.int64)
+        g2l[ml] = np.arange(n_local)
+        rl = g2l[rows_g]
+        cl = g2l[cols_g]
+        owned_row = (rl >= 0) & (rl < md)
+        dropped_nonzero = owned_row & (cl < 0) & nonzero
+        if dropped_nonzero.any():
+            raise ValueError(
+                f"partition_ssh_operator: device {d} drops "
+                f"{int(dropped_nonzero.sum())} NONZERO owned-row operator entries "
+                f"(column outside the node halo) — the SSH stencil exceeds the node "
+                f"halo; the local matvec would be incomplete on owned rows."
+            )
+        keep = (rl >= 0) & (cl >= 0)
+        sel_rows.append(rl[keep].astype(np.int32))
+        sel_cols.append(cl[keep].astype(np.int32))
+        sel_sv.append(sv_g[keep].astype(np.float64))
+        sel_pv.append(pv_g[keep].astype(np.float64))
+        nnz.append(int(keep.sum()))
+        diag_PL[d, :n_local] = diag_g[ml]
+
+    nnz_max = int(max(nnz))
+    rows_PL = np.zeros((P, nnz_max), dtype=np.int32)
+    cols_PL = np.zeros((P, nnz_max), dtype=np.int32)
+    sv_PL = np.zeros((P, nnz_max), dtype=np.float64)
+    pv_PL = np.zeros((P, nnz_max), dtype=np.float64)
+    for d in range(P):
+        k = nnz[d]
+        rows_PL[d, :k] = sel_rows[d]
+        cols_PL[d, :k] = sel_cols[d]
+        sv_PL[d, :k] = sel_sv[d]
+        pv_PL[d, :k] = sel_pv[d]
+
+    return ShardedSSHOperator(
+        rows=rows_PL, cols=cols_PL, stiff_vals=sv_PL, precond_vals=pv_PL,
+        diag=diag_PL, P=P, nnz_max=nnz_max, Lmax_nod=Lmax_nod,
+    )
+
+
+def local_ssh_operator(sop: ShardedSSHOperator, d: int) -> SSHOperator:
+    """Reconstruct device ``d``'s local :class:`SSHOperator` (host helper / tests).
+    Inside ``shard_map`` build the same object from the per-device sharded leaves."""
+    return SSHOperator(
+        rows=jnp.asarray(sop.rows[d]), cols=jnp.asarray(sop.cols[d]),
+        stiff_vals=jnp.asarray(sop.stiff_vals[d]),
+        precond_vals=jnp.asarray(sop.precond_vals[d]),
+        diag=jnp.asarray(sop.diag[d]), n_nodes=sop.Lmax_nod,
+    )
 
 
 def build_ssh_operator(
@@ -163,15 +296,32 @@ def build_ssh_operator(
     )
 
 
-def ssh_matvec(op: SSHOperator, x):
-    """``S @ x`` — the static stiffness matvec (``y[row] = Σ S[row,col]·x[col]``)."""
+def ssh_matvec(op: SSHOperator, x, halo: "SSHHalo | None" = None):
+    """``S @ x`` — the static stiffness matvec (``y[row] = Σ S[row,col]·x[col]``).
+
+    Distributed (``halo`` given, inside ``shard_map``): first **broadcast-exchange**
+    ``x`` (refresh the halo node copies from their owners — the C's "exchange ``pp``
+    before each SpMV"), then a LOCAL ``segment_sum`` into ``[Lmax_nod]``. Owned rows
+    come out COMPLETE because every nonzero column of an owned row is a local node
+    (the operator loop-bound, asserted in :func:`partition_ssh_operator`); halo rows
+    are incomplete but never trusted (overwritten by the next exchange). ``halo=None``
+    is the dense single-device path — byte-identical to ``v1.0``.
+    """
+    if halo is not None:
+        x = halo_exchange(x, halo.src_dev, halo.src_lane, halo.axis_name)
     return jax.ops.segment_sum(
         op.stiff_vals * x[op.cols], op.rows, num_segments=op.n_nodes
     )
 
 
-def ssh_precond(op: SSHOperator, r):
-    """``M⁻¹ @ r`` — the MITgcm symmetric preconditioner matvec (same pattern)."""
+def ssh_precond(op: SSHOperator, r, halo: "SSHHalo | None" = None):
+    """``M⁻¹ @ r`` — the MITgcm symmetric preconditioner matvec (same pattern).
+
+    Distributed: exchange ``r`` first (the C's "exchange ``rr`` after the residual
+    update", which is exactly before this preconditioner SpMV), then the local
+    ``segment_sum``. ``halo=None`` ⇒ dense (byte-identical)."""
+    if halo is not None:
+        r = halo_exchange(r, halo.src_dev, halo.src_lane, halo.axis_name)
     return jax.ops.segment_sum(
         op.precond_vals * r[op.cols], op.rows, num_segments=op.n_nodes
     )
@@ -223,7 +373,8 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
 # ==========================================================================
 # Substep 9 — preconditioned CG solve
 # ==========================================================================
-def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None):
+def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
+         reduce=None, n_global=None, return_iters=False):
     """Preconditioned CG, a literal port of ``fesom_ssh_solve_cg``
     (``fesom_ssh.c:384``). Stops at ``‖r‖/√N < soltol·‖b‖/√N`` (relative residual
     ``soltol``). ``x0`` is the initial guess; returns the (possibly early-stopped)
@@ -232,16 +383,28 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None):
     ``rtol_abs`` overrides the (RMS) stop threshold directly — used for the
     warm-started forward solve, where the C measures the residual against the
     **original** ``‖ssh_rhs‖`` rather than the deflated ``‖b_eff‖`` (see
-    :func:`solve_ssh`)."""
-    n = b.shape[0]
-    s0 = jnp.sum(b * b)
+    :func:`solve_ssh`).
+
+    Distributed CG (Phase 8, S.6): ``reduce`` is a global dot ``(u,v) → Σ_owned u·v``
+    then ``psum`` (so every dot/residual is a GLOBAL reduction, device-identical) and
+    ``n_global`` is the global node count for the residual RMS. The ``matvec``/
+    ``precond`` passed in halo-exchange ``x``/``r`` internally, so the loop body is
+    structurally unchanged. Because the residual is a ``psum`` it is identical on all
+    devices ⇒ the data-dependent ``while_loop`` trip count is device-identical (no
+    deadlock) and — load-bearing — matches the single-device count (review #1/#4).
+    ``reduce=None``/``n_global=None`` ⇒ the dense path (plain ``jnp.sum``,
+    ``n=b.shape[0]``), byte-identical to ``v1.0``. ``return_iters`` (diagnostic /
+    tests) also returns the iteration count; it leaves the default graph untouched."""
+    n = b.shape[0] if n_global is None else n_global
+    dot = (lambda u, v: jnp.sum(u * v)) if reduce is None else reduce
+    s0 = dot(b, b)
     rtol = (soltol * jnp.sqrt(s0 / n)) if rtol_abs is None else rtol_abs
 
     def run(_):
         r0 = b - matvec(x0)
         z0 = precond(r0)
-        resid0 = jnp.sqrt(jnp.sum(r0 * r0) / n)
-        sold0 = jnp.sum(r0 * z0)
+        resid0 = jnp.sqrt(dot(r0, r0) / n)
+        sold0 = dot(r0, z0)
 
         def cond(c):
             _x, _r, _z, _p, _s, resid, it = c
@@ -250,27 +413,35 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None):
         def body(c):
             x, r, z, p, s_old, _resid, it = c
             Ap = matvec(p)
-            al = s_old / jnp.sum(p * Ap)
+            al = s_old / dot(p, Ap)
             x = x + al * p
             r = r - al * Ap
             z = precond(r)
-            sp0 = jnp.sum(r * z)
-            sp1 = jnp.sum(r * r)
+            sp0 = dot(r, z)
+            sp1 = dot(r, r)
             resid = jnp.sqrt(sp1 / n)
             be = sp0 / s_old
             p = z + be * p
             return (x, r, z, p, sp0, resid, it + 1)
 
         init = (x0, r0, z0, z0, sold0, resid0, jnp.array(0))
-        x = lax.while_loop(cond, body, init)[0]
-        return x
+        final = lax.while_loop(cond, body, init)
+        return final if return_iters else final[0]
+
+    if return_iters:
+        zero_carry = (jnp.zeros_like(x0), jnp.zeros_like(b), jnp.zeros_like(b),
+                      jnp.zeros_like(b), jnp.zeros((), b.dtype),
+                      jnp.zeros((), b.dtype), jnp.array(0))
+        out = lax.cond(s0 > 0.0, run, lambda _: zero_carry, operand=None)
+        return out[0], out[6]
 
     # Zero rhs → d_eta = 0 (fesom_ssh.c:414), and avoids 0/0 in the recurrence.
     return lax.cond(s0 > 0.0, run, lambda _: jnp.zeros_like(x0), operand=None)
 
 
-def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, forward_tol: float = SOLTOL,
-              grad_tol: float = GRAD_SOLTOL, maxiter: int = MAXITER):
+def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = None,
+              forward_tol: float = SOLTOL, grad_tol: float = GRAD_SOLTOL,
+              maxiter: int = MAXITER):
     """Solve ``S·d_eta = ssh_rhs`` (substep 9), returning ``d_eta`` ``[nod2D]``.
 
     Forward: PCG to the loose ``forward_tol`` (``=soltol`` ⇒ matches the dump's
@@ -283,13 +454,22 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, forward_tol: float = SOLTOL,
     ``None`` ⇒ 0, the step-1 case). It is ``stop_gradient``-ed (the solution is
     mathematically independent of ``x0``) and folded into the rhs so the inner
     solve is a *linear* map of its argument — required by ``custom_linear_solve``.
+
+    Distributed (Phase 8, S.6): pass a :class:`SSHHalo` (with ``op`` a per-device
+    :func:`partition_ssh_operator` slice) and call inside ``shard_map``. The matvec/
+    precond then broadcast-exchange their input, the CG dots become global
+    (``psum``) reductions, and the residual RMS divides by the global node count —
+    so the early-stop iteration count is device-identical to single device (the
+    load-bearing determinism). ``halo=None`` is the dense single-device path,
+    byte-identical to ``v1.0`` (the gate stays the exact same graph). The
+    ``custom_linear_solve`` transpose runs sharded too (gradient checked in S.8).
     """
     n = op.n_nodes
     x0 = jnp.zeros((n,), ssh_rhs.dtype) if x0 is None else x0
     x0 = lax.stop_gradient(x0)
 
-    matvec = lambda x: ssh_matvec(op, x)        # noqa: E731
-    precond = lambda r: ssh_precond(op, r)      # noqa: E731
+    matvec = lambda x: ssh_matvec(op, x, halo)    # noqa: E731
+    precond = lambda r: ssh_precond(op, r, halo)  # noqa: E731
 
     # Solve for the correction δ = S⁻¹·b_eff from δ0=0 (linear), then d_eta = x0+δ.
     # For x0=0 (step 1) b_eff = ssh_rhs and this is exactly the C's solve-from-zero.
@@ -301,15 +481,22 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, forward_tol: float = SOLTOL,
     # the inner solve at ``soltol·‖ssh_rhs‖`` replicates the C's warm-started
     # early-stop exactly (a good warm start ⇒ b_eff already below threshold ⇒ 0
     # iters ⇒ d_eta = x0). Deriving rtol from ‖b_eff‖ instead would over-converge.
-    nrhs = ssh_rhs.shape[0]
-    rtol_fwd = forward_tol * jnp.sqrt(jnp.sum(ssh_rhs * ssh_rhs) / nrhs)
+    if halo is None:
+        nrhs = ssh_rhs.shape[0]
+        rtol_fwd = forward_tol * jnp.sqrt(jnp.sum(ssh_rhs * ssh_rhs) / nrhs)
+        reduce_fn, n_global = None, None
+    else:
+        reduce_fn = lambda u, v: global_dot(u, v, halo.owned_mask, halo.axis_name)
+        n_global = halo.n_global
+        rtol_fwd = forward_tol * jnp.sqrt(reduce_fn(ssh_rhs, ssh_rhs) / n_global)
 
     def solve(mv, b):           # forward: early-stopped (dump-matching)
         return _pcg(mv, precond, b, jnp.zeros_like(b), forward_tol, maxiter,
-                    rtol_abs=rtol_fwd)
+                    rtol_abs=rtol_fwd, reduce=reduce_fn, n_global=n_global)
 
     def transpose_solve(mv, b):  # reverse cotangent: tight (accurate gradient)
-        return _pcg(mv, precond, b, jnp.zeros_like(b), grad_tol, maxiter)
+        return _pcg(mv, precond, b, jnp.zeros_like(b), grad_tol, maxiter,
+                    reduce=reduce_fn, n_global=n_global)
 
     delta = jax.lax.custom_linear_solve(
         matvec, b_eff, solve, transpose_solve, symmetric=True
