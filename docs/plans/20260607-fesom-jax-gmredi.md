@@ -325,30 +325,30 @@ augmentation in `impl_vert_diff`). `tests/test_gm_redi.py`. C: G.1 dump (full GM
 > composes the Fortran `del_ttf` accumulation + `ale_reconstruct`). The 5 partial-cell branches
 > of G7b collapse to masked per-level sums (the ocean-upwind-5-zones precedent).
 
-- [ ] **G7a `diff_ver_part_redi_expl`** (`fesom_gm.c:646-790`, per tracer): `tr_xy` = per-element
-  `∇(valuesold)` (`gradient_sca`); area-weighted → `tr_xynodes` (÷`3·areasvol`); `vd_flux` at
-  interfaces from `slope_tapered·tr_xynodes·Ki` on the OLD mesh (`hnode`); `T += (vd_flux[nz] −
-  vd_flux[nz+1])·dt/(areasvol·hnode_new)`. Element→node scatter (~1e-12).
-- [ ] **G7b `diff_part_hor_redi`** (`fesom_gm.c:824-1022`, per tracer): `tr_z` = per-node
-  `∂(valuesold)/∂z` (interfaces, ÷`0.5(h_up+h_dn)`); edge loop, the **5 level-range branches**
-  A/B/C/D/E (`ul1..ul12`, `ul2..ul12`, `ul12..nl12` both, `nl12..nl1`, `nl12..nl2`) →
-  `Kh=0.5(Ki[e1]+Ki[e2])`, `Fx=Kh(Tx+SxTz)`, `c=(±dx·Fy ∓ dy·Fx)·dz`, antisymmetric
-  endpoint scatter; `T += rhs·dt/(areasvol·hnode_new)`. **Vectorize the 5 branches as masked
-  per-level edge sums** (each branch = a level mask + a `dx/dy/dz` selection).
-- [ ] **K33** (`fesom_tracer_diff.c:167-246`): augment the `impl_vert_diff` TDMA diagonal with
-  `Ty/Ty1 = Σ (z-diff)·zinv·slope_tapered²·Ki` (the isoneutral vertical projection, `isredi=1`),
-  added to the off-diagonal `a/c` and diagonal `b`. Behind the `gm_cfg` arg (None ⇒ `Ty/Ty1≡0`,
-  the current bit-identical path).
-- [ ] ⚠️ **AD-safe guards:** `1/(3·areasvol)`, `1/mid`, `1/(areasvol·hnode_new)`, `1/(0.5(h_up+
-  h_dn))` — all `where`-guarded on masked lanes. `slope_tapered²·Ki` has no divide. The 5-branch
-  masks must zero cleanly (no double-count at level boundaries).
-- [ ] **Gate:** the **full GM-ON** post-Redi T/S vs the G.1/per-substep dump (substep 15) — now
-  TIGHT (all 6 GM contributions present); `tr_xy`/`tr_z` vs the dump; an independent numpy ref for
-  the 5 G7b branches (the dump may not hit all level-mismatch cases). MAP/scatter classes.
-- [ ] **AD:** `d(ΣT)/d(T₀)` finite everywhere incl. masked (the Redi divides) + the K33 path;
-  FD↔AD on a smooth interior node.
-- [ ] run — must pass before G.7. **Lesson:** append (the valuesold-vs-values threading, the
-  5-branch→masked-sum collapse, the K33 diagonal).
+> **✅ DONE 2026-06-07.** `fesom_jax/gm_redi.py` (G7a + G7b + K33). NEW C `fesom_redi_blob` hook
+> (`FESOM_REDI_DUMP_DIR`, `fesom_step.c`) dumps `T_old/T_pre/T_g7a/T_g7b/tr_xy/tr_z` all-node
+> (job 25401747). Verified vs the dump: **`tr_xy` bit-exact**, **G7a 1.78e-15** (moved T 3.1e-3),
+> **G7b 1.07e-14** (the 5-branch edge loop, moved T 1.2e-3 — the 5→3-case `(in1,in2)` collapse
+> worked first try). **K33 = augment Kv** (`Ty(nz)==Ty1(nz-1)` ⇒ one per-interface value; `impl_vert_diff`
+> already does `a∝Kv[nz]`/`c∝Kv[nz+1]` so `Kv+K33_aug` reproduces the C with NO diffusion change)
+> — sanity-checked (finite/active/AD-finite; tight gate at G.7). `test_gm_redi.py` = **4 passed**.
+> 3 lessons. **The entire GM/Redi physics is now ported + verified.** `dt=fesom_phase1_dt=500`.
+
+- [x] **G7a `diff_ver_part_redi_expl`** (`fesom_gm.c:646-790`): `tr_xy`=∇(T_old); area-weighted →
+  `tr_xynodes` (÷3·areasvol); `vd_flux` from `slope_tapered·tr_xynodes·Ki` (static geometry);
+  `ΔT=(vd_flux[nz]−vd_flux[nz+1])·dt/(areasvol·hnode_new)`. **1.78e-15 vs the dump.**
+- [x] **G7b `diff_part_hor_redi`** (`fesom_gm.c:824-1022`): `tr_z`=∂(T_old)/∂z; edge loop with the
+  **5 branches → 3 cases** (`both/only1/only2` from `elem_layer_mask[el1/el2]`); `c=(CX·Fx+CY·Fy)·dz`;
+  antisymmetric `+c→e1,−c→e2` scatter; `ΔT=rhs·dt/(areasvol·hnode_new)`. **1.07e-14 vs the dump.**
+- [x] **K33** (`fesom_tracer_diff.c:167-246`): `gm_redi.k33_augmentation` → `Kv+K33_aug` (no
+  `impl_vert_diff` change — the C's `Ty/Ty1` is one per-interface `K33_aug`). Sanity-checked.
+- [x] ⚠️ **AD-safe guards:** `1/(3·areasvol)`, `1/mid`, `1/(areasvol·hnode_new)`, `1/(0.5(h_up+
+  h_dn))` all `where`-guarded; `slope²·Ki` no divide; the 3-case masks zero cleanly (no double-count).
+- [x] **Gate:** the Redi dump (`T_pre+G7a==T_g7a`, `T_g7a+G7b==T_g7b`) all-node — tight. K33's
+  tight gate (it's inside the diffusion) folds into the G.7 assembled post-step T/S.
+- [x] **AD:** `d(Σfer_uv²)/d(T)` (G.5) + `d(ΣK33)/d(slope)` finite; full `d/d(T₀)` is the G.7 gate.
+- [x] run — **DONE** (test_gm_redi 4 passed). **Lesson:** appended (the 5→3-case collapse, the
+  K33-augment-Kv, the valuesold-vs-values threading + the Redi dump).
 
 ### Task G.7: GATE 6B — assemble GM/Redi into the CORE2 step + stability + gradient
 

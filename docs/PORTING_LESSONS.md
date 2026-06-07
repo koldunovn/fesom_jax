@@ -1586,3 +1586,30 @@ Cite the C source (`file:line`) or dump probe that proves it.
   It returns `(fer_uv, slope_tapered, Ki, fer_K, fer_C)` — `fer_uv` drives the bolus (G.5),
   `slope_tapered`/`Ki` the Redi terms (G.6). `d(Σfer_uv²)/d(T)` through the full chain (incl. the
   TDMA) finite + nonzero. (`gm.gm_diagnostics`, G.5.)
+
+## Phase 6B — GM/Redi (Task G.6 — the Redi tracer terms)
+
+- **[gm/redi] ⚠️ G7b's 5 partial-cell branches A/B/C/D/E collapse to 3 CASES by level-membership
+  `(in1=nz∈el1, in2=nz∈el2)`: el1-only (A∪D), el2-only (B∪E), both (C).** A and D are the SAME
+  formula (el1-only, above vs below the overlap); B and E likewise. So per (edge, level) select
+  `(Tx, Ty, dz, CX, CY)` by the 3 cases (`both/only1/only2` from `elem_layer_mask[el1/el2]`):
+  `c = (CX·Fx + CY·Fy)·dz`, `Fx=Kh(Tx+SxTz)`; el1-only `CX=dyL,CY=−dxL`; el2-only `CX=−dyR,CY=dxR`;
+  both `CX=dyL−dyR,CY=dxR−dxL`. The node-endpoint `Kh/SxTz/SyTz` (the `COMPUTE_KH_TZ_S` macro) are
+  the SAME in all branches. Antisymmetric edge→node scatter (`+c→e1,−c→e2`), then
+  `÷(areasvol·hnode_new)`. **Matched the C at 1.07e-14 first try** — the same "5-zones→masked-sum"
+  collapse as the ocean upwind advection. (`gm_redi.diff_part_hor_redi`, `fesom_gm.c:824`, G.6.)
+
+- **[gm/redi] ⚠️ The Redi K33 is just "AUGMENT Kv" — `Ty(nz)==Ty1(nz-1)` is ONE per-interface value,
+  and `impl_vert_diff` already builds `a[nz]∝Kv[nz]`, `c[nz]∝Kv[nz+1]`, so passing `Kv+K33_aug`
+  reproduces the C's `a∝(Kv[nz]+Ty)`, `c∝(Kv[nz+1]+Ty1)` with NO change to the diffusion kernel.**
+  `K33_aug[k] = (geo_up·zinv)·s[k-1]²Ki[k-1] + (geo_dn·zinv)·s[k]²Ki[k]` (`s`=`slope_tapered[...,2]`
+  the |slope|, static linfs geometry). The (3,3) Redi-tensor term = the isoneutral vertical
+  diffusivity. (`gm_redi.k33_augmentation`, `fesom_tracer_diff.c:167-246`, G.6.)
+
+- **[gm/redi/verify] The G7a/G7b explicit terms read `valuesold` (the AB2 pre-step T) for their
+  gradients but APPLY to the post-advection T — gate by capturing T before/after each Redi piece
+  all-node.** The C composes the Fortran `del_ttf` accumulation + `ale_reconstruct`, so in JAX each
+  is a `delta` added to T with the `/(areasvol·hnode_new)` factor. The `fesom_redi_blob` hook
+  (`FESOM_REDI_DUMP_DIR`) dumps `T_old/T_pre/T_g7a/T_g7b/tr_xy/tr_z` all-node ⇒ gate `T_pre+G7a==
+  T_g7a`, `T_g7a+G7b==T_g7b` exactly (the dt is `fesom_phase1_dt`=the runtime 500, NOT a separate
+  constant). (`fesom_step.c fesom_redi_blob`, `test_gm_redi`, G.6.)
