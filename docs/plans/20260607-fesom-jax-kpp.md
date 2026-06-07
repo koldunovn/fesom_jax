@@ -245,33 +245,42 @@ require a smooth plateau through the discrete `kbl`.
 Each kernel: **port AD-safe → controlled-replay dump-gate vs C → tick + lesson**. (The C plan's K0–K11
 is the template; `port2/.../docs/plans/completed/20260524-kpp-vertical-mixing.md`.)
 
-- [ ] **K.0 — Scaffolding + reference dumps (NO behavior change).** New `fesom_jax/kpp.py` with
+- [x] **K.0 — Scaffolding + reference dumps (NO behavior change).** ✅ New `fesom_jax/kpp.py` with
   `KppConfig(NamedTuple)` (all §1 constants + derived `Vtc/cg/deltaz/deltau` ported verbatim from
-  `fesom_kpp.c:130-138`). Thread `kpp_cfg=None` through `step.py`/`integrate.py` (+ both
-  `static_argnames`), mirroring `gm_cfg`. Generate the C KPP reference dumps:
-  `port2/jobs/jax_kpp_dump_core2.sh` (mirror `jax_gm_dump_core2.sh`) with `FESOM_MIX_SCHEME=KPP` +
-  `FESOM_KPP_DUMP_DIR` + per-kernel replay inputs (`FESOM_KPP_REPLAY_DIR`) → `data/kpp_dump_core2/…`.
-  **Gate:** full suite green (`kpp_cfg=None` bit-identical); reference dumps exist + load via
-  `io_dump`. *(C side already built/validated — this is running it, not writing C.)*
-- [ ] **K.1 — `init`: lookup tables + derived constants.** Build the `wmt`/`wst` 2-D velocity-scale
-  tables (NNI×NNJ) + `Vtc,cg,deltaz,deltau`. Constant data → build once (numpy/jnp at config time,
-  clamp the `^{1/3}` base ≥0); no grad through the table. **Gate:** table + scalars match the C init
-  to ~1e-13.
-- [ ] **K.2 — `wscale`: turbulent velocity scales.** `kpp_wscale` (`:173-210`): bilinear table lookup
-  (continuous weights, `stop_gradient` the `int()` bin index) + the stable-analytic branch
-  (`jnp.where`). **Gate (controlled replay):** C-dumped `(zehat,us)` → `wm,ws` vs C ~1e-12.
-- [ ] **K.3 — `ri_iwmix`: interior mixing.** `kpp_ri_iwmix` (`:219-274`): shear `Ri=max(N²,0)/(shear+δ)`
-  → `frit=(1−min(Ri/Riinfty,1)²)³` → `viscA=visc_sh_limit·frit+A_bg`, `diffK=diff_sh_limit·frit+K_bg`.
-  **Gate (replay):** `viscA,diffKt,diffKs` vs C ~1e-12.
-- [ ] **K.4 — `ddmix`: double diffusion — GATE ONLY.** Port the `KPP_DOUBLE_DIFFUSION=0` no-op gate;
-  defer the body. **Gate:** confirmed no-op (CORE2 `double_diffusion=.false.`); document the gap.
-- [ ] **K.5 — pre-step (`dVsq`,`ustar`,`Bo`) + `dbsfc` + `bldepth` (HIGHEST RISK).** `dVsq` (`:792-809`);
-  `ustar` **safe-sqrt** (`:815`); `Bo` (`:816-820`). **ADD `dbsfc`** (the EOS surface-buoyancy
-  difference — mirror `fesom_eos.c`; AD-safe). `kpp_bldepth` (`:317-435`): vectorized bulk-Ri
-  threshold-crossing → `kbl` (stop-grad) + differentiable `hbl` interp; Ekman/Monin-Obukhov limits
-  (`:389-397`); `caseA` (`:433`). **Gate (controlled replay):** C-dumped `(dVsq,ustar,Bo,bvfreq,dbsfc,
-  sw_3d)` → `hbl,kbl,bfsfc,caseA` vs C. (Live-run will diff at ~half the nodes from the step-1 forcing
-  transient — replay is the gate.)
+  `fesom_kpp.c:130-138` — **bit-match the C dump**). Threaded `kpp_cfg=None` through
+  `step.py`/`integrate.py` (+ both `static_argnames` + the pi/CORE2 eager+scan bodies), mirroring
+  `gm_cfg` — verified `kpp_cfg=None ⇔ KppConfig()` bit-identical (max|Δ|=0) through `step_jit` +
+  `integrate`. Generated the C KPP reference dumps: `port2/jobs/jax_kpp_dump_core2.sh` (KPP, GM OFF,
+  ice OFF; 57 s, ~890 MB text) → `data/kpp_dump_core2/…` (per-kernel `*_rank0.txt` + `kpp_init` +
+  `kpp_wscale`); reader added (`io_dump.{read_kpp_table,load_kpp_dump,load_kpp_init,
+  load_kpp_wscale_sweep}`). **Bonus:** the wm/ws 892×480 table + the 4 derived scalars recompute
+  bit-exactly (max|Δ|=0) vs the dump ⇒ K.1's builder is pre-validated. **Gate:** reference dumps exist
+  + load ✅; full suite green (`sbatch run_suite.sbatch`) — *(C side already built/validated — this was
+  running it, not writing C.)*
+- [x] **K.1 — `init`: lookup tables + derived constants.** ✅ `kpp.build_wscale_tables` (the `wmt`/`wst`
+  892×482 tables, `lru_cache`d host-numpy constant → jnp; `^{1/3}` base clamped ≥0 in discarded lanes,
+  exact) + `Vtc,cg,deltaz,deltau` in `KppConfig`. **Gate:** tables max|Δ|=1.7e-18, scalars BIT-match
+  the C init dump (`test_kpp_wscale.py`).
+- [x] **K.2 — `wscale`: turbulent velocity scales.** ✅ `kpp.wscale` (`:173-210`): bilinear lookup
+  (`jnp.trunc` bin index = zero-grad discrete; **`ufrac`/`zfrac` use the UNCLAMPED numerator** ⇒ ustar
+  beyond UMAX extrapolates, the key fidelity subtlety) + the stable-analytic branch (`jnp.where`, safe
+  denom). **Gate (controlled replay):** C sweep (201×101) → `wm,ws` max|Δ|=4.3e-13/8.6e-13 (stable
+  region exact); AD finite incl. the ustar=0 column.
+- [x] **K.3 — `ri_iwmix`: interior mixing.** ✅ `kpp.ri_iwmix` (`:219-274`): shear `Ri=max(N²,0)/
+  (shear+δ)` → `frit=(1−min(Ri/Riinfty,1)²)³` → `viscA=visc_sh_limit·frit+A_bg`, `diffKt=diffKs=
+  diff_sh_limit·frit+K_bg`, edge copies nzmin/nzmax. **Gate (replay):** vs C dump max|Δ|=0 (BIT-EXACT,
+  shear=0 step-1) + synthetic cubic-frit (3e-18) + AD finite. (`test_kpp_ri_iwmix.py`.)
+- [x] **K.4 — `ddmix`: double diffusion — GATE ONLY.** ✅ `kpp.assert_no_double_diffusion` — no-op for
+  CORE2 (`double_diffusion=.false.`), raises if enabled (the C `#error` analog). `ghats` computed in
+  K.6 but `use_kpp_nonlclflx=False` ⇒ not wired. **Gate:** confirmed no-op + raises-if-on.
+- [x] **K.5 — pre-step (`dVsq`,`ustar`,`Bo`) + `dbsfc` + `bldepth` (HIGHEST RISK).** ✅
+  `kpp.prestep`: `dVsq` (=0 at cold-start step 1), `ustar` = `sqrt(sqrt(τx²+τy²)/ρ0)` (both nested
+  sqrts `_safe_sqrt`, τ=0 AD finite), `Bo` (formulas bit-exact). `eos.compute_dbsfc` (the missing EOS
+  input) bit-exact (max|Δ|=0) vs the C dump (gated via the GM dump's step-1 T/S). `kpp.bldepth`:
+  two masked first-crossings (`Rib_k>Ricr→kbl1`+hbl interp; `|zbar|>hbl→kbl`), `stop_gradient` the
+  integer kbl + differentiable hbl weight, Ekman/MO clamp, `caseA`. **Extended the C dump
+  (jax-mesh-export) with `sw_3d`+`sw_alpha`** for the replay. **Gate (controlled replay):** hbl 6.5e-12,
+  **kbl 0/126858 mismatches**, bfsfc 8.6e-23, stable/caseA EXACT; AD finite. (`test_kpp_bldepth.py`.)
 - [ ] **K.6 — `blmix`: BL coeffs + cubic shape + `dkm1` + `ghats`.** `kpp_blmix` (`:449-579`): base
   velocity scales; matching level `kn` (stop-grad); interior value+one-sided slope at `hbl`
   (`2·max(dvdz,0)`); `gat1/dat1` match (`dat1=min(dat1,0)`, `f1=bfsfc/(u*⁴+δ)`); cubic shape over
@@ -326,6 +335,28 @@ functioning model is complete** → Phase 7a (differentiable parameter tuning,
 ---
 
 ## Revision Log
+
+- **2026-06-07 — K.1–K.5 DONE (tables → wscale → ri_iwmix → ddmix gate → pre-step/dbsfc/bldepth).**
+  All controlled-replay dump-gated vs the C + AD-finite, 14 new tests green (`test_kpp_wscale.py`,
+  `test_kpp_ri_iwmix.py`, `test_kpp_bldepth.py`). Highlights: the wm/ws table + 4 scalars bit-match
+  (1.7e-18); wscale forward bit-faithful (4e-13, the `ufrac` beyond-UMAX extrapolation subtlety) + AD
+  finite incl. ustar=0; ri_iwmix BIT-EXACT (max|Δ|=0, shear=0 step-1) + synthetic cubic frit; ddmix a
+  no-op gate; **bldepth (the highest-risk OBL search) matched the C on the FIRST try — hbl 6.5e-12, kbl
+  0/126858 mismatches, bfsfc 8.6e-23, stable/caseA exact** (two masked first-crossings, stop-grad kbl +
+  differentiable hbl interp); `eos.compute_dbsfc` bit-exact (the one missing EOS input). The C KPP dump
+  was extended (jax-mesh-export) with `sw_3d`+`sw_alpha` for the bldepth replay (rebuilt + rerun).
+  **Next: K.6 `blmix`** (BL coeffs + cubic shape + dkm1 + ghats — the C's hardest replay, hit 3.18e-13).
+
+- **2026-06-07 — K.0 DONE (scaffolding + reference dumps).** `fesom_jax/kpp.py` + `KppConfig` (all §1
+  constants + the 4 derived scalars, bit-matching the C dump). `kpp_cfg=None` threaded through
+  `step.py`/`integrate.py` exactly like `gm_cfg` — bit-identical regression verified locally
+  (`kpp_cfg=None ⇔ KppConfig()`, max|Δ|=0 through `step_jit` + the checkpointed `integrate`). The C KPP
+  reference dump generated (`jax_kpp_dump_core2.sh`: KPP / GM-OFF / ice-OFF, single-rank, 57 s, ~890 MB
+  text) and the `io_dump` readers added + validated against the real data: init scalars bit-match
+  `KppConfig`, the 892×480 wm/ws table recomputes at max|Δ|=0 (pre-validates K.1), the wscale sweep +
+  per-kernel tags load with single-rank gid-identity (JAX node `i` ↔ gid `i+1`), sane values
+  (ustar≥0, hbl∈[0.04,790] m, caseA/stable∈{0,1}). Full-suite green pending the compute-node job.
+  Lessons appended (`PORTING_LESSONS.md`, "Phase 6C — KPP (Task K.0)").
 
 - **2026-06-07 — Created.** Phase 6C (KPP) sub-plan written from a full research pass: `fesom_kpp.c`
   (1046 lines) + `.h` algorithmic breakdown; the mixing seam on both sides (`pp.py`→`step.py`→solvers;

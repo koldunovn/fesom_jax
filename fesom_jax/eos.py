@@ -262,3 +262,52 @@ def compute_sw_alpha_beta(mesh: Mesh, T, S):
     sw_beta = ops.mask_below_bottom(beta, mesh.node_layer_mask)
     sw_alpha = ops.mask_below_bottom(a_over_b * beta, mesh.node_layer_mask)
     return sw_alpha, sw_beta
+
+
+# --- dbsfc (surface-buoyancy difference) — KPP bldepth input, Phase 6C K.5 --------
+# Mirror of fesom_pressure_bv's dbsfc block (fesom_eos.c:116-158 =
+# oce_ale_pressure_bv.F90:314-339). Only KPP reads it (PP skips it — hence it was
+# absent until Phase 6C); computed unconditionally here, AD-clean (ρ_insitu≈1030 ⇒ no
+# singular denominator, unlike the bvfreq 1/Δz).
+
+
+def compute_dbsfc(mesh: Mesh, T, S):
+    """Surface-buoyancy difference ``dbsfc`` for the KPP boundary-layer-depth search.
+
+    Per node/level ``dbsfc[nz] = −g·(ρ_surf(z) − ρ_insitu(z)) / ρ_insitu(z)`` where
+    ``z = Z[nz]`` (mid-layer depth), ``ρ_insitu(z)`` is the in-situ density at ``z``
+    (the :func:`_insitu` form, NOT minus ρ0), and ``ρ_surf(z)`` is the **surface**
+    parcel's JM-EOS components (``b0/bpz/bpz2/rhopot`` at ``nzmin``) brought
+    adiabatically to depth ``z``. ``T``/``S`` are ``[nod2D, nl]``.
+
+    Computed on the layer range with ``dbsfc[nzmin]=0`` (automatic — the surface parcel
+    at its own depth equals the in-situ value) and ``dbsfc[nzmax]=dbsfc[nzmax-1]``
+    (bottom fill), masked to the interface range (``node_iface_mask`` = ``[nzmin,
+    nzmax]``) — the array the KPP ``bldepth`` consumes as ``Ritop = zk·dbsfc[nz]``.
+    ``fesom_eos.c:138``.
+    """
+    g = G
+    nl = mesh.nl
+    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])           # (nl,) pad invalid tail
+    z = Zp[None, :]                                        # (1, nl)
+    b0, bpz, bpz2, rhopot = jm_components(T, S)            # each (nod2D, nl)
+
+    r_full = _insitu(b0, bpz, bpz2, rhopot, z)            # in-situ density at z (NOT −ρ0)
+
+    # surface (nzmin) parcel components, brought to depth z
+    nzmin = (mesh.ulevels_nod2D - 1).reshape(-1, 1)       # (nod2D,1); 0 for CORE2 (no cavity)
+    b0_s = jnp.take_along_axis(b0, nzmin, axis=1)         # (nod2D,1)
+    bpz_s = jnp.take_along_axis(bpz, nzmin, axis=1)
+    bpz2_s = jnp.take_along_axis(bpz2, nzmin, axis=1)
+    rhopot_s = jnp.take_along_axis(rhopot, nzmin, axis=1)
+    rho_surf = _insitu(b0_s, bpz_s, bpz2_s, rhopot_s, z)  # (nod2D,nl) surface parcel at z
+
+    dbsfc = -g * (rho_surf - r_full) / r_full
+
+    # bottom-fill nzmax←nzmax-1 (the layer formula is valid on [nzmin,nzmax-1]); the
+    # surface nzmin is already 0; mask to the iface range.
+    k = jnp.arange(nl).reshape(1, -1)
+    hi = (mesh.nlevels_nod2D - 2).reshape(-1, 1)          # = nzmax-1
+    idx = jnp.clip(k, nzmin, hi)
+    dbsfc = jnp.take_along_axis(dbsfc, idx, axis=1)
+    return ops.mask_below_bottom(dbsfc, mesh.node_iface_mask)

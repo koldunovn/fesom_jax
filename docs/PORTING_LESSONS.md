@@ -1714,3 +1714,134 @@ Cite the C source (`file:line`) or dump probe that proves it.
   static-config gate exactly (`kpp_cfg=None ⇒ PP bit-identical`); it is STATELESS (no new `State`
   fields, like GM); double diffusion + nonlocal flux are GATE-ONLY for CORE2. (Phase 6C planning,
   `docs/plans/20260607-fesom-jax-kpp.md`.)
+
+## Phase 6C — KPP (Task K.0 — scaffolding + reference dumps)
+
+- **[kpp/scaffold] `kpp_cfg=None` threads bit-identically exactly like `gm_cfg` — verified `kpp_cfg=None
+  ⇔ KppConfig()` give max|ΔT|=max|Δuv|=0 through both `step_jit` AND the checkpointed `integrate`
+  (scan body).** `KppConfig(NamedTuple)` is plain Python scalars/bools ⇒ hashable ⇒ a valid
+  `static_argname` (the GM/ice precedent); KPP carries NO differentiable leaves of its own (the
+  seam tunables stay in `Params`; `Ricr`/`visc_sh_limit`/backgrounds become Phase-7a targets there).
+  Threaded `step.py` (`:53` sig, `step_jit`+`run` static_argnames) + `integrate.py` (sig, both the pi
+  eager+scan and CORE2 eager+scan bodies, `integrate_jit` static_argnames). The arg is THREADED but
+  UNUSED through K.0 (the `if kpp_cfg: kpp.mixing_kpp` gate is K.8) — an unused static arg is free.
+  (`fesom_jax/kpp.py`, `step.py`, `integrate.py`, K.0.)
+
+- **[kpp/init] ⚠️ The derived scalars `Vtc/cg/deltaz/deltau` AND the full 892×480 wm/ws lookup table
+  recompute BIT-EXACTLY (max|Δ|=0) vs the C dump — so K.1's table builder is already pre-validated by
+  the K.0 reader check.** Compute the derived scalars at module load with `math.sqrt`/`math.pow` (the
+  same libm routines the C `pow()` calls ⇒ bit-equal), VERBATIM from `fesom_kpp.c:130-138` (do NOT
+  re-derive Vtc/cg from a paper — research disagreed; trust the C association). They are frozen at the
+  CORE2 values in `KppConfig` (NOT auto-recomputed from the tuple's own fields — re-derive if Ricr/concv
+  change under Phase-7a). The table-build `pow(conas·u³−concs·zehat, 1/3)` base can go negative → the
+  K.1 builder must clamp ≥0 (the table is a constant → build once, freeze, no grad). (`kpp.py`
+  `_VTC`/`_CG`/`_DELTAZ`/`_DELTAU`, `io_dump.load_kpp_init`, K.0/K.1.)
+
+- **[kpp/dump] The C KPP dump is plain TEXT (not the GM `.f64` binary): one `kpp_dump_s<step>_<tag>_rank<R>.txt`
+  per kernel field + `kpp_init_rank0.txt` + `kpp_wscale_rank0.txt`.** Run single-rank (`--ntasks=1`),
+  so `*_rank0.txt` carries every node (gid 1..N) in `myList` order, and (single-rank) JAX node `i` ↔
+  global gid `i+1` (the GM-gate node alignment, made explicit) — `load_kpp_dump` reorders by gid
+  (`out[gid-1]=row`, robust to partition order; verified gids are the identity here). Fast parse via
+  `np.fromstring(sep=' ')` (1.5 s for the 90 MB `dVsq`). The dump job isolates KPP (`FESOM_MIX_SCHEME=KPP`,
+  GM OFF, ice OFF — the controlled-replay gate feeds C inputs so config doesn't affect validity; ice OFF
+  drops EVP noise) — 57 s, ~890 MB text, all step-1. A 10-comp `iceforce` ice-debug tag shares the dir
+  (reuses the harness; harmless — gates request named tags). (`jax_kpp_dump_core2.sh`,
+  `io_dump.{read_kpp_table,load_kpp_dump,load_kpp_init,load_kpp_wscale_sweep}`, K.0.)
+
+## Phase 6C — KPP (Tasks K.1 + K.2 — lookup tables + wscale)
+
+- **[kpp] The wm/ws lookup tables (892×482) + the 4 derived scalars are bit-exact CONSTANTS
+  (max|Δ|=1.7e-18 / 0 vs the C init dump) — build once (`lru_cache` on `cfg`, host numpy → jnp
+  constant, no grad through the table).** The `pow(·,1/3|1/4|1/2)` base is positive in every KEPT
+  branch lane (verified analytically: `conas·u³−concs·zehat ≥ 70·|zehat|` when `zeta≤zetas`;
+  `conam·u³−concm·zehat>0` for `zehat<0`; `1−conc2·zeta`/`1−conc3·zeta>0` since `zeta<0`), so
+  `np.power(np.maximum(base,0), …)` only suppresses NaN in DISCARDED `np.where` lanes ⇒ the clamp is
+  exact. (`kpp.build_wscale_tables`, `fesom_kpp.c:140-165`, K.1.)
+
+- **[kpp/⚠️BUG] `wscale`'s bilinear `zfrac`/`ufrac` use the UNCLAMPED numerator minus the CLAMPED
+  integer index (`fesom_kpp.c:184-191`) — so ustar beyond the table's `UMAX=0.04` EXTRAPOLATES
+  LINEARLY (`ufrac>1`), it is NOT a clamped table edge.** I first clamped `uq=min(udiff/deltau,nnj)`
+  and used `uq` for BOTH the index and the frac → at `ustar=0.05` got `vonk·0.04=0.0159` vs the C's
+  `vonk·0.05=0.02`. The fix: `ju=trunc(min(uq_raw,nnj))` (clamped index) but `ufrac=uq_raw−ju`
+  (UNCLAMPED numerator). `zfrac` was already right (numerator `zq` never clamped; only `iz` is). The
+  remaining table-region residual (4.3e-13) is this extrapolation amplifying the table's ~1e-15
+  last-ULP by `ufrac≈121` (the C's libm class); the stable region (`zehat>0`) is EXACT (0.0). *Lesson:
+  in a clamped table lookup, check whether the fractional weight uses the clamped or the raw
+  coordinate — FESOM extrapolates, so the raw one. Strong wind drives ustar≈0.2 ≫ UMAX, so this
+  extrapolation path is HOT, not a corner case.* (`kpp.wscale`, K.2.)
+
+- **[kpp/ad] `wscale` AD is finite everywhere incl. the ustar=0 zero-wind column: the `(int)` bin
+  index is `jnp.trunc` (zero grad a.e. ⇒ discrete selection carries no cotangent), the bilinear
+  weights stay differentiable ⇒ the gradient is the table's piecewise-linear slope; the stable-branch
+  denom gets a `jnp.where`-safe dummy (`=1`) in the masked unstable lanes so the unused branch can't
+  emit a `0·inf` masked-NaN.** Gated via the C `kpp_wscale_rank0.txt` sweep (201×101 over
+  zehat∈[−1e-6,1e-6], ustar∈[0,0.05]) — spans table/stable/clamp/zero-wind. (`kpp.wscale`,
+  `test_kpp_wscale.py`, K.2.)
+
+## Phase 6C — KPP (Tasks K.3 + K.4 — interior mixing + ddmix gate)
+
+- **[kpp] `ri_iwmix` matches the C dump BIT-EXACTLY (max|Δ|=0 over 3.8M iface points) — but only
+  because step-1 `uvnode=0` (cold start) ⇒ shear=0 ⇒ `frit∈{0,1}` (a pure `sign(N²)` map).** The
+  shear=0 dump exercises the edge copies + masking + the static-instability (N²<0→frit=1) branch but
+  NOT the intermediate cubic `frit=(1−min(Ri/Riinfty,1)²)³` ⇒ add a SYNTHETIC test (a linear
+  u-profile sets a controlled shear, N² targets Ri across (0,Riinfty)) — matched 3e-18. The C's
+  two-pass scratch (pass-1 Ri edge copies are FULLY overwritten by pass-2 viscA/diffK edge copies,
+  since pass 2 reads only the interior Ri) collapses to a single edge-copy-of-the-result
+  (`take_along_axis` with `clip(k, nzmin+1, nzmax-1)`). `diffKt is diffKs` (the `Kv0_const` branch ⇒
+  one array for both). Output range = `node_iface_mask` = `[nzmin,nzmax]` (KPP FILLS surface+bottom
+  via edge copies, unlike PP which leaves them 0). (`kpp.ri_iwmix`, `fesom_kpp.c:219`, K.3.)
+
+- **[kpp/ad] `ri_iwmix`'s `Ri=max(N²,0)/(shear+epsln)` epsln=1e-40 is forward-inert AND backward-safe
+  in practice.** Any realistic shear `(Δu/Δz)²≫1e-40` so epsln never bites the forward; where
+  `shear→0` the outcome is `frit∈{0,1}` with a CLAMPED (`min`) or ZERO (`max(N²,0)=0`) ratio whose
+  `d(ratio)/d(Ri)=0` ⇒ no `1/epsln²` blow-up at the relevant lanes (and dry lanes have N²=0→Ri=0). The
+  dz reciprocal is clamped `where(dz==0,1,dz)` (the surface k=0 + the bottom-pad duplicate, both
+  masked) to kill the `1/0` Inf the `pp`/`eos` shear pattern would otherwise leave in discarded lanes.
+  d/d(uvnode), d/d(bvfreq) finite. (`kpp.ri_iwmix`, K.3.)
+
+- **[kpp] K.4 `ddmix` (double diffusion) + the nonlocal flux are GATE-ONLY for CORE2** —
+  `assert_no_double_diffusion(cfg)` is a no-op (`double_diffusion=False`) and raises `NotImplementedError`
+  if enabled (the C `#error` analog, `fesom_kpp.c:828-831`); `ghats` is *computed* in blmix (K.6) but
+  `use_kpp_nonlclflx=False` ⇒ never wired into the tracer flux. (`kpp.assert_no_double_diffusion`, K.4.)
+
+## Phase 6C — KPP (Task K.5 — pre-step + dbsfc + bldepth, the highest-risk kernel)
+
+- **[kpp/⭐] `bldepth` (the OBL bulk-Ri search, historically the buggiest KPP kernel) VECTORIZES
+  cleanly + matched the C on the FIRST try: hbl 6.5e-12, kbl 0/126858 mismatches, bfsfc 8.6e-23,
+  stable/caseA EXACT.** The key realization: `Rib_k[nz]` has NO inter-level dependence — each level is
+  a pure function of its own forcing (bfsfc/zehat/ws/Vtsq/Ritop/dVsq at nz) — so the C's two
+  sequential per-node loops become two **masked first-crossings** (`jnp.argmax` of a bool = first
+  True): loop 1 `Rib_k>Ricr → kbl1` + interpolated hbl, loop 2 `|zbar|>hbl → kbl`. The only sequential
+  quantity, `Rib_km1`, is the gather `Rib_k[kbl-1]` with a `Rib_k[nzmin]=0` SENTINEL so a first-level
+  crossing recovers the C's `Rib_km1=0` init. (`kpp.bldepth`, `fesom_kpp.c:317`, K.5.)
+
+- **[kpp/⚠️] The loop-1-end bfsfc (feeding the Ekman/Monin-Obukhov gate) = bfsfc at kbl1 in BOTH the
+  crossed AND never-crossed cases — no case split needed.** In the never-crossed case the C's final
+  sw-interp-to-hbl collapses to `sw_3d[nzmax]` (the interp fraction → 1 exactly when
+  `hbl=|zbar[nzmax]|`), which equals the top-of-loop bfsfc at nzmax = bfsfc at kbl1 (kbl1=nzmax). So a
+  single gather `Bo+coeff_sw·(sw_surf−sw_3d[kbl1])` reproduces it. The Ekman/MO clamp
+  `max(min(hbl,hlimit),|zbar[1]|)` applies only where `bfsfc1>0 && nzmin==0` (stabilizing forcing). The
+  final-loop bfsfc interp uses SIGNED zbar `(hbl+zbar_km1)/(zbar_km1−zbar_k)`. (`kpp.bldepth`, K.5.)
+
+- **[kpp/ad] bldepth AD finite everywhere (d/d{dVsq,Bo,bvfreq,dbsfc,sw_3d}): stop_gradient the integer
+  kbl1/kbl, keep the hbl interp weight `(Ricr−Rib_prev)/(Rib_at−Rib_prev+ε)` differentiable, `_heaviside`
+  = `0.5+copysign(0.5,x)` for stable/caseA (zero-grad regime switch), `_safe_sqrt(|bvfreq|)` in Vtsq.**
+  Gradients are large (d/dBo ~1e10 — the hbl interp + `hmonob/(bfsfc+ε)` amplify) but FINITE; the
+  masked-NaN gate K.10 confirms end-to-end. (`kpp.bldepth`, K.5.)
+
+- **[kpp/⚠️] `ustar = sqrt( sqrt(τx²+τy²) / ρ0 )` is TWO nested sqrts, BOTH hitting 0 at zero wind
+  (inner `sqrt(τ²)`, outer `sqrt(·/ρ0)`) ⇒ BOTH need `_safe_sqrt`.** The plan's "`sqrt(sqrt(|τ|/ρ0))`"
+  notation is loose — it is the standard `sqrt(|τ_vec|/ρ0)` with `|τ_vec|=sqrt(τx²+τy²)` (exponent 0.5
+  on the magnitude, NOT 0.25 — a test-math trap I hit). d/d(stress) at τ=0 finite (the #1 AD priority —
+  ustar is in many downstream u*³/u*⁴ denominators). `dVsq=0` at the cold-start step 1 (uv=0; dump
+  ~2e-30). (`kpp.prestep`, `fesom_kpp.c:792-821`, K.5.)
+
+- **[kpp/eos] `dbsfc = −g·(ρ_surf(z)−ρ_insitu(z))/ρ_insitu(z)` (the surface parcel brought adiabatically
+  to z vs in-situ) is AD-clean (ρ_insitu≈1030 ⇒ no singular denom, unlike bvfreq's 1/Δz) and bit-exact
+  (max|Δ|=0) vs the C dump.** Gated via the GM dump's step-1 T/S — the SAME PHC IC (the EOS runs on the
+  pre-mixing state, so the mixing scheme is irrelevant; GM-dump=PP, KPP-dump=KPP, identical step-1 T/S).
+  `dbsfc[surface]=0` automatic (surface parcel at its own depth). Added to `eos.py` (only KPP reads it —
+  PP skipped it, hence absent until now). **Extended the C KPP dump (jax-mesh-export) with `sw_3d` +
+  `sw_alpha`** (bldepth reads them live — not previously dumped) so the controlled-replay has ALL its
+  inputs; surgical C edit + rebuild + rerun (1 min). (`eos.compute_dbsfc`, `fesom_eos.c:138`,
+  `jax_kpp_dump_core2.sh`, K.5.)

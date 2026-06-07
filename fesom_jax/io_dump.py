@@ -191,6 +191,140 @@ def load_gm_dump(dirpath: Union[str, Path]) -> tuple[dict, dict]:
     return fields, meta
 
 
+# ---------------------------------------------------------------------------
+# KPP reference dumps (Phase 6C) — the C ``fesom_kpp.c`` dump harness writes
+# plain-text files (NOT the binary GM ``.f64`` blobs): one file per (step, tag,
+# rank), keyed by 1-based global id. The dump job (``jax_kpp_dump_core2.sh``)
+# runs single-rank, so ``*_rank0.txt`` carries every node/element (gid 1..N) and
+# row order is the partition's ``myList`` order; we reorder by gid into JAX mesh
+# index order (``out[gid-1] = row``) — robust regardless of the partition order,
+# and (single-rank) JAX node index ``i`` ↔ global gid ``i+1`` (the GM-gate node
+# alignment, made explicit). Three file kinds:
+#   * ``kpp_dump_s<step>_<tag>_rank<R>.txt`` — per-kernel node/element columns
+#     (``# step=.. tag=.. rank=.. N=.. ncomp=..`` header + ``gid v0 v1 …`` lines).
+#   * ``kpp_init_rank0.txt``  — Vtc/cg/deltaz/deltau scalars + the wm/ws lookup
+#     table (``i j wmt wst``, row-major in i; K.1 gate).
+#   * ``kpp_wscale_rank0.txt`` — the wscale sweep (``i j zehat ustar wm ws``; K.2 gate).
+# ---------------------------------------------------------------------------
+
+# tag → ncomp / entity, for reference + selective loading (the per-kernel gates
+# request only the few tags they need; the full all-node set is ~GB of text).
+KPP_NODE_TAGS = (
+    "prestep", "dVsq", "dbsfc",                       # K.5 bldepth inputs (prestep=ustar,Bo)
+    "ri_viscA", "ri_diffKt", "ri_diffKs", "ri_bvfreq",  # K.3 ri_iwmix outputs (+ bvfreq input)
+    "bldepth",                                         # K.5 outputs: hbl, kbl+1, bfsfc, stable, caseA
+    "blmc_m", "blmc_t", "blmc_s", "bl_ghats", "dkm1",   # K.6 blmix outputs (pre-enhance)
+    "viscA", "diffKt", "diffKs", "ghats",              # K.7 final (post-combine) node outputs
+)
+KPP_ELEM_TAGS = ("viscAE",)                            # K.7 final element viscosity (= Av)
+
+
+def _parse_kpp_header(line: str) -> dict:
+    """Parse a ``# step=1 tag=viscA rank=0 N=126858 ncomp=48`` header line."""
+    if not line.startswith("#"):
+        raise IOError(f"KPP dump: expected '# step=...' header, got {line!r}")
+    out: dict = {}
+    for tok in line.lstrip("#").split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    for k in ("step", "rank", "N", "ncomp"):
+        out[k] = int(out[k])
+    return out
+
+
+def read_kpp_table(path: Union[str, Path]) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Read one ``kpp_dump_s<step>_<tag>_rank<R>.txt`` → ``(gids, values, meta)``.
+
+    ``gids`` is ``int64[N]`` (1-based global ids, in file/``myList`` order),
+    ``values`` is ``float64[N, ncomp]`` (same order), ``meta`` the parsed header.
+    Uses ``np.fromstring`` (C parser) for the large all-node files."""
+    path = Path(path)
+    with open(path) as fh:
+        meta = _parse_kpp_header(fh.readline())
+        flat = np.fromstring(fh.read(), sep=" ", dtype=np.float64)
+    N, ncomp = meta["N"], meta["ncomp"]
+    if flat.size != N * (1 + ncomp):
+        raise ValueError(
+            f"KPP dump {path.name}: {flat.size} numbers != N*(1+ncomp)={N*(1+ncomp)}")
+    flat = flat.reshape(N, 1 + ncomp)
+    return flat[:, 0].astype(np.int64), np.ascontiguousarray(flat[:, 1:]), meta
+
+
+def load_kpp_dump(
+    dirpath: Union[str, Path], tags: Iterable[str] | None = None,
+    *, step: int = 1, rank: int = 0, reorder: bool = True,
+) -> tuple[dict, dict]:
+    """Read the per-kernel KPP node/element dumps for ``(step, rank)``.
+
+    ``tags`` selects which to load (the per-kernel gate names the few it needs; the
+    full set is ~GB of text). ``None`` ⇒ every ``kpp_dump_s<step>_*_rank<rank>.txt``
+    present. Returns ``(fields, meta)``: ``fields[tag]`` is ``float64[N, ncomp]`` in
+    **JAX mesh index order** (``reorder`` reindexes by gid: ``out[gid-1]=row``) — the
+    gate slices/masks per its layer convention. ``meta`` maps each tag to its header
+    ``{N, ncomp}`` and records ``gids_identity`` (whether the file was already in
+    ``gid==row+1`` order — the single-rank expectation)."""
+    d = Path(dirpath)
+    if tags is None:
+        tags = sorted(p.name.split("_rank")[0].split(f"s{step}_", 1)[1]
+                      for p in d.glob(f"kpp_dump_s{step}_*_rank{rank}.txt"))
+    fields: dict = {}
+    meta: dict = {}
+    for tag in tags:
+        path = d / f"kpp_dump_s{step}_{tag}_rank{rank}.txt"
+        if not path.is_file():
+            raise FileNotFoundError(f"KPP dump tag {tag!r} missing: {path}")
+        gids, values, hdr = read_kpp_table(path)
+        N = hdr["N"]
+        identity = bool(np.array_equal(gids, np.arange(1, N + 1)))
+        if reorder and not identity:
+            out = np.empty_like(values)
+            if not np.array_equal(np.sort(gids), np.arange(1, N + 1)):
+                raise ValueError(f"KPP dump {tag}: gids are not a permutation of 1..{N}")
+            out[gids - 1] = values
+            values = out
+        fields[tag] = values
+        meta[tag] = {"N": N, "ncomp": hdr["ncomp"], "gids_identity": identity}
+    return fields, meta
+
+
+def load_kpp_init(dirpath: Union[str, Path]) -> dict:
+    """Read ``kpp_init_rank0.txt`` → the 4 derived scalars + the ``wmt``/``wst``
+    lookup tables (each ``float64[nni+2, nnj+2]``, row-major in i). K.1 gate."""
+    d = Path(dirpath)
+    path = d / "kpp_init_rank0.txt"
+    with open(path) as fh:
+        out: dict = {}
+        # 4 scalar comment lines: "# Vtc <val>", …
+        for _ in range(4):
+            toks = fh.readline().lstrip("#").split()
+            out[toks[0]] = float(toks[1])
+        hdr = fh.readline()                          # "# i j wmt wst  (nni=890 nnj=480)"
+        nni = int(hdr.split("nni=")[1].split()[0])
+        nnj = int(hdr.split("nnj=")[1].split(")")[0])
+        body = np.fromstring(fh.read(), sep=" ", dtype=np.float64).reshape(-1, 4)
+    out["nni"], out["nnj"] = nni, nnj
+    out["wmt"] = body[:, 2].reshape(nni + 2, nnj + 2)
+    out["wst"] = body[:, 3].reshape(nni + 2, nnj + 2)
+    return out
+
+
+def load_kpp_wscale_sweep(dirpath: Union[str, Path]) -> dict:
+    """Read ``kpp_wscale_rank0.txt`` → ``zehat``/``ustar``/``wm``/``ws`` over the
+    fixed sweep grid (each ``float64[NZ, NU]``, row-major in i). K.2 gate."""
+    d = Path(dirpath)
+    path = d / "kpp_wscale_rank0.txt"
+    with open(path) as fh:
+        hdr = fh.readline()                          # "# i j zehat ustar wm ws  (sweep 201x101)"
+        nz, nu = (int(x) for x in hdr.split("sweep")[1].split(")")[0].strip().split("x"))
+        body = np.fromstring(fh.read(), sep=" ", dtype=np.float64).reshape(-1, 6)
+    return {
+        "NZ": nz, "NU": nu,
+        "zehat": body[:, 2].reshape(nz, nu), "ustar": body[:, 3].reshape(nz, nu),
+        "wm": body[:, 4].reshape(nz, nu), "ws": body[:, 5].reshape(nz, nu),
+    }
+
+
 def _summary_main(argv: list[str]) -> int:  # pragma: no cover - debug CLI
     if not argv:
         print("usage: python -m fesom_jax.io_dump <dumpfile> [more...]")

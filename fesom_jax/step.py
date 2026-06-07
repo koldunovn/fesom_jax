@@ -50,7 +50,8 @@ S_FLOOR = 0.5
 
 def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
          *, dt: float = DT_DEFAULT, is_first_step: bool = False,
-         step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None) -> State:
+         step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
+         kpp_cfg=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -81,7 +82,16 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     isoneutral term augments ``Kv`` in the vertical diffusion. GM/Redi is **stateless** (no
     new ``State`` fields — recomputed each step from T/S/N²). The differentiable ceilings
     ``k_gm``/``redi_kmax`` enter via ``params`` (the 2nd ML-hook seam). ``gm_cfg=None`` ⇒
-    a dead branch (no trace) ⇒ the pi/Phase-5/ice path is **bit-identical**."""
+    a dead branch (no trace) ⇒ the pi/Phase-5/ice path is **bit-identical**.
+
+    **KPP (Phase 6C).** ``kpp_cfg`` (a :class:`fesom_jax.kpp.KppConfig`, static/hashable —
+    the ``gm_cfg``/``ice_cfg`` precedent) selects the **K-Profile Parameterization** — the
+    *real* FESOM2 CORE2 default vertical mixing — in place of PP at the mixing seam
+    (substep 4): KPP recomputes the OBL profile each step from N²/forcing and emits the same
+    ``(Kv, Av)`` PP does. Like GM/Redi it is **stateless** (no new ``State`` fields) and, like
+    ice, a **CORE2 forced-path feature** (it needs ``heat_flux``/``water_flux``/wind stress →
+    ``ustar``/``Bo`` → the OBL depth). ``kpp_cfg=None`` ⇒ the existing PP branch,
+    **byte-identical**. Wiring lands in Task K.8; through K.0 the arg is threaded but unused."""
     st = state
     if params is None:
         params = Params.defaults()
@@ -224,12 +234,14 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 # Jitted entry point (the Task-2.11 deliverable; also what Phase 3's lax.scan wraps).
 # ``mesh``/``op``/``state``/``stress_surf`` are pytree args; ``dt``/``is_first_step``
 # are static (the latter ⇒ two compiled variants: the step-1 AB2 branch and the rest).
-step_jit = jax.jit(step, static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg"))
+step_jit = jax.jit(step,
+                   static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg", "kpp_cfg"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         params: Params = None, *, dt: float = DT_DEFAULT,
-        step_forcings=None, forcing_static=None, ice_cfg=None, gm_cfg=None) -> State:
+        step_forcings=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
+        kpp_cfg=None) -> State:
     """Run ``n_steps`` jitted forward steps from ``state`` (a plain Python loop;
     Phase 3 adds :func:`fesom_jax.integrate.integrate`, a checkpointed ``lax.scan``,
     for the differentiable path). ``is_first_step`` is set on the first iteration
@@ -242,5 +254,6 @@ def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         sf = None if step_forcings is None else jax.tree.map(lambda x: x[i], step_forcings)
         state = step_jit(state, mesh, op, stress_surf, params, dt=dt,
                          is_first_step=(i == 0), step_forcing=sf,
-                         forcing_static=forcing_static, ice_cfg=ice_cfg, gm_cfg=gm_cfg)
+                         forcing_static=forcing_static, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
+                         kpp_cfg=kpp_cfg)
     return state
