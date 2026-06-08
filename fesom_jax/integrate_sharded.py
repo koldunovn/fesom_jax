@@ -150,16 +150,45 @@ def unfold_state(folded: State, P: int) -> State:
 # --------------------------------------------------------------------------
 # The shard_map wrapper (npes==1 no-op scaffold; halo/splits are the rest of S.7)
 # --------------------------------------------------------------------------
-def _halo_arrays(sm: ShardedMesh) -> tuple[dict, dict]:
+_RKINDS = ("nod", "elem", "edge")
+
+
+def _halo_arrays(sm: ShardedMesh, ragged: bool = False) -> tuple[dict, dict]:
     """Fold the per-kind exchange maps + the node owned-mask to ``[P*Lmax_kind]``
-    ``shard_map`` inputs + their all-``'p'`` spec dict."""
+    ``shard_map`` inputs + their all-``'p'`` spec dict. With ``ragged=True`` (Phase 8b)
+    ALSO fold the :class:`~fesom_jax.shard_mesh.RaggedExchange` maps for the halo-only
+    ``ragged_all_to_all`` path (left out when ``ragged=False`` ⇒ the all_gather traces
+    are byte-unchanged)."""
     ha: dict = {}
-    for k in ("nod", "elem", "edge"):
+    for k in _RKINDS:
         src_dev, src_lane = sm.exchange[k]
         ha[f"sd_{k}"] = _fold(src_dev).astype(jnp.int32)
         ha[f"sl_{k}"] = _fold(src_lane).astype(jnp.int32)
+        if ragged:
+            r = sm.exchange_ragged[k]
+            ha[f"rsi_{k}"] = _fold(r.send_idx).astype(jnp.int32)
+            ha[f"rss_{k}"] = _fold(r.send_sizes).astype(jnp.int32)
+            ha[f"rso_{k}"] = _fold(r.send_offsets).astype(jnp.int32)
+            ha[f"roo_{k}"] = _fold(r.out_offsets).astype(jnp.int32)
+            ha[f"rrs_{k}"] = _fold(r.recv_sizes).astype(jnp.int32)
+            ha[f"rrg_{k}"] = _fold(r.recv_gather).astype(jnp.int32)
+            ha[f"rhm_{k}"] = _fold(r.halo_mask)
     ha["owned_nod"] = _fold(sm.owned_mask["nod"])
     return ha, {k: _P for k in ha}
+
+
+def _ragged_ctx(h: dict) -> dict:
+    """Re-assemble the per-device :class:`RaggedExchange` dict (inside ``shard_map``)
+    from the folded halo-arrays ``h`` — the ``{kind: {...}}`` :class:`HaloCtx` consumes."""
+    return {k: {"send_idx": h[f"rsi_{k}"], "send_sizes": h[f"rss_{k}"],
+                "send_off": h[f"rso_{k}"], "out_off": h[f"roo_{k}"],
+                "recv_sizes": h[f"rrs_{k}"], "recv_gather": h[f"rrg_{k}"],
+                "halo_mask": h[f"rhm_{k}"]} for k in _RKINDS}
+
+
+def _recv_max(sm: ShardedMesh) -> dict:
+    """Per-kind static recv-buffer extent for ``ragged_all_to_all`` (closed into the body)."""
+    return {k: sm.exchange_ragged[k].recv_max for k in _RKINDS}
 
 
 def run_gm_diag_sharded(sm: ShardedMesh, T_p, S_p, bvfreq_p, hnode_new_p, helem_p,
@@ -200,7 +229,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      stress_p, *, dt: float, is_first_step: bool, npes: int,
                      wire_halo: bool = True, params=None, step_forcing=None,
                      forcing_static=None, ice_cfg=None, gm_cfg=None,
-                     kpp_cfg=None, boundary_node_p=None) -> State:
+                     kpp_cfg=None, boundary_node_p=None, use_ragged: bool = False) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
     return the ``[P, Lmax, …]`` next State.
 
@@ -261,14 +290,17 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                             out_specs=fs_spec, check_vma=False)(fm, fs, fop, fstress, *extras)
         return unfold_state(out, npes)
 
-    ha, ha_spec = _halo_arrays(sm)
+    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged)
+    recv_max = _recv_max(sm) if use_ragged else None
 
     def body(m, s, o, stress, h, *ex):
         exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
         ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
                            owned_mask=h["owned_nod"], n_global=n_global, axis_name="p")
         ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
-                      owned_mask={"nod": h["owned_nod"]})
+                      owned_mask={"nod": h["owned_nod"]},
+                      exch_ragged=_ragged_ctx(h) if use_ragged else None,
+                      recv_max=recv_max, use_ragged=use_ragged)
         return _run(m, s, o, stress, ctx, ex)
 
     out = jax.shard_map(body, mesh=jmesh,
@@ -279,7 +311,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
 
 def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       stress_p, n_steps: int, *, dt: float, npes: int, params=None,
-                      gm_cfg=None, kpp_cfg=None) -> State:
+                      gm_cfg=None, kpp_cfg=None, use_ragged: bool = False) -> State:
     """Multi-step (S.7 part 3): step-1 eager (``is_first_step=True``) + ``lax.scan`` of steps
     2..N under ONE ``shard_map`` — the :func:`fesom_jax.integrate.integrate` pattern, sharded.
     Returns the ``[P, Lmax, …]`` final State after ``n_steps``.
@@ -299,14 +331,17 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     fstress = _fold(stress_p)
     jmesh = halo.device_mesh(devices=jax.devices()[:npes])
     n_global = sm.nod2D
-    ha, ha_spec = _halo_arrays(sm)
+    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged)
+    recv_max = _recv_max(sm) if use_ragged else None
 
     def body(m, s, o, stress, h):
         exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
         ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
                            owned_mask=h["owned_nod"], n_global=n_global, axis_name="p")
         ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
-                      owned_mask={"nod": h["owned_nod"]})
+                      owned_mask={"nod": h["owned_nod"]},
+                      exch_ragged=_ragged_ctx(h) if use_ragged else None,
+                      recv_max=recv_max, use_ragged=use_ragged)
 
         def one(carry, is_first):
             return stepmod.step(carry, m, o, stress, params, dt=dt, is_first_step=is_first,

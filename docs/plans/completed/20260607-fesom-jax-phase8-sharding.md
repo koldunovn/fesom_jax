@@ -445,9 +445,9 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 
 ### S.10: [Final] Docs + handoff
 
-- [ ] update `docs/NEXT_SESSION_PROMPT.md` (Phase 8 done → the multi-node / climate follow-up, or Phase 7a).
-- [ ] append the final Phase-8 lessons to `docs/PORTING_LESSONS.md`; tag `v1.1-multi-gpu`.
-- [ ] move this plan to `docs/plans/completed/`.
+- [x] update `docs/NEXT_SESSION_PROMPT.md` (Phase 8 done → Phase 8b scaling fork).
+- [x] append the final Phase-8 lessons to `docs/PORTING_LESSONS.md` (the S.9 lesson); tag `v1.1-multi-gpu`.
+- [x] move this plan to `docs/plans/completed/`.
 
 ---
 
@@ -496,6 +496,16 @@ multi-rank port is functional (`MPI_PORT_REPORT.md`: "dist_8 partition correctne
 long-run drift = chaotic Allreduce-order, not a per-substep bug → validates the per-substep gate choice).
 Task ladder S.1→S.10: reader → sharded-mesh → exchange primitive → scatter gate → reductions → CG → wire
 `shard_map` → AD gate → the 2–4 device GATE → docs.
+
+### #15 — S.10 COMPLETE: Phase 8 closed, tagged `v1.1-multi-gpu` (2026-06-08)
+Phase 8 (multi-GPU/multi-core via `shard_map` + halos) is **DONE**: the FESOM2→JAX model is N-vs-1
+forward- and gradient-correct, validated on real A100s. Tagged **`v1.1-multi-gpu`** (the multi-GPU baseline,
+the sharding analog of `v1.0-single-gpu`). Final Phase-8 lessons in `PORTING_LESSONS.md`;
+`NEXT_SESSION_PROMPT.md` pivoted to the **Phase 8b** scaling fork. This plan moves to
+`docs/plans/completed/`. ⚠️ The headline caveat carried into 8b: the `all_gather` halo (`halo.py`) is
+**O(P·N_local)** — correct but non-scaling; **Phase 8b STEP 0 = replace it with `ragged_all_to_all`**
+(point-to-point neighbour exchange; the `com_struct` slist/rlist is already in `partit.py`), gated by the
+S.7/S.8 oracles, before any farc→dars→NG5 scaling numbers mean anything.
 
 ### #14 — S.9 COMPLETE: the model runs CORRECTLY on real A100s (2026-06-08)
 First time the sharded model touched real GPUs (NCCL, not CPU fake-devices). `scripts/phase8_s9_gpu.sbatch`

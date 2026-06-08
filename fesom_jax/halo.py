@@ -58,10 +58,19 @@ class HaloCtx:
     axis_name: str
     ssh_halo: object     # ssh.SSHHalo (kept opaque to avoid a circular import)
     owned_mask: dict     # {kind: [Lmax] bool}
+    # --- Phase 8b B.0: the halo-only ragged_all_to_all path (None ⇒ all_gather) ---
+    exch_ragged: dict = None    # {kind: {send_idx, send_sizes, send_off, out_off,
+    #                                     recv_sizes, recv_gather, halo_mask}} per-device arrays
+    recv_max: dict = None       # {kind: int} static recv-buffer leading dim
+    use_ragged: bool = False    # pick ragged_all_to_all over all_gather
 
     def exchange(self, field, kind: str):
         """Broadcast-refresh ``field``'s halo lanes from their owners (a no-op on
-        interior + pad lanes), for the given entity ``kind``."""
+        interior + pad lanes), for the given entity ``kind``. Uses the halo-only
+        ``ragged_all_to_all`` path when ``use_ragged`` (Phase 8b), else ``all_gather``."""
+        if self.use_ragged and self.exch_ragged is not None:
+            return halo_exchange_ragged(
+                field, self.exch_ragged[kind], self.recv_max[kind], self.axis_name)
         src_dev, src_lane = self.exch[kind]
         return halo_exchange(field, src_dev, src_lane, self.axis_name)
 
@@ -77,6 +86,34 @@ def halo_exchange(field, src_dev, src_lane, axis_name: str = DEFAULT_AXIS):
     """
     gathered = lax.all_gather(field, axis_name, axis=0, tiled=False)  # [P, Lmax, *rest]
     return gathered[src_dev, src_lane]
+
+
+def halo_exchange_ragged(field, r: dict, recv_max: int, axis_name: str = DEFAULT_AXIS):
+    """One broadcast halo exchange via **halo-only point-to-point**
+    ``lax.ragged_all_to_all`` (Phase 8b B.0) — the scaling replacement for
+    :func:`halo_exchange`'s ``all_gather``. Called inside ``shard_map``; ``field`` is
+    this device's ``[Lmax, *rest]`` local array, ``r`` its per-device ragged maps
+    (:class:`~fesom_jax.shard_mesh.RaggedExchange`, folded to this shard), ``recv_max``
+    the static recv-buffer extent. Returns the refreshed ``[Lmax, *rest]`` (halo lanes
+    overwritten by their owner's value; interior + pad lanes untouched).
+
+    Each device ships only its boundary lanes to the neighbours that need them
+    (``operand = field[send_idx]``), exchanges them point-to-point, and reads the
+    received values back per lane (``recv[recv_gather]``), overwriting halo lanes via
+    ``halo_mask``. All three steps (gather / ``ragged_all_to_all`` / gather-back +
+    masked select) are linear in ``field`` with registered transposes ⇒ the reverse
+    pass scatter-adds each halo cotangent back to its owner (the AD gate's oracle)."""
+    rest = field.shape[1:]
+    operand = field[r["send_idx"]]                                   # [send_max, *rest]
+    output = jnp.zeros((recv_max,) + rest, dtype=field.dtype)        # [recv_max, *rest]
+    recv = lax.ragged_all_to_all(
+        operand, output,
+        r["send_off"], r["send_sizes"],        # input_offsets, send_sizes
+        r["out_off"], r["recv_sizes"],         # output_offsets (= recv_offsets.T row), recv_sizes
+        axis_name=axis_name)                                         # [recv_max, *rest]
+    gathered = recv[r["recv_gather"]]                                # [Lmax, *rest]
+    mask = r["halo_mask"].reshape(r["halo_mask"].shape + (1,) * len(rest))
+    return jnp.where(mask, gathered, field)
 
 
 def device_mesh(axis_name: str = DEFAULT_AXIS, devices=None) -> Mesh:
@@ -116,4 +153,32 @@ def run_halo_exchange(field_PL, src_dev_PL, src_lane_PL, jmesh: Mesh,
         mesh=jmesh, in_specs=(spec, spec, spec), out_specs=spec,
     )
     out = fn(field, sdev.astype(jnp.int32), slane.astype(jnp.int32))
+    return _unfold(out, P, Lmax)
+
+
+def run_halo_exchange_ragged(field_PL, rmap, jmesh: Mesh,
+                             axis_name: str = DEFAULT_AXIS):
+    """Standalone :func:`halo_exchange_ragged` (the B.0 gate + standalone use): run the
+    halo-only ``ragged_all_to_all`` exchange on a stacked ``[P, Lmax, *rest]`` field via
+    ``shard_map``. ``rmap`` is the kind's :class:`~fesom_jax.shard_mesh.RaggedExchange`
+    (global ``[P, …]`` arrays); ``jmesh`` must have ``P`` devices on ``axis_name``."""
+    field, P, Lmax = _fold(field_PL)
+    recv_max = int(rmap.recv_max)
+    fold0 = lambda a: _fold(np.asarray(a))[0]
+    si = fold0(rmap.send_idx).astype(jnp.int32)
+    ss = fold0(rmap.send_sizes).astype(jnp.int32)
+    so = fold0(rmap.send_offsets).astype(jnp.int32)
+    oo = fold0(rmap.out_offsets).astype(jnp.int32)
+    rs = fold0(rmap.recv_sizes).astype(jnp.int32)
+    rg = fold0(rmap.recv_gather).astype(jnp.int32)
+    hm = fold0(rmap.halo_mask)
+    spec = PartitionSpec(axis_name)
+
+    def f(fld, si, ss, so, oo, rs, rg, hm):
+        r = {"send_idx": si, "send_sizes": ss, "send_off": so, "out_off": oo,
+             "recv_sizes": rs, "recv_gather": rg, "halo_mask": hm}
+        return halo_exchange_ragged(fld, r, recv_max, axis_name)
+
+    fn = jax.shard_map(f, mesh=jmesh, in_specs=(spec,) * 8, out_specs=spec)
+    out = fn(field, si, ss, so, oo, rs, rg, hm)
     return _unfold(out, P, Lmax)

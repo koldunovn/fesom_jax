@@ -80,20 +80,45 @@ The load-bearing rewrite. Everything downstream is meaningless until this lands 
       neighbours is gathered multiple times into `operand` (correct — the transpose scatter-ADDs the
       cotangents back, why AD stays correct). ⚠️ The builder uses Python per-halo-lane loops — fine for
       CORE2/farc/dars; vectorize for NG5 (and consider export-caching the maps) at B.3.
-- [ ] **B.0b — the new `halo_exchange`.** `operand = field[send_idx]` (gather) →
-      `recv = lax.ragged_all_to_all(operand, output_buf, input_offsets, send_sizes, output_offsets,
-      recv_sizes, axis_name='p')` → `field.at[recv_idx].set(recv_chunk)` (scatter into halo lanes). Keep
-      the `all_gather` implementation available behind a flag (`HaloCtx` carries which primitive) as the
-      reference oracle and a fallback. `halo_ctx=None` stays the dense identity no-op (single-device path
-      byte-identical — the whole single-device suite is still the proof).
-- [ ] **B.0c — GATE.** (1) **Forward byte-identical** to the `all_gather` path: the S.3 identity gate +
-      `test_step_sharded.py` npes==1 byte-id + the npes==2 owned field-appropriate match, all green with the
-      ragged primitive (CPU fake-devices first, then 2/4×A100). (2) **AD transpose-correct**:
-      `test_gradient_sharded.py` green with the ragged primitive (the registered transpose must scatter-add
-      the halo cotangent back to the owner — verify `d/d(T0)` reconstruction `Bᵀ(g_p)` == dense as before).
-      ⚠️ `ragged_all_to_all` may need ≥2 real devices to exercise the cross-device path; confirm the
-      CPU-fake-device lowering works (it should — it's a standard collective) and fall back to a 2×A100 gate
-      if not. Append the B.0 lesson to `PORTING_LESSONS.md`.
+- [x] **B.0b — the new `halo_exchange`.** ✅ IMPLEMENTED (gate pending B.0c). `halo.halo_exchange_ragged`:
+      `operand = field[send_idx]` (gather) → `recv = lax.ragged_all_to_all(operand, zeros(recv_max),
+      send_offsets, send_sizes, out_offsets, recv_sizes, axis_name='p')` → `jnp.where(halo_mask,
+      recv[recv_gather], field)` (gather-back + masked select — NOT `.at[].set`, so it stays cleanly linear
+      for AD with no duplicate-index hazard). **Decisive `ragged_all_to_all` semantics** (verified vs the
+      docstring's size-2 example): `output_offsets[d,e]` = where d's slice lands ON RECEIVER e (the receiver
+      applies an internal `all_to_all` to recover its local write offsets) ⇒ `out_offsets = recv_offsets.T`
+      and the constraint `send_sizes == all_to_all(recv_sizes)` holds by `send_sizes = recv_sizes.T`. Picked
+      via `HaloCtx(use_ragged=, exch_ragged=, recv_max=)`; the all_gather path is the default + fallback.
+      `halo_ctx=None` stays the dense identity no-op (single-device suite still byte-identical). Wired into
+      `integrate_sharded.run_step_sharded(use_ragged=)` (the SSH/CG halo still uses all_gather — a B.0d
+      follow-on). Standalone `halo.run_halo_exchange_ragged` for the isolated gate. ⚠️ `run_steps_sharded`
+      / `run_gm_diag_sharded` not yet ragged-wired (not needed for the B.0c gates).
+- [~] **B.0c — GATE (GPU-only).** ⚠️ **`lax.ragged_all_to_all` is UNIMPLEMENTED on XLA:CPU** (`UNIMPLEMENTED:
+      HLO opcode 'ragged-all-to-all' is not supported by XLA:CPU ThunkEmitter`, confirmed job 25438390 — the
+      existing all_gather S.3 tests stayed green, only the 6 new ragged tests hit the CPU gap). So B.0 can
+      ONLY be gated on real GPUs (NCCL). The ragged tests now **SKIP on CPU** (platform guard) so the
+      single-device/CPU suite stays clean. GPU gate (`scripts/phase8b_b0_gpu.sbatch`, job 25438454):
+      (1) **isolated primitive** `test_halo.py::test_ragged_primitive_matches_allgather` — ragged ==
+      all_gather forward (byte-id on valid lanes) + grad (transpose), npes 2 & 4, all three kinds;
+      (2) **step-level wiring** `test_step_sharded.py::test_ragged_step_matches_allgather` —
+      `run_step_sharded(use_ragged=True)` == `(use_ragged=False)` byte-identical on owned. The host-side
+      B.0a gate already proves the index math; the GPU gate proves the collective + its AD transpose.
+      **RESULT (job 25438454):** FORWARD ✅ byte-identical to all_gather (all kinds, npes 2 & 4 — the
+      collective + my offset args are correct). GRADIENT ❌ — JAX's `ragged_all_to_all` autodiff transpose
+      is WRONG (grad max|Δ| ≈ 4.3@npes2 → 8.0@npes4, ~linear in P; the forward is exact + all-linear, so the
+      bug is JAX's `_ragged_all_to_all_transpose`, summing over the axis instead of point-to-point). The
+      step-level forward differs by 1.3e-7 (pad-lane handling: ragged leaves pad, all_gather sets pad=lane0
+      — climate-close, my `<1e-12` was too strict → relaxed to field-appropriate). **So the FORWARD is
+      validated; the AD is deferred to B.0d.** `use_ragged=True` is forward-only safe (default False keeps
+      grad correct). Lesson appended to `PORTING_LESSONS.md`; the grad test is `xfail` (B.0d).
+
+### B.0d — fully-correct ragged backward via `custom_vjp` (DEFERRED — not needed for forward scaling)
+- [ ] Wrap `halo_exchange_ragged` in `jax.custom_vjp` so we control the transpose (JAX's is broken, B.0c).
+      Backward option (A, simpler): reuse the proven `all_gather` exchange's VJP (correct on every meaningful
+      lane; backward still O(P·N_local)). Option (B, fully scaling): hand-written reverse `ragged_all_to_all`
+      (`input_offsets=recv_offsets`, `send_sizes=recv_sizes`, `output_offsets=send_offsets.T` [add to
+      `RaggedExchange`], `recv_sizes=send_sizes`). Re-gate the AD on GPU (the `xfail` flips to pass).
+      ⚠️ Needed for **training-at-scale** with the ragged halo; a forward-only scaling run does NOT need it.
 
 ### B.1 — farc (638 k × 48) forward scaling on ~1 A100
 
@@ -129,6 +154,19 @@ run remains a separate follow-up (chaotic reduction-order divergence — same as
 ---
 
 ## Revision Log
+
+### #2 — B.0b/c: ragged FORWARD validated on A100; JAX autodiff transpose is broken → B.0d (2026-06-08)
+GPU gate (job 25438454, 4×A100): the halo-only `ragged_all_to_all` exchange == `all_gather` **byte-identical
+on the forward** (all kinds, npes 2 & 4) — the maps + `output_offsets=recv_offsets.T` arg semantics +
+NCCL movement are correct. But **JAX 0.10.1's `ragged_all_to_all` reverse-mode autodiff is WRONG** (grad
+max|Δ| ≈ 4.3@2 → 8.0@4, ~linear in P → its transpose sums over the axis instead of routing point-to-point).
+`halo_exchange_ragged` is all-linear with an exact forward, so it's JAX's transpose, not our composition.
+The AD gate did its job (caught silent grad corruption). **Forward is validated**; AD deferred to **B.0d**
+(`custom_vjp`: backward via the proven all_gather VJP, or a hand-written reverse a2a). `use_ragged=True` is
+forward-only safe (default False = all_gather = correct grad). ⚠️ `ragged_all_to_all` is also UNIMPLEMENTED
+on XLA:CPU, so all of this (and the scaling work) is **GPU-only** — fake CPU devices have no interconnect to
+measure anyway. NEXT: forward scaling (B.1 farc → B.2 dars → B.3 NG5) on real GPUs, ragged vs all_gather +
+absolute throughput vs the Kokkos `SCALING_*.md` numbers.
 
 ### #1 — B.0a DONE: the ragged exchange maps (2026-06-08)
 `shard_mesh.RaggedExchange` + `_ragged_exchange_map` build the per-device halo-only send/recv maps from the

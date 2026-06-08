@@ -233,16 +233,23 @@ class RaggedExchange:
     (the ``input_offsets``/``output_offsets`` ``ragged_all_to_all`` wants)."""
 
     send_idx: np.ndarray      # [P, send_max] int32 — local interior lanes to gather
-    send_sizes: np.ndarray    # [P, P] int32
-    send_offsets: np.ndarray  # [P, P] int32 — exclusive cumsum of send_sizes (axis 1)
-    recv_idx: np.ndarray      # [P, recv_max] int32 — local halo lanes to scatter into
-    recv_sizes: np.ndarray    # [P, P] int32
+    send_sizes: np.ndarray    # [P, P] int32 — send_sizes[d,e] = #lanes d ships to e
+    send_offsets: np.ndarray  # [P, P] int32 — input_offsets: exclusive cumsum of send_sizes (axis 1)
+    recv_idx: np.ndarray      # [P, recv_max] int32 — local halo lanes per recv-buffer slot
+    recv_sizes: np.ndarray    # [P, P] int32 — recv_sizes[d,e] = #lanes d gets from e
     recv_offsets: np.ndarray  # [P, P] int32 — exclusive cumsum of recv_sizes (axis 1)
+    # --- the extras the in-shard_map ragged_all_to_all primitive consumes ---
+    out_offsets: np.ndarray   # [P, P] int32 == recv_offsets.T — ragged_all_to_all `output_offsets`
+    #                           (out_offsets[d,e] = where d's slice lands on receiver e = recv_offsets[e,d])
+    recv_gather: np.ndarray   # [P, Lmax] int32 — inverse of recv_idx: per lane, its recv-buffer slot (0 if
+    #                           not a halo lane; masked out by halo_mask)
+    halo_mask: np.ndarray     # [P, Lmax] bool — True on halo lanes (md ≤ lane < n_local); the exchange
+    #                           overwrites these with the gathered owner value, leaves interior+pad as-is
     send_max: int
     recv_max: int
 
 
-def _ragged_exchange_map(mylists, mydim, owner, owner_local) -> RaggedExchange:
+def _ragged_exchange_map(mylists, mydim, Lmax: int, owner, owner_local) -> RaggedExchange:
     """Build the :class:`RaggedExchange` for one entity kind from the owner map
     (the same ``owner``/``owner_local`` :func:`_exchange_map` uses)."""
     P = len(mylists)
@@ -279,14 +286,21 @@ def _ragged_exchange_map(mylists, mydim, owner, owner_local) -> RaggedExchange:
             for _lane, ol in recv_pairs[e][d]:
                 send_idx[d, pos] = ol
                 pos += 1
+    recv_gather = np.zeros((P, Lmax), dtype=np.int32)   # per lane → its recv-buffer slot
+    halo_mask = np.zeros((P, Lmax), dtype=bool)
     for e in range(P):                                  # recv buffer, ordered by source d
         pos = 0
         for d in range(P):
             for lane, _ol in recv_pairs[e][d]:
                 recv_idx[e, pos] = lane
+                recv_gather[e, lane] = pos              # inverse map for the gather-back
                 pos += 1
+        md = int(mydim[e])
+        halo_mask[e, md:mylists[e].size] = True         # halo lanes [md, n_local)
+    out_offsets = recv_offsets.T.copy()                 # ragged_all_to_all `output_offsets`
     return RaggedExchange(send_idx, send_sizes, send_offsets,
-                          recv_idx, recv_sizes, recv_offsets, send_max, recv_max)
+                          recv_idx, recv_sizes, recv_offsets,
+                          out_offsets, recv_gather, halo_mask, send_max, recv_max)
 
 
 # --------------------------------------------------------------------------
@@ -341,7 +355,8 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
         valid_mask[k] = lane[k] < nlc
         owner, owner_local = _owner_map(mylist[k], mydim[k], gcount[k])
         exchange[k] = _exchange_map(mylist[k], mydim[k], Lmax[k], owner, owner_local)
-        exchange_ragged[k] = _ragged_exchange_map(mylist[k], mydim[k], owner, owner_local)
+        exchange_ragged[k] = _ragged_exchange_map(
+            mylist[k], mydim[k], Lmax[k], owner, owner_local)
 
     counts = {
         "myDim_nod": partition.myDim_nod2D, "eDim_nod": partition.eDim_nod2D,

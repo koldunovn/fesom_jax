@@ -161,3 +161,65 @@ def test_linear_and_grad():
         xm = x.copy(); xm[d, i] -= eps
         fd = (float(loss(xp)) - float(loss(xm))) / (2 * eps)
         assert abs(g[d, i] - fd) < 1e-4, f"grad[{d},{i}] {g[d,i]} vs FD {fd}"
+
+
+# --------------------------------------------------------------------------
+# Phase 8b B.0b/c — the ragged_all_to_all primitive == all_gather (fwd + transpose)
+# --------------------------------------------------------------------------
+def _ragged_setup(npes, kind):
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(load_mesh(CORE2_MESH), part)
+    Lmax = sm.Lmax[kind]
+    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    valid = np.asarray(sm.valid_mask[kind])
+    rng = np.random.default_rng(2)
+    field = jnp.asarray(rng.standard_normal((npes, Lmax, sm.nl)))
+    return sm, Lmax, jmesh, valid, field, rng
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_ragged_primitive_forward_matches_allgather(npes, kind):
+    """B.0c: the halo-only ``ragged_all_to_all`` exchange == the ``all_gather`` exchange
+    on every VALID lane, BYTE-IDENTICALLY (same owner values, moved point-to-point
+    instead of broadcast). The FORWARD is what a scaling run needs. ⚠️ GPU-only —
+    ``ragged_all_to_all`` is UNIMPLEMENTED on XLA:CPU, so this SKIPs on CPU."""
+    if jax.devices()[0].platform == "cpu":
+        pytest.skip("lax.ragged_all_to_all is unimplemented on XLA:CPU; needs GPU (NCCL)")
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, _ = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    rmap = sm.exchange_ragged[kind]
+    ref = np.asarray(halo.run_halo_exchange(field, src_dev, src_lane, jmesh))
+    got = np.asarray(halo.run_halo_exchange_ragged(field, rmap, jmesh))
+    vm = valid[:, :, None]
+    assert np.array_equal(np.where(vm, got, 0.0), np.where(vm, ref, 0.0)), \
+        f"ragged != all_gather forward on valid {kind} lanes (npes={npes})"
+
+
+@avail
+@pytest.mark.xfail(reason="JAX 0.10.1 lax.ragged_all_to_all autodiff transpose is broken "
+                          "(grad scales with device count); fix = custom_vjp, Phase 8b B.0d",
+                   strict=False)
+@pytest.mark.parametrize("npes", [2])
+@pytest.mark.parametrize("kind", ["nod"])
+def test_ragged_primitive_grad_known_broken(npes, kind):
+    """KNOWN-BROKEN (B.0c): the ragged exchange's gradient should match the all_gather
+    exchange's (the transpose scatter-adds halo cotangents to owners), but JAX's
+    ``ragged_all_to_all`` reverse-mode autodiff mis-routes (grad max|Δ| ~ O(npes)). This
+    `xfail` documents it + flips to PASS once B.0d wraps it in a `custom_vjp`. GPU-only."""
+    if jax.devices()[0].platform == "cpu":
+        pytest.skip("lax.ragged_all_to_all is unimplemented on XLA:CPU; needs GPU (NCCL)")
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, rng = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    rmap = sm.exchange_ragged[kind]
+    w = jnp.asarray(rng.standard_normal((npes, Lmax, sm.nl)) * valid[:, :, None])
+    g_ref = np.asarray(jax.grad(lambda f: jnp.sum(
+        w * halo.run_halo_exchange(f, src_dev, src_lane, jmesh)))(field))
+    g_rag = np.asarray(jax.grad(lambda f: jnp.sum(
+        w * halo.run_halo_exchange_ragged(f, rmap, jmesh)))(field))
+    assert np.allclose(g_rag, g_ref, atol=1e-12, rtol=0), \
+        f"ragged grad != all_gather grad ({kind}, npes={npes}); " \
+        f"max|Δ|={np.max(np.abs(g_rag - g_ref)):.3e}"

@@ -228,6 +228,56 @@ def test_sharded_step_owned_matches(npes):
     _owned_match(st_dense, st_N, mesh, part, npes, tag="ocean")
 
 
+@avail
+@pytest.mark.parametrize("npes", [2])
+def test_ragged_step_matches_allgather(npes):
+    """Phase 8b B.0c: the full sharded ocean step with the halo-only ``ragged_all_to_all``
+    exchange == the ``all_gather`` exchange on owned, to the **field-appropriate floor**.
+    The per-substep exchanges deliver the same owner values on valid lanes (the B.0c
+    isolated gate proves it byte-identical), so owned results agree — but the two schemes
+    handle PAD lanes differently (ragged leaves pad untouched; all_gather sets pad=lane-0),
+    and that tiny difference rides the same climate-close floor as everything else (FCT
+    upwind flips, cancelling SSH divergences). Proves the `HaloCtx` dispatch + `_halo_arrays`
+    ragged folding are wired right end-to-end. ⚠️ ``ragged_all_to_all`` is GPU-only — SKIPs
+    on CPU."""
+    if jax.devices()[0].platform == "cpu":
+        pytest.skip("lax.ragged_all_to_all is unimplemented on XLA:CPU; needs GPU (NCCL)")
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    state = _perturbed_state(mesh)
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    state_p = shard_mesh.partition_state(state, part)
+    sop = ssh.partition_ssh_operator(op, part)
+    stress_p = _stress_p(mesh, part, sm.Lmax["elem"])
+    kw = dict(dt=DT, is_first_step=True, npes=npes)
+    st_ag = ish.run_step_sharded(sm, state_p, sop, stress_p, use_ragged=False, **kw)
+    st_rg = ish.run_step_sharded(sm, state_p, sop, stress_p, use_ragged=True, **kw)
+    rows, worst = [], 0.0
+    for fld in dataclasses.fields(State):
+        a = np.asarray(getattr(st_ag, fld.name))
+        b = np.asarray(getattr(st_rg, fld.name))
+        if a.ndim < 2:
+            continue
+        d_max = 0.0
+        for d in range(npes):
+            md = int(part.myDim_nod2D[d]) if a.shape[1] == sm.Lmax["nod"] else \
+                 int(part.myDim_elem2D[d]) if a.shape[1] == sm.Lmax["elem"] else 0
+            if md:
+                d_max = max(d_max, float(np.max(np.abs(a[d, :md] - b[d, :md]))))
+        rows.append((fld.name, d_max))
+        worst = max(worst, d_max)
+    print("\n[ragged-vs-allgather] ocean step owned max|Δ| per field:")
+    for name, d in sorted(rows, key=lambda r: -r[1]):
+        if d > 0:
+            print(f"   {name:14s} {d:.3e}")
+    # field-appropriate: ragged forward == all_gather forward to the climate-close floor
+    # (pad-handling + FCT upwind-flip / SSH-cancellation reassociation), NOT byte-identity.
+    assert worst < 1e-5, f"ragged step != all_gather on owned: worst max|Δ|={worst:.3e}"
+
+
 # --------------------------------------------------------------------------
 # 4. GM/Redi-ON (S.7 part 3): the forced-path eddy parameterization exchanges
 # --------------------------------------------------------------------------

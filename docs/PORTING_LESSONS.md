@@ -2673,3 +2673,24 @@ Cite the C source (`file:line`) or dump probe that proves it.
   is gathered multiple times into `operand` — correct, because the transpose scatter-ADDs the cotangents
   back (the same additive-reverse-exchange property the `all_gather` AD relies on). ⚠️ The host builder uses
   per-halo-lane Python loops (fine to dars; vectorize for NG5's 7.4 M nodes).
+
+- **[Phase 8b B.0c — JAX 0.10.1 `lax.ragged_all_to_all` FORWARD is correct but its reverse-mode AUTODIFF
+  TRANSPOSE is WRONG (cotangent scales with device count) — wrap in `custom_vjp`]** The B.0 GPU gate
+  (`scripts/phase8b_b0_gpu.sbatch`, 4×A100, job 25438454) found: the halo-only `ragged_all_to_all` exchange
+  matches the `all_gather` exchange **byte-identically on the forward** (all 3 kinds, npes 2 & 4 — the maps,
+  the `output_offsets = recv_offsets.T` argument semantics, and the NCCL movement are all correct), **but its
+  gradient is wrong by an order-unity amount that scales ~linearly with `npes`**: nod/elem/edge grad max|Δ|
+  ≈ 4.3 at npes=2 and ≈ 8.0 at npes=4 (a clean ~2× doubling). Since `halo_exchange_ragged` is a composition
+  of only linear ops (gather → `ragged_all_to_all` → gather-back → masked `where`) and the forward is exact,
+  the culprit is **JAX's registered `_ragged_all_to_all_transpose`** — the ~linear-in-P error is the
+  signature of the cotangent being SUMMED over the device axis instead of routed point-to-point. **This is
+  why the AD gate exists** — it caught a silent gradient corruption before it could poison training.
+  **Suggested fix (B.0d, deferred — forward scaling doesn't need it):** give `halo_exchange_ragged` a
+  `jax.custom_vjp` so we control the transpose. Two backward options: (A) **reuse the proven `all_gather`
+  exchange's VJP** in the backward (correct on every meaningful lane — pad-lane cotangents are inert; simple,
+  but the backward still moves O(P·N_local)), or (B) a **hand-written reverse `ragged_all_to_all`** with
+  swapped routing (`input_offsets=recv_offsets`, `send_sizes=recv_sizes`, `output_offsets=send_offsets.T`,
+  `recv_sizes=send_sizes`) for a fully-scaling backward. Until B.0d, `use_ragged=True` is **FORWARD-ONLY
+  safe** (the default `use_ragged=False` all_gather path keeps gradients correct). A forward-only scaling run
+  never triggers the backward, so the bug does NOT block the scaling work — only training-at-scale with the
+  ragged halo.
