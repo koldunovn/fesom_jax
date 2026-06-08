@@ -296,7 +296,10 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     def body(m, s, o, stress, h, *ex):
         exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
         ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
-                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p")
+                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
+                           ragged=_ragged_ctx(h)["nod"] if use_ragged else None,
+                           recv_max=recv_max["nod"] if use_ragged else 0,
+                           use_ragged=use_ragged)
         ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
                       owned_mask={"nod": h["owned_nod"]},
                       exch_ragged=_ragged_ctx(h) if use_ragged else None,
@@ -337,7 +340,10 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     def body(m, s, o, stress, h):
         exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
         ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
-                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p")
+                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
+                           ragged=_ragged_ctx(h)["nod"] if use_ragged else None,
+                           recv_max=recv_max["nod"] if use_ragged else 0,
+                           use_ragged=use_ragged)
         ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
                       owned_mask={"nod": h["owned_nod"]},
                       exch_ragged=_ragged_ctx(h) if use_ragged else None,

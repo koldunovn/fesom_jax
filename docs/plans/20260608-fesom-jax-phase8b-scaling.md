@@ -155,6 +155,25 @@ run remains a separate follow-up (chaotic reduction-order divergence — same as
 
 ## Revision Log
 
+### #3 — CORE2 forward benchmark: the SSH/CG halo is the dominant comm (ragged-ized it) (2026-06-08)
+First forward-scaling benchmark (`scripts/bench_forward_scaling.{py,sbatch}`, CORE2, 4×A100, job
+25440383): the multistep ragged FORWARD **runs end-to-end on GPU through the `lax.scan`** ✅ (the
+lowering validation). Timing (ms/step): npes2 allgather 144.6 / ragged 164.8; npes4 allgather 109.6 /
+ragged 142.6. **Ragged is SLOWER at CORE2 scale (+14% → +30%, penalty grows with npes).** Two honest
+reasons: (1) CORE2 (127k / 2–4 dev) is far BELOW the crossover — when little data moves, `all_gather`'s
+single mature NCCL collective beats `ragged`'s collective + the extra gather/scatter/where kernels;
+ragged's O(boundary) only beats all_gather's O(P·N_local) at large P / large mesh. (2) **DECISIVE: the
+benchmark barely tests ragged** — the dominant per-step comm is the **SSH CG solve** (`ssh_matvec` +
+`ssh_precond`, each an `all_gather` halo, × ~127 CG iters ⇒ ~250 all_gather exchanges/step), which was
+STILL all_gather; the ragged swap only touched the ~10–20 per-substep field exchanges. So both runs were
+~95% all_gather (the CG) + ragged overhead on the minority. **FIX (this commit): ragged-ized the SSH/CG
+halo** — `SSHHalo` gains `ragged`/`recv_max`/`use_ragged`; `ssh_matvec`/`ssh_precond` dispatch;
+`run_step_sharded`/`run_steps_sharded` build `SSHHalo(use_ragged=)`. So a `use_ragged=True` run now
+ragged-izes the dominant path too. (Forward-only safe — the CG-halo ragged backward also rides the B.0d
+custom_vjp gap; default `use_ragged=False` keeps grad correct.) NEXT: benchmark **farc** (638k, above the
+crossover) with full-ragged (substep + CG), npes 2/4, vs all_gather + the Kokkos `SCALING_FARC.md` numbers
+— the first run that CAN show a ragged win. farc mesh exporting to `/work` (job 25440396).
+
 ### #2 — B.0b/c: ragged FORWARD validated on A100; JAX autodiff transpose is broken → B.0d (2026-06-08)
 GPU gate (job 25438454, 4×A100): the halo-only `ragged_all_to_all` exchange == `all_gather` **byte-identical
 on the forward** (all kinds, npes 2 & 4) — the maps + `output_offsets=recv_offsets.T` arg semantics +

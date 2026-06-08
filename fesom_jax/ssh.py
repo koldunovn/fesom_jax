@@ -43,7 +43,7 @@ import scipy.sparse as sp
 from jax import lax, tree_util
 
 from .config import DT_DEFAULT, G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
-from .halo import halo_exchange
+from .halo import halo_exchange, halo_exchange_ragged
 from .mesh import Mesh
 from .reductions import global_dot
 
@@ -98,12 +98,18 @@ class SSHHalo:
     owned_mask: jax.Array    # (Lmax_nod,) bool
     n_global: int = dataclasses.field(metadata={"static": True})
     axis_name: str = dataclasses.field(default="p", metadata={"static": True})
+    # --- Phase 8b: the halo-only ragged_all_to_all node exchange for the CG (the
+    # DOMINANT per-step comm — ~2 exchanges × ~127 CG iters). None ⇒ all_gather. ---
+    ragged: dict = dataclasses.field(default=None)          # {send_idx, send_sizes, send_off,
+    #                                       out_off, recv_sizes, recv_gather, halo_mask} or None
+    recv_max: int = dataclasses.field(default=0, metadata={"static": True})
+    use_ragged: bool = dataclasses.field(default=False, metadata={"static": True})
 
 
 tree_util.register_dataclass(
     SSHHalo,
-    data_fields=["src_dev", "src_lane", "owned_mask"],
-    meta_fields=["n_global", "axis_name"],
+    data_fields=["src_dev", "src_lane", "owned_mask", "ragged"],
+    meta_fields=["n_global", "axis_name", "recv_max", "use_ragged"],
 )
 
 
@@ -308,7 +314,9 @@ def ssh_matvec(op: SSHOperator, x, halo: "SSHHalo | None" = None):
     is the dense single-device path — byte-identical to ``v1.0``.
     """
     if halo is not None:
-        x = halo_exchange(x, halo.src_dev, halo.src_lane, halo.axis_name)
+        x = (halo_exchange_ragged(x, halo.ragged, halo.recv_max, halo.axis_name)
+             if halo.use_ragged
+             else halo_exchange(x, halo.src_dev, halo.src_lane, halo.axis_name))
     return jax.ops.segment_sum(
         op.stiff_vals * x[op.cols], op.rows, num_segments=op.n_nodes
     )
@@ -321,7 +329,9 @@ def ssh_precond(op: SSHOperator, r, halo: "SSHHalo | None" = None):
     update", which is exactly before this preconditioner SpMV), then the local
     ``segment_sum``. ``halo=None`` ⇒ dense (byte-identical)."""
     if halo is not None:
-        r = halo_exchange(r, halo.src_dev, halo.src_lane, halo.axis_name)
+        r = (halo_exchange_ragged(r, halo.ragged, halo.recv_max, halo.axis_name)
+             if halo.use_ragged
+             else halo_exchange(r, halo.src_dev, halo.src_lane, halo.axis_name))
     return jax.ops.segment_sum(
         op.precond_vals * r[op.cols], op.rows, num_segments=op.n_nodes
     )
