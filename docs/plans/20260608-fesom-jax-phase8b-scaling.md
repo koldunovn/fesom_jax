@@ -163,6 +163,27 @@ run remains a separate follow-up (chaotic reduction-order divergence — same as
 
 ## Revision Log
 
+### #5 — FULL model (real JRA+PHC+ice): JAX is COMPARABLE to Kokkos-CUDA; the "10×" was a compile bug (2026-06-09)
+Two corrections (both user-flagged): (a) the bench must use the **REAL Kokkos setup** — PHC winter IC
+(`phc_ic.load_phc_ic`, mesh-agnostic) + JRA55 1958 (`build_core_forcing`, mesh-agnostic) + prognostic ice
+(real a_ice cover ⇒ the EVP does real work) — NOT synthetic constant forcing; (b) the timed window must
+**exclude XLA compile**. The original bench warmed up at n=2 but timed n=N (different scan length ⇒ different
+executable) and `run_steps_sharded` re-jits a fresh shard_map each call ⇒ the timed wall-time was
+COMPILE-dominated, and the full model's much bigger graph (120-subcycle EVP scan + KPP + GM) compiles much
+longer ⇒ a spurious "10× slower than Kokkos". FIX: `run_steps_sharded(return_executable=True)` returns the
+jitted fn + inputs so the bench compiles ONCE then times a warm 2nd call; per-step via the **subtraction
+method** `(t_N − t_W)/(N − W)` (the JAX analog of Kokkos "omit the first 5 steps" — cancels compile, dispatch
+overhead, and the AB2 first-step transient). Also wired the full forced+ice path into `run_steps_sharded`
+(ice_cfg/step_forcing/forcing_static/boundary_node_p, constant forcing across the scan — fair for timing).
+**CORRECTED CORE2 npes=4 (4×A100, dt1800, real forcing), ms/step:** full allgather **92.6**, full ragged
+**86.7**, vs **Kokkos CORE2 full GPU 1N = 117** ⇒ **JAX is COMPARABLE / slightly faster than hand-tuned
+Kokkos-CUDA** (the 10× retracted). Decomposition: ocean+forcing 58.3 (63%), +ice/EVP +18.0 (19%), +KPP+GM
++14.6 (16%) — proportions like Kokkos's own profile; the EVP is healthy, not a bottleneck. **Ragged is now
+slightly FASTER than allgather on the full model** (86.7<92.6) — the first ragged win: the full model fires
+~500 exchanges/step (EVP 120×2 + CG ~127×2 + substeps) so ragged's per-exchange volume savings outweigh its
+per-call overhead even single-node. Compile ~33 s (one-time). NEXT: farc-full (single node, vs Kokkos 309
+ms); dars/NG5 full = multi-node.
+
 ### #4 — farc forward benchmark: the ragged win is a MULTI-NODE phenomenon, not single-node (2026-06-08)
 CORE2+farc at npes=4, full-ragged (substep + CG), correct dt (CORE2 1800 / farc 900), job 25440595, 4×A100
 single node. ms/step: CORE2 allgather 110.6 / ragged 144.7 (**+31%**); farc allgather 287.5 / ragged 298.4

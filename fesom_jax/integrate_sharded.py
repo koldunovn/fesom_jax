@@ -314,7 +314,9 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
 
 def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       stress_p, n_steps: int, *, dt: float, npes: int, params=None,
-                      gm_cfg=None, kpp_cfg=None, use_ragged: bool = False) -> State:
+                      gm_cfg=None, kpp_cfg=None, use_ragged: bool = False,
+                      ice_cfg=None, step_forcing=None, forcing_static=None,
+                      boundary_node_p=None, return_executable: bool = False):
     """Multi-step (S.7 part 3): step-1 eager (``is_first_step=True``) + ``lax.scan`` of steps
     2..N under ONE ``shard_map`` — the :func:`fesom_jax.integrate.integrate` pattern, sharded.
     Returns the ``[P, Lmax, …]`` final State after ``n_steps``.
@@ -337,7 +339,22 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     ha, ha_spec = _halo_arrays(sm, ragged=use_ragged)
     recv_max = _recv_max(sm) if use_ragged else None
 
-    def body(m, s, o, stress, h):
+    # Full forced+ice step (constant forcing across the scan — correct for TIMING / scaling, the
+    # per-step cost is forcing-VALUE-independent; per-step forcing as the scan xs is the science
+    # follow-up). Forcing + the global boundary_node folded as device-constant shard_map inputs,
+    # mirroring run_step_sharded. All None ⇒ the no-forcing ocean path (byte-unchanged).
+    extras, extras_spec = [], []
+    have_forcing = step_forcing is not None
+    if have_forcing:
+        sff, sff_spec = _fold_forcing(step_forcing)
+        fsf, fsf_spec = _fold_forcing(forcing_static)
+        extras += [sff, fsf]; extras_spec += [sff_spec, fsf_spec]
+    have_bn = boundary_node_p is not None
+    if have_bn:
+        extras.append(_fold(boundary_node_p)); extras_spec.append(_P)
+    extras, extras_spec = tuple(extras), tuple(extras_spec)
+
+    def body(m, s, o, stress, h, *ex):
         exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
         ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
                            owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
@@ -348,10 +365,13 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       owned_mask={"nod": h["owned_nod"]},
                       exch_ragged=_ragged_ctx(h) if use_ragged else None,
                       recv_max=recv_max, use_ragged=use_ragged)
+        sf_, fs_ = (ex[0], ex[1]) if have_forcing else (None, None)
+        bn_ = ex[2 if have_forcing else 0] if have_bn else None
 
         def one(carry, is_first):
             return stepmod.step(carry, m, o, stress, params, dt=dt, is_first_step=is_first,
-                                gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, halo_ctx=ctx)
+                                step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
+                                gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, halo_ctx=ctx, boundary_node=bn_)
 
         st = one(s, True)                            # step 1 eager (AB2 first-step branch)
         if n_steps > 1:
@@ -366,7 +386,14 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     # multistep forward gate + the npes==1 byte-identity are unaffected — jit is semantically
     # identity); ``run_step_sharded`` (no scan ⇒ no checkpoint ⇒ no closed_call) doesn't need it.
     body_sm = jax.shard_map(body, mesh=jmesh,
-                            in_specs=(fm_spec, fs_spec, fop_spec, _P, ha_spec),
+                            in_specs=(fm_spec, fs_spec, fop_spec, _P, ha_spec) + extras_spec,
                             out_specs=fs_spec, check_vma=False)
-    out = jax.jit(body_sm)(fm, fs, fop, fstress, ha)
-    return unfold_state(out, npes)
+    jfn = jax.jit(body_sm)
+    args = (fm, fs, fop, fstress, ha, *extras)
+    # return_executable: hand back the jitted fn + its inputs so a caller (the timing benchmark)
+    # can compile ONCE then time a SECOND call that reuses the executable — otherwise every
+    # run_steps_sharded call rebuilds the shard_map + re-jits (a fresh closure ⇒ cache miss ⇒
+    # recompile), so a one-shot call's wall-time is dominated by XLA COMPILE, not stepping.
+    if return_executable:
+        return jfn, args, npes
+    return unfold_state(jfn(*args), npes)

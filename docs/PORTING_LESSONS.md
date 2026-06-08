@@ -2694,3 +2694,24 @@ Cite the C source (`file:line`) or dump probe that proves it.
   safe** (the default `use_ragged=False` all_gather path keeps gradients correct). A forward-only scaling run
   never triggers the backward, so the bug does NOT block the scaling work — only training-at-scale with the
   ragged halo.
+
+- **[benchmarking JAX/XLA per-step time: EXCLUDE compile or you measure the wrong thing — it can be a
+  10× error]** The Phase-8b scaling bench first reported the full CORE2 model as "10× slower than Kokkos"
+  (1.19 s/step vs 0.117). It was a TIMING BUG: the timed window included the **XLA compile**. Two causes:
+  (1) warming up at `n=2` steps but timing `n=N` — `lax.scan` bakes the trip count into the executable, so
+  different `n` ⇒ different compile ⇒ the timed call recompiled; (2) `run_steps_sharded` builds a fresh
+  `shard_map` + `jax.jit` closure each call ⇒ a fresh cache key ⇒ recompile EVERY call (a one-shot call's
+  wall-time is dominated by compile). The full model's graph (the 120-subcycle EVP `lax.scan` + KPP + GM) is
+  far bigger than ocean-only ⇒ a far longer compile ⇒ the spurious 10×. **CORRECTED: JAX full CORE2 = 92.6
+  ms/step (allgather) / 86.7 (ragged) vs Kokkos 117 — COMPARABLE / slightly faster.** Fix pattern: have the
+  runner return the jitted executable (`run_steps_sharded(return_executable=True)`) so you compile ONCE then
+  time a reused 2nd call; and use the **subtraction method** `per_step = (t_N − t_W)/(N − W)` over two warm
+  runs (N and W steps) — the JAX analog of "omit the first W steps" (Kokkos' warmup exclusion), which cancels
+  compile + per-call dispatch overhead + the AB2 first-step transient. ⚠️ ALSO benchmark the REAL workload:
+  use the real PHC IC + JRA55 forcing + prognostic ice (`phc_ic.load_phc_ic` + `core2_forcing.build_core_forcing`
+  are BOTH mesh-agnostic — they interpolate the global `/pool` datasets onto any mesh), NOT synthetic constant
+  forcing — the SSH-CG iteration count (the dominant comm) is state/forcing-dependent, so a degenerate state
+  understates it. (Per-step cost IS forcing-value-independent, so holding the real forcing constant across the
+  timing window is fine.) Decomp (CORE2 full): ocean+forcing 63%, ice/EVP 19%, KPP+GM 16% — like Kokkos's
+  profile; ragged starts WINNING on the full model (~500 exchanges/step from EVP 120×2 + CG) where its
+  per-exchange volume savings outweigh its per-call overhead, even single-node.
