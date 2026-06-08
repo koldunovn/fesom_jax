@@ -22,6 +22,8 @@ M=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
 C="--name dars --mesh-dir $M --dist-dir $POOL/dars --npes 8 --steps 25 --warmup 5 \
    --dt 180 --full 1 --ic-dir $M --year 1958"
 echo "=== $(date) nodes=$SLURM_JOB_NODELIST ==="
-echo "#### dars FULL 8GPU allgather ####"; srun --cpu-bind=none "$PY" scripts/bench_forward_scaling.py $C --ragged 0
+# ragged FIRST: all_gather OOMs GPU mem at dars/8GPU (each GPU materializes the full global
+# field — the O(P*N_local) cost ragged avoids). ragged (halo-only) should fit.
 echo "#### dars FULL 8GPU ragged ####";    srun --cpu-bind=none "$PY" scripts/bench_forward_scaling.py $C --ragged 1
+echo "#### dars FULL 8GPU allgather ####"; srun --cpu-bind=none "$PY" scripts/bench_forward_scaling.py $C --ragged 0
 echo "=== done $(date) ==="
