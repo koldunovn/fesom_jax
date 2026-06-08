@@ -149,10 +149,11 @@ def main():
         jax.block_until_ready(jfn(*jargs))        # 2nd call: reuse executable → pure run
         return time.perf_counter() - t0, comp
 
-    W = max(1, args.warmup)
+    # ONE compile per config (the full-model XLA compile is minutes — the subtraction method's
+    # 2nd compile doesn't fit the QOS window). per_step = warm run / N (compile excluded by the
+    # 2nd-call timing); the single is_first step is ~1/N ≈ 4% at N=25, within ±10% node noise.
     t_N, compile_s = warm_time(args.steps)
-    t_W, _ = warm_time(W)
-    per_step = (t_N - t_W) / (args.steps - W)
+    per_step = t_N / args.steps
     per_step_ms = per_step * 1e3
     tput = mesh.nod2D * mesh.nl / per_step / 1e6   # M node-levels / s
     tag = "ragged" if use_ragged else "allgather"

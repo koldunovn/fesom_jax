@@ -8,7 +8,8 @@
 #SBATCH --nodes=2
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=64
+#SBATCH --mem=0
 #SBATCH --time=00:30:00
 #SBATCH -o /home/a/a270088/port_jax/scripts/bench_dars_mn.%j.out
 #SBATCH -e /home/a/a270088/port_jax/scripts/bench_dars_mn.%j.out
