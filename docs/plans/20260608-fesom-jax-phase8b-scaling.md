@@ -142,12 +142,27 @@ The load-bearing rewrite. Everything downstream is meaningless until this lands 
 - [ ] farc → dars is mostly "bigger mesh, more partitions" — surface any O(N) host-side build cost or
       memory ceiling in `build_sharded_mesh` (the `[P, Lmax, …]` materialization). Scaling vs `SCALING_DARS.md`.
 
-### B.3 — NG5 (7.4 M × 70) multi-node — the headline
-
-- [ ] `jax.distributed.initialize` for multi-node; partition across nodes. The deep-mesh fixes the Kokkos
-      `SCALING_NG5.md` flags: **nl=70 > a hardcoded level cap somewhere**, and the **step-0 global-gather
-      OOM** (the initial all-mesh gather in setup must be chunked/avoided at 7.4 M nodes). Scaling vs
-      `SCALING_NG5.md`. This is the user's actual goal (the 7 M mesh, ~200-step scaling test).
+### B.3 — MULTI-NODE scaling (dars + NG5) vs Kokkos — the headline (user-requested, in progress)
+dars (3.16 M) and NG5 (7.4 M) **do not fit one 4×A100 node** (OOM even ocean-only — Kokkos starts both at
+2 nodes too), so they are multi-node. Staged:
+- [~] **STEP 1 — `jax.distributed` bring-up.** `scripts/multinode_sanity.{py,sbatch}` on 2 GPU nodes
+      (8 A100, 1 task/node × 4 GPU): `jax.distributed.initialize()` (SLURM auto-detect) → confirm
+      `jax.devices()`=8 global + cross-process `psum`/`all_gather` inside `shard_map` (the model's
+      collectives). [job 25441355]
+- [ ] **STEP 2 — multi-process data placement.** Each process builds the GLOBAL host arrays (mesh + PHC IC +
+      forcing — they FIT one node's RAM: dars ~22 GB, NG5 ~80 GB ≪ 256 GB) and `device_put`s the folded
+      shard_map inputs to a GLOBAL `NamedSharding(global_mesh, P('p'))` so each process places only its
+      addressable shards on its local GPUs (GPU memory is what multi-node relieves: NG5/8GPU ≈ 8 GB/GPU).
+      `run_steps_sharded` gains a multi-process path (`device_put` global inputs; `jmesh` = all global
+      devices). PHC IC per mesh cached to `/work` (`cache_phc_ic.py`). If the global host arrays ever
+      exceed one node's RAM (more ranks / bigger mesh), switch to true per-subdomain loading
+      (`make_array_from_process_local_data`) — deferred until needed.
+- [ ] **STEP 3 — dars multi-node full model** (dist_8 = 2 nodes, then dist_16/32), real JRA+PHC+ice,
+      dt=180, subtraction-timed, ragged vs all_gather → vs Kokkos `SCALING_M524.md` dars GPU s/step.
+- [ ] **STEP 4 — NG5 multi-node full model** (dist_8/16/32…), dt=180 → vs Kokkos NG5. ⚠️ deep-mesh:
+      nl=70 (watch for a hardcoded level cap on load); the step-0 global-gather at 7.4 M (chunk/avoid).
+      The user's headline goal (~200-step scaling on the 7 M mesh). The ragged win is EXPECTED here
+      (multi-node = bandwidth-bound, where all_gather's O(P·N_local) volume finally dominates).
 
 ---
 
