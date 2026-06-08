@@ -79,12 +79,17 @@ def main():
     ap.add_argument("--gm", type=int, default=1)
     args = ap.parse_args()
     DT = args.dt
+    import os
     jax.config.update("jax_enable_x64", True)
+    if os.environ.get("JDIST"):               # multi-node: 1 process/node, all local GPUs
+        jax.distributed.initialize(
+            local_device_ids=list(range(int(os.environ.get("GPUS_PER_NODE", "4")))))
 
     from fesom_jax import partit, shard_mesh, ssh
     from fesom_jax import integrate_sharded as ish
     from fesom_jax.mesh import load_mesh
 
+    proc0 = jax.process_index() == 0
     plat = jax.devices()[0].platform
     ndev = len(jax.devices())
     use_ragged = bool(args.ragged)
@@ -156,9 +161,10 @@ def main():
         model = f"FULL({comp or 'oce'}+JRA{args.year})"
     else:
         model = "ocean-only"
-    print(f"[bench] mesh={args.name:6s} nod2D={mesh.nod2D} nl={mesh.nl} npes={args.npes} "
-          f"halo={tag:9s} model={model:20s} steps={args.steps}  per_step={per_step_ms:8.2f} ms  "
-          f"throughput={tput:8.1f} Mnodlev/s  compile={compile_s:6.1f}s  plat={plat}")
+    if proc0:
+        print(f"[bench] mesh={args.name:6s} nod2D={mesh.nod2D} nl={mesh.nl} npes={args.npes} "
+              f"halo={tag:9s} model={model:20s} steps={args.steps}  per_step={per_step_ms:8.2f} ms  "
+              f"throughput={tput:8.1f} Mnodlev/s  compile={compile_s:6.1f}s  plat={plat}")
 
 
 if __name__ == "__main__":

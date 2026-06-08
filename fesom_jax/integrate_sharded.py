@@ -28,7 +28,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
-from jax.sharding import PartitionSpec
+from jax.sharding import PartitionSpec, NamedSharding
 
 from . import halo
 from . import step as stepmod
@@ -42,6 +42,16 @@ from .state import State
 
 _P = PartitionSpec("p")          # sharded on the device axis (folded leading dim)
 _R = PartitionSpec()             # replicated (every device gets the full array)
+
+
+def _to_global_sharded(x, spec, mesh):
+    """Multi-process (B.3): ``device_put`` a folded input ``x`` + its ``PartitionSpec`` tree
+    to a GLOBAL ``NamedSharding`` over ``mesh`` so each process places ONLY its addressable
+    shards on its local GPUs (each process builds the full global host array, contributes its
+    rows). Single-process callers don't need this (shard_map shards the local array directly)."""
+    shardings = jax.tree.map(lambda sp: NamedSharding(mesh, sp), spec,
+                             is_leaf=lambda v: isinstance(v, PartitionSpec))
+    return jax.device_put(x, shardings)
 
 # entity-leading mesh fields (shard 'p'); the rest (zbar/Z + the CSR dummy) replicate.
 _ENTITY_FIELDS = (set(NODE_FIELDS) | set(ELEM_FIELDS) | set(EDGE_FIELDS)
@@ -390,6 +400,9 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                             out_specs=fs_spec, check_vma=False)
     jfn = jax.jit(body_sm)
     args = (fm, fs, fop, fstress, ha, *extras)
+    if jax.process_count() > 1:               # multi-node (B.3): place addressable shards per process
+        specs = (fm_spec, fs_spec, fop_spec, _P, ha_spec) + extras_spec
+        args = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(args, specs))
     # return_executable: hand back the jitted fn + its inputs so a caller (the timing benchmark)
     # can compile ONCE then time a SECOND call that reuses the executable — otherwise every
     # run_steps_sharded call rebuilds the shard_map + re-jits (a fresh closure ⇒ cache miss ⇒

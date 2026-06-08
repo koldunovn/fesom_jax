@@ -4,9 +4,12 @@
   * a global sharded array places addressable shards per process,
   * cross-process collectives (psum, all_gather) inside shard_map give the right answer.
 Run via srun across nodes (1 task/node, 4 GPUs/task)."""
+import os
 import jax
 jax.config.update("jax_enable_x64", True)
-jax.distributed.initialize()                       # SLURM auto-detect
+# 1 process per NODE, each using all 4 local GPUs (auto-detect's coordinator works at 1
+# task/node; its default local_device_ids=[SLURM_LOCALID] would give only 1 GPU — override).
+jax.distributed.initialize(local_device_ids=list(range(int(os.environ.get("GPUS_PER_NODE", "4")))))
 
 import numpy as np
 import jax.numpy as jnp
@@ -42,7 +45,8 @@ def body(x):
     ag = lax.all_gather(x, "p", axis=0, tiled=True)        # cross-process gather (the halo primitive)
     return jnp.stack([s, jnp.sum(ag)])
 
-out = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=P("p"), out_specs=P()))(gs)
+out = jax.jit(jax.shard_map(body, mesh=mesh, in_specs=P("p"), out_specs=P(),
+                            check_vma=False))(gs)
 p0(f"[sanity] shard_map psum={float(out[0])}  allgather_sum={float(out[1])}  "
    f"expected={float(g_host.sum())}")
 ok = abs(float(out[0]) - g_host.sum()) < 1e-6 and abs(float(out[1]) - g_host.sum()) < 1e-6

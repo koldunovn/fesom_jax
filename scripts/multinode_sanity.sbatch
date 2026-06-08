@@ -15,6 +15,7 @@
 source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
+export GPUS_PER_NODE=4
 echo "=== $(date)  nodes=$SLURM_JOB_NODELIST ntasks=$SLURM_NTASKS ==="
 srun --cpu-bind=none "$PY" scripts/multinode_sanity.py
 echo ">>>> exit: $?  ($(date))"
