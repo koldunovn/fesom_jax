@@ -46,12 +46,20 @@ All meshes + their `dist_<NP>` partitions live on `/pool/data/AWICM/FESOM2/MESHE
 port already ran this exact ladder — `port_kokkos/docs/SCALING_{FARC,DARS,NG5}.md` are the reference
 numbers + the known deep-mesh gotchas. Mirror their setup; compare wall-clock/throughput honestly.
 
-| mesh  | nodes  | levels | target hardware                     | Kokkos doc        |
-|-------|--------|--------|-------------------------------------|-------------------|
-| CORE2 | 127 k  | 47     | the correctness gate (Phase 8)      | —                 |
-| farc  | 638 k  | 48     | ~1 A100                             | `SCALING_FARC.md` |
-| dars  | 3.16 M | 47     | 4 GPU / 1 node                      | `SCALING_DARS.md` |
-| NG5   | 7.4 M  | 70     | multi-node (`jax.distributed`)      | `SCALING_NG5.md`  |
+| mesh  | nodes  | levels | dt (cold) | target hardware                 | Kokkos doc        |
+|-------|--------|--------|-----------|---------------------------------|-------------------|
+| CORE2 | 127 k  | 48     | 1800 s    | the correctness gate (Phase 8)  | —                 |
+| farc  | 638 k  | 48     | 900 s     | ~1 A100                         | `SCALING_FARC.md` |
+| dars  | 3.16 M | 57     | 180 s     | 4 GPU / 1 node                  | `SCALING_DARS.md` |
+| NG5   | 7.4 M  | 70     | 180 s     | multi-node (`jax.distributed`)  | `SCALING_NG5.md`  |
+
+**⚠️ Timestep (CFL) is mesh-specific — `dt=1800` is CORE2-only.** Finer meshes need a smaller `dt` or they
+go CFL-unstable. The Kokkos cold-PHC-start values (`SCALING_DARS.md`, `SCALING_M524.md`): CORE2 1800, farc
+900, dars/NG5 180 (`dt=240` is CFL-unstable from cold on dars/NG5; production runs use 240 only post-spinup).
+The benchmark (`bench_forward_scaling.py --dt`) MUST pass the per-mesh `dt` — same `dt` for the ragged-vs-
+all_gather pair so the comparison stays apples-to-apples. Mesh `.npy` bundles live on **`/work`**
+(`/work/ab0995/a270088/fesom_jax_meshes/mesh_{farc,dars,ng5}`), exported by the C port
+(`jobs/jax_mesh_export_{farc,dars,ng5}.sh` on the `jax-mesh-export` branch).
 
 ---
 
@@ -129,7 +137,7 @@ The load-bearing rewrite. Everything downstream is meaningless until this lands 
 - [ ] N-vs-1 correctness spot-check on farc (the gate is mesh-agnostic — same `test_step_sharded` logic on
       the farc fixtures) to confirm the partition + exchange maps are right at this size.
 
-### B.2 — dars (3.16 M × 47) on 4 GPU / 1 node
+### B.2 — dars (3.16 M × 57) on 4 GPU / 1 node
 
 - [ ] farc → dars is mostly "bigger mesh, more partitions" — surface any O(N) host-side build cost or
       memory ceiling in `build_sharded_mesh` (the `[P, Lmax, …]` materialization). Scaling vs `SCALING_DARS.md`.
@@ -154,6 +162,23 @@ run remains a separate follow-up (chaotic reduction-order divergence — same as
 ---
 
 ## Revision Log
+
+### #4 — farc forward benchmark: the ragged win is a MULTI-NODE phenomenon, not single-node (2026-06-08)
+CORE2+farc at npes=4, full-ragged (substep + CG), correct dt (CORE2 1800 / farc 900), job 25440595, 4×A100
+single node. ms/step: CORE2 allgather 110.6 / ragged 144.7 (**+31%**); farc allgather 287.5 / ragged 298.4
+(**+3.8%**). **The ragged penalty shrinks sharply with mesh size** (+31% → +3.8%), but ragged is still
+marginally SLOWER on farc-4 — even though per device the halo is ~1019 nod vs ~160k owned (all_gather moves
+~600× more *data*). **Why: on a SINGLE node the 4 A100s talk over NVLink (~600 GB/s), so all_gather's larger
+volume is ~free (a 2D-node all_gather at farc-4 ≈ 5 MB/device ≈ sub-ms); the cost is per-collective-call
+LATENCY/overhead, and ragged has MORE of it (a less-mature collective + my extra gather/scatter/where
+kernels).** So the ragged win is fundamentally a **bandwidth-bound** regime — **high device count AND/OR
+MULTI-NODE** (inter-node links ~25–100 GB/s ≪ NVLink, and all_gather's O(P·N_local) volume grows with P),
+which is exactly the NG5 multi-node target (B.3). Single-node benchmarks CANNOT show the ragged win and we
+should stop expecting them to. **Encouraging side-result: farc per-step ≈ 0.29 s at 4×A100 is in the
+ballpark of the Kokkos `SCALING_M524.md` farc(dt900) s/step — the JAX FORWARD is computationally
+competitive.** Also validated: the full-ragged forward (substep + CG, EVP path) runs end-to-end + STABLY on
+a 638k mesh at dt=900. NEXT: the real ragged-win test is **multi-node** (NG5 via `jax.distributed`, B.3);
+dars-4 single-node would only confirm the penalty-shrink trend + that dars loads.
 
 ### #3 — CORE2 forward benchmark: the SSH/CG halo is the dominant comm (ragged-ized it) (2026-06-08)
 First forward-scaling benchmark (`scripts/bench_forward_scaling.{py,sbatch}`, CORE2, 4×A100, job
