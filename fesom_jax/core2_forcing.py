@@ -103,7 +103,8 @@ class SurfaceFluxes(NamedTuple):
 # Device per-step forcing math (AD-safe; runs inside step / lax.scan)
 # ==========================================================================
 def compute_surface_fluxes(mesh: Mesh, state: State, sf: StepForcing,
-                           fs: ForcingStatic, *, dt: float = DT_DEFAULT) -> SurfaceFluxes:
+                           fs: ForcingStatic, *, dt: float = DT_DEFAULT,
+                           owned_mask=None, axis_name=None) -> SurfaceFluxes:
     """Compute the surface BCs from the start-of-step model ``state`` + this step's
     atmosphere ``sf`` + the static constants ``fs``. Pure & differentiable w.r.t.
     ``state`` (the bulk taps ``state.T[:,0]`` / ``state.uvnode[:,0]``).
@@ -123,7 +124,8 @@ def compute_surface_fluxes(mesh: Mesh, state: State, sf: StepForcing,
     # 2 — SSS restoring + runoff balance (consumes the bulk water_flux + S_top).
     sss = sss_runoff.sss_runoff_fluxes(
         state.S[:, 0], bulk.water_flux, sf.Ssurf_month, fs.runoff_node,
-        fs.areasvol_surf, fs.ocean_area, fs.open_water)
+        fs.areasvol_surf, fs.ocean_area, fs.open_water,
+        owned_mask=owned_mask, axis_name=axis_name)
 
     # 3 — oce_fluxes_mom ice stress blend (fesom_ice_coupling.c:234-264). At ice nodes the
     #     wind stress is replaced by stress = ice_drag·a_ice + atm·(1−a_ice); the ice-ocean

@@ -740,7 +740,7 @@ def _node_to_elem_visc(mesh: Mesh, viscA, cfg: KppConfig):
 
 
 def assemble_mixing(mesh: Mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffKs, kbl,
-                    cfg: KppConfig):
+                    cfg: KppConfig, exch=None):
     """smooth_blmc (3-sweep) + combine + node→elem — the KPP driver tail
     (``fesom_kpp.c:875-918``). Each ``blmc`` channel is smoothed 3× with the
     area-weighted node-patch smoother (:func:`eos.smooth_nod3D`); within the BL
@@ -750,10 +750,19 @@ def assemble_mixing(mesh: Mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffK
     combined ``diffKt`` (the T-channel, used for BOTH T and S in CORE2).
 
     Returns ``(Kv [N,nl], Av [E,nl], viscA, diffKt, diffKs, ghats)`` — the final
-    module-gate fields."""
-    blmcM = eos.smooth_nod3D(mesh, blmcM, 3)
-    blmcT = eos.smooth_nod3D(mesh, blmcT, 3)
-    blmcS = eos.smooth_nod3D(mesh, blmcS, 3)
+    module-gate fields.
+
+    **Sharding (Phase 8, S.7 part 3).** ``exch`` (``None`` ⇒ byte-identical) wires the two
+    KPP-internal halo-exchange points (``SYNC_MAP`` §6 / row 3): (1) the ``blmc`` channels
+    are uvnode-derived (``ri_iwmix``←``uvnode`` SCATTER) so INCOMPLETE on the halo — the
+    3-sweep ``smooth_nod3D`` refreshes them per sweep (``exch`` threaded in); (2) the combined
+    node ``viscA`` is read at HALO-node vertices by the ``_node_to_elem_visc`` GATHER (a
+    boundary OWNED element has halo vertices), so refresh ``viscA`` before the average. The
+    other per-node fields (``diffKt``→``Kv``, ``ghats``) are read per-NODE downstream
+    (``Kv`` is refreshed by ``step.py``'s post-mixing exchange) ⇒ no exchange here."""
+    blmcM = eos.smooth_nod3D(mesh, blmcM, 3, exch=exch)
+    blmcT = eos.smooth_nod3D(mesh, blmcT, 3, exch=exch)
+    blmcS = eos.smooth_nod3D(mesh, blmcS, 3, exch=exch)
 
     k = jnp.arange(mesh.nl).reshape(1, -1)
     nzmin = (mesh.ulevels_nod2D - 1).reshape(-1, 1)
@@ -767,6 +776,8 @@ def assemble_mixing(mesh: Mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffK
     diffKs = jnp.where(in_bl, jnp.maximum(diffKs, blmcS), diffKs)
     ghats = jnp.where(below_bl, 0.0, ghats)
 
+    if exch is not None:
+        viscA = exch(viscA, "nod")        # read at HALO vertices by the node→elem gather
     Av = _node_to_elem_visc(mesh, viscA, cfg)
     return diffKt, Av, viscA, diffKt, diffKs, ghats
 
@@ -775,7 +786,8 @@ def assemble_mixing(mesh: Mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffK
 # K.8 — assembled KPP driver: the single mixing-seam entry point
 # ============================================================================
 def mixing_kpp(mesh: Mesh, uv, bvfreq, dbsfc, sw_alpha, sw_beta, S,
-               heat_flux, water_flux, stress_node_surf, sw_3d, hnode, cfg: KppConfig):
+               heat_flux, water_flux, stress_node_surf, sw_3d, hnode, cfg: KppConfig,
+               exch=None):
     """Assembled KPP vertical-mixing driver — the mirror of ``fesom_kpp_mixing``
     (``fesom_kpp.c:784-939``) preceded by ``compute_vel_nodes`` and followed by the
     shared ``mo_convect`` (the ``fesom_step.c:251-264`` dispatch). Returns
@@ -824,8 +836,9 @@ def mixing_kpp(mesh: Mesh, uv, bvfreq, dbsfc, sw_alpha, sw_beta, S,
     blmcM, blmcT, blmcS, ghats = enhance(
         mesh, blmcM, blmcT, blmcS, ghats, dkm1, viscA, diffKt, diffKs, hbl, caseA, kbl, cfg)
     # 8 — smooth_blmc (3-sweep) + combine + node→elem Av; Kv = combined diffKt (T-channel)
+    #     (exch wires the smoother's per-sweep refresh + the pre-node→elem viscA exchange).
     Kv, Av, *_ = assemble_mixing(
-        mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffKs, kbl, cfg)
+        mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffKs, kbl, cfg, exch=exch)
 
     # shared convective adjustment (fesom_step.c:264 — applied after PP or KPP)
     Kv, Av = pp.mo_convect(mesh, Kv, Av, bvfreq)

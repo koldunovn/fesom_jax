@@ -51,7 +51,7 @@ S_FLOOR = 0.5
 def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
          *, dt: float = DT_DEFAULT, is_first_step: bool = False,
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
-         kpp_cfg=None, halo_ctx=None) -> State:
+         kpp_cfg=None, halo_ctx=None, boundary_node=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -106,9 +106,15 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     if halo_ctx is None:
         _exch = lambda f, kind: f                       # noqa: E731
         _ssh_halo = None
+        _red_mask = None                                # reductions: plain masked sum
+        _red_axis = None
     else:
         _exch = halo_ctx.exchange
         _ssh_halo = halo_ctx.ssh_halo
+        # distributed reductions (S.7 part 3): owned-node sum + psum. owned_mask=None ⇒
+        # the dense path is byte-identical (plain jnp.sum), so this is a dead-branch gate.
+        _red_mask = halo_ctx.owned_mask.get("nod")
+        _red_axis = halo_ctx.axis_name
 
     # CORE2 surface forcing (None ⇒ pi path: keep the passed stress_surf, zero BCs).
     # ``ice_cfg`` (an IceConfig) ⇒ the Phase-6 PROGNOSTIC sea-ice step (ocean2ice → EVP → FCT
@@ -122,7 +128,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         if ice_cfg is not None:
             from . import ice_step as _ice_step       # lazy: keep ice deps off the pi path
             ice_out = _ice_step.ice_surface_step(
-                ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt)
+                ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt,
+                owned_mask=_red_mask, axis_name=_red_axis, exch=_exch,
+                boundary_node=boundary_node)
             stress_surf = ice_out.stress_surf
             bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
             heat_flux, water_flux = ice_out.heat_flux, ice_out.water_flux
@@ -130,7 +138,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         else:
             from . import core2_forcing            # lazy: keep netCDF deps off the pi path
             sfx = core2_forcing.compute_surface_fluxes(
-                mesh, st, step_forcing, forcing_static, dt=dt)
+                mesh, st, step_forcing, forcing_static, dt=dt,
+                owned_mask=_red_mask, axis_name=_red_axis)
             stress_surf = sfx.stress_surf
             bc_T, bc_S, sw_3d = sfx.bc_T, sfx.bc_S, sfx.sw_3d
             heat_flux, water_flux = sfx.heat_flux, sfx.water_flux
@@ -154,7 +163,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     gm_diag = None
     if gm_cfg is not None:
         gm_diag = gm.gm_diagnostics(mesh, st.T, st.S, bvfreq, hnode_new, st.helem,
-                                    params, gm_cfg)
+                                    params, gm_cfg, exch=_exch)
 
     # 3 — pressure-gradient force
     pgf_x, pgf_y = pgf.pressure_force_linfs(mesh, hpressure)
@@ -175,7 +184,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         dbsfc = eos.compute_dbsfc(mesh, st.T, st.S)
         Kv, Av, uvnode = kpp.mixing_kpp(
             mesh, st.uv, bvfreq, dbsfc, sw_alpha, sw_beta, st.S,
-            heat_flux, water_flux, stress_node_surf, sw_3d, st.hnode, kpp_cfg)
+            heat_flux, water_flux, stress_node_surf, sw_3d, st.hnode, kpp_cfg, exch=_exch)
     else:
         Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq,
                                       k_ver=params.k_ver, a_ver=params.a_ver)
@@ -237,8 +246,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     uv_adv, w_e_adv = uv, w_e
     if gm_diag is not None:
         fer_w = ale.compute_w(mesh, gm_diag.fer_uv, st.helem)
-        uv_adv = uv + gm_diag.fer_uv
-        w_e_adv = w_e + fer_w
+        fer_w = _exch(fer_w, "nod")    # compute_w is an edge→node scatter ⇒ refresh halo
+        uv_adv = uv + gm_diag.fer_uv   # uv (exch elem) + fer_uv (exch elem) ⇒ halo-complete
+        w_e_adv = w_e + fer_w          # w_e (exch nod) + fer_w (exch nod) ⇒ halo-complete
 
     # 15 — FCT tracer advection (T then S) + Redi explicit terms + implicit vert diffusion.
     #      advect_one_fct exchanges fct_LO + fct_plus/minus internally (S.7 splits).

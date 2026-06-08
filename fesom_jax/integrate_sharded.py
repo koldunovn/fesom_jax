@@ -27,12 +27,14 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax import lax
 from jax.sharding import PartitionSpec
 
 from . import halo
 from . import step as stepmod
 from .halo import HaloCtx
 from .mesh import Mesh
+from .params import Params
 from .shard_mesh import (CONN_FIELDS, EDGE_FIELDS, ELEM_FIELDS, NODE_FIELDS,
                          REPLICATED_FIELDS, ShardedMesh)
 from .ssh import SSHHalo, SSHOperator, ShardedSSHOperator
@@ -111,6 +113,23 @@ def folded_state(state_p: State) -> tuple[State, State]:
     return fs, jax.tree.map(lambda _: _P, fs)
 
 
+def _fold_forcing(f):
+    """Fold a ``[P, Lmax_nod]``-leaf ``StepForcing``/``ForcingStatic`` NamedTuple (from
+    :func:`shard_mesh.partition_step_forcing` / ``partition_forcing_static``) to a
+    ``[P*Lmax_nod]``-leaf ``shard_map`` input + its spec-tree: node fields shard ``'p'``,
+    the replicated scalar ``ocean_area`` (a 0-d leaf) stays ``PartitionSpec()`` (it becomes a
+    ``psum`` over owned nodes in the reductions). Same-typed NamedTuples out, so the spec-tree
+    matches the input pytree structure."""
+    data, spec = {}, {}
+    for name in f._fields:
+        arr = jnp.asarray(getattr(f, name))
+        if arr.ndim == 0:
+            data[name], spec[name] = arr, _R          # scalar (ocean_area) → replicated
+        else:
+            data[name], spec[name] = _fold(arr), _P   # [P, Lmax_nod, …] → [P*Lmax_nod, …]
+    return type(f)(**data), type(f)(**spec)
+
+
 def folded_operator(sop: ShardedSSHOperator) -> tuple[SSHOperator, SSHOperator]:
     """Fold the per-device :class:`ShardedSSHOperator` to a ``shard_map`` input
     :class:`SSHOperator` (``[P*nnz_max]`` rows/cols/vals, ``[P*Lmax_nod]`` diag,
@@ -143,11 +162,45 @@ def _halo_arrays(sm: ShardedMesh) -> tuple[dict, dict]:
     return ha, {k: _P for k in ha}
 
 
+def run_gm_diag_sharded(sm: ShardedMesh, T_p, S_p, bvfreq_p, hnode_new_p, helem_p,
+                        *, npes: int, gm_cfg, params=None):
+    """Run :func:`fesom_jax.gm.gm_diagnostics` (WITH the S.7-part-3 GM halo exchanges)
+    under ``shard_map`` over ``npes`` devices — the per-kernel GM-exchange gate (the S.4
+    scatter-gate analogue, isolating the GM coefficient/bolus chain from the FCT). Inputs
+    are ``[P, Lmax, …]`` partitioned (``T``/``S``/``bvfreq``/``hnode_new`` node, ``helem``
+    elem). Returns the ``[P, Lmax, …]`` ``(fer_uv, slope_tapered, Ki)`` — the fields the
+    bolus advection + Redi terms consume — so a caller can assert they match single-device
+    on OWNED entities (≈ scatter floor), proving the ``fer_gamma``/``fer_uv``/
+    ``slope_tapered``/``Ki`` exchanges are correct (hence any residual FCT-tracer N-vs-1
+    spread is the upwind-flip floor, not a missing exchange)."""
+    from . import gm
+    if params is None:
+        params = Params.defaults()
+    fm, fm_spec = folded_mesh(sm)
+    ha, ha_spec = _halo_arrays(sm)
+    fT, fS, fbv, fhn = _fold(T_p), _fold(S_p), _fold(bvfreq_p), _fold(hnode_new_p)
+    fhe = _fold(helem_p)
+    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+
+    def body(m, T, S, bv, hn, he, h):
+        exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
+        ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=None,
+                      owned_mask={"nod": h["owned_nod"]})
+        d = gm.gm_diagnostics(m, T, S, bv, hn, he, params, gm_cfg, exch=ctx.exchange)
+        return d.fer_uv, d.slope_tapered, d.Ki
+
+    out = jax.shard_map(body, mesh=jmesh,
+                        in_specs=(fm_spec, _P, _P, _P, _P, _P, ha_spec),
+                        out_specs=(_P, _P, _P), check_vma=False)(
+                            fm, fT, fS, fbv, fhn, fhe, ha)
+    return tuple(_unfold(o, npes) for o in out)
+
+
 def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      stress_p, *, dt: float, is_first_step: bool, npes: int,
                      wire_halo: bool = True, params=None, step_forcing=None,
                      forcing_static=None, ice_cfg=None, gm_cfg=None,
-                     kpp_cfg=None) -> State:
+                     kpp_cfg=None, boundary_node_p=None) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
     return the ``[P, Lmax, …]`` next State.
 
@@ -169,16 +222,83 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     jmesh = halo.device_mesh(devices=jax.devices()[:npes])
     n_global = sm.nod2D
 
+    # Optional CORE2 forcing + the GLOBAL ice boundary_node → sharded shard_map inputs
+    # (varargs; () when absent ⇒ the no-forcing pi/GM path traces EXACTLY as before). The
+    # forcing folds the StepForcing/ForcingStatic NamedTuples; boundary_node_p is the
+    # PARTITIONED global coastal mask (the local-mesh recompute mis-flags partition-boundary
+    # nodes as coastal — the EVP needs the global one). `have_*` flags are closed over so the
+    # body can parse the positional varargs (shard_map inputs can't be None).
+    extras, extras_spec = [], []
+    have_forcing = step_forcing is not None
+    if have_forcing:
+        sff, sff_spec = _fold_forcing(step_forcing)
+        fsf, fsf_spec = _fold_forcing(forcing_static)
+        extras += [sff, fsf]
+        extras_spec += [sff_spec, fsf_spec]
+    have_bn = boundary_node_p is not None
+    if have_bn:
+        extras.append(_fold(boundary_node_p))
+        extras_spec.append(_P)
+    extras, extras_spec = tuple(extras), tuple(extras_spec)
+
+    def _run(m, s, o, stress, ctx, ex):
+        i = 0
+        if have_forcing:
+            sf_, fs_, i = ex[0], ex[1], 2
+        else:
+            sf_, fs_ = None, None
+        bn_ = ex[i] if have_bn else None
+        return stepmod.step(s, m, o, stress, params, dt=dt,
+                            is_first_step=is_first_step, step_forcing=sf_,
+                            forcing_static=fs_, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
+                            kpp_cfg=kpp_cfg, halo_ctx=ctx, boundary_node=bn_)
+
     if not wire_halo:
-        def body0(m, s, o, stress):
-            return stepmod.step(s, m, o, stress, params, dt=dt,
-                                is_first_step=is_first_step, step_forcing=step_forcing,
-                                forcing_static=forcing_static, ice_cfg=ice_cfg,
-                                gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, halo_ctx=None)
-        out = jax.shard_map(body0, mesh=jmesh, in_specs=(fm_spec, fs_spec, fop_spec, _P),
-                            out_specs=fs_spec, check_vma=False)(fm, fs, fop, fstress)
+        def body0(m, s, o, stress, *ex):
+            return _run(m, s, o, stress, None, ex)
+        out = jax.shard_map(body0, mesh=jmesh,
+                            in_specs=(fm_spec, fs_spec, fop_spec, _P) + extras_spec,
+                            out_specs=fs_spec, check_vma=False)(fm, fs, fop, fstress, *extras)
         return unfold_state(out, npes)
 
+    ha, ha_spec = _halo_arrays(sm)
+
+    def body(m, s, o, stress, h, *ex):
+        exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
+        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
+                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p")
+        ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
+                      owned_mask={"nod": h["owned_nod"]})
+        return _run(m, s, o, stress, ctx, ex)
+
+    out = jax.shard_map(body, mesh=jmesh,
+                        in_specs=(fm_spec, fs_spec, fop_spec, _P, ha_spec) + extras_spec,
+                        out_specs=fs_spec, check_vma=False)(fm, fs, fop, fstress, ha, *extras)
+    return unfold_state(out, npes)
+
+
+def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
+                      stress_p, n_steps: int, *, dt: float, npes: int, params=None,
+                      gm_cfg=None, kpp_cfg=None) -> State:
+    """Multi-step (S.7 part 3): step-1 eager (``is_first_step=True``) + ``lax.scan`` of steps
+    2..N under ONE ``shard_map`` — the :func:`fesom_jax.integrate.integrate` pattern, sharded.
+    Returns the ``[P, Lmax, …]`` final State after ``n_steps``.
+
+    The scan body's halo exchanges (the ``OCEAN_SCHEDULE`` posts) + the CG are collectives
+    (``all_gather``/``psum``) INSIDE ``lax.scan`` inside ``shard_map`` (``check_vma=False``) —
+    the same "collective in a scan/loop under ``shard_map``" lowering the S.6 CG ``while_loop``
+    and the ice EVP subcycle rely on. ``jax.checkpoint`` wraps the scan body (caps the backward
+    memory for the S.8 AD gate; forward-transparent). The :class:`~fesom_jax.halo.HaloCtx` is
+    built ONCE inside the body and closed over by every step. **No-forcing path** (pi/GM ocean,
+    ``stress_p`` static); the forced multi-step (per-step forcing as the scan ``xs``, a
+    ``[n_steps, P*Lmax]`` ``PartitionSpec(None,'p')`` fold) is the follow-up for the PRIMARY
+    KPP+GM+ice few-step gate."""
+    fm, fm_spec = folded_mesh(sm)
+    fs, fs_spec = folded_state(state_p)
+    fop, fop_spec = folded_operator(sop)
+    fstress = _fold(stress_p)
+    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    n_global = sm.nod2D
     ha, ha_spec = _halo_arrays(sm)
 
     def body(m, s, o, stress, h):
@@ -187,10 +307,16 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                            owned_mask=h["owned_nod"], n_global=n_global, axis_name="p")
         ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
                       owned_mask={"nod": h["owned_nod"]})
-        return stepmod.step(s, m, o, stress, params, dt=dt,
-                            is_first_step=is_first_step, step_forcing=step_forcing,
-                            forcing_static=forcing_static, ice_cfg=ice_cfg,
-                            gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, halo_ctx=ctx)
+
+        def one(carry, is_first):
+            return stepmod.step(carry, m, o, stress, params, dt=dt, is_first_step=is_first,
+                                gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, halo_ctx=ctx)
+
+        st = one(s, True)                            # step 1 eager (AB2 first-step branch)
+        if n_steps > 1:
+            st, _ = lax.scan(jax.checkpoint(lambda c, _: (one(c, False), None)),
+                             st, xs=None, length=n_steps - 1)
+        return st
 
     out = jax.shard_map(body, mesh=jmesh,
                         in_specs=(fm_spec, fs_spec, fop_spec, _P, ha_spec),

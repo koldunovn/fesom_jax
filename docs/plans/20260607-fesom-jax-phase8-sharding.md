@@ -356,25 +356,38 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
       `momentum.visc_filt_bidiff` (exch `Uc/Vc` between its 2 scatter stages); `momentum_adv_scalar`
       (exch `un_u/un_v` before the vertex→element gather — ➕ a scatter-result site the Kokkos `SYNC_MAP`
       flagged that the `MPI_PORT_REPORT` folds into substep 4); `tracer_adv.advect_one_fct`/`zalesak_limit`
-      (exch `fct_LO`, ➕ `tr_xy`, `fct_plus/minus`). ⏳ ice EVP/FCT splits + KPP `smooth_blmc` + GM/Redi
-      `tr_xy/tr_z` remain (forced-path; they need the KPP/GM/ice configs + forcing).
+      (exch `fct_LO`, ➕ `tr_xy`, `fct_plus/minus`). **[part 3 ✅]** GM/Redi (`fer_gamma` INTRA + `fer_uv`/
+      `slope_tapered`/`Ki`/`fer_w`; `tr_xy/tr_z` auto-complete in JAX) + KPP (`smooth_blmc` per-sweep refresh +
+      `viscA` before the `Av` gather) DONE & gated; ice EVP/FCT splits CODED (gating).
 - [x] interleave `halo_exchange` at each `OCEAN_SCHEDULE` exchange point inside `step` via one
       `_exch(field,kind)` closure. **Gated by `halo_ctx=None`** (a pytree-or-None arg — the treedef makes
       `None` a trace-time dead branch, the `kpp_cfg=None` discipline) ⇒ byte-identical `v1.0` (the 483-test
       single-device suite stays GREEN). 🎯 **JAX needs FEWER exchanges than the C**: per-node intermediates
       are auto-complete on the halo (computed over the full local extent), so only SCATTER results need an
       exchange (the C's pre-smooth `bvfreq` exchange is unnecessary).
-- [x] `run_step_sharded` (`integrate_sharded.py`) wraps the body under one `shard_map` (`check_vma=False`);
-      ⏳ the multi-step checkpointed `lax.scan` is a thin wrapper for the few-step gate (next).
+- [x] `run_step_sharded` (`integrate_sharded.py`) wraps the body under one `shard_map` (`check_vma=False`).
+      **[part 3 ✅]** `run_steps_sharded` = step-1-eager + `lax.scan` of the rest under ONE `shard_map`
+      (the collective-in-scan LOWERS, even with `jax.checkpoint`); a FREE-running multi-step compare
+      decorrelates chaotically (Decision 4 at 2 steps) so the per-step gate is TEACHER-FORCED.
 - [x] **PRIMARY per-substep gate** (CPU fake-devices, N=2): the assembled OCEAN step sharded == single-device
       on OWNED to a **field-appropriate** budget — momentum/SSH/ALE/EOS to <1e-7 (the wiring proof), FCT
       tracers + cancelling SSH divergences to the **climate-close upwind-flip floor** (~1e-3 on a sharp test
       bump; NOT a missing exchange — all FCT inputs match to 1e-9, `S` matches when constant, owned==halo).
-      ⏳ +KPP/+GM/+ice + the multi-step `io_dump` per-substep compare (vs the single-device dump) remain.
+      **[part 3 ✅ COMPLETE]** GM gate: clean fields machine-precision + per-kernel `gm_diagnostics` bit-exact
+      (0.0) on owned ⇒ T/S spread is the FCT flip floor. KPP gate: `Kv`/`Av` machine-precision. Ice gate: ALL
+      ice prognostic fields bit-exact (0.0) on owned, `uv` machine-precision (after the `a_ice`-before-the-
+      `stress_surf`-gather fix). **PRIMARY assembled gate (KPP+GM+ice+forcing): `uv` 1.9e-16, all clean fields
+      machine-precision, T/S the climate-close floor — PASSED.** The few-step per-substep compare is
+      teacher-forced (a State-field N-vs-1 compare IS per-substep — every substep output is a State field;
+      `io_dump` is reserved for the S.9c cross-runtime C-N diff).
 - [x] write tests: `test_step_sharded.py` (reconstruction + npes==1 no-op byte-identity + npes==2 owned
-      field-appropriate gate). ⏳ +ice/+KPP/+GM build-up.
-- [x] run tests — **3 passed (CPU fake-devices); single-device suite ALL GREEN (475+47+36)**. Lesson
-      appended. ⏳ the forced-path (KPP/GM/ice) exchanges + multi-step `io_dump` gate are S.7 part 3.
+      field-appropriate gate). **[part 3 ✅]** + GM (`gm_diagnostics` per-kernel + full-step) + KPP (forced
+      npes==1 byte-id + npes==2 owned) + reductions (`sss_runoff_fluxes`) + ice (serial + owned) + multistep
+      (scan-lowers + teacher-forced) + the PRIMARY assembled KPP+GM+ice gate.
+- [x] run tests — **3 passed (CPU fake-devices); single-device suite ALL GREEN (475+47+36)**. **[part 3 ✅]**
+      GM 2 passed + reductions 9 passed + KPP 2 passed (`Kv`/`Av` ~1e-14) + ice 2 passed (npes==1 byte-id +
+      npes==2 `uv` 1.8e-16) + 18 single-device ice + teacher-forced multistep + the PRIMARY assembled gate
+      (`uv` 1.9e-16). **S.7 (the `shard_map` wiring) is COMPLETE.**
 
 ### S.8: AD through the collectives (gradient gate)
 
@@ -464,6 +477,53 @@ multi-rank port is functional (`MPI_PORT_REPORT.md`: "dist_8 partition correctne
 long-run drift = chaotic Allreduce-order, not a per-substep bug → validates the per-substep gate choice).
 Task ladder S.1→S.10: reader → sharded-mesh → exchange primitive → scatter gate → reductions → CG → wire
 `shard_map` → AD gate → the 2–4 device GATE → docs.
+
+### #12 — S.7 part 3 COMPLETE: ice + multi-step scan + the PRIMARY assembled gate (2026-06-08)
+Closed S.7. **Ice** (`ice_evp.evp_dynamics` exch `u_ice/v_ice` INSIDE the 120-subcycle `lax.scan`;
+`ice_adv.fct_solve`/`_solve_high_order`/`_fem_fct` exch the low-order `a_l/m_l/ms_l` + high-order `dvalues`
++ limiter `icepplus/icepminus`; the GLOBAL `boundary_node` partitioned through `run_step_sharded(
+boundary_node_p)` → `step(boundary_node)`): 🎯 **an `all_gather` lowers inside `jax.checkpoint` inside
+`lax.scan` inside `shard_map`** (the hardest collective placement — the ice npes==1 byte-id passed). Every
+ICE prognostic field (`a/m/snow/u/v_ice/sigma`) matched single-device to **0.0 bit-exact** on owned. 🐛 The
+npes==2 gate caught `uv`≈7e-4 (a CLEAN field) while every ice field was bit-exact — `ice_oce_fluxes_mom`'s
+`stress_surf` is a node→elem GATHER reading `a_ice` at HALO vertices, and I'd exchanged `a_ice` at step-END
+(too late); moving it BEFORE the gather fixed `uv` to **1.8e-16** (the per-field ordering — ice bit-exact,
+ocean fields descending by coupling depth — localized it to an ice→ocean OUTPUT instantly). **Multi-step**
+(`run_steps_sharded` = step-1 eager + `lax.scan` rest under one `shard_map`): the collective-in-scan lowers
++ runs FINITE; a FREE-running 2-step compare decorrelates chaotically (the step-1 FCT flip floor →
+density→uv→PP/`mo_convect` binary flips→ssh_rhs, ordered by coupling depth — Decision 4 at 2 steps), so the
+per-step gate is TEACHER-FORCED (each sharded step reads the single-device's previous state ⇒ only the
+within-step reassociation differs; a threading bug would show a CLEAN field diverging). **PRIMARY assembled
+gate** (KPP + GM/Redi + prognostic ice + bulk/SSS forcing, npes==2): every clean ocean field MACHINE
+PRECISION (`uv` 1.9e-16, `d_eta` 3.3e-16), T/S the climate-close FCT floor, ice fields bit-exact —
+**PASSED**. The whole forced-path `shard_map` wiring (all exchanges + reductions + fused-kernel splits +
+the in-scan collectives) is now N-vs-1 correct on owned. NEXT: S.8 (the AD gradient gate) → S.9 (the real
+4×A100 GATE) → S.10 (docs/tag).
+
+### #11 — S.7 part 3: GM/Redi + reductions + KPP forced-path exchanges DONE (2026-06-08)
+Wired three of the four forced-path increments + the distributed reductions, each gated npes==2 on CPU
+fake-devices (sbatch on compute) with the single-device suite green. **GM/Redi** (`gm.gm_diagnostics` exch:
+`fer_gamma` nod INTRA before `fer_gamma2vel`, then `fer_uv` elem + `slope_tapered`/`Ki` nod; `step.py` 13a
+`fer_w` nod): the Kokkos `SYNC_MAP` row 1b caught `fer_gamma` (the plan's per-field guess missed it — it is
+gathered at HALO vertices of owned boundary elements, S.1 redundant ownership); the Redi `tr_xy`/`tr_z` need
+NO exchange in JAX (recomputed from halo-complete `T_old`). A NEW **per-kernel GM gate** (`run_gm_diag_sharded`,
+the S.4 scatter-gate analogue) matched `fer_uv`/`slope_tapered`/`Ki` on owned to **0.0 bit-exact** ⇒ the
+exchanges are proven, and the full GM step's T/S spread (T≈8.6e-3, S≈3.9e-3 on PHC IC; ALL clean fields
+machine-precision) is the FCT upwind-flip floor, NOT a missing exchange. **Reductions** (`_area_mean` →
+`owned_mask`/`psum`, a 5-file `None`-default thread, byte-identical) + `_fold_forcing` (folds the
+`StepForcing`/`ForcingStatic` NamedTuples to sharded `shard_map` inputs — the forced path needs the forcing
+SHARDED, not closed-over/replicated). **KPP** (`kpp.mixing_kpp`/`assemble_mixing`/`eos.smooth_nod3D` exch:
+the 3-sweep `blmc` smoother refreshes the halo PER SWEEP — each sweep is an element→node scatter — + `viscA`
+before the node→elem `Av` gather; the per-node-COLUMN kernels `ri_iwmix`/`prestep`/`bldepth`/`blmix` +
+`sw_alpha/β`/`dbsfc` are auto-complete ⇒ no exchange): `Kv`≈2.4e-14 / `Av`≈9.1e-15 on owned (machine
+precision) ⇒ the smoother + `viscA` exchanges are correct; the forced npes==1 byte-id proves the whole forced
+machinery (forcing fold + reductions + KPP exch) collapses to `v1.0` (a ~17 min compile — the most collectives
+yet). Gates: GM 2 passed + reductions 9 passed + single-device sss 9 passed + KPP 2 passed. ⚠️ The ICE
+increment is CODED (EVP in-scan `u_ice/v_ice` exchange inside the 120-subcycle `lax.scan`; the ice FCT
+low-order/high-order-`dvalues`/`icepplus/icepminus` splits — same per-sweep idiom as KPP; the GLOBAL
+`boundary_node` partitioned in, since the local-mesh recompute mis-flags partition-boundary nodes as coastal)
+and GATING. NEXT: confirm ice + the multi-step `lax.scan` (S.7p3.5) + the PRIMARY KPP+GM+ice io_dump gate
+(S.7p3.6).
 
 ### #10 — S.7 part 2: OCEAN halo exchanges + fused-kernel splits DONE (2026-06-08)
 Wired the OCEAN step's halo exchanges + fused-kernel splits in `step.py` (one `_exch(field,kind)` closure +

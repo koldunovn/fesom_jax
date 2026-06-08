@@ -1,13 +1,17 @@
 # Next-session prompt — FESOM2 → JAX port: PHASE 8 (multi-GPU / multi-core sharding)
 
-> **⚡ STATE (2026-06-08): S.1→S.7-part-2 are DONE and COMMITTED on `main`. The sharding foundation, the
-> distributed CG (gated on real 4×A100), the device-mesh placement, and the whole OCEAN step's halo
-> exchanges all work; the single-device suite is byte-identical `v1.0` (ALL GREEN 475+47+36). NEXT: S.7
-> PART 3 — the FORCED-PATH exchanges (+GM, +KPP, +ice) + the multi-step scan + the `io_dump` per-substep
-> gate. Then S.8 (AD), S.9 (the GPU GATE), S.10 (docs/tag).**
+> **⚡ STATE (2026-06-08): S.1→S.7 are DONE and COMMITTED on `main` (the HEAD commit — `git log --oneline -5`).
+> The ENTIRE `shard_map`
+> wiring is N-vs-1 correct on owned: the OCEAN exchanges, the forced-path exchanges (+GM, +KPP, +ice), the
+> distributed reductions, the multi-step `lax.scan`, AND the in-scan collectives (the CG `while_loop` + the
+> ice EVP 120-subcycle scan). The PRIMARY assembled KPP+GM+ice gate PASSED (every clean ocean field
+> machine-precision, `uv` 1.9e-16; T/S the climate-close FCT floor; ice fields bit-exact). Single-device suite
+> byte-identical `v1.0`. NEXT: S.8 (the AD gradient gate), then S.9 (the real 2–4×A100 GATE), S.10 (docs/tag
+> `v1.1-multi-gpu`).**
 >
-> Commits this far: `80f6a71` S.1–S.5 foundation · `497e802` S.6 CG · `a770000`+`990da45` S.7 part 1 ·
-> `9bc9c39` S.7 part 2. Plan Revision Log #2→#10 records every decision/discovery.
+> Commits: `80f6a71` S.1–S.5 foundation · `497e802` S.6 CG · `a770000`+`990da45` S.7 part 1 · `9bc9c39`
+> S.7 part 2 · **HEAD = S.7 part 3** (GM/KPP/ice/reductions/multistep + the PRIMARY assembled gate). Plan
+> Revision Log #2→#12 records every decision/discovery (#11+#12 = S.7 part 3).
 
 ## ⚠️ READ FIRST — two hard rules this session learned
 1. **Run every multi-minute `shard_map`/model compile via `sbatch` on `-p compute`, NEVER on the login
@@ -24,15 +28,19 @@
 
 ## START HERE — the plan is the source of truth; do NOT re-plan
 1. **READ `docs/plans/20260607-fesom-jax-phase8-sharding.md`** — the full Phase-8 sub-plan. Revision Log
-   #2→#10 records what each task built; S.1–S.7(parts 1&2) are ticked, S.7-part-3 onward open.
+   #2→#12 records what each task built; **S.1–S.7 are ALL ticked; S.8 onward open** (S.8 = the AD gate).
 2. **READ the Phase-8 lessons** in `docs/PORTING_LESSONS.md` (every "Phase 8 — sharding (Task S.x)" section).
-   The load-bearing ones for part 3: 🎯 **JAX needs FEWER exchanges than the C** (per-node intermediates are
-   auto-complete on the halo — only SCATTER results read at the halo need an exchange); 🎯 the **FCT
-   upwind-flip floor** is climate-close non-determinism, not a bug; the `check_vma=False` + `halo_ctx=None`
-   gating; the operator/loop-bound-by-value rules.
+   The load-bearing ones for **S.8 (AD)**: the **masked-NaN rule across the device axis** (padded/halo lanes
+   must compute a FINITE value + 0 cotangent — the Phase 3/5/6 discipline, now on the device-pad axis); 🎯
+   **a collective lowers inside `jax.checkpoint`→`lax.scan`→`shard_map`** (the ice EVP scan — its FORWARD is
+   verified; the BACKWARD recompute re-runs the `all_gather`, whose transpose is the reverse exchange); the
+   CG `custom_linear_solve` `transpose_solve` already runs sharded (S.6). General part-3 context: 🎯 **JAX
+   needs FEWER exchanges than the C** (only SCATTER results read at the halo need an exchange); 🎯 the **FCT
+   upwind-flip floor / free-running multi-step chaos** is climate-close (Decision 4), so AD gates must also be
+   FIELD-APPROPRIATE / teacher-forced if a free-running grad is noisy; the `check_vma=False` gating.
 3. **Memory:** `[[fesom-jax-port]]`, `[[hpc-job-file-conventions]]`, `[[porting-lessons-log]]`.
 
-## WHAT'S BUILT (S.1→S.7-part-2 — do NOT re-litigate)
+## WHAT'S BUILT (S.1→S.7 ALL DONE — do NOT re-litigate)
 - **`partit.py`** (S.1) reads `dist_<NP>`; **`shard_mesh.py`** (S.2/2b) builds the per-device padded
   `ShardedMesh` + `partition_state`/`partition_forcing_*`; **`halo.py`** (S.3) = `halo_exchange`
   (`all_gather`+gather) + the `HaloCtx` (S.7); **`halo_points.py`** (S.4) = `OCEAN_SCHEDULE`/`ICE_SCHEDULE`
@@ -49,33 +57,25 @@
   `Uc/Vc`; `momentum_adv_scalar` exch `un_u/un_v`; `advect_one_fct`/`zalesak_limit` exch `fct_LO`+`tr_xy`+
   `fct_plus/minus`). Gate `test_step_sharded.py` (npes==1 byte-identical; npes==2 owned field-appropriate).
 
-## THE LADDER — start at S.7 PART 3
-- **S.7 PART 3 — the FORCED-PATH exchanges + the multi-step gate.** Build up incrementally, each gated on
-  CPU fake-devices (sbatch on compute) + single-device suite green:
-  1. **+GM/Redi** (`gm_cfg=GMConfig()`): the Redi diffusion (`gm_redi.diff_part_hor_redi`) has internal
-     `tr_xy` (elem) + `tr_z` (nod) scatter-result exchanges (Kokkos SYNC_MAP row 13-Redi); thread `exch` in.
-     The GM coefficient chain (`gm.gm_diagnostics`) is per-node/elem maps → auto-complete on the halo (verify;
-     likely only the post-kernel `fer_uv`/`slope_tapered`/`Ki` exchanges needed).
-  2. **+KPP** (`kpp_cfg=KppConfig()`, needs CORE2 forcing): `kpp.mixing_kpp` has 2 internal exchanges
-     (Kokkos: `smooth_blmc` = blmc×3 + the 3-sweep `eos.smooth_nod3D`; + the pre-elem-average). ⚠️ apply the
-     redundant-compute lens: a per-node field feeding `smooth_nod3D` is auto-complete on the halo (no pre-smooth
-     exchange) UNLESS it is itself a scatter/OBL-search result incomplete on the halo — verify per field.
-     Also `sw_alpha`/`sw_beta` (EOS, KPP path).
-  3. **+ice** (`ice_cfg=IceConfig()`): the `ICE_SCHEDULE` (halo_points.py) — the EVP subcycle `u_ice/v_ice`
-     exchange is INSIDE the 120-step `lax.scan` (the hard one: a collective in `scan` under `shard_map`,
-     `check_vma=False`); the ice FCT (`m_ice_lo`/`a_ice_lo`/`m_snow_lo` + `icepplus`/`icepminus`) splits like
-     the ocean FCT; thermo `ustar`; oce_fluxes.
-  4. **Reductions:** route `sss_runoff._area_mean` + `ice_coupling.ice_oce_fluxes` (virtual-salt / relax-salt
-     / water-flux balances) through `owned_mask`/`axis_name` (the helpers exist; `owned_mask=None` ⇒ byte-id).
-     `ocean_area` is the replicated static constant.
-  5. **Multi-step `lax.scan`** under `shard_map` (the `integrate` body unchanged; `run_step_sharded` is the
-     single-step template) — step-1-eager + scan-rest, for a few-step run.
-  6. **PRIMARY gate:** a few-step assembled CORE2 step (KPP+GM+ice) sharded == single-device, **per-substep**,
-     **field-appropriate** budget (momentum/SSH/ALE/EOS <1e-7; FCT tracers + cancelling SSH divergences to the
-     climate-close upwind-flip floor — NOT 1e-12 for those; see the lesson). Reuse `io_dump` against a
-     single-device CORE2 dump (capture it like `capture_core2_ssh_rhs.py` assembles the forced step).
+- **`gm.py` / `eos.py` / `kpp.py` / `ice_*.py` / `sss_runoff.py` / `core2_forcing.py` / `integrate_sharded.py`**
+  (S.7 p3) — the FORCED-PATH exchanges, ALL N-vs-1 correct on owned (gated, sbatch on compute):
+  **GM** (`gm_diagnostics` exch `fer_gamma` INTRA + `fer_uv`/`slope_tapered`/`Ki` + `step.py` `fer_w`; the Redi
+  `tr_xy/tr_z` auto-complete in JAX); **KPP** (`smooth_nod3D` per-sweep refresh + `viscA` before the `Av`
+  gather); **reductions** (`_area_mean`→`owned_mask`/`psum`, + `_fold_forcing` folds the forcing to sharded
+  inputs); **ice** (`evp_dynamics` `u_ice/v_ice` exch inside the 120-subcycle `lax.scan`; `fct_solve`
+  low/high-order/limiter splits; the GLOBAL `boundary_node` partitioned in; ⚠️ `a_ice` exchanged BEFORE the
+  `ice_oce_fluxes_mom` `stress_surf` gather, not at step-end); **multi-step** (`run_steps_sharded` = step-1
+  eager + `lax.scan` rest). Gates: per-kernel `run_gm_diag_sharded` (bit-exact), `Kv/Av` ~1e-14, ice fields
+  bit-exact, the PRIMARY assembled KPP+GM+ice gate (`uv` 1.9e-16). The few-step gate is TEACHER-FORCED (a
+  free-running compare decorrelates chaotically — Decision 4).
+
+## THE LADDER — start at S.8 (S.1→S.7 DONE)
 - **S.8 AD gate** — `jax.grad` of the sharded run == single-device gradient; masked/halo lanes finite +
   0-cotangent (masked-NaN across the device axis). `custom_linear_solve` transpose already runs sharded (S.6).
+  ⚠️ The ice EVP scan is `jax.checkpoint`'d with an in-scan `all_gather` — the FORWARD lowers (verified); the
+  BACKWARD recompute re-runs the collective (its transpose = the reverse exchange = `psum`/reduce-scatter).
+  The multi-step `run_steps_sharded` checkpoints its scan body (the AD-window memory cap). Start small (2-step
+  OCEAN grad N-vs-1) then +forcing; reuse the teacher-forcing insight if a free-running grad is noisy.
 - **S.9 the GATE** — (a) per-substep N==1 on 2/4×A100 (`-A ab0995_gpu -p gpu --gres=gpu:4 --nodes=1`),
   (b) gradient, (c) BONUS JAX-N ↔ C-N dump diff on `dist_2/4` (looser cross-runtime budget). Update
   `[[fesom-jax-port]]` memory at the gate.
@@ -86,6 +86,14 @@
 - **Sharding tests → COMPUTE node sbatch** (see Rule 1): `scripts/test_step_sharded.sbatch` runs
   `test_step_sharded.py` on 4 fake-devices; `scripts/run_suite.sbatch` runs the full suite (ocean / ice /
   SHARDING) — "ALL GREEN" iff all three rc=0. The collective tests SKIP cleanly at 1 device.
+- **S.7 part 3 gate scripts** (focused, per-increment — the proof; each a separate `-k` selection on
+  `test_step_sharded.py`): `test_gm_red_sharded.sbatch` (GM + reductions), `test_kpp_sharded.sbatch` (KPP),
+  `test_ice_ms.sbatch` (ice + multistep), `test_assembled.sbatch` (the PRIMARY KPP+GM+ice). ⚠️ A forced step
+  under `shard_map` is a **~10–30 min compile** (the assembled is the heaviest, the most collectives) — budget
+  `--time` generously. ⚠️ **`run_suite.sbatch`'s SHARDING group auto-collects `test_*_sharded.py`, so it now
+  pulls the heavy forced tests ⇒ ~1.5–2 hr** — a FOLLOW-UP should add a `@pytest.mark.slow` to the forced
+  `test_step_sharded.py` tests and `-m "not slow"` the SHARDING group (keep the focused sbatch jobs as the
+  forced-test gates).
 - **CORE2 partitions:** `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2/dist_{2,4,…}`. Dense mesh
   `data/mesh_core2/`; IC `data/ic_core2/`; forcing via `core2_forcing.build_core_forcing` (JRA on `/pool`).
   `scripts/capture_core2_ssh_rhs.py` shows assembling the forced KPP+GM+ice step (`dt=1800`).
@@ -105,5 +113,12 @@
   FIELD-APPROPRIATE (don't demand 1e-12 of the FCT tracers / cancelling SSH divergences — that's the
   climate-close floor, Decision 4); float64 throughout.
 
-Confirm you've read the committed plan + Revision Log #2→#10 + the Phase-8 lessons; then start **S.7 PART 3**
-(+GM Redi exchanges first — the smallest forced increment — gated npes==2 vs single-device, sbatch on compute).
+Confirm you've read the plan + Revision Log #2→#12 + the Phase-8 lessons; then start **S.8 — the AD gradient
+gate**. Concretely: `jax.grad` of a scalar loss of a sharded run (start with a **2-step OCEAN** `run_steps_sharded`,
+no forcing) wrt `params` (e.g. `k_gm`) and the initial `state` (`T0`) == the single-device gradient (the `v1.0`
+baseline) to tight tol; then masked-NaN check (padded/halo lanes finite + 0 cotangent across the device axis);
+then +forcing (KPP+GM+ice). The forward already lowers (incl. the in-scan collectives + `custom_linear_solve`);
+S.8 gates the BACKWARD. New tests go in a `test_gradient_sharded.py`; gate via a focused sbatch on compute
+(the grad compile is heavier than the forward — budget `--time` generously). If a free-running multi-step grad
+is noisy (chaos, Decision 4), gate the gradient teacher-forced or at 1–2 steps. S.7 part 3 is committed (the
+HEAD commit; `git log --oneline -5` to confirm); the working tree is clean at the start of the S.8 session.

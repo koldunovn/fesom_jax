@@ -85,25 +85,39 @@ def _solve_low_order(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, rhs_a, rh
     return low(a_ice, rhs_a), low(m_ice, rhs_m), low(m_snow, rhs_ms)
 
 
-def _solve_high_order(cfg: IceConfig, mesh: Mesh, rhs_a, rhs_m, rhs_ms):
+def _solve_high_order(cfg: IceConfig, mesh: Mesh, rhs_a, rhs_m, rhs_ms, exch=None):
     """High-order increment ``dvalues`` (``ice_solve_high_order``): first approx ``rhs/area``,
-    then 2 residual-correction passes ``d ← d + (rhs - mm·d)/area``."""
+    then 2 residual-correction passes ``d ← d + (rhs - mm·d)/area``.
+
+    Sharding: ``_mm_times`` reads ``d`` at the element's HALO vertices (then scatters), so each
+    pass's OWNED output needs ``d`` complete on the halo — and the scatter leaves the new halo
+    INCOMPLETE for the next pass. ``exch`` refreshes ``d`` BEFORE each ``mm·d`` (the smoother
+    idiom; the C's per-iter ``dvalues`` halo, ``SYNC_MAP`` M4.3c)."""
     area = mesh.area[:, 0]
     inv_area = 1.0 / jnp.where(area > 0, area, 1.0)
     nc = mesh.ulevels_nod2D <= 1
+    _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
 
     def hi(rhs):
         d = jnp.where(nc, rhs * inv_area, 0.0)
         for _ in range(2):                                  # num_iter_solve-1 = 2 (C line 309)
+            d = _exch(d, "nod")                             # refresh halo before mm·d reads it
             d = jnp.where(nc, d + (rhs - _mm_times(mesh, d)) * inv_area, d)
         return d
 
     return hi(rhs_a), hi(rhs_m), hi(rhs_ms)
 
 
-def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals):
+def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None):
     """The Zalesak limiter for one tracer (``ice_fem_fct``, ``:351-518``). Returns the
-    flux-corrected tracer ``= vals_l + limited antidiffusive flux``."""
+    flux-corrected tracer ``= vals_l + limited antidiffusive flux``.
+
+    Sharding: the clipping ratios ``pplus``/``pminus`` (``icepplus``/``icepminus``) are read at
+    the element's HALO vertices by the limiter (``cand = pplus[en]``), but are built from the
+    SCATTER sums ``fp``/``fm`` (incomplete on the halo) — so ``exch`` refreshes them before the
+    element gather (``fesom_ice_fct.c:474``, ``SYNC_MAP`` M4.3c). ``vals_l``/``dvals`` are
+    exchanged by the caller (``fct_solve``) before this."""
+    _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
     en = mesh.elem_nodes
     g = cfg.ice_gamma_fct
     area = mesh.area[:, 0]
@@ -139,6 +153,8 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals):
                        0.0)
     pplus = jnp.where(nc_n, pplus, 0.0)
     pminus = jnp.where(nc_n, pminus, 0.0)
+    pplus = _exch(pplus, "nod")        # icepplus: read at HALO vertices by the limiter below
+    pminus = _exch(pminus, "nod")      # icepminus
 
     # limit element fluxes: ae = min over the 3 vertices of (pplus|pminus by flux sign).
     cand = jnp.where(icefluxes >= 0.0, pplus[en], pminus[en])   # [elem,3]
@@ -149,13 +165,24 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals):
     return vals_l + ops.scatter_add(limited, en, mesh.nod2D)
 
 
-def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice):
+def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, exch=None):
     """Advance the 3 ice tracers one step by FCT (``fesom_ice_fct_solve``). Returns the
-    advected ``(a_ice, m_ice, m_snow)`` (before ``cut_off``)."""
+    advected ``(a_ice, m_ice, m_snow)`` (before ``cut_off``).
+
+    Sharding (``exch=None`` ⇒ byte-identical): ``_fem_fct`` reads both the low-order ``X_l``
+    (cluster min/max + ``tmax=hi-X_l``) and the high-order ``dvals`` (``w=γ·vals+dvals``) at
+    the element's HALO vertices, and both are SCATTER results (incomplete on the halo) — so
+    refresh them before the limiter (``SYNC_MAP`` M4.3c: the low-order ``a_l/m_l/ms_l`` + the
+    high-order ``dvalues`` halos). The high-order solve's per-iteration ``dvalues`` refresh +
+    the limiter's ``icepplus/icepminus`` refresh are owned by ``_solve_high_order``/``_fem_fct``."""
+    _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
     rhs_m, rhs_a, rhs_ms = _tg_rhs(cfg, mesh, u_ice, v_ice, a_ice, m_ice, m_snow)
-    da, dm, dms = _solve_high_order(cfg, mesh, rhs_a, rhs_m, rhs_ms)
+    da, dm, dms = _solve_high_order(cfg, mesh, rhs_a, rhs_m, rhs_ms, exch=exch)
     a_l, m_l, ms_l = _solve_low_order(cfg, mesh, a_ice, m_ice, m_snow, rhs_a, rhs_m, rhs_ms)
-    m_new = _fem_fct(cfg, mesh, m_ice, m_l, dm)
-    a_new = _fem_fct(cfg, mesh, a_ice, a_l, da)
-    ms_new = _fem_fct(cfg, mesh, m_snow, ms_l, dms)
+    # refresh the low- + high-order halos read at element vertices inside the limiter.
+    a_l, m_l, ms_l = _exch(a_l, "nod"), _exch(m_l, "nod"), _exch(ms_l, "nod")
+    da, dm, dms = _exch(da, "nod"), _exch(dm, "nod"), _exch(dms, "nod")
+    m_new = _fem_fct(cfg, mesh, m_ice, m_l, dm, exch=exch)
+    a_new = _fem_fct(cfg, mesh, a_ice, a_l, da, exch=exch)
+    ms_new = _fem_fct(cfg, mesh, m_snow, ms_l, dms, exch=exch)
     return a_new, m_new, ms_new

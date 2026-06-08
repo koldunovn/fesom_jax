@@ -253,7 +253,8 @@ def _area_mean(x, areasvol_surf, ocean_area, *, owned_mask=None, axis_name=None)
 
 def sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,
                       areasvol_surf, ocean_area, open_water=None,
-                      balance_water_flux=True) -> SSSFluxes:
+                      balance_water_flux=True, *, owned_mask=None,
+                      axis_name=None) -> SSSFluxes:
     """AD-safe port of the ``oce_fluxes`` salt + water balance
     (``fesom_sss_runoff_step:382-440``). Pure, differentiable function:
 
@@ -285,20 +286,23 @@ def sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,
     # virtual_salt (C:384-400) — rsss = S_top (ref_sss_local=1).
     virtual_salt = S_top * water_flux
     virtual_salt = jnp.where(open_water,
-                             virtual_salt - _area_mean(virtual_salt, areasvol_surf, ocean_area),
+                             virtual_salt - _area_mean(virtual_salt, areasvol_surf, ocean_area,
+                                       owned_mask=owned_mask, axis_name=axis_name),
                              virtual_salt)
 
     # relax_salt (C:404-417).
     relax_salt = SURF_RELAX_S * (Ssurf_month - S_top)
     relax_salt = jnp.where(open_water,
-                           relax_salt - _area_mean(relax_salt, areasvol_surf, ocean_area),
+                           relax_salt - _area_mean(relax_salt, areasvol_surf, ocean_area,
+                                       owned_mask=owned_mask, axis_name=axis_name),
                            relax_salt)
 
     # water balance (C:419-440) — add ⟨water_flux + runoff⟩ to every node. The ice-on path
     # (balance_water_flux=False) skips it (runoff is already inside flx_fw → water_flux).
     if balance_water_flux:
         flux = water_flux + runoff_node
-        water_flux = water_flux + _area_mean(flux, areasvol_surf, ocean_area)
+        water_flux = water_flux + _area_mean(flux, areasvol_surf, ocean_area,
+                                             owned_mask=owned_mask, axis_name=axis_name)
 
     return SSSFluxes(virtual_salt=virtual_salt, relax_salt=relax_salt,
                      water_flux=water_flux)

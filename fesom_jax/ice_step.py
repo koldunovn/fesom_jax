@@ -58,7 +58,8 @@ class IceStepOut(NamedTuple):
 
 
 def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
-                     dt: float, boundary_node=None) -> IceStepOut:
+                     dt: float, boundary_node=None,
+                     owned_mask=None, axis_name=None, exch=None) -> IceStepOut:
     """One assembled ice step → the surface fluxes + the new ice state. ``sf`` is this step's
     :class:`core2_forcing.StepForcing` (atmosphere + month SSS/chl); ``fs`` the
     :class:`core2_forcing.ForcingStatic` (runoff/areas/open_water). ``boundary_node`` (the
@@ -83,16 +84,16 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         sf.u_air, sf.v_air, state.u_ice, state.v_ice)         # prev-step u_ice (bulk runs first)
 
     # --- fesom_ice_step: ocean2ice → EVP → FCT → cut_off → thermo → oce_fluxes ---
-    srf = ice_coupling.ocean2ice(state)
+    srf = ice_coupling.ocean2ice(state)         # slices of already-exchanged ocean state
     u_ice, v_ice, s11, s12, s22 = ice_evp.evp_dynamics(
         cfg, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow,
         u_ice=state.u_ice, v_ice=state.v_ice,
         sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,
         srfoce_u=srf.u, srfoce_v=srf.v, elevation=srf.ssh,
-        stress_ax=stress_ax, stress_ay=stress_ay, boundary_node=boundary_node)
+        stress_ax=stress_ax, stress_ay=stress_ay, boundary_node=boundary_node, exch=exch)
 
     a_adv, m_adv, ms_adv = ice_adv.fct_solve(
-        cfg, mesh, state.a_ice, state.m_ice, state.m_snow, u_ice, v_ice)
+        cfg, mesh, state.a_ice, state.m_ice, state.m_snow, u_ice, v_ice, exch=exch)
     a_co, m_co, ms_co = ice_thermo.cut_off(a_adv, m_adv, ms_adv)
 
     th = ice_thermo.thermodynamics(
@@ -103,16 +104,31 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         u_wind=sf.u_air, v_wind=sf.v_air, rain=sf.prec_rain, snow=sf.prec_snow,
         runo=fs.runoff_node, ch=bulk.ch, ce=bulk.ce, geo_lat=geo_lat, non_cavity=open_water)
 
+    # Refresh the prognostic ice TRACER halos RIGHT AFTER thermo — BEFORE they are consumed
+    # (the FCT scatter→cut_off→thermo chain leaves them incomplete on the halo). ⚠️ This must
+    # precede ice_oce_fluxes_mom: its `stress_surf` is a node→elem GATHER of the blended node
+    # stress `sns`, which reads `a_ice` at the element's HALO vertices (a boundary OWNED
+    # element) — incomplete-halo a_ice there gives a wrong OWNED `stress_surf`, hence a wrong
+    # ocean `uv` (the bug the npes==2 gate caught: uv≈7e-4 while every ICE field was bit-exact).
+    # The same complete halos feed the next step's EVP (reads a_ice/m_ice at element vertices).
+    # u_ice/v_ice are already halo-complete (refreshed inside the EVP subcycle scan); sigma/
+    # t_skin are per-element/per-node maps of complete inputs ⇒ auto-complete. exch=None ⇒ no-op.
+    _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
+    a_out = _exch(th.a_ice, "nod")
+    m_out = _exch(th.m_ice, "nod")
+    ms_out = _exch(th.m_snow, "nod")
+
     icef = ice_coupling.ice_oce_fluxes(
         srf.salt, th.flx_fw, th.flx_h, sf.Ssurf_month, fs.runoff_node,
-        fs.areasvol_surf, fs.ocean_area, open_water)
+        fs.areasvol_surf, fs.ocean_area, open_water,
+        owned_mask=owned_mask, axis_name=axis_name)
 
-    # --- oce_fluxes_mom: ice-ocean stress blend (prognostic a_ice/u_ice) ---
+    # --- oce_fluxes_mom: ice-ocean stress blend (prognostic a_ice/u_ice; halo-complete a_ice) ---
     stress_surf, stress_node_surf = ice_coupling.ice_oce_fluxes_mom(
-        mesh, th.a_ice, u_ice, v_ice, srf.u, srf.v, bulk.stress_node_surf, open_water, cfg)
+        mesh, a_out, u_ice, v_ice, srf.u, srf.v, bulk.stress_node_surf, open_water, cfg)
 
     # --- shortwave penetration (open-water-only gate on the prognostic a_ice) ---
-    pene_open = open_water & (th.a_ice <= 0.0)
+    pene_open = open_water & (a_out <= 0.0)
     heat_flux, sw_3d = _forcing.cal_shortwave_rad(
         mesh, icef.heat_flux, sf.shortwave, sf.chl, pene_open)
 
@@ -125,6 +141,6 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         stress_node_surf=stress_node_surf,
         heat_flux=heat_flux, water_flux=icef.water_flux,
         virtual_salt=icef.virtual_salt, relax_salt=icef.relax_salt,
-        a_ice=th.a_ice, m_ice=th.m_ice, m_snow=th.m_snow,
+        a_ice=a_out, m_ice=m_out, m_snow=ms_out,
         u_ice=u_ice, v_ice=v_ice, t_skin=th.t_skin,
         sigma11=s11, sigma12=s12, sigma22=s22)

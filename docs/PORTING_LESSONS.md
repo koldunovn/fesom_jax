@@ -2388,3 +2388,168 @@ Cite the C source (`file:line`) or dump probe that proves it.
   it on the shared login node (`levante0`, ~40 users, RAM-limited, one-CPU-JAX-process) is antisocial and can
   be killed. Only the lightweight host-side numpy checks (stencil/connectivity audits) belong on login. The
   slower `sbatch` debug cycle (queue + run) is the correct cost; batch several diagnostics into one job.
+
+## Phase 8 — sharding (Task S.7 part 3 — GM/Redi forced-path exchanges)
+
+- **[🎯GM-needs-5-exchanges-fer_gamma-is-the-trap] The GM/Redi chain needs only FIVE halo exchanges, and
+  `fer_gamma` (the streamfunction) is the easy-to-miss one — the Kokkos `SYNC_MAP` row 1b caught what the
+  plan's "likely only fer_uv/slope_tapered/Ki" underestimated.** The C/Kokkos exchanges ~10 GM intermediates
+  (it computes per-node fields over `myDim` only); the JAX redundant-compute model needs only the fields a
+  downstream kernel reads at the HALO of an entity whose value is INCOMPLETE there: **`fer_gamma`** (nod,
+  INTRA — before `fer_gamma2vel`), **`fer_uv`** (elem), **`slope_tapered`**/**`Ki`** (nod), all in
+  `gm.gm_diagnostics`, + **`fer_w`** (nod) in `step.py`'s bolus wrap. The trap is `fer_gamma`: `fer_gamma2vel`
+  GATHERS it at the element's 3 vertices, and a boundary OWNED element has HALO-node vertices (S.1 redundant
+  element ownership), whose `fer_gamma` is incomplete (its per-node TDMA RHS reads the element→node SCATTER
+  `sigma_xy`, incomplete on the halo). So the owned element's `fer_uv` is wrong unless `fer_gamma`'s halo is
+  refreshed BEFORE the gather. `sigma_xy`/`neutral_slope`/`fer_K`/`fer_C` need NO exchange (per-node maps,
+  read per-NODE downstream — owned-complete). **READ THE REFERENCE MAP FIRST** (user hard-rule #2): the plan's
+  per-field guess missed `fer_gamma`; the `SYNC_MAP` row had it as the one explicit "re-push" (L30).
+
+- **[🎯Redi-tr_xy/tr_z-auto-complete-in-JAX] The Redi diffusion (`gm_redi`) needs NO internal exchange,
+  unlike the C.** The C exchanges `tr_xy` (elem) inside `diff_ver` and `tr_z` (nod) inside `diff_hor`
+  (`SYNC_MAP` §6) because it builds them over `myDim` only. In JAX both are recomputed per call from
+  halo-complete `T_old` over the FULL local extent (`tr_xy` = per-element ∇T_old, `tr_z` = per-node ∂z T_old),
+  so they are auto-complete — the edge loop's owned-node output is correct GIVEN `slope_tapered`/`Ki` are
+  exchanged (read at halo edge endpoints). The "JAX needs fewer exchanges than the C" rule again: a
+  recomputed-from-complete-inputs intermediate never needs its own exchange; only the persistent
+  scatter-results read at the halo do.
+
+- **[🎯per-kernel-gm-gate-is-BIT-EXACT] The per-kernel GM-exchange gate (`run_gm_diag_sharded`, the S.4
+  scatter-gate analogue) matches single-device to EXACTLY 0.0 on owned — definitively proving the exchanges
+  before the noisy FCT.** Running `gm_diagnostics` alone under `shard_map` (npes=2) and diffing `fer_uv`/
+  `slope_tapered`/`Ki` on owned gave `max|Δ|=0.000e+00` (bit-exact, not just ~1e-9): each owned node/elem's
+  GM output is the same scatter terms in the same order as the dense, and the exchanges only touch the halo.
+  This ISOLATES the GM exchange correctness from the FCT tracer floor — so when the full GM step then matched
+  every clean field to MACHINE PRECISION (uv 2e-16, w 7e-17, d_eta 3e-16, Kv/density tiny) and only T/S were
+  elevated (T≈8.6e-3, S≈3.9e-3), it was PROVABLY the upwind-flip floor (GM-diag bit-exact ⇒ the bolus + Redi
+  inputs are correct), not a missing exchange. Build the per-kernel gate when a composite (GM/KPP/ice) feeds
+  the FCT — it discriminates "missing exchange" (would be O(1) on owned boundary) from "flip floor" cleanly.
+
+- **[GM-FCT-floor-larger-on-PHC-IC] The GM+PHC-IC FCT flip floor (T≈8.6e-3) is LARGER than the part-2
+  sharp-bump (~1e-3) — realistic fronts + the bolus-augmented advecting velocity make more upwind flips.**
+  The bolus `uv_adv = uv + fer_uv` carries `fer_uv`'s ~1e-12 scatter reassociation into the FCT, and the real
+  PHC IC has sharper tracer gradients (thermocline, western-boundary currents) than the test bump — so the
+  flip floor scales UP with gradient × velocity. T > S (8.6e-3 vs 3.9e-3) because T's gradients are sharper.
+  Set the FCT-tracer budget per-config (sharp-bump 5e-3, GM/PHC-IC 2e-2); it is climate-close, not a bug
+  (Decision 4). The non-FCT/clean fields stay at the machine-precision floor regardless — gate THEM tightly.
+
+- **[GM-needs-stratified-state] Gate GM on the REAL PHC IC (stratified), NOT a depth-uniform perturbed-rest
+  state — the latter degenerates (N²≈0 ⇒ the ODM95 slope taper collapses, the slopes blow up).** GM is purely
+  diagnostic (no surface forcing, no reductions), so it gates WITHOUT the forced path — but it needs genuine
+  vertical stratification or `compute_neutral_slope`'s `denom=max(bv0+bv1, eps²)` floors to `eps²` and the
+  `sigma_xy·(2g/ρ₀/eps²)` slopes explode. The cached `core2_initial_state` (PHC IC) is the right state; it
+  isolates the GM exchanges from the forcing/reduction wiring (which KPP/ice need).
+
+## Phase 8 — sharding (Task S.7 part 3 — reductions routing + the forced-path forcing fold)
+
+- **[reduction-threading-is-pure-plumbing] Routing the `_area_mean` balances through `owned_mask`/`axis_name`
+  is a 5-file thread with a `None` default => byte-identical `v1.0`.** The S.5 `global_sum` helper already
+  existed; S.7-part-3 threads `owned_mask=None, axis_name=None` (keyword-only) down the call chain
+  `step.py -> compute_surface_fluxes / ice_surface_step -> sss_runoff_fluxes / ice_oce_fluxes -> _area_mean`.
+  `owned_mask=None` keeps the `if owned_mask is None: return jnp.sum(x*area)/ocean_area` branch (the EXACT v1.0
+  graph - the 9 single-device `sss` tests stay green). `step.py` derives `(_red_mask, _red_axis)` from
+  `halo_ctx` (`owned_mask["nod"]`, `"p"`) or `(None, None)` when dense. The sharded owned-sum + `psum` matches
+  single-device on owned to ~1e-12. The `_area_mean` subtracts a GLOBAL scalar mean, so each owned node's
+  balanced flux is `local_value - global_mean` = correct (local value owned-complete, mean `psum`'d) - no
+  per-node halo issue.
+
+- **[fold-the-forcing-as-a-sharded-input-NOT-closed-over] On the sharded FORCED path the `StepForcing`/
+  `ForcingStatic` MUST be folded to `[P*Lmax]` `shard_map` inputs - closing over the `[P, Lmax]` partitioned
+  forcing REPLICATES it (every device sees all ranks' forcing).** `run_step_sharded` previously passed
+  `step_forcing`/`forcing_static` as Python closures into the body; that is correct only at `npes==1`. For
+  `npes>=2`, `_fold_forcing` folds each NamedTuple field `[P, Lmax_nod, ...] -> [P*Lmax_nod, ...]` (spec
+  `'p'`), EXCEPT the 0-d scalar `ocean_area` which stays replicated (`PartitionSpec()`, it becomes a `psum`),
+  and passes them as varargs through `shard_map`'s `in_specs` (a same-typed NamedTuple-of-`PartitionSpec` -
+  JAX accepts nested-pytree specs). `forc=()` when `step_forcing is None` => the no-forcing pi/GM path traces
+  EXACTLY as before (the GM gate stayed byte-identical). The partition helpers `partition_step_forcing`/
+  `partition_forcing_static` (S.2b) produce the `[P, Lmax]` form; `_fold_forcing` is the device-placement step.
+
+## Phase 8 — sharding (Task S.7 part 3 — KPP forced-path exchanges)
+
+- **[🎯KPP-smoother-must-exchange-PER-SWEEP] The KPP 3-sweep `blmc` smoother needs a halo refresh BEFORE
+  EVERY sweep, not just once — each sweep is an element->node SCATTER, so its halo is incomplete for the
+  next.** `eos.smooth_nod3D(arr, n_smooth, exch)` exchanges `arr` at the start of each of its `n` sweeps: the
+  first refresh fixes the INCOMPLETE input (`blmc` is uvnode-derived: `ri_iwmix(uvnode)` where `uvnode` is the
+  element->node scatter `compute_vel_nodes`), the later refreshes fix the inter-sweep scatter incompleteness
+  (the sweep reads `arr` at the element's HALO vertices). Mirrors the C's "the smoother does its own internal
+  exchanges" (`SYNC_MAP` M2.3). The single-sweep `bvfreq` smoother (substep 1) passes `exch=None` — its input
+  is a halo-complete per-node T/S map, so one sweep is correct unrefreshed. **Proof:** `Kv` (the smoother
+  output) matched single-device on owned to **2.4e-14** (machine precision), npes=2.
+
+- **[KPP-2nd-exchange-viscA-before-the-Av-gather] After `smooth_blmc`+combine, refresh the node `viscA` BEFORE
+  the node->elem `Av` average.** `_node_to_elem_visc` GATHERS `viscA` at the element's 3 vertices (HALO nodes
+  for a boundary OWNED element), but `viscA = max(viscA, smoothed blmcM)` is still incomplete on the halo
+  (the smoother's final halo is incomplete). The second `SYNC_MAP` KPP exchange point. `Kv` (=combined
+  `diffKt`) is refreshed by `step.py`'s post-mixing `Kv` exchange (read per-NODE downstream), so it needs no
+  in-kernel exchange. **Proof:** `Av` matched on owned to **9.1e-15**, npes=2.
+
+- **[🎯KPP-needs-FEWER-than-the-C-uvnode/sw_alpha-auto-complete] KPP's per-node-COLUMN kernels are
+  auto-complete, so only the 2 horizontal ops (smoother + `Av` gather) need exchanges — NOT the C's `uvnode`/
+  `sw_alpha`/`sw_beta`/`dbsfc` pre-exchanges.** `ri_iwmix` (shear Ri), `prestep` (ustar/Bo), `bldepth` (the OBL
+  search) and `blmix` are all per-node-COLUMN (they read `uvnode`/forcing at the node's own column, vertically)
+  -> their OWNED outputs are complete from the OWNED (scatter-complete) `uvnode`, with no horizontal
+  neighbour read. `sw_alpha`/`sw_beta`/`dbsfc` are per-node maps of halo-complete T/S -> auto-complete. The C
+  exchanges all of them because it computes per-node over `myDim` only; JAX computes over the full extent. The
+  forced-path inputs (`heat_flux`/`water_flux`/`stress_node_surf`) are per-node maps of the (folded,
+  halo-complete) forcing + the `_area_mean`-balanced global scalar -> complete on owned.
+
+- **[KPP-forced-compile-is-heavy] The forced KPP step under `shard_map` is a ~17 min CPU compile — the most
+  collectives of any step (9 `blmc`-smoother `all_gather`s + ~18 ocean exchanges + the CG + the `psum`
+  reductions).** Budget the `sbatch` time accordingly (`--time=00:30:00`) and split the npes==1 byte-id +
+  npes==2 owned gates so a failure is localized. The npes==1 byte-identity is the proof the whole forced
+  machinery (forcing fold + reductions + KPP exchanges + the smoother `exch`) collapses to `v1.0`; the npes==2
+  `Kv`/`Av` machine-precision match is the proof the exchanges are correct on real shards.
+
+## Phase 8 — sharding (Task S.7 part 3 — ice forced-path exchanges + the multi-step scan)
+
+- **[🎯collective-in-CHECKPOINTED-scan-lowers] An `all_gather` (the `u_ice/v_ice` halo exchange) inside
+  `jax.checkpoint` inside `lax.scan` inside `shard_map` (`check_vma=False`) LOWERS and runs — the hardest
+  collective placement in the port, validated by the ice npes==1 byte-id.** The EVP momentum subcycle is a
+  120-step `lax.scan` with a `jax.checkpoint`'d body (Phase-6 backward-memory cap); the sharded port adds a
+  per-subcycle `u_ice/v_ice` `exch` INSIDE that body (each subcycle's `velocity_update` is a per-node update
+  of the element→node SCATTER `u_rhs`/`v_rhs`, incomplete on the halo, and the next subcycle's `stress_tensor`
+  reads `u_ice` at the element's HALO vertices). This extends the S.6 result (collective in a `while_loop`
+  inside `custom_linear_solve`) to a CHECKPOINTED scan — the forward pass lowers cleanly (the checkpoint only
+  affects the backward recompute, S.8). The ice FCT's `_solve_high_order` per-iteration `dvalues` refresh +
+  the `a_l/m_l/ms_l` low-order + the `icepplus/icepminus` limiter splits are the same per-sweep idiom as the
+  KPP smoother. **Result:** every ICE prognostic field (`a_ice`/`m_ice`/`m_snow`/`u_ice`/`v_ice`/`sigma`)
+  matched single-device on owned to **0.0 bit-exact** (npes==2) — the EVP in-scan + FCT split exchanges are
+  correct.
+
+- **[🎯exchange-before-the-CONSUMER-not-at-step-end] A field read by a node→elem GATHER must be halo-refreshed
+  BEFORE that gather, not at the end of the step.** The bug the npes==2 ice gate caught: `uv`≈7e-4 on owned
+  (a CLEAN field) while EVERY ice field was bit-exact. `ice_oce_fluxes_mom`'s `stress_surf` is a node→elem
+  gather of the blended node stress `sns`, which reads the FCT-derived `a_ice` at the element's HALO vertices
+  (a boundary OWNED element) — but the `a_ice` exchange was placed at step-END (for the next step's EVP), so
+  the gather read INCOMPLETE-halo `a_ice` ⇒ wrong OWNED `stress_surf` ⇒ wrong ocean `uv`. Fix: exchange
+  `a_ice` RIGHT AFTER thermo, before `ice_oce_fluxes_mom`. The lesson generalizes the S.4 "who reads this at
+  the halo?" rule across the ice→ocean SEAM: an ice OUTPUT consumed by an ocean kernel's gather needs its halo
+  fresh at the consumer, and a single end-of-step refresh is too late if an earlier consumer gathers it.
+
+- **[ice-bit-exact-ocean-amplifies-localizes-the-bug] When the per-field diagnostic shows the ICE fields
+  bit-exact (0.0) and only the OCEAN fields elevated + ordered by coupling depth, the gap is in an ice→ocean
+  OUTPUT (a surface BC), not an ice-internal exchange.** The breakdown — ice fields not even printed (= 0.0),
+  ocean `uv` 7e-4 → `d_eta` 1e-5 → `w` 6e-8 (descending by how deep in the coupling chain) — immediately
+  pointed at `stress_surf` (the ice momentum BC, fed to the ocean `impl_vert_visc`), not the EVP/FCT. Read the
+  per-field ordering as a dependency graph: the SHALLOWEST elevated field (closest to the gap) is the suspect.
+
+- **[🎯global-boundary_node-not-local] The EVP coastal BC needs the GLOBAL `boundary_node` partitioned in —
+  the local-mesh recompute mis-flags partition-boundary nodes as coastal.** `boundary_node_mask` counts
+  boundary edges (`edge_tri[:,1]==-1`); on a device's LOCAL mesh a partition-boundary edge has its off-rank
+  element unmappable (`-1`), so an interior node gets mis-detected as coastal and its `u_ice` forced to 0 —
+  diverging from single-device. Compute the mask on the dense mesh, `_shard_along_axis` it, and thread it
+  through `run_step_sharded(boundary_node_p=…)` → `step(boundary_node=…)` → `ice_surface_step` → `evp_dynamics`
+  (the C uses `partit->myList_edge2D`, `SYNC_MAP` M4.3b). The dense step derives it from the full mesh itself,
+  so only the SHARDED side passes it.
+
+- **[🎯free-running-multistep-decorrelates-use-TEACHER-FORCING] A free-running N-step N-vs-1 compare is NOT a
+  tight gate — the step-1 FCT flip floor amplifies chaotically through the coupled system within a few steps;
+  gate per-step with TEACHER-FORCING instead.** A 2-step OCEAN compare showed the fields ordered by coupling
+  depth: `uvnode` 2.6e-17 → `bvfreq` 2.9e-10 → `density` 9.4e-7 → `uv` 1.1e-5 → `Kv`/`Av` 0.1 → `ssh_rhs` 67 —
+  the ~5e-6 step-1 tracer flip floor propagating density→PGF→momentum→(PP-mixing + `mo_convect` binary
+  flips)→SSH, exactly Decision 4's chaotic divergence, visible at just 2 steps. So: (a) gate the multi-step
+  SCAN MECHANISM by "lowers + runs + FINITE + physically bounded" (the `run_steps_sharded` collective-in-scan
+  works); (b) gate PER-STEP CORRECTNESS by teacher-forcing — each sharded step reads the SINGLE-DEVICE's
+  previous state (partitioned), so the only N-vs-1 difference is the within-step reassociation (clean except
+  FCT). A threading bug shows as a CLEAN field diverging under teacher-forcing; chaos cannot. `T_old`/`S_old`
+  (the AB2 histories of FCT tracers) are FCT-class — add them to the climate-close set.

@@ -320,7 +320,7 @@ class GMDiag(NamedTuple):
 
 
 def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
-                   cfg: GMConfig) -> GMDiag:
+                   cfg: GMConfig, exch=None) -> GMDiag:
     """Run the full GM/Redi diagnostic chain (G.2-G.4) from the ocean state:
     ``sw_alpha_beta → sigma_xy → neutral_slope → init_redi_gm → fer_solve_gamma →
     fer_gamma2vel``. Returns the fields the bolus advection (G.5) and Redi terms
@@ -328,13 +328,42 @@ def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
 
     Mirrors ``fesom_step.c:124-130`` (the GM coefficient block). Each sub-kernel is
     individually dump-verified (G.1-G.4); this composes them.
-    """
+
+    **Sharding (Phase 8, S.7 part 3).** ``exch`` is the broadcast halo-refresh closure
+    (``step.py`` ``_exch(field, kind)``; ``None`` ⇒ the identity ⇒ the single-device path
+    is byte-identical). The C/Kokkos port exchanges every GM intermediate (``SYNC_MAP`` row
+    1b lists ~10), but the JAX redundant-compute model needs only the fields that a
+    downstream kernel reads at the HALO of an entity whose value is INCOMPLETE there:
+
+    * ``fer_gamma`` (nod, INTRA) — :func:`fer_gamma2vel` gathers it at the element's 3
+      vertices, and a boundary OWNED element has HALO-node vertices (S.1 redundant element
+      ownership) whose ``fer_gamma`` is incomplete (its per-node TDMA RHS reads the
+      element→node SCATTER ``sigma_xy``, incomplete on the halo). So the owned element's
+      ``fer_uv`` would be wrong unless ``fer_gamma``'s halo is refreshed BEFORE the gather
+      (the ``SYNC_MAP`` "re-push", L30).
+    * ``fer_uv`` (elem) — read at HALO elements by ``compute_w`` (``fer_w``) + the tracer FCT.
+    * ``slope_tapered``/``Ki`` (nod) — read at HALO edge endpoints by
+      :func:`fesom_jax.gm_redi.diff_part_hor_redi`.
+
+    Everything else (``sw_alpha/β``, ``sigma_xy``, ``neutral_slope``, ``fer_K``, ``fer_C``)
+    is a per-node/elem map whose OWNED output is complete (computed over the full local
+    extent from halo-complete T/S/bvfreq) and is only read per-NODE downstream — so it needs
+    no exchange (the "JAX needs FEWER exchanges than the C" rule). The Redi terms
+    (:mod:`fesom_jax.gm_redi`) recompute ``tr_xy``/``tr_z`` from halo-complete ``T_old`` over
+    the full extent ⇒ auto-complete ⇒ no internal exchange there either (verified by the
+    per-field N-vs-1 gate)."""
+    if exch is None:
+        exch = lambda f, kind: f                       # noqa: E731  (identity ⇒ byte-id)
     from .eos import compute_sw_alpha_beta
     sw_alpha, sw_beta = compute_sw_alpha_beta(mesh, T, S)
     sigma_xy = compute_sigma_xy(mesh, T, S, sw_alpha, sw_beta, cfg)
     _, slope_tapered, fer_tapfac = compute_neutral_slope(mesh, sigma_xy, bvfreq, cfg)
     fer_K, Ki, fer_C, _ = init_redi_gm(mesh, bvfreq, hnode_new, fer_tapfac, params, cfg)
     fer_gamma = fer_solve_gamma(mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg)
+    fer_gamma = exch(fer_gamma, "nod")                 # INTRA: gathered at HALO vertices below
     fer_uv = fer_gamma2vel(mesh, fer_gamma, helem)
+    fer_uv = exch(fer_uv, "elem")                      # read at HALO elems (compute_w / FCT)
+    slope_tapered = exch(slope_tapered, "nod")         # read at HALO edge endpoints (Redi G7b)
+    Ki = exch(Ki, "nod")                               # read at HALO edge endpoints (Redi G7b)
     return GMDiag(fer_uv=fer_uv, slope_tapered=slope_tapered, Ki=Ki,
                   fer_K=fer_K, fer_C=fer_C)

@@ -20,7 +20,7 @@ from jax.sharding import PartitionSpec
 
 from fesom_jax import halo, partit, reductions, shard_mesh
 from fesom_jax.mesh import load_mesh
-from fesom_jax.sss_runoff import _area_mean
+from fesom_jax.sss_runoff import _area_mean, sss_runoff_fluxes
 
 CORE2_MESH = Path(__file__).resolve().parents[2] / "data" / "mesh_core2"
 CORE2_DIST = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2")
@@ -121,6 +121,63 @@ def test_owned_mask_excludes_halo(npes):
     assert (sm.valid_mask["nod"][0, h] and not sm.owned_mask["nod"][0, h])
     corrupted = _device_total(xPL, sm.owned_mask["nod"], npes, reductions.global_sum)
     assert corrupted == pytest.approx(clean, rel=0, abs=1e-9)
+
+
+@avail
+@pytest.mark.parametrize("npes", [2])
+def test_sss_runoff_fluxes_sharded_matches_single(npes):
+    """S.7 part 3 reduction routing: ``sss_runoff_fluxes`` threaded with
+    ``owned_mask``/``axis_name`` (owned-node sum + ``psum`` inside ``shard_map``) matches the
+    single-device fluxes on OWNED nodes. The ``_area_mean`` global-mean subtraction
+    (virtual-salt / relax-salt / water-flux balance) is the same total whether summed on one
+    device or owned-summed + ``psum``'d across devices ⇒ each owned node's balanced flux
+    matches. (``owned_mask=None`` is already proven byte-identical to ``v1.0``.)"""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    Ln = sm.Lmax["nod"]
+    N = mesh.nod2D
+    rng = np.random.default_rng(7)
+    S_top = rng.uniform(30.0, 36.0, N)
+    water_flux = rng.standard_normal(N) * 1e-6
+    Ssurf = rng.uniform(30.0, 36.0, N)
+    runoff = np.abs(rng.standard_normal(N)) * 1e-7
+    areasvol = np.asarray(mesh.areasvol)[:, 0]
+    ocean_area = float(mesh.ocean_area)
+
+    # single-device reference (owned_mask=None ⇒ the v1.0 graph)
+    ref = sss_runoff_fluxes(S_top, water_flux, Ssurf, runoff, areasvol, ocean_area)
+
+    # partition the node fields to [P, Ln] (gather owned+halo by myList, pad with 0)
+    def _part(x):
+        out = np.zeros((npes, Ln))
+        for d in range(npes):
+            ml = part.myList_nod2D[d]
+            out[d, : ml.size] = x[ml]
+        return jnp.asarray(out).reshape(npes * Ln)
+
+    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    spec = PartitionSpec("p")
+
+    def body(S_t, wf, Ss, ru, av, m):
+        out = sss_runoff_fluxes(S_t, wf, Ss, ru, av, ocean_area,
+                                owned_mask=m, axis_name="p")
+        return jnp.stack([out.virtual_salt, out.relax_salt, out.water_flux], axis=-1)
+
+    fn = jax.shard_map(body, mesh=jmesh, in_specs=(spec,) * 6, out_specs=spec)
+    res = np.asarray(fn(_part(S_top), _part(water_flux), _part(Ssurf), _part(runoff),
+                        _part(areasvol), jnp.asarray(sm.owned_mask["nod"]).reshape(npes * Ln)))
+    res = res.reshape(npes, Ln, 3)
+
+    for j, name in enumerate(("virtual_salt", "relax_salt", "water_flux")):
+        a = np.asarray(getattr(ref, name))
+        worst = 0.0
+        for d in range(npes):
+            md = int(part.myDim_nod2D[d])
+            worst = max(worst, float(np.max(np.abs(res[d, :md, j] - a[part.myList_nod2D[d][:md]]))))
+        assert worst < 1e-12, f"{name}: owned max|Δ|={worst:.3e}"
 
 
 @avail

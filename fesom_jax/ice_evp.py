@@ -203,13 +203,25 @@ def velocity_update(cfg: IceConfig, mesh: Mesh, u_ice, v_ice, u_rhs, v_rhs,
 def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
                  u_ice, v_ice, sigma11, sigma12, sigma22,
                  srfoce_u, srfoce_v, elevation, stress_ax, stress_ay,
-                 boundary_node=None):
+                 boundary_node=None, exch=None):
     """Run the EVP momentum solver (setup + 120 subcycles). Returns the updated
     ``(u_ice, v_ice, sigma11, sigma12, sigma22)``. ``stress_ax/ay`` = the atm-ice wind stress
-    (``forcing.atm_ice_stress``); ``elevation`` = ``srfoce_ssh`` (``hbar``)."""
+    (``forcing.atm_ice_stress``); ``elevation`` = ``srfoce_ssh`` (``hbar``).
+
+    **Sharding (Phase 8, S.7 part 3).** ``exch`` (``None`` ⇒ byte-identical) is the
+    ``u_ice``/``v_ice`` node halo refresh wired INSIDE the 120-subcycle ``lax.scan`` (a
+    collective in a ``scan`` under ``shard_map``, ``check_vma=False``): each subcycle's
+    ``velocity_update`` is a per-node update of the element→node SCATTER ``u_rhs``/``v_rhs``
+    (incomplete on the halo), and the NEXT subcycle's ``stress_tensor`` reads ``u_ice``/
+    ``v_ice`` at the element's HALO vertices — so without the per-subcycle refresh the halo
+    error propagates into owned nodes over 120 subcycles (``fesom_ice_evp.c:446``,
+    ``SYNC_MAP`` M4.3b). ``boundary_node`` MUST be the GLOBAL coastal mask (partitioned in),
+    NOT the local-mesh recompute: a partition-boundary edge has ``edge_tri[:,1]==-1`` locally
+    and would mis-flag an interior node as coastal (the C uses ``partit->myList_edge2D``)."""
     if boundary_node is None:
         boundary_node = boundary_node_mask(mesh)
     st = evp_setup(cfg, mesh, a_ice, m_ice, m_snow, elevation)
+    _exch = (lambda f, k: f) if exch is None else exch        # noqa: E731
 
     def body(carry, _):
         u_i, v_i, s11, s12, s22 = carry
@@ -218,6 +230,8 @@ def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
                                   st.inv_areamass, st.tilt_u, st.tilt_v)
         u_i, v_i = velocity_update(cfg, mesh, u_i, v_i, u_rhs, v_rhs, srfoce_u, srfoce_v,
                                    stress_ax, stress_ay, st.inv_mass, a_ice, boundary_node)
+        u_i = _exch(u_i, "nod")                              # refresh halo for next subcycle's
+        v_i = _exch(v_i, "nod")                              # stress_tensor (reads at vertices)
         return (u_i, v_i, s11, s12, s22), None
 
     init = (u_ice, v_ice, sigma11, sigma12, sigma22)

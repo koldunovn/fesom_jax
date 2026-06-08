@@ -67,7 +67,8 @@ class IceOceFluxes(NamedTuple):
 
 
 def ice_oce_fluxes(S_top, flx_fw, flx_h, Ssurf_month, runoff_node,
-                   areasvol_surf, ocean_area, open_water=None) -> IceOceFluxes:
+                   areasvol_surf, ocean_area, open_water=None, *,
+                   owned_mask=None, axis_name=None) -> IceOceFluxes:
     """Ice-mediated surface heat/freshwater fluxes (``fesom_ice_oce_fluxes``).
 
     ``water_flux = -flx_fw`` (the thermo flux, runoff already folded in via ``prec``);
@@ -78,7 +79,8 @@ def ice_oce_fluxes(S_top, flx_fw, flx_h, Ssurf_month, runoff_node,
     heat_flux = -flx_h
     sss = sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,
                             areasvol_surf, ocean_area, open_water,
-                            balance_water_flux=False)
+                            balance_water_flux=False,
+                            owned_mask=owned_mask, axis_name=axis_name)
     return IceOceFluxes(heat_flux=heat_flux, water_flux=sss.water_flux,
                         virtual_salt=sss.virtual_salt, relax_salt=sss.relax_salt)
 

@@ -162,7 +162,7 @@ def pressure_bv(mesh: Mesh, T, S, hnode):
     return density, hpressure, bvfreq
 
 
-def smooth_nod3D(mesh: Mesh, arr, n_smooth: int = 1):
+def smooth_nod3D(mesh: Mesh, arr, n_smooth: int = 1, exch=None):
     """Area-weighted node-patch horizontal smoother (``fesom_smooth_nod3D``).
 
     One sweep = for every element ``el`` and interface level ``nz`` in its valid
@@ -171,11 +171,25 @@ def smooth_nod3D(mesh: Mesh, arr, n_smooth: int = 1):
     level range ⊆ its vertices' ranges (node ``nlevels``=MAX, ``ulevels``=MIN over
     cells), so the per-element clamp is exactly ``elem_iface_mask`` — no extra
     node-side level clamp. ``arr`` is ``[nod2D, nl]``. Scatter class → ~1e-12.
+
+    **Sharding (Phase 8, S.7 part 3).** ``exch`` (the ``step.py`` ``_exch(field, kind)``
+    closure; ``None`` ⇒ byte-identical) is the per-sweep node halo refresh. Each sweep
+    reads ``arr`` at the element's 3 vertices (HALO nodes for a boundary element) and
+    scatters to nodes, so a sweep's OWNED output needs its input complete on the halo —
+    and the scatter leaves the new halo lanes INCOMPLETE for the next sweep. Refreshing
+    the halo BEFORE every sweep makes each sweep's owned output correct (mirrors the C's
+    "the smoother does its own internal exchanges", ``SYNC_MAP`` §6). The single-sweep
+    ``bvfreq`` smoother (substep 1) passes ``exch=None``: its input is a per-node map of
+    T/S, already halo-complete, so one sweep is correct without a refresh (``step.py``
+    exchanges the result after). Only KPP's 3-sweep ``blmc`` smoother (incomplete
+    uvnode-derived input) needs it.
     """
     e, three, nl = mesh.elem2D, 3, mesh.nl
     area = mesh.elem_area[:, None]                        # (elem2D, 1)
     arr_s = jnp.asarray(arr)
     for _ in range(n_smooth):
+        if exch is not None:
+            arr_s = exch(arr_s, "nod")                   # refresh halo before each sweep
         corners = ops.gather_nodes_to_elem(arr_s, mesh.elem_nodes)   # (elem2D,3,nl)
         bsum = corners.sum(axis=1)                                   # (elem2D, nl)
         contrib = jnp.where(mesh.elem_iface_mask, area * bsum, 0.0)  # (elem2D, nl)
