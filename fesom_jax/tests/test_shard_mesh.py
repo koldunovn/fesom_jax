@@ -228,3 +228,66 @@ def test_export_load_roundtrip(tmp_path):
 def test_load_missing_dir_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         shard_mesh.load_sharded_mesh(tmp_path / "nope")
+
+
+# --------------------------------------------------------------------------
+# Phase 8b B.0a — the ragged halo-exchange maps reproduce the all_gather exchange
+# --------------------------------------------------------------------------
+def _apply_allgather_host(field_PL, src_dev, src_lane):
+    """Host mirror of :func:`fesom_jax.halo.halo_exchange` (all_gather + gather):
+    ``out[d, l] = field[src_dev[d,l], src_lane[d,l]]``."""
+    P = field_PL.shape[0]
+    out = np.empty_like(field_PL)
+    for d in range(P):
+        out[d] = field_PL[src_dev[d], src_lane[d]]
+    return out
+
+
+def _apply_ragged_host(field_PL, rmap):
+    """Host mirror of the ragged primitive (gather send lanes → ``ragged_all_to_all``
+    → scatter into halo lanes). Interior + pad lanes are untouched."""
+    P, Lmax = field_PL.shape[0], field_PL.shape[1]
+    rest = field_PL.shape[2:]
+    out = field_PL.copy()
+    for e in range(P):
+        recv_tot = int(rmap.recv_sizes[e].sum())
+        if recv_tot == 0:
+            continue
+        buf = np.zeros((recv_tot,) + rest, dtype=field_PL.dtype)
+        for d in range(P):
+            s = int(rmap.recv_sizes[e, d])
+            if s == 0:
+                continue
+            so = int(rmap.send_offsets[d, e])
+            ro = int(rmap.recv_offsets[e, d])
+            buf[ro:ro + s] = field_PL[d][rmap.send_idx[d, so:so + s]]
+        out[e][rmap.recv_idx[e, :recv_tot]] = buf
+    return out
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+def test_ragged_exchange_reproduces_allgather(mesh, npes):
+    """B.0a: the :class:`RaggedExchange` maps (the halo-only point-to-point exchange)
+    applied on the host == the ``all_gather`` exchange on every VALID (interior+halo)
+    lane, for all three kinds. (Pad lanes legitimately differ — all_gather reads
+    self-lane-0, the ragged path leaves pad untouched — and are masked everywhere.)
+    This is the byte-for-bit oracle that the transport swap changes nothing."""
+    sm = _build(mesh, npes)
+    assert sm.exchange_ragged is not None
+    rng = np.random.default_rng(0)
+    for k in _KINDS:
+        Lmax = sm.Lmax[k]
+        src_dev, src_lane = sm.exchange[k]
+        rmap = sm.exchange_ragged[k]
+        # send/recv block sizes are consistent across devices (d→e == e←d).
+        np.testing.assert_array_equal(rmap.send_sizes, rmap.recv_sizes.T)
+        valid = sm.valid_mask[k]                       # [P, Lmax] interior+halo
+        gid = np.where(valid, np.arange(npes * Lmax).reshape(npes, Lmax), -1.0)
+        ml = rng.standard_normal((npes, Lmax, sm.nl))
+        for field in (gid.astype(np.float64), ml):
+            ref = _apply_allgather_host(field, src_dev, src_lane)
+            got = _apply_ragged_host(field, rmap)
+            vm = valid if field.ndim == 2 else valid[:, :, None]
+            assert np.array_equal(np.where(vm, got, 0.0), np.where(vm, ref, 0.0)), \
+                f"ragged != all_gather on valid {k} lanes (npes={npes})"

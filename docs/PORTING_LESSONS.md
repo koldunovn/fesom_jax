@@ -2654,3 +2654,22 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `shard_map` on the hardware. The EVP-scan backward materializes its ~120-subcycle intermediates; making the
   forced grad fit GPU memory (more aggressive `jax.checkpoint` on the EVP scan, or fewer subcycles for the
   gate) is deferred to its own task — it does not block the S.9 correctness verdict.
+
+- **[Phase 8b B.0a — derive the ragged point-to-point halo maps from the OWNER MAP, not the C `ComStruct`]**
+  The scaling fix replaces the O(P·N_local) `all_gather` halo with halo-only `lax.ragged_all_to_all`
+  (confirmed in JAX 0.10.1 **with a registered transpose + jvp** — `_ragged_all_to_all_{transpose,jvp}` —
+  so the gradient survives). The per-device send/recv index maps could come from the C `ComStruct`
+  (`rPE`/`rlist`, `sPE`/`slist`, already parsed in `partit.py`), BUT the `Partition` has **no
+  `com_edge2D`** — edges have no C communicator — whereas the existing `all_gather` `_exchange_map` derives
+  ownership uniformly for nod/elem/edge from `_owner_map` (the lowest-id interior owner of each global id).
+  So build the ragged maps (`shard_mesh.RaggedExchange`) from the **same `_owner_map`**: it is (a) uniform
+  across all three kinds, and (b) **provably consistent with the `all_gather` oracle** (same ownership, only
+  the transport differs). **Canonical ordering for `ragged_all_to_all`:** order each per-`(receiver e,
+  source d)` block by **increasing halo-lane index on the receiver**, and build BOTH sides from the same
+  `recv_pairs[e][d]` list → `send_sizes[d,e] == recv_sizes[e,d]` and the transported chunks align
+  element-wise without any extra sorting. The forward is then a gather (`operand=field[send_idx]`) →
+  `ragged_all_to_all` → scatter into halo lanes (interior+pad untouched); a host-numpy applier reproduces
+  the `all_gather` exchange on every valid lane (the B.0a gate). ⚠️ An owned lane sent to several neighbours
+  is gathered multiple times into `operand` — correct, because the transpose scatter-ADDs the cotangents
+  back (the same additive-reverse-exchange property the `all_gather` AD relies on). ⚠️ The host builder uses
+  per-halo-lane Python loops (fine to dars; vectorize for NG5's 7.4 M nodes).

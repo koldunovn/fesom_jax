@@ -116,6 +116,7 @@ class ShardedMesh:
     edge2D_in: int = 0
     myDim_edge2D_global: int = 0
     ocean_area: float = 0.0
+    exchange_ragged: dict = None  # {kind: RaggedExchange} — Phase 8b B.0 (None ⇒ not built)
 
 
 # --------------------------------------------------------------------------
@@ -211,6 +212,83 @@ def _exchange_map(mylists, mydim, Lmax: int, owner, owner_local):
     return src_dev, src_lane
 
 
+@dataclasses.dataclass(frozen=True)
+class RaggedExchange:
+    """Per-device ragged halo-exchange maps for ``lax.ragged_all_to_all`` (Phase 8b
+    Task B.0) — the halo-only, point-to-point replacement for the O(P·N_local)
+    ``all_gather`` exchange (:func:`_exchange_map`). Built from the **same** owner
+    map, so it reproduces the broadcast exchange byte-identically on valid lanes;
+    only the transport changes (each device ships just its boundary lanes to the
+    neighbours that need them, like the C/Kokkos MPI).
+
+    All arrays are device-leading ``[P, …]``. For device ``d``:
+      * ships ``send_sizes[d, e]`` interior lanes to device ``e``, gathered from its
+        local lanes ``send_idx[d, send_offsets[d,e] : +send_sizes[d,e]]``;
+      * receives ``recv_sizes[d, e]`` lanes from device ``e`` into its local halo
+        lanes ``recv_idx[d, recv_offsets[d,e] : +recv_sizes[d,e]]``.
+    ``send_sizes[d,e] == recv_sizes[e,d]`` by construction; the per-``(e,d)`` block
+    is ordered by increasing halo-lane index on the receiver, so send and recv
+    sides align element-wise. ``send_idx``/``recv_idx`` are padded to ``send_max`` /
+    ``recv_max`` (max total over devices); offsets are per-device exclusive cumsums
+    (the ``input_offsets``/``output_offsets`` ``ragged_all_to_all`` wants)."""
+
+    send_idx: np.ndarray      # [P, send_max] int32 — local interior lanes to gather
+    send_sizes: np.ndarray    # [P, P] int32
+    send_offsets: np.ndarray  # [P, P] int32 — exclusive cumsum of send_sizes (axis 1)
+    recv_idx: np.ndarray      # [P, recv_max] int32 — local halo lanes to scatter into
+    recv_sizes: np.ndarray    # [P, P] int32
+    recv_offsets: np.ndarray  # [P, P] int32 — exclusive cumsum of recv_sizes (axis 1)
+    send_max: int
+    recv_max: int
+
+
+def _ragged_exchange_map(mylists, mydim, owner, owner_local) -> RaggedExchange:
+    """Build the :class:`RaggedExchange` for one entity kind from the owner map
+    (the same ``owner``/``owner_local`` :func:`_exchange_map` uses)."""
+    P = len(mylists)
+    # recv_pairs[e][d] = (halo_lane_on_e, owner_local_lane_on_d) for halo lanes on e
+    # owned by d, in increasing halo-lane order — the canonical per-(e,d) ordering
+    # shared by the send and recv sides so the transported chunks align.
+    recv_pairs = [[[] for _ in range(P)] for _ in range(P)]
+    for e in range(P):
+        md = int(mydim[e])
+        ml = mylists[e]
+        for lane in range(md, ml.size):                 # halo lanes on e
+            gid = int(ml[lane])
+            recv_pairs[e][int(owner[gid])].append((lane, int(owner_local[gid])))
+
+    send_sizes = np.zeros((P, P), dtype=np.int32)
+    recv_sizes = np.zeros((P, P), dtype=np.int32)
+    for e in range(P):
+        for d in range(P):
+            n = len(recv_pairs[e][d])
+            recv_sizes[e, d] = n        # e receives n lanes from d
+            send_sizes[d, e] = n        # d sends n lanes to e
+    send_offsets = np.zeros((P, P), dtype=np.int32)
+    recv_offsets = np.zeros((P, P), dtype=np.int32)
+    if P:
+        send_offsets[:, 1:] = np.cumsum(send_sizes, axis=1)[:, :-1]
+        recv_offsets[:, 1:] = np.cumsum(recv_sizes, axis=1)[:, :-1]
+    send_max = int(send_sizes.sum(axis=1).max()) if P else 0
+    recv_max = int(recv_sizes.sum(axis=1).max()) if P else 0
+    send_idx = np.zeros((P, max(send_max, 1)), dtype=np.int32)
+    recv_idx = np.zeros((P, max(recv_max, 1)), dtype=np.int32)
+    for d in range(P):                                  # send buffer, ordered by dest e
+        pos = 0
+        for e in range(P):
+            for _lane, ol in recv_pairs[e][d]:
+                send_idx[d, pos] = ol
+                pos += 1
+    for e in range(P):                                  # recv buffer, ordered by source d
+        pos = 0
+        for d in range(P):
+            for lane, _ol in recv_pairs[e][d]:
+                recv_idx[e, pos] = lane
+                pos += 1
+    return RaggedExchange(send_idx, send_sizes, send_offsets,
+                          recv_idx, recv_sizes, recv_offsets, send_max, recv_max)
+
+
 # --------------------------------------------------------------------------
 # Build
 # --------------------------------------------------------------------------
@@ -254,7 +332,7 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
     for name in REPLICATED_FIELDS:
         fields[name] = np.asarray(getattr(mesh, name))         # global, replicated
 
-    owned_mask, valid_mask, exchange = {}, {}, {}
+    owned_mask, valid_mask, exchange, exchange_ragged = {}, {}, {}, {}
     lane = {k: np.arange(Lmax[k])[None, :] for k in _KINDS}      # [1, Lmax]
     for k in _KINDS:
         md = mydim[k][:, None]                                  # [P, 1]
@@ -263,6 +341,7 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
         valid_mask[k] = lane[k] < nlc
         owner, owner_local = _owner_map(mylist[k], mydim[k], gcount[k])
         exchange[k] = _exchange_map(mylist[k], mydim[k], Lmax[k], owner, owner_local)
+        exchange_ragged[k] = _ragged_exchange_map(mylist[k], mydim[k], owner, owner_local)
 
     counts = {
         "myDim_nod": partition.myDim_nod2D, "eDim_nod": partition.eDim_nod2D,
@@ -275,7 +354,8 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
 
     return ShardedMesh(
         P=P, Lmax=Lmax, nl=mesh.nl, fields=fields,
-        owned_mask=owned_mask, valid_mask=valid_mask, exchange=exchange, counts=counts,
+        owned_mask=owned_mask, valid_mask=valid_mask, exchange=exchange,
+        exchange_ragged=exchange_ragged, counts=counts,
         nod2D=mesh.nod2D, elem2D=mesh.elem2D, edge2D=mesh.edge2D,
         edge2D_in=mesh.edge2D_in, myDim_edge2D_global=mesh.myDim_edge2D,
         ocean_area=mesh.ocean_area,

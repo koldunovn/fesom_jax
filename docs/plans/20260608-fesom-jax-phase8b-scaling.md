@@ -65,18 +65,21 @@ The load-bearing rewrite. Everything downstream is meaningless until this lands 
 **Files:** `fesom_jax/shard_mesh.py` (build the ragged maps), `fesom_jax/halo.py` (the new primitive),
 `fesom_jax/tests/test_halo.py` / `test_step_sharded.py` / `test_gradient_sharded.py` (gates).
 
-- [ ] **B.0a — ragged exchange maps from `ComStruct`.** Per device, per kind (`nod`/`elem`/`edge`), build
-      from the `Partition`'s per-rank `ComStruct` (`rPE`/`rptr`/`rlist` recv, `sPE`/`sptr`/`slist` send):
-      - **send**: `send_idx` = the `slist` local interior lanes concatenated **ordered by destination
-        device 0..P-1** (expand the sparse `sPE` neighbour list to a dense length-P layout), plus dense
-        `send_sizes[P]` and `input_offsets[P]`. (`operand = field[send_idx]` — gather the lanes to ship.)
-      - **recv**: `recv_idx` = the `rlist` local halo lanes concatenated **ordered by source device
-        0..P-1**, plus dense `recv_sizes[P]` and `output_offsets[P]`. (Scatter the received contiguous
-        buffer into these halo lanes; interior + pad lanes untouched — the broadcast/overwrite semantics.)
-      Store on `ShardedMesh` next to the existing `exchange` map (e.g. `exchange_ragged: {kind: RaggedMap}`).
-      ⚠️ One owned lane may be sent to several neighbours (it appears in multiple `sPE` blocks) → it is
-      gathered multiple times into `operand`; that is correct (the transpose then scatter-ADDs the
-      cotangents back, which is why AD stays correct).
+- [x] **B.0a — ragged exchange maps (`shard_mesh.RaggedExchange`).** ✅ DONE (RevLog #1). Built per device,
+      per kind from the **same owner map** (`_owner_map`) `_exchange_map` uses — NOT the C `ComStruct` —
+      because the owner map is uniform across `nod`/`elem`/`edge` (the `Partition` has no `com_edge2D`) and
+      is provably consistent with the `all_gather` oracle. Per device `d`:
+      - **send**: `send_idx` = local interior lanes concatenated **ordered by destination device 0..P-1**,
+        plus dense `send_sizes[P]` + `send_offsets[P]` (the `input_offsets`). `operand = field[send_idx]`.
+      - **recv**: `recv_idx` = local halo lanes concatenated **ordered by source device 0..P-1**, plus
+        `recv_sizes[P]` + `recv_offsets[P]` (the `output_offsets`). Scatter the recv buffer into these halo
+        lanes; interior + pad untouched (broadcast/overwrite). `send_sizes[d,e]==recv_sizes[e,d]`.
+      Stored as `ShardedMesh.exchange_ragged: {kind: RaggedExchange}`. Gate
+      `test_shard_mesh.py::test_ragged_exchange_reproduces_allgather` (host numpy, npes=2/4) PASSES — the
+      ragged maps reproduce the `all_gather` exchange on every valid lane. ⚠️ One owned lane sent to several
+      neighbours is gathered multiple times into `operand` (correct — the transpose scatter-ADDs the
+      cotangents back, why AD stays correct). ⚠️ The builder uses Python per-halo-lane loops — fine for
+      CORE2/farc/dars; vectorize for NG5 (and consider export-caching the maps) at B.3.
 - [ ] **B.0b — the new `halo_exchange`.** `operand = field[send_idx]` (gather) →
       `recv = lax.ragged_all_to_all(operand, output_buf, input_offsets, send_sizes, output_offsets,
       recv_sizes, axis_name='p')` → `field.at[recv_idx].set(recv_chunk)` (scatter into halo lanes). Keep
@@ -126,6 +129,16 @@ run remains a separate follow-up (chaotic reduction-order divergence — same as
 ---
 
 ## Revision Log
+
+### #1 — B.0a DONE: the ragged exchange maps (2026-06-08)
+`shard_mesh.RaggedExchange` + `_ragged_exchange_map` build the per-device halo-only send/recv maps from the
+same `_owner_map` the `all_gather` `_exchange_map` uses (uniform across nod/elem/edge; consistent with the
+oracle by construction). Stored on `ShardedMesh.exchange_ragged`. Host-numpy gate
+(`test_ragged_exchange_reproduces_allgather`, npes=2/4) confirms the ragged maps reproduce the `all_gather`
+exchange on every valid lane, all three kinds. `export/load_sharded_mesh` left untouched (ragged maps
+default to None on load — cheap to rebuild; export-caching is an NG5-scale item). NEXT: B.0b — wire
+`lax.ragged_all_to_all` into `halo.halo_exchange` (gather→a2a→scatter) behind the `HaloCtx` interface,
+then B.0c gate it against the forward + AD oracles on CPU fake-devices then 2/4×A100.
 
 ### #0 — Plan created (2026-06-08)
 Phase 8 closed + tagged `v1.1-multi-gpu`. Phase 8b scopes the scaling work the whole port targets, opening
