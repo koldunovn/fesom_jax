@@ -40,6 +40,13 @@ NDEV = len(jax.devices())
 DT = 1800.0
 YEAR = 1958
 
+# Byte-identity is a CPU property. GPU XLA fuses/reorders the same arithmetic differently
+# (a larger reassociation floor), so the serial-collapse "byte-id" gates use a platform-aware
+# floor: exact-ish on CPU, the measured A100 reassociation floor on GPU (S.9: worst across all
+# State fields on a 1-device collapse was 7.66e-9 — well below the dynamics' clean budget).
+_PLATFORM = jax.devices()[0].platform
+_BYTE_ID_ATOL = 1e-9 if _PLATFORM == "cpu" else 1e-7
+
 avail = pytest.mark.skipif(
     not CORE2_MESH.is_dir() or not (CORE2_DIST / "dist_2").is_dir(),
     reason="CORE2 dense mesh or dist partitions missing")
@@ -121,7 +128,7 @@ def test_serial_sharded_step_matches_dense():
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
             worst = max(worst, float(np.max(np.abs(a - b))))
-    assert worst < 1e-9, f"serial sharded step max|Δ|={worst:.3e} (expected byte-identical)"
+    assert worst < _BYTE_ID_ATOL, f"serial sharded step max|Δ|={worst:.3e} (expected byte-id, floor {_BYTE_ID_ATOL:.0e})"
 
 
 # --------------------------------------------------------------------------
@@ -139,6 +146,16 @@ def test_serial_sharded_step_matches_dense():
 _FCT_FIELDS = {"T", "S", "T_old", "S_old", "ssh_rhs", "ssh_rhs_old", "del_ttf"}
 _CLEAN_ATOL = 1e-7        # momentum/SSH/ALE/EOS exchanges: clean reassociation
 _FCT_ATOL = 5e-3          # FCT/cancellation upwind-flip floor (this test bump)
+
+# The EVP internal stress tensor σ is a NON-PROGNOSTIC VP-kink diagnostic, not gated for
+# N-vs-1 agreement (S.9 decision). σ = ζ·ε with ζ = ice_strength/Δ and Δ = max(√radicand,
+# Δ_min): near-rigid ice rides the viscous-plastic yield kink where Δ≈Δ_min, so a ~1e-15
+# reassociation wiggle in the strain is multiplied by a huge viscosity → an O(0.5) jump in the
+# raw stress on a handful of near-kink elements. The PROGNOSTIC ice state it drives — u_ice,
+# v_ice, m_ice, a_ice, m_snow — still matches single-device to 1e-7 (S.9 4×A100 run): the net
+# stress divergence (the force) is correct, only the per-element stress branch flips. We gate
+# the prognostic state, not the kink diagnostic. σ is still PRINTED so the floor stays visible.
+_DIAG_FIELDS = {"sigma11", "sigma12", "sigma22"}
 
 
 def _owned_match(st_dense, st_N, mesh, part, npes, *, tag="",
@@ -166,15 +183,19 @@ def _owned_match(st_dense, st_N, mesh, part, npes, *, tag="",
             md = int(mydim[d])
             if md:
                 diff = max(diff, float(np.max(np.abs(B[d, :md] - a[myl[d][:md]]))))
+        is_diag = fld.name in _DIAG_FIELDS
         is_fct = fld.name in soft
-        rows.append((fld.name, diff, is_fct))
-        if not is_fct:
+        rows.append((fld.name, diff, is_fct, is_diag))
+        if not is_fct and not is_diag:
             worst_clean = max(worst_clean, diff)
     print(f"\n[{tag}] per-field owned max|Δ| (npes={npes}):")
-    for name, diff, is_fct in sorted(rows, key=lambda r: -r[1]):
+    for name, diff, is_fct, is_diag in sorted(rows, key=lambda r: -r[1]):
         if diff > 0:
-            print(f"   {'FCT ' if is_fct else '    '}{name:14s} {diff:.3e}")
-    for name, diff, is_fct in rows:
+            tagc = "DIAG" if is_diag else ("FCT " if is_fct else "    ")
+            print(f"   {tagc}{name:14s} {diff:.3e}")
+    for name, diff, is_fct, is_diag in rows:
+        if is_diag:        # non-prognostic VP-kink diagnostic — printed, not gated (S.9)
+            continue
         atol = fct_atol if is_fct else clean_atol
         assert diff < atol, f"[{tag}] {name}: owned max|Δ|={diff:.3e} > {atol:.0e}"
     assert worst_clean < clean_atol, f"[{tag}] clean fields max|Δ|={worst_clean:.3e}"
@@ -246,7 +267,7 @@ def test_gm_serial_sharded_step_matches_dense():
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
             worst = max(worst, float(np.max(np.abs(a - b))))
-    assert worst < 1e-9, f"serial GM sharded step max|Δ|={worst:.3e} (expected byte-id)"
+    assert worst < _BYTE_ID_ATOL, f"serial GM sharded step max|Δ|={worst:.3e} (expected byte-id, floor {_BYTE_ID_ATOL:.0e})"
 
 
 @avail
@@ -298,7 +319,7 @@ def test_gm_diagnostics_sharded_owned_matches(npes):
             md = int(mydim[d])
             worst = max(worst, float(np.max(np.abs(B[d, :md] - a[myl[d][:md]]))))
         print(f"[gm-diag] {name:14s} owned max|Δ|={worst:.3e}")
-        assert worst < 1e-9, f"{name}: owned max|Δ|={worst:.3e} (GM exchange gap?)"
+        assert worst < _BYTE_ID_ATOL, f"{name}: owned max|Δ|={worst:.3e} (GM exchange gap?, floor {_BYTE_ID_ATOL:.0e})"
 
 
 @avail
@@ -390,7 +411,7 @@ def test_kpp_serial_sharded_step_matches_dense(core2_forced):
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
             worst = max(worst, float(np.max(np.abs(a - b))))
-    assert worst < 1e-9, f"serial KPP sharded step max|Δ|={worst:.3e} (expected byte-id)"
+    assert worst < _BYTE_ID_ATOL, f"serial KPP sharded step max|Δ|={worst:.3e} (expected byte-id, floor {_BYTE_ID_ATOL:.0e})"
 
 
 @avail
@@ -420,8 +441,11 @@ def test_kpp_sharded_step_owned_matches(npes, core2_forced):
 # the ocean FCT (low-order + high-order dvalues + icepplus/icepminus); the GLOBAL boundary_node
 # (the local-mesh recompute mis-flags partition-boundary nodes as coastal). The ice prognostic
 # fields (a/m/snow via FCT, u/v_ice via EVP) are climate-close like the ocean FCT.
-_ICE_FIELDS = ("a_ice", "m_ice", "m_snow", "u_ice", "v_ice", "t_skin",
-               "sigma11", "sigma12", "sigma22")
+# Prognostic ice fields gated climate-close (like the ocean FCT). The EVP internal stress
+# σ11/σ12/σ22 is NOT here — it is a non-prognostic VP-kink diagnostic (see _DIAG_FIELDS): the
+# raw stress flips branch at the yield kink under reassociation, but the u_ice/v_ice it drives
+# (below) match to 1e-7, so we gate the velocity, not the stress.
+_ICE_FIELDS = ("a_ice", "m_ice", "m_snow", "u_ice", "v_ice", "t_skin")
 
 
 def _seed_ice_state(fx):
@@ -461,7 +485,7 @@ def test_ice_serial_sharded_step_matches_dense(core2_forced):
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
             worst = max(worst, float(np.max(np.abs(a - b))))
-    assert worst < 1e-9, f"serial ICE sharded step max|Δ|={worst:.3e} (expected byte-id)"
+    assert worst < _BYTE_ID_ATOL, f"serial ICE sharded step max|Δ|={worst:.3e} (expected byte-id, floor {_BYTE_ID_ATOL:.0e})"
 
 
 @avail

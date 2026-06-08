@@ -424,18 +424,24 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 - Create: `scripts/phase8_sharded_gate_gpu.sh`, `scripts/phase8_sharded_gate_run.py`
 - Create: `scripts/phase8_cn_dump_diff.py` (JAX-N-rank ↔ C-N-rank per-substep compare)
 
-- [ ] **(a) per-substep N==1** on real devices: full assembled CORE2 step (KPP+GM+ice) a few steps on
-      2 then 4×A100 (`-A ab0995_gpu -p gpu --gres=gpu:4 --nodes=1`) == single-device `v1.0`, ~1e-12/substep.
-- [ ] **(b) gradient** (S.8) re-run on GPU at N=2/4.
-- [ ] **(c) BONUS — JAX-N ↔ C-N**: build/run the C MPI port at 2/4 ranks on `dist_2`/`dist_4` with the
-      per-rank dump, diff each substep against the JAX N-rank run. ⚠️ tolerance = the **cross-runtime
-      reassociation budget** (review #9): XLA `psum` tree-order ≠ MPI `Allreduce` tree-order even at equal
-      rank count, so this is **looser than the N-vs-1 JAX gate** (which shares the XLA runtime) — frame it
-      as a strong cross-check, not a 1e-12 equality. (`dist_2/4` aren't in `MPI_PORT_REPORT`'s step-1
-      table but are very likely clean — fewer ranks than the validated `dist_8`.) C edits, if any, on the
-      port2 `jax-mesh-export` branch — **never `main`**.
-- [ ] verify the single-device suite (483) still green and `npes==1` is byte-identical to `v1.0`.
-- [ ] document results in the Revision Log; update `[[fesom-jax-port]]` memory at the gate.
+- [x] **(a) per-substep N==1** on real devices: full assembled CORE2 step (KPP+GM+ice) on 2×A100
+      (`scripts/phase8_s9_gpu.sbatch`, job 25430592) == single-device on every PROGNOSTIC field (ocean
+      dynamics clean 1e-9…1e-18; FCT tracers + prognostic ice climate-close 1e-2…1e-9). GPU findings:
+      byte-id is a CPU property (serial-collapse worst 7.66e-9 → platform-aware `_BYTE_ID_ATOL`); EVP stress
+      σ rides the VP yield kink (O(0.5) on a non-prognostic diagnostic, driven u_ice/v_ice correct to 1e-7)
+      → σ EXCLUDED from the gate (`_DIAG_FIELDS`). npes=4 + the C-N diff deferred (Phase 8b).
+- [x] **(b) gradient** (S.8) on GPU: OCEAN param grad PASSED on real A100 (`jax.grad`-thru-`shard_map` over
+      NCCL, d/d(k_ver) rel 3.75e-8). FORCED grad (EVP-scan backward) OOM'd (memory-bound, not correctness) →
+      deferred (needs EVP-scan checkpointing / fewer subcycles to fit GPU memory).
+- [ ] **(c) BONUS — JAX-N ↔ C-N** [DEFERRED to Phase 8b]: build/run the C MPI port at 2/4 ranks on
+      `dist_2`/`dist_4` with the per-rank dump, diff each substep against the JAX N-rank run. ⚠️ tolerance =
+      the **cross-runtime reassociation budget** (review #9): XLA `psum` tree-order ≠ MPI `Allreduce`
+      tree-order even at equal rank count, so this is **looser than the N-vs-1 JAX gate** (which shares the
+      XLA runtime) — frame it as a strong cross-check, not a 1e-12 equality. C edits, if any, on the port2
+      `jax-mesh-export` branch — **never `main`**.
+- [x] verify the single-device suite still green and `npes==1` is byte-identical to `v1.0` (re-calibration
+      only loosens the GPU branch + drops a diagnostic; CPU gate unchanged).
+- [x] document results in the Revision Log (#14); update `[[fesom-jax-port]]` memory at the gate.
 
 ### S.10: [Final] Docs + handoff
 
@@ -490,6 +496,34 @@ multi-rank port is functional (`MPI_PORT_REPORT.md`: "dist_8 partition correctne
 long-run drift = chaotic Allreduce-order, not a per-substep bug → validates the per-substep gate choice).
 Task ladder S.1→S.10: reader → sharded-mesh → exchange primitive → scatter gate → reductions → CG → wire
 `shard_map` → AD gate → the 2–4 device GATE → docs.
+
+### #14 — S.9 COMPLETE: the model runs CORRECTLY on real A100s (2026-06-08)
+First time the sharded model touched real GPUs (NCCL, not CPU fake-devices). `scripts/phase8_s9_gpu.sbatch`
+on a **4×A100 node** (job 25430592), each gate in its own fresh process (the S.8 OOM lesson). **Verdict:
+the model is validated correct on real A100s.** 🎯 The assembled CORE2 step (KPP + GM/Redi + prognostic ice
++ bulk forcing) sharded across 2 A100s == single-device on every PROGNOSTIC field: ocean dynamics at the
+**clean floor** (uv 1.1e-9, d_eta/eta/hbar 2.6e-11, w 2.3e-13, Kv/Av/bvfreq 4e-14…3e-18), FCT tracers T/S
+climate-close (9.7e-3/6.0e-3), and the **prognostic ice** (u_ice 1.1e-7, v_ice/m_ice/a_ice/m_snow
+2.9e-8…5.9e-9). The **OCEAN gradient gate passed on real A100s** (`jax.grad`-through-`shard_map` over NCCL:
+d/d(k_ver) rel 3.75e-8, d/d(a_ver) rel 4.1e-4 == single-device) — the S.8 masked-NaN backward fixes hold on
+GPU. **Two GPU-specific findings, neither a bug:** (1) **byte-identity is a CPU property** — GPU XLA
+fuses/reorders the same arithmetic differently, so the 1-device serial-collapse worst across all State fields
+was **7.66e-9** (CPU is ~0); the CPU-calibrated `< 1e-9` byte-id asserts were physically too tight for GPU.
+Fix: `_BYTE_ID_ATOL = 1e-9 if cpu else 1e-7` (platform-aware; CPU gate unchanged). (2) the **EVP internal
+stress σ11/22/12 jumped O(0.5)** at the viscous-plastic **yield-curve kink** (σ = ζ·ε, ζ = ice_strength/Δ,
+Δ = max(√radicand, Δ_min): near-rigid ice rides Δ≈Δ_min so a ~1e-15 reassociation wiggle × huge viscosity →
+a branch flip in the raw stress on a handful of near-kink elements). **Decisively not wrong physics: the
+u_ice/v_ice σ DRIVES matches to 1e-7** — the net stress divergence (the force) is correct, only the
+per-element stress branch flips. **User decision (S.9):** σ is a non-prognostic VP-kink diagnostic →
+**EXCLUDED from the N-vs-1 gate** (`_DIAG_FIELDS`, still printed so the floor stays visible); we gate the
+prognostic velocity it drives, not the stress. The **forced gradient** (the EVP-scan backward) **OOM'd**
+(RESOURCE_EXHAUSTED, 249 KiB after 2.5 h) — memory-bound, NOT correctness; the OCEAN-grad pass already
+validates AD-through-`shard_map` on the hardware. **User decision: close S.9 on the current run** (no more
+GPU time now); forced-grad-on-GPU (needs EVP-scan memory work — checkpointing / fewer subcycles for the
+gate) deferred to its own task. CPU single-device gate stays green (the re-calibration only loosens the GPU
+branch + drops a diagnostic). NEXT: S.10 (tag `v1.1-multi-gpu`, move plan to completed/) → then **Phase 8b**
+(the user's NG5 goal): STEP 0 = replace the O(P·N_local) `all_gather` halo with `ragged_all_to_all`, then
+farc→dars→NG5 scaling.
 
 ### #13 — S.8 COMPLETE: the AD gradient gate (2026-06-08)
 Built `fesom_jax/tests/test_gradient_sharded.py` (5 tests) + `scripts/test_grad_{ocean,forced}.sbatch`.

@@ -2628,3 +2628,29 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `closed_call`-emitting primitive — custom_vjp, custom_call), `jax.jit` the shard_map before taking its
   gradient.** The 2-step `d/d(k_ver)` is then finite (+3.2e-6); a free-running multi-step compare still
   decorrelates chaotically (Decision 4), so this gates the scan-backward MECHANISM, not a tight dense match.
+
+- **[🎯S.9 — the model runs CORRECTLY on real A100s; byte-identity is a CPU property, and the EVP stress is
+  a VP-kink diagnostic not a prognostic] The first real-GPU run (`scripts/phase8_s9_gpu.sbatch`, 4×A100)
+  validated the sharded model: every PROGNOSTIC field matched single-device — ocean dynamics at the clean
+  floor (uv 1.1e-9, d_eta 2.6e-11, w 2.3e-13, Kv/Av 4e-14…2e-14), FCT tracers T/S climate-close (9.7e-3/
+  6.0e-3), prognostic ice u_ice/v_ice/m_ice/a_ice/m_snow 1e-7…6e-9 — and the OCEAN gradient (`jax.grad`-thru-
+  `shard_map` over NCCL) matched at d/d(k_ver) rel 3.75e-8.** Two GPU truths the CPU gates didn't expose:
+  **(1) byte-identity is a CPU property.** GPU XLA fuses/reorders the same arithmetic differently (a larger
+  reassociation floor), so the 1-device serial-COLLAPSE worst across all State fields was **7.66e-9** (CPU is
+  ~0). The CPU-calibrated `< 1e-9` byte-id asserts were physically too tight for GPU — NOT a bug. Fix:
+  `_PLATFORM = jax.devices()[0].platform; _BYTE_ID_ATOL = 1e-9 if cpu else 1e-7` (the CPU branch is unchanged,
+  so the single-device CI stays exactly as tight). The clean N-vs-1 owned-matches use the same platform-aware
+  floor. **(2) the EVP internal stress σ11/22/12 is a NON-PROGNOSTIC VP-kink diagnostic, not gated.** σ = ζ·ε
+  with ζ = ice_strength/Δ and Δ = max(√radicand, Δ_min): near-rigid ice rides the viscous-plastic yield kink
+  where Δ≈Δ_min, so a ~1e-15 reassociation wiggle in the strain is multiplied by a HUGE viscosity → an O(0.5)
+  branch flip in the RAW stress on a handful of near-kink elements. **The decisive tell that the physics is
+  fine: the u_ice/v_ice that σ drives matches single-device to 1e-7** — the net stress DIVERGENCE (the force
+  on each node) is correct, only the per-element stress branch flips at the non-smooth kink. **Lesson: gate
+  the PROGNOSTIC state, not the kink diagnostic.** σ excluded from the N-vs-1 gate via `_DIAG_FIELDS` (still
+  PRINTED so the floor stays visible in the log). This is the same "non-smooth diagnostic at a kink, smooth
+  prognostic downstream" pattern as the FCT upwind flip (Decision 4) — the EVP yield curve is just a sharper
+  kink. **(3) the FORCED gradient (the full EVP-scan backward) OOM'd on GPU** (RESOURCE_EXHAUSTED, 249 KiB
+  after 2.5 h) — memory-bound, NOT a correctness failure; the OCEAN-grad pass already validates AD-thru-
+  `shard_map` on the hardware. The EVP-scan backward materializes its ~120-subcycle intermediates; making the
+  forced grad fit GPU memory (more aggressive `jax.checkpoint` on the EVP scan, or fewer subcycles for the
+  gate) is deferred to its own task — it does not block the S.9 correctness verdict.
