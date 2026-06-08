@@ -318,7 +318,14 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                              st, xs=None, length=n_steps - 1)
         return st
 
-    out = jax.shard_map(body, mesh=jmesh,
-                        in_specs=(fm_spec, fs_spec, fop_spec, _P, ha_spec),
-                        out_specs=fs_spec, check_vma=False)(fm, fs, fop, fstress, ha)
+    # ⚠️ jax.jit AROUND the shard_map is REQUIRED for the BACKWARD (S.8): the scan body is
+    # jax.checkpoint'd (a ``closed_call`` primitive), and grad of a closed_call inside a
+    # shard_map raises "Eager evaluation of closed_call inside a shard_map isn't yet supported"
+    # (JAX 0.10) unless the shard_map-decorated fn is jitted. Forward-transparent (the S.7p3
+    # multistep forward gate + the npes==1 byte-identity are unaffected — jit is semantically
+    # identity); ``run_step_sharded`` (no scan ⇒ no checkpoint ⇒ no closed_call) doesn't need it.
+    body_sm = jax.shard_map(body, mesh=jmesh,
+                            in_specs=(fm_spec, fs_spec, fop_spec, _P, ha_spec),
+                            out_specs=fs_spec, check_vma=False)
+    out = jax.jit(body_sm)(fm, fs, fop, fstress, ha)
     return unfold_state(out, npes)

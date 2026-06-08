@@ -139,6 +139,12 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None):
     lo_flat = jnp.broadcast_to(jnp.where(nc_e, elem_lo, jnp.inf)[:, None], (en.shape[0], 3))
     hi = jax.ops.segment_max(hi_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
     lo = jax.ops.segment_min(lo_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
+    # Pad / all-non-cell nodes keep the ±inf sentinel (empty/masked segment). The clipping
+    # ratios below mask them (`fp>0`/`fm<0`), but ±inf poisons the AD backward (0·inf=NaN —
+    # the sharded reverse pass exposes it). Clamp to finite (forward byte-identical; the
+    # masked ratios are unchanged on every live node, where hi/lo are finite).
+    hi = jnp.where(jnp.isfinite(hi), hi, 0.0)
+    lo = jnp.where(jnp.isfinite(lo), lo, 0.0)
     tmax = hi - vals_l
     tmin = lo - vals_l
 

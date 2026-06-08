@@ -79,9 +79,17 @@ def pp_mixing(mesh: Mesh, uvnode, bvfreq, *, k_ver=K_VER, a_ver=A_VER):
     :class:`fesom_jax.params.Params`)."""
     nl = mesh.nl
     Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
-    dz = _shift_down(Zp) - Zp                              # Z[nz-1]-Z[nz] > 0
+    dz = _shift_down(Zp) - Zp                              # Z[nz-1]-Z[nz]
     dz = dz.at[0].set(1.0)                                 # k=0 unused; avoid 0
-    dz_inv = (1.0 / dz)[None, :]                           # (1,nl)
+    # The bottom/pad interfaces have dz==0 (the Zp tail duplicates Z[-1]); they are masked
+    # out downstream (``nmask``), but ``1/dz`` is +inf there and the AD backward of the
+    # masked ``shear`` below is then 0·inf=NaN — a masked-NaN trap the sharded reverse pass
+    # exposes (the dense single-device XLA folds the structural zero; shard_map/check_vma
+    # keeps it). Guard the divisor so ``dz_inv`` is FINITE on those lanes. Forward
+    # byte-identical: the inf lanes were always masked (the 2-yr v1.0 run proves they carry
+    # no live output), so the value on every unmasked lane is unchanged.
+    safe_dz = jnp.where(dz != 0.0, dz, 1.0)
+    dz_inv = (1.0 / safe_dz)[None, :]                      # (1,nl), finite everywhere
 
     u, v = uvnode[..., 0], uvnode[..., 1]                  # (nod2D,nl)
     du = _shift_down(u) - u                                # u[nz-1]-u[nz]

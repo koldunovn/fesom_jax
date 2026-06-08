@@ -2553,3 +2553,78 @@ Cite the C source (`file:line`) or dump probe that proves it.
   previous state (partitioned), so the only N-vs-1 difference is the within-step reassociation (clean except
   FCT). A threading bug shows as a CLEAN field diverging under teacher-forcing; chaos cannot. `T_old`/`S_old`
   (the AB2 histories of FCT tracers) are FCT-class — add them to the climate-close set.
+
+## Phase 8 — sharding (Task S.8 — the AD gradient gate)
+
+- **[🎯the-sharded-REVERSE-pass-exposes-masked-NaN-traps-the-dense-XLA-folds] The forward of the
+  sharded model is N-vs-1 correct (S.7), but `jax.grad` of it NaN'd — because the sharded BACKWARD
+  does NOT fold the `0·inf` / `0·(±inf)` that single-device XLA silently folds.** A masked lane that
+  carries an `inf` forward intermediate (so the forward `where`-mask hides it — the output is finite)
+  poisons the backward: the cotangent into the masked branch is `0`, but `d/d(input)` of the inf-producing
+  op is `±inf`, and `0·(±inf)=NaN`. `shard_map(check_vma=False)` + the manual-mode graph keeps that NaN
+  where the single-device graph constant-folds the structural zero. This is the **masked-NaN rule on the
+  device-pad axis** the plan flagged — a NEW masked axis the Phase-3/5/6 discipline must cover. **7 guards
+  across 5 kernels**, ALL forward-byte-identical (the inf lanes were always masked — the 2-yr v1.0 run + 123
+  single-device tests prove no live output changed):
+  - **`pp.py`** (PP `pp_mixing`): `dz_inv = 1/dz`, `dz==0` at the `Zp=concat([Z,Z[-1:]])` duplicated-tail
+    interface ⇒ `shear = 0·inf=NaN` backward. Guard the divisor.
+  - **`momentum.py`** (`impl_vert_visc`): `Av/dZ_up` with `dZ_up==0` (same `Zp` tail) and `Av==0` (masked)
+    ⇒ `0/0=NaN`. Guard `dZ_up`/`dZ_dn`.
+  - **`tracer_adv.py`** (ocean FCT `zalesak_limit`) + **`ice_adv.py`** (ice FCT): `segment_max`/`segment_min`
+    return their identity **`±inf`** on **empty pad-node segments** ⇒ `fct_ttf_max/min = ±inf` ⇒
+    `0·(−fct_ttf/flux²)=NaN` backward. Clamp to finite on non-wet lanes.
+  - **`kpp.py`** (`bldepth` + `blmix`): three `(hbl+zk)/(zk−zk1)` and `…/dth_kn` interpolations whose
+    layer-spacing divisor is `0` on pad / degenerate-`kbl` nodes ⇒ `inf` ⇒ `0·inf=NaN`. Guard the divisors.
+  `tracer_diff.py`/`kpp.py`(dz)/`eos.py`(zdiff)/`ice_thermo.py` ALREADY had these guards (their authors hit
+  the same trap in single-device AD — the docstrings cite it); pp/momentum/the-FCTs/kpp-OBL were the gaps
+  the device-pad backward newly exposed. **Lesson: every `1/<geometry-that-can-be-0>` and every
+  `segment_min/max`/`±inf`-sentinel reduction is a masked-NaN trap unless the divisor is guarded BEFORE the
+  divide / the `±inf` is clamped — a forward `where`-mask is NOT enough (it stops the forward, not the
+  `0·inf` backward).**
+
+- **[🎯debug-method: jax_debug_nans + a cheap focused probe, iterate; a FORCED probe pre-clears the heavy
+  gate] A scalar `d/d(a_ver)` grad under `jax_debug_nans` (npes=2, ~1 min) pinpoints each trap by source
+  line; fix, re-run, repeat.** `debug_nans` halts at the FIRST NaN in execution order (incl. harmless masked
+  ones), so it walks the traps one per run (pp → momentum → ocean-FCT here). A separate `d/d(T0)` probe
+  reaches EVERY kernel (EOS→PGF→KPP→momentum→FCT→ice), catching what the `a_ver` probe (which starts at the
+  mixing) misses; the FORCED `d/d(T0)` probe (assembled KPP+GM+ice, ~20 min) found the KPP-OBL traps and then
+  confirmed the **ice-EVP 120-subcycle `jax.checkpoint`'d scan backward runs FINITE** — all far cheaper than
+  discovering NaNs inside the full forced gate. Proactive grep (`Zp=concat`, `segment_max/min`, unguarded
+  `1.0/`) batches siblings (found `kpp:blmix`/`ice_adv` before their probe iteration).
+
+- **[CG-transpose-backward-runs-sharded-CLEAN] The CG `custom_linear_solve` `transpose_solve` backward is
+  AD-correct under `shard_map` — isolated probe: `grad_b 0.5‖solve_ssh(b,halo)‖²` is finite (max 7e-11), the
+  matvec-only control finite too.** So the implicit-diff transpose (the S.6 forward's reverse-mode) carries
+  through sharded; the `a_ver` NaN was NOT the CG (it was upstream `impl_vert_visc` + downstream FCT). And the
+  **closure-grad of a REPLICATED param** (the `params` pytree closed over `run_step_sharded`'s `shard_map`)
+  correctly `psum`s its cotangent (toy probe rel 0.0 with the real `jax.sharding.Mesh` API; the gate: `d/d(k_ver)`
+  matches single-device to **3.75e-8**) — Decision 6's "`psum` transpose = `psum`" holds. ⚠️ `jax.make_mesh`
+  (the newer explicit-sharding API) breaks closure-grad of a replicated scalar ("device assignment … not
+  equal to mesh size"); the older `jax.sharding.Mesh` (what `halo.device_mesh` uses) works.
+
+- **[🎯gradient-gate-is-FIELD-APPROPRIATE — the gradient analog of the forward Decision-4 gate] A sharded
+  param/field gradient matches single-device to the floor of the PATH it traverses, not a uniform tol.**
+  `k_ver` → CLEAN tracer vertical DIFFUSION ⇒ machine floor (rel 3.75e-8); `a_ver` → the FCT tracer
+  ADVECTION (via `uv`) ⇒ the upwind-flip floor ON THE GRADIENT (rel 4e-4, and its gradient is tiny ~3e-8 so
+  the absolute reassociation dominates the rel — within the dense path's own FD accuracy, `test_grad_flows_through_cg`);
+  `T0`/`k_gm` likewise FCT-influenced. The **T0-field grad reconstruction** `Bᵀ(g_p)` (scatter-add the sharded
+  cotangent over each global node's owner-interior + halo copies = the `all_gather` transpose) matches dense
+  to **max |Δ|=7.4e-8, median ~1e-22** (the reverse-exchange AD is exact; the bulk is machine-precision, a few
+  near-flip nodes ride the FCT floor). ⚠️ Gate the T0 reconstruction on the **ABS** diff, not rel — the rel
+  blows up (1e4) at nodes where the dense grad ≈ 0 (a meaningless near-zero divide, not an error). The
+  masked-NaN-across-devices check: `d/d(T0)` is FINITE everywhere (halo/pad/below-bottom), exactly 0 on
+  dry/pad lanes, nonzero on owned-wet.
+
+- **[🎯grad-of-a-jax.checkpoint'd-scan-under-shard_map-needs-jax.jit-AROUND-the-shard_map] The
+  multi-step gradient (`run_steps_sharded`, a `jax.checkpoint`'d `lax.scan` under `shard_map`) raised
+  `NotImplementedError: Eager evaluation of closed_call inside a shard_map isn't yet supported` — fixed
+  by wrapping the shard_map-decorated body in `jax.jit`.** The 1-step `run_step_sharded` grad (param +
+  T0) lowers WITHOUT a jit (no scan ⇒ no checkpoint ⇒ no `closed_call`); but `jax.checkpoint` emits a
+  `closed_call` primitive, and JAX 0.10's reverse pass cannot eagerly evaluate a `closed_call` *inside* a
+  `shard_map` unless that shard_map is under a `jax.jit` trace (the error message prescribes exactly this).
+  The FORWARD lowered fine without the jit (the S.7p3 multistep gate), so this is a BACKWARD-only
+  requirement. The fix is forward-transparent (jit is semantically identity ⇒ the npes==1 byte-identity +
+  the forward gate are unaffected). **Lesson: when a `shard_map` body contains `jax.checkpoint` (or any
+  `closed_call`-emitting primitive — custom_vjp, custom_call), `jax.jit` the shard_map before taking its
+  gradient.** The 2-step `d/d(k_ver)` is then finite (+3.2e-6); a free-running multi-step compare still
+  decorrelates chaotically (Decision 4), so this gates the scan-backward MECHANISM, not a tight dense match.

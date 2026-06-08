@@ -1,17 +1,21 @@
 # Next-session prompt — FESOM2 → JAX port: PHASE 8 (multi-GPU / multi-core sharding)
 
-> **⚡ STATE (2026-06-08): S.1→S.7 are DONE and COMMITTED on `main` (the HEAD commit — `git log --oneline -5`).
-> The ENTIRE `shard_map`
-> wiring is N-vs-1 correct on owned: the OCEAN exchanges, the forced-path exchanges (+GM, +KPP, +ice), the
-> distributed reductions, the multi-step `lax.scan`, AND the in-scan collectives (the CG `while_loop` + the
-> ice EVP 120-subcycle scan). The PRIMARY assembled KPP+GM+ice gate PASSED (every clean ocean field
-> machine-precision, `uv` 1.9e-16; T/S the climate-close FCT floor; ice fields bit-exact). Single-device suite
-> byte-identical `v1.0`. NEXT: S.8 (the AD gradient gate), then S.9 (the real 2–4×A100 GATE), S.10 (docs/tag
-> `v1.1-multi-gpu`).**
+> **⚡ STATE (2026-06-08): S.1→S.8 are DONE on `main` (S.8 = the latest commit — `git log --oneline -6`).
+> The ENTIRE `shard_map` wiring is N-vs-1 correct on owned (S.7), AND the whole differentiable model is
+> **gradient-correct on CPU fake-devices (S.8)**: `jax.grad` of a sharded run == single-device, field-
+> appropriate (clean params machine-floor, FCT-advection params the upwind-flip floor); the T0-field
+> reconstruction `Bᵀ(g_p)` == dense (max 7e-8 OCEAN / 3.6e-5 FORCED); masked/halo/pad lanes finite + 0
+> cotangent; the **ice-EVP 120-subcycle checkpointed-scan backward** runs. S.8 found+fixed **8 bugs the
+> sharded BACKWARD exposes** (the dense XLA folds the `0·inf`): 7 masked-NaN guards (pp/momentum/ocean-FCT/
+> ice-FCT/kpp×3) + `jax.jit`-around-the-`shard_map` for the multi-step scan grad — ALL forward-byte-identical
+> (211 single-device tests green incl. the v1.0 dump). NEXT: S.9 (the real 2–4×A100 GATE), S.10 (docs/tag
+> `v1.1-multi-gpu`). THEN → Phase 8b (scaling: farc→dars→NG5) — but FIRST replace the `all_gather` halo
+> exchange with `ragged_all_to_all` (the `all_gather` is O(P·N_local), fine for the 2–4-dev correctness gate
+> but NON-scaling; the point-to-point `com_struct` slist/rlist is already in `partit.py`).**
 >
-> Commits: `80f6a71` S.1–S.5 foundation · `497e802` S.6 CG · `a770000`+`990da45` S.7 part 1 · `9bc9c39`
-> S.7 part 2 · **HEAD = S.7 part 3** (GM/KPP/ice/reductions/multistep + the PRIMARY assembled gate). Plan
-> Revision Log #2→#12 records every decision/discovery (#11+#12 = S.7 part 3).
+> Commits: `80f6a71` S.1–S.5 · `497e802` S.6 CG · `a770000`+`990da45` S.7 part 1 · `9bc9c39` S.7 part 2 ·
+> `5214cf0` S.7 part 3 · **HEAD = S.8** (the AD gradient gate). Plan Revision Log #2→#13 records every
+> decision/discovery (#13 = S.8).
 
 ## ⚠️ READ FIRST — two hard rules this session learned
 1. **Run every multi-minute `shard_map`/model compile via `sbatch` on `-p compute`, NEVER on the login
@@ -69,13 +73,11 @@
   bit-exact, the PRIMARY assembled KPP+GM+ice gate (`uv` 1.9e-16). The few-step gate is TEACHER-FORCED (a
   free-running compare decorrelates chaotically — Decision 4).
 
-## THE LADDER — start at S.8 (S.1→S.7 DONE)
-- **S.8 AD gate** — `jax.grad` of the sharded run == single-device gradient; masked/halo lanes finite +
-  0-cotangent (masked-NaN across the device axis). `custom_linear_solve` transpose already runs sharded (S.6).
-  ⚠️ The ice EVP scan is `jax.checkpoint`'d with an in-scan `all_gather` — the FORWARD lowers (verified); the
-  BACKWARD recompute re-runs the collective (its transpose = the reverse exchange = `psum`/reduce-scatter).
-  The multi-step `run_steps_sharded` checkpoints its scan body (the AD-window memory cap). Start small (2-step
-  OCEAN grad N-vs-1) then +forcing; reuse the teacher-forcing insight if a free-running grad is noisy.
+## THE LADDER — start at S.9 (S.1→S.8 DONE)
+- **S.8 AD gate** ✅ **DONE** — `jax.grad` of the sharded run == single-device, field-appropriate; masked/
+  halo/pad lanes finite + 0-cotangent; the ice-EVP checkpointed-scan backward runs. Found+fixed 8 backward
+  bugs (7 masked-NaN guards + `jax.jit`-around-`shard_map` for the checkpointed-scan grad), all
+  forward-byte-identical. See Revision Log #13 + the S.8 lessons.
 - **S.9 the GATE** — (a) per-substep N==1 on 2/4×A100 (`-A ab0995_gpu -p gpu --gres=gpu:4 --nodes=1`),
   (b) gradient, (c) BONUS JAX-N ↔ C-N dump diff on `dist_2/4` (looser cross-runtime budget). Update
   `[[fesom-jax-port]]` memory at the gate.
@@ -113,12 +115,21 @@
   FIELD-APPROPRIATE (don't demand 1e-12 of the FCT tracers / cancelling SSH divergences — that's the
   climate-close floor, Decision 4); float64 throughout.
 
-Confirm you've read the plan + Revision Log #2→#12 + the Phase-8 lessons; then start **S.8 — the AD gradient
-gate**. Concretely: `jax.grad` of a scalar loss of a sharded run (start with a **2-step OCEAN** `run_steps_sharded`,
-no forcing) wrt `params` (e.g. `k_gm`) and the initial `state` (`T0`) == the single-device gradient (the `v1.0`
-baseline) to tight tol; then masked-NaN check (padded/halo lanes finite + 0 cotangent across the device axis);
-then +forcing (KPP+GM+ice). The forward already lowers (incl. the in-scan collectives + `custom_linear_solve`);
-S.8 gates the BACKWARD. New tests go in a `test_gradient_sharded.py`; gate via a focused sbatch on compute
-(the grad compile is heavier than the forward — budget `--time` generously). If a free-running multi-step grad
-is noisy (chaos, Decision 4), gate the gradient teacher-forced or at 1–2 steps. S.7 part 3 is committed (the
-HEAD commit; `git log --oneline -5` to confirm); the working tree is clean at the start of the S.8 session.
+Confirm you've read the plan + Revision Log #2→#13 + the Phase-8 lessons (esp. the S.8 masked-NaN /
+`jax.jit`-around-`shard_map` lessons). **S.1→S.8 are DONE** (the model is N-vs-1 forward- AND
+gradient-correct on CPU fake-devices). **Next is a user-steered fork:**
+- **S.9 — the real-GPU GATE** (the plan's path, recommended): re-run the per-substep N==1 correctness + the
+  gradient on an actual **2–4×A100** node (`-A ab0995_gpu -p gpu --gres=gpu:4 --nodes=1`) — the gates are
+  written (`test_step_sharded.py`, `test_gradient_sharded.py`), so it's mostly "submit on GPU + read"; it's
+  the FIRST time anything runs on real GPUs (de-risks the hardware path + is the GPU on-ramp scaling needs).
+  Then (c) the BONUS JAX-N ↔ C-N dump diff on `dist_2/4`. Then S.10 (tag `v1.1-multi-gpu`).
+- **Phase 8b — scaling (the user's NG5 goal)**: the realistic ladder is **farc (638k, 1 A100) → dars (3.16M,
+  4 GPU/1 node) → NG5 (7.4M×70, multi-node `jax.distributed`)**, validated against the Kokkos
+  `port_kokkos/docs/SCALING_{NG5,FARC,DARS}.md` numbers. ⚠️ **STEP 0 is mandatory: replace the `all_gather`
+  halo exchange (`halo.py`) with `ragged_all_to_all`** (point-to-point neighbour exchange — the `com_struct`
+  slist/rlist is already in `partit.py`). The current `all_gather` is O(P·N_local) and gets WORSE with node
+  count → scaling numbers on it are meaningless. The S.8 gate (`test_gradient_sharded.py`) + the S.7 forward
+  gate (`test_step_sharded.py`) are the correctness ORACLES for that rewrite. NG5 needs the deep-mesh fixes
+  the Kokkos `SCALING_NG5.md` notes (nl=70 > a hardcoded cap; the step-0 global-gather OOM).
+
+The working tree is clean at the start of the next session (S.8 = the HEAD commit; `git log --oneline -6`).

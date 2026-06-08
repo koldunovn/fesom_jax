@@ -392,18 +392,31 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 ### S.8: AD through the collectives (gradient gate)
 
 **Files:**
-- Create: `scripts/phase8_grad_gate.py` + `.sbatch`
-- Create: `fesom_jax/tests/test_gradient_sharded.py`
+- Create: `fesom_jax/tests/test_gradient_sharded.py` ✅
+- Create: `scripts/test_grad_ocean.sbatch` + `scripts/test_grad_forced.sbatch` ✅ (the focused-gate
+  sbatch convention from S.7p3, in place of a single `phase8_grad_gate.py`)
 
-- [ ] `jax.grad` of a scalar loss of the sharded few-step run wrt `params` (the mixing/eddy seams) and
-      wrt initial `state` (`T0`) — `ppermute`/`all_to_all` transpose = reverse exchange, `psum`
-      transpose = `psum`; confirm reverse-mode carries through.
-- [ ] **masked-NaN across devices**: padded/halo lanes must compute a FINITE value and contribute 0 to
-      the cotangent (the Phase 3/5/6 discipline, now across the device axis).
-- [ ] **gradient gate**: sharded `d(loss)/d(param)` == single-device gradient (the `v1.0` baseline) to
-      tight tol; an FD spot-check on one well-conditioned seam (`k_gm`).
-- [ ] write tests: small-mesh 2-device grad == 1-device grad; masked-lane cotangent == 0; no NaN.
-- [ ] run tests — must pass before S.9. Append lesson.
+- [x] `jax.grad` of a scalar loss (owned-masked mean SST) of the sharded run wrt `params` (`k_ver`/`a_ver`/
+      `k_gm`/`redi_kmax`, closed over the `shard_map` ⇒ their cotangent is `psum`'d — Decision 6 verified:
+      `d/d(k_ver)` matches single-device to **3.75e-8**) and wrt initial `state` (`T0`). The CG
+      `custom_linear_solve` transpose backward runs sharded (isolated probe clean); reverse-mode carries
+      through. ➕ **8 AD bug-fixes the sharded BACKWARD exposed** (the dense XLA folds the `0·inf`; `shard_map`
+      keeps it): 7 masked-NaN guards (pp `dz_inv`, momentum `dZ_up/dZ_dn`, ocean+ice FCT `segment_max/min`
+      `±inf`, kpp `bldepth`+`blmix`×2) + `jax.jit`-around-the-`shard_map` for the `jax.checkpoint`'d
+      multi-step scan grad. All forward-byte-identical (211 single-device tests green, incl. the v1.0 dump).
+- [x] **masked-NaN across devices**: `d/d(T0)` FINITE everywhere (halo/pad/below-bottom), exactly **0**
+      cotangent on dry/pad lanes, nonzero on owned-wet — OCEAN and FORCED (the ice-EVP backward).
+- [x] **gradient gate**: sharded `d(loss)/d(param)` == single-device, **field-appropriate** (the gradient
+      analog of Decision 4): CLEAN paths (k_ver→diffusion) machine-floor; FCT-advection paths (a_ver/k_gm/T0)
+      the upwind-flip floor. T0-field reconstruction `Bᵀ(g_p)` (the `all_gather` transpose = scatter-add) ==
+      dense to **max 7e-8** (OCEAN) / **3.6e-5** (FORCED). FD spot-check on the well-conditioned `k_ver`
+      (plateau **4.2e-5** < 1e-4) — k_ver chosen over the plan's `k_gm` (k_gm → FCT-advection is noisy /
+      needs GM-on; the FORCED gate covers `k_gm` finite + field-appropriate).
+- [x] write tests: 2-device grad == 1-device grad (param + T0-reconstruction); masked-lane cotangent == 0;
+      no NaN; the multi-step scan-backward + the FORCED assembled (KPP+GM+ice, the **ice-EVP 120-subcycle
+      checkpointed-scan backward**) all finite. `test_gradient_sharded.py` (5 tests).
+- [x] run tests — **PASS** (OCEAN param/fd/ic/multistep + FORCED assembled, CPU fake-devices); single-device
+      211 green (byte-identical v1.0). Lessons appended. **S.8 COMPLETE.**
 
 ### S.9: GATE — 2–4 device correctness (CPU + A100) + bonus C-N-rank diff
 
@@ -477,6 +490,28 @@ multi-rank port is functional (`MPI_PORT_REPORT.md`: "dist_8 partition correctne
 long-run drift = chaotic Allreduce-order, not a per-substep bug → validates the per-substep gate choice).
 Task ladder S.1→S.10: reader → sharded-mesh → exchange primitive → scatter gate → reductions → CG → wire
 `shard_map` → AD gate → the 2–4 device GATE → docs.
+
+### #13 — S.8 COMPLETE: the AD gradient gate (2026-06-08)
+Built `fesom_jax/tests/test_gradient_sharded.py` (5 tests) + `scripts/test_grad_{ocean,forced}.sbatch`.
+The whole differentiable sharded model is **gradient-correct on CPU fake-devices** (the BACKWARD through
+every collective: the `all_gather`-exchange transpose = scatter-add, the `psum` transpose = `psum`, the CG
+`custom_linear_solve` `transpose_solve` sharded, and the **ice-EVP 120-subcycle `jax.checkpoint`'d-scan
+backward**). 🎯 **The gate earned its keep — the sharded REVERSE pass exposed 8 bugs the dense
+single-device XLA silently folds** (the `0·inf`/`0·(±inf)` masked-NaN on the device-pad axis the plan
+flagged): **7 masked-NaN guards** (`pp.py` dz_inv; `momentum.py` dZ_up/dZ_dn; `tracer_adv.py`+`ice_adv.py`
+FCT `segment_max/min` `±inf`-identity on empty pad-node segments; `kpp.py` bldepth+blmix ×2 OBL
+interpolations) + **`jax.jit`-around-the-`shard_map`** for the `jax.checkpoint`'d multi-step scan grad
+(`closed_call`-under-`shard_map` backward, JAX 0.10). ALL forward-byte-identical — **211 single-device tests
+green** (incl. `test_reference_dump` = the v1.0 byte-identity). Method: a focused `jax_debug_nans` probe
+(scalar `d/d(a_ver)`, ~1 min) pinpoints each trap by source line; a `d/d(T0)` probe reaches every kernel;
+the FORCED `d/d(T0)` probe pre-cleared the ice path before the ~25-min assembled gate. The gate is
+**FIELD-APPROPRIATE** (the gradient analog of Decision 4): k_ver→clean-diffusion matches single-device to
+3.75e-8; a_ver/k_gm/T0→FCT-advection inherit the upwind-flip floor (a_ver rel 4e-4, k_gm tiny+noisy); the
+T0-field reconstruction `Bᵀ(g_p)` == dense to max 7e-8 (OCEAN) / 3.6e-5 (FORCED). With KPP active the PP
+backgrounds k_ver/a_ver are 0 (unused) — the eddy seam is GM's k_gm/redi_kmax. NEXT: S.9 (the real
+2–4×A100 gate) → S.10 (tag `v1.1-multi-gpu`). ⚠️ The `all_gather` halo exchange is O(P·N_local) — fine for
+the 2–4-device correctness gate but NON-scaling; **Phase 8b** (scaling: farc→dars→NG5) must FIRST replace
+it with `ragged_all_to_all` (point-to-point, the `com_struct` slist/rlist already in `partit.py`).
 
 ### #12 — S.7 part 3 COMPLETE: ice + multi-step scan + the PRIMARY assembled gate (2026-06-08)
 Closed S.7. **Ice** (`ice_evp.evp_dynamics` exch `u_ice/v_ice` INSIDE the 120-subcycle `lax.scan`;

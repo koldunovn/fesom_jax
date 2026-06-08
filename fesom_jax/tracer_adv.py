@@ -402,6 +402,12 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
                         _shift_up(tvert_min))
     fct_ttf_max = jnp.where(use_own, tvert_max, tmax3) - LO
     fct_ttf_min = jnp.where(use_own, tvert_min, tmin3) - LO
+    # Pad nodes (empty segments) get ±inf from segment_max/min (the identity element). The
+    # limiter masks them out below (`valid`), but ±inf poisons the AD backward (0·inf=NaN in
+    # d/d(flux_neg) — the sharded reverse pass over the device-pad axis exposes it; dense has
+    # no empty-segment nodes). Clamp to finite on non-wet lanes (forward byte-identical).
+    fct_ttf_max = jnp.where(nlm, fct_ttf_max, 0.0)
+    fct_ttf_min = jnp.where(nlm, fct_ttf_min, 0.0)
 
     # b1: sum positive / negative antidiffusive contributions per node
     fv_bot = _shift_up(adf_v)                            # adf_v[nz+1]

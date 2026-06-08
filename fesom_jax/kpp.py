@@ -549,7 +549,10 @@ def bldepth(mesh: Mesh, dVsq, ustar, Bo, bvfreq, dbsfc, sw_3d, sw_alpha, wmt, ws
     sw_k = jnp.take_along_axis(sw_3d, kblc, 1)[:, 0]
     zbar_km1 = jnp.take_along_axis(zbar, kblc - 1, 1)[:, 0]
     zbar_k = jnp.take_along_axis(zbar, kblc, 1)[:, 0]
-    frac = (hbl + zbar_km1) / (zbar_km1 - zbar_k)
+    _dzkbl = zbar_km1 - zbar_k                            # layer spacing at kbl (>0 on wet)
+    frac = (hbl + zbar_km1) / jnp.where(_dzkbl != 0.0, _dzkbl, 1.0)  # guard pad/degenerate-kbl
+    # (the 0 divisor on pad nodes ⇒ frac=inf ⇒ 0·inf=NaN backward — masked-NaN on the device
+    #  axis; forward byte-identical: wet nodes have _dzkbl>0, pad results are masked downstream)
     bfsfc_f = Bo + coeff_sw[:, 0] * (sw_surf[:, 0] - (sw_km1 + (sw_k - sw_km1) * frac))
     stable_f = _heaviside(bfsfc_f)
     bfsfc_f = bfsfc_f + stable_f * cfg.epsln
@@ -619,6 +622,10 @@ def blmix(mesh: Mesh, hnode, viscA, diffKt, diffKs, hbl, bfsfc, stable, caseA, k
     delhat = gcol(jnp.broadcast_to(Zabs, (N, nl)), kn) - hbl   # |Z[kn]| − hbl
     dth_kn = gcol(dthick, kn)
     dth_knp1 = gcol(dthick, knp1)
+    # Guard pad/degenerate-index thicknesses (0 ⇒ inf ⇒ 0·inf=NaN backward on the device
+    # axis; wet nodes have dth>0 ⇒ forward byte-identical, pad results masked downstream).
+    dth_kn = jnp.where(dth_kn != 0.0, dth_kn, 1.0)
+    dth_knp1 = jnp.where(dth_knp1 != 0.0, dth_knp1, 1.0)
     R = 1.0 - delhat / dth_kn
 
     def slope_valh(ch):
@@ -700,7 +707,8 @@ def enhance(mesh: Mesh, blmcM, blmcT, blmcS, ghats, dkm1, viscA, diffKt, diffKs,
 
     zk = gcol(zbar, kk)
     zk1 = gcol(zbar, kk + 1)
-    delta = (hbl + zk) / (zk - zk1)
+    _dzk = zk - zk1                                       # OBL layer spacing (>0 on wet)
+    delta = (hbl + zk) / jnp.where(_dzk != 0.0, _dzk, 1.0)  # guard pad/degenerate-kbl (0·inf)
     om = 1.0 - delta
     om2, d2 = om * om, delta * delta
 

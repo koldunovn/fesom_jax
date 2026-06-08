@@ -278,6 +278,13 @@ def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT):
     zinv = dt / h
     dZ_up = (_shift_down(Zp) - Zp).at[0].set(1.0)   # Z[nz-1]-Z[nz]; [0] unused (a=0)
     dZ_dn = (Zp - _shift_up(Zp)).at[-1].set(1.0)    # Z[nz]-Z[nz+1]; [-1] unused
+    # The Zp tail duplicates Z[-1] ⇒ the bottom interface has dZ==0; with Av==0 there
+    # (masked), ``Av/dZ`` is 0/0=NaN and the AD backward of the masked tridiagonal is
+    # poisoned — a masked-NaN trap the sharded reverse pass exposes (dense XLA folds the
+    # structural zero). Guard the divisors (the kpp.py:352 idiom). Forward byte-identical:
+    # these lanes are masked by ``valid``/``bot`` downstream.
+    dZ_up = jnp.where(dZ_up != 0.0, dZ_up, 1.0)
+    dZ_dn = jnp.where(dZ_dn != 0.0, dZ_dn, 1.0)
 
     a_full = -Av / dZ_up[None, :] * zinv[None, :]
     c_full = -_shift_up(Av) / dZ_dn[None, :] * zinv[None, :]
