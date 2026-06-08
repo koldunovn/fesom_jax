@@ -84,8 +84,8 @@
   every prognostic field; (b) the OCEAN gradient over NCCL == single-device. GPU-aware tolerances baked in
   (`_BYTE_ID_ATOL`, `_DIAG_FIELDS` σ-exclusion). Deferred to follow-ups: npes=4, the C-N dump diff (8b), and
   the forced-grad-on-GPU (EVP-scan memory). See Revision Log #14 + the S.9 lesson.
-- **S.10 docs** ⬅️ **START HERE** — tag `v1.1-multi-gpu`, move the plan to `completed/`, then the Phase-8b
-  fork below.
+- **S.10 docs** ✅ **DONE** — tagged `v1.1-multi-gpu`; plan moved to `docs/plans/completed/`. **PHASE 8 is
+  CLOSED.** ⬅️ **START HERE = Phase 8b** (the scaling fork below).
 
 ## REPRODUCE / TOOLS
 - **Env python (ALL python/pytest):** `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python`.
