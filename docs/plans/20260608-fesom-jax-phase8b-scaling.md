@@ -145,20 +145,27 @@ The load-bearing rewrite. Everything downstream is meaningless until this lands 
 ### B.3 — MULTI-NODE scaling (dars + NG5) vs Kokkos — the headline (user-requested, in progress)
 dars (3.16 M) and NG5 (7.4 M) **do not fit one 4×A100 node** (OOM even ocean-only — Kokkos starts both at
 2 nodes too), so they are multi-node. Staged:
-- [~] **STEP 1 — `jax.distributed` bring-up.** `scripts/multinode_sanity.{py,sbatch}` on 2 GPU nodes
-      (8 A100, 1 task/node × 4 GPU): `jax.distributed.initialize()` (SLURM auto-detect) → confirm
-      `jax.devices()`=8 global + cross-process `psum`/`all_gather` inside `shard_map` (the model's
-      collectives). [job 25441355]
-- [ ] **STEP 2 — multi-process data placement.** Each process builds the GLOBAL host arrays (mesh + PHC IC +
-      forcing — they FIT one node's RAM: dars ~22 GB, NG5 ~80 GB ≪ 256 GB) and `device_put`s the folded
-      shard_map inputs to a GLOBAL `NamedSharding(global_mesh, P('p'))` so each process places only its
-      addressable shards on its local GPUs (GPU memory is what multi-node relieves: NG5/8GPU ≈ 8 GB/GPU).
-      `run_steps_sharded` gains a multi-process path (`device_put` global inputs; `jmesh` = all global
-      devices). PHC IC per mesh cached to `/work` (`cache_phc_ic.py`). If the global host arrays ever
-      exceed one node's RAM (more ranks / bigger mesh), switch to true per-subdomain loading
+- [x] **STEP 1 — `jax.distributed` bring-up.** ✅ `scripts/multinode_sanity.{py,sbatch}` on 2 GPU nodes
+      (8 A100, 1 task/node × 4 GPU): `jax.distributed.initialize()` (SLURM auto-detect) → confirmed
+      `jax.devices()`=8 global + cross-process `psum`/`all_gather` inside `shard_map` + `device_put` of a
+      global host array to a multi-host `NamedSharding` placing addressable shards per process. [job 25441355]
+- [x] **STEP 2 — multi-process data placement (the HOST-BUILD REWRITE).** ✅ DONE + VALIDATED (RevLog #7).
+      The whole data pipeline now builds HOST numpy (`State.zeros/rest` `xp=np`; `integrate_sharded._fold`
+      polymorphic — numpy for concrete, `jnp` for tracers so grad-through-fold survives; `folded_*`/
+      `_halo_arrays`/`_fold_forcing` host) and `run_steps_sharded` **ALWAYS** `device_put`s the folded inputs
+      to a `NamedSharding` (single- AND multi-process — dropped the `process_count>1` guard). So GPU 0 never
+      holds the full global: dars-8 `peak_gpu_after_setup = 8.10 GiB` (was 40+ GiB → setup OOM). Each process
+      builds the GLOBAL host arrays (fit one node's RAM: dars ~22 GB, NG5 ~80 GB ≪ 256 GB) → device_put places
+      only its addressable shards. PHC IC per mesh cached to `/work` (dars + NG5 done). If the global host
+      arrays ever exceed one node's RAM, switch to per-subdomain loading
       (`make_array_from_process_local_data`) — deferred until needed.
-- [ ] **STEP 3 — dars multi-node full model** (dist_8 = 2 nodes, then dist_16/32), real JRA+PHC+ice,
-      dt=180, subtraction-timed, ragged vs all_gather → vs Kokkos `SCALING_M524.md` dars GPU s/step.
+- [~] **STEP 3 — dars multi-node full model** (dist_8 = 2 nodes done; dist_16/32 next), real JRA+PHC+ice,
+      dt=180, ragged vs all_gather → vs Kokkos `SCALING_M524.md`. ✅ **dist_8 (job 25446699):** RAGGED runs
+      **0.934 s/step** (peak_gpu 35.90 GiB); **ALLGATHER OOMs** (needs a 43.34 GiB collective buffer) — the
+      FIRST hard ragged win (all_gather's O(P·N_local) doesn't fit at 8 GPU). vs Kokkos M524 CUDA dars-2N
+      **0.814** → ~15% slower (XLA-vs-MPI collective overlap; CORE2 JAX was faster). ⚠️ JAX mesh nl=57; confirm
+      Kokkos M524 dars level count (old doc says 47). NEXT: dist_16 (4N) + dist_32 (8N) ragged for the JAX
+      scaling curve vs M524 (dars 4N 0.475, 8N 0.344).
 - [ ] **STEP 4 — NG5 multi-node full model** (dist_8/16/32…), dt=180 → vs Kokkos NG5. ⚠️ deep-mesh:
       nl=70 (watch for a hardcoded level cap on load); the step-0 global-gather at 7.4 M (chunk/avoid).
       The user's headline goal (~200-step scaling on the 7 M mesh). The ragged win is EXPECTED here
@@ -168,7 +175,10 @@ dars (3.16 M) and NG5 (7.4 M) **do not fit one 4×A100 node** (OOM even ocean-on
 
 ## B.3 REWRITE PREP — host-build the data pipeline (the dars/NG5 setup-OOM blocker)
 *Prepared 2026-06-09 for next-session planning + execution. This is the one real change blocking
-multi-node numbers — and it also unblocks single-node dars.*
+multi-node numbers.* **✅ DONE + VALIDATED 2026-06-09 (RevLog #7)** — dars-8 multi-node FULL now runs
+(ragged 0.934 s/step; setup peak 8.10 GiB). ⚠️ The "also unblocks single-node dars-4" claim below was WRONG:
+host-build removed the SETUP OOM, but dars-4 FULL still OOMs on the MODEL working set (48.6 GiB/GPU at dist_4);
+dars needs 2 nodes (the Kokkos limit too). See RevLog #7.
 
 **Symptom.** dars full model OOMs the GPU during SETUP (before any timing). Identical error for BOTH
 all_gather and ragged: `RESOURCE_EXHAUSTED: Out of memory ... 1.34 GiB ... executable jit__where`
@@ -242,6 +252,29 @@ run remains a separate follow-up (chaotic reduction-order divergence — same as
 ---
 
 ## Revision Log
+
+### #7 — HOST-BUILD REWRITE done + validated; dars-8 multi-node FULL runs (ragged fits, all_gather OOMs) (2026-06-09)
+Implemented the B.3 REWRITE PREP host-build fix: `State.zeros/rest` take `xp=jnp|np` (default byte-identical;
+`np` builds the global IC on the HOST); `integrate_sharded._fold` is now **polymorphic** (numpy for concrete
+host arrays so the full global never lands on GPU 0; `jnp` for tracers so the S.8 grad-through-fold survives —
+the one real trap, the IC-field gate folds a `jax.grad` tracer); `folded_mesh`/`_fold_forcing`/`_halo_arrays`
+host-numpy; `run_steps_sharded` **ALWAYS** `device_put`s the folded inputs to a `NamedSharding` (single- AND
+multi-process). Bench `phc_state`/`perturbed_state`/`stress_p` numpy + a peak-GPU-mem probe.
+**GATES (CPU fake-devices, all GREEN):** State/partition byte-identical (68 tests) + direct `xp=np`-vs-`jnp`
+byte-diff = 0; ocean sharded forward (npes 1/2/4); ocean grad (param `d/d k_ver` rel 3.8e-8, `a_ver` 4.1e-4 /
+IC-field+masked-NaN / FD / **multistep** = the `run_steps_sharded` device_put path); forced assembled forward
++ backward (KPP+GM+ice — `_fold_forcing` + boundary_node device_put). Placement-only ⇒ every value identical.
+**dars-8 (dist_8, 2 nodes, 8×A100, FULL JRA1958+PHC+ice, dt=180, job 25446699):** host-build VALIDATED —
+`peak_gpu_after_setup = 8.10 GiB` (was 40+ GiB → the setup OOM is GONE); **RAGGED runs 0.934 s/step**
+(peak_gpu 35.90 GiB), **ALLGATHER OOMs** (needs a 43.34 GiB collective buffer) — the FIRST hard ragged win
+(all_gather's O(P·N_local) doesn't fit multi-node). vs Kokkos M524 CUDA dars-2N **0.814** → ~15% slower
+(comparable; XLA-vs-MPI overlap — CORE2 JAX was *faster*). ⚠️ **Correction to the prep:** "host-build fixes
+single-node dars-4" was WRONG — host-build removed the SETUP OOM (dars-4 reaches step compile), but dars-4
+FULL OOMs on the MODEL working set (`hlo_rematerialization` floor 48.6 GiB/GPU at dist_4) — the SAME limit
+Kokkos hits (dars needs 2 nodes). Separate the setup OOM (data build, fixed) from the model OOM (step
+working set, needs more devices). The host↔GPU copy is one-time (`device_put` of the IC); all N steps run in
+one `jax.jit(shard_map(lax.scan))` with the carry GPU-resident (no per-step host traffic). NEXT: dars-16/32
+ragged (the JAX scaling curve vs M524 4N 0.475 / 8N 0.344) → NG5 (7.4M, IC cached — the headline goal).
 
 ### #6 — multi-node bring-up DONE; dars/NG5 blocked on a setup-OOM (data built on GPU 0) — REWRITE PREP (2026-06-09)
 B.3 STEP 1 (jax.distributed) + STEP 2 (multi-process device_put) committed + validated: 2-node sanity

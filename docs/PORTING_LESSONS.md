@@ -2732,3 +2732,41 @@ Cite the C source (`file:line`) or dump probe that proves it.
   device — a "build then shard" pipeline silently routes the *whole global* through GPU 0; for sharded/
   multi-process data, build with `np` and shard at `device_put`. (Single-node CORE2/farc hid this — their
   globals fit one GPU; dars/NG5 are the first that don't.)
+
+- **[host-build rewrite IMPLEMENTED + VALIDATED — the `_fold` must stay POLYMORPHIC, and the setup OOM ≠
+  the model OOM]** Executed the host-build fix above (`State.zeros/rest` gained `xp=jnp|np`; `integrate_sharded._fold`
+  + `folded_mesh`/`_fold_forcing`/`_halo_arrays` host-numpy; `run_steps_sharded` ALWAYS `device_put`s the
+  folded inputs to a `NamedSharding`, dropping the `process_count>1` guard; bench `phc_state`/`perturbed_state`
+  numpy). **The one non-obvious trap: `_fold` is differentiated THROUGH** — the S.8 IC-field gradient gate does
+  `jax.grad(loss)(state_p.T)`, which folds a *tracer*. A blanket `np.asarray` in `_fold` raises
+  "can't convert tracer to numpy". So `_fold` must be **polymorphic**: `a = arr if isinstance(arr, np.ndarray)
+  else jnp.asarray(arr)` — concrete host arrays stay numpy (off GPU 0), tracers stay `jnp` (autodiff flows).
+  The differentiated inputs in `run_steps_sharded` are CLOSED OVER the body (params/`k_ver`), not in the
+  device_put'd `args`, so `device_put` of the (constant) folded inputs is grad-safe. **Validated:** the full
+  CORE2 gate suite stayed GREEN on CPU fake-devices — State/partition byte-identical (68 tests), ocean sharded
+  forward (npes 1/2/4), ocean grad (param/IC/FD/multistep — the multistep is the `run_steps_sharded` device_put
+  path), forced assembled forward + backward (KPP+GM+ice, `_fold_forcing` + boundary_node device_put). It only
+  changes WHERE arrays live, so every value is identical — exactly as the placement-only change should be.
+  ⚠️ **Surprise: "host-build fixes single-node dars-4" (the prep claim) was WRONG.** The host-build DID remove
+  the SETUP OOM (dars-4 now reaches XLA step compile instead of dying in the data build), but dars-4 FULL then
+  OOMs on the **MODEL working set** — `hlo_rematerialization` floor 48.6 GiB/GPU at dist_4 (790k nod/GPU; the
+  compiled full-step's live intermediates: EVP 120-subcycle scan + KPP + GM + CG + FCT), which exceeds even an
+  80 GB A100. That is the SAME limit Kokkos hits (`SCALING_M524`: "dars/NG5 don't fit 4×A100, both start at
+  2N"). **Lesson: separate the SETUP OOM (data build on GPU 0 — fixed by host-build) from the MODEL OOM (per-
+  device step working set — fixed only by MORE devices / smaller shards).** dars needs 2 nodes (dist_8).
+
+- **[the first HARD ragged win: at dars/8GPU multi-node, `ragged_all_to_all` FITS where `all_gather` OOMs]**
+  dars (3.16M × nl57) FULL model (real JRA1958 + PHC IC + prognostic ice, dt=180) on **2 nodes / 8×A100**
+  (dist_8, `jax.distributed`, 1 proc/node): **RAGGED runs — 0.934 s/step, peak_gpu 35.90 GiB; ALLGATHER OOMs**
+  (needs a 43.34 GiB collective buffer; `hlo_rematerialization` floor 52.5 GiB vs ragged's lower working set).
+  This is the FIRST place the ragged halo is not just faster but **necessary** — all_gather's O(P·N_local)
+  gather volume literally doesn't fit at 8 GPU, exactly the "you copy too much data" failure mode the rewrite
+  targets. (Single-node CORE2/farc could NOT show this — NVLink made all_gather's volume ~free, so ragged only
+  showed a per-call-overhead penalty there; the win is fundamentally a multi-node / bandwidth-bound regime, as
+  RevLog #4 predicted.) **The host↔GPU transfer is one-time** (`device_put` of the IC; `peak_gpu_after_setup =
+  8.10 GiB` ≪ the old 40+ GiB build-on-GPU-0); all N steps run in ONE `jax.jit(shard_map(lax.scan(...)))` with
+  the state carry resident on GPU — per-step traffic is GPU↔GPU only (the halo + `psum`). **vs Kokkos:** JAX
+  dars-2N 0.934 s/step vs Kokkos M524 CUDA dars-2N **0.814** → ~15% slower (hand-tuned CUDA/MPI overlap; CORE2
+  JAX was actually *faster* — the multi-node gap is XLA collective overlap). ⚠️ Confirm the Kokkos M524 dars
+  level count (old `SCALING_DARS.md` says 47; the JAX mesh ran nl=57 — a ~20% vertical-work caveat on the exact
+  ratio). NEXT: dars-16/32 (the JAX scaling curve) + NG5 (the headline 7.4M multi-node goal; IC cached).

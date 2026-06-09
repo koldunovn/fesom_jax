@@ -45,10 +45,12 @@ _R = PartitionSpec()             # replicated (every device gets the full array)
 
 
 def _to_global_sharded(x, spec, mesh):
-    """Multi-process (B.3): ``device_put`` a folded input ``x`` + its ``PartitionSpec`` tree
-    to a GLOBAL ``NamedSharding`` over ``mesh`` so each process places ONLY its addressable
-    shards on its local GPUs (each process builds the full global host array, contributes its
-    rows). Single-process callers don't need this (shard_map shards the local array directly)."""
+    """``device_put`` a host-numpy folded input ``x`` + its ``PartitionSpec`` tree to a
+    ``NamedSharding`` over ``mesh``, so the array goes STRAIGHT to its shards and the full
+    global is never staged on GPU 0 (Phase 8b B.3, the dars/NG5 setup-OOM fix — run for
+    single- AND multi-process now). Single-process: ``mesh`` is the local devices, all shards
+    addressable. Multi-process: ``mesh`` is the global device set; each process builds the
+    full global host array and ``device_put`` places ONLY its addressable (local) shards."""
     shardings = jax.tree.map(lambda sp: NamedSharding(mesh, sp), spec,
                              is_leaf=lambda v: isinstance(v, PartitionSpec))
     return jax.device_put(x, shardings)
@@ -81,9 +83,16 @@ def local_mesh(sm: ShardedMesh, d: int) -> Mesh:
 # --------------------------------------------------------------------------
 # Fold helpers ([P, Lmax_kind, …] → [P*Lmax_kind, …]) + matching spec-trees
 # --------------------------------------------------------------------------
-def _fold(arr) -> jax.Array:
-    """``[P, X, …] → [P*X, …]`` (fold the device axis into the leading dim)."""
-    a = jnp.asarray(arr)
+def _fold(arr):
+    """``[P, X, …] → [P*X, …]`` (fold the device axis into the leading dim).
+
+    **Polymorphic placement (Phase 8b B.3, the dars/NG5 setup-OOM fix):** a concrete
+    ``np.ndarray`` input (the host-built data pipeline — ``partition_state`` etc.) stays on
+    the HOST (numpy reshape) so the full global folded array is NEVER materialized on GPU 0
+    before ``device_put`` shards it; a traced/jax input (grad-through-fold, e.g. the IC-field
+    gradient gate folds a ``jax.grad`` tracer of ``state_p.T``) goes through ``jnp`` so
+    autodiff still flows. The reshape is value-identical either way."""
+    a = arr if isinstance(arr, np.ndarray) else jnp.asarray(arr)
     return a.reshape((a.shape[0] * a.shape[1],) + a.shape[2:])
 
 
@@ -102,13 +111,13 @@ def folded_mesh(sm: ShardedMesh) -> tuple[Mesh, Mesh]:
     spec: dict = {}
     for name, arr in sm.fields.items():
         if name in REPLICATED_FIELDS:
-            data[name] = jnp.asarray(arr)
+            data[name] = np.asarray(arr)          # host (replicated; device_put places it)
             spec[name] = _R
         else:
-            data[name] = _fold(arr)
+            data[name] = _fold(arr)               # host numpy (sm.fields are numpy)
             spec[name] = _P
-    data["nod_in_elem2D_offsets"] = jnp.zeros(Ln + 1, jnp.int32)
-    data["nod_in_elem2D"] = jnp.zeros(1, jnp.int32)
+    data["nod_in_elem2D_offsets"] = np.zeros(Ln + 1, np.int32)
+    data["nod_in_elem2D"] = np.zeros(1, np.int32)
     spec["nod_in_elem2D_offsets"] = _R
     spec["nod_in_elem2D"] = _R
     meta = dict(nod2D=Ln, elem2D=Le, edge2D=Led, nl=sm.nl, edge2D_in=sm.edge2D_in,
@@ -132,11 +141,11 @@ def _fold_forcing(f):
     matches the input pytree structure."""
     data, spec = {}, {}
     for name in f._fields:
-        arr = jnp.asarray(getattr(f, name))
-        if arr.ndim == 0:
-            data[name], spec[name] = arr, _R          # scalar (ocean_area) → replicated
+        arr = getattr(f, name)
+        if np.ndim(arr) == 0:
+            data[name], spec[name] = np.asarray(arr), _R   # scalar (ocean_area) → replicated (host)
         else:
-            data[name], spec[name] = _fold(arr), _P   # [P, Lmax_nod, …] → [P*Lmax_nod, …]
+            data[name], spec[name] = _fold(arr), _P        # [P, Lmax_nod, …] → [P*Lmax_nod, …] (host)
     return type(f)(**data), type(f)(**spec)
 
 
@@ -172,16 +181,16 @@ def _halo_arrays(sm: ShardedMesh, ragged: bool = False) -> tuple[dict, dict]:
     ha: dict = {}
     for k in _RKINDS:
         src_dev, src_lane = sm.exchange[k]
-        ha[f"sd_{k}"] = _fold(src_dev).astype(jnp.int32)
-        ha[f"sl_{k}"] = _fold(src_lane).astype(jnp.int32)
+        ha[f"sd_{k}"] = _fold(src_dev).astype(np.int32)       # mesh constants → host numpy
+        ha[f"sl_{k}"] = _fold(src_lane).astype(np.int32)
         if ragged:
             r = sm.exchange_ragged[k]
-            ha[f"rsi_{k}"] = _fold(r.send_idx).astype(jnp.int32)
-            ha[f"rss_{k}"] = _fold(r.send_sizes).astype(jnp.int32)
-            ha[f"rso_{k}"] = _fold(r.send_offsets).astype(jnp.int32)
-            ha[f"roo_{k}"] = _fold(r.out_offsets).astype(jnp.int32)
-            ha[f"rrs_{k}"] = _fold(r.recv_sizes).astype(jnp.int32)
-            ha[f"rrg_{k}"] = _fold(r.recv_gather).astype(jnp.int32)
+            ha[f"rsi_{k}"] = _fold(r.send_idx).astype(np.int32)
+            ha[f"rss_{k}"] = _fold(r.send_sizes).astype(np.int32)
+            ha[f"rso_{k}"] = _fold(r.send_offsets).astype(np.int32)
+            ha[f"roo_{k}"] = _fold(r.out_offsets).astype(np.int32)
+            ha[f"rrs_{k}"] = _fold(r.recv_sizes).astype(np.int32)
+            ha[f"rrg_{k}"] = _fold(r.recv_gather).astype(np.int32)
             ha[f"rhm_{k}"] = _fold(r.halo_mask)
     ha["owned_nod"] = _fold(sm.owned_mask["nod"])
     return ha, {k: _P for k in ha}
@@ -399,10 +408,14 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                             in_specs=(fm_spec, fs_spec, fop_spec, _P, ha_spec) + extras_spec,
                             out_specs=fs_spec, check_vma=False)
     jfn = jax.jit(body_sm)
+    # ALWAYS place the (host-numpy) folded inputs onto their shards via device_put (Phase 8b
+    # B.3): single-process to the local device mesh, multi-process to the global one. This is
+    # what keeps the full global off GPU 0 — without it the folded arrays would be re-uploaded
+    # whole to the default device (the dars/NG5 setup-OOM). Differentiated inputs are closed
+    # over the body (params/kv), not in `args`, so device_put of these constants is grad-safe.
     args = (fm, fs, fop, fstress, ha, *extras)
-    if jax.process_count() > 1:               # multi-node (B.3): place addressable shards per process
-        specs = (fm_spec, fs_spec, fop_spec, _P, ha_spec) + extras_spec
-        args = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(args, specs))
+    specs = (fm_spec, fs_spec, fop_spec, _P, ha_spec) + extras_spec
+    args = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(args, specs))
     # return_executable: hand back the jitted fn + its inputs so a caller (the timing benchmark)
     # can compile ONCE then time a SECOND call that reuses the executable — otherwise every
     # run_steps_sharded call rebuilds the shard_map + re-jits (a fresh closure ⇒ cache miss ⇒

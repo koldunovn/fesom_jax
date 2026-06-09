@@ -25,6 +25,7 @@ import dataclasses
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import tree_util
 
 from .mesh import Mesh
@@ -89,13 +90,19 @@ class State:
 
     # ---- constructors -----------------------------------------------------
     @classmethod
-    def zeros(cls, mesh: Mesh) -> "State":
-        """All-zero state with every field correctly shaped & float64."""
+    def zeros(cls, mesh: Mesh, *, xp=jnp) -> "State":
+        """All-zero state with every field correctly shaped & float64.
+
+        ``xp`` selects the array backend: the default ``jnp`` is byte-identical to before
+        (builds on the default device); ``xp=np`` builds the whole State on the HOST as
+        numpy (Phase 8b B.3 — so a global IC for a big mesh is never materialized on GPU 0
+        before sharding, the dars/NG5 setup-OOM fix). Either way the result is a valid
+        ``State`` pytree; the data pipeline (``partition_state``) consumes both."""
         n, e, nl = mesh.nod2D, mesh.elem2D, mesh.nl
-        f = jnp.float64
+        f = xp.float64
 
         def Z(*shape):
-            return jnp.zeros(shape, f)
+            return xp.zeros(shape, f)
 
         return cls(
             T=Z(n, nl), S=Z(n, nl), T_old=Z(n, nl), S_old=Z(n, nl), del_ttf=Z(n, nl),
@@ -111,23 +118,37 @@ class State:
         )
 
     @classmethod
-    def rest(cls, mesh: Mesh, T0: float = 10.0, S0: float = 35.0) -> "State":
+    def rest(cls, mesh: Mesh, T0: float = 10.0, S0: float = 35.0, *, xp=jnp) -> "State":
         """Rest state: zero flow/SSH, constant ``T=T0``/``S=S0``, reference layer
         thicknesses (``zbar`` differences). The exact C-matching rest init is a
-        Phase-2 gate; this is a clean physical starting point."""
-        st = cls.zeros(mesh)
+        Phase-2 gate; this is a clean physical starting point.
+
+        ``xp`` selects the array backend (see :meth:`zeros`): the default ``jnp`` is
+        byte-identical to before; ``xp=np`` builds on the HOST (the dars/NG5 setup-OOM fix)."""
+        st = cls.zeros(mesh, xp=xp)
         n, e, nl = mesh.nod2D, mesh.elem2D, mesh.nl
-        T = jnp.full((n, nl), float(T0), jnp.float64)
-        S = jnp.full((n, nl), float(S0), jnp.float64)
+        T = xp.full((n, nl), float(T0), xp.float64)
+        S = xp.full((n, nl), float(S0), xp.float64)
 
-        # reference layer thickness h[k] = z(k) - z(k+1) > 0, masked to valid layers
+        # reference layer thickness h[k] = z(k) - z(k+1) > 0, masked to valid layers. The
+        # jnp path uses the original .at[].set(); the numpy path the equivalent slice-assign
+        # (bit-identical values — same subtraction, last column left 0).
         z_n = mesh.zbar_3d_n                                   # (n, nl)
-        dz_n = jnp.zeros((n, nl)).at[:, :-1].set(z_n[:, :-1] - z_n[:, 1:])
-        hnode = jnp.where(mesh.node_layer_mask, dz_n, 0.0)
-
         zbar = mesh.zbar                                       # (nl,)
-        dz = jnp.zeros((nl,)).at[:-1].set(zbar[:-1] - zbar[1:])
-        helem = jnp.where(mesh.elem_layer_mask, dz[None, :], 0.0)
+        if xp is jnp:
+            dz_n = jnp.zeros((n, nl)).at[:, :-1].set(z_n[:, :-1] - z_n[:, 1:])
+            dz = jnp.zeros((nl,)).at[:-1].set(zbar[:-1] - zbar[1:])
+            node_mask, elem_mask = mesh.node_layer_mask, mesh.elem_layer_mask
+        else:
+            z_n, zbar = np.asarray(z_n), np.asarray(zbar)
+            dz_n = np.zeros((n, nl))
+            dz_n[:, :-1] = z_n[:, :-1] - z_n[:, 1:]
+            dz = np.zeros((nl,))
+            dz[:-1] = zbar[:-1] - zbar[1:]
+            node_mask = np.asarray(mesh.node_layer_mask)
+            elem_mask = np.asarray(mesh.elem_layer_mask)
+        hnode = xp.where(node_mask, dz_n, 0.0)
+        helem = xp.where(elem_mask, dz[None, :], 0.0)
 
         return dataclasses.replace(
             st, T=T, S=S, T_old=T, S_old=S, hnode=hnode, hnode_new=hnode, helem=helem

@@ -26,33 +26,46 @@ DT = 1800.0
 
 def perturbed_state(mesh):
     """Generic non-trivial State: rest + a smooth lat perturbation of T (so the SSH CG does
-    representative work). Mirrors the test helper, mesh-agnostic."""
+    representative work). Mirrors the test helper, mesh-agnostic. **Built entirely on the HOST
+    (numpy)** (Phase 8b B.3) — the global IC for dars/NG5 never materializes on GPU 0;
+    ``partition_state`` + ``device_put`` place only each device's shard."""
     from fesom_jax.state import State
-    st = State.rest(mesh)
+    st = State.rest(mesh, xp=np)
     lat = np.asarray(mesh.geo_coord_nod2D)[:, 1]
     bump = 0.5 * np.cos(2 * lat)[:, None]
     T = np.asarray(st.T) + np.where(np.asarray(mesh.node_layer_mask), bump, 0.0)
-    return dataclasses.replace(st, T=jnp.asarray(T))
+    return dataclasses.replace(st, T=T)
 
 
 def phc_state(mesh, ic_dir=None):
     """REAL PHC3.0 winter IC (the Kokkos IC) as a rest State, with base T_old/S_old (the C
     step-1 AB2 history, per core2_initial_state). Loads a cached T_ic/S_ic.npy from ``ic_dir``
     if present, else interpolates the global PHC nc onto the mesh live (slow for big meshes —
-    pre-cache with build_and_cache_ic → /work)."""
+    pre-cache with build_and_cache_ic → /work). **Built entirely on the HOST (numpy)** (Phase
+    8b B.3) so the global 3-D IC never lands on GPU 0 before sharding (the dars/NG5 setup-OOM)."""
     import dataclasses as _dc
     from fesom_jax.state import State
     from fesom_jax import phc_ic
     if ic_dir and (Path(ic_dir) / "T_ic.npy").exists():
-        T = jnp.asarray(np.load(Path(ic_dir) / "T_ic.npy"))
-        S = jnp.asarray(np.load(Path(ic_dir) / "S_ic.npy"))
+        T = np.load(Path(ic_dir) / "T_ic.npy")
+        S = np.load(Path(ic_dir) / "S_ic.npy")
     else:
         res = phc_ic.load_phc_ic(mesh)
-        T, S = jnp.asarray(res.T), jnp.asarray(res.S)
-    mask = mesh.node_layer_mask
-    st = State.rest(mesh, T0=10.0, S0=35.0)
-    return _dc.replace(st, T=T, S=S, T_old=jnp.where(mask, 10.0, 0.0),
-                       S_old=jnp.where(mask, 35.0, 0.0))
+        T, S = np.asarray(res.T), np.asarray(res.S)
+    mask = np.asarray(mesh.node_layer_mask)
+    st = State.rest(mesh, T0=10.0, S0=35.0, xp=np)
+    return _dc.replace(st, T=T, S=S, T_old=np.where(mask, 10.0, 0.0),
+                       S_old=np.where(mask, 35.0, 0.0))
+
+
+def _gpu_peak_gb():
+    """Max peak GPU bytes-in-use across local devices (GiB), or -1 on CPU / if unavailable.
+    Phase 8b B.3 setup-OOM probe: confirms the host-build keeps GPU 0 below the OOM ceiling."""
+    try:
+        peaks = [d.memory_stats().get("peak_bytes_in_use", 0) for d in jax.local_devices()]
+        return max(peaks) / (1024 ** 3) if peaks else -1.0
+    except Exception:
+        return -1.0
 
 
 def main():
@@ -131,7 +144,10 @@ def main():
 
     state_p = shard_mesh.partition_state(state, part)
     sop = ssh.partition_ssh_operator(op, part)
-    stress_p = jnp.zeros((args.npes, sm.Lmax["elem"], 2))
+    stress_p = np.zeros((args.npes, sm.Lmax["elem"], 2))      # host (Phase 8b B.3)
+    if proc0:
+        print(f"[bench] {args.name} npes={args.npes}: host setup done  "
+              f"peak_gpu_after_setup={_gpu_peak_gb():.2f} GiB", flush=True)
 
     # Per-step time via the SUBTRACTION method (the JAX analog of Kokkos "omit the first W
     # steps"): time a warm N-step run and a warm W-step run, both with XLA compile EXCLUDED
@@ -165,7 +181,8 @@ def main():
     if proc0:
         print(f"[bench] mesh={args.name:6s} nod2D={mesh.nod2D} nl={mesh.nl} npes={args.npes} "
               f"halo={tag:9s} model={model:20s} steps={args.steps}  per_step={per_step_ms:8.2f} ms  "
-              f"throughput={tput:8.1f} Mnodlev/s  compile={compile_s:6.1f}s  plat={plat}")
+              f"throughput={tput:8.1f} Mnodlev/s  compile={compile_s:6.1f}s  plat={plat}  "
+              f"peak_gpu={_gpu_peak_gb():.2f} GiB", flush=True)
 
 
 if __name__ == "__main__":
