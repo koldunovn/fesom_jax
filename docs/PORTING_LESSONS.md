@@ -2715,3 +2715,20 @@ Cite the C source (`file:line`) or dump probe that proves it.
   timing window is fine.) Decomp (CORE2 full): ocean+forcing 63%, ice/EVP 19%, KPP+GM 16% — like Kokkos's
   profile; ragged starts WINNING on the full model (~500 exchanges/step from EVP 120×2 + CG) where its
   per-exchange volume savings outweigh its per-call overhead, even single-node.
+
+- **[multi-process / large-mesh sharding: BUILD global arrays on HOST (numpy), never `jnp` — or GPU 0 OOMs
+  in SETUP before the model even runs]** dars/NG5 full-model OOM'd the GPU during setup (identical
+  `1.34 GiB jit__where` for BOTH all_gather and ragged — 1.34 GiB = one full global 3-D field), single- AND
+  multi-node. Root cause: the data pipeline materialized the FULL GLOBAL arrays as `jax.numpy` on the
+  default device (GPU 0) BEFORE sharding — `State.rest`/`State.zeros` (`jnp.full`/`where`), the bench
+  `phc_state`/`perturbed_state`, and `integrate_sharded._fold`/`folded_state`/`folded_mesh`/`folded_operator`/
+  `_halo_arrays` (`jnp.asarray(...)`). `shard_mesh.partition_state` already returns host numpy, but `_fold`
+  re-uploads it to GPU 0. So GPU 0 had to hold the entire global model (dars ≈ 20+ GiB) before `device_put`
+  could shard it. **Fix: keep the whole pipeline HOST numpy (`np`) until a single final `jax.device_put` to
+  a `NamedSharding` — which places ONLY the addressable shards per process, so GPU 0 never holds the full
+  global.** The host keeps the full global numpy (fits a 512-GB node: dars ~22 GB, NG5 ~80 GB; use
+  `--mem=0`); each GPU holds 1/P. This is the contained alternative to true per-subdomain loading (only
+  needed if a mesh's global exceeds one node's host RAM). Lesson: in JAX, `jnp.*` runs on the default
+  device — a "build then shard" pipeline silently routes the *whole global* through GPU 0; for sharded/
+  multi-process data, build with `np` and shard at `device_put`. (Single-node CORE2/farc hid this — their
+  globals fit one GPU; dars/NG5 are the first that don't.)

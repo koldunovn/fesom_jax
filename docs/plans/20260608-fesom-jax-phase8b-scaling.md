@@ -166,6 +166,71 @@ dars (3.16 M) and NG5 (7.4 M) **do not fit one 4×A100 node** (OOM even ocean-on
 
 ---
 
+## B.3 REWRITE PREP — host-build the data pipeline (the dars/NG5 setup-OOM blocker)
+*Prepared 2026-06-09 for next-session planning + execution. This is the one real change blocking
+multi-node numbers — and it also unblocks single-node dars.*
+
+**Symptom.** dars full model OOMs the GPU during SETUP (before any timing). Identical error for BOTH
+all_gather and ragged: `RESOURCE_EXHAUSTED: Out of memory ... 1.34 GiB ... executable jit__where`
+(single-node dars-4 earlier: same, `jit_broadcast_in_dim`). **1.34 GiB = 3.16M × 57 × 8 B = exactly ONE
+full global 3-D node field.** Same for both halos ⇒ it is NOT the halo/model — it is the data build.
+
+**Root cause (traced to the functions).** The pipeline materializes the FULL GLOBAL arrays as
+`jax.numpy` (GPU) arrays on the default device (GPU 0) BEFORE sharding:
+- `fesom_jax/state.py` `State.rest`/`State.zeros` (+ the bench `phc_state`/`perturbed_state`):
+  `jnp.full`/`jnp.zeros`/`jnp.where` ⇒ the global State `[N, nl]` lands on GPU 0 (dars: ~1.34 GiB ×
+  ~15 fields ≈ 20 GiB on ONE GPU).
+- `fesom_jax/integrate_sharded.py` `_fold` + `folded_state`/`folded_mesh`/`folded_operator` +
+  `_halo_arrays`: `jnp.asarray(...)` ⇒ the folded `[P·Lmax, nl]` global on GPU 0.
+- `shard_mesh.partition_state`/`partition_forcing_*` already return HOST numpy ✓ — but `_fold`
+  immediately re-uploads them to GPU 0.
+So GPU 0 must hold the ENTIRE global model before `device_put` shards it ⇒ OOM at dars/NG5 scale.
+(CORE2/farc fit only because their globals are small enough for one GPU. The B.3 STEP-2 `device_put`
+shards the *folded* arrays — but they were already built on GPU 0, so it doesn't help.)
+
+**Fix (CONTAINED — host-build + device_put-sharded; NOT the per-subdomain rewrite).**
+1. Build the WHOLE pipeline as HOST numpy (`np`), never `jnp`, until the final placement:
+   `state.py` (a numpy `rest`/`zeros` path or a `_rest_numpy`), bench `phc_state`/`perturbed_state`,
+   and `_fold`/`folded_*`/`_halo_arrays` → `np.asarray`.
+2. ALWAYS `device_put` the folded inputs to a sharding before `jax.jit(shard_map)` — single-process
+   to a LOCAL `NamedSharding`, multi-process to the GLOBAL one (generalize the existing
+   `_to_global_sharded`). `device_put` of a host-numpy global to a sharding places ONLY the
+   addressable shards on device ⇒ GPU 0 never holds the full global.
+3. Net: host holds the full global numpy (dars ~22 GB, NG5 ~80 GB — fit a 512 GB GPU node; keep
+   `--mem=0`); each GPU holds only its 1/P shard. (Per-subdomain loading is a FUTURE step, only if a
+   mesh's global exceeds one node's RAM — NG5 80 GB ≪ 512 GB, so host-build suffices for now.)
+
+**This also fixes single-node dars-4** (the OOM was the build, not the sharded model: dars/4 ≈ 790k
+nod/GPU fits 40 GB). **Verify in order:** dars-4 single-node full → dars-8 multi-node → dist_16/32 → NG5.
+
+**Change-list (files):**
+- `fesom_jax/state.py` — numpy path for `rest`/`zeros` (or a host builder used by the data pipeline).
+- `fesom_jax/integrate_sharded.py` — `_fold` + `folded_state`/`folded_mesh`/`folded_operator` +
+  `_halo_arrays` → `np`; make the `device_put`-to-sharding ALWAYS run (single-process too, to a local
+  mesh sharding) so the global is never on one GPU.
+- `scripts/bench_forward_scaling.py` — `phc_state`/`perturbed_state` → numpy.
+- GATE: the single-device suite + `test_step_sharded.py`/`test_gradient_sharded.py` must stay green
+  (the host-build + device_put must be numerically identical — it only changes WHERE arrays live).
+
+**Verification.** Add a peak-GPU-mem probe in setup; run dars-4 single-node full (must fit post-fix);
+confirm CORE2/farc per-step unchanged; then dars-8 multi-node.
+
+**Risks / open questions for the planning session:**
+- Confirm `jax.jit(shard_map)` accepts device_put-sharded host-numpy single-process (the 8-GPU sanity
+  showed it works for the global multi-process case).
+- `folded_mesh` reconstructs the local `Mesh` INSIDE `shard_map` from the sharded inputs — unaffected,
+  but re-confirm after switching its build to numpy.
+- NG5 IC: the `_extrap_nod3D` numpy GS loop over 7.4 M nodes may be slow/fail (dars 3.16 M = 670 s) —
+  caching kicked off (job 25445934, 4 h); fallback = the C-port PHC dump.
+- Full-model XLA compile ≈ 15 min/config ⇒ run **one config per job** (don't batch; the subtraction
+  timing's 2nd compile already proved too costly — using compile-once + warm-call now).
+
+**Already prepped (so next session starts ready):** jax.distributed multi-node bring-up VALIDATED
+(8 GPU, cross-node collectives correct); the multi-process `device_put` path + launchers committed;
+farc + dars PHC IC cached on `/work`; NG5 IC caching running (25445934).
+
+---
+
 ## 2. Acceptance
 
 Phase 8b is done when the model runs N-vs-1-correct at farc/dars/NG5 scale with **halo-only point-to-point
@@ -177,6 +242,20 @@ run remains a separate follow-up (chaotic reduction-order divergence — same as
 ---
 
 ## Revision Log
+
+### #6 — multi-node bring-up DONE; dars/NG5 blocked on a setup-OOM (data built on GPU 0) — REWRITE PREP (2026-06-09)
+B.3 STEP 1 (jax.distributed) + STEP 2 (multi-process device_put) committed + validated: 2-node sanity
+(8 A100, 1 proc/node × 4 GPU) confirms global devices + cross-process psum/all_gather in shard_map are
+correct (config lesson: 1 proc/node with `local_device_ids=range(4)`; 4-procs/node raced the coordinator).
+farc + dars PHC IC cached (real T). BUT every dars full-model run (single-node dist_4 AND 2-node dist_8,
+all_gather AND ragged) OOMs the GPU in SETUP with the identical `1.34 GiB jit__where` (= one full global
+3-D field) — traced to the data pipeline building the FULL GLOBAL arrays as `jnp` on GPU 0 before sharding
+(`State.rest`/`phc_state` jnp; `_fold`/`folded_*`/`_halo_arrays` `jnp.asarray`). `partition_state` is
+already numpy but `_fold` re-uploads it. **Fix = host-build the whole pipeline (numpy) + always
+device_put-sharded** (contained; NOT per-subdomain) — also unblocks single-node dars-4. Full diagnosis +
+change-list + verification + risks in the **"B.3 REWRITE PREP"** section above (prepared for next-session
+planning). Also learned: the full-model XLA compile is ~15 min/config (run 1 config/job; switched the
+timing from the 2-compile subtraction to compile-once + warm-call). NG5 IC caching kicked off (25445934).
 
 ### #5 — FULL model (real JRA+PHC+ice): JAX is COMPARABLE to Kokkos-CUDA; the "10×" was a compile bug (2026-06-09)
 Two corrections (both user-flagged): (a) the bench must use the **REAL Kokkos setup** — PHC winter IC

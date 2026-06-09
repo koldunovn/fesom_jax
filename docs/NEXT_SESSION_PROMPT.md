@@ -1,22 +1,29 @@
-# Next-session prompt — FESOM2 → JAX port: PHASE 8 (multi-GPU / multi-core sharding)
+# Next-session prompt — FESOM2 → JAX port: PHASE 8b (scaling) — the data-loading REWRITE
 
-> **⚡ STATE (2026-06-08): S.1→S.9 are DONE on `main`. The model is VALIDATED CORRECT ON REAL A100s** (S.9,
-> `scripts/phase8_s9_gpu.sbatch`, 4×A100 job 25430592). The ENTIRE `shard_map` wiring is N-vs-1 correct on
-> owned (S.7), gradient-correct (S.8), and now confirmed on real GPUs: the assembled CORE2 step (KPP+GM+ice)
-> sharded across 2 A100s == single-device on every PROGNOSTIC field — ocean dynamics clean (uv 1.1e-9, d_eta
-> 2.6e-11, w 2.3e-13, Kv/Av 1e-14), FCT tracers + prognostic ice climate-close (T/S 1e-2…1e-3, ice
-> u/v/m/a/snow 1e-7…1e-9) — and the OCEAN gradient matches over NCCL (`jax.grad`-thru-`shard_map`, d/d(k_ver)
-> rel 3.75e-8). **Two GPU truths (neither a bug, both now baked into the gate):** byte-identity is a CPU
-> property (GPU reassociation floor ~8e-9 → platform-aware `_BYTE_ID_ATOL`); the EVP stress σ is a
-> non-prognostic VP-kink diagnostic (O(0.5) branch-flip, but the u_ice/v_ice it drives is correct to 1e-7) →
-> EXCLUDED from the gate (`_DIAG_FIELDS`). The forced gradient OOM'd on GPU (memory, not correctness) →
-> deferred. NEXT: **S.10** (tag `v1.1-multi-gpu`, move plan to `completed/`). THEN → Phase 8b (scaling:
-> farc→dars→NG5) — but FIRST replace the `all_gather` halo exchange with `ragged_all_to_all` (the `all_gather`
-> is O(P·N_local), fine for the 2–4-dev correctness gate but NON-scaling; the point-to-point `com_struct`
-> slist/rlist is already in `partit.py`).**
+> **⚡ STATE (2026-06-09): Phase 8 DONE (tag `v1.1-multi-gpu`). Phase 8b (scaling) is well underway — the
+> IMMEDIATE NEXT TASK is the data-loading rewrite, fully scoped in
+> `docs/plans/20260608-fesom-jax-phase8b-scaling.md` → the "B.3 REWRITE PREP" section (read it first).**
 >
-> Commits: `80f6a71` S.1–S.5 · `497e802` S.6 CG · `a770000`+`990da45` S.7 part 1 · `9bc9c39` S.7 part 2 ·
-> `5214cf0` S.7 part 3 · `b28f621` S.8 AD gate · **HEAD = S.9** (the real-A100 gate + GPU-aware tolerances).
+> What's done in 8b (plan Revision Log #1–#6): B.0 = `ragged_all_to_all` halo (FORWARD validated on A100;
+> JAX's autodiff transpose of it is broken → `custom_vjp` is B.0d, forward-only-safe for now). The
+> **headline result is trustworthy**: on the FULL CORE2 model (real JRA1958 + PHC IC + prognostic ice,
+> 4×A100), **JAX = 92.6 ms/step vs Kokkos-CUDA full-step = 117 ms — COMPARABLE / slightly faster** (the
+> earlier "10× slower" was a compile-in-timing bug, fixed: compile-once + warm-call, 1 config/job).
+> Multi-node bring-up (B.3 STEP 1-2) is VALIDATED: `jax.distributed` across 2 nodes (8 A100), cross-process
+> `psum`/`all_gather` in `shard_map` correct; per-mesh PHC IC + real forcing are mesh-agnostic
+> (`load_phc_ic` + `build_core_forcing`); farc/dars IC cached on `/work`, NG5 IC caching (job 25445934).
+>
+> **THE BLOCKER (the rewrite):** dars/NG5 full-model OOMs the GPU in SETUP (identical `1.34 GiB jit__where`
+> for BOTH halos) because the data pipeline builds the FULL GLOBAL arrays as `jnp` on GPU 0 before sharding
+> (`State.rest`/`phc_state` + `_fold`/`folded_*`/`_halo_arrays`). **Fix = host-build (numpy) the whole
+> pipeline + always `device_put`-sharded** (contained, NOT per-subdomain) — also unblocks single-node
+> dars-4. Verify dars-4 single → dars-8 multi → dist_16/32 → NG5 vs Kokkos `SCALING_M524.md`. The full
+> change-list + risks are in the REWRITE PREP section. ⚠️ Honest scaling truth so far: all_gather is
+> O(P·N_local) (OOMs at scale), ragged is the multi-node answer; JAX is per-step competitive with Kokkos.
+>
+> Commits: …`b28f621` S.8 · `ddc8fff` S.9 · `7b16d27` S.10/tag · then Phase 8b `4acb9a2` plan · `6ec4234`
+> B.0a · `ba342f6` B.0b/c · `85d39b3` SSH-ragged · `b123726` farc bench · `51adf5c` full-model bench ·
+> `633770d` (HEAD) multi-node + 1-compile timing. The 8b plan Revision Log #1→#6 records every step.
 > Plan Revision Log #2→#14 records every decision/discovery (#14 = S.9).
 
 ## ⚠️ READ FIRST — two hard rules this session learned
