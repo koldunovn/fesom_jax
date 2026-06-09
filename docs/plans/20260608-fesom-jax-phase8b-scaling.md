@@ -166,10 +166,16 @@ dars (3.16 M) and NG5 (7.4 M) **do not fit one 4×A100 node** (OOM even ocean-on
       **0.814** → ~15% slower (XLA-vs-MPI collective overlap; CORE2 JAX was faster). ⚠️ JAX mesh nl=57; confirm
       Kokkos M524 dars level count (old doc says 47). NEXT: dist_16 (4N) + dist_32 (8N) ragged for the JAX
       scaling curve vs M524 (dars 4N 0.475, 8N 0.344).
-- [ ] **STEP 4 — NG5 multi-node full model** (dist_8/16/32…), dt=180 → vs Kokkos NG5. ⚠️ deep-mesh:
-      nl=70 (watch for a hardcoded level cap on load); the step-0 global-gather at 7.4 M (chunk/avoid).
-      The user's headline goal (~200-step scaling on the 7 M mesh). The ragged win is EXPECTED here
-      (multi-node = bandwidth-bound, where all_gather's O(P·N_local) volume finally dominates).
+- [x] **STEP 4 — NG5 multi-node full model** ✅ (RevLog #8). NG5 (7.4M × nl70) FULL model RUNS on **dist_32
+      (8 nodes, 32 A100): 0.840 s/step** (job 25452144) — vs Kokkos M524 CUDA NG5-8N **0.810** → ~3.7% slower
+      (the gap closes with scale: dars-2N 15% → dars-4N 8% → NG5-8N 4%). nl=70 needed NO level-cap fix (JAX
+      reads `mesh.nl` dynamically; the Kokkos "64-level scratch cap" was C-specific). dist_16 (4N) + dist_8 (2N)
+      OOM the per-GPU model working set (140 GiB at dist_16); dist_32 is the min that fits (66.63 GiB). The TWO
+      enabling fixes: (1) `_to_global_sharded` → `make_array_from_callback` (the `device_put` of the folded
+      global staged ~125.81 GiB on one GPU — the NG5-only wall); (2) **gather-free sharded Zarr output**
+      (`zarr_output.py`, `--out-zarr`): each GPU writes its `Lmax`-chunk in parallel → 19 GB across 8 nodes,
+      `owned_nod == nod2D` exact — the "step-0 global-gather" OOM avoided. The ragged win is concrete from
+      dars-8 on (all_gather OOMs multi-node where ragged fits).
 
 ---
 
@@ -252,6 +258,23 @@ run remains a separate follow-up (chaotic reduction-order divergence — same as
 ---
 
 ## Revision Log
+
+### #8 — NG5 RUNS (the headline): the global-fold placement wall + gather-free Zarr output; dars curve (2026-06-09)
+After the host-build fix, **dars scaled cleanly** — dars-8 (2N) 0.934 s/step, **dars-16 (4N) 0.513** (vs Kokkos
+M524 0.814 / 0.475 — gap 15%→8%, 2N→4N speedup 1.82× ≥ Kokkos's 1.71×). **NG5 then hit a placement wall:**
+dist_16 OOM'd (working set 140 GiB + I/O "exceeds base limit") and dist_32 OOM'd in a `jit__identity_fn`
+allocating **125.81 GiB ≈ the full folded global `[P·Lmax,nl]` on ONE GPU** — even though the model working set
+FIT (66.63 GiB at dist_32). Root cause: `_to_global_sharded`'s `jax.device_put(folded_global, NamedSharding)`
+stages a global-sized copy on a single device (≈56 GB dars = fit; ≈125.81 GiB NG5 = OOM); it does NOT shrink
+with node count. **Fix: `make_array_from_callback`** (per-shard host slicing, no global on device; CPU-verified
+bit-identical to `device_put`, both gates green). Also built **`fesom_jax/zarr_output.py`** — gather-free
+sharded output: each GPU writes its folded `Lmax`-chunk to Zarr in parallel (rank-0 metadata → barrier →
+disjoint `addressable_shards` writes), `gid`/`owned` maps for `reconstruct_global`; round-trip CPU-exact, wired
+as `--out-zarr`. **RESULT (job 25452144): NG5 dist_32 (8 nodes/32 A100) FULL model RUNS 0.840 s/step (vs
+Kokkos 0.810, ~4%) AND writes 19 GB sharded Zarr** (T = 32 chunk files = 1/GPU; `owned_nod == nod2D` exact).
+The headline NG5 multi-node goal is reached; the JAX port is ~4–8% off hand-tuned Kokkos CUDA at dars/NG5 scale
+with halo-only (ragged) comms + process-local I/O. zarr v2 installed in the env. ⚠️ login can't reconstruct an
+NG5 global (~8 GB > login per-proc cap) — use a compute node.
 
 ### #7 — HOST-BUILD REWRITE done + validated; dars-8 multi-node FULL runs (ragged fits, all_gather OOMs) (2026-06-09)
 Implemented the B.3 REWRITE PREP host-build fix: `State.zeros/rest` take `xp=jnp|np` (default byte-identical;

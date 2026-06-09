@@ -2770,3 +2770,35 @@ Cite the C source (`file:line`) or dump probe that proves it.
   JAX was actually *faster* — the multi-node gap is XLA collective overlap). ⚠️ Confirm the Kokkos M524 dars
   level count (old `SCALING_DARS.md` says 47; the JAX mesh ran nl=57 — a ~20% vertical-work caveat on the exact
   ratio). NEXT: dars-16/32 (the JAX scaling curve) + NG5 (the headline 7.4M multi-node goal; IC cached).
+
+- **[`jax.jit(shard_map)` + `device_put` of a *folded global* array stages it on ONE device — the NG5 wall;
+  fix = `make_array_from_callback` (per-shard host slicing)]** After the host-build fix, dars scaled fine
+  (dist_8/16) but **NG5 dist_16 + dist_32 OOM'd in a `jit__identity_fn` allocating ~the *full folded global*
+  `[P·Lmax, nl]` (125.81 GiB at dist_32) on ONE GPU** — even though the model's own working set FIT (66.63 GiB
+  at dist_32, scaled down from dist_16's 140). The culprit was the INPUT placement: `_to_global_sharded` used
+  `jax.device_put(folded_global_numpy, NamedSharding)`, which routes a global-sized staging copy on a single
+  device — ~56 GB for dars (fit an 80 GB A100, so it silently worked) but ~125.81 GiB for NG5 ⇒ OOM. It does
+  NOT shrink with node count (`P·Lmax` ≈ global + P·halo grows with P), so more nodes can't fix it.
+  **Fix: `jax.make_array_from_callback(shape, sharding, lambda idx: host_numpy[idx])`** — JAX calls the callback
+  per ADDRESSABLE shard and pulls only that slice from the host numpy, so the global never lands on a device
+  (CPU-verified bit-identical to `device_put`; single- and multi-process). After this, **NG5 dist_32 (8 nodes,
+  32 A100) FULL model RUNS: 0.840 s/step** — vs Kokkos M524 CUDA NG5-8N **0.810** → **~3.7% slower** (the gap
+  *closes* with scale: dars-2N 15% → dars-4N 8% → NG5-8N 4%; ragged halo + process-local I/O make the JAX port
+  competitive with hand-tuned CUDA at 7.4 M nodes multi-node). Lesson: with manual `shard_map`, the `jit` I/O
+  boundary is the *global* logical array — `device_put` of it can stage a global copy on one device; for
+  big-mesh multi-process, **place via `make_array_from_callback`/`make_array_from_process_local_data`, never a
+  global `device_put`.** (`integrate_sharded._to_global_sharded`.)
+
+- **[sharded, gather-free model OUTPUT to Zarr — each GPU writes its own shard in parallel, no rank-0 gather]**
+  Writing NG5 output the C/Kokkos way (gather the global field to rank 0 → one NetCDF) re-hits the
+  single-device-materialization wall (the Kokkos `SCALING_NG5` "step-0 ~66 GB global gather" OOM). Instead
+  (`fesom_jax/zarr_output.py`): write the **folded** `[P·Lmax_kind, …]` State to Zarr **chunked at `Lmax_kind`**
+  along axis 0, so each device's shard is exactly one chunk ⇒ different processes write DISJOINT chunk files ⇒
+  fully parallel, no locking, no gather (rank 0 creates the `.zarray` metadata + per-kind `gid`/`owned` index
+  maps → `multihost_utils.sync_global_devices` barrier → every process writes its `arr.addressable_shards`).
+  `reconstruct_global` scatters the OWNED lanes (`owned_<kind>` is True only on each entity's unique owner, so
+  `owned.sum() == nod2D` exactly — no double-write) by `gid` back to a dense `[nod2D, …]` host array on read.
+  **Verified: NG5 wrote 19 GB across 8 nodes, T had exactly 32 chunk files (one per GPU), `owned_nod == nod2D`
+  (7,402,886).** The output analogue of the input `make_array_from_callback` fix — nothing global on one device.
+  (zarr v2; `bench_forward_scaling.py --out-zarr`.) ⚠️ Reconstructing an NG5 *global* field (~8 GB) OOMs the
+  *login* node's per-process cap — reconstruct on a compute node, or read chunk-wise.

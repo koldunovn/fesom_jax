@@ -45,15 +45,27 @@ _R = PartitionSpec()             # replicated (every device gets the full array)
 
 
 def _to_global_sharded(x, spec, mesh):
-    """``device_put`` a host-numpy folded input ``x`` + its ``PartitionSpec`` tree to a
-    ``NamedSharding`` over ``mesh``, so the array goes STRAIGHT to its shards and the full
-    global is never staged on GPU 0 (Phase 8b B.3, the dars/NG5 setup-OOM fix — run for
-    single- AND multi-process now). Single-process: ``mesh`` is the local devices, all shards
-    addressable. Multi-process: ``mesh`` is the global device set; each process builds the
-    full global host array and ``device_put`` places ONLY its addressable (local) shards."""
+    """Place a host-numpy folded input ``x`` (+ its ``PartitionSpec`` tree) onto a
+    ``NamedSharding`` over ``mesh`` by copying **each addressable shard directly from the host
+    numpy to its device** (:func:`jax.make_array_from_callback`), so NO global-sized array is
+    ever staged on a single device.
+
+    **Why not ``device_put`` (the NG5 fix, Phase 8b B.3):** ``jax.device_put`` of a folded
+    global array routed a ``jit__identity_fn`` that materialized the WHOLE folded global
+    ``[P·Lmax, …]`` on one GPU before sharding — ~56 GB for dars (fit an 80 GB A100, so it
+    worked) but **~125.81 GiB for NG5 dist_32 ⇒ OOM**. ``make_array_from_callback`` calls the
+    per-shard callback with each addressable shard's index and pulls ONLY that slice from the
+    host numpy, so the global never lands on a device. Single-process: every shard addressable.
+    Multi-process: each process builds the full global host array and places only its local
+    shards (the rows for its local devices)."""
     shardings = jax.tree.map(lambda sp: NamedSharding(mesh, sp), spec,
                              is_leaf=lambda v: isinstance(v, PartitionSpec))
-    return jax.device_put(x, shardings)
+
+    def _place(leaf, sharding):
+        a = np.asarray(leaf)                      # already host numpy (the host-build pipeline)
+        return jax.make_array_from_callback(a.shape, sharding, lambda idx, a=a: a[idx])
+
+    return jax.tree.map(_place, x, shardings)
 
 # entity-leading mesh fields (shard 'p'); the rest (zbar/Z + the CSR dummy) replicate.
 _ENTITY_FIELDS = (set(NODE_FIELDS) | set(ELEM_FIELDS) | set(EDGE_FIELDS)

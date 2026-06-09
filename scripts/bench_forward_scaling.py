@@ -86,6 +86,9 @@ def main():
     ap.add_argument("--ic-dir", default=None,
                     help="dir with cached T_ic.npy/S_ic.npy (PHC IC); else interpolate live.")
     ap.add_argument("--year", type=int, default=1958, help="JRA55 forcing year (Kokkos used 1958).")
+    ap.add_argument("--out-zarr", default=None,
+                    help="if set, write the final State to this Zarr store — each GPU writes its "
+                         "own shard in parallel (no gather), the scaling output path for NG5.")
     # component toggles (default on under --full) — to DECOMPOSE the per-step cost
     ap.add_argument("--ice", type=int, default=1)
     ap.add_argument("--kpp", type=int, default=1)
@@ -163,14 +166,27 @@ def main():
         comp = time.perf_counter() - tc
         t0 = time.perf_counter()
         jax.block_until_ready(jfn(*jargs))        # 2nd call: reuse executable → pure run
-        return time.perf_counter() - t0, comp
+        return time.perf_counter() - t0, comp, jfn, jargs
 
     # ONE compile per config (the full-model XLA compile is minutes — the subtraction method's
     # 2nd compile doesn't fit the QOS window). per_step = warm run / N (compile excluded by the
     # 2nd-call timing); the single is_first step is ~1/N ≈ 4% at N=25, within ±10% node noise.
-    t_N, compile_s = warm_time(args.steps)
+    t_N, compile_s, jfn, jargs = warm_time(args.steps)
     per_step = t_N / args.steps
     per_step_ms = per_step * 1e3
+
+    # Optional gather-free output: each GPU writes its own shard of the FOLDED final State to
+    # Zarr in parallel (the NG5 scaling output path — no global gather to rank 0). jfn(*jargs)
+    # returns the folded [P*Lmax, …] sharded State; write_state_zarr writes addressable shards.
+    if args.out_zarr:
+        from fesom_jax import zarr_output
+        out_state = jfn(*jargs)
+        jax.block_until_ready(out_state)
+        zarr_output.write_state_zarr(args.out_zarr, out_state, sm, part,
+                                     attrs={"mesh": args.name, "dt": float(DT), "steps": int(args.steps)})
+        if proc0:
+            print(f"[bench] wrote sharded Zarr output → {args.out_zarr}  "
+                  f"(peak_gpu={_gpu_peak_gb():.2f} GiB)", flush=True)
     tput = mesh.nod2D * mesh.nl / per_step / 1e6   # M node-levels / s
     tag = "ragged" if use_ragged else "allgather"
     if args.full:
