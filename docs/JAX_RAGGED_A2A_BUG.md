@@ -99,25 +99,43 @@ the composition, which depends on the field/weights — not a clean O(npes) law.
 
 ---
 
-## Draft upstream bug report (isolation DONE — confirmed bare-primitive; ready to file)
+## Self-contained, filing-ready repro (VERIFIED on 2×A100, job 25456662)
 
-> **Title:** `lax.ragged_all_to_all` reverse-mode autodiff transpose produces an incorrect gradient (error
-> grows with device/axis size)
+`scripts/ragged_a2a_transpose_bug.py` — **jax + numpy only**, built on JAX's OWN `ragged_all_to_all`
+docstring example (axis size 2). Output:
+
+```
+(1) forward             : [[1,3,0,0],[2,2,4,0]]   == docstring        -> OK
+(2) transpose f^T(ones) : [[2,2,2],[2,2,0]]
+    expected (by hand)  : [[1,1,1],[1,1,0]]                            -> WRONG
+(3) adjoint identity    : <f(x),y>=+1.6176  <x,f^T(y)>=+2.3548  rel|Δ|=0.313  -> VIOLATED
+```
+
+**Key observation:** `fᵀ(ones)` is **exactly `axis_size`× the correct value** (2× at 2 devices; the unsent
+`operand[2]` stays 0). The correct `fᵀ(ones)[i]` = "#output positions operand[i] lands in" = 1 for every sent
+element (each is routed exactly once). So the transpose **accumulates each cotangent ~`axis_size` times** — an
+over-count across the device axis. (On random `y` the error is 31%, not a uniform 2×, so it's a mis-route that
+adds spurious cross-terms, not a pure scalar factor — i.e. the fix is in the routing, not a `/axis_size`.)
+
+## Draft upstream bug report (ready to file)
+
+> **Title:** `lax.ragged_all_to_all`: reverse-mode autodiff transpose is incorrect (gradient over-counts by
+> ~axis_size); forward is correct
 >
-> **Repro:** (the self-contained version of `scripts/ragged_a2a_adjoint_repro.py` — adapt the `ragged_all_to_all`
-> docstring's size-2 example, wrap in `shard_map`, check the adjoint identity `⟨f(x),y⟩ == ⟨x, fᵀ(y)⟩`). GPU/TPU
-> required (`ragged_all_to_all` is unimplemented on XLA:CPU).
+> **Repro:** `scripts/ragged_a2a_transpose_bug.py` (≈60 lines, jax+numpy only) — JAX's own `ragged_all_to_all`
+> docstring example (axis size 2) wrapped in `shard_map`. Checks: (1) forward == documented result; (2) the
+> transpose of an all-ones cotangent vs the hand-derived gradient; (3) the adjoint identity `⟨f(x),y⟩ ==
+> ⟨x, fᵀ(y)⟩`. **GPU/TPU required** (`ragged_all_to_all` is unimplemented on XLA:CPU).
 >
-> **Expected:** the adjoint identity holds to floating-point tolerance (the op is linear).
+> **Expected:** forward = `[[1,3,0,0],[2,2,4,0]]` (✓); `fᵀ(ones) = [[1,1,1],[1,1,0]]`; adjoint identity holds.
 >
-> **Actual:** it fails; the discrepancy grows with the number of devices (we saw `max|Δ| ≈ 4.3 @ 2 dev → 8.0
-> @ 4 dev` in a downstream use). Forward is correct.
+> **Actual (JAX 0.10.1, 2×A100, x64):** forward correct, but `fᵀ(ones) = [[2,2,2],[2,2,0]]` (exactly 2× =
+> axis_size) and the adjoint identity is violated (rel|Δ| = 0.31). Downstream (a halo exchange) this corrupts
+> `jax.grad` silently.
 >
-> **Env:** JAX 0.10.1, A100 + NCCL, `jax_enable_x64=True`.
->
-> **Note:** `_ragged_all_to_all_transpose` (quoted above) builds a reverse `ragged_all_to_all`; the failure is
-> likely in the `all_to_all(offsets, tiled=True)` sync and/or the `cumsum` mask for general (non-trivial,
-> possibly multi-neighbour or unsorted) offset patterns — happy to help narrow it down.
+> **Likely locus:** `_ragged_all_to_all_transpose` in `jax/_src/lax/parallel.py` builds a reverse
+> `ragged_all_to_all` (good shape) but the `all_to_all(input_offsets/output_offsets, tiled=True)` sync and/or
+> the `cumsum` mask appear to route each cotangent to ~axis_size destinations instead of one. Happy to help.
 
 ---
 
