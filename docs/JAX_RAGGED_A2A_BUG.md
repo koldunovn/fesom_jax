@@ -13,10 +13,11 @@ workaround we use. **Created 2026-06-09** (Phase 8b B.0c findings + a fresh upst
    not supported by XLA:CPU ThunkEmitter` (job 25438390). It runs only on **GPU (NCCL)** / TPU. So all ragged
    validation + scaling is GPU-only; the CPU correctness gates use `all_gather`. (Guards: `bench_forward_scaling.py`
    `SKIP ragged on CPU`; `tests/test_halo.py` platform skip.)
-2. **Its reverse-mode autodiff (transpose) gives the WRONG gradient** — measured on A100 (B.0c): the halo
-   exchange built on it has a **byte-exact forward** (== `all_gather`) but a gradient that **mis-matches and
-   scales with device count** (`max|Δ| ≈ 4.3 @ npes2 → 8.0 @ npes4`). The `all_gather` halo's gradient is
-   correct (the AD oracle). **⚠️ Not yet isolated to the bare primitive — see "What is / isn't confirmed".**
+2. **Its reverse-mode autodiff (transpose) gives the WRONG gradient — CONFIRMED in the bare primitive.** The
+   **bare** `lax.ragged_all_to_all` violates the adjoint identity `⟨f(x),y⟩==⟨x,fᵀ(y)⟩` by **O(1) relative
+   error** (sign-flipped at npes=2), with valid offsets and a byte-exact forward (isolation job 25454884,
+   A100). So it is **JAX's `ragged_all_to_all` transpose**, not our composition. The `all_gather` halo's
+   gradient is correct (the AD oracle).
 3. **Version:** JAX **0.10.1 is the latest** (changelog, 2026-05-20) — no newer version to upgrade to, and the
    changelog never mentions `ragged_all_to_all`. No version escape hatch.
 4. **Upstream awareness:** a GitHub-issues + changelog search found **no report** specific to the
@@ -77,23 +78,28 @@ def _ragged_all_to_all_transpose(
 
 ---
 
-## What IS and ISN'T confirmed (the isolation gap)
+## CONFIRMED: it's JAX's bare-primitive transpose (isolation run 2026-06-09, job 25454884, A100)
 
-- **Confirmed:** our ragged *halo-exchange composition* has a wrong gradient on GPU (forward exact). Real, reproducible.
-- **NOT confirmed:** that the bug is in JAX's `_ragged_all_to_all_transpose` itself vs. in *our* composition /
-  offset maps (`send_offsets`, `out_offsets = recv_offsets.T`, `recv_sizes`, the gather/scatter index arrays)
-  interacting with an assumption the transpose makes (e.g. that `output_offsets` are sorted/non-overlapping for
-  the `cumsum` mask, or the `all_to_all(offsets, tiled=True)` sync).
-- **The decisive test:** the **bare-primitive adjoint identity** — for the linear map
-  `f = shard_map(lax.ragged_all_to_all)`, check `⟨f(x), y⟩ == ⟨x, fᵀ(y)⟩` (`fᵀ = jax.linear_transpose(f, x)`),
-  with NO gather/scatter/where around it. If it fails → **JAX bug, file it**. If it holds → the bug is in our
-  composition/offsets, fix on our side. Repro: `scripts/ragged_a2a_adjoint_repro.{py,sbatch}` (GPU-only).
+The bare-primitive adjoint identity `⟨f(x), y⟩ == ⟨x, fᵀ(y)⟩` for `f = shard_map(lax.ragged_all_to_all)`
+(NO gather/scatter/where around it, valid multi-neighbour offsets, forward byte-exact) **FAILS**:
 
-**Run this before filing an upstream bug.** It's a small (2–4 GPU) job and decides whether the report is real.
+```
+npes=2:  <f(x),y> = -1.157977e+02   <x,fT(y)> = +6.826251e+01   rel|Δ| = 1.589   (sign-flipped!)
+npes=4:  <f(x),y> = -2.930010e+02   <x,fT(y)> = -5.021581e+02   rel|Δ| = 0.417
+```
+
+For a linear op the identity must hold to float tolerance; instead it's **O(1) relative error**. So the bug is
+**definitively in JAX's `ragged_all_to_all` transpose**, NOT in our composition or offset maps. (The full
+composition's adjoint also fails — rel|Δ| 0.12 @ npes2, 0.26 @ npes4 — consistent: it inherits the bare bug.)
+Repro: `scripts/ragged_a2a_adjoint_repro.{py,sbatch}` (GPU-only). **The upstream report is now justified.**
+
+⚠️ Note the error does NOT scale cleanly with npes (1.589 @ 2 vs 0.417 @ 4) — it's just *wrong* (O(1)),
+magnitude varying with the random data. (The earlier "grows with device count" was the absolute grad-diff in
+the composition, which depends on the field/weights — not a clean O(npes) law.)
 
 ---
 
-## Draft upstream bug report (file AFTER the isolation repro confirms it's the bare primitive)
+## Draft upstream bug report (isolation DONE — confirmed bare-primitive; ready to file)
 
 > **Title:** `lax.ragged_all_to_all` reverse-mode autodiff transpose produces an incorrect gradient (error
 > grows with device/axis size)
@@ -115,13 +121,17 @@ def _ragged_all_to_all_transpose(
 
 ---
 
-## Can we suggest a fix to JAX? (honest assessment)
+## Can we suggest a fix to JAX? (honest assessment, post-isolation)
 
-- **To JAX's transpose rule: not from inspection alone — that would be guessing.** The rule already does the
-  role-swap a correct transpose needs; the bug (if it's here) is in the *details* (offset `all_to_all` / mask)
-  for general offset patterns. Pinpointing it needs the isolation repro + reducing our offsets to a minimal
-  failing case. We ARE well-placed to do that (we understand the offset semantics deeply — see B.0a/B.0b), so
-  it's "a bit more work", not "too much": run the repro → minimize → then a precise fix or a precise report.
+- **To JAX's transpose rule: a DIRECTION, not yet a one-line fix.** Now that it's isolated to the bare
+  primitive, the rule's structure (reverse `ragged_all_to_all` with role-swap) is right, so the defect is in
+  the **offset handling for general offset patterns** — the prime suspects are `all_to_all(output_offsets,
+  tiled=True)` / `all_to_all(input_offsets, tiled=True)` (do they correctly invert the forward's "offsets are
+  in the receiver's frame" convention for multi-neighbour sends?) and/or the `cumsum` mask if `output_offsets`
+  aren't contiguous/sorted. Pinning the exact line needs minimizing our multi-neighbour offsets to the
+  smallest failing case (≈ a day's work; we know the offset semantics from B.0a/B.0b). So: **suggesting the
+  precise patch is "a bit more work, not too much"** — but the credible bug report (adjoint-identity failure +
+  this suspect list) we can file now.
 - **On our side: yes, a clear fix — `jax.custom_vjp` (B.0d).** Wrap `halo_exchange_ragged`; for the backward,
   reuse the **proven `all_gather` exchange's VJP** (correct on every meaningful lane; backward stays
   O(P·N_local), but the forward — the scaling-critical path — stays ragged). Optional fully-scaling variant:
