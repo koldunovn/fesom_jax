@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.24",
     "scipy>=1.10",       # host-side SSH stiffness assembly (ssh.build_ssh_operator)
     "netCDF4>=1.6",      # NetCDF-4 PHC/JRA55/SSS readers (Phase 5)
+    "zarr>=2.17,<3",     # sharded gather-free model output (fesom_jax.zarr_output, Phase 8b)
 ]
 
 [project.optional-dependencies]
@@ -20,6 +21,7 @@ dependencies = [
 # needed on Levante). Install with:  pip install -e ".[cuda,dev]"
 cuda = ["jax[cuda12]>=0.4.34"]
 dev = ["pytest>=8"]
+viz = ["matplotlib>=3.7"]   # scaling/SYPD plots (scripts/plot_sypd.py)
 
 [tool.setuptools.packages.find]
 include = ["fesom_jax*"]
