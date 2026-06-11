@@ -671,6 +671,30 @@ written to the namelist, in Fortran; the perfect-model twin recovers the injecte
 - Validate on a large mesh (`farc`, ~638K nodes).
 - **GATE 8:** distributed run climate-close to single-device AND gradient-correct.
 
+### Phase 9 — Physics options: zstar / TKE / mEVP (sub-plans, added 2026-06-11)
+
+The C port (now at `port2/fesom2_port_zstar`, branch `mevp`) landed three new validated options —
+**zstar** (`FESOM_ALE=zstar`; the user's "zlevel" — zlevel proper is NOT in the C, aborts),
+**CVMix classical TKE** (`FESOM_MIX_SCHEME=TKE`), and **mEVP** (`FESOM_WHICH_EVP=1`; aEVP=2 NOT in
+the C, aborts). Port all three to JAX, **each differentiable**, each behind a static cfg seam with
+the `None/0 ⇒ bit-identical` guarantee, each gated against its own C dump oracle on
+`/work/ab0995/a270088/port/{zstar,tke,mevp}`:
+
+- **9a — zstar vertical coordinate:** `docs/plans/20260611-fesom-jax-zstar.md` (the invasive one:
+  live geometry, forcing flip incl. the rsf producer, state-dependent SSH stiffness via
+  `custom_linear_solve`, shchepetkin PGF).
+- **9b — TKE mixing:** `docs/plans/20260611-fesom-jax-tke.md` (**the primary hybrid-ML seam** — a
+  prognostic `State.tke` field; trainable `c_k/c_eps/cd/alpha_tke` in `Params` from day one;
+  replay-primary validation).
+- **9c — mEVP rheology:** `docs/plans/20260611-fesom-jax-mevp.md` (contained `ice_evp.py` variant;
+  the C's 14-trap fidelity checklist is the core risk).
+
+Recommended order 9a→9b→9c (mirrors the C; geometry seam first), but the plans are **independent** —
+TKE was C-validated under linfs, mEVP composes with either coordinate. **GATE 9 (per sub-plan):**
+forward dump-fidelity + 10-day stability + year-scale vs the C reference + gradient gates
+(masked-NaN clean, FD↔AD plateaus). Phase 9 does NOT depend on the Phase-8b B.3 data-loading
+rewrite (all gates single-device or CPU-fake-device sharded) — the two tracks stay parallel.
+
 ---
 
 ### Task N−1: Verify acceptance criteria (per phase)
@@ -1125,3 +1149,16 @@ written to the namelist, in Fortran; the perfect-model twin recovers the injecte
   `EPSLN=1e-40` denominators) → AD-safe by construction (safe-sqrt, `stop_gradient` the index,
   meaningful floors) + a masked-NaN gradient gate. 11-task ladder K.0–K.11. Handoff in
   `docs/NEXT_SESSION_PROMPT.md`.
+- **2026-06-11 — Phase 9 (physics options: zstar / TKE / mEVP) added; three sub-plans written.**
+  The C port landed three new validated options in `port2/fesom2_port_zstar` (branch `mevp`, three
+  completed C plans with full revision logs — mined via a 4-agent digest). Naming corrections vs the
+  request: the C implements **zstar** (zlevel aborts — no reference) and **mEVP** (aEVP aborts) —
+  scope follows the C ("match the C, not the parent outline"). Structure decision: **three separate
+  plans** (house precedent in both repos; features code-decoupled; per-feature gates/oracles;
+  failure isolation), order 9a zstar → 9b TKE → 9c mEVP recommended, hard dependencies none. Shared
+  infra (the gid-keyed `read_gid_table` reader generalization) lives in whichever runs first. All
+  three differentiable by contract: per-plan AD-safety sections + gradient gates; TKE is the primary
+  ML seam (prognostic `State.tke`, trainable constants in `Params` day-one). Oracles verified intact
+  on `/work/ab0995/a270088/port/{zstar,tke,mevp}` (C+Fortran dump sets, TKE replay set, C 2yr/5yr
+  climate runs incl. the zstar+TKE matrix). Plans:
+  `20260611-fesom-jax-{zstar,tke,mevp}.md`.
