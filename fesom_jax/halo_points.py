@@ -77,6 +77,11 @@ OCEAN_SCHEDULE: tuple[Exch, ...] = (
     Exch("11 ssh.compute_hbar", "ssh_rhs_old", "nod", "post", "compute_hbar (oce_ale.F90:2078)"),
     Exch("11 ssh.compute_hbar", "hbar",        "nod", "post", "compute_hbar (oce_ale.F90:2102)"),
     Exch("13 ale.compute_w", "w", "nod", "post", "ALE vert_vel (oce_ale.F90:2679)"),
+    # zstar-only (Phase 9a, JZ.4): the C's exchange_nod(hnode_new) at vert_vel end
+    # (oce_ale.F90:2871 / fesom_ale.c:157) — its halo feeds the Z1 commit. linfs ⇒ no-op
+    # (hnode_new is the static hoist; the _exch is gated under ale_cfg in step.py).
+    Exch("13 ale.vert_vel_zstar_distribute", "hnode_new", "nod", "post",
+         "zstar-only exchange_nod(hnode_new) (oce_ale.F90:2871)"),
     Exch("13 ale.compute_cfl_z", "cfl_z", "nod", "post", "ALE compute_cflz row"),
     Exch("13 ale.compute_wvel_split", "w_e", "nod", "post", "ALE wvel_split row"),
     Exch("13 ale.compute_wvel_split", "w_i", "nod", "post", "ALE wvel_split row"),

@@ -1,24 +1,34 @@
 """PHC3.0 initial-condition reader (Task 5.2) — a faithful **numpy** port of
 ``fesom_phc.c`` (``load_one_variable`` + ``extrap_nod3D`` + ``insitu2pot``) for the
-single-rank, no-cavity case (npes=1, ``ulevels_nod2D==1``).
+no-cavity case (``ulevels_nod2D==1``), bit-exact in both the serial (npes=1) and the
+partition-faithful (``rank_nodes=…``) extrapolation orders.
 
 The IC is a **one-time, host-side, non-differentiable setup** computation (it is *not*
 in the autodiff path); the produced ``T``/``S`` fields are the model's initial state and
 are a valid gradient target. We mirror the C bit-for-bit so the JAX CORE2 run starts from
-the exact C initial condition (verified against the C ``phc_dump_*`` surface dumps).
+the exact C initial condition (verified against the C ``phc_dump_*`` surface dumps —
+byte-equal, ``test_phc_ic.py``).
 
 Pipeline (``fesom_phc.c:387`` ``fesom_phc_load_ic``):
   1. read PHC ``temp``/``salt`` ``(depth,lat,lon)`` + coords; cyclic-pad lon by ±1 column.
   2. per-node bilinear bracket (``binarysearch_d`` on geographic node coords).
   3. ``load_one_variable``: bilinear-horizontal + linear-vertical interp onto ``mesh.Z``,
-     leaving ``PHC_DUMMY`` where land/below-deepest-PHC.
+     leaving ``PHC_DUMMY`` where land/below-deepest-PHC. FP association mirrors the C
+     exactly (``((v·wx)·wy)``, ``fesom_phc.c:215-218``) — bit-equality, not ~1e-14.
   4. ``extrap_nod3D``: per-layer **sequential Gauss-Seidel** land fill (order-dependent —
      replicated exactly) + a top→down vertical fill.
   5. cleanup (dummy→0, below ``nlevels``→0, K→°C) and ``insitu2pot`` (Bryden-1973 ptheta).
 
 ⚠️ The GS extrapolation is order-dependent: each dummy node is filled once, with the mean
 of its neighbours valid *at fill time*. A vectorized Jacobi would give different values, so
-we walk dummy nodes in ascending index order, updating in place (``fesom_phc.c:318-342``).
+we walk dummy nodes in fill order, updating in place (``fesom_phc.c:318-342``).
+
+⚠️⚠️ Order-dependence ⇒ **the C IC is PARTITION-DEPENDENT**: under MPI each rank sweeps
+only its OWN nodes (local ``myList_nod2D`` order) with halo values frozen between
+``exchange_nod`` calls, so a 1-rank and a 16-rank C run differ at GS-filled nodes by up to
+~25 PSU (Baltic/Kara basins seeded from different fill fronts). To match a C dump oracle
+bit-for-bit, build the IC with that run's partition (``rank_nodes`` →
+:func:`_extrap_nod3D_mpi`; ``scripts/rebuild_ic_dist16.py`` for the dist_16 z2_cdump).
 """
 
 from __future__ import annotations
@@ -132,9 +142,12 @@ def _load_one_variable(ncvar, geo_deg, Z, nlevels_nod2D, node_layer_mask,
     x1 = nc_lon[ic]; x2 = nc_lon[ip1]
     y1 = nc_lat[jc]; y2 = nc_lat[jp1]
     denom = (x2 - x1) * (y2 - y1)
-    wx2 = (x2 - x); wx1 = (x - x1); wy2 = (y2 - y); wy1 = (y - y1)
-    data1d = (v00 * (wx2 * wy2)[:, None] + v10 * (wx1 * wy2)[:, None]
-              + v01 * (wx2 * wy1)[:, None] + v11 * (wx1 * wy1)[:, None]) / denom[:, None]
+    wx2 = (x2 - x)[:, None]; wx1 = (x - x1)[:, None]
+    wy2 = (y2 - y)[:, None]; wy1 = (y - y1)[:, None]
+    # C association order (fesom_phc.c:215-218): ((v·wx)·wy) summed left-to-right —
+    # grouping wx·wy first differs by ~1 ulp at ~27k nodes (vs the C 16r dump).
+    data1d = ((v00 * wx2) * wy2 + (v10 * wx1) * wy2
+              + (v01 * wx2) * wy1 + (v11 * wx1) * wy1) / denom[:, None]
     # per-depth: if any corner dummy at depth k → data1d[:,k]=DUMMY (fesom_phc.c:219).
     corner_dummy = ((v00 > _DUMMY_HI) | (v10 > _DUMMY_HI)
                     | (v01 > _DUMMY_HI) | (v11 > _DUMMY_HI))
@@ -214,6 +227,77 @@ def _extrap_nod3D(arr, nlevels_nod2D, nlevels_elem, off, flat, elem_nodes):
                 col[nz] = col[nz - 1]
 
 
+def _extrap_nod3D_mpi(arr, nlevels_nod2D, nlevels_elem, off, flat, elem_nodes,
+                      rank_nodes):
+    """Port of ``extrap_nod3D`` (``fesom_phc.c:264``) under an ``npes>1`` partition.
+
+    The GS land fill is order-dependent, so the C IC is **partition-dependent**: each
+    rank sweeps only its OWN nodes in LOCAL index order, halo values are frozen at the
+    last ``exchange_nod`` (once per outer iteration, ``fesom_phc.c:348``), and the outer
+    loop continues only while the **surface** layer still has dummies anywhere
+    (``fesom_phc.c:299-309``) — deep layers whose cross-rank propagation is unfinished
+    when the surface converges are left to the vertical fill. ``rank_nodes`` is a list
+    of per-rank 0-based global node indices in the C local order (``myList_nod2D``).
+
+    Simulation of the concurrent ranks: all ranks of one outer iteration read the same
+    snapshot (the post-exchange state); owned results merge into ``arr`` afterwards.
+    ``arr`` is ``[N, nl]``, modified in place."""
+    N, nl = arr.shape
+    rank_nodes = [np.asarray(rn, dtype=np.int64) for rn in rank_nodes]
+    it_outer = 0
+    while it_outer < 200:
+        it_outer += 1
+        if arr[:, 0].max() <= _DUMMY_HI:
+            break
+        snapshot = arr.copy()
+        any_progress = False
+        for nz in range(nl - 1):
+            col_snap = snapshot[:, nz]
+            has_layer = (nlevels_nod2D - 1) > nz
+            for own in rank_nodes:
+                cand = own[(col_snap[own] > _DUMMY_HI) & has_layer[own]]
+                if cand.size == 0:
+                    continue
+                work = col_snap.copy()      # owned live, halo frozen at snapshot
+                active = cand.tolist()      # C local order
+                progress = True
+                sweep = 0
+                while progress and sweep < 200:
+                    progress = False
+                    sweep += 1
+                    still = []
+                    for n in active:
+                        val = 0.0
+                        cnt = 0
+                        for kk in range(off[n], off[n + 1]):
+                            el = flat[kk]
+                            if nz > nlevels_elem[el] - 1:
+                                continue
+                            for jv in range(3):
+                                v = elem_nodes[el, jv]
+                                if work[v] <= _DUMMY_HI and (nlevels_nod2D[v] - 1) > nz:
+                                    val += work[v]
+                                    cnt += 1
+                        if cnt > 0:
+                            work[n] = val / cnt
+                            progress = True
+                            any_progress = True
+                        else:
+                            still.append(n)
+                    active = still
+                arr[own, nz] = work[own]
+        if not any_progress:
+            break   # sim-only shortcut: a stalled iteration can never change the output
+
+    # Vertical fill — top→down within each node's valid range (fesom_phc.c:361-369).
+    for n in range(N):
+        nl1 = nlevels_nod2D[n] - 1
+        col = arr[n]
+        for nz in range(1, nl1):
+            if col[nz] > _DUMMY_HI:
+                col[nz] = col[nz - 1]
+
+
 # --------------------------------------------------------------------------
 # Top-level
 # --------------------------------------------------------------------------
@@ -227,10 +311,16 @@ class PHCResult:
     S_pre_surf: np.ndarray
 
 
-def load_phc_ic(mesh, path: str = DEFAULT_PHC_PATH, t_insitu: bool = True) -> PHCResult:
-    """Build the PHC initial condition on ``mesh`` (npes=1). Returns :class:`PHCResult`
+def load_phc_ic(mesh, path: str = DEFAULT_PHC_PATH, t_insitu: bool = True,
+                rank_nodes=None) -> PHCResult:
+    """Build the PHC initial condition on ``mesh``. Returns :class:`PHCResult`
     with the final potential-T / S ``[N, nl]`` and the pre-extrap surface + bracket
-    indices (for verifying against the C ``phc_dump_*`` surface dumps)."""
+    indices (for verifying against the C ``phc_dump_*`` surface dumps).
+
+    ``rank_nodes`` (list of per-rank 0-based node-index arrays in C local order)
+    selects the partition-faithful MPI extrapolation — the GS land fill is
+    order-dependent, so matching a C oracle run bit-for-bit requires its partition
+    (e.g. dist_16 for the 16-rank ``z2_cdump``). ``None`` = serial (npes=1) order."""
     nl = int(mesh.nl)
     Z = np.asarray(mesh.Z, dtype=np.float64)
     geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64)
@@ -293,8 +383,12 @@ def load_phc_ic(mesh, path: str = DEFAULT_PHC_PATH, t_insitu: bool = True) -> PH
     T_pre_surf = T[:, 0].copy()
     S_pre_surf = S[:, 0].copy()
 
-    _extrap_nod3D(T, nlevels_nod2D, nlevels_elem, off, flat, elem_nodes)
-    _extrap_nod3D(S, nlevels_nod2D, nlevels_elem, off, flat, elem_nodes)
+    if rank_nodes is None:
+        _extrap_nod3D(T, nlevels_nod2D, nlevels_elem, off, flat, elem_nodes)
+        _extrap_nod3D(S, nlevels_nod2D, nlevels_elem, off, flat, elem_nodes)
+    else:
+        _extrap_nod3D_mpi(T, nlevels_nod2D, nlevels_elem, off, flat, elem_nodes, rank_nodes)
+        _extrap_nod3D_mpi(S, nlevels_nod2D, nlevels_elem, off, flat, elem_nodes, rank_nodes)
 
     # Cleanup (fesom_phc.c:528-540): dummy→0, below nlevels→0, K→°C.
     for arr in (T, S):
@@ -319,10 +413,11 @@ def load_phc_ic(mesh, path: str = DEFAULT_PHC_PATH, t_insitu: bool = True) -> PH
 
 
 def build_and_cache_ic(mesh, path: str = DEFAULT_PHC_PATH,
-                       out_dir: str | Path = DEFAULT_IC_DIR) -> PHCResult:
+                       out_dir: str | Path = DEFAULT_IC_DIR,
+                       rank_nodes=None) -> PHCResult:
     """Build the PHC IC on ``mesh`` and cache ``T_ic.npy``/``S_ic.npy`` to ``out_dir``
     (one-time; ``out_dir`` is gitignored under ``data/``)."""
-    res = load_phc_ic(mesh, path)
+    res = load_phc_ic(mesh, path, rank_nodes=rank_nodes)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "T_ic.npy", res.T)

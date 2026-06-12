@@ -45,6 +45,7 @@ class IceStepOut(NamedTuple):
     water_flux: jnp.ndarray
     virtual_salt: jnp.ndarray
     relax_salt: jnp.ndarray
+    real_salt_flux: jnp.ndarray     # zstar real-salt producer [PSU·m/s] (0 under linfs)
     # updated prognostic ice state (to thread into State)
     a_ice: jnp.ndarray
     m_ice: jnp.ndarray
@@ -58,12 +59,17 @@ class IceStepOut(NamedTuple):
 
 
 def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
-                     dt: float, boundary_node=None,
+                     dt: float, boundary_node=None, use_virt_salt: bool = True,
                      owned_mask=None, axis_name=None, exch=None) -> IceStepOut:
     """One assembled ice step → the surface fluxes + the new ice state. ``sf`` is this step's
     :class:`core2_forcing.StepForcing` (atmosphere + month SSS/chl); ``fs`` the
     :class:`core2_forcing.ForcingStatic` (runoff/areas/open_water). ``boundary_node`` (the
-    coastal mask) is precomputed once if given, else derived from ``mesh``."""
+    coastal mask) is precomputed once if given, else derived from ``mesh``.
+
+    ``use_virt_salt`` (static; ``True`` for linfs, ``False`` for zstar = ``ale_cfg`` present):
+    selects the freshwater/salt path — the thermo real-salt split + the ``real_salt_flux``
+    producer, the global water-flux balancing, ``virtual_salt≡0``, and the ``bc_S`` real-salt
+    term. ``True`` ⇒ byte-identical to the pre-Phase-9 ice step."""
     # ⚠️ The ice timestep MUST track the ocean dt (C ``fesom_ice_setup``: ``ice_dt =
     # ice_ave_steps*dt``, fesom_ice.c:231). ``IceConfig.ice_dt`` is only a build-time default
     # (500 s) — if the run's ocean dt differs (e.g. the dt=1800 climate run) and ice_dt is left
@@ -102,7 +108,8 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         srfoce_u=srf.u, srfoce_v=srf.v,
         fsh=sf.shortwave, flo=sf.longwave, Tair=sf.Tair, qa=sf.shum,
         u_wind=sf.u_air, v_wind=sf.v_air, rain=sf.prec_rain, snow=sf.prec_snow,
-        runo=fs.runoff_node, ch=bulk.ch, ce=bulk.ce, geo_lat=geo_lat, non_cavity=open_water)
+        runo=fs.runoff_node, ch=bulk.ch, ce=bulk.ce, geo_lat=geo_lat,
+        non_cavity=open_water, use_virt_salt=use_virt_salt)
 
     # Refresh the prognostic ice TRACER halos RIGHT AFTER thermo — BEFORE they are consumed
     # (the FCT scatter→cut_off→thermo chain leaves them incomplete on the halo). ⚠️ This must
@@ -121,7 +128,20 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     icef = ice_coupling.ice_oce_fluxes(
         srf.salt, th.flx_fw, th.flx_h, sf.Ssurf_month, fs.runoff_node,
         fs.areasvol_surf, fs.ocean_area, open_water,
-        owned_mask=owned_mask, axis_name=axis_name)
+        owned_mask=owned_mask, axis_name=axis_name,
+        use_virt_salt=use_virt_salt, real_salt_flux=th.real_salt_flux)
+
+    # zstar (Phase 9a): the global freshwater-flux balancing on water_flux (the C's
+    # !use_virt_salt block, fesom_ice_coupling.c:193-216). a_ice_old = the PREVIOUS step's
+    # concentration (state.a_ice, since the ice step runs at the start). Under linfs this is
+    # skipped (dead branch ⇒ byte-identical).
+    water_flux = icef.water_flux
+    if not use_virt_salt:
+        water_flux = ice_coupling.fresh_water_balance_zstar(
+            water_flux, th.evaporation, th.ice_sublimation, sf.prec_rain, sf.prec_snow,
+            state.a_ice, fs.runoff_node, th.thdgr, th.thdgrsn,
+            fs.areasvol_surf, fs.ocean_area, cfg,
+            owned_mask=owned_mask, axis_name=axis_name)
 
     # --- oce_fluxes_mom: ice-ocean stress blend (prognostic a_ice/u_ice; halo-complete a_ice) ---
     stress_surf, stress_node_surf = ice_coupling.ice_oce_fluxes_mom(
@@ -132,15 +152,21 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     heat_flux, sw_3d = _forcing.cal_shortwave_rad(
         mesh, icef.heat_flux, sf.shortwave, sf.chl, pene_open)
 
-    # --- surface BCs (linfs) ---
+    # --- surface BCs (fesom_tracer_diff.c:43-75 / bc_surface). bc_T's base; the zstar
+    #     −dt·sval·water_flux·is_nonlinfs term needs the POST-ADVECTION surface T (the C's
+    #     sval = trarr[surface] at the diffusion), so it is added in step.py before
+    #     impl_vert_diff (NOT here). bc_S is fully resolved here: under zstar virtual_salt≡0
+    #     and the real_salt_flux term turns on (is_nonlinfs=1); linfs ⇒ rsf=0 ⇒ unchanged.
+    is_nonlinfs = 0.0 if use_virt_salt else 1.0
     bc_T = -dt * heat_flux / VCPW
-    bc_S = dt * (icef.virtual_salt + icef.relax_salt)
+    bc_S = dt * (icef.virtual_salt + icef.relax_salt + icef.real_salt_flux * is_nonlinfs)
 
     return IceStepOut(
         stress_surf=stress_surf, bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d,
         stress_node_surf=stress_node_surf,
-        heat_flux=heat_flux, water_flux=icef.water_flux,
+        heat_flux=heat_flux, water_flux=water_flux,
         virtual_salt=icef.virtual_salt, relax_salt=icef.relax_salt,
+        real_salt_flux=icef.real_salt_flux,
         a_ice=a_out, m_ice=m_out, m_snow=ms_out,
         u_ice=u_ice, v_ice=v_ice, t_skin=th.t_skin,
         sigma11=s11, sigma12=s12, sigma22=s22)

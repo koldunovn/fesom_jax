@@ -15,7 +15,9 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --hint=nomultithread
 #SBATCH --mem=200G
-#SBATCH --time=00:45:00
+# 01:05 — ocean ~19 min + ice ~2 min + sharding ~30 min (shard_map compiles) exceeds
+# the old 45-min cap (cancelled the sharding group mid-run); 65 min clears it with margin.
+#SBATCH --time=01:05:00
 #SBATCH -o /home/a/a270088/port_jax/scripts/run_suite.%j.out
 #SBATCH -e /home/a/a270088/port_jax/scripts/run_suite.%j.out
 

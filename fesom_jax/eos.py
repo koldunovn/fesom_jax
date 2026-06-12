@@ -98,17 +98,29 @@ def _shift_down(x):
     return jnp.concatenate([x[..., :1], x[..., :-1]], axis=-1)
 
 
-def pressure_bv(mesh: Mesh, T, S, hnode):
+def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None):
     """Raw (pre-smooth) ``density``, ``hpressure``, ``bvfreq`` columns.
 
     ``T``, ``S``, ``hnode`` are ``[nod2D, nl]`` (``hnode`` zero below bottom). The
     returned ``bvfreq`` still needs :func:`smooth_nod3D` to match the dump. Mirrors
     ``fesom_pressure_bv`` for ``nzmin = ulevels-1``, ``nzmax = nlevels-1``.
-    """
+
+    **zstar (Phase 9a, JZ.6).** ``Z3d`` (the live per-node mid-depths ``Z_3d_n``
+    ``[nod2D, nl]``) re-points the depth used by the in-situ density compressibility and
+    the N² layer spacing from the static column-uniform ``mesh.Z`` to the moving
+    coordinate. ``Z3d=None`` ⇒ the static path (byte-identical; live==static at cold
+    start). hpressure also uses the depth but is UNUSED under zstar (the shchepetkin PGF
+    takes density directly)."""
     g = G
     rho_ref = DENSITY_0
-    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])          # (nl,) pad invalid tail
-    z = Zp[None, :]                                       # (1, nl)
+    # depth z + the up-shifted Z[nz-1], both shaped (.,nl) — broadcast static or per-node live.
+    if Z3d is None:
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])      # (nl,) pad invalid tail
+        z = Zp[None, :]                                   # (1, nl)
+        Zd = _shift_down(Zp)[None, :]                     # (1, nl) Z[nz-1], edge-replicated
+    else:
+        z = jnp.asarray(Z3d)                              # (nod2D, nl) live mid-depths
+        Zd = _shift_down(z)                               # (nod2D, nl) Z[nz-1]
 
     b0, bpz, bpz2, rhopot = jm_components(T, S)           # each (nod2D, nl)
 
@@ -134,9 +146,8 @@ def pressure_bv(mesh: Mesh, T, S, hnode):
     # --- Brunt-Väisälä N² (interface field) ------------------------------------
     # ρ_up, ρ_dn evaluated at the SAME depth zmean (compressibility cancels):
     #   zmean[nz] = ½(Z[nz-1]+Z[nz]);  bv[nz] = -g/(Z[nz-1]-Z[nz])·(ρ_up-ρ_dn)/ρ0
-    Zd = _shift_down(Zp)                                  # Z[nz-1], edge-replicated
-    zmean = (0.5 * (Zd + Zp))[None, :]
-    zdiff = Zd - Zp
+    zmean = 0.5 * (Zd + z)                                # (.,nl)
+    zdiff = Zd - z
     # zdiff == 0 at BOTH unused interfaces — the surface (nz=0, edge-replicated) and
     # the bottom padding (Zp duplicates Z[-1] in its tail) — where 1/zdiff would be
     # inf. Both are clipped out of the forward bvfreq, but a forward inf still poisons
@@ -149,7 +160,7 @@ def pressure_bv(mesh: Mesh, T, S, hnode):
     bulk_dn = b0 + zmean * (bpz + zmean * bpz2)
     rho_up_n = bulk_up * _shift_down(rhopot) / (bulk_up + 0.1 * zmean * _STATE_EQ_INT)
     rho_dn_n = bulk_dn * rhopot / (bulk_dn + 0.1 * zmean * _STATE_EQ_INT)
-    bv = -g * (1.0 / zdiff[None, :]) * (rho_up_n - rho_dn_n) / rho_ref   # (nod2D,nl)
+    bv = -g * (1.0 / zdiff) * (rho_up_n - rho_dn_n) / rho_ref            # (nod2D,nl)
 
     # pad surface/bottom interfaces: bvfreq[nzmin]=bv[nzmin+1], bvfreq[nzmax]=bv[nzmax-1].
     # Equivalent to gathering bv at clip(nz, nzmin+1, nzmax-1) over the interface range.
@@ -206,11 +217,12 @@ def smooth_nod3D(mesh: Mesh, arr, n_smooth: int = 1, exch=None):
     return arr_s
 
 
-def compute_pressure_bv(mesh: Mesh, T, S, hnode, n_smooth: int = 1):
+def compute_pressure_bv(mesh: Mesh, T, S, hnode, n_smooth: int = 1, Z3d=None):
     """Driver mirror of ``fesom_step.c:77-92``: raw EOS/pressure/N² then the N²
     smoother. Returns ``(density, hpressure, bvfreq_smoothed)`` — the substep-1
-    dump fields, ready to compare."""
-    density, hpressure, bvfreq = pressure_bv(mesh, T, S, hnode)
+    dump fields, ready to compare. ``Z3d`` (zstar live mid-depths; ``None`` ⇒ static,
+    byte-identical) re-points the density/N² depth (JZ.6)."""
+    density, hpressure, bvfreq = pressure_bv(mesh, T, S, hnode, Z3d=Z3d)
     bvfreq = smooth_nod3D(mesh, bvfreq, n_smooth)
     return density, hpressure, bvfreq
 
@@ -222,21 +234,24 @@ def compute_pressure_bv(mesh: Mesh, T, S, hnode, n_smooth: int = 1):
 # for bit-for-bit agreement. Pure per-node MAP, no sqrt/divide ⇒ trivially AD-finite.
 
 
-def compute_sw_alpha_beta(mesh: Mesh, T, S):
+def compute_sw_alpha_beta(mesh: Mesh, T, S, Z3d=None):
     """Thermal-expansion (``sw_alpha``, 1/K) and saline-contraction (``sw_beta``,
     1/(g/kg)) coefficients per node/level — McDougall (1987), ``fesom_eos.c:323``.
 
-    ``T``, ``S`` are ``[nod2D, nl]``. Pressure proxy ``p1 = |Z[nz]|`` (the static
-    layer-midpoint depth, broadcast over nodes; linfs full-cell ⇒ ``Z_3d_n = Z``).
+    ``T``, ``S`` are ``[nod2D, nl]``. Pressure proxy ``p1 = |Z[nz]|``. ``Z3d=None`` ⇒
+    the static layer-midpoint depth (broadcast over nodes; linfs full-cell ⇒ byte-identical);
+    under zstar pass the live mid-depths ``Z_3d_n`` ``[nod2D, nl]`` (JZ.6 re-point).
     Returns ``(sw_alpha, sw_beta)``, both ``[nod2D, nl]``, masked to the layer
     range. Consumed by GM/Redi (:mod:`fesom_jax.gm`) and KPP (Phase 6C).
     """
     t1 = jnp.asarray(T) * 1.00024
     s1 = jnp.asarray(S)
-    # Z is the (nl-1,) layer-midpoint depth; pad the invalid tail to (nl,) like
-    # pressure_bv (the padded lane is masked out below). p1 = |Z[nz]| broadcast.
-    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
-    p1 = jnp.abs(Zp)[None, :]                             # (1, nl) pressure proxy |Z|
+    # pressure proxy p1 = |Z[nz]|: static (nl-1)→(nl)-padded broadcast, or live per-node.
+    if Z3d is None:
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
+        p1 = jnp.abs(Zp)[None, :]                         # (1, nl) static |Z|
+    else:
+        p1 = jnp.abs(jnp.asarray(Z3d))                    # (nod2D, nl) live |Z_3d_n|
 
     t1_2 = t1 * t1
     t1_3 = t1_2 * t1

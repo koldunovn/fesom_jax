@@ -208,82 +208,120 @@ Hazard inventory from the C digest, each with its JAX treatment:
 **Files:** Modify: `fesom_jax/ale.py` (AleConfig), `fesom_jax/step.py`, `fesom_jax/integrate.py`,
 `fesom_jax/integrate_sharded.py`, `fesom_jax/io_dump.py`. Create: `fesom_jax/tests/test_ale_zstar.py`.
 
-- [ ] `AleConfig` + thread `ale_cfg=None` through step/integrate/sharded + static_argnames
-- [ ] generalize `read_kpp_table` → shared `read_gid_table` + `ALE_TAGS` loader (12 tags × 3 steps)
-- [ ] audit `/work/ab0995/a270088/port/zstar/z2_cdump` tag completeness; regenerate via the documented
-      16r/3-step job if stale/incomplete (archive job script in `scripts/`)
-- [ ] tests: cfg-threading no-op (None ⇒ step output bit-identical), reader round-trip on all tags
-- [ ] full suite green
+- [x] `AleConfig` + thread `ale_cfg=None` through step/integrate/sharded + static_argnames
+- [x] generalize `read_kpp_table` → shared `read_gid_table` + `ALE_TAGS` loader (12 tags × 3 steps);
+      `load_ale_dump` merges 16 ranks by gid (nodes disjoint; elements bit-identical overlap)
+- [x] audit `z2_cdump`: **COMPLETE** — 12 tags × 3 steps × 16 ranks = 576 files, full feature set
+      (nod2D=126858, elem2D=244659, nl=48 = `mesh_core2`); NO regeneration needed
+- [x] tests: cfg-threading no-op (None vs `AleConfig()` ⇒ step bit-identical, max|Δ|=0), reader
+      round-trip on all tags (16 tests in `test_ale_zstar.py`)
+- [x] full suite green — **OCEAN 503 + ICE 47, 0 fail**; sharded `ale_cfg=None` byte-identical (the
+      sharded tests that ran all pass). ⚠️ The sharded-GRADIENT group is pre-existingly slow post-Phase-8b
+      (ragged halo); the Jun-8 baseline ran it green in 11:55, my runs time out — NOT a zstar regression
+      (verified: `ale_cfg=None` is an inert closure constant; Phase 8b rewrote the sharded path).
 
 ### JZ.1 — Thickness machinery: init + live geometry + commit
 
 **Files:** Modify: `fesom_jax/ale.py`, `fesom_jax/state.py` (rest-IC path only), `fesom_jax/tests/test_ale_zstar.py`.
 
-- [ ] `init_thickness_zstar` (`fesom_ale.c:45-146`): `hnode=(Δzbar)·(1+hbar/dd)`, helem mean, hnode_new=hnode;
-      ⚠️ init `eta_n = α·hbar_old + (1−α)·hbar` — **reversed weights vs per-step** (C lesson #7)
-- [ ] `live_geometry(mesh, hnode) → (zbar_3d_n, Z_3d_n)`: bottom→top reconstruction over
-      `nz ≤ min_f−2`, deeper interfaces keep nominal; below-bottom lanes = nominal spacing (AD rule)
-- [ ] commit under zstar: NO per-step `hnode_new=hnode` copy on the linfs pattern (C lesson #8 — the
-      C *skips* the linfs memcpy; our un-hoisted flow must match)
-- [ ] tests: cold-start degeneracy (zstar init ≡ linfs bit-for-bit at hbar=0 — the free Z1 gate);
-      `live_geometry(st.hnode)` ≡ static `zbar_3d_n`/`Z` under linfs (bitwise); ≤1-ulp helem note
-      (C lesson #13)
-- [ ] full suite green
+- [x] `init_thickness_zstar` (`fesom_ale.c:45-146`): whole-column `(Δzbar)·(1+(hbar/dd)·stretch)`
+      (no separate bottom field — full-cell ⇒ nominal), helem mean, eta_n reversed weights, ssh_rhs_old
+- [x] `live_geometry(mesh, hnode) → (zbar_3d_n, Z_3d_n)`: reverse-cumsum-from-anchor reconstruction over
+      `nz < min_f−2`; ⚠️ below-stretch/below-bottom lanes = nominal `zbar` (dz>0), NOT `mesh.zbar_3d_n`
+      (0-padded below bottom on ALL nodes ⇒ the inf factory)
+- [x] commit under zstar reuses `commit_thickness` (full-cell ⇒ bottom-helem agrees ≤1 ulp); the
+      un-hoist of `hnode_new` is JZ.6 (step-flow), noted there
+- [x] tests: cold-start degeneracy (zstar init ≡ linfs **exactly 0** at hbar=0 — the free Z1 gate);
+      `live_geometry` ≡ static `zbar_3d_n`/`Z` **bitwise on pi**; vs-numpy-ref for hbar≠0; AD finite (10 tests)
+- [x] full suite green (OCEAN 503 + ICE 47; `State.rest(ale_cfg=)` byte-identical, `test_state` green)
 
 ### JZ.2 — Forcing flip: rsf producer, water-flux composition, balancing, BCs
 
 **Files:** Modify: `fesom_jax/ice_thermo.py`, `fesom_jax/ice_step.py`, `fesom_jax/ice_coupling.py`,
 `fesom_jax/core2_forcing.py`, `fesom_jax/sss_runoff.py`. Create: tests in `test_ale_zstar.py`.
 
-- [ ] rsf producer in ice thermo (`fesom_ice_thermo.c:360-405,516-525`); SPLIT the existing combined
-      `evap` (`ice_thermo.py:135` bundles evaporation+sublimation) into `evaporation`/`ice_sublimation`,
-      surfaced via `IceStepOut`
-- [ ] verify the C `bc_surface` `sval` source (surface-T timing) and match it in the JAX `bc_T` build
-      (the JAX builds `bc_T` in the forcing step from start-of-step `T[:,0]` — confirm the C agrees)
-- [ ] water-flux ice-volume terms + **global net balancing** (`fesom_ice_coupling.c:178-216`), sums via
-      `reductions.global_sum` (sharded-correct)
-- [ ] `virtual_salt ≡ 0` under zstar; `bc_T`/`bc_S` per §0.7 — ⚠️ S has **+dt and NO sval·wf** (lesson #3)
-- [ ] tests: replay vs the `forcing` ale_dump tag (wf, virtual_salt≡0, relax_salt, rsf) at the C's
-      "explained-by-input" bar; `ale_cfg=None` byte-identity
-- [ ] full suite green
+- [x] rsf producer in ice thermo (`fesom_ice_thermo.c:359-408`); SPLIT `evap` into
+      `evaporation`/`ice_sublimation` (the C already computes both halves — free), surfaced via
+      `ThermoOut`→`ThermoState`→`IceStepOut`. rsf matches the closed form exactly.
+- [x] verified the C `sval` source: ⚠️ it is the **POST-ADVECTION** `trarr[surface]` (`tracer_diff.c:292`),
+      NOT start-of-step — so the `bc_T −= dt·sval·wf` term lands in `step.py` before `impl_vert_diff`,
+      not in the forcing step. (plan hedge resolved: the C does NOT use start-of-step T)
+- [x] water-flux ice-volume terms + **global net balancing** (`ice_coupling.fresh_water_balance_zstar`,
+      `fesom_ice_coupling.c:193-216`), `net = ⟨flux⟩` via `sss_runoff._area_mean` → `reductions.global_sum`
+- [x] `virtual_salt ≡ 0` under zstar (ice + no-ice paths); `bc_S = dt·(0 + relax_salt + rsf·is_nonlinfs)`
+      (+dt, NO sval·wf — lesson #3); `bc_T` sval·wf term in step.py
+- [x] tests: ✅ CPU unit tests (split exact, rsf producer formula, balancing global-mean, bc_S flip,
+      kernel byte-identity — 4 new + the ice suite green); ✅ **config-independent linfs↔zstar FLIP gate
+      on CORE2** (`test_forcing_flip_linfs_vs_zstar`, compute): relax_salt path-Δ=**0**, virtual_salt
+      6.8e-4→**0**, rsf 0→8.53e-5 (≈ z2_cdump's 8.53e-5). ⏳ direct `z2_cdump` `forcing`-tag match is a
+      ⚠️ **CROSS-CUTTING config-matching follow-on** (the JAX harness ≠ z2_cdump step-1 inputs by ~1e-5;
+      virtual_salt≡0 matches exactly; the path-independent relax_salt diff proves it's inputs, not code —
+      affects ALL z2_cdump dump gates, so JZ.3+ validate via flip/degeneracy/transitive + z2_cdump as
+      diagnostic). See `[[zstar-forcing-dump-config-gap]]`.
+- [x] `ale_cfg=None` byte-identity: `test_ice_thermo`/`ice_coupling`/`ice_step`/`core2_step` all green
 
 ### JZ.3 — SSH plumbing: rhs tail, hbar wf term, stiffness-as-function-of-state
 
 **Files:** Modify: `fesom_jax/ssh.py`, `fesom_jax/step.py`. Tests: `test_ale_zstar.py`.
 
-- [ ] `ssh_rhs += −α·wf·areasvol + (1−α)·ssh_rhs_old` (zstar tail; `fesom_ssh.c:405-426`) and
-      `compute_hbar`: `ssh_rhs_old −= wf·areasvol` (`fesom_momentum.c:843-860`) — ⚠️ the wf subtraction
-      lands BETWEEN the transport divergence and the hbar update (hbar consumes the wf-modified
-      `ssh_rhs_old`; the wf-modified value is also what's stored for next step's `(1−α)` term)
-- [ ] D2 matvec: `A(x) = base(x) + ΔA(mean₃(st.hbar))(x)·g·dt·α·θ` (edge-assembly increment,
-      `fesom_ssh.c:238-296` semantics); preconditioner untouched (frozen — lesson #11)
-- [ ] tests: `sshsolve` + `hbar`/`dhe` dump tags (note dhe is recomputable as `mean₃(hbar−hbar_old)` —
-      compare derived value); step-1 increment ≡ no-op; transpose-residual with state-dependent A
-- [ ] full suite green
+- [x] `ssh_rhs += −α·wf·areasvol + (1−α)·ssh_rhs_old` (zstar tail; `fesom_ssh.c:413-421`,
+      `compute_ssh_rhs(water_flux=)`) and `compute_hbar(water_flux=)`: `ssh_rhs_old −= wf·areasvol`
+      (`fesom_momentum.c:839-846`) — the wf subtraction lands BETWEEN the transport divergence and the
+      hbar update (hbar + next step's `(1−α)` term read the wf-modified `ssh_rhs_old`). Non-cavity arm
+      only (cavity unported). `water_flux=None` ⇒ linfs byte-identical.
+- [x] D2 matvec: `stiff_increment_matvec` = `A_base(x) + ΔA(−mean₃(st.hbar))(x)` with `factor=g·dt·α·θ`,
+      added inside the `solve_ssh` matvec (`mesh`+`hbar` args); the C's cumulative CSR
+      (`fesom_update_stiff_mat_ale`, `fesom_ssh.c:238-296`) telescopes to `Σdhe ≡ mean₃(hbar)` at cold
+      start (`fesom_step.c:216-227`), recomputed each step. Preconditioner frozen (base only). ΔA is the
+      same antisymmetric edge→node scatter with "velocity"=∇x ⇒ symmetric ⇒ `custom_linear_solve(symmetric)`
+      holds; closure ⇒ implicit diff propagates into A via `hbar`.
+- [x] tests (9, green): wf-tail/wf-term exact algebra (probed at uv=0 to dodge the near-cancelling base);
+      `water_flux=None` byte-identity; **step-1 increment ≡ no-op** + cold-start solve bitwise == linfs;
+      increment symmetric; **transpose-residual with state-dependent A**; `d/d(hbar)` finite+nonzero.
+      Config-INDEPENDENT C-internal `dhe`/telescoping: `dhe`-tag ≡ `mean₃(hbar−hbar_old)` recompute (Δ=0
+      at all 3 steps); `Σdhe ≡ mean₃(hbar_3)` (1.7e-16) — validates the D2 increment-depth foundation
+      WITHOUT JAX forcing (sidesteps the config gap). The assembled `sshsolve`/`hbar` z2_cdump dump gate
+      (on the config-clean subset) is the JZ.7 multi-step run.
+- [x] full suite green — **OCEAN 517 + ICE 47, 0 fail** (job 25534571, 2026-06-12); sharded group times
+      out (pre-existing Phase-8b, not zstar). `ale_cfg=None` byte-identical across CORE2/GM/KPP/ice.
 
 ### JZ.4 — vert_vel distribute + hnode_new production
 
 **Files:** Modify: `fesom_jax/ale.py`, `fesom_jax/step.py`, `fesom_jax/halo_points.py`. Tests: `test_ale_zstar.py`.
 
-- [ ] `vert_vel_zstar_distribute` (`fesom_ale.c:162-218`): **vertically-integrated** Wvel correction
+- [x] `vert_vel_zstar_distribute` (`fesom_ale.c:162-201`): **vertically-integrated** Wvel correction
       `(zbar_3d_n(nz)−dd1)·dd/dt` (NOT per-layer h·dd/dt), `Wvel(1) −= wf`, hnode_new on stretch
-      layers only; uses **pre-update** geometry (from `st.hnode`)
-- [ ] `_exch(hnode_new, "nod")` + `OCEAN_SCHEDULE` row (the C's zstar-only exchange, lesson #9)
-- [ ] tests: `Wvel` + `hnode_new` dump tags; surface-interface Wvel budget closes to machine zero
-      (the C's exact-budget check)
-- [ ] full suite green
+      layers only; uses **pre-update** geometry (`live_geometry(st.hnode)`). Wired into `step.py`
+      substep 13: corrects `w`, **overrides** the hoisted linfs `hnode_new` (so substeps 15/16 read the
+      new thickness, GM substep 2 already read the OLD `st.hnode` ⇒ the dual-geometry, lesson #6).
+- [x] `_exch(hnode_new, "nod")` (gated under `ale_cfg`) + `OCEAN_SCHEDULE` row (the C's zstar-only
+      `exchange_nod(hnode_new)`, `fesom_ale.c:157`); linfs ⇒ no-op. Sharded N-vs-1 is JZ.7.
+- [x] tests (4 kernel + 1 smoke, green): numpy-loop-ref match (golden rule); **cold-start degeneracy**
+      (hbar=hbar_old ⇒ w unchanged, hnode_new=hnode); surface-wf-BC isolation; `d/d(hbar)` finite;
+      assembled **pi-zstar 2-step smoke** finite (no NaN, hnode_new genuinely stretched, warm-hbar D2
+      increment live). The `Wvel`/`hnode_new` z2_cdump dump-tag gate (config-clean subset) is the JZ.7
+      assembled run (needs CORE2 forcing).
+- [x] full suite green — **OCEAN 524 + ICE 47, 0 fail** (job 25534806, 2026-06-12); sharded times out
+      (pre-existing). `ale_cfg=None` byte-identical across CORE2/GM/KPP/ice.
 
 ### JZ.5 — Shchepetkin PGF
 
 **Files:** Modify: `fesom_jax/pgf.py`, `fesom_jax/step.py`. Tests: `test_ale_zstar.py`.
 
-- [ ] `pressure_force_shchepetkin` (`fesom_eos.c:348-503`, 156 LOC): 1-based local stacks from helem,
-      static bottom anchor `zbar_n[nle+1]=zbar[nlevels−1]` (the C reads *static* depth there —
-      mirror, don't "fix"), quadratic-Newton vertex `drho_dz`, surface/bottom one-sided stencils as
-      precomputed static case masks, safe denominators
-- [ ] hpressure gated OFF under zstar (`fesom_eos.c:172`)
-- [ ] tests: `pgf_x`/`pgf_y` dump tags — the C hit ~1e-18 on step-1; gate at ≤1e-12 all-elems
-- [ ] full suite green
+- [x] `pressure_force_shchepetkin` (`fesom_eos.c:348-503`): element `Z_n` stack from helem (static
+      bottom anchor `zbar[nlevels−1]`, mirrored not "fixed"), quadratic-Newton vertex `drho_dz`
+      (`_drho_dz`), surface/interior/bottom stencils as precomputed static case masks (forward/centered/
+      backward), safe denominators. The vertical integral is the **cumsum identity** `pgf[k] =
+      cumsum(aux)[k] − ½·aux[k]` (replaces the C's running `int_dp += aux`). Wired into `step.py`
+      substep 3 on the hoisted live `Z3d_live`.
+- [x] hpressure unused under zstar (the shchepetkin path takes density+geometry directly; `compute_pressure_bv`
+      still returns hpressure but it is discarded — the C "no hpressure" `fesom_eos.c:172`; JZ.6 may skip
+      its compute). linfs ⇒ `pressure_force_linfs(hpressure)` unchanged (byte-identical).
+- [x] tests (2 kernel + smoke, green): **numpy-loop-ref match** (golden rule, <1e-12, config-independent);
+      `d/d(density)` finite (safe-denominator AD discipline); the pi-zstar smoke now runs through the
+      shchepetkin PGF finite. The `pgf_x`/`pgf_y` z2_cdump dump-tag gate (config-clean subset, step-1 where
+      live==static) is the JZ.7 assembled run (needs CORE2 IC density).
+- [x] full suite green — **OCEAN 524 + ICE 47, 0 fail** (job 25534806, 2026-06-12; same run as JZ.4).
 
 ### JZ.6 — Geometry re-point sweep + dual-geometry discipline
 
@@ -291,8 +329,36 @@ Hazard inventory from the C digest, each with its JAX treatment:
 `fesom_jax/tracer_diff.py`, `fesom_jax/momentum.py`, `fesom_jax/gm.py`, `fesom_jax/gm_redi.py`,
 `fesom_jax/forcing.py`, `fesom_jax/step.py` (un-hoist). Tests: `test_ale_zstar.py`.
 
-- [ ] re-point every §2-listed consumer to live geometry under zstar (grep-by-array audit; lesson #5);
-      un-hoist `step.py:157`
+**Audited design (2026-06-12) — the executable sweep:** `step.py` already hoists `zbar3_live, Z3d_live =
+ale.live_geometry(st.hnode)` (JZ.5) — thread these into each consumer as optional `Z3d=None`/`zbar3=None`
+args (None ⇒ `mesh.Z[None,:]`/`mesh.zbar[None,:]` broadcast = today's behaviour = **byte-neutral for
+linfs since live==static under nominal hnode**; given ⇒ the live per-node 2-D depths). Per-consumer
+grep-by-array hits (the static→live targets):
+  * `eos.py:110` density depth `z` (the in-situ pressure proxy) + `:238` bvfreq `dz` spacing → live `Z3d`
+    (the `_insitu`/N² depth becomes per-node; hpressure unused under zstar so its `z` is don't-care).
+  * `pp.py:81` shear `dz` (`Zp`) → live.
+  * `kpp.py:702` `zbar_3d_n` (+ `:350,492,590-591,675` Ri/bldepth/blmix depths) → live.
+  * `momentum.py:273-274` TDMA `zbar`/`Z` spacings → live (per-node, `st.helem`-derived).
+  * `tracer_adv.py:258` QR4C `_z_stencil` → live on the **committed** `st.hnode` geometry (dual-geometry).
+  * `gm_redi.py:81,192` `zbar,Z` → live; `gm.py:215,250-252` fer on `hnode_new` (dual-geometry).
+  * `forcing.py:340` sw-penetration depth → live.
+Each re-point is independently linfs-byte-neutral ⇒ suite-gate after each module; the zstar assembled
+correctness (steps ≥2, where live≠static) is the JZ.7 gate. The "un-hoist step.py:157" is **already done**
+(JZ.4 overrides `hnode_new` after vert_vel; GM substep-2 reads the OLD `st.hnode`-hoist, downstream reads
+the new — the C dual-geometry, no rename needed).
+
+- [~] re-point every §2-listed consumer to live geometry under zstar (grep-by-array audit; lesson #5);
+      un-hoist `step.py:157` ✅ (JZ.4 override — see Audited design above). **PARTIAL (2026-06-12):**
+      ✅ `eos.py` (density compressibility depth + N² spacing `Z3d=Z3d_live`), ✅ `pp.py` (shear `dz`,
+      `Z3d_live`), ✅ `tracer_diff.py` (impl-diff layer spacings from `hnode_new` ⇒ `Z3d=Z3d_new`, the
+      dual-geometry "new" side) — all byte-neutral (`Z3d=None` ⇒ exact static path; test_step_pi + the
+      kernel tests + the pi-zstar assembled smoke all green; **full suite OCEAN 524 + ICE 47, 0 fail —
+      job 25535224, 2026-06-12**). ⬜ REMAINING (intricate, do alongside the
+      JZ.7 multi-step gate that validates the live branch — at step 1 live==static so they're no-ops):
+      `tracer_adv` QR4C (needs `_z_stencil` 2-D + `Z3d_live`/`zbar3_live` through the FCT driver),
+      `momentum` impl_vert_visc (element geometry from `helem`, the shchepetkin `Z_n`-stack pattern),
+      `gm`/`gm_redi` (fer on `hnode_new`, horizontal Redi on `st.hnode`), `kpp` (5 sites), `forcing`
+      sw-penetration (`zbar3_live`; needs the hoist moved before the forcing block).
 - [ ] dual-geometry exactly as the C: QR4C on committed (st.hnode) geometry, flux-limited + impl-diff
       + GM fer on `hnode_new`, horizontal Redi on `st.hnode` (lesson #6)
 - [ ] confirm the existing unconditional salinity floor (`step.py:282`) stays untouched (mirrors the
@@ -305,8 +371,30 @@ Hazard inventory from the C digest, each with its JAX treatment:
 **Files:** Modify: `fesom_jax/tests/test_ale_zstar.py`, `fesom_jax/tests/test_step_sharded.py` (if a
 new exchange row needs asserting). Create: `scripts/` gate job if needed.
 
-- [ ] assembled 3-step eager+jit zstar run vs ALL 12 dump tags × 3 steps (post-commit thickness tags
-      included); jit-twice no-leak regression
+- [~] assembled eager zstar run vs the dump tags. **STEP-1 DONE (2026-06-12, job 25535718,
+      `test_jz7_assembled_zstar_step1` + `scripts/jz7_assembled_gate.sbatch`):** the FULL 4-config
+      model — **KPP + GM/Redi + EVP ice + zstar, the z2_cdump config — assembles and runs FINITE the
+      first time all four knobs run together** (the key integration milestone).
+      **IC MISMATCH ROOT-CAUSED & FIXED (2026-06-12, job 25537808): FULL-MESH BIT-IDENTITY.** The former
+      pgf tail (max~3e-5, k≥15 shelf-break) + the 488 brackish surface nodes were ONE mechanism: the C
+      `extrap_nod3D` GS land fill is order-dependent and runs PER-RANK (local order, halo frozen between
+      exchanges, surface-only outer-loop continuation) ⇒ **the C IC is partition-dependent** (C 1r vs 16r
+      dumps differ by up to 25.8 PSU at fill nodes). Fix: `phc_ic._extrap_nod3D_mpi` (dist_16-faithful,
+      rank lists from the dump gid columns; `scripts/rebuild_ic_dist16.py`) + the bilinear association fix
+      (`((v·wx)·wy)` like C — was ~1 ulp off at ~27k nodes). Rebuilt-IC surface = C 16r postload dump
+      **EXACTLY (0 diffs, all 126858 nodes)**; standalone density→pgf max|Δ|=**2.7e-20**. Step-1 gates
+      now FULL-mesh: config-clean = 126858/126858; `pgf_x/y` max=**4.4e-16/5.6e-16** (gate p99<1e-15,
+      max<1e-14; the assembled-step ulp slack is the AB2 tracer-blend reassociation);
+      `d_eta`/`hbar`/`eta_n` p50=p99.9≈2.5e-7 max=5.5e-7 — pure CG early-stop, the elliptic config-gap
+      halo is GONE (gate p99<1e-6, max<5e-6); `Wvel` max=2.8e-8 (gate max<1e-6); `ssh_rhs` diagnostic
+      (near-cancelling). The JZ.2 forcing diagnostic became a HARD gate (the ~1e-5 "input gap" was the
+      IC too): `relax_salt` max=3.4e-18, `real_salt_flux` 1.6e-10, `water_flux` 1.4e-9. New IC gates:
+      `test_phc_ic.py` serial dumps now byte-exact (`np.array_equal`) + `test_dist16_*` (16r postload
+      bit-identity + cache currency for BOTH caches). ⚠️ TWO IC caches (the legacy CORE2 oracles were
+      1-rank runs — one IC can't serve both partitions): `data/ic_core2` = serial (legacy gates),
+      `data/ic_core2_dist16` = dist_16 (all z2_cdump-gated zstar tests point here). ⬜ MULTI-STEP
+      (steps 2-3) needs JZ.6 complete (the live geometry re-points are step-1 no-ops); jit-twice
+      no-leak pending.
 - [ ] sharded N-vs-1 (CPU fake devices ×4) with `ale_cfg` ON — generic State-field loops cover
       hnode/helem/hbar; hnode_new exchange row asserted
 - [ ] full suite green

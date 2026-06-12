@@ -132,16 +132,28 @@ class ThermoOut(NamedTuple):
     fw: jax.Array       # total freshwater flux to ocean [m water/ice_dt] (+down; incl. runoff)
     ehf: jax.Array      # net surface heat flux to ocean [W/m²] (+down)
     thdgr: jax.Array    # dhgrowth = (h_new - h_old)/ice_dt [m/s]
-    evap: jax.Array     # evap + sublimation [m water/s]
+    evap: jax.Array     # evap + sublimation [m water/s] (bundled — the linfs consumer)
     dAgrowth: jax.Array
     iflice: jax.Array
+    # zstar (Phase 9a) real-salt path — the split + the rsf producer + thdgrsn for the
+    # fresh-water balancing (all 0 / virtual-salt-equivalent under use_virt_salt=True).
+    evaporation: jax.Array      # open-water evaporation _evap·(1−A) [m water/s] (= C's _evap)
+    ice_sublimation: jax.Array  # sublimation over ice _subli·A [m water/s] (= C's _subli)
+    rsf: jax.Array              # real_salt_flux = fwice·Sice − iflice·ρice/ρwat·Sice [PSU·m/s]
+    thdgrsn: jax.Array          # dhsngrowth = (hsn_new − hsn_post_fall)/ice_dt [m/s]
 
 
 def therm_ice_cell(cfg: IceConfig, h, hsn, A, fsh, flo, Ta, qa, rain, snow, runo,
-                   rsss, ug, ustar, T_oc, S_oc, ch, ce, t, lid_clo) -> ThermoOut:
-    """One node's growth/melt step (``fesom_therm_ice``, virtual-salt path). Scalar — the
-    driver `vmap`s it over nodes. ``H_ML = cfg.h_ml``, ``ice_dt = cfg.ice_dt``. ``ch``/``ce``
-    = open-ocean transfer coeffs (bulk ``Ch``/``Ce_atm_oce``)."""
+                   rsss, ug, ustar, T_oc, S_oc, ch, ce, t, lid_clo,
+                   use_virt_salt: bool = True) -> ThermoOut:
+    """One node's growth/melt step (``fesom_therm_ice``). Scalar — the driver `vmap`s it
+    over nodes. ``H_ML = cfg.h_ml``, ``ice_dt = cfg.ice_dt``. ``ch``/``ce`` = open-ocean
+    transfer coeffs (bulk ``Ch``/``Ce_atm_oce``).
+
+    ``use_virt_salt`` (static): ``True`` = the linfs virtual-salt path (``fwice`` scaled by
+    ``(rsss−Sice)/rsss``, ``rsf=0``, flooding corrects ``fw``); ``False`` = the zstar real-salt
+    path (``fwice`` unscaled, ``rsf=fwice·Sice``, flooding corrects ``rsf``) — the freshwater/salt
+    split the zstar forcing flip needs (``fesom_ice_thermo.c:359-408``)."""
     ice_dt = cfg.ice_dt
     inv_rhosno = 1.0 / cfg.rhosno
     h_old = h                                              # for dhgrowth (initial h)
@@ -203,9 +215,16 @@ def therm_ice_cell(cfg: IceConfig, h, hsn, A, fsh, flo, Ta, qa, rain, snow, runo
     dhsngrowth = (hsn - hsn_post_fall) / ice_dt
     ehf = ahf + cfg.cl * (dhgrowth + (cfg.rhosno / cfg.rhoice) * dhsngrowth)
 
-    # freshwater (virtual-salt path) (:367-372)
+    # freshwater + real_salt_flux (:359-372). use_virt_salt=True (linfs): fwice scaled by
+    # (rsss−Sice)/rsss, rsf=0. use_virt_salt=False (zstar): fwice unscaled (real volume change),
+    # rsf = fwice·Sice — the real-salt producer the linfs port lacked.
     rsss_safe = jnp.where(rsss != 0.0, rsss, 1.0)
-    fwice = -dhgrowth * cfg.rhoice / cfg.rhowat * (rsss - cfg.Sice) / rsss_safe
+    if use_virt_salt:
+        fwice = -dhgrowth * cfg.rhoice / cfg.rhowat * (rsss - cfg.Sice) / rsss_safe
+        rsf = jnp.zeros_like(h)
+    else:
+        fwice = -dhgrowth * cfg.rhoice / cfg.rhowat
+        rsf = fwice * cfg.Sice
     fwsnw = -dhsngrowth * cfg.rhosno / cfg.rhowat
     fw = prec + evap + fwice + fwsnw
 
@@ -219,14 +238,21 @@ def therm_ice_cell(cfg: IceConfig, h, hsn, A, fsh, flo, Ta, qa, rain, snow, runo
     A = jnp.minimum(jnp.maximum(A, 0.0), 1.0)
     dAgrowth = (A - Aold) / ice_dt
 
-    # flooding (snow→ice) + the virtual-salt correction (:387-403)
+    # flooding (snow→ice) + the salt-conservation correction (:387-403). Snow-derived ice
+    # carries no salt; without the correction the system "produces" salt as snow → ice. It
+    # adjusts fw (virtual-salt path) or rsf (real-salt path), per the same sign as fwice.
     h_pre_flood = h
     h, hsn = _flooding(cfg, h, hsn)
     iflice = (h - h_pre_flood) / ice_dt
-    fw = fw + iflice * cfg.rhoice / cfg.rhowat * cfg.Sice / rsss_safe
+    salt_corr = iflice * cfg.rhoice / cfg.rhowat * cfg.Sice
+    if use_virt_salt:
+        fw = fw + salt_corr / rsss_safe
+    else:
+        rsf = rsf - salt_corr
 
     return ThermoOut(h=h, hsn=hsn, A=A, t=t, fw=fw, ehf=ehf, thdgr=dhgrowth,
-                     evap=evap + subli, dAgrowth=dAgrowth, iflice=iflice)
+                     evap=evap + subli, dAgrowth=dAgrowth, iflice=iflice,
+                     evaporation=evap, ice_sublimation=subli, rsf=rsf, thdgrsn=dhsngrowth)
 
 
 # --------------------------------------------------------------------------
@@ -261,29 +287,40 @@ class ThermoState(NamedTuple):
     flx_fw: jax.Array      # = therm_ice fw (+down; oce_fluxes negates to water_flux)
     flx_h: jax.Array       # = therm_ice ehf (+down; oce_fluxes negates to heat_flux)
     thdgr: jax.Array
+    # zstar real-salt path — fed to the water-flux balancing + the bc_S real_salt_flux term.
+    thdgrsn: jax.Array          # dhsngrowth [m/s]
+    evaporation: jax.Array      # open-water evaporation [m water/s]
+    ice_sublimation: jax.Array  # sublimation over ice [m water/s]
+    real_salt_flux: jax.Array   # rsf [PSU·m/s] (0 under use_virt_salt=True)
 
 
 def thermodynamics(cfg: IceConfig, *, m_ice, m_snow, a_ice, u_ice, v_ice, t_skin,
                    srfoce_temp, srfoce_salt, srfoce_u, srfoce_v,
                    fsh, flo, Tair, qa, u_wind, v_wind, rain, snow, runo,
-                   ch, ce, geo_lat, non_cavity) -> ThermoState:
+                   ch, ce, geo_lat, non_cavity, use_virt_salt: bool = True) -> ThermoState:
     """Run the per-node sea-ice thermodynamics over the whole mesh (the ``vmap`` of
     `therm_ice_cell` + the ``ustar`` pass + the cavity mask). All inputs are ``[nod2D]``.
-    ``ch``/``ce`` are the bulk open-ocean coeffs; ``geo_lat`` selects ``lid_clo``."""
+    ``ch``/``ce`` are the bulk open-ocean coeffs; ``geo_lat`` selects ``lid_clo``.
+    ``use_virt_salt`` (static) selects the linfs virtual-salt vs zstar real-salt freshwater
+    path (surfaces ``real_salt_flux``/``evaporation``/``ice_sublimation``/``thdgrsn``)."""
     ustar = compute_ustar(cfg, u_ice, v_ice, srfoce_u, srfoce_v)
     ug = _safe_sqrt(u_wind * u_wind + v_wind * v_wind)
     rsss = srfoce_salt if cfg.ref_sss_local else jnp.full_like(srfoce_salt, cfg.ref_sss)
     lid_clo = jnp.where(geo_lat > 0.0, cfg.h0, cfg.h0_s)
 
-    out = jax.vmap(lambda *a: therm_ice_cell(cfg, *a))(
+    out = jax.vmap(lambda *a: therm_ice_cell(cfg, *a, use_virt_salt=use_virt_salt))(
         m_ice, m_snow, a_ice, fsh, flo, Tair, qa, rain, snow, runo,
         rsss, ug, ustar, srfoce_temp, srfoce_salt, ch, ce, t_skin, lid_clo)
 
     # Cavity skip (ulevels_nod2D>1): leave those nodes unchanged (no-op on CORE2).
     keep = non_cavity
     sel = lambda new, old: jnp.where(keep, new, old)
+    z = jnp.zeros_like(srfoce_salt)
     return ThermoState(
         a_ice=sel(out.A, a_ice), m_ice=sel(out.h, m_ice), m_snow=sel(out.hsn, m_snow),
         t_skin=sel(out.t, t_skin),
         flx_fw=jnp.where(keep, out.fw, 0.0), flx_h=jnp.where(keep, out.ehf, 0.0),
-        thdgr=jnp.where(keep, out.thdgr, 0.0))
+        thdgr=jnp.where(keep, out.thdgr, 0.0), thdgrsn=jnp.where(keep, out.thdgrsn, 0.0),
+        evaporation=jnp.where(keep, out.evaporation, 0.0),
+        ice_sublimation=jnp.where(keep, out.ice_sublimation, 0.0),
+        real_salt_flux=jnp.where(keep, out.rsf, 0.0))

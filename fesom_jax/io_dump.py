@@ -192,14 +192,17 @@ def load_gm_dump(dirpath: Union[str, Path]) -> tuple[dict, dict]:
 
 
 # ---------------------------------------------------------------------------
-# KPP reference dumps (Phase 6C) — the C ``fesom_kpp.c`` dump harness writes
-# plain-text files (NOT the binary GM ``.f64`` blobs): one file per (step, tag,
-# rank), keyed by 1-based global id. The dump job (``jax_kpp_dump_core2.sh``)
-# runs single-rank, so ``*_rank0.txt`` carries every node/element (gid 1..N) and
-# row order is the partition's ``myList`` order; we reorder by gid into JAX mesh
-# index order (``out[gid-1] = row``) — robust regardless of the partition order,
-# and (single-rank) JAX node index ``i`` ↔ global gid ``i+1`` (the GM-gate node
-# alignment, made explicit). Three file kinds:
+# Generic gid-keyed text dumps — the SHARED format used by both the KPP harness
+# (Phase 6C, ``fesom_kpp.c``) and the ALE/zstar harness (Phase 9a,
+# ``fesom_ale_dump.c``): one plain-text file per (step, tag, rank) with a
+# ``# step=.. tag=.. rank=.. N=.. ncomp=..`` header + ``gid v0 v1 …`` lines, the
+# 1-based gid first. :func:`read_gid_table` parses one such file; :func:`load_kpp_dump`
+# (single-rank KPP) and :func:`load_ale_dump` (multi-rank ALE, merge-by-gid) build on it.
+#
+# KPP file kinds (the dump job ``jax_kpp_dump_core2.sh`` runs single-rank, so
+# ``*_rank0.txt`` carries every node/element gid 1..N; we reorder by gid into JAX
+# mesh index order ``out[gid-1] = row`` — robust regardless of partition order, and
+# single-rank JAX node index ``i`` ↔ global gid ``i+1``). Three file kinds:
 #   * ``kpp_dump_s<step>_<tag>_rank<R>.txt`` — per-kernel node/element columns
 #     (``# step=.. tag=.. rank=.. N=.. ncomp=..`` header + ``gid v0 v1 …`` lines).
 #   * ``kpp_init_rank0.txt``  — Vtc/cg/deltaz/deltau scalars + the wm/ws lookup
@@ -219,10 +222,11 @@ KPP_NODE_TAGS = (
 KPP_ELEM_TAGS = ("viscAE",)                            # K.7 final element viscosity (= Av)
 
 
-def _parse_kpp_header(line: str) -> dict:
-    """Parse a ``# step=1 tag=viscA rank=0 N=126858 ncomp=48`` header line."""
+def _parse_gid_header(line: str) -> dict:
+    """Parse a ``# step=1 tag=viscA rank=0 N=126858 ncomp=48`` header line (the shared
+    KPP / ALE gid-table header)."""
     if not line.startswith("#"):
-        raise IOError(f"KPP dump: expected '# step=...' header, got {line!r}")
+        raise IOError(f"gid dump: expected '# step=...' header, got {line!r}")
     out: dict = {}
     for tok in line.lstrip("#").split():
         if "=" in tok:
@@ -233,22 +237,30 @@ def _parse_kpp_header(line: str) -> dict:
     return out
 
 
-def read_kpp_table(path: Union[str, Path]) -> tuple[np.ndarray, np.ndarray, dict]:
-    """Read one ``kpp_dump_s<step>_<tag>_rank<R>.txt`` → ``(gids, values, meta)``.
+def read_gid_table(path: Union[str, Path]) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Read one gid-keyed dump table → ``(gids, values, meta)``.
 
-    ``gids`` is ``int64[N]`` (1-based global ids, in file/``myList`` order),
-    ``values`` is ``float64[N, ncomp]`` (same order), ``meta`` the parsed header.
-    Uses ``np.fromstring`` (C parser) for the large all-node files."""
+    The shared text format of the KPP (``kpp_dump_s<step>_<tag>_rank<R>.txt``) and ALE
+    (``ale_dump_s<step>_<tag>_rank<R>.txt``) harnesses: a ``# step=.. tag=.. rank=.. N=..
+    ncomp=..`` header followed by ``N`` lines ``gid v0 v1 … v<ncomp-1>``. ``gids`` is
+    ``int64[N]`` (1-based global ids, in file/``myList`` order), ``values`` is
+    ``float64[N, ncomp]`` (same order), ``meta`` the parsed header. Uses ``np.fromstring``
+    (C parser) for the large all-node files."""
     path = Path(path)
     with open(path) as fh:
-        meta = _parse_kpp_header(fh.readline())
+        meta = _parse_gid_header(fh.readline())
         flat = np.fromstring(fh.read(), sep=" ", dtype=np.float64)
     N, ncomp = meta["N"], meta["ncomp"]
     if flat.size != N * (1 + ncomp):
         raise ValueError(
-            f"KPP dump {path.name}: {flat.size} numbers != N*(1+ncomp)={N*(1+ncomp)}")
+            f"gid dump {path.name}: {flat.size} numbers != N*(1+ncomp)={N*(1+ncomp)}")
     flat = flat.reshape(N, 1 + ncomp)
     return flat[:, 0].astype(np.int64), np.ascontiguousarray(flat[:, 1:]), meta
+
+
+# Backward-compatible aliases (KPP loaders + any scripts predating the Phase-9a rename).
+read_kpp_table = read_gid_table
+_parse_kpp_header = _parse_gid_header
 
 
 def load_kpp_dump(
@@ -274,7 +286,7 @@ def load_kpp_dump(
         path = d / f"kpp_dump_s{step}_{tag}_rank{rank}.txt"
         if not path.is_file():
             raise FileNotFoundError(f"KPP dump tag {tag!r} missing: {path}")
-        gids, values, hdr = read_kpp_table(path)
+        gids, values, hdr = read_gid_table(path)
         N = hdr["N"]
         identity = bool(np.array_equal(gids, np.arange(1, N + 1)))
         if reorder and not identity:
@@ -323,6 +335,135 @@ def load_kpp_wscale_sweep(dirpath: Union[str, Path]) -> dict:
         "zehat": body[:, 2].reshape(nz, nu), "ustar": body[:, 3].reshape(nz, nu),
         "wm": body[:, 4].reshape(nz, nu), "ws": body[:, 5].reshape(nz, nu),
     }
+
+
+# ---------------------------------------------------------------------------
+# ALE / zstar reference dumps (Phase 9a) — the C ``fesom_ale_dump.c`` harness
+# (env ``FESOM_ALE_DUMP_DIR`` / ``FESOM_ALE_DUMP_STEPS``) writes the SAME gid-keyed
+# text format as KPP, but **multi-rank**: each rank dumps only its OWNED rows
+# (``myDim_nod2D`` / ``myDim_elem2D``, keyed by ``myList_*``). Node partitions are
+# disjoint (union = 1..nod2D, no dupes); element partitions overlap on a thin
+# boundary ring but the duplicated rows are bit-identical — so a merge-by-gid
+# (``out[gid-1] = row``) reconstructs the global field exactly. 12 tags at 6 driver
+# sites (``fesom_ale_dump.c:77-154``), the component layout fixed by the C getters.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AleTag:
+    """One ALE dump tag's layout (the source of truth = the C ``fesom_ale_dump.c``
+    getter that fills it). ``entity`` selects the global size (node vs element);
+    ``kind`` selects the level convention for masking in verification:
+
+    * ``"scalar"`` — ``comps`` is a tuple of independent per-(node|elem) 2-D field
+      names (``ncomp == len(comps)``; e.g. ``forcing`` packs 4 surface flux fields);
+    * ``"layer"`` — a per-layer column, ``ncomp == nl-1`` (valid ``[ulevels-1, nlevels-1)``);
+    * ``"iface"`` — a per-interface column, ``ncomp == nl`` (valid ``[ulevels-1, nlevels-1]``).
+    """
+
+    name: str
+    entity: str                      # "nod" | "elem"
+    kind: str                        # "scalar" | "layer" | "iface"
+    comps: tuple[str, ...] | None    # field names for "scalar"; None for columns
+
+
+# The 12 tags (`fesom_ale_dump.c:77-154`), component order matching the C getters
+# (`get_2d`'s `s->a[c]` array / `get_col`'s level index).
+ALE_TAGS: dict[str, AleTag] = {
+    # forcing site (fesom_ale_dump.c:82-85)
+    "forcing":   AleTag("forcing", "nod", "scalar",
+                        ("water_flux", "virtual_salt", "relax_salt", "real_salt_flux")),
+    # pgf site (fesom_ale_dump.c:93-98)
+    "pgf_x":     AleTag("pgf_x", "elem", "layer", None),
+    "pgf_y":     AleTag("pgf_y", "elem", "layer", None),
+    # sshsolve site (fesom_ale_dump.c:106-108)
+    "sshsolve":  AleTag("sshsolve", "nod", "scalar", ("ssh_rhs", "d_eta")),
+    # hbar site (fesom_ale_dump.c:116-122)
+    "hbar":      AleTag("hbar", "nod", "scalar",
+                        ("hbar", "hbar_old", "ssh_rhs_old", "eta_n")),
+    "dhe":       AleTag("dhe", "elem", "scalar", ("dhe",)),
+    # vertvel site (fesom_ale_dump.c:130-135)
+    "Wvel":      AleTag("Wvel", "nod", "iface", None),
+    "hnode_new": AleTag("hnode_new", "nod", "layer", None),
+    # thickness (post-commit) site (fesom_ale_dump.c:142-153)
+    "hnode":     AleTag("hnode", "nod", "layer", None),
+    "zbar_3d_n": AleTag("zbar_3d_n", "nod", "iface", None),
+    "Z_3d_n":    AleTag("Z_3d_n", "nod", "layer", None),
+    "helem":     AleTag("helem", "elem", "layer", None),
+}
+
+
+def load_ale_dump(
+    dirpath: Union[str, Path], tags: Iterable[str] | None = None,
+    *, step: int = 1, n_nod: int | None = None, n_elem: int | None = None,
+    strict: bool = True,
+) -> tuple[dict, dict]:
+    """Read the multi-rank ALE/zstar dump for ``step``, merging ranks by gid.
+
+    ``tags`` selects which to load (``None`` ⇒ every tag present for ``step``). Returns
+    ``(fields, meta)``: ``fields[tag]`` is ``float64[Nglobal, ncomp]`` in **JAX mesh index
+    order** (``out[gid-1] = row``), with ``Nglobal`` = ``n_nod`` (node tags) / ``n_elem``
+    (element tags), or the max gid seen when those are ``None``. ``meta[tag]`` records
+    ``{N, ncomp, entity, kind, nranks}``. Gids never written stay ``NaN``; with
+    ``strict`` (default) a node tag missing any gid in ``1..N`` raises, and overlapping
+    element rows are asserted bit-identical (the boundary-ring invariant)."""
+    d = Path(dirpath)
+    if tags is None:
+        present = set()
+        prefix = f"ale_dump_s{step}_"
+        for p in d.glob(f"{prefix}*_rank*.txt"):
+            present.add(p.name[len(prefix):].rsplit("_rank", 1)[0])
+        tags = sorted(present)
+    fields: dict = {}
+    meta: dict = {}
+    for tag in tags:
+        paths = sorted(d.glob(f"ale_dump_s{step}_{tag}_rank*.txt"),
+                       key=lambda p: int(p.name.rsplit("_rank", 1)[1].split(".")[0]))
+        if not paths:
+            raise FileNotFoundError(
+                f"ALE dump tag {tag!r} step {step} missing: {d}/ale_dump_s{step}_{tag}_rank*.txt")
+        chunks = [read_gid_table(p) for p in paths]
+        ncomp = chunks[0][2]["ncomp"]
+        spec = ALE_TAGS.get(tag)
+        entity = spec.entity if spec else None
+        kind = spec.kind if spec else None
+        gmax = max(int(g.max()) for g, _, _ in chunks)
+        Ng = (n_nod if entity == "nod" else n_elem if entity == "elem" else None) or gmax
+        out = np.full((Ng, ncomp), np.nan, np.float64)
+        seen = np.zeros(Ng, dtype=bool)
+        for g, v, hdr in chunks:
+            if hdr["ncomp"] != ncomp:
+                raise ValueError(f"ALE dump {tag}: rank {hdr['rank']} ncomp "
+                                 f"{hdr['ncomp']} != {ncomp}")
+            idx = g - 1
+            if strict:
+                dup = seen[idx]
+                if dup.any() and not np.array_equal(out[idx[dup]], v[dup]):
+                    raise ValueError(
+                        f"ALE dump {tag}: overlapping gids disagree across ranks "
+                        f"(stale-halo dump?) — expected the boundary-ring rows bit-identical")
+            out[idx] = v
+            seen[idx] = True
+        if strict and not seen.all():
+            raise ValueError(
+                f"ALE dump {tag}: {int((~seen).sum())} of {Ng} gids never written "
+                f"(incomplete rank set or wrong n_{entity})")
+        fields[tag] = out
+        meta[tag] = {"N": Ng, "ncomp": ncomp, "entity": entity, "kind": kind,
+                     "nranks": len(paths)}
+    return fields, meta
+
+
+def ale_component(fields: dict, tag: str, name: str) -> np.ndarray:
+    """Pick one named component column out of a ``"scalar"``-kind ALE tag's
+    ``[N, ncomp]`` block (e.g. ``ale_component(f, "forcing", "water_flux")`` →
+    ``[N]``). Uses :data:`ALE_TAGS` for the component order (the C getter packing)."""
+    spec = ALE_TAGS[tag]
+    if spec.comps is None:
+        raise ValueError(f"ALE tag {tag!r} is a column ({spec.kind}); index by level, "
+                         f"not component name")
+    if name not in spec.comps:
+        raise KeyError(f"ALE tag {tag!r} has no component {name!r}; one of {spec.comps}")
+    return fields[tag][:, spec.comps.index(name)]
 
 
 def _summary_main(argv: list[str]) -> int:  # pragma: no cover - debug CLI

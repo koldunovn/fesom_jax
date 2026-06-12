@@ -104,7 +104,8 @@ class SurfaceFluxes(NamedTuple):
 # ==========================================================================
 def compute_surface_fluxes(mesh: Mesh, state: State, sf: StepForcing,
                            fs: ForcingStatic, *, dt: float = DT_DEFAULT,
-                           owned_mask=None, axis_name=None) -> SurfaceFluxes:
+                           owned_mask=None, axis_name=None,
+                           use_virt_salt: bool = True) -> SurfaceFluxes:
     """Compute the surface BCs from the start-of-step model ``state`` + this step's
     atmosphere ``sf`` + the static constants ``fs``. Pure & differentiable w.r.t.
     ``state`` (the bulk taps ``state.T[:,0]`` / ``state.uvnode[:,0]``).
@@ -150,14 +151,18 @@ def compute_surface_fluxes(mesh: Mesh, state: State, sf: StepForcing,
     heat_flux, sw_3d = _forcing.cal_shortwave_rad(
         mesh, bulk.heat_flux, sf.shortwave, sf.chl, pene_open)
 
-    # 5 — surface BCs (fesom_tracer_diff.c:56,67; linfs ⇒ is_nonlinfs=0, real_salt_flux=0).
+    # 5 — surface BCs (fesom_tracer_diff.c:43-75). bc_T base here; the zstar −dt·sval·wf term
+    #     is added in step.py (post-advection sval). Under zstar (use_virt_salt=False) the
+    #     no-ice path has no ice thermo ⇒ no real_salt_flux, and virtual_salt≡0 ⇒
+    #     bc_S = dt·relax_salt. linfs (default) ⇒ byte-identical.
+    virtual_salt = sss.virtual_salt if use_virt_salt else jnp.zeros_like(sss.virtual_salt)
     bc_T = -dt * heat_flux / VCPW
-    bc_S = dt * (sss.virtual_salt + sss.relax_salt)
+    bc_S = dt * (virtual_salt + sss.relax_salt)
 
     return SurfaceFluxes(
         stress_surf=stress_surf, bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d,
         stress_node_surf=sns_b, heat_flux=heat_flux, water_flux=sss.water_flux,
-        virtual_salt=sss.virtual_salt, relax_salt=sss.relax_salt)
+        virtual_salt=virtual_salt, relax_salt=sss.relax_salt)
 
 
 # ==========================================================================

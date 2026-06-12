@@ -341,7 +341,7 @@ def ssh_precond(op: SSHOperator, r, halo: "SSHHalo | None" = None):
 # Substep 8 — SSH RHS (linfs)
 # ==========================================================================
 def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
-                    ssh_rhs_old=None):
+                    ssh_rhs_old=None, water_flux=None):
     """SSH equation RHS ``[nod2D]`` (substep 8, ``fesom_compute_ssh_rhs_linfs``).
 
     Per edge, sum over each adjacent cell's layers
@@ -350,6 +350,11 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
     ``ssh_rhs[n1] += c, ssh_rhs[n2] −= c``. ``uv``/``uv_rhs`` are ``[elem2D,nl,2]``,
     ``helem`` ``[elem2D,nl]``. With ``alpha=1`` the ``(1−alpha)·ssh_rhs_old`` term
     (``fesom_ssh.c:325``) is zero; it is added when ``ssh_rhs_old`` is supplied.
+
+    **zstar (Phase 9a, JZ.3).** ``water_flux`` (``[nod2D]``) adds the real-freshwater
+    tail (``fesom_ssh.c:413-421``): ``ssh_rhs[n] += −α·wf·areasvol[n,0]`` on non-cavity
+    nodes (the cavity arm is unported). ``water_flux=None`` ⇒ the linfs path (no tail),
+    byte-identical.
     """
     et = mesh.edge_tri
     el1, el2 = et[:, 0], et[:, 1]
@@ -375,6 +380,10 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
     ssh_rhs = jax.ops.segment_sum(
         vals.reshape(-1), mesh.edges.reshape(-1), num_segments=mesh.nod2D
     )
+    # zstar water-flux tail (fesom_ssh.c:413-421): −α·wf·areasvol[n,0] on non-cavity.
+    if water_flux is not None:
+        nocav = mesh.ulevels_nod2D == 1
+        ssh_rhs = ssh_rhs + jnp.where(nocav, -alpha * water_flux * mesh.areasvol[:, 0], 0.0)
     if ssh_rhs_old is not None and alpha != 1.0:
         ssh_rhs = ssh_rhs + (1.0 - alpha) * ssh_rhs_old
     return ssh_rhs
@@ -449,7 +458,62 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
     return lax.cond(s0 > 0.0, run, lambda _: jnp.zeros_like(x0), operand=None)
 
 
+def stiff_increment_matvec(mesh: Mesh, hbar, x, *, dt: float = DT_DEFAULT,
+                           alpha: float = SSH_ALPHA, theta: float = SSH_THETA,
+                           halo: "SSHHalo | None" = None):
+    """``ΔA·x`` — the zstar per-step SSH-stiffness increment (D2), recomputed each step
+    from the start-of-step ``hbar`` rather than carried as the C's cumulative CSR.
+
+    The C ``fesom_update_stiff_mat_ale`` (``fesom_ssh.c:238-296``) adds, per step, the
+    **base edge-assembly** with the static column depth replaced by ``−dhe`` — the
+    elemental ``mean₃(hbar−hbar_old)`` (``fesom_step.c:216-227``). Telescoping over steps
+    at cold start (``hbar_init=0``) gives ``Σ dhe ≡ mean₃(hbar)``, so the live matrix is
+    ``A_base + ΔA`` with ``ΔA = assembly(depth = −mean₃(hbar_el))`` and the SAME
+    ``factor = g·dt·α·θ``. ΔA is the identical antisymmetric edge→node scatter as
+    :func:`compute_ssh_rhs`, with the "velocity" replaced by the **element gradient of
+    the iterate** ``x`` (``∂ₓx = Σ_k ∂N_k/∂x·x[node_k]``), so it is linear in ``x`` and
+    **symmetric** (the base operator's symmetry is preserved ⇒
+    ``custom_linear_solve(symmetric=True)`` still holds). At cold start ``hbar=0 ⇒ ΔA=0``
+    (the step-1 no-op). Cavity elements (``ulevels>1``) contribute 0 (the C's dhe guard).
+
+    Distributed (``halo`` given): exchange ``x`` first (like :func:`ssh_matvec`); the
+    element gradients + edge scatter then run on the local mesh. ``halo=None`` is the
+    dense single-device path (validated at JZ.3; the sharded zstar solve is JZ.7)."""
+    if halo is not None:
+        x = (halo_exchange_ragged(x, halo.ragged, halo.recv_max, halo.axis_name)
+             if halo.use_ragged
+             else halo_exchange(x, halo.src_dev, halo.src_lane, halo.axis_name))
+    en = mesh.elem_nodes
+    g = mesh.gradient_sca                                  # (elem2D,6): ∂N/∂x(0:3),∂N/∂y(3:6)
+    xe = x[en]                                             # (elem2D,3)
+    gx = jnp.sum(g[:, 0:3] * xe, axis=1)                   # ∂x/∂x per element
+    gy = jnp.sum(g[:, 3:6] * xe, axis=1)                   # ∂x/∂y per element
+    # increment depth = −mean₃(hbar) (the telescoped Σdhe); cavity element ⇒ 0.
+    dhe = (hbar[en[:, 0]] + hbar[en[:, 1]] + hbar[en[:, 2]]) / 3.0
+    depth = jnp.where(mesh.ulevels == 1, -dhe, 0.0)
+    factor = float(G) * float(dt) * float(alpha) * float(theta)
+
+    et = mesh.edge_tri
+    el1, el2 = et[:, 0], et[:, 1]
+    has1, has2 = el1 >= 0, el2 >= 0
+    el1s = jnp.where(has1, el1, 0)
+    el2s = jnp.where(has2, el2, 0)
+    cross = mesh.edge_cross_dxdy
+
+    def cterm(els, has, dxcol, dycol, sign):
+        # base flux (fesom_ssh.c:157), k-summed against x: depth·(∂ₓx·dy_i − ∂ᵧx·dx_i)
+        f = depth[els] * (gx[els] * cross[:, dycol] - gy[els] * cross[:, dxcol])
+        return sign * jnp.where(has, f, 0.0)
+
+    c = cterm(el1s, has1, 0, 1, 1.0) + cterm(el2s, has2, 2, 3, -1.0)
+    vals = jnp.stack([c, -c], axis=1) * factor            # n1 += c·factor, n2 −= c·factor
+    return jax.ops.segment_sum(
+        vals.reshape(-1), mesh.edges.reshape(-1), num_segments=mesh.nod2D)
+
+
 def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = None,
+              mesh: "Mesh | None" = None, hbar=None, dt: float = DT_DEFAULT,
+              alpha: float = SSH_ALPHA, theta: float = SSH_THETA,
               forward_tol: float = SOLTOL, grad_tol: float = GRAD_SOLTOL,
               maxiter: int = MAXITER):
     """Solve ``S·d_eta = ssh_rhs`` (substep 9), returning ``d_eta`` ``[nod2D]``.
@@ -473,12 +537,26 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = Non
     load-bearing determinism). ``halo=None`` is the dense single-device path,
     byte-identical to ``v1.0`` (the gate stays the exact same graph). The
     ``custom_linear_solve`` transpose runs sharded too (gradient checked in S.8).
-    """
+
+    zstar (Phase 9a, JZ.3): pass ``mesh`` + ``hbar`` (the start-of-step ``st.hbar``) to
+    add the D2 stiffness increment ``ΔA(mean₃(hbar))`` (:func:`stiff_increment_matvec`)
+    to the matvec — the operator becomes a differentiable function of state. ``hbar=None``
+    (linfs) ⇒ the static operator, byte-identical. At cold start (``hbar=0``) the
+    increment is 0, so the step-1 solve is the linfs solve exactly."""
     n = op.n_nodes
     x0 = jnp.zeros((n,), ssh_rhs.dtype) if x0 is None else x0
     x0 = lax.stop_gradient(x0)
 
-    matvec = lambda x: ssh_matvec(op, x, halo)    # noqa: E731
+    # zstar (Phase 9a, JZ.3): the live operator is A_base + ΔA(mean₃(hbar)) (D2). The
+    # increment is recomputed inside the matvec from the (start-of-step) ``hbar``, so the
+    # implicit-diff cotangent propagates into A via ``hbar`` (the closure), not just b.
+    # ``hbar=None`` ⇒ the static linfs operator (byte-identical; no extra trace).
+    if hbar is None:
+        matvec = lambda x: ssh_matvec(op, x, halo)    # noqa: E731
+    else:
+        def matvec(x):
+            return ssh_matvec(op, x, halo) + stiff_increment_matvec(
+                mesh, hbar, x, dt=dt, alpha=alpha, theta=theta, halo=halo)
     precond = lambda r: ssh_precond(op, r, halo)  # noqa: E731
 
     # Solve for the correction δ = S⁻¹·b_eff from δ0=0 (linear), then d_eta = x0+δ.
@@ -517,7 +595,8 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = Non
 # ==========================================================================
 # Substeps 11–12 — hbar (transport divergence) + eta_n blend
 # ==========================================================================
-def compute_hbar(mesh: Mesh, uv, helem, hbar, *, dt: float = DT_DEFAULT):
+def compute_hbar(mesh: Mesh, uv, helem, hbar, *, dt: float = DT_DEFAULT,
+                 water_flux=None):
     """Transport-divergence → ``ssh_rhs_old``, then the hbar update (substep 11).
 
     Mirror of ``fesom_compute_hbar`` (``fesom_momentum.c:779``; Fortran
@@ -537,8 +616,19 @@ def compute_hbar(mesh: Mesh, uv, helem, hbar, *, dt: float = DT_DEFAULT):
 
     The division by the large CV area (``~1e9–1e12 m²``) strongly suppresses the
     absolute error of the near-cancelling ``ssh_rhs_old`` (see the ssh/rhs
-    lesson), so ``hbar`` matches the dump tightly in absolute terms."""
+    lesson), so ``hbar`` matches the dump tightly in absolute terms.
+
+    **zstar (Phase 9a, JZ.3).** ``water_flux`` subtracts the real-freshwater term
+    (``fesom_momentum.c:839-846``): ``ssh_rhs_old[n] −= wf·areasvol[n,0]`` on non-cavity,
+    **before** the hbar update — so the wf-modified ``ssh_rhs_old`` is BOTH what hbar
+    consumes and what the next step reads via the ``(1−α)·ssh_rhs_old`` term. The inner
+    transport divergence is the bare ``uv`` (no wf); the tail is added here, not in the
+    inner :func:`compute_ssh_rhs`. ``water_flux=None`` ⇒ linfs (byte-identical)."""
     ssh_rhs_old = compute_ssh_rhs(mesh, uv, jnp.zeros_like(uv), helem, alpha=1.0)
+    if water_flux is not None:
+        nocav0 = mesh.ulevels_nod2D == 1
+        ssh_rhs_old = ssh_rhs_old + jnp.where(
+            nocav0, -water_flux * mesh.areasvol[:, 0], 0.0)
     top = mesh.ulevels_nod2D - 1                          # 0 for pi (non-cavity)
     area = jnp.take_along_axis(mesh.areasvol, top[:, None], axis=1)[:, 0]
     nocav = mesh.ulevels_nod2D == 1

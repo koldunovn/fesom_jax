@@ -34,7 +34,7 @@ from .forcing import _safe_speed
 from .ice import IceConfig
 from .mesh import Mesh
 from .state import State
-from .sss_runoff import sss_runoff_fluxes
+from .sss_runoff import _area_mean, sss_runoff_fluxes
 
 
 # --------------------------------------------------------------------------
@@ -62,27 +62,65 @@ def ocean2ice(state: State) -> SrfOce:
 class IceOceFluxes(NamedTuple):
     heat_flux: jnp.ndarray      # = -flx_h        [W/m²]
     water_flux: jnp.ndarray     # = -flx_fw       [m/s] (incl. runoff; +ocean loses FW)
-    virtual_salt: jnp.ndarray   # rsss·water_flux − ⟨·⟩   [PSU·m/s]
+    virtual_salt: jnp.ndarray   # rsss·water_flux − ⟨·⟩   [PSU·m/s]  (≡0 under zstar)
     relax_salt: jnp.ndarray     # surf_relax_S·(Ssurf − S_top) − ⟨·⟩   [PSU·m/s]
+    real_salt_flux: jnp.ndarray  # rsf from the ice thermo [PSU·m/s] (0 under linfs/virt-salt)
 
 
 def ice_oce_fluxes(S_top, flx_fw, flx_h, Ssurf_month, runoff_node,
                    areasvol_surf, ocean_area, open_water=None, *,
-                   owned_mask=None, axis_name=None) -> IceOceFluxes:
+                   owned_mask=None, axis_name=None,
+                   use_virt_salt: bool = True, real_salt_flux=None) -> IceOceFluxes:
     """Ice-mediated surface heat/freshwater fluxes (``fesom_ice_oce_fluxes``).
 
     ``water_flux = -flx_fw`` (the thermo flux, runoff already folded in via ``prec``);
     ``heat_flux = -flx_h``; ``virtual_salt``/``relax_salt`` via the Phase-5 balance with
     ``balance_water_flux=False`` (the ice-on path drops the ``⟨water_flux+runoff⟩`` term —
-    ``runoff_node`` is passed only because the shared signature takes it, and is unused here)."""
+    ``runoff_node`` is passed only because the shared signature takes it, and is unused here).
+
+    ``use_virt_salt`` (static): ``True`` = linfs (``real_salt_flux≡0``, unchanged);
+    ``False`` = zstar — ``virtual_salt ≡ 0`` (``fesom_ale.c:31``) and the thermo's
+    ``real_salt_flux`` is surfaced (the global water-flux balancing is the separate
+    :func:`fresh_water_balance_zstar`, applied to ``water_flux`` in the ice step)."""
     water_flux = -flx_fw
     heat_flux = -flx_h
     sss = sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,
                             areasvol_surf, ocean_area, open_water,
                             balance_water_flux=False,
                             owned_mask=owned_mask, axis_name=axis_name)
+    virtual_salt = sss.virtual_salt
+    rsf = jnp.zeros_like(water_flux)
+    if not use_virt_salt:
+        virtual_salt = jnp.zeros_like(sss.virtual_salt)   # zstar ⇒ no virtual-salt flux
+        rsf = real_salt_flux
     return IceOceFluxes(heat_flux=heat_flux, water_flux=sss.water_flux,
-                        virtual_salt=sss.virtual_salt, relax_salt=sss.relax_salt)
+                        virtual_salt=virtual_salt, relax_salt=sss.relax_salt,
+                        real_salt_flux=rsf)
+
+
+def fresh_water_balance_zstar(water_flux, evaporation, ice_sublimation, prec_rain,
+                              prec_snow, a_ice_old, runoff_node, thdgr, thdgrsn,
+                              areasvol_surf, ocean_area, cfg: IceConfig = IceConfig(),
+                              *, owned_mask=None, axis_name=None):
+    """zstar global freshwater-flux balancing (``fesom_ice_coupling.c:178-216``, gated
+    ``!use_virt_salt``). Removes the spurious GLOBAL-MEAN freshwater input so the column-
+    distributed SSH change conserves volume::
+
+        flux = evaporation − ice_sublimation + prec_rain + prec_snow·(1−a_ice_old) + runoff
+             − thdgr·ρice/ρwat − thdgrsn·ρsno/ρwat
+        net  = ⟨flux⟩  (area-weighted global mean);   water_flux += net
+
+    The global mean routes through :func:`sss_runoff._global_mean` ⇒
+    :func:`reductions.global_sum` (owned-node sum + ``psum``) so the sharded path is
+    psum-correct. Under linfs this block is never called (``ale_cfg=None``)."""
+    inv_rhowat = 1.0 / cfg.rhowat
+    flux = (evaporation - ice_sublimation + prec_rain
+            + prec_snow * (1.0 - a_ice_old) + runoff_node
+            - thdgr * cfg.rhoice * inv_rhowat
+            - thdgrsn * cfg.rhosno * inv_rhowat)
+    net = _area_mean(flux, areasvol_surf, ocean_area,
+                     owned_mask=owned_mask, axis_name=axis_name)
+    return water_flux + net
 
 
 # --------------------------------------------------------------------------

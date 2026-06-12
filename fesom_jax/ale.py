@@ -28,12 +28,62 @@ no cavity / no partial cells, single MPI rank):
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import jax.numpy as jnp
 from jax import lax
 
 from . import ops
 from .config import DT_DEFAULT, USE_WSPLIT, WSPLIT_MAXCFL
 from .mesh import Mesh
+
+
+class AleConfig(NamedTuple):
+    """Static ALE (vertical-coordinate) config — the Phase-9a ``which_ALE='zstar'``
+    seam (locked decision 2). Closed over the step / passed as a ``static_argname``,
+    exactly like :class:`~fesom_jax.gm.GMConfig` / :class:`~fesom_jax.kpp.KppConfig`
+    / ``IceConfig``. Hashable (all fields are Python scalars/bools); carries **no**
+    differentiable leaves.
+
+    **The presence of an ``AleConfig`` ⇒ zstar; ``ale_cfg=None`` ⇒ the linfs path**
+    (byte-identical to the pre-Phase-9 model). This mirrors the C runtime switch
+    ``fesom_ale_mode_init`` (``fesom_ale.c:13-33``): ``FESOM_ALE`` is ``linfs`` (default)
+    or ``zstar``; **any other mode aborts** — zlevel / local-zstar / partial cells /
+    floating ice / cavities are out of scope (no reference run ⇒ no oracle). We port that
+    abort as :meth:`validate` (a runtime guard at the step seam, the C's
+    ``exit(1)`` parity), since ``typing.NamedTuple`` forbids a ``__new__`` override.
+
+    Derived (the C's two mode globals, ``fesom_ale.c:31-32``):
+
+    * :attr:`use_virt_salt` = ``not zstar`` (zstar ⇒ ``False``: real freshwater/salt
+      fluxes replace the virtual-salt flux);
+    * :attr:`is_nonlinfs` = ``1.0 if zstar else 0.0`` (the float multiplier the surface
+      BCs / forcing terms gate on).
+    """
+
+    zstar: bool = True            # which_ALE = 'zstar' (the only supported non-linfs mode)
+
+    @property
+    def use_virt_salt(self) -> bool:
+        """``fesom_use_virt_salt = !fesom_ale_zstar`` (``fesom_ale.c:31``)."""
+        return not self.zstar
+
+    @property
+    def is_nonlinfs(self) -> float:
+        """``fesom_is_nonlinfs = fesom_ale_zstar ? 1.0 : 0.0`` (``fesom_ale.c:32``)."""
+        return 1.0 if self.zstar else 0.0
+
+    def validate(self) -> "AleConfig":
+        """Raise on an unsupported mode (the C ``fesom_ale_mode_init`` abort parity,
+        ``fesom_ale.c:25-30``). Called at the step seam whenever ``ale_cfg is not None``;
+        returns ``self`` so it can wrap an expression. ``ale_cfg=None`` is the linfs path
+        and never reaches here."""
+        if not self.zstar:
+            raise ValueError(
+                "AleConfig only supports which_ALE='zstar' (zstar=True); zlevel / "
+                "local-zstar / partial cells are out of scope (no C reference run). "
+                "Use ale_cfg=None for the linfs path. (fesom_ale.c:25-30 abort parity)")
+        return self
 
 
 def _shift_down_zero(x):
@@ -69,6 +119,160 @@ def commit_thickness(mesh: Mesh, hnode_new):
     helem = (h3[:, 0] + h3[:, 1] + h3[:, 2]) / 3.0
     helem = ops.mask_below_bottom(helem, mesh.elem_layer_mask)
     return hnode, helem
+
+
+# ===========================================================================
+# zstar (Phase 9a) — thickness machinery: init + derived live geometry (JZ.1)
+# ===========================================================================
+# Decision D1: zbar_3d_n / Z_3d_n are NOT carried State — they are recomputed from
+# the prognostic `hnode` by `live_geometry`, replicating the C commit's bottom→top
+# reconstruction (`fesom_ale_update_thickness_zstar`, fesom_ale.c:228-240). Decision
+# D5 (AD): every below-stretch / below-bottom lane is filled with NOMINAL spacing
+# (the strictly-decreasing `mesh.zbar`), never the C's 0-padding (`mesh.zbar_3d_n`
+# below bottom is 0 ⇒ dz=0 ⇒ a dense-JAX inf factory; verified all 3140 pi nodes).
+
+
+def _stretch_mask(mesh: Mesh):
+    """Static boolean ``[nod2D, nl]``: the zstar **stretch range** — layers/interfaces
+    ``nz ≤ nlevels_nod2D_min(n) − 3`` (0-based), i.e. ``nz < min_f − 2``. These are the
+    layers above the shallowest neighbouring bottom; only they stretch with the SSH
+    change (the bottom-intersecting + bottom layers keep nominal spacing). Derives
+    purely from the static integer level array ⇒ precomputable, traceable as a constant
+    (`fesom_ale.c:70,78` ``nz = 1..min-2`` 1-based)."""
+    nl = mesh.zbar.shape[0]
+    k = jnp.arange(nl)[None, :]                              # (1, nl) 0-based level
+    min_f = jnp.asarray(mesh.nlevels_nod2D_min)[:, None]     # (nod2D,1) 1-based K_v⁻
+    return k < (min_f - 2)
+
+
+def init_thickness_zstar(mesh: Mesh, hbar, hbar_old, *, alpha: float = 1.0,
+                         dt: float = DT_DEFAULT):
+    """zstar thickness initialisation (``fesom_ale_init_thickness_zstar``,
+    ``fesom_ale.c:45-146``). Returns ``(hnode, helem, eta_n, ssh_rhs_old)``.
+
+    * **Stretch layers** (``nz < min_f−2``): ``hnode = (zbar[nz]−zbar[nz+1])·(1 +
+      hbar/dd)`` with ``dd = zbar[0] − zbar[min_f−2]`` (the stretchable column depth,
+      ``fesom_ale.c:75-82``). **Non-stretch layers** (bottom-intersecting + bottom):
+      nominal ``zbar[nz]−zbar[nz+1]`` — in full-cell (``use_partial_cell=.false.``)
+      this equals the C's ``bottom_node_thickness``, so the whole column is
+      ``(zbar diff)·(1 + (hbar/dd)·stretch)`` with no separate bottom field.
+    * **helem** = vertex mean of ``hnode`` (full mean; full-cell ⇒ matches the C's
+      ``update_thickness_zstar`` stretch-mean + ``bottom_elem_thickness`` to ≤1 ulp).
+    * ``eta_n = α·hbar_old + (1−α)·hbar`` — ⚠️ **REVERSED weights vs the per-step
+      blend** ``α·hbar + (1−α)·hbar_old`` (C lesson #7, ``fesom_ale.c:62-63``).
+    * ``ssh_rhs_old = (hbar − hbar_old)·areasvol[:,top]/dt`` (``fesom_ale.c:58-59``).
+
+    **Cold start (``hbar=hbar_old=0``)** ⇒ ``hnode``/``helem`` = nominal (linfs), ``eta_n
+    = ssh_rhs_old = 0`` — the zstar init is bit-for-bit the linfs rest init (the free Z1
+    degeneracy gate). AD-safe: ``dd`` gets the double-``where`` guard (nominal where 0)."""
+    zbar = mesh.zbar                                          # (nl,)
+    nl = zbar.shape[0]
+    # nominal layer thickness dz[nz] = zbar[nz]-zbar[nz+1] > 0, padded to nl (last 0).
+    dz = jnp.zeros((nl,)).at[:-1].set(zbar[:-1] - zbar[1:])   # (nl,)
+    min_f = jnp.asarray(mesh.nlevels_nod2D_min)               # (nod2D,) 1-based
+    # dd = zbar[0] - zbar[min_f-2] (per node); guard against dd==0 (double-where, AD).
+    anchor_dep = zbar[min_f - 2]                              # (nod2D,) static gather
+    dd = zbar[0] - anchor_dep                                 # (nod2D,)
+    dd_safe = jnp.where(dd != 0.0, dd, 1.0)
+    stretch = _stretch_mask(mesh)                             # (nod2D, nl)
+    ratio = jnp.where(dd != 0.0, hbar / dd_safe, 0.0)[:, None]   # (nod2D,1)
+    factor = 1.0 + jnp.where(stretch, ratio, 0.0)            # 1 off the stretch range
+    hnode = jnp.where(mesh.node_layer_mask, dz[None, :] * factor, 0.0)
+
+    hnode, helem = commit_thickness(mesh, hnode)            # vertex-mean helem (full cell)
+    eta_n = alpha * hbar_old + (1.0 - alpha) * hbar         # ⚠️ reversed weights (lesson #7)
+    ssh_rhs_old = (hbar - hbar_old) * mesh.areasvol[:, 0] / dt
+    return hnode, helem, eta_n, ssh_rhs_old
+
+
+def live_geometry(mesh: Mesh, hnode):
+    """Derived per-node interface/mid-layer depths ``(zbar_3d_n, Z_3d_n)`` ``[nod2D, nl]``
+    from the carried ``hnode`` (decision D1) — the zstar commit's bottom→top
+    reconstruction (``fesom_ale_update_thickness_zstar``, ``fesom_ale.c:228-240``) as a
+    PURE function of state (no carried geometry):
+
+        zbar_3d_n[nz] = zbar_3d_n[nz+1] + hnode[nz]   (nz = min_f−3 .. 0, bottom→top)
+        Z_3d_n[nz]    = zbar_3d_n[nz+1] + hnode[nz]/2
+
+    anchored at the nominal interface ``min_f−2`` (which keeps static spacing). Vectorized
+    as ``zbar_3d_n[nz] = anchor + Σ_{j≥nz} hnode_stretch[j]`` (a reverse cumsum over the
+    stretch range). At step 1 (nominal hnode) this is bit-identical to the C recurrence
+    (it telescopes); at step ≥2 the cumsum reassociates ~1e-10 vs the C's sequential
+    ``zbar[nz]=zbar[nz+1]+hnode[nz]`` — harmless for the gates (verified: switching to the
+    exact recurrence left the JZ.7 step-1 pgf byte-for-byte identical). If the JZ.7 multi-step
+    gate ever surfaces a geometry tail at step ≥2, swap this for a ``lax.scan`` recurrence.
+
+    **AD-safety (D5):** the non-stretch / below-bottom lanes are filled with the
+    strictly-decreasing **nominal ``zbar``** (positive spacing everywhere), NOT the
+    stored ``mesh.zbar_3d_n`` (0-padded below bottom ⇒ ``dz=0`` ⇒ inf on divide).
+    In the wet range ``mesh.zbar_3d_n == zbar`` (non-cavity full-cell), so the output
+    matches the static geometry there; consumers mask the below-bottom lanes anyway."""
+    zbar = mesh.zbar                                          # (nl,)
+    nl = zbar.shape[0]
+    min_f = jnp.asarray(mesh.nlevels_nod2D_min)              # (nod2D,) 1-based
+    stretch = _stretch_mask(mesh)                            # (nod2D, nl)
+    anchor = zbar[min_f - 2][:, None]                        # (nod2D,1) nominal anchor depth
+
+    # zbar: bottom→top reverse cumsum of the stretch-layer thicknesses, on the anchor.
+    h_str = jnp.where(stretch, hnode, 0.0)
+    revcum = lax.cumsum(h_str, axis=1, reverse=True)        # Σ_{j≥nz} h_str[j]
+    zbar_nom = jnp.broadcast_to(zbar[None, :], (mesh.nod2D, nl))   # AD-safe nominal (dz>0)
+    zbar_3d_n = jnp.where(stretch, anchor + revcum, zbar_nom)
+
+    # Z mid-layer: zbar_3d_n[nz+1] + hnode[nz]/2 in the stretch range; nominal mesh.Z below.
+    zbar_below = jnp.concatenate([zbar_3d_n[:, 1:], zbar_3d_n[:, -1:]], axis=1)  # [nz+1]
+    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])             # (nl,) nominal mid-depths, padded
+    Z_3d_n = jnp.where(stretch, zbar_below + 0.5 * hnode, Zp[None, :])
+    return zbar_3d_n, Z_3d_n
+
+
+def vert_vel_zstar_distribute(mesh: Mesh, w, hnode, zbar_3d_n, hbar, hbar_old,
+                              water_flux, *, dt: float = DT_DEFAULT):
+    """zstar branch of vert_vel (substep 13 add-on, ``fesom_ale_vert_vel_zstar_distribute``,
+    ``fesom_ale.c:162-201``). Distributes the per-step SSH change ``(hbar−hbar_old)``
+    proportionally over the **stretched** part of the column, ON TOP of the shared
+    divergence-built ``w`` (:func:`compute_w`), and produces the new layer thickness
+    ``hnode_new``. Returns ``(w, hnode_new)``.
+
+    Per non-cavity node (``zbar_3d_n``/``hnode`` are the **pre-commit/carried** live
+    geometry from ``st.hnode``; ``hbar``/``hbar_old`` the post-:func:`~fesom_jax.ssh.compute_hbar`
+    values):
+
+        dd1 = zbar_3d_n[min_f−2]                 (anchor interface, first non-stretch)
+        dd  = (hbar − hbar_old) / (zbar_3d_n[0] − dd1)
+        nz < min_f−2:  w[nz]        −= (zbar_3d_n[nz] − dd1)·dd/dt     (vertically-INTEGRATED,
+                       hnode_new[nz] = hnode[nz] + (zbar_3d_n[nz]−zbar_3d_n[nz+1])·dd   NOT per-layer)
+        w[0] −= water_flux                        (real-volume surface continuity BC)
+
+    The ``w`` correction is the bottom→top integral ``Σ dh/dt`` (depth-weighted), **not**
+    the per-layer ``h·dd/dt``; below the stretch range (``nz ≥ min_f−2``) ``hnode_new`` keeps
+    the nominal ``hnode`` (bottom layers don't stretch). At **cold start** (``hbar=hbar_old``)
+    ``dd=0`` ⇒ ``w`` unchanged and ``hnode_new=hnode`` (the degeneracy gate). AD-safe: the
+    stretchable depth gets the double-``where`` guard; live ``zbar_3d_n`` is strictly
+    decreasing (positive spacing) so every divide/subtract is finite.
+
+    The caller (``step.py``) exchanges BOTH ``w`` and ``hnode_new`` (the C's zstar-only
+    ``exchange_nod(hnode_new)``, ``fesom_ale.c:157`` — its halo feeds the Z1 commit)."""
+    min_f = jnp.asarray(mesh.nlevels_nod2D_min)             # (nod2D,) 1-based K_v⁻
+    nocav = (mesh.ulevels_nod2D == 1)                       # non-cavity node mask
+    # anchor interface dd1 = zbar_3d_n[n, min_f−2] (the first non-stretch interface, nominal)
+    dd1 = jnp.take_along_axis(zbar_3d_n, (min_f - 2)[:, None], axis=1)[:, 0]   # (nod2D,)
+    col = zbar_3d_n[:, 0] - dd1                             # stretchable column depth (>0)
+    col_safe = jnp.where(col != 0.0, col, 1.0)
+    dd = jnp.where(col != 0.0, (hbar - hbar_old) / col_safe, 0.0)              # (nod2D,)
+    dddt = dd / dt
+    stretch = _stretch_mask(mesh) & nocav[:, None]         # (nod2D,nl) — the C loop range nz<min_f−2
+
+    # Wvel correction: subtract the vertically-integrated (zbar_3d_n − dd1)·dd/dt on the stretch range.
+    w = w - jnp.where(stretch, (zbar_3d_n - dd1[:, None]) * dddt[:, None], 0.0)
+    # hnode_new: stretch layers grow by (Δzbar_3d_n)·dd; non-stretch (+ below bottom) stay nominal hnode.
+    zbar_below = jnp.concatenate([zbar_3d_n[:, 1:], zbar_3d_n[:, -1:]], axis=1)   # [nz+1]
+    hnode_new = jnp.where(stretch, hnode + (zbar_3d_n - zbar_below) * dd[:, None], hnode)
+    # surface freshwater BC w[0] −= wf (non-cavity; independent of the stretch range, fesom_ale.c:189).
+    # water_flux=None ⇒ zero flux (the C's `water_flux ? water_flux[n] : 0.0` startup arm).
+    if water_flux is not None:
+        w = w.at[:, 0].add(-jnp.where(nocav, water_flux, 0.0))
+    return w, hnode_new
 
 
 def compute_w(mesh: Mesh, uv, helem):

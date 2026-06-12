@@ -118,17 +118,40 @@ class State:
         )
 
     @classmethod
-    def rest(cls, mesh: Mesh, T0: float = 10.0, S0: float = 35.0, *, xp=jnp) -> "State":
+    def rest(cls, mesh: Mesh, T0: float = 10.0, S0: float = 35.0, *, xp=jnp,
+             ale_cfg=None) -> "State":
         """Rest state: zero flow/SSH, constant ``T=T0``/``S=S0``, reference layer
         thicknesses (``zbar`` differences). The exact C-matching rest init is a
         Phase-2 gate; this is a clean physical starting point.
 
         ``xp`` selects the array backend (see :meth:`zeros`): the default ``jnp`` is
-        byte-identical to before; ``xp=np`` builds on the HOST (the dars/NG5 setup-OOM fix)."""
+        byte-identical to before; ``xp=np`` builds on the HOST (the dars/NG5 setup-OOM fix).
+
+        ``ale_cfg`` (Phase 9a): an :class:`~fesom_jax.ale.AleConfig` ⇒ the thickness IC is
+        built by :func:`fesom_jax.ale.init_thickness_zstar` instead of the bare ``zbar``
+        differences. At cold start (``hbar=0``) the two are **bit-for-bit identical** (the
+        free Z1 degeneracy gate) — the zstar stretch factor ``(1+hbar/dd)`` is 1 — so this
+        is a no-op on the values, just the explicit zstar entry point (the carried thickness
+        becomes time-varying only once the run starts). ``None`` ⇒ the linfs path (unchanged).
+        Only the ``jnp`` backend is supported with ``ale_cfg`` (the host-numpy path is the
+        big-mesh sharding setup; its zstar IC is out of scope here)."""
         st = cls.zeros(mesh, xp=xp)
         n, e, nl = mesh.nod2D, mesh.elem2D, mesh.nl
         T = xp.full((n, nl), float(T0), xp.float64)
         S = xp.full((n, nl), float(S0), xp.float64)
+
+        if ale_cfg is not None:
+            ale_cfg.validate()
+            if xp is not jnp:
+                raise NotImplementedError(
+                    "State.rest(ale_cfg=...) supports the jnp backend only (the host-numpy "
+                    "path is the big-mesh sharding setup; zstar IC there is out of scope)")
+            from . import ale as _ale       # lazy: keep ale off the host-numpy import path
+            hbar0 = jnp.zeros((n,), jnp.float64)
+            hnode, helem, eta_n, ssh_rhs_old = _ale.init_thickness_zstar(mesh, hbar0, hbar0)
+            return dataclasses.replace(
+                st, T=T, S=S, T_old=T, S_old=S, hnode=hnode, hnode_new=hnode, helem=helem,
+                eta_n=eta_n, ssh_rhs_old=ssh_rhs_old)
 
         # reference layer thickness h[k] = z(k) - z(k+1) > 0, masked to valid layers. The
         # jnp path uses the original .at[].set(); the numpy path the equivalent slice-assign

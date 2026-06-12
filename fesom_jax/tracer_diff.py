@@ -66,7 +66,7 @@ def _shift_up(x):
 
 
 def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT,
-                       bc_surf=None, sw_3d=None):
+                       bc_surf=None, sw_3d=None, Z3d=None):
     """Per-node implicit vertical diffusion of one tracer. Returns the updated
     tracer ``[nod2D, nl]`` (``diff_ver_part_impl_ale``, ``fesom_tracer_diff.c:85``).
 
@@ -75,21 +75,27 @@ def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT,
     ``None``) is the shortwave flux whose per-layer divergence is added to every valid
     layer's RHS (T tracer only, ``:298-308``). Both ``None`` ⇒ the Phase-2 path."""
     nl = mesh.nl
-    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])           # (nl,) static mid-depths
-    # Layer-center spacings. The padded tail (and the unused k=0 of dZ_up) is exactly
-    # 0; replace those zeros with 1 so the masked-off a/c lanes are FINITE — a bare 0
-    # denominator yields inf/NaN that the `where` masks forward but that POISONS the
-    # backward pass (0·inf = NaN in d/d(Kv); cf. the eos unused-N²-level lesson).
-    dZ_up = _shift_down(Zp) - Zp                          # Z[nz-1]-Z[nz]; [0]=0 unused (a=0)
-    dZ_dn = Zp - _shift_up(Zp)                            # Z[nz]-Z[nz+1]; tail=0 unused
+    # Layer-center spacings dZ. Static column-uniform ``mesh.Z`` or — under zstar (JZ.6) —
+    # the per-node live mid-depths ``Z3d`` (the C builds zbar_n/Z_n from hnode_new,
+    # ``tracer_diff.c:148-158``). ``Z3d=None`` ⇒ static, byte-identical.
+    # The padded tail (and the unused k=0 of dZ_up) is exactly 0; replace those zeros with 1
+    # so the masked-off a/c lanes are FINITE — a bare 0 denominator yields inf/NaN that the
+    # `where` masks forward but POISONS the backward pass (0·inf = NaN in d/d(Kv)).
+    if Z3d is None:
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])       # (nl,) static mid-depths
+        dZ_up = (_shift_down(Zp) - Zp)[None, :]           # Z[nz-1]-Z[nz]; [0]=0 unused (a=0)
+        dZ_dn = (Zp - _shift_up(Zp))[None, :]             # Z[nz]-Z[nz+1]; tail=0 unused
+    else:
+        dZ_up = _shift_down(Z3d) - Z3d                    # (nod2D,nl) per-node live spacing
+        dZ_dn = Z3d - _shift_up(Z3d)
     dZ_up = jnp.where(dZ_up == 0.0, 1.0, dZ_up)
     dZ_dn = jnp.where(dZ_dn == 0.0, 1.0, dZ_dn)
 
     area = mesh.area
     safe_av = jnp.where(mesh.areasvol > 0.0, mesh.areasvol, 1.0)
 
-    a_full = -Kv * dt / dZ_up[None, :] * (area / safe_av)
-    c_full = -_shift_up(Kv) * dt / dZ_dn[None, :] * (_shift_up(area) / safe_av)
+    a_full = -Kv * dt / dZ_up * (area / safe_av)
+    c_full = -_shift_up(Kv) * dt / dZ_dn * (_shift_up(area) / safe_av)
 
     k = jnp.arange(nl)[None, :]
     nzmin = (mesh.ulevels_nod2D - 1)[:, None]
@@ -123,12 +129,13 @@ def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT,
 
 
 def impl_vert_diff(mesh: Mesh, T, S, Kv, hnode_new, *, dt: float = DT_DEFAULT,
-                   bc_T=None, bc_S=None, sw_3d=None):
+                   bc_T=None, bc_S=None, sw_3d=None, Z3d=None):
     """Diffuse both tracers with the same ``Kv`` (``fesom_impl_vert_diff_tracers``,
     ``fesom_tracer_diff.c:338``). Returns ``(T_new, S_new)``.
 
     ``bc_T``/``bc_S`` are the per-tracer surface BC increments (``None`` ⇒ 0); ``sw_3d``
     is the shortwave flux applied to **T only** (``None`` ⇒ off). All ``None`` ⇒ the
-    Phase-2 pi path (bit-identical)."""
-    return (impl_vert_diff_one(mesh, T, Kv, hnode_new, dt=dt, bc_surf=bc_T, sw_3d=sw_3d),
-            impl_vert_diff_one(mesh, S, Kv, hnode_new, dt=dt, bc_surf=bc_S, sw_3d=None))
+    Phase-2 pi path (bit-identical). ``Z3d`` (zstar live mid-depths from ``hnode_new``;
+    ``None`` ⇒ static, byte-identical) re-points the layer-center spacings (JZ.6)."""
+    return (impl_vert_diff_one(mesh, T, Kv, hnode_new, dt=dt, bc_surf=bc_T, sw_3d=sw_3d, Z3d=Z3d),
+            impl_vert_diff_one(mesh, S, Kv, hnode_new, dt=dt, bc_surf=bc_S, sw_3d=None, Z3d=Z3d))

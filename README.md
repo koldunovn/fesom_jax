@@ -193,6 +193,13 @@ $PY scripts/bench_forward_scaling.py --mesh-dir data/mesh_core2 \
 Meshes are dense `.npy` bundles exported from the C port (`docs/MESH_EXPORT_LAYOUT.md`). Cache a
 mesh's PHC IC once with `scripts/cache_phc_ic.py --mesh-dir <M> --out-dir <M>` (slow at NG5 scale).
 
+⚠️ The C IC is **partition-dependent** (the `extrap_nod3D` Gauss-Seidel land fill is
+order-dependent and runs per-rank), so an IC meant to match a C dump oracle bit-for-bit must be
+built with that run's partition. Two CORE2 caches coexist: `data/ic_core2` = the **serial**
+(1-rank) order (`cache_phc_ic.py`; the legacy core2/kpp/gm/ice oracles were 1-rank runs) and
+`data/ic_core2_dist16` = the **dist_16** order (`scripts/rebuild_ic_dist16.py`; matches the
+16-rank `z2_cdump` zstar oracle).
+
 **Mesh ladder + per-mesh timestep** (CFL — `dt` is mesh-specific):
 
 | mesh  | nodes  | levels | dt (cold) | min nodes (JAX) |
