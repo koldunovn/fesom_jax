@@ -490,3 +490,13 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
   wf-ordering and `bc_T` sval-timing notes added to JZ.2/JZ.3. Review verified D1/D2 sound (D2
   telescoping confirmed algebraically exact vs the C, `fesom_ssh.c:229-231`) and the JZ ladder
   complete vs the C Z0–Z10.
+- **2026-06-12 — JZ.6 + JZ.7 COMPLETE.** JZ.6: the 5 remaining consumers re-pointed to live
+  geometry (tracer_adv QR4C, momentum element-stack via the new `ale.live_geometry_elem`, gm/gm_redi,
+  kpp ×5, forcing sw-pen, + the audit-caught `eos.compute_dbsfc`), the which-side map confirmed
+  against the C source (4-agent extraction). All byte-neutral (suite OCEAN 529 + ICE 47, 0 fail, job
+  25550512). JZ.7: step-1 gate re-green with JZ.6; the **multi-step (1-3) gate** (job 25550843) —
+  pgf bit-faithful on genuinely-live geometry at steps ≥2 (the JZ.6 validation), the d_eta/hbar ~mm
+  divergence root-caused as the warm-started CG early-stop (same soltol as C, bounded, not a bug);
+  the **sharded N-vs-1** (job 25551060) — npes=1 byte-id + npes=2 owned-match, every zstar State field
+  at the clean reassociation floor (hnode_new 2.8e-14, d_eta 3.3e-16). **Next: JZ.8** (10-day A100
+  stability, year-scale climate vs `c_zstar_2yr`, the §4 gradient gates — GATE 9a evidence).
