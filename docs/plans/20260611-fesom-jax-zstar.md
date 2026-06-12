@@ -430,10 +430,21 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
 **Files:** Create: `scripts/core2_zstar_stability.{py,sbatch}`, `scripts/core2_zstar_grad_gate.{py,sbatch}`.
 
 - [ ] 10-day CORE2 A100 zstar-ON (KPP+GM+ice) stable, no NaN; SSH/steric sanity (global mean drift)
+      — ⬜ needs A100 + `scripts/core2_zstar_stability.{py,sbatch}` (not yet written).
 - [ ] year-scale: JAX-zstar ↔ `c_zstar_2yr` SST/SSS — must be ≪ the zstar↔linfs contrast (3–9×)
-- [ ] gradient gates per §4 (masked-NaN probe, k_ver plateau zstar-ON, CG transpose residual,
-      d/d(hbar-IC) finite)
-- [ ] full suite green
+      — ⬜ needs the 2-yr A100 run + the monthly-SST/SSS comparison tooling (the K.9 style).
+- [x] gradient gates per §4 — **DONE (2026-06-12, job 25551862, `test_jz8_grad_*_zstar` (3) +
+      `scripts/jz8_grad_gate.sbatch`).** All N=1 backward through the assembled zstar step on a
+      compute node (no ice scan ⇒ CPU-feasible): **masked-NaN** `d(SST)/d(T₀)` through KPP+GM+zstar
+      finite EVERYWHERE + nonzero on wet + EXACTLY 0 on masked lanes (the live-geometry ÷thickness
+      guards + shchepetkin safe denominators + vert_vel/D2/forcing-flip paths are AD-safe);
+      `d(SST)/d(k_ver)` (PP+zstar) finite+nonzero; **`d(SST)/d(hbar-IC)`** (GM+zstar, the NEW
+      prognostic-thickness state path: `init_thickness_zstar`→live geometry→D2 closure) finite+nonzero.
+      The CG transpose with the state-dependent D2 matvec is gated by JZ.3
+      (`test_solve_ssh_state_dependent_transpose_residual`); the quantitative FD↔AD plateau is the
+      deferred GPU gate (`scripts/core2_zstar_grad_gate.*`, smooth-regime/N=1).
+- [ ] full suite green — ocean/ice green (job 25550512); the JZ.8 grad gates gate via
+      `jz8_grad_gate.sbatch` (heavy CORE2 backward, like `test_gradient_core2`).
 
 ### JZ.9 — Close-out
 

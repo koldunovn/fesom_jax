@@ -1136,3 +1136,119 @@ def test_jz7_assembled_zstar_steps123(capsys):
         wv_p50 = 1e-9 if s == 1 else 1e-6      # observed s1~1e-10, s2/s3~1.7e-7/3.3e-7
         assert pc(s, "Wvel", 50) < wv_p50 and mx(s, "Wvel") < cg_max, \
             f"Wvel p50={pc(s, 'Wvel', 50):.2e} max={mx(s, 'Wvel'):.2e} step {s}"
+
+
+# ==========================================================================
+# 13. JZ.8 — gradient gates (GATE 9a §4): the differentiability contract, zstar-ON
+# ==========================================================================
+# The assembled-model masked-NaN probe + the param/IC gradients with ale_cfg ON. N=1 (one
+# step, no scan) — the cheapest backward that still traverses every zstar masked-divide lane
+# (live geometry's ÷thickness guards, the shchepetkin safe denominators, the vert_vel /
+# D2-closure / forcing-flip paths). KPP+GM+zstar+forcing, NO ice (the EVP 120-subcycle scan
+# backward is the memory hog — ice AD is covered by K.10/JZ.2; every zstar-specific AD path is
+# in the OCEAN step). A WARM hbar seed ⇒ the live geometry is genuinely active under AD. The
+# CG transpose with the state-dependent D2 matvec is already gated by JZ.3
+# (test_solve_ssh_state_dependent_transpose_residual); the quantitative FD↔AD plateau is the
+# GPU gate (scripts/, JZ.8 deliverable). These run on a compute node (-p compute, CPU).
+def _mean_sst_z(state, mesh):
+    wet0 = jnp.asarray(mesh.node_layer_mask[:, 0])
+    return jnp.sum(jnp.where(wet0, state.T[:, 0], 0.0)) / jnp.sum(wet0)
+
+
+def _jz8_grad_setup(mesh):
+    """CORE2 warm-zstar state (stretched hnode via the zstar init) + 1-step forcing + op."""
+    from fesom_jax import core2_forcing
+    from fesom_jax.phc_ic import core2_initial_state
+    state = core2_initial_state(mesh, CORE2_IC)
+    sst = np.asarray(state.T[:, 0])
+    lat = np.asarray(mesh.geo_coord_nod2D)[:, 1]
+    hbar = jnp.asarray(0.5 * np.cos(2.0 * lat))           # ~0.5 m bump ⇒ stretched column
+    hnode, helem, eta_n, sro = ale.init_thickness_zstar(mesh, hbar, jnp.zeros_like(hbar), dt=DT_ZSTAR)
+    state = dataclasses.replace(state, hbar=hbar, hbar_old=jnp.zeros_like(hbar), hnode=hnode,
+                                helem=helem, eta_n=eta_n, ssh_rhs_old=sro)
+    op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
+    cf = core2_forcing.build_core_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
+    sf = cf.step_forcing(*core2_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
+    return state, op, cf.static, sf
+
+
+@core2_forcing_missing
+def test_jz8_grad_ic_field_finite_zstar():
+    """GATE 9a masked-NaN probe: ``d(mean SST)/d(T₀)`` over one assembled KPP+GM+**zstar** step
+    is finite EVERYWHERE (incl. below-bottom/masked lanes — the strong probe a scalar gradient
+    misses), nonzero on wet layers, and EXACTLY 0 on masked lanes. Traverses every zstar
+    masked-divide backward: the live geometry's ÷thickness double-``where`` guards (EOS/PP/
+    dbsfc/KPP/QR4C/momentum/GM re-points), the shchepetkin safe denominators, the vert_vel
+    distribute, and the D2-stiffness closure in the CG — the proof the JZ.6 re-points + the
+    JZ.1-5 kernels are AD-safe under the moving coordinate (the masked-NaN rule, lesson)."""
+    import jax
+    from fesom_jax.gm import GMConfig
+    from fesom_jax.kpp import KppConfig
+    mesh = load_mesh(CORE2_MESH)
+    st0, op, fs, sf = _jz8_grad_setup(mesh)
+    mlay = np.asarray(mesh.node_layer_mask)
+    cfgs = dict(kpp_cfg=KppConfig(), gm_cfg=GMConfig(), ale_cfg=AleConfig())
+
+    def loss(T0):
+        s = dataclasses.replace(st0, T=T0)        # keep T_old = the const base (AB2)
+        fin = stepmod.step(s, mesh, op, None, dt=DT_ZSTAR, is_first_step=True,
+                           step_forcing=sf, forcing_static=fs, **cfgs)
+        return _mean_sst_z(fin, mesh)
+
+    g = np.asarray(jax.grad(loss)(st0.T))
+    assert np.all(np.isfinite(g)), f"{int(np.isnan(g).sum())} non-finite grad entries (zstar masked-NaN)"
+    assert np.max(np.abs(g[mlay])) > 0.0, "IC gradient identically zero on wet layers (zstar)"
+    assert np.max(np.abs(g[~mlay])) == 0.0, "below-bottom lanes carry spurious gradient (zstar)"
+
+
+@core2_forcing_missing
+def test_jz8_grad_kver_finite_zstar():
+    """``d(mean SST)/d(k_ver)`` over one **zstar** step is finite + nonzero — the PP background
+    diffusivity (the 1st ML-hook) routes through ``Kv`` → the vertical tracer diffusion (whose
+    layer-center spacings are now the live ``Z_3d_n``-from-``hnode_new``), with the bulk
+    ``heat_flux→bc_T`` + the zstar ``−dt·sval·wf`` surface term in the RHS. PP path (KPP off)
+    so ``k_ver`` is live; zstar ON so the diffusion geometry is the moving coordinate."""
+    import jax
+    import jax.numpy as _jnp
+    from fesom_jax.config import A_VER
+    from fesom_jax.params import Params
+    mesh = load_mesh(CORE2_MESH)
+    st0, op, fs, sf = _jz8_grad_setup(mesh)
+
+    def loss(kver):
+        p = Params(k_ver=kver, a_ver=_jnp.asarray(A_VER, _jnp.float64))
+        fin = stepmod.step(st0, mesh, op, None, params=p, dt=DT_ZSTAR, is_first_step=True,
+                           step_forcing=sf, forcing_static=fs, ale_cfg=AleConfig())
+        return _mean_sst_z(fin, mesh)
+
+    g_ad = float(jax.grad(loss)(_jnp.asarray(1e-4, _jnp.float64)))
+    assert np.isfinite(g_ad) and g_ad != 0.0, f"d(mean SST)/d(k_ver) zstar = {g_ad}"
+
+
+@core2_forcing_missing
+def test_jz8_grad_hbar_ic_finite_zstar():
+    """GATE 9a NEW state path: ``d(mean SST)/d(hbar-IC)`` over one assembled GM+**zstar** step is
+    finite + nonzero. The initial SSH ``hbar`` rebuilds the stretched ``hnode``/``helem`` (via
+    ``init_thickness_zstar``) ⇒ the live geometry ⇒ density/PGF/diffusion ⇒ SST, AND feeds the
+    D2 stiffness increment (the ``custom_linear_solve`` matvec closing over ``hbar``). This is
+    the gradient through the zstar-only prognostic-thickness path that linfs has no analog for —
+    the proof the derived-geometry (D1) + stiffness-as-state (D2) closures are differentiable."""
+    import jax
+    import jax.numpy as _jnp
+    from fesom_jax.gm import GMConfig
+    mesh = load_mesh(CORE2_MESH)
+    st0, op, fs, sf = _jz8_grad_setup(mesh)
+    z = _jnp.zeros(mesh.nod2D)
+    cfgs = dict(gm_cfg=GMConfig(), ale_cfg=AleConfig())
+
+    def loss(hbar_ic):
+        hnode, helem, eta_n, sro = ale.init_thickness_zstar(mesh, hbar_ic, z, dt=DT_ZSTAR)
+        s = dataclasses.replace(st0, hbar=hbar_ic, hbar_old=z, hnode=hnode, helem=helem,
+                                eta_n=eta_n, ssh_rhs_old=sro)
+        fin = stepmod.step(s, mesh, op, None, dt=DT_ZSTAR, is_first_step=True,
+                           step_forcing=sf, forcing_static=fs, **cfgs)
+        return _mean_sst_z(fin, mesh)
+
+    g = np.asarray(jax.grad(loss)(_jnp.asarray(st0.hbar)))
+    assert np.all(np.isfinite(g)), f"{int(np.isnan(g).sum())} non-finite d/d(hbar-IC) entries"
+    assert np.max(np.abs(g)) > 0.0, "d(mean SST)/d(hbar-IC) identically zero (new state path dead)"
