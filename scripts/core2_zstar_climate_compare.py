@@ -54,11 +54,14 @@ def bias(a, b, mask):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--year", type=int, default=1958)
+    ap.add_argument("--jax-dir", type=str, default=str(JAX_DIR),
+                    help="JAX-zstar monthly output dir (e.g. data/zstar_climate_1yr_dist864)")
     args = ap.parse_args()
     y = args.year
+    jax_dir = Path(args.jax_dir)
 
     runs = {
-        "jax_zstar":     JAX_DIR / f"{{v}}.fesom.{y}.monthly.nc",
+        "jax_zstar":     jax_dir / f"{{v}}.fesom.{y}.monthly.nc",
         "c_zstar":       ZORACLE / "c_zstar_2yr" / f"{{v}}.fesom.{y}.monthly.nc",
         "fortran_zstar": ZORACLE / "fortran_zstar_2yr" / f"{{v}}.fesom.{y}.nc",
         "fortran_linfs": ZORACLE / "fortran_linfs_2yr_b" / f"{{v}}.fesom.{y}.nc",

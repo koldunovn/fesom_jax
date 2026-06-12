@@ -20,7 +20,7 @@ from fesom_jax.mesh import load_mesh
 from fesom_jax import partit, phc_ic
 
 CORE2_MESH = Path("data/mesh_core2")
-CORE2_DIST = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2/dist_864")
+CORE2_DIST = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2")   # parent; read_partition appends dist_864
 IC_DIR = Path("data/ic_core2_dist864")
 NRANK = 864
 

@@ -167,12 +167,14 @@ def main():
     ap.add_argument("--out", type=str, default="")
     ap.add_argument("--ale", choices=["on", "off"], default="off",
                     help="on ⇒ zstar (ale_cfg=AleConfig() + the dist16 IC); off ⇒ linfs (default)")
+    ap.add_argument("--ic-dir", type=str, default="",
+                    help="override the IC cache dir (e.g. data/ic_core2_dist864 to match an 864r oracle)")
     ap.add_argument("--steps", type=int, default=0, help="override n_steps (smoke test)")
     args = ap.parse_args()
     dt = args.dt
     n_steps = args.steps if args.steps > 0 else int(round(args.years * 365 * 86400 / dt))
     ale_cfg = AleConfig() if args.ale == "on" else None
-    ic_dir = IC_DIR_ZSTAR if args.ale == "on" else IC_DIR
+    ic_dir = Path(args.ic_dir) if args.ic_dir else (IC_DIR_ZSTAR if args.ale == "on" else IC_DIR)
     out = args.out or str(ROOT / "data" / ("zstar_climate" if args.ale == "on" else "kpp_climate_2yr"))
 
     print(f"[setup] backend={jax.default_backend()} devices={jax.devices()}", flush=True)
