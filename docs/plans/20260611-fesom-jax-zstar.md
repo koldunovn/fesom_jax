@@ -450,8 +450,12 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       was run on **864 ranks** (C zstar plan Z9, job 25495449) ≠ my **dist_16** IC — the documented
       partition-dependent `extrap_nod3D` GS fill ([[zstar-forcing-dump-config-gap]]) makes the dist_16
       and dist_864 ICs differ by up to ~25 PSU at the Baltic fill nodes ⇒ apples-to-oranges IC.
-      **Closure (running):** `scripts/rebuild_ic_dist864.{py,sbatch}` (job 25553563) builds the
-      dist_864-faithful IC (864-rank node lists from the partition files), then re-run + re-compare.
+      **Closure:** `scripts/rebuild_ic_dist864.{py,sbatch}` (job 25553646, 32s) built the
+      dist_864-faithful IC (864-rank `my_list` from the partition files) — and it **differs from the
+      dist_16 IC by up to 25.74 PSU (SSS), 512 differing nodes in the Baltic box** (= the original
+      finding's "~25.8 PSU at fill nodes", exactly the climate-divergence region) ⇒ IC mismatch
+      CONFIRMED. Re-running the 1-yr climate from `data/ic_core2_dist864`
+      (`scripts/core2_zstar_climate_dist864.sbatch`, job 25553805) + re-compare (`--jax-dir`).
 - [x] gradient gates per §4 — **DONE (2026-06-12, job 25551862, `test_jz8_grad_*_zstar` (3) +
       `scripts/jz8_grad_gate.sbatch`).** All N=1 backward through the assembled zstar step on a
       compute node (no ice scan ⇒ CPU-feasible): **masked-NaN** `d(SST)/d(T₀)` through KPP+GM+zstar

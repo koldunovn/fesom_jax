@@ -3224,3 +3224,21 @@ Cite the C source (`file:line`) or dump probe that proves it.
   N-vs-1-test a config-gated feature whose effect is a step-1 no-op (cold start), seed the state PAST
   the degeneracy first. (`test_zstar_{serial,assembled}_sharded_*`, `scripts/jz7_shard_zstar.sbatch`,
   Task JZ.7.)
+
+## Phase 9a — zstar (Task JZ.8 — climate: the IC-partition provenance bites a SECOND oracle)
+
+- **[verify/zstar] ⚠️ A year-scale climate MISMATCH (JAX-zstar↔C-zstar SSS 0.12 vs the C↔Fortran
+  ref 0.0015) was NOT a code bug — it was the partition-dependent IC ([[zstar-forcing-dump-config-gap]])
+  biting a DIFFERENT oracle than the one the IC was built for.** I built `data/ic_core2_dist16` to
+  match the **16-rank** `z2_cdump` (the step gate). But the climate oracle `c_zstar_2yr` was run on
+  **864 ranks** (the C plan's Z9, job 25495449) — and the C `extrap_nod3D` GS land fill is
+  order-dependent per-rank, so the dist_16 and dist_864 ICs differ by **up to 25.7 PSU at the Baltic
+  fill nodes** (`scripts/rebuild_ic_dist864.py` confirmed: 12258 surface nodes differ, 512 in the
+  Baltic). The smoking-gun signature that it's the IC and not the physics: the divergence is (a)
+  **largest at month 1, decaying** (a spin-up transient from a different start), (b) **localized to
+  the GS-fill nodes** (global p50 SSS = 1.7e-3 = the ref level), (c) **global salt budget conserved**
+  (no leak). Fix = build the IC for the ORACLE's partition (dist_864) and re-run. **Moral (a repeat,
+  now load-bearing): "which partition produced THIS oracle?" must be answered PER ORACLE — the dump
+  oracle and the climate oracle can be different decompositions, and an order-dependent IC fill makes
+  each one demand its own matched IC.** (`scripts/rebuild_ic_dist864.{py,sbatch}`,
+  `scripts/core2_zstar_climate_compare.py`, Task JZ.8.)
