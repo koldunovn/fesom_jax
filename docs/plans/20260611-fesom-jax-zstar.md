@@ -439,8 +439,19 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       failure mode), **global-mean ⟨hbar⟩ drift = −1.4e-4 m** (volume conserved under the real
       freshwater fluxes), |SSH|≈2 m, max|vel|≈1.9 m/s, **SST capped at −1.89 °C** (the ice
       supercooling cap holds under zstar), ice grows physically (m_ice 2.0→2.77, a_ice→1.0).
-- [ ] year-scale: JAX-zstar ↔ `c_zstar_2yr` SST/SSS — must be ≪ the zstar↔linfs contrast (3–9×)
-      — ⬜ needs the 2-yr A100 run + the monthly-SST/SSS comparison tooling (the K.9 style).
+- [~] year-scale: JAX-zstar ↔ `c_zstar_2yr` SST/SSS ≪ the zstar↔linfs contrast — **IN PROGRESS,
+      ⚠️ IC-PROVENANCE GAP found (2026-06-12).** JAX 1-yr 1958 run (job 25552572, **stable 17520
+      steps**) + `scripts/core2_zstar_climate_compare.py`. The comparison methodology is sound — C₀ =
+      RMS(C-zstar,Fortran-zstar) = **3.7e-3/1.5e-3** reproduces the plan-§0 reference 0.0038/0.0014
+      EXACTLY. But the aggregate gate FAILED: JAX↔C-zstar SST 1.9e-2 / SSS 0.12 (B/A≈1). **Diagnosed
+      (NOT a code bug):** the divergence is (a) **largest at month 1, decaying** to month 12, (b)
+      **localized to the Baltic/Kara GS-fill nodes** (global p50 SSS = 1.7e-3 = the C↔Fortran level),
+      (c) **global salt budget conserved** to ~2e-3 psu (no leak). Root cause VERIFIED: `c_zstar_2yr`
+      was run on **864 ranks** (C zstar plan Z9, job 25495449) ≠ my **dist_16** IC — the documented
+      partition-dependent `extrap_nod3D` GS fill ([[zstar-forcing-dump-config-gap]]) makes the dist_16
+      and dist_864 ICs differ by up to ~25 PSU at the Baltic fill nodes ⇒ apples-to-oranges IC.
+      **Closure (running):** `scripts/rebuild_ic_dist864.{py,sbatch}` (job 25553563) builds the
+      dist_864-faithful IC (864-rank node lists from the partition files), then re-run + re-compare.
 - [x] gradient gates per §4 — **DONE (2026-06-12, job 25551862, `test_jz8_grad_*_zstar` (3) +
       `scripts/jz8_grad_gate.sbatch`).** All N=1 backward through the assembled zstar step on a
       compute node (no ice scan ⇒ CPU-feasible): **masked-NaN** `d(SST)/d(T₀)` through KPP+GM+zstar
