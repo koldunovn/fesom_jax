@@ -680,9 +680,14 @@ the C, aborts). Port all three to JAX, **each differentiable**, each behind a st
 the `None/0 ⇒ bit-identical` guarantee, each gated against its own C dump oracle on
 `/work/ab0995/a270088/port/{zstar,tke,mevp}`:
 
-- **9a — zstar vertical coordinate:** `docs/plans/20260611-fesom-jax-zstar.md` (the invasive one:
-  live geometry, forcing flip incl. the rsf producer, state-dependent SSH stiffness via
-  `custom_linear_solve`, shchepetkin PGF).
+- **9a — zstar vertical coordinate: ✅ COMPLETE — GATE 9a MET (2026-06-12),**
+  `docs/plans/completed/20260611-fesom-jax-zstar.md` (live geometry, forcing flip incl. the rsf
+  producer, state-dependent SSH stiffness via `custom_linear_solve`, shchepetkin PGF). Behind
+  `ale_cfg=None` (linfs byte-identical, suite 529+47). Validated: step-1 bit-identity vs z2_cdump
+  (pgf 4e-16), SSH solve+D2 byte-id on CPU (controlled-replay 7e-16), sharded N-vs-1 clean, 10-day +
+  full-year A100 stable, gradients masked-NaN clean, year-scale climate JAX↔C-zstar SST 3.5e-3/SSS
+  3.0e-3 ≈ the C↔Fortran ref (B/A=5.7–7.4×, inside the 3–9× coordinate contrast). ⚠️ IC-partition
+  provenance is per-oracle (z2_cdump=16r `ic_core2_dist16`; c_zstar_2yr=864r `ic_core2_dist864`).
 - **9b — TKE mixing:** `docs/plans/20260611-fesom-jax-tke.md` (**the primary hybrid-ML seam** — a
   prognostic `State.tke` field; trainable `c_k/c_eps/cd/alpha_tke` in `Params` from day one;
   replay-primary validation).
