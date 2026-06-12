@@ -37,6 +37,7 @@ from netCDF4 import Dataset
 
 from fesom_jax import core2_forcing, ice, ssh
 from fesom_jax import step as stepmod
+from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
 from fesom_jax.kpp import KppConfig
@@ -46,6 +47,7 @@ from fesom_jax.phc_ic import core2_initial_state
 ROOT = Path(__file__).resolve().parents[1]
 MESH_DIR = ROOT / "data" / "mesh_core2"
 IC_DIR = ROOT / "data" / "ic_core2"
+IC_DIR_ZSTAR = ROOT / "data" / "ic_core2_dist16"   # --ale on: the zstar-canonical IC
 
 SSH_ABSMAX, VEL_ABSMAX, MICE_MAX = 5.0, 3.0, 20.0
 # C-port variable names / metadata (the m32_climate_compare surface fields + 3-D T/S)
@@ -162,17 +164,22 @@ def main():
     ap.add_argument("--start-year", type=int, default=1958)
     ap.add_argument("--dt", type=float, default=1800.0)
     ap.add_argument("--every", type=int, default=200)
-    ap.add_argument("--out", type=str, default=str(ROOT / "data" / "kpp_climate_2yr"))
+    ap.add_argument("--out", type=str, default="")
+    ap.add_argument("--ale", choices=["on", "off"], default="off",
+                    help="on ⇒ zstar (ale_cfg=AleConfig() + the dist16 IC); off ⇒ linfs (default)")
     ap.add_argument("--steps", type=int, default=0, help="override n_steps (smoke test)")
     args = ap.parse_args()
     dt = args.dt
     n_steps = args.steps if args.steps > 0 else int(round(args.years * 365 * 86400 / dt))
+    ale_cfg = AleConfig() if args.ale == "on" else None
+    ic_dir = IC_DIR_ZSTAR if args.ale == "on" else IC_DIR
+    out = args.out or str(ROOT / "data" / ("zstar_climate" if args.ale == "on" else "kpp_climate_2yr"))
 
     print(f"[setup] backend={jax.default_backend()} devices={jax.devices()}", flush=True)
     t0 = time.time()
     mesh = load_mesh(MESH_DIR)
-    sst0 = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])
-    state = ice.seed_ice(core2_initial_state(mesh, IC_DIR), mesh, sst0)
+    sst0 = np.asarray(core2_initial_state(mesh, ic_dir).T[:, 0])
+    state = ice.seed_ice(core2_initial_state(mesh, ic_dir), mesh, sst0)
     op = ssh.build_ssh_operator(mesh, dt=dt)
     dates = core2_forcing.dates_for_steps(args.start_year, dt, n_steps)
     cf_year = args.start_year
@@ -180,9 +187,9 @@ def main():
     ice_cfg, gm_cfg, kpp_cfg = IceConfig(), GMConfig(), KppConfig()
     diag = make_diag(mesh)
     nz1 = int(mesh.nl) - 1
-    writer = MonthlyWriter(args.out, mesh, nz1)
+    writer = MonthlyWriter(out, mesh, nz1)
     print(f"[setup] built in {time.time()-t0:.1f}s; {n_steps} steps × dt={dt:.0f} = "
-          f"{n_steps*dt/86400:.1f} days; monthly means → {args.out}", flush=True)
+          f"{n_steps*dt/86400:.1f} days; ale={args.ale}; monthly means → {out}", flush=True)
 
     @jax.jit
     def accumulate(acc, st):
@@ -216,7 +223,7 @@ def main():
         ts = time.time()
         state = stepmod.step_jit(state, mesh, op, None, dt=dt, is_first_step=(i == 0),
                                  step_forcing=sf, forcing_static=cf.static,
-                                 ice_cfg=ice_cfg, gm_cfg=gm_cfg, kpp_cfg=kpp_cfg)
+                                 ice_cfg=ice_cfg, gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, ale_cfg=ale_cfg)
         if (y, month) != (am_year, am_month):              # entered a new month → flush prev
             flush(am_year, am_month, acc, count, last_doy)
             acc, count = zero_acc(), 0
