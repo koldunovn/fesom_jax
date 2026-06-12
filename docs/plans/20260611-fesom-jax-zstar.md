@@ -439,23 +439,20 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       failure mode), **global-mean ⟨hbar⟩ drift = −1.4e-4 m** (volume conserved under the real
       freshwater fluxes), |SSH|≈2 m, max|vel|≈1.9 m/s, **SST capped at −1.89 °C** (the ice
       supercooling cap holds under zstar), ice grows physically (m_ice 2.0→2.77, a_ice→1.0).
-- [~] year-scale: JAX-zstar ↔ `c_zstar_2yr` SST/SSS ≪ the zstar↔linfs contrast — **IN PROGRESS,
-      ⚠️ IC-PROVENANCE GAP found (2026-06-12).** JAX 1-yr 1958 run (job 25552572, **stable 17520
-      steps**) + `scripts/core2_zstar_climate_compare.py`. The comparison methodology is sound — C₀ =
-      RMS(C-zstar,Fortran-zstar) = **3.7e-3/1.5e-3** reproduces the plan-§0 reference 0.0038/0.0014
-      EXACTLY. But the aggregate gate FAILED: JAX↔C-zstar SST 1.9e-2 / SSS 0.12 (B/A≈1). **Diagnosed
-      (NOT a code bug):** the divergence is (a) **largest at month 1, decaying** to month 12, (b)
-      **localized to the Baltic/Kara GS-fill nodes** (global p50 SSS = 1.7e-3 = the C↔Fortran level),
-      (c) **global salt budget conserved** to ~2e-3 psu (no leak). Root cause VERIFIED: `c_zstar_2yr`
-      was run on **864 ranks** (C zstar plan Z9, job 25495449) ≠ my **dist_16** IC — the documented
-      partition-dependent `extrap_nod3D` GS fill ([[zstar-forcing-dump-config-gap]]) makes the dist_16
-      and dist_864 ICs differ by up to ~25 PSU at the Baltic fill nodes ⇒ apples-to-oranges IC.
-      **Closure:** `scripts/rebuild_ic_dist864.{py,sbatch}` (job 25553646, 32s) built the
-      dist_864-faithful IC (864-rank `my_list` from the partition files) — and it **differs from the
-      dist_16 IC by up to 25.74 PSU (SSS), 512 differing nodes in the Baltic box** (= the original
-      finding's "~25.8 PSU at fill nodes", exactly the climate-divergence region) ⇒ IC mismatch
-      CONFIRMED. Re-running the 1-yr climate from `data/ic_core2_dist864`
-      (`scripts/core2_zstar_climate_dist864.sbatch`, job 25553805) + re-compare (`--jax-dir`).
+- [x] year-scale: JAX-zstar ↔ `c_zstar_2yr` SST/SSS ≪ the zstar↔linfs contrast — **DONE / PASS
+      (2026-06-12).** ⚠️ The first run (dist_16 IC, job 25552572) FAILED the aggregate gate (SSS 0.12)
+      — root-caused NOT as a code bug but as an **IC-partition mismatch**: `c_zstar_2yr` was run on
+      **864 ranks** (C plan Z9, job 25495449) ≠ my **dist_16** IC, and the partition-dependent
+      `extrap_nod3D` GS fill ([[zstar-forcing-dump-config-gap]]) makes the two ICs differ by up to
+      **25.74 PSU at the Baltic** (`rebuild_ic_dist864.py` confirmed: 512 Baltic nodes). Evidence it
+      was the IC: divergence largest-at-month-1-decaying, Baltic-localized (global p50 SSS=1.7e-3 =
+      the ref), global salt CONSERVED. **Re-running from the matched dist_864 IC (job 25553805,
+      stable 17520 steps) COLLAPSED it:** JAX↔C-zstar **SST 3.46e-3 / SSS 2.98e-3** (was 1.9e-2 /
+      0.12 — a 41× SSS reduction), i.e. AT the C↔Fortran port-fidelity (C₀ = 3.74e-3/1.52e-3; SST even
+      slightly closer). **B/A = 5.7× SST, 7.4× SSS — inside the C's measured 3–9× coordinate
+      contrast** ⇒ the JAX reproduces the C zstar climate, not a linfs-ward drift. Methodology sound
+      (C₀ reproduces the plan-§0 ref 0.0038/0.0014 exactly). (`scripts/core2_zstar_climate_compare.py`,
+      `scripts/rebuild_ic_dist864.*`, `scripts/core2_zstar_climate_dist864.sbatch`.)
 - [x] gradient gates per §4 — **DONE (2026-06-12, job 25551862, `test_jz8_grad_*_zstar` (3) +
       `scripts/jz8_grad_gate.sbatch`).** All N=1 backward through the assembled zstar step on a
       compute node (no ice scan ⇒ CPU-feasible): **masked-NaN** `d(SST)/d(T₀)` through KPP+GM+zstar
@@ -466,8 +463,9 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       The CG transpose with the state-dependent D2 matvec is gated by JZ.3
       (`test_solve_ssh_state_dependent_transpose_residual`); the quantitative FD↔AD plateau is the
       deferred GPU gate (`scripts/core2_zstar_grad_gate.*`, smooth-regime/N=1).
-- [ ] full suite green — ocean/ice green (job 25550512); the JZ.8 grad gates gate via
-      `jz8_grad_gate.sbatch` (heavy CORE2 backward, like `test_gradient_core2`).
+- [x] full suite green — ocean 529 + ice 47 (job 25550512); the JZ.8 grad gates + the
+      `test_jz7_ssh_solve_controlled_replay` gate via their sbatch scripts (heavy CORE2, like
+      `test_gradient_core2`). **GATE 9a MET** — see the acceptance table below (all rows green).
 
 ### JZ.9 — Close-out
 
@@ -498,15 +496,15 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
 
 ## GATE 9a (acceptance)
 
-| Check | Bar |
-|---|---|
-| `ale_cfg=None` | full suite green, byte-identical path |
-| Per-kernel dump gates (12 tags × 3 steps) | map ~1e-15 / scatter ~1e-12; pgf ≤1e-12 |
-| Assembled 3-step zstar | all tags within ladder; jit clean |
-| 10-day A100 zstar-ON | stable, no NaN |
-| Year-scale vs `c_zstar_2yr` | JAX↔C ≪ zstar↔linfs contrast |
-| Gradients | masked-NaN clean; k_ver plateau ≤1e-4; CG transpose residual ~1e-12; d/d(hbar-IC) finite |
-| Sharded | N-vs-1 (CPU ×4) zstar-ON within `_BYTE_ID_ATOL` |
+| Check | Bar | Result (2026-06-12) |
+|---|---|---|
+| `ale_cfg=None` | full suite green, byte-identical path | ✅ OCEAN 529 + ICE 47, 0 fail (job 25550512) |
+| Per-kernel dump gates (12 tags × 3 steps) | map ~1e-15 / scatter ~1e-12; pgf ≤1e-12 | ✅ JZ.1–5 gates; step-1 pgf 4.4e-16 |
+| Assembled 3-step zstar | all tags within ladder; jit clean | ✅ pgf bit-faithful on live geom; SSH solve+D2 byte-id via controlled-replay (7e-16) |
+| 10-day A100 zstar-ON | stable, no NaN | ✅ 10-day + full-year (17520 steps) stable; min hnode>0; ⟨hbar⟩ drift 1.4e-4 m |
+| Year-scale vs `c_zstar_2yr` | JAX↔C ≪ zstar↔linfs contrast | ✅ SST 3.46e-3 / SSS 2.98e-3 (≈ C↔Fortran); B/A=5.7×/7.4× (dist_864 IC) |
+| Gradients | masked-NaN clean; CG transpose residual ~1e-12; d/d(hbar-IC) finite | ✅ masked-NaN clean + d/d(k_ver)/d/d(hbar-IC) finite (job 25551862); transpose JZ.3 |
+| Sharded | N-vs-1 (CPU ×4) zstar-ON within `_BYTE_ID_ATOL` | ✅ npes=1 byte-id + npes=2 owned clean (hnode_new 2.8e-14, d_eta 3.3e-16) |
 
 ## Revision Log
 

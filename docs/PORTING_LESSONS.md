@@ -3237,8 +3237,11 @@ Cite the C source (`file:line`) or dump probe that proves it.
   Baltic). The smoking-gun signature that it's the IC and not the physics: the divergence is (a)
   **largest at month 1, decaying** (a spin-up transient from a different start), (b) **localized to
   the GS-fill nodes** (global p50 SSS = 1.7e-3 = the ref level), (c) **global salt budget conserved**
-  (no leak). Fix = build the IC for the ORACLE's partition (dist_864) and re-run. **Moral (a repeat,
-  now load-bearing): "which partition produced THIS oracle?" must be answered PER ORACLE — the dump
-  oracle and the climate oracle can be different decompositions, and an order-dependent IC fill makes
-  each one demand its own matched IC.** (`scripts/rebuild_ic_dist864.{py,sbatch}`,
+  (no leak). Fix = build the IC for the ORACLE's partition (dist_864) and re-run — which COLLAPSED
+  the SSS error 41x (0.12 -> 2.98e-3 psu) to the C<->Fortran port-fidelity (JAX<->C-zstar SST
+  3.46e-3 / SSS 2.98e-3 vs C0=3.74e-3/1.52e-3; B/A=5.7x/7.4x, inside the C's 3-9x coordinate contrast
+  => PASS), PROVING the whole "failure" was the IC. **Moral (a repeat, now load-bearing): "which
+  partition produced THIS oracle?" must be answered PER ORACLE — the dump oracle (z2_cdump=16r) and
+  the climate oracle (c_zstar_2yr=864r) were different decompositions, and an order-dependent IC fill
+  makes each demand its own matched IC.** (`scripts/rebuild_ic_dist864.{py,sbatch}`,
   `scripts/core2_zstar_climate_compare.py`, Task JZ.8.)
