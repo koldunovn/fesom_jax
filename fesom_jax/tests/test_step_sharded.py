@@ -652,3 +652,81 @@ def test_assembled_kpp_gm_ice_sharded_owned_matches(npes, core2_forced):
                                           boundary_node_p=bn_p)
     _owned_match(st_dense, st_N, mesh, part, npes, tag="assembled", fct_atol=3e-2,
                  extra_fct=_ICE_FIELDS)
+
+
+# --------------------------------------------------------------------------
+# 8. zstar-ON (Phase 9a, JZ.7): the live-geometry vertical coordinate sharding
+# --------------------------------------------------------------------------
+def _warm_zstar_state(state, mesh):
+    """Seed a WARM zstar state (hbar≠0 ⇒ a genuinely STRETCHED hnode/helem via the zstar init)
+    so a single step exercises the LIVE geometry under sharding. At cold start (hbar=0) the JZ.6
+    re-points + the vert_vel distribute + the D2 stiffness increment are all no-ops (live==static),
+    so a cold sharded step would only test the forcing-flip reductions + the hnode_new exchange,
+    NOT the live-geometry sharding. A smooth ~0.5 m SSH bump stretches the column (hbar/dd ~ 1e-4,
+    well above the 1e-9 byte-id floor ⇒ a live-path sharding gap is detectable)."""
+    from fesom_jax import ale
+    lat = np.asarray(mesh.geo_coord_nod2D)[:, 1]
+    hbar = jnp.asarray(0.5 * np.cos(2.0 * lat))           # (nod2D,) ~0.5 m SSH bump
+    hbar_old = jnp.zeros_like(hbar)
+    hnode, helem, eta_n, ssh_rhs_old = ale.init_thickness_zstar(mesh, hbar, hbar_old, dt=DT)
+    return dataclasses.replace(state, hbar=hbar, hbar_old=hbar_old, hnode=hnode, helem=helem,
+                               eta_n=eta_n, ssh_rhs_old=ssh_rhs_old)
+
+
+@avail
+@have_forcing
+def test_zstar_serial_sharded_step_matches_dense(core2_forced):
+    """npes=1 zstar (the full z2_cdump 4-config: KPP + GM/Redi + prognostic ice + zstar) sharded
+    == dense, byte-identically. The whole zstar path — live geometry (the EOS/PP/dbsfc/KPP/GM/
+    QR4C/vert-Redi/K33/momentum re-points), the vert_vel distribute, the D2 stiffness-as-state
+    increment (the matvec closure over hbar), the forcing flip (real fw/salt + the global
+    fw-balancing psum), and the zstar-only hnode_new exchange — lowers under ``shard_map`` and
+    collapses to ``v1.0`` at 1 device (identity exchange, psum-over-1=identity). A WARM hbar seed
+    makes the live geometry genuinely stretched (not the cold-start no-op)."""
+    from fesom_jax.ale import AleConfig
+    from fesom_jax.ice import IceConfig
+    fx = dict(core2_forced)
+    mesh = fx["mesh"]
+    fx["state"] = _warm_zstar_state(_seed_ice_state(core2_forced), mesh)
+    ser = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
+    bn_p = _global_boundary_node_p(mesh, ser)
+    st_dense, st_N = _forced_sharded_step(fx, ser, 1, kpp_cfg=KppConfig(), gm_cfg=GMConfig(),
+                                          ice_cfg=IceConfig(), ale_cfg=AleConfig(),
+                                          boundary_node_p=bn_p)
+    worst = 0.0
+    for fld in dataclasses.fields(State):
+        a = np.asarray(getattr(st_dense, fld.name))
+        b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
+        if a.size:
+            worst = max(worst, float(np.max(np.abs(a - b))))
+    assert worst < _BYTE_ID_ATOL, \
+        f"serial zstar sharded step max|Δ|={worst:.3e} (expected byte-id, floor {_BYTE_ID_ATOL:.0e})"
+
+
+@avail
+@have_forcing
+@pytest.mark.parametrize("npes", [2])
+def test_zstar_assembled_sharded_owned_matches(npes, core2_forced):
+    """The PRIMARY zstar sharding gate: the full 4-config (KPP + GM + prognostic ice + zstar, the
+    z2_cdump config) sharded == single-device on OWNED entities, field-appropriate budget. WARM
+    hbar ⇒ the live geometry is stretched ⇒ the JZ.6 re-points + the vert_vel distribute + the D2
+    stiffness closure + the fw-balancing psum all fire under multi-device exchange. The new zstar
+    State fields (hnode/helem/hbar/hnode_new) are covered by the generic ``_owned_match`` loop to
+    the CLEAN reassociation floor — the proof the zstar exchanges are correct (the hnode_new
+    OCEAN_SCHEDULE row from JZ.4 + the live geometry's halo-completeness); a missing one would
+    corrupt hnode_new / the stretched geometry on owned BOUNDARY nodes by O(stretch) ≫ 1e-7. T/S +
+    ice prognostic fields stay in the climate-close FCT floor."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    from fesom_jax.ale import AleConfig
+    from fesom_jax.ice import IceConfig
+    mesh = core2_forced["mesh"]
+    fx = dict(core2_forced)
+    fx["state"] = _warm_zstar_state(_seed_ice_state(core2_forced), mesh)
+    part = partit.read_partition(CORE2_DIST, npes)
+    bn_p = _global_boundary_node_p(mesh, part)
+    st_dense, st_N = _forced_sharded_step(fx, part, npes, kpp_cfg=KppConfig(), gm_cfg=GMConfig(),
+                                          ice_cfg=IceConfig(), ale_cfg=AleConfig(),
+                                          boundary_node_p=bn_p)
+    _owned_match(st_dense, st_N, mesh, part, npes, tag="zstar", fct_atol=3e-2,
+                 extra_fct=_ICE_FIELDS)

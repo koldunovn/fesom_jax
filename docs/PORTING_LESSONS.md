@@ -3195,3 +3195,23 @@ Cite the C source (`file:line`) or dump probe that proves it.
   **Moral:** when validating a chained multi-step run against an early-stopped-CG dump, pick a gate
   field that is ROBUST to the SSH solve's slow-mode noise (a tracer/density-driven one like pgf),
   not the SSH-derived fields themselves. (`test_jz7_assembled_zstar_steps123`, Task JZ.7.)
+
+## Phase 9a — zstar (Task JZ.7 — sharded N-vs-1: the whole zstar path shards clean)
+
+- **[sharding/zstar] The full zstar path shards N-vs-1 to the clean reassociation floor — but ONLY
+  a WARM hbar seed exercises it; a cold-start sharded step is a live-geometry no-op.** At hbar=0 the
+  JZ.6 re-points + the vert_vel distribute + the D2 stiffness increment are all `live==static`, so a
+  cold sharded step tests only the forcing-flip reductions + the (trivial) hnode_new exchange. Seed a
+  ~0.5 m smooth hbar bump + rebuild hnode/helem via `ale.init_thickness_zstar` (`_warm_zstar_state`)
+  so the column is genuinely stretched (hbar/dd~1e-4 ≫ the 1e-9 byte-id floor ⇒ a live-path sharding
+  gap is detectable). Result (npes=2 owned-match, the generic `dataclasses.fields(State)` loop):
+  **hnode_new 2.8e-14** (the JZ.4 `exchange_nod(hnode_new)` OCEAN_SCHEDULE row is correct), **hnode
+  2.8e-14 / helem 5.7e-14 / hbar 1.9e-13** (the live geometry is a per-node/elem map ⇒ halo-complete
+  from the redundant compute, no new exchange needed), **d_eta 3.3e-16** (the D2 stiffness-as-state
+  increment — the `custom_linear_solve` matvec closing over `st.hbar` — shards correctly inside the
+  distributed CG: its ΔA edge→node scatter rides the SAME halo as the base stiffness). T/S at the
+  upwind-flip FCT floor (9.7e-3), ssh_rhs at the cancellation floor — the documented N-vs-1
+  non-determinism, NOT a missing exchange. npes=1 collapses to dense byte-identically. **Moral:** to
+  N-vs-1-test a config-gated feature whose effect is a step-1 no-op (cold start), seed the state PAST
+  the degeneracy first. (`test_zstar_{serial,assembled}_sharded_*`, `scripts/jz7_shard_zstar.sbatch`,
+  Task JZ.7.)

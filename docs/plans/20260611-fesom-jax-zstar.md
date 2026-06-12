@@ -411,9 +411,19 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       config-independently in JZ.3, below this noise floor). Gates: pgf tight (the JZ.6 precision
       gate); d_eta/hbar/geometry the bounded "no-blow-up" CG class; finiteness hard. jit-twice no-leak:
       the eager 3-step chain runs clean (both is_first_step branches compile).
-- [ ] sharded N-vs-1 (CPU fake devices ×4) with `ale_cfg` ON — generic State-field loops cover
-      hnode/helem/hbar; hnode_new exchange row asserted
-- [ ] full suite green
+- [x] sharded N-vs-1 (CPU fake devices) with `ale_cfg` ON — **DONE (2026-06-12, job 25551060,
+      `test_zstar_serial_sharded_step_matches_dense` (npes=1 byte-id) + `test_zstar_assembled_
+      sharded_owned_matches` (npes=2 owned) + `scripts/jz7_shard_zstar.sbatch`).** A WARM hbar seed
+      (`_warm_zstar_state`, ~0.5 m bump ⇒ stretched hnode) makes the live geometry genuinely active
+      (cold-start would be a no-op). npes=1: the full 4-config (KPP+GM+ice+zstar) collapses to dense
+      BYTE-identically. npes=2 owned-match: every new zstar State field at the CLEAN reassociation
+      floor — **hnode_new 2.8e-14** (the JZ.4 exchange row), **hnode 2.8e-14 / helem 5.7e-14 / hbar
+      1.9e-13** (live geometry shards), **d_eta 3.3e-16** (the D2 stiffness-as-state increment shards
+      inside the distributed CG); T/S at the upwind-flip FCT floor (9.7e-3<3e-2), ssh_rhs at the
+      cancellation floor — the documented N-vs-1 non-determinism, NOT a missing exchange.
+- [x] full suite green — OCEAN 529 + ICE 47, 0 fail (job 25550512). The zstar sharded tests run
+      only in the SHARDING group (4 fake-devices; the ocean group ignores `test_*_sharded.py`) ⇒ they
+      gate via `jz7_shard_zstar.sbatch`, not the (pre-existingly slow) suite sharding group.
 
 ### JZ.8 — Stability, climate, gradient gates (GATE 9a evidence)
 
