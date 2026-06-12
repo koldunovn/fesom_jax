@@ -402,14 +402,17 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       3-step set — the REAL validation of the JZ.6 live-geometry re-points (live≠static at steps ≥2).
       **pgf stays bit-faithful on genuinely-live geometry** (s2/s3 p50≈4e-9, p99≈3.7e-7, max≈4.5e-6 vs
       step-1 4e-16) — since pgf reads BOTH density (T/S) AND live `Z_3d_n`, this certifies the geometry
-      reconstruction AND the re-pointed tracer chain. ⚠️ KEY FINDING: the SSH-solve-derived fields
-      (`d_eta`/`hbar`/`eta_n` + the hbar-built `zbar_3d_n`/`Z_3d_n`) diverge to ~mm at step ≥2 (s2≈s3≈
-      7e-3, BOUNDED) — the **warm-started early-stop** of the near-null-space CG (verified JAX & C both
-      use soltol=1e-5/maxiter=500: step 1 same-seed x0=0 ⇒ 5.5e-7, step ≥2 warm-start from
-      5.5e-7-different seeds ⇒ slow modes at ~soltol·‖ssh_rhs‖, amplified by ‖ssh_rhs‖~1e6 during
-      spin-up). NOT a bug (pgf is the discriminating gate; the D2 increment is validated
-      config-independently in JZ.3, below this noise floor). Gates: pgf tight (the JZ.6 precision
-      gate); d_eta/hbar/geometry the bounded "no-blow-up" CG class; finiteness hard. jit-twice no-leak:
+      reconstruction AND the re-pointed tracer chain. ⚠️ KEY FINDING (corrected via the
+      controlled-replay): the SSH-solve-derived fields (`d_eta`/`hbar`/`eta_n` + the hbar-built
+      `zbar_3d_n`/`Z_3d_n`) diverge to ~mm at step ≥2 (s2≈s3≈7e-3, BOUNDED), but **the SSH solve
+      itself is BYTE-IDENTICAL on CPU** — `test_jz7_ssh_solve_controlled_replay` feeds the C's OWN
+      dumped `ssh_rhs`+warm-start+`hbar` and reproduces the C `d_eta` to **7.2e-16 (step 1) / 9.7e-16
+      (step 2, D2 increment LIVE)**. So the chained ~mm is the UPSTREAM velocity/`ssh_rhs`
+      FP-reassociation (~1e-12 scatter floor) amplified by the near-cancelling `ssh_rhs`
+      (`dx·helem~1e7`, Phase-2 ssh/rhs) + the near-null-space `S⁻¹` — the FP-trajectory butterfly
+      (the C vs Fortran has it too ⇒ the year-scale climate gate). NOT a bug. Gates: pgf tight (the
+      JZ.6 precision gate); the SSH solve+D2 byte-fidelity gated by the controlled-replay (1e-12) +
+      JZ.3; d_eta/hbar/geometry the bounded "no-blow-up" class; finiteness hard. jit-twice no-leak:
       the eager 3-step chain runs clean (both is_first_step branches compile).
 - [x] sharded N-vs-1 (CPU fake devices) with `ale_cfg` ON — **DONE (2026-06-12, job 25551060,
       `test_zstar_serial_sharded_step_matches_dense` (npes=1 byte-id) + `test_zstar_assembled_
@@ -512,7 +515,9 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
   against the C source (4-agent extraction). All byte-neutral (suite OCEAN 529 + ICE 47, 0 fail, job
   25550512). JZ.7: step-1 gate re-green with JZ.6; the **multi-step (1-3) gate** (job 25550843) —
   pgf bit-faithful on genuinely-live geometry at steps ≥2 (the JZ.6 validation), the d_eta/hbar ~mm
-  divergence root-caused as the warm-started CG early-stop (same soltol as C, bounded, not a bug);
+  chained divergence root-caused via the **controlled-replay** (`test_jz7_ssh_solve_controlled_replay`):
+  the SSH solve + D2 increment are BYTE-IDENTICAL with identical inputs (7e-16/9.7e-16) — the chained
+  ~mm is the upstream velocity/ssh_rhs reassociation amplified by the SSH near-cancellation, not a bug;
   the **sharded N-vs-1** (job 25551060) — npes=1 byte-id + npes=2 owned-match, every zstar State field
   at the clean reassociation floor (hnode_new 2.8e-14, d_eta 3.3e-16). **Next: JZ.8** (10-day A100
   stability, year-scale climate vs `c_zstar_2yr`, the §4 gradient gates — GATE 9a evidence).

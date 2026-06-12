@@ -3173,16 +3173,24 @@ Cite the C source (`file:line`) or dump probe that proves it.
   one oracle, enumerate ALL oracles that consume it and their provenance. (Suite job 25538063 →
   caught by the full-suite rerun discipline.)
 
-## Phase 9a — zstar (Task JZ.7 — multi-step assembled gate: the warm-started CG early-stop class)
+## Phase 9a — zstar (Task JZ.7 — multi-step gate: the SSH solve is byte-faithful; the chained divergence is upstream)
 
-- **[verify/zstar] ⚠️ The chained 3-step gate's `d_eta`/`hbar` diverge to ~mm at step ≥2 even though
-  JAX and C use the SAME soltol=1e-5/maxiter=500 — the warm-started early-stop of a near-null-space
-  elliptic solve, NOT a bug.** Step 1 both CGs start from `x0=0` (identical seed) ⇒ `d_eta`/`hbar`
-  match to **5.5e-7**; at step ≥2 they warm-start from their respective (5.5e-7-different) step-1
-  `d_eta` and early-stop at the same soltol, leaving the **slow SSH modes** at ~`soltol·‖ssh_rhs‖` —
-  and during spin-up `‖ssh_rhs‖~1e6` (the `dx·helem`-amplified near-cancelling floor, Phase-2 ssh/rhs
-  lesson) ⇒ ~mm in `d_eta`/`hbar`/`eta_n` and the hbar-built geometry `zbar_3d_n`/`Z_3d_n`. **BOUNDED**
-  (s2≈s3≈7e-3, not growing) — the Phase-2 ssh/solver lesson compounded over warm-starts.
+- **[verify/zstar] ⚠️ CORRECTED (the controlled-replay): the chained 3-step gate's `d_eta`/`hbar`
+  diverge to ~mm at step ≥2, but the SSH SOLVE IS BYTE-IDENTICAL on CPU — the divergence is the
+  UPSTREAM velocity/ssh_rhs reassociation amplified, NOT a solve/early-stop property.** A controlled
+  replay (`test_jz7_ssh_solve_controlled_replay`, `scripts/jz7_ssh_replay_check.py`) feeds the C's
+  OWN dumped `ssh_rhs`+warm-start+`hbar` (instead of the JAX chained state) into `solve_ssh`:
+  step 1 (`x0=0`,`hbar=0`) → max|Δ|=**7.2e-16**, step 2 (`x0=C_d_eta1`,`hbar=C_hbar1`, the **D2
+  increment LIVE**) → **9.7e-16** — both at the map/gather floor. So with IDENTICAL inputs the
+  iterated near-null-space CG + the zstar D2 closure reproduce the C bit-for-bit (the early-stop is
+  a red herring: identical inputs ⇒ identical early-stopped iterate). The chained ~mm is because the
+  JAX computes its OWN `ssh_rhs` from the JAX velocity (~1e-12-different from C's per the scatter
+  floor), which the near-cancelling `ssh_rhs` (Phase-2 ssh/rhs `dx·helem~1e7` floor) + the
+  near-null-space `S⁻¹` blow up to ~mm in `d_eta` — the FP-trajectory butterfly EVERY ocean model
+  has (the C vs Fortran too ⇒ the year-scale climate gate, not multi-step bit-identity). BOUNDED
+  (s2≈s3≈7e-3). **Moral: the assembled step-1 5.5e-7 / chained-mm in an SSH-derived field is the
+  INPUT difference, NOT the kernel — controlled-replay (feed the dump's own inputs) to separate the
+  two before suspecting the solve.** (`test_jz7_ssh_solve_controlled_replay`, Task JZ.7.)
 - **[verify/zstar] The DISCRIMINATING gate that the JZ.6 live geometry is correct (not the divergence
   source) is `pgf`, NOT `d_eta`/`hbar`.** pgf (shchepetkin) reads BOTH the density (T/S — the tracer
   chain) AND the live `Z_3d_n` (built from hbar). It stays **p50≈4e-9 / p99≈3.7e-7 / max≈4.5e-6** at
@@ -3190,11 +3198,12 @@ Cite the C source (`file:line`) or dump probe that proves it.
   scale, and a diverged tracer chain at the *density* scale; 4e-9 is consistent ONLY with a correct
   re-point fed inputs carrying the ~1e-6-relative (mm-over-km-depth) hbar noise. So gate pgf tight
   (the JZ.6 precision gate) + finiteness hard; treat `d_eta`/`hbar`/geometry as the bounded
-  "no-blow-up" CG class (the dump is an early-stopped iterate ⇒ a sub-mm precision gate there is
-  impossible; the D2 stiffness increment is validated config-independently in JZ.3, below this floor).
-  **Moral:** when validating a chained multi-step run against an early-stopped-CG dump, pick a gate
-  field that is ROBUST to the SSH solve's slow-mode noise (a tracer/density-driven one like pgf),
-  not the SSH-derived fields themselves. (`test_jz7_assembled_zstar_steps123`, Task JZ.7.)
+  "no-blow-up" class (their chained `ssh_rhs` differs; the solve+D2 byte-fidelity is gated separately
+  by `test_jz7_ssh_solve_controlled_replay` + JZ.3, not by the chained multi-step).
+  **Moral:** when validating a chained multi-step run against a partial-state dump (no T/S/uv to
+  reset), pick a gate field ROBUST to the SSH machinery's near-cancellation amplification (a
+  tracer/density-driven one like pgf), not the SSH-derived fields — and controlled-replay the
+  SSH-derived ones separately. (`test_jz7_assembled_zstar_steps123`, Task JZ.7.)
 
 ## Phase 9a — zstar (Task JZ.7 — sharded N-vs-1: the whole zstar path shards clean)
 

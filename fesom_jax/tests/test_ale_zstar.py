@@ -1000,6 +1000,50 @@ def test_jz7_assembled_zstar_step1(capsys):
         f"Wvel p50={np.percentile(d_wvel, 50):.2e} max={d_wvel.max():.2e}"
 
 
+@core2_dhe_missing
+def test_jz7_ssh_solve_controlled_replay(capsys):
+    """⚠️ The DECISIVE fidelity check: the SSH solve (incl. the zstar D2 stiffness increment) is
+    **BYTE-IDENTICAL on CPU** with IDENTICAL inputs — proving the ~mm chained-multistep d_eta/hbar
+    divergence (next test) is the upstream velocity/ssh_rhs FP-reassociation amplified by the
+    near-cancelling SSH machinery (the trajectory butterfly EVERY ocean model has, incl. the C vs
+    Fortran), NOT a solve/D2 bug.
+
+    Controlled replay = feed the C's OWN dumped solve inputs (not the JAX chained state, which the
+    dump can't fully reconstruct — no T/S/uv tags):
+      * step 1: solve(C_ssh_rhs[1], x0=0,          hbar=0)         vs C_d_eta[1]   (D2 a cold no-op)
+      * step 2: solve(C_ssh_rhs[2], x0=C_d_eta[1], hbar=C_hbar[1]) vs C_d_eta[2]   (D2 LIVE)
+    Both match the C dump to **~1e-15** (the map/gather floor — NOT the 5.5e-7 the *assembled*
+    step-1 gate shows, which is the JAX's OWN ssh_rhs differing from the C's). So with identical
+    inputs the iterated near-null-space CG + the D2 closure reproduce the C bit-for-bit; the chained
+    divergence is purely the input difference (the Phase-2 ssh/rhs `dx·helem~1e7` cancellation floor
+    propagated). (`scripts/jz7_ssh_replay_check.py`.)"""
+    mesh = load_mesh(CORE2_MESH)
+    op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
+    nlm0 = np.asarray(mesh.node_layer_mask)[:, 0]
+    z = jnp.zeros(mesh.nod2D)
+
+    def load(step):
+        fsh, _ = io_dump.load_ale_dump(ZSTAR_ORACLE, ["sshsolve", "hbar"], step=step, n_nod=NG5_NOD2D)
+        return (io_dump.ale_component(fsh, "sshsolve", "ssh_rhs").astype(np.float64),
+                io_dump.ale_component(fsh, "sshsolve", "d_eta").astype(np.float64),
+                io_dump.ale_component(fsh, "hbar", "hbar").astype(np.float64))
+
+    rhs1, deta1, hbar1 = load(1)        # hbar1 = end-of-step-1 hbar = start-of-step-2 (D2 input)
+    rhs2, deta2, _ = load(2)
+    jx1 = np.asarray(ssh.solve_ssh(op, jnp.asarray(rhs1), x0=z, mesh=mesh, hbar=z, dt=DT_ZSTAR))
+    jx2 = np.asarray(ssh.solve_ssh(op, jnp.asarray(rhs2), x0=jnp.asarray(deta1),
+                                   mesh=mesh, hbar=jnp.asarray(hbar1), dt=DT_ZSTAR))
+    d1 = np.abs(jx1 - deta1)[nlm0]
+    d2 = np.abs(jx2 - deta2)[nlm0]
+    with capsys.disabled():
+        print(f"\n[ssh-replay] step1 (x0=0,hbar=0)        max|Δ|={d1.max():.2e}")
+        print(f"[ssh-replay] step2 (x0=C_deta1,hbar=C_hbar1) max|Δ|={d2.max():.2e}  (D2 live)")
+    # byte-faithful with identical inputs: the map/gather floor, BOTH steps. The step-2 D2
+    # increment must not move it off that floor (a wrong increment ⇒ ~mm even with identical inputs).
+    assert d1.max() < 1e-12, f"step1 controlled-replay d_eta max={d1.max():.2e} (solve not byte-faithful)"
+    assert d2.max() < 1e-12, f"step2 controlled-replay d_eta max={d2.max():.2e} (D2 increment broke byte-fidelity)"
+
+
 @core2_forcing_missing
 def test_jz7_assembled_zstar_steps123(capsys):
     """JZ.7 multi-step (compute-node): the assembled CORE2 zstar model run for 3 steps vs the
@@ -1008,15 +1052,17 @@ def test_jz7_assembled_zstar_steps123(capsys):
     momentum/forcing geometry only diverges from static at steps ≥2 — here the SSH change has
     stretched the column and every re-pointed consumer reads genuinely-moving depths.
 
-    The JAX state is chained (the C dumps only the 12 ALE tags, not full T/S/uv). ⚠️ KEY
-    FINDING (calibrated 2026-06-12): the JAX and C CG use the **same** soltol=1e-5/maxiter=500,
-    but the comparison still carries a step-≥2 **warm-started early-stop divergence of ~mm** in
-    the SSH-solve-derived fields (d_eta/hbar/eta_n and the hbar-built geometry zbar_3d_n/Z_3d_n).
-    At step 1 both CGs start from x0=0 (identical seed) ⇒ d_eta/hbar match to 5.5e-7; at steps
-    ≥2 they warm-start from their respective (5.5e-7-different) step-1 d_eta and early-stop at the
-    SAME soltol, which leaves the **slow SSH modes** at ~soltol·‖ssh_rhs‖ — and during spin-up
-    ‖ssh_rhs‖~1e6 (the dx·helem-amplified near-cancelling floor) ⇒ ~mm in d_eta/hbar. It is
-    BOUNDED (s2≈s3≈7e-3, not growing) — the Phase-2 ssh/solver lesson compounded over warm-starts.
+    The JAX state is CHAINED (the C dumps only the 12 ALE tags, not full T/S/uv — so this CANNOT
+    be a controlled replay that resets to the C state each step). ⚠️ KEY FINDING (2026-06-12,
+    corrected): the SSH-solve-derived fields (d_eta/hbar/eta_n + the hbar-built zbar_3d_n/Z_3d_n)
+    diverge to ~mm at step ≥2, but this is NOT a property of the solve — the
+    ``test_jz7_ssh_solve_controlled_replay`` above proves that with IDENTICAL inputs the solve (+
+    the zstar D2 increment) reproduces the C d_eta to **~1e-15** (byte-faithful, BOTH steps). The
+    chained ~mm divergence is the **upstream velocity/ssh_rhs FP-reassociation amplified**: the
+    JAX computes its OWN ssh_rhs from the JAX velocity, ~1e-12-different from the C's, which the
+    near-cancelling ssh_rhs (the Phase-2 ssh/rhs ``dx·helem~1e7`` floor) + the near-null-space
+    solve blow up to ~mm in d_eta — the FP-trajectory butterfly EVERY ocean model has (the C vs
+    Fortran too, hence the year-scale climate gate). BOUNDED (s2≈s3≈7e-3, not growing).
 
     So gate by what each tag's noise floor allows (per step):
 
@@ -1025,9 +1071,9 @@ def test_jz7_assembled_zstar_steps123(capsys):
         tracer chain) AND the live ``Z_3d_n`` — its bit-faithfulness proves the re-pointed geometry
         is correct (a wrong reconstruction corrupts pgf at the geometry scale, not at 1e-9; and a
         diverged T/S would corrupt the density, so 4e-9 also certifies the re-pointed tracer chain).
-      * **d_eta/hbar/eta_n + zbar_3d_n/Z_3d_n** — the warm-started CG early-stop class (~mm,
-        bounded). A loose "no blow-up" gate, NOT a precision gate (the dump is an early-stopped
-        iterate; the D2 increment is validated config-independently in JZ.3).
+      * **d_eta/hbar/eta_n + zbar_3d_n/Z_3d_n** — the upstream-reassociation-amplified class (~mm,
+        bounded). A loose "no blow-up" gate, NOT a precision gate (the chained ssh_rhs differs; the
+        solve+D2 byte-fidelity is gated by ``test_jz7_ssh_solve_controlled_replay`` + JZ.3).
       * **hnode/helem** — per-layer thickness (smaller, ~1e-3). **Wvel** — bit-faithful bulk
         (÷area) + CG tail. **ssh_rhs** — near-cancelling diagnostic (no gate).
 
@@ -1118,14 +1164,15 @@ def test_jz7_assembled_zstar_steps123(capsys):
         assert mx(s, "pgf_x") < pgf_max and mx(s, "pgf_y") < pgf_max, \
             f"pgf max x={mx(s, 'pgf_x'):.2e} y={mx(s, 'pgf_y'):.2e} step {s} (JZ.6 geom regressed)"
 
-        # SSH-solve-derived fields — the warm-started CG early-stop class. Step 1 (x0=0, same seed)
-        # is tight (~5.5e-7); steps ≥2 carry the ~mm slow-mode early-stop (bounded, s2≈s3). A
-        # loose "no blow-up" gate (NOT a precision gate — the dump is an early-stopped iterate).
+        # SSH-solve-derived fields — the upstream-ssh_rhs-reassociation-amplified class (the solve
+        # itself is byte-faithful, test_jz7_ssh_solve_controlled_replay). Step 1 the JAX ssh_rhs is
+        # ~5.5e-7-different from C's; steps ≥2 it blows up to ~mm (bounded, s2≈s3). A loose "no
+        # blow-up" gate, NOT a precision gate (the chained ssh_rhs differs from the C's).
         cg_p99 = 1e-6 if s == 1 else 5e-3      # observed: s1~2.5e-7, s2/s3~1.2e-3/1.8e-3
         cg_max = 1e-6 if s == 1 else 1.5e-2    # observed: s1~5.5e-7, s2/s3~7.3e-3/7.7e-3
         for t in ("d_eta", "hbar", "eta_n", "zbar_3d_n", "Z_3d_n"):
             assert pc(s, t, 99) < cg_p99 and mx(s, t) < cg_max, \
-                f"{t} p99={pc(s, t, 99):.2e} max={mx(s, t):.2e} step {s} (SSH early-stop class blew up)"
+                f"{t} p99={pc(s, t, 99):.2e} max={mx(s, t):.2e} step {s} (SSH-class blew up)"
         # per-layer thickness — a fraction of the cumulative-geometry class.
         th_p99 = 1e-6 if s == 1 else 5e-4      # observed s2/s3 p99~6e-5/8e-5
         th_max = 1e-6 if s == 1 else 5e-3      # observed s2/s3 max~1.5e-3/1.2e-3
