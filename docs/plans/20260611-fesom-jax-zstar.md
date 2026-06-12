@@ -429,8 +429,13 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
 
 **Files:** Create: `scripts/core2_zstar_stability.{py,sbatch}`, `scripts/core2_zstar_grad_gate.{py,sbatch}`.
 
-- [ ] 10-day CORE2 A100 zstar-ON (KPP+GM+ice) stable, no NaN; SSH/steric sanity (global mean drift)
-      — ⬜ needs A100 + `scripts/core2_zstar_stability.{py,sbatch}` (not yet written).
+- [x] 10-day CORE2 A100 zstar-ON (KPP+GM+ice) stable, no NaN; SSH/steric sanity — **DONE
+      (2026-06-12, job 25552436, `scripts/core2_zstar_stability.{py,sbatch}`).** The full 4-config
+      ran **480 steps / 10.00 days stable** on an A100-80 (~0.12 s/step after an 11.8 s compile):
+      `fin=1` throughout, **min hnode = 4.52 m > 0** every step (NO column collapse — the zstar
+      failure mode), **global-mean ⟨hbar⟩ drift = −1.4e-4 m** (volume conserved under the real
+      freshwater fluxes), |SSH|≈2 m, max|vel|≈1.9 m/s, **SST capped at −1.89 °C** (the ice
+      supercooling cap holds under zstar), ice grows physically (m_ice 2.0→2.77, a_ice→1.0).
 - [ ] year-scale: JAX-zstar ↔ `c_zstar_2yr` SST/SSS — must be ≪ the zstar↔linfs contrast (3–9×)
       — ⬜ needs the 2-yr A100 run + the monthly-SST/SSS comparison tooling (the K.9 style).
 - [x] gradient gates per §4 — **DONE (2026-06-12, job 25551862, `test_jz8_grad_*_zstar` (3) +
