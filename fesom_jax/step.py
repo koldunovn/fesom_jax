@@ -132,6 +132,17 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         _red_mask = halo_ctx.owned_mask.get("nod")
         _red_axis = halo_ctx.axis_name
 
+    # zstar live geometry (D1): the per-node zbar_3d_n/Z_3d_n + the per-element zbar_n/Z_n,
+    # both derived from the carried (pre-commit) st.hnode/st.helem. Hoisted ONCE here — BEFORE
+    # the forcing block, whose shortwave-penetration reads zbar3_live (JZ.6) — and reused by the
+    # shchepetkin PGF (JZ.5), vert_vel distribute (JZ.4), and the JZ.6 consumer re-points
+    # (EOS/PP/dbsfc/KPP/GM/QR4C/vert-Redi/momentum). At cold start (hbar=0) live == static;
+    # linfs ⇒ all None (the consumers keep the static mesh geometry ⇒ byte-identical).
+    zbar3_live = Z3d_live = elem_geo_live = None
+    if ale_cfg is not None:
+        zbar3_live, Z3d_live = ale.live_geometry(mesh, st.hnode)
+        elem_geo_live = ale.live_geometry_elem(mesh, st.helem)
+
     # CORE2 surface forcing (None ⇒ pi path: keep the passed stress_surf, zero BCs).
     # ``ice_cfg`` (an IceConfig) ⇒ the Phase-6 PROGNOSTIC sea-ice step (ocean2ice → EVP → FCT
     # → cut_off → thermo → oce_fluxes → stress blend → shortwave); else the Phase-5 static-ice
@@ -146,7 +157,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             ice_out = _ice_step.ice_surface_step(
                 ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt,
                 owned_mask=_red_mask, axis_name=_red_axis, exch=_exch,
-                boundary_node=boundary_node, use_virt_salt=use_virt_salt)
+                boundary_node=boundary_node, use_virt_salt=use_virt_salt, zbar3=zbar3_live)
             stress_surf = ice_out.stress_surf
             bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
             heat_flux, water_flux = ice_out.heat_flux, ice_out.water_flux
@@ -155,19 +166,12 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             from . import core2_forcing            # lazy: keep netCDF deps off the pi path
             sfx = core2_forcing.compute_surface_fluxes(
                 mesh, st, step_forcing, forcing_static, dt=dt,
-                owned_mask=_red_mask, axis_name=_red_axis, use_virt_salt=use_virt_salt)
+                owned_mask=_red_mask, axis_name=_red_axis, use_virt_salt=use_virt_salt,
+                zbar3=zbar3_live)
             stress_surf = sfx.stress_surf
             bc_T, bc_S, sw_3d = sfx.bc_T, sfx.bc_S, sfx.sw_3d
             heat_flux, water_flux = sfx.heat_flux, sfx.water_flux
             stress_node_surf = sfx.stress_node_surf
-
-    # zstar live geometry (D1): zbar_3d_n/Z_3d_n derived from the carried (pre-commit) st.hnode.
-    # Hoisted once and reused by the shchepetkin PGF (substep 3, JZ.5) + the vert_vel distribute
-    # (substep 13, JZ.4); JZ.6 re-points the EOS/PP/KPP/tracer consumers to it too. At cold start
-    # (hbar=0) live == static. linfs ⇒ None (the consumers keep the static mesh geometry).
-    zbar3_live = Z3d_live = None
-    if ale_cfg is not None:
-        zbar3_live, Z3d_live = ale.live_geometry(mesh, st.hnode)
 
     # 1 — EOS / hydrostatic pressure / N² (zstar: density compressibility + N² spacing on
     #     live geometry; hpressure unused under zstar). Z3d_live=None ⇒ static (byte-identical).
@@ -188,7 +192,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     gm_diag = None
     if gm_cfg is not None:
         gm_diag = gm.gm_diagnostics(mesh, st.T, st.S, bvfreq, hnode_new, st.helem,
-                                    params, gm_cfg, exch=_exch)
+                                    params, gm_cfg, exch=_exch,
+                                    Z3d=Z3d_live, zbar3=zbar3_live)
 
     # 3 — pressure-gradient force. zstar ⇒ the shchepetkin density-Jacobian on live geometry
     #     (NO hpressure under zstar — the C uses none); linfs ⇒ the hpressure gradient (byte-identical).
@@ -210,10 +215,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 "heat_flux/water_flux/stress_node_surf/sw_3d for ustar/Bo/bfsfc. The pi "
                 "analytical path has no surface forcing — keep kpp_cfg=None there.")
         sw_alpha, sw_beta = eos.compute_sw_alpha_beta(mesh, st.T, st.S, Z3d=Z3d_live)
-        dbsfc = eos.compute_dbsfc(mesh, st.T, st.S)
+        dbsfc = eos.compute_dbsfc(mesh, st.T, st.S, Z3d=Z3d_live)
         Kv, Av, uvnode = kpp.mixing_kpp(
             mesh, st.uv, bvfreq, dbsfc, sw_alpha, sw_beta, st.S,
-            heat_flux, water_flux, stress_node_surf, sw_3d, st.hnode, kpp_cfg, exch=_exch)
+            heat_flux, water_flux, stress_node_surf, sw_3d, st.hnode, kpp_cfg, exch=_exch,
+            Z3d=Z3d_live, zbar3=zbar3_live)
     else:
         Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq,
                                       k_ver=params.k_ver, a_ver=params.a_ver, Z3d=Z3d_live)
@@ -233,8 +239,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     uv_rhs = momentum.visc_filt_bidiff(mesh, st.uv, uv_rhs, dt=dt, exch=_exch)
     uv_rhs = _exch(uv_rhs, "elem")
 
-    # 7 — implicit vertical viscosity → increment du (the C keeps it in uv_rhs)
-    du = momentum.impl_vert_visc(mesh, st.uv, uv_rhs, Av, stress_surf, dt=dt)
+    # 7 — implicit vertical viscosity → increment du (the C keeps it in uv_rhs). zstar (JZ.6):
+    #     the per-element tridiagonal geometry comes from the live st.helem stack (elem_geo_live);
+    #     None ⇒ static column-uniform zbar/Z (byte-identical).
+    du = momentum.impl_vert_visc(mesh, st.uv, uv_rhs, Av, stress_surf, dt=dt,
+                                 elem_geo=elem_geo_live)
     du = _exch(du, "elem")
 
     # zstar (Phase 9a, JZ.3): the SSH plumbing gains the real-freshwater tail (ssh_rhs +
@@ -289,6 +298,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     w_e = _exch(w_e, "nod")
     w_i = _exch(w_i, "nod")
 
+    # zstar (JZ.6): the about-to-commit ("new") live geometry from hnode_new — the dual-geometry
+    # "new" side. Used by the Redi K33 augmentation + the impl vert diff layer-center spacings
+    # (the C builds zbar_n/Z_n from hnode_new, tracer_diff.c:134-158). linfs ⇒ None (static, byte-id).
+    zbar3_new = Z3d_new = None
+    if ale_cfg is not None:
+        zbar3_new, Z3d_new = ale.live_geometry(mesh, hnode_new)
+
     # 13a — GM bolus wrap (fesom_step.c:422-438): feed the bolus-augmented velocity to the
     #       tracer advection. fer_w reuses compute_w driven by fer_uv. In functional JAX the
     #       carried uv/w_e are untouched, so the C's post-diffusion subtract-back is automatic.
@@ -302,9 +318,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # 15 — FCT tracer advection (T then S) + Redi explicit terms + implicit vert diffusion.
     #      advect_one_fct exchanges fct_LO + fct_plus/minus internally (S.7 splits).
     T_adv, T_old = tracer_adv.advect_one_fct(mesh, uv_adv, w_e_adv, st.helem, st.hnode,
-                                             hnode_new, st.T, st.T_old, dt=dt, exch=_exch)
+                                             hnode_new, st.T, st.T_old, dt=dt, exch=_exch,
+                                             Z3d=Z3d_live, zbar3=zbar3_live)
     S_adv, S_old = tracer_adv.advect_one_fct(mesh, uv_adv, w_e_adv, st.helem, st.hnode,
-                                             hnode_new, st.S, st.S_old, dt=dt, exch=_exch)
+                                             hnode_new, st.S, st.S_old, dt=dt, exch=_exch,
+                                             Z3d=Z3d_live, zbar3=zbar3_live)
     T_adv = _exch(T_adv, "nod")
     S_adv = _exch(S_adv, "nod")
 
@@ -316,15 +334,20 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     Kv_eff = Kv
     if gm_diag is not None:
         slope_tap, Ki = gm_diag.slope_tapered, gm_diag.Ki
+        # zstar (JZ.6): vertical Redi geometry on the OLD (st.hnode) side (zbar3/Z3d_live, the ÷
+        # hnode_new divisor stays the new side); horizontal Redi already on st.hnode/helem/hnode_new
+        # (no static geom); K33 on the NEW (hnode_new) side (zbar3/Z3d_new — matches impl_vert_diff).
         T_adv = (T_adv
-                 + gm_redi.diff_ver_part_redi_expl(mesh, st.T, slope_tap, Ki, hnode_new, dt=dt)
+                 + gm_redi.diff_ver_part_redi_expl(mesh, st.T, slope_tap, Ki, hnode_new, dt=dt,
+                                                   zbar3=zbar3_live, Z3d=Z3d_live)
                  + gm_redi.diff_part_hor_redi(mesh, st.T, slope_tap, Ki, st.hnode, hnode_new,
                                               st.helem, dt=dt))
         S_adv = (S_adv
-                 + gm_redi.diff_ver_part_redi_expl(mesh, st.S, slope_tap, Ki, hnode_new, dt=dt)
+                 + gm_redi.diff_ver_part_redi_expl(mesh, st.S, slope_tap, Ki, hnode_new, dt=dt,
+                                                   zbar3=zbar3_live, Z3d=Z3d_live)
                  + gm_redi.diff_part_hor_redi(mesh, st.S, slope_tap, Ki, st.hnode, hnode_new,
                                               st.helem, dt=dt))
-        Kv_eff = Kv + gm_redi.k33_augmentation(mesh, slope_tap, Ki)
+        Kv_eff = Kv + gm_redi.k33_augmentation(mesh, slope_tap, Ki, zbar3=zbar3_new, Z3d=Z3d_new)
     # zstar bc_T surface term −dt·sval·water_flux (is_nonlinfs=1): sval = the POST-advection
     # (+Redi) surface T, the C's `trarr[surface]` at the diffusion (fesom_tracer_diff.c:292) —
     # NOT the start-of-step T, so it lands HERE, not in the forcing-step bc_T. bc_S has no such
@@ -332,11 +355,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     if ale_cfg is not None and bc_T is not None:
         bc_T = bc_T - dt * T_adv[:, 0] * water_flux
     # zstar: the impl vert diff layer-center spacings come from the NEW (about-to-commit)
-    # thickness hnode_new — the C builds zbar_n/Z_n from hnode_new (tracer_diff.c:148-158),
-    # the dual-geometry's "new" side (vs QR4C on the committed st.hnode). linfs ⇒ None (static).
-    Z3d_new = None
-    if ale_cfg is not None:
-        _, Z3d_new = ale.live_geometry(mesh, hnode_new)
+    # thickness hnode_new (Z3d_new, hoisted after vert_vel above) — the dual-geometry's "new"
+    # side (vs QR4C on the committed st.hnode). linfs ⇒ None (static).
     T_new, S_new = tracer_diff.impl_vert_diff(mesh, T_adv, S_adv, Kv_eff, hnode_new, dt=dt,
                                               bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d, Z3d=Z3d_new)
     # salinity floor on wet layers only (below-bottom stays 0)

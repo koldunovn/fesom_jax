@@ -226,6 +226,31 @@ def live_geometry(mesh: Mesh, hnode):
     return zbar_3d_n, Z_3d_n
 
 
+def live_geometry_elem(mesh: Mesh, helem):
+    """Per-ELEMENT interface/mid-layer depths ``(zbar_n, Z_n)`` ``[elem2D, nl]`` from the
+    live element thickness ``helem`` — the bottom→top reverse-cumsum stack anchored at the
+    **static** element bottom interface ``zbar[nlevels−1]``:
+
+        zbar_n[nz] = zbar_n[nz+1] + helem[nz]      (nz = nlevels−2 .. ulevels−1, bottom→top)
+        Z_n[nz]    = zbar_n[nz+1] + helem[nz]/2
+
+    This is the element analogue of :func:`live_geometry` and mirrors the C reconstruction
+    that ``fesom_impl_vert_visc`` (``fesom_momentum.c:321-333``) and the shchepetkin PGF
+    (``fesom_eos.c``) both build per element from ``helem``. Used by
+    :func:`fesom_jax.momentum.impl_vert_visc` under zstar (the element-geometry "old" side,
+    from the carried ``st.helem``). Below-bottom lanes carry the static bottom depth (the
+    ``elem_layer_mask`` zeroes ``helem`` there), so spacings stay finite for AD; consumers
+    mask the below-bottom lanes anyway. At cold start (nominal ``helem``) this telescopes to
+    the static ``mesh.zbar``/``mesh.Z`` bit-for-bit."""
+    hel = jnp.where(mesh.elem_layer_mask, helem, 0.0)         # 0 below bottom
+    zbar_bot = mesh.zbar[mesh.nlevels - 1][:, None]           # (elem2D,1) static bottom interface
+    revcum = jnp.cumsum(hel[:, ::-1], axis=1)[:, ::-1]        # Σ_{j≥nz} hel[j]
+    zbar_n = zbar_bot + revcum                                # interface depths [e,nz]
+    zbar_n_below = jnp.concatenate([zbar_n[:, 1:], zbar_bot], axis=1)   # zbar_n[nz+1]
+    Z_n = zbar_n_below + 0.5 * hel                            # element mid-depth of layer nz
+    return zbar_n, Z_n
+
+
 def vert_vel_zstar_distribute(mesh: Mesh, w, hnode, zbar_3d_n, hbar, hbar_old,
                               water_flux, *, dt: float = DT_DEFAULT):
     """zstar branch of vert_vel (substep 13 add-on, ``fesom_ale_vert_vel_zstar_distribute``,

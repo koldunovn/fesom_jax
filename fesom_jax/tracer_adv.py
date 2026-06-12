@@ -238,13 +238,20 @@ def _z_stencil(Z, nl):
     return Z_nz, Z_m1, Z_m2, Z_p1
 
 
-def adv_flux_ver_ho(mesh: Mesh, w_e, ttf):
+def adv_flux_ver_ho(mesh: Mesh, w_e, ttf, Z3d=None, zbar3=None):
     """High-order QR 4th-order vertical flux ``[nod2D, nl]`` at interfaces
     (``adv_tra_ver_qr4c``, ``fesom_tracer_adv.c:621``, ``num_ord=1``).
 
     Surface ``-ttf·W·area``; the 2nd and bottom-minus-1 interfaces use centred
     differences ``-½(T[nz-1]+T[nz])·W·area``; the interior uses the quadratic
-    4th-order reconstruction; the bottom interface is 0. ``ttf = ttfAB``."""
+    4th-order reconstruction; the bottom interface is 0. ``ttf = ttfAB``.
+
+    **zstar (Phase 9a, JZ.6).** ``Z3d``/``zbar3`` (the live per-node mid-depths
+    ``Z_3d_n`` / interface depths ``zbar_3d_n`` ``[nod2D, nl]``, built from the carried
+    ``st.hnode`` — the QR4C high-order reconstruction reads the committed "old" geometry,
+    C ``tracer_adv.c:673-690``) re-point the vertical stencil depths. Both ``None`` ⇒ the
+    static column-uniform ``mesh.Z``/``mesh.zbar`` (byte-identical; live==static at cold
+    start)."""
     W = w_e
     area = mesh.area
     T = ttf
@@ -255,8 +262,15 @@ def adv_flux_ver_ho(mesh: Mesh, w_e, ttf):
     surf = -T * W * area
     cent = -0.5 * (Tm1 + T) * W * area
 
-    Z_nz, Z_m1, Z_m2, Z_p1 = _z_stencil(mesh.Z, mesh.nl)
-    zb = mesh.zbar                                        # (nl,) interface depths
+    if Z3d is None:
+        Z_nz, Z_m1, Z_m2, Z_p1 = _z_stencil(mesh.Z, mesh.nl)
+        zb = mesh.zbar                                    # (nl,) interface depths
+    else:
+        Z_nz = Z3d                                       # (nod2D,nl) live mid-depths
+        Z_m1 = _shift_down(Z3d)                          # Z[nz-1] (edge-rep top)
+        Z_m2 = _shift_down(Z_m1)                         # Z[nz-2]
+        Z_p1 = jnp.concatenate([Z3d[:, 1:], Z3d[:, -1:]], axis=1)   # Z[nz+1] (edge-rep bottom)
+        zb = zbar3                                        # (nod2D,nl) live interface depths
 
     def _safe(x):                                        # guard zero stencil gaps
         return jnp.where(x == 0.0, 1.0, x)
@@ -471,13 +485,16 @@ def flux2dtracer_fct(mesh: Mesh, T, LO, adf_h, adf_v, hnode, hnode_new, *,
 
 
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
-                   *, dt: float = DT_DEFAULT, exch=None):
+                   *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None):
     """One tracer's FCT advection + ALE reconstruction
     (``fesom_tracer_advect_one_fct``, ``fesom_tracer_adv.c:1199``). Returns
     ``(T_new, T_old_new)`` with ``T_old_new = T`` (the AB2 ``valuesold`` save).
 
     LO fluxes & the element/up-dn gradient are built from **values** (T); the HO
     fluxes use the AB2-extrapolated ``ttfAB`` (== T at step 1).
+
+    ``Z3d``/``zbar3`` (zstar live ``Z_3d_n``/``zbar_3d_n`` from ``st.hnode``; ``None`` ⇒
+    static, byte-identical) re-point the QR4C high-order vertical stencil (JZ.6).
 
     ``exch`` (Phase 8, S.7): the Zalesak FCT has two intra-kernel halo exchanges (the C
     ``oce_adv_tra_*.F90``): the low-order field ``LO`` after the LO solve (read at the
@@ -496,7 +513,7 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
     tr_xy = _exch(tr_xy, "elem")  # S.7: eXDim halo elem gradients are read by fill_up_dn_grad
     eud = fill_up_dn_grad(mesh, tr_xy)
     adf_h = adv_flux_hor_ho(mesh, uv, helem, ttfAB, eud) - flux_h_lo
-    adf_v = adv_flux_ver_ho(mesh, w_e, ttfAB) - flux_v_lo
+    adf_v = adv_flux_ver_ho(mesh, w_e, ttfAB, Z3d=Z3d, zbar3=zbar3) - flux_v_lo
     # 5 — Zalesak limit (exchanges fct_plus/fct_minus internally)
     adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, hnode_new, dt=dt, exch=exch)
     # 6-7 — assemble del_ttf  8 — reconstruct (T_new = LO + limited antidiff)

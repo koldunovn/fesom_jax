@@ -105,7 +105,7 @@ class SurfaceFluxes(NamedTuple):
 def compute_surface_fluxes(mesh: Mesh, state: State, sf: StepForcing,
                            fs: ForcingStatic, *, dt: float = DT_DEFAULT,
                            owned_mask=None, axis_name=None,
-                           use_virt_salt: bool = True) -> SurfaceFluxes:
+                           use_virt_salt: bool = True, zbar3=None) -> SurfaceFluxes:
     """Compute the surface BCs from the start-of-step model ``state`` + this step's
     atmosphere ``sf`` + the static constants ``fs``. Pure & differentiable w.r.t.
     ``state`` (the bulk taps ``state.T[:,0]`` / ``state.uvnode[:,0]``).
@@ -149,7 +149,7 @@ def compute_surface_fluxes(mesh: Mesh, state: State, sf: StepForcing,
     #     under ice (a_ice>0) or cavity — fesom_bulk.c:381-382.
     pene_open = fs.open_water & (a <= 0.0)
     heat_flux, sw_3d = _forcing.cal_shortwave_rad(
-        mesh, bulk.heat_flux, sf.shortwave, sf.chl, pene_open)
+        mesh, bulk.heat_flux, sf.shortwave, sf.chl, pene_open, zbar3=zbar3)
 
     # 5 — surface BCs (fesom_tracer_diff.c:43-75). bc_T base here; the zstar −dt·sval·wf term
     #     is added in step.py (post-advection sval). Under zstar (use_virt_salt=False) the

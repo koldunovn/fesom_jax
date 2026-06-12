@@ -3062,6 +3062,31 @@ Cite the C source (`file:line`) or dump probe that proves it.
   exercised at step ≥2 and only the JZ.7 multi-step dump gate validates it (the linfs suite only gates
   the `Z3d=None` byte-neutrality). (`step.step`, Task JZ.6.)
 
+- **[step/zstar] JZ.6 COMPLETE — the per-consumer which-side map, confirmed against the C source
+  (`fesom_gm.c`/`fesom_momentum.c`/`fesom_tracer_diff.c`), not guessed.** A 4-agent C extraction
+  pinned each re-pointed consumer to its exact thickness time-level + array kind:
+  * `eos.compute_dbsfc` — a consumer the grep-by-array audit caught that the comment-scan missed
+    (the "dbsfc denom"; the adiabatic-compression depth `z=Z[nz]` → `Z3d_live`). **Moral: audit by
+    ARRAY (`mesh.Z`/`mesh.zbar`/`zbar_3d_n`), not by reading docstrings** (C lesson #5).
+  * `momentum.impl_vert_visc` — **per-ELEMENT** geometry, not per-node: the C (`fesom_momentum.c:321-333`)
+    rebuilds `zbar_n`/`Z_n` per element from `mesh->helem` (the carried/OLD element thickness), anchored
+    at the static bottom `zbar[nlevels-1]`. Needed a NEW helper `ale.live_geometry_elem(helem)` (the
+    element analogue of `live_geometry`, same stack as the shchepetkin PGF) + the kernel's 1-D `zinv`/
+    `dZ_up`/`dZ_dn` become 2-D `(elem2D,nl)` (drop the `[None,:]`; gathers → `take_along_axis`).
+  * `gm.fer_solve_gamma`+zscaling — per-NODE from `hnode_new`@prev-step ≡ `st.hnode` (`fesom_gm.c:517-527`),
+    so `Z3d_live`/`zbar3_live`. `gm_redi.diff_ver_part_redi_expl` (G7a) — geometry from `hnode` (OLD,
+    `Z3d_live`) but the `÷(areasvol·hnode_new)` divisor is the NEW side (already the arg). `gm_redi`
+    horizontal Redi (G7b) — already uses `st.hnode`/`st.helem`/`hnode_new` directly (NO static-geometry
+    ref ⇒ no re-point). `gm_redi.k33_augmentation` — the ONLY GM consumer on the NEW side: `hnode_new`
+    (`Z3d_new`/`zbar3_new`, `fesom_tracer_diff.c:134-158` — matches `impl_vert_diff`).
+  * `kpp` (5 sites: `ri_iwmix`/`bldepth`/`blmix`×2/`enhance`), `tracer_adv` QR4C, `forcing` sw-pen — all
+    start-of-step ⇒ `Z3d_live`/`zbar3_live`. The QR4C 2-D `_z_stencil` uses `_shift_down`×2 for `Z[nz-2]`
+    (matches the static edge-pad on the `is_int` range k≥nzmin+2; the surface/cent lanes are don't-care).
+  * The per-node TDMA geometry (`fer_solve_gamma`, G7a, k33) goes 1-D `jnp.zeros(nl).at[1:nl-1].set(...)`
+    → 2-D `jnp.zeros((N,nl)).at[:,1:nl-1].set(...)`; live geometry is strictly decreasing (nominal fill
+    below stretch) ⇒ no zero divides, no extra guard needed. (`eos`/`momentum`/`gm`/`gm_redi`/`kpp`/
+    `tracer_adv`/`forcing`, Task JZ.6.)
+
 ## Phase 9a — zstar vertical coordinate (Task JZ.7 — assembled step-1 gate)
 
 - **[integration] The full 4-config CORE2 model — KPP + GM/Redi + EVP ice + zstar — assembles and runs
@@ -3147,3 +3172,26 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (1086 surface nodes / ~13.6k (node,k) entries). **Moral:** before changing a shared fixture to match
   one oracle, enumerate ALL oracles that consume it and their provenance. (Suite job 25538063 →
   caught by the full-suite rerun discipline.)
+
+## Phase 9a — zstar (Task JZ.7 — multi-step assembled gate: the warm-started CG early-stop class)
+
+- **[verify/zstar] ⚠️ The chained 3-step gate's `d_eta`/`hbar` diverge to ~mm at step ≥2 even though
+  JAX and C use the SAME soltol=1e-5/maxiter=500 — the warm-started early-stop of a near-null-space
+  elliptic solve, NOT a bug.** Step 1 both CGs start from `x0=0` (identical seed) ⇒ `d_eta`/`hbar`
+  match to **5.5e-7**; at step ≥2 they warm-start from their respective (5.5e-7-different) step-1
+  `d_eta` and early-stop at the same soltol, leaving the **slow SSH modes** at ~`soltol·‖ssh_rhs‖` —
+  and during spin-up `‖ssh_rhs‖~1e6` (the `dx·helem`-amplified near-cancelling floor, Phase-2 ssh/rhs
+  lesson) ⇒ ~mm in `d_eta`/`hbar`/`eta_n` and the hbar-built geometry `zbar_3d_n`/`Z_3d_n`. **BOUNDED**
+  (s2≈s3≈7e-3, not growing) — the Phase-2 ssh/solver lesson compounded over warm-starts.
+- **[verify/zstar] The DISCRIMINATING gate that the JZ.6 live geometry is correct (not the divergence
+  source) is `pgf`, NOT `d_eta`/`hbar`.** pgf (shchepetkin) reads BOTH the density (T/S — the tracer
+  chain) AND the live `Z_3d_n` (built from hbar). It stays **p50≈4e-9 / p99≈3.7e-7 / max≈4.5e-6** at
+  steps 2-3 (vs 4e-16 at step 1) — a wrong geometry reconstruction would corrupt it at the *geometry*
+  scale, and a diverged tracer chain at the *density* scale; 4e-9 is consistent ONLY with a correct
+  re-point fed inputs carrying the ~1e-6-relative (mm-over-km-depth) hbar noise. So gate pgf tight
+  (the JZ.6 precision gate) + finiteness hard; treat `d_eta`/`hbar`/geometry as the bounded
+  "no-blow-up" CG class (the dump is an early-stopped iterate ⇒ a sub-mm precision gate there is
+  impossible; the D2 stiffness increment is validated config-independently in JZ.3, below this floor).
+  **Moral:** when validating a chained multi-step run against an early-stopped-CG dump, pick a gate
+  field that is ROBUST to the SSH solve's slow-mode noise (a tracer/density-driven one like pgf),
+  not the SSH-derived fields themselves. (`test_jz7_assembled_zstar_steps123`, Task JZ.7.)

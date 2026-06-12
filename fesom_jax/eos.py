@@ -300,7 +300,7 @@ def compute_sw_alpha_beta(mesh: Mesh, T, S, Z3d=None):
 # singular denominator, unlike the bvfreq 1/Δz).
 
 
-def compute_dbsfc(mesh: Mesh, T, S):
+def compute_dbsfc(mesh: Mesh, T, S, Z3d=None):
     """Surface-buoyancy difference ``dbsfc`` for the KPP boundary-layer-depth search.
 
     Per node/level ``dbsfc[nz] = −g·(ρ_surf(z) − ρ_insitu(z)) / ρ_insitu(z)`` where
@@ -314,11 +314,17 @@ def compute_dbsfc(mesh: Mesh, T, S):
     (bottom fill), masked to the interface range (``node_iface_mask`` = ``[nzmin,
     nzmax]``) — the array the KPP ``bldepth`` consumes as ``Ritop = zk·dbsfc[nz]``.
     ``fesom_eos.c:138``.
+
+    ``Z3d`` (zstar live mid-depths ``Z_3d_n`` ``[nod2D,nl]`` from ``st.hnode``; ``None`` ⇒
+    static ``mesh.Z``, byte-identical) re-points the adiabatic compression depth (JZ.6).
     """
     g = G
     nl = mesh.nl
-    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])           # (nl,) pad invalid tail
-    z = Zp[None, :]                                        # (1, nl)
+    if Z3d is None:
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])       # (nl,) pad invalid tail
+        z = Zp[None, :]                                    # (1, nl)
+    else:
+        z = jnp.asarray(Z3d)                               # (nod2D, nl) live mid-depths
     b0, bpz, bpz2, rhopot = jm_components(T, S)            # each (nod2D, nl)
 
     r_full = _insitu(b0, bpz, bpz2, rhopot, z)            # in-situ density at z (NOT −ρ0)

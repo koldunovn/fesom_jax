@@ -324,7 +324,7 @@ def _shift_down(x):
 # ============================================================================
 # K.3 — ri_iwmix: interior shear-Ri + background mixing (fesom_kpp.c:219-274)
 # ============================================================================
-def ri_iwmix(mesh: Mesh, uvnode, bvfreq, cfg: KppConfig):
+def ri_iwmix(mesh: Mesh, uvnode, bvfreq, cfg: KppConfig, Z3d=None):
     """Interior viscosity/diffusivity from local shear-Richardson instability +
     the constant backgrounds — literal port of ``kpp_ri_iwmix`` (``fesom_kpp.c:219``).
 
@@ -347,10 +347,15 @@ def ri_iwmix(mesh: Mesh, uvnode, bvfreq, cfg: KppConfig):
     ``shear→0`` the outcome is ``frit∈{0,1}`` with a clamped/zero ``ratio`` ⇒ no
     backward blow-up; the masked-NaN gate K.10 confirms end-to-end finiteness)."""
     nl = mesh.nl
-    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])            # (nl,) pad invalid tail
-    dz = _shift_down(Zp) - Zp                              # Z[nz-1]-Z[nz] (>0 interior)
-    dz = jnp.where(dz == 0.0, 1.0, dz)                     # k=0 + bottom-pad: avoid 0 (masked)
-    dz_inv = (1.0 / dz)[None, :]                           # (1,nl)
+    # shear layer spacing dz = Z[nz-1]-Z[nz]: static column-uniform or zstar live per-node.
+    if Z3d is None:
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])        # (nl,) pad invalid tail
+        dz = _shift_down(Zp) - Zp                          # Z[nz-1]-Z[nz] (>0 interior)
+        dz = jnp.where(dz == 0.0, 1.0, dz)                 # k=0 + bottom-pad: avoid 0 (masked)
+        dz_inv = (1.0 / dz)[None, :]                       # (1,nl)
+    else:
+        dz = _shift_down(Z3d) - Z3d                        # (N,nl) live Z[nz-1]-Z[nz]
+        dz_inv = 1.0 / jnp.where(dz == 0.0, 1.0, dz)       # (N,nl)
 
     u, v = uvnode[..., 0], uvnode[..., 1]                  # (N,nl)
     du = _shift_down(u) - u                                # u[nz-1]-u[nz]
@@ -468,7 +473,7 @@ def prestep(mesh: Mesh, uvnode, stress_node_surf, heat_flux, water_flux,
 # K.5 — bldepth: OBL depth hbl/kbl + bfsfc/stable/caseA (fesom_kpp.c:317-435)
 # ============================================================================
 def bldepth(mesh: Mesh, dVsq, ustar, Bo, bvfreq, dbsfc, sw_3d, sw_alpha, wmt, wst,
-            cfg: KppConfig):
+            cfg: KppConfig, zbar3=None):
     """Oceanic-boundary-layer depth ``hbl`` + level ``kbl`` + ``bfsfc``/``stable``/
     ``caseA`` — literal port of ``kpp_bldepth`` (``fesom_kpp.c:317-435``). The
     highest-risk KPP kernel: a per-node bulk-Richardson first-crossing search.
@@ -489,7 +494,8 @@ def bldepth(mesh: Mesh, dVsq, ustar, Bo, bvfreq, dbsfc, sw_3d, sw_alpha, wmt, ws
     ``wmt``/``wst`` tables. Returns ``(hbl[N], kbl[N] int, bfsfc[N], stable[N],
     caseA[N])``."""
     nl = mesh.nl
-    zbar = mesh.zbar_3d_n                                   # (N,nl) signed interface depth (≤0)
+    # signed interface depth: static zbar_3d_n or zstar live zbar3 (both (N,nl); JZ.6).
+    zbar = mesh.zbar_3d_n if zbar3 is None else zbar3      # (N,nl) signed interface depth (≤0)
     absz = jnp.abs(zbar)                                   # zk = |zbar|
     nzmin = mesh.ulevels_nod2D - 1                         # (N,)
     nzmax = mesh.nlevels_nod2D - 1
@@ -565,7 +571,7 @@ def bldepth(mesh: Mesh, dVsq, ustar, Bo, bvfreq, dbsfc, sw_3d, sw_alpha, wmt, ws
 # K.6 — blmix: BL coeffs blmc[3] + dkm1[3] + ghats (fesom_kpp.c:449-579)
 # ============================================================================
 def blmix(mesh: Mesh, hnode, viscA, diffKt, diffKs, hbl, bfsfc, stable, caseA, kbl,
-          ustar, wmt, wst, cfg: KppConfig):
+          ustar, wmt, wst, cfg: KppConfig, Z3d=None, zbar3=None):
     """Boundary-layer mixing coefficients — literal port of ``kpp_blmix``
     (``fesom_kpp.c:449-579``). Matches the interior diffusivities (the ``ri_iwmix``
     ``viscA``/``diffKt``/``diffKs`` = ``dcol``) to the surface-layer scaling at ``hbl``
@@ -587,8 +593,12 @@ def blmix(mesh: Mesh, hnode, viscA, diffKt, diffKs, hbl, bfsfc, stable, caseA, k
     [N,nl], dkm1 [N,3])``."""
     nl = mesh.nl
     N = viscA.shape[0]
-    Zabs = jnp.abs(jnp.concatenate([mesh.Z, mesh.Z[-1:]]))[None, :]   # |Z| (1,nl)
-    zbar = mesh.zbar_3d_n                                  # (N,nl) signed
+    # |Z| (mid-depth) + signed interface depth: static or zstar live per-node (JZ.6).
+    if Z3d is None:
+        Zabs = jnp.abs(jnp.concatenate([mesh.Z, mesh.Z[-1:]]))[None, :]   # |Z| (1,nl)
+    else:
+        Zabs = jnp.abs(Z3d)                               # (N,nl) live |Z_3d_n|
+    zbar = mesh.zbar_3d_n if zbar3 is None else zbar3     # (N,nl) signed
     k = jnp.arange(nl).reshape(1, -1)
     nzmin = mesh.ulevels_nod2D - 1
     nzmax = mesh.nlevels_nod2D - 1
@@ -691,7 +701,7 @@ def blmix(mesh: Mesh, hnode, viscA, diffKt, diffKs, hbl, bfsfc, stable, caseA, k
 # K.7 — enhance (blend at kbl-1) + smooth_blmc + combine + node→elem (Av)
 # ============================================================================
 def enhance(mesh: Mesh, blmcM, blmcT, blmcS, ghats, dkm1, viscA, diffKt, diffKs,
-            hbl, caseA, kbl, cfg: KppConfig):
+            hbl, caseA, kbl, cfg: KppConfig, zbar3=None):
     """Enhance the BL coeffs at the ``kbl-1`` interface — literal port of
     ``kpp_enhance`` (``fesom_kpp.c:588-621``). Blends the interior (``caseA``)
     coefficient, the BL coefficient, and ``dkm1`` at ``k=kbl-1`` with the fractional
@@ -699,7 +709,7 @@ def enhance(mesh: Mesh, blmcM, blmcT, blmcS, ghats, dkm1, viscA, diffKt, diffKs,
     ``ghats[kbl-1]`` by ``(1−caseA)``. Modifies only the single ``kbl-1`` interface per
     node. Returns the updated ``(blmcM, blmcT, blmcS, ghats)``."""
     nl = mesh.nl
-    zbar = mesh.zbar_3d_n
+    zbar = mesh.zbar_3d_n if zbar3 is None else zbar3      # static or zstar live (JZ.6)
     kk = kbl - 1                                           # k = kbl-1 (≥0)
 
     def gcol(arr, idx):
@@ -795,7 +805,7 @@ def assemble_mixing(mesh: Mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffK
 # ============================================================================
 def mixing_kpp(mesh: Mesh, uv, bvfreq, dbsfc, sw_alpha, sw_beta, S,
                heat_flux, water_flux, stress_node_surf, sw_3d, hnode, cfg: KppConfig,
-               exch=None):
+               exch=None, Z3d=None, zbar3=None):
     """Assembled KPP vertical-mixing driver — the mirror of ``fesom_kpp_mixing``
     (``fesom_kpp.c:784-939``) preceded by ``compute_vel_nodes`` and followed by the
     shared ``mo_convect`` (the ``fesom_step.c:251-264`` dispatch). Returns
@@ -829,20 +839,21 @@ def mixing_kpp(mesh: Mesh, uv, bvfreq, dbsfc, sw_alpha, sw_beta, S,
     uvnode = pp.compute_vel_nodes(mesh, uv)      # element→node velocity (fesom_step.c:251)
 
     # 3 — interior shear-Ri + background mixing (the "dcol" the BL profile matches to)
-    viscA, diffKt, diffKs = ri_iwmix(mesh, uvnode, bvfreq, cfg)
+    viscA, diffKt, diffKs = ri_iwmix(mesh, uvnode, bvfreq, cfg, Z3d=Z3d)
     # 2 — pre-step surface forcing (dVsq shear re surface, ustar, Bo)
     dVsq, ustar, Bo = prestep(mesh, uvnode, stress_node_surf, heat_flux, water_flux,
                               sw_alpha, sw_beta, S, cfg)
     # 5 — OBL depth + level + bfsfc/stable/caseA
     hbl, kbl, bfsfc, stable, caseA = bldepth(
-        mesh, dVsq, ustar, Bo, bvfreq, dbsfc, sw_3d, sw_alpha, wmt, wst, cfg)
+        mesh, dVsq, ustar, Bo, bvfreq, dbsfc, sw_3d, sw_alpha, wmt, wst, cfg, zbar3=zbar3)
     # 6 — boundary-layer coeffs (cubic shape) + dkm1 + ghats
     blmcM, blmcT, blmcS, ghats, dkm1 = blmix(
         mesh, hnode, viscA, diffKt, diffKs, hbl, bfsfc, stable, caseA, kbl,
-        ustar, wmt, wst, cfg)
+        ustar, wmt, wst, cfg, Z3d=Z3d, zbar3=zbar3)
     # 7 — enhance the BL coeffs at kbl-1
     blmcM, blmcT, blmcS, ghats = enhance(
-        mesh, blmcM, blmcT, blmcS, ghats, dkm1, viscA, diffKt, diffKs, hbl, caseA, kbl, cfg)
+        mesh, blmcM, blmcT, blmcS, ghats, dkm1, viscA, diffKt, diffKs, hbl, caseA, kbl, cfg,
+        zbar3=zbar3)
     # 8 — smooth_blmc (3-sweep) + combine + node→elem Av; Kv = combined diffKt (T-channel)
     #     (exch wires the smoother's per-sweep refresh + the pre-node→elem viscA exchange).
     Kv, Av, *_ = assemble_mixing(

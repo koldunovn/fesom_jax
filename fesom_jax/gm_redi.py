@@ -45,7 +45,7 @@ def tr_xy_elem(mesh: Mesh, T_old):
 
 
 def diff_ver_part_redi_expl(mesh: Mesh, T_old, slope_tapered, Ki, hnode_new,
-                            *, dt: float = DT_DEFAULT):
+                            *, dt: float = DT_DEFAULT, zbar3=None, Z3d=None):
     """G7a — the Redi vertical-explicit flux's contribution to T.
 
     Returns ``delta`` ``(N, nl)`` to ADD to the post-advection T. Per node:
@@ -77,11 +77,20 @@ def diff_ver_part_redi_expl(mesh: Mesh, T_old, slope_tapered, Ki, hnode_new,
     term_full = jnp.pad(term, ((0, 0), (0, 1)))               # (N,nl)
     term_up = jnp.concatenate([term_full[:, :1], term_full[:, :-1]], axis=1)
 
-    # static interface geometry (valid nz∈[1,nl-1)); z_n=Z, zbar_n=zbar.
-    zbar, Z = mesh.zbar, mesh.Z
-    up_geo = jnp.zeros(nl).at[1:nl - 1].set(Z[: nl - 2] - zbar[1:nl - 1])
-    dn_geo = jnp.zeros(nl).at[1:nl - 1].set(zbar[1:nl - 1] - Z[1:nl - 1])
-    mid_geo = jnp.ones(nl).at[1:nl - 1].set(Z[: nl - 2] - Z[1:nl - 1])
+    # interface geometry (valid nz∈[1,nl-1)). Static z_n=Z, zbar_n=zbar; or — under zstar
+    # (JZ.6) — the OLD-mesh (st.hnode) live per-node zbar3/Z3d (the C builds zbar_n/z_n from
+    # hnode, fesom_gm.c:739-753; the ÷hnode_new divisor below is the NEW side).
+    if zbar3 is None:
+        zbar, Z = mesh.zbar, mesh.Z
+        up_geo = jnp.zeros(nl).at[1:nl - 1].set(Z[: nl - 2] - zbar[1:nl - 1])[None, :]
+        dn_geo = jnp.zeros(nl).at[1:nl - 1].set(zbar[1:nl - 1] - Z[1:nl - 1])[None, :]
+        mid_geo = jnp.ones(nl).at[1:nl - 1].set(Z[: nl - 2] - Z[1:nl - 1])[None, :]
+    else:
+        N = mesh.nod2D
+        Zm = Z3d[:, : nl - 1]                              # (N,nl-1) live mid-depths
+        up_geo = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(Zm[:, : nl - 2] - zbar3[:, 1:nl - 1])
+        dn_geo = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(zbar3[:, 1:nl - 1] - Zm[:, 1:nl - 1])
+        mid_geo = jnp.ones((N, nl)).at[:, 1:nl - 1].set(Zm[:, : nl - 2] - Zm[:, 1:nl - 1])
 
     k = jnp.arange(nl)[None, :]
     ule = (mesh.ulevels_nod2D - 1)[:, None]
@@ -174,7 +183,7 @@ def diff_part_hor_redi(mesh: Mesh, T_old, slope_tapered, Ki, hnode, hnode_new,
 # ============================================================================
 # G.6 — K33 isoneutral augmentation (fesom_tracer_diff.c:167-246)
 # ============================================================================
-def k33_augmentation(mesh: Mesh, slope_tapered, Ki):
+def k33_augmentation(mesh: Mesh, slope_tapered, Ki, zbar3=None, Z3d=None):
     """The Redi K33 (3,3-tensor) augmentation of the vertical tracer diffusivity:
     a per-interface ``K33_aug`` to ADD to ``Kv`` before ``impl_vert_diff`` (the C's
     ``Ty/Ty1`` terms; note ``Ty(nz) == Ty1(nz-1)`` ⇒ one per-interface value).
@@ -189,16 +198,26 @@ def k33_augmentation(mesh: Mesh, slope_tapered, Ki):
     ``a∝(Kv[nz]+Ty)``, ``c∝(Kv[nz+1]+Ty1)`` exactly.
     """
     nl = mesh.nl
-    zbar, Z = mesh.zbar, mesh.Z
     s = slope_tapered[:, :, 2]                                # (N,nl-1) |slope|
     stKi = s * s * Ki[:, : nl - 1]                            # (N,nl-1) s²·Ki at layer k
     stKi_full = jnp.pad(stKi, ((0, 0), (0, 1)))             # (N,nl)
     stKi_up = _shift_down(stKi_full)                         # s²Ki[k-1]
 
-    zinv = jnp.zeros(nl).at[1:nl - 1].set(1.0 / (Z[: nl - 2] - Z[1:nl - 1]))
-    geo_up = jnp.zeros(nl).at[1:nl - 1].set(Z[: nl - 2] - zbar[1:nl - 1])
-    geo_dn = jnp.zeros(nl).at[1:nl - 1].set(zbar[1:nl - 1] - Z[1:nl - 1])
-    K33 = (geo_up * zinv)[None, :] * stKi_up + (geo_dn * zinv)[None, :] * stKi_full
+    # vertical geometry. Static z_n=Z, zbar_n=zbar; or — under zstar (JZ.6) — the NEW-mesh
+    # (hnode_new) live per-node zbar3/Z3d (the C K33 builds zbar_n/Z_n from hnode_new,
+    # fesom_tracer_diff.c:134-158 — the impl-diff "new" side, matching impl_vert_diff).
+    if zbar3 is None:
+        zbar, Z = mesh.zbar, mesh.Z
+        zinv = jnp.zeros(nl).at[1:nl - 1].set(1.0 / (Z[: nl - 2] - Z[1:nl - 1]))
+        gu_zinv = (jnp.zeros(nl).at[1:nl - 1].set(Z[: nl - 2] - zbar[1:nl - 1]) * zinv)[None, :]
+        gd_zinv = (jnp.zeros(nl).at[1:nl - 1].set(zbar[1:nl - 1] - Z[1:nl - 1]) * zinv)[None, :]
+    else:
+        N = mesh.nod2D
+        Zm = Z3d[:, : nl - 1]                              # (N,nl-1) live mid-depths
+        zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(1.0 / (Zm[:, : nl - 2] - Zm[:, 1:nl - 1]))
+        gu_zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(Zm[:, : nl - 2] - zbar3[:, 1:nl - 1]) * zinv
+        gd_zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(zbar3[:, 1:nl - 1] - Zm[:, 1:nl - 1]) * zinv
+    K33 = gu_zinv * stKi_up + gd_zinv * stKi_full
 
     k = jnp.arange(nl)[None, :]
     iface = (k >= mesh.ulevels_nod2D[:, None]) & (k < (mesh.nlevels_nod2D - 1)[:, None])

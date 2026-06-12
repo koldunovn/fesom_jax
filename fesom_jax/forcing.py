@@ -297,7 +297,7 @@ def atm_ice_stress(u_air, v_air, u_ice, v_ice):
     return BULK_CD_ATM_ICE * mag * dux, BULK_CD_ATM_ICE * mag * dvy
 
 
-def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None):
+def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None, zbar3=None):
     """Shortwave penetration — AD-safe port of ``fesom_cal_shortwave_rad``
     (``oce_shortwave_pene.F90``, ``fesom_bulk.c:362-415``). Returns
     ``(heat_flux_pene, sw_3d)``:
@@ -337,7 +337,8 @@ def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None):
     sc2 = 7.925 - 6.644 * c + 3.662 * c2 - 1.815 * c3 - 0.218 * c4 + 0.502 * c5
 
     # per-interface attenuation aux[n, nz] = v1·e^{z/sc1} + v2·e^{z/sc2}, z≤0 (depth).
-    z = mesh.zbar_3d_n                                         # (nod2D, nl)
+    # static zbar_3d_n or zstar live zbar3 (committed = st.hnode side; JZ.6).
+    z = mesh.zbar_3d_n if zbar3 is None else zbar3            # (nod2D, nl)
     aux = (v1[:, None] * jnp.exp(z / sc1[:, None])
            + v2[:, None] * jnp.exp(z / sc2[:, None]))
 

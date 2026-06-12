@@ -257,7 +257,8 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None):
     return ops.mask_below_bottom(out, mesh.elem_layer_mask)
 
 
-def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT):
+def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT,
+                   elem_geo=None):
     """Implicit vertical viscosity per element (substep 7). Returns the velocity
     **increment** ``du`` ``[elem2D, nl, 2]`` (the C stores it back into ``uv_rhs``;
     ``update_vel`` later does ``uv += du``).
@@ -267,27 +268,49 @@ def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT):
     ``w_i=0`` (the advective tridiagonal terms drop). Builds the tridiagonal
     (a,b,c) from ``Av`` + geometry, adds wind-stress (surface) and quadratic
     bottom-drag (bottom) forcing, converts to the ``du`` system, and solves with
-    :func:`ops.tdma` (vectorized over elements)."""
+    :func:`ops.tdma` (vectorized over elements).
+
+    **zstar (Phase 9a, JZ.6).** ``elem_geo`` is the live per-element ``(zbar_n, Z_n)``
+    ``[elem2D, nl]`` from :func:`fesom_jax.ale.live_geometry_elem` (built from the carried
+    ``st.helem`` — the element-geometry "old" side; the C rebuilds them from ``helem`` per
+    element, ``fesom_momentum.c:321-333``). ``elem_geo=None`` ⇒ the static column-uniform
+    ``zbar``/``Z`` (byte-identical; live==static at cold start)."""
     nl = mesh.nl
     inv_rho0 = 1.0 / DENSITY_0
-    zbar = mesh.zbar
-    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
+    # Layer thickness ``h`` (for ``zinv=dt/h``) + the layer-center spacings ``dZ_up``/
+    # ``dZ_dn``. Static column-uniform geometry, or — under zstar — the live per-element
+    # ``zbar_n``/``Z_n`` (``h[nz]=zbar_n[nz]−zbar_n[nz+1]``, exactly the C's ``zinv`` denom).
+    # The masked surface/bottom-pad lanes get ``dZ==0`` ⇒ guard the divisors (the kpp.py:352
+    # idiom): a bare 0 yields inf/NaN that the masks hide forward but that poisons the AD
+    # backward of the masked tridiagonal (the sharded reverse pass exposes it).
+    if elem_geo is None:
+        zbar = mesh.zbar
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
+        hh = zbar[:-1] - zbar[1:]
+        h = jnp.concatenate([hh, hh[-1:]])          # layer thickness (nl,), tail padded
+        zinv = dt / h
+        dZ_up = (_shift_down(Zp) - Zp).at[0].set(1.0)   # Z[nz-1]-Z[nz]; [0] unused (a=0)
+        dZ_dn = (Zp - _shift_up(Zp)).at[-1].set(1.0)    # Z[nz]-Z[nz+1]; [-1] unused
+        dZ_up = jnp.where(dZ_up != 0.0, dZ_up, 1.0)
+        dZ_dn = jnp.where(dZ_dn != 0.0, dZ_dn, 1.0)
+        zinv_b, dZ_up_b, dZ_dn_b = zinv[None, :], dZ_up[None, :], dZ_dn[None, :]
+        zinv_top = ops.gather(zinv, mesh.ulevels - 1)[:, None]      # (elem2D,1)
+        zinv_bot = ops.gather(zinv, mesh.nlevels - 2)[:, None]
+    else:
+        zbar_n, Z_n = elem_geo                       # (elem2D,nl) live element depths
+        zbar_n_below = jnp.concatenate([zbar_n[:, 1:], zbar_n[:, -1:]], axis=1)  # zbar_n[nz+1]
+        h = zbar_n - zbar_n_below                    # layer thickness = helem (0 at pad)
+        zinv = dt / jnp.where(h != 0.0, h, 1.0)      # (elem2D,nl)
+        dZ_up = _shift_down(Z_n) - Z_n               # Z_n[nz-1]-Z_n[nz]
+        dZ_dn = Z_n - _shift_up(Z_n)                 # Z_n[nz]-Z_n[nz+1]
+        dZ_up = jnp.where(dZ_up != 0.0, dZ_up, 1.0)
+        dZ_dn = jnp.where(dZ_dn != 0.0, dZ_dn, 1.0)
+        zinv_b, dZ_up_b, dZ_dn_b = zinv, dZ_up, dZ_dn
+        zinv_top = jnp.take_along_axis(zinv, (mesh.ulevels - 1)[:, None], axis=1)
+        zinv_bot = jnp.take_along_axis(zinv, (mesh.nlevels - 2)[:, None], axis=1)
 
-    hh = zbar[:-1] - zbar[1:]
-    h = jnp.concatenate([hh, hh[-1:]])              # layer thickness (nl,), tail padded
-    zinv = dt / h
-    dZ_up = (_shift_down(Zp) - Zp).at[0].set(1.0)   # Z[nz-1]-Z[nz]; [0] unused (a=0)
-    dZ_dn = (Zp - _shift_up(Zp)).at[-1].set(1.0)    # Z[nz]-Z[nz+1]; [-1] unused
-    # The Zp tail duplicates Z[-1] ⇒ the bottom interface has dZ==0; with Av==0 there
-    # (masked), ``Av/dZ`` is 0/0=NaN and the AD backward of the masked tridiagonal is
-    # poisoned — a masked-NaN trap the sharded reverse pass exposes (dense XLA folds the
-    # structural zero). Guard the divisors (the kpp.py:352 idiom). Forward byte-identical:
-    # these lanes are masked by ``valid``/``bot`` downstream.
-    dZ_up = jnp.where(dZ_up != 0.0, dZ_up, 1.0)
-    dZ_dn = jnp.where(dZ_dn != 0.0, dZ_dn, 1.0)
-
-    a_full = -Av / dZ_up[None, :] * zinv[None, :]
-    c_full = -_shift_up(Av) / dZ_dn[None, :] * zinv[None, :]
+    a_full = -Av / dZ_up_b * zinv_b
+    c_full = -_shift_up(Av) / dZ_dn_b * zinv_b
 
     k = jnp.arange(nl)[None, :]
     nzmin = (mesh.ulevels - 1)[:, None]
@@ -306,8 +329,7 @@ def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT):
     u_old, v_old = uv[:, :, 0], uv[:, :, 1]
     fu, fv = uv_rhs[:, :, 0], uv_rhs[:, :, 1]
 
-    # surface wind stress at the top row
-    zinv_top = ops.gather(zinv, mesh.ulevels - 1)[:, None]      # (elem2D,1)
+    # surface wind stress at the top row (zinv_top from the geometry branch above)
     fu = fu + jnp.where(surf, zinv_top * (stress_surf[:, 0:1] * inv_rho0), 0.0)
     fv = fv + jnp.where(surf, zinv_top * (stress_surf[:, 1:2] * inv_rho0), 0.0)
 
@@ -316,7 +338,6 @@ def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT):
     u_bot = jnp.take_along_axis(u_old, bot_idx, axis=1)
     v_bot = jnp.take_along_axis(v_old, bot_idx, axis=1)
     spd = _safe_sqrt(u_bot * u_bot + v_bot * v_bot)            # (elem2D,1)
-    zinv_bot = ops.gather(zinv, mesh.nlevels - 2)[:, None]
     fric = -C_D * spd
     fu = fu + jnp.where(bot, zinv_bot * fric * u_bot, 0.0)
     fv = fv + jnp.where(bot, zinv_bot * fric * v_bot, 0.0)

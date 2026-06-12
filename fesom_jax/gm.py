@@ -168,7 +168,8 @@ def compute_neutral_slope(mesh: Mesh, sigma_xy, bvfreq, cfg: GMConfig):
 # ============================================================================
 # G.3 — init_redi_gm (fesom_gm.c:345-468)
 # ============================================================================
-def init_redi_gm(mesh: Mesh, bvfreq, hnode_new, fer_tapfac, params, cfg: GMConfig):
+def init_redi_gm(mesh: Mesh, bvfreq, hnode_new, fer_tapfac, params, cfg: GMConfig,
+                 zbar3=None):
     """Per-step GM/Redi coefficient builder: ``fer_K`` (GM thickness diffusivity),
     ``Ki`` (Redi diffusivity), ``fer_C`` (baroclinic-wave-speed²), ``fer_scal``
     (resolution scaling). Reads the differentiable ``params.k_gm``/``params.redi_kmax``
@@ -212,7 +213,8 @@ def init_redi_gm(mesh: Mesh, bvfreq, hnode_new, fer_tapfac, params, cfg: GMConfi
     fer_C = cm * cm                                         # (N,)
 
     # --- F2: depth-exp zscaling (regular bounds) -----------------------------
-    z = jnp.abs(mesh.zbar_3d_n)                             # (N,nl) |interface depth|
+    # |interface depth|: static zbar_3d_n or zstar live zbar3 (from st.hnode; JZ.6).
+    z = jnp.abs(mesh.zbar_3d_n if zbar3 is None else zbar3)   # (N,nl) |interface depth|
     zscaling = cfg.gmzexp_smin + (1.0 - cfg.gmzexp_smin) * jnp.exp(-z / cfg.gmzexp_zref)
     zscaling = jnp.clip(zscaling, cfg.gmzexp_smin, 1.0)     # (N,nl); below-bottom→1 (z=0)
 
@@ -233,7 +235,8 @@ def init_redi_gm(mesh: Mesh, bvfreq, hnode_new, fer_tapfac, params, cfg: GMConfi
 # ============================================================================
 # G.4 — fer_solve_gamma (fesom_gm.c:492-612)
 # ============================================================================
-def fer_solve_gamma(mesh: Mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg: GMConfig):
+def fer_solve_gamma(mesh: Mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg: GMConfig,
+                    zbar3=None, Z3d=None):
     """Per-node 1-D TDMA for the GM streamfunction Γ:
     ``∂z(C·∂z Γ) − N²·Γ = (g/ρ₀)·∇σ·K_GM``. The two horizontal components (x, y)
     share the matrix. Solved on the CONSERVATIVE (inner) level range with Dirichlet
@@ -247,18 +250,29 @@ def fer_solve_gamma(mesh: Mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg: GMConfig):
     nl = mesh.nl
     r = cfg.g / cfg.rho_ref
 
-    # --- static tridiagonal geometry (zbar_n=zbar, Z_n=Z in linfs) -----------
-    zbar = mesh.zbar                                       # (nl,)
-    Z = mesh.Z                                             # (nl-1,)
-    zinv_if = 1.0 / (zbar[:-1] - zbar[1:])                 # (nl-1,) 1/(zbar[k]-zbar[k+1])
-    zinv_mid = 1.0 / (Z[:-1] - Z[1:])                      # (nl-2,) 1/(Z[nz-1]-Z[nz]), nz∈[1,nl-1)
-    # body nz∈[1,nl-1): a∝zinv_if[nz-1]·zinv_mid[nz], c∝zinv_if[nz]·zinv_mid[nz]
-    Ga = jnp.zeros(nl).at[1:nl - 1].set(zinv_if[: nl - 2] * zinv_mid)
-    Gc = jnp.zeros(nl).at[1:nl - 1].set(zinv_if[1:nl - 1] * zinv_mid)
+    # --- tridiagonal geometry. Static column-uniform (zbar_n=zbar, Z_n=Z in linfs) or,
+    #     under zstar (JZ.6), per-node live zbar3/Z3d (the C rebuilds zbar_n/Z_n per node
+    #     from hnode_new@prev-step ≡ st.hnode, fesom_gm.c:517-527). Live geometry is
+    #     strictly decreasing (nominal fill below stretch) ⇒ no zero divides.
+    if zbar3 is None:
+        zbar = mesh.zbar                                  # (nl,)
+        Z = mesh.Z                                        # (nl-1,)
+        zinv_if = 1.0 / (zbar[:-1] - zbar[1:])            # (nl-1,) 1/(zbar[k]-zbar[k+1])
+        zinv_mid = 1.0 / (Z[:-1] - Z[1:])                # (nl-2,) 1/(Z[nz-1]-Z[nz]), nz∈[1,nl-1)
+        # body nz∈[1,nl-1): a∝zinv_if[nz-1]·zinv_mid[nz], c∝zinv_if[nz]·zinv_mid[nz]
+        Ga = jnp.zeros(nl).at[1:nl - 1].set(zinv_if[: nl - 2] * zinv_mid)[None, :]
+        Gc = jnp.zeros(nl).at[1:nl - 1].set(zinv_if[1:nl - 1] * zinv_mid)[None, :]
+    else:
+        N = mesh.nod2D
+        Zmid = Z3d[:, : nl - 1]                           # (N,nl-1) live mid-depths (drop pad)
+        zinv_if = 1.0 / (zbar3[:, :-1] - zbar3[:, 1:])    # (N,nl-1)
+        zinv_mid = 1.0 / (Zmid[:, :-1] - Zmid[:, 1:])     # (N,nl-2)
+        Ga = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(zinv_if[:, : nl - 2] * zinv_mid)
+        Gc = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(zinv_if[:, 1:nl - 1] * zinv_mid)
 
     fc = fer_C[:, None]                                    # (N,1)
-    a = fc * Ga[None, :]                                   # (N,nl)
-    c = fc * Gc[None, :]
+    a = fc * Ga                                            # (N,nl)
+    c = fc * Gc
     bv_floor = jnp.maximum(bvfreq, cfg.gamma_bv_floor)     # max(N²,1e-8)
     b_body = -a - c - bv_floor
 
@@ -320,7 +334,7 @@ class GMDiag(NamedTuple):
 
 
 def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
-                   cfg: GMConfig, exch=None) -> GMDiag:
+                   cfg: GMConfig, exch=None, Z3d=None, zbar3=None) -> GMDiag:
     """Run the full GM/Redi diagnostic chain (G.2-G.4) from the ocean state:
     ``sw_alpha_beta → sigma_xy → neutral_slope → init_redi_gm → fer_solve_gamma →
     fer_gamma2vel``. Returns the fields the bolus advection (G.5) and Redi terms
@@ -355,11 +369,15 @@ def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
     if exch is None:
         exch = lambda f, kind: f                       # noqa: E731  (identity ⇒ byte-id)
     from .eos import compute_sw_alpha_beta
-    sw_alpha, sw_beta = compute_sw_alpha_beta(mesh, T, S)
+    # zstar (JZ.6): the GM block reads the OLD committed (st.hnode) node geometry — at this
+    # call hnode_new ≡ st.hnode, so Z3d/zbar3 are live_geometry(st.hnode). None ⇒ static.
+    sw_alpha, sw_beta = compute_sw_alpha_beta(mesh, T, S, Z3d=Z3d)
     sigma_xy = compute_sigma_xy(mesh, T, S, sw_alpha, sw_beta, cfg)
     _, slope_tapered, fer_tapfac = compute_neutral_slope(mesh, sigma_xy, bvfreq, cfg)
-    fer_K, Ki, fer_C, _ = init_redi_gm(mesh, bvfreq, hnode_new, fer_tapfac, params, cfg)
-    fer_gamma = fer_solve_gamma(mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg)
+    fer_K, Ki, fer_C, _ = init_redi_gm(mesh, bvfreq, hnode_new, fer_tapfac, params, cfg,
+                                       zbar3=zbar3)
+    fer_gamma = fer_solve_gamma(mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg,
+                                zbar3=zbar3, Z3d=Z3d)
     fer_gamma = exch(fer_gamma, "nod")                 # INTRA: gathered at HALO vertices below
     fer_uv = fer_gamma2vel(mesh, fer_gamma, helem)
     fer_uv = exch(fer_uv, "elem")                      # read at HALO elems (compute_w / FCT)

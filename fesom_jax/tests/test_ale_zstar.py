@@ -998,3 +998,141 @@ def test_jz7_assembled_zstar_step1(capsys):
         f"d_eta p99={np.percentile(d_deta, 99):.2e} max={d_deta.max():.2e}"
     assert np.percentile(d_wvel, 50) < 1e-9 and d_wvel.max() < 1e-6, \
         f"Wvel p50={np.percentile(d_wvel, 50):.2e} max={d_wvel.max():.2e}"
+
+
+@core2_forcing_missing
+def test_jz7_assembled_zstar_steps123(capsys):
+    """JZ.7 multi-step (compute-node): the assembled CORE2 zstar model run for 3 steps vs the
+    z2_cdump 3-step dump set. This is the REAL validation of the JZ.6 live-geometry re-points:
+    at step 1 live==static (a cold-start no-op), so the EOS/PP/dbsfc/KPP/GM/QR4C/vert-Redi/K33/
+    momentum/forcing geometry only diverges from static at steps ≥2 — here the SSH change has
+    stretched the column and every re-pointed consumer reads genuinely-moving depths.
+
+    The JAX state is chained (the C dumps only the 12 ALE tags, not full T/S/uv). ⚠️ KEY
+    FINDING (calibrated 2026-06-12): the JAX and C CG use the **same** soltol=1e-5/maxiter=500,
+    but the comparison still carries a step-≥2 **warm-started early-stop divergence of ~mm** in
+    the SSH-solve-derived fields (d_eta/hbar/eta_n and the hbar-built geometry zbar_3d_n/Z_3d_n).
+    At step 1 both CGs start from x0=0 (identical seed) ⇒ d_eta/hbar match to 5.5e-7; at steps
+    ≥2 they warm-start from their respective (5.5e-7-different) step-1 d_eta and early-stop at the
+    SAME soltol, which leaves the **slow SSH modes** at ~soltol·‖ssh_rhs‖ — and during spin-up
+    ‖ssh_rhs‖~1e6 (the dx·helem-amplified near-cancelling floor) ⇒ ~mm in d_eta/hbar. It is
+    BOUNDED (s2≈s3≈7e-3, not growing) — the Phase-2 ssh/solver lesson compounded over warm-starts.
+
+    So gate by what each tag's noise floor allows (per step):
+
+      * **pgf** (shchepetkin on live geometry) — the STRONG JZ.6 gate: bit-faithful at step 1
+        (live==static), then p50~4e-9 / p99<1e-6 at steps ≥2. pgf reads BOTH density (T/S, the
+        tracer chain) AND the live ``Z_3d_n`` — its bit-faithfulness proves the re-pointed geometry
+        is correct (a wrong reconstruction corrupts pgf at the geometry scale, not at 1e-9; and a
+        diverged T/S would corrupt the density, so 4e-9 also certifies the re-pointed tracer chain).
+      * **d_eta/hbar/eta_n + zbar_3d_n/Z_3d_n** — the warm-started CG early-stop class (~mm,
+        bounded). A loose "no blow-up" gate, NOT a precision gate (the dump is an early-stopped
+        iterate; the D2 increment is validated config-independently in JZ.3).
+      * **hnode/helem** — per-layer thickness (smaller, ~1e-3). **Wvel** — bit-faithful bulk
+        (÷area) + CG tail. **ssh_rhs** — near-cancelling diagnostic (no gate).
+
+    Bounds calibrated from the per-step prints (house style); finiteness is the hard gate at
+    every step (no NaN through 3 assembled zstar steps = the integration milestone)."""
+    from fesom_jax import core2_forcing, ice
+    from fesom_jax.gm import GMConfig
+    from fesom_jax.kpp import KppConfig
+    from fesom_jax.ice import IceConfig
+    from fesom_jax.phc_ic import core2_initial_state
+    mesh = load_mesh(CORE2_MESH)
+    state = core2_initial_state(mesh, CORE2_IC)
+    sst = np.asarray(state.T[:, 0])
+    state0 = ice.seed_ice(state, mesh, sst)
+    op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
+    cf = core2_forcing.build_core_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
+    dates = core2_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 3)
+    sfs = [cf.step_forcing(*d) for d in dates]
+
+    clean_node = _config_clean_node_mask(mesh)
+    assert clean_node.all(), (f"{int((~clean_node).sum())} nodes above the relax reduction floor "
+                              "— stale IC cache? rerun scripts/rebuild_ic_dist16.py")
+    en = np.asarray(mesh.elem_nodes)
+    clean_elem = clean_node[en[:, 0]] & clean_node[en[:, 1]] & clean_node[en[:, 2]]
+    nim = np.asarray(mesh.node_iface_mask)
+    elm = np.asarray(mesh.elem_layer_mask)
+    nlm = np.asarray(mesh.node_layer_mask)
+
+    def _stat(tag, jx, c, mask):
+        d = np.abs(np.asarray(jx, dtype=np.float64) - np.asarray(c, dtype=np.float64))[mask]
+        with capsys.disabled():
+            print(f"[jz7-ms] s{_sN} {tag:11s} |Δ| p50={np.percentile(d, 50):.2e} "
+                  f"p99={np.percentile(d, 99):.2e} p99.9={np.percentile(d, 99.9):.2e} max={d.max():.2e}")
+        return d
+
+    cfgs = dict(kpp_cfg=KppConfig(), gm_cfg=GMConfig(), ice_cfg=IceConfig(), ale_cfg=AleConfig())
+    st = state0
+    R = {}                                   # (step, tag) → |Δ| array, for the deferred gates
+    for i in range(3):
+        _sN = i + 1
+        st = stepmod.step(st, mesh, op, None, dt=DT_ZSTAR, is_first_step=(i == 0),
+                          step_forcing=sfs[i], forcing_static=cf.static, **cfgs)
+        # finiteness — the hard gate at every step (a NaN here is a genuine integration failure).
+        for fld in ("T", "S", "uv", "hbar", "hnode", "hnode_new", "helem", "pgf_x", "pgf_y",
+                    "d_eta", "w", "eta_n", "ssh_rhs", "a_ice"):
+            a = np.asarray(getattr(st, fld))
+            assert np.all(np.isfinite(a)), f"{fld} non-finite at zstar step {_sN}"
+
+        # --- load this step's dump tags ---
+        fp, _ = io_dump.load_ale_dump(ZSTAR_ORACLE, ["pgf_x", "pgf_y"], step=_sN,
+                                      n_nod=NG5_NOD2D, n_elem=NG5_ELEM2D)
+        fsh, _ = io_dump.load_ale_dump(ZSTAR_ORACLE, ["sshsolve", "hbar"], step=_sN, n_nod=NG5_NOD2D)
+        fwv, _ = io_dump.load_ale_dump(ZSTAR_ORACLE, ["Wvel"], step=_sN, n_nod=NG5_NOD2D)
+        fth, _ = io_dump.load_ale_dump(ZSTAR_ORACLE, ["hnode", "zbar_3d_n", "Z_3d_n", "helem"],
+                                       step=_sN, n_nod=NG5_NOD2D, n_elem=NG5_ELEM2D)
+
+        # post-commit live geometry (the DIRECT JZ.6 gate: live_geometry vs the C reconstruction).
+        zbar3_j, Z3d_j = ale.live_geometry(mesh, st.hnode)
+        R[_sN, "hnode"] = _stat("hnode", st.hnode[:, :NG5_NL - 1], fth["hnode"], nlm[:, :NG5_NL - 1])
+        R[_sN, "zbar_3d_n"] = _stat("zbar_3d_n", zbar3_j, fth["zbar_3d_n"], nim)
+        R[_sN, "Z_3d_n"] = _stat("Z_3d_n", Z3d_j[:, :NG5_NL - 1], fth["Z_3d_n"], nlm[:, :NG5_NL - 1])
+        R[_sN, "helem"] = _stat("helem", st.helem[:, :NG5_NL - 1], fth["helem"], elm[:, :NG5_NL - 1])
+        # pgf (element layer)
+        R[_sN, "pgf_x"] = _stat("pgf_x", st.pgf_x[:, :NG5_NL - 1], fp["pgf_x"], elm[:, :NG5_NL - 1])
+        R[_sN, "pgf_y"] = _stat("pgf_y", st.pgf_y[:, :NG5_NL - 1], fp["pgf_y"], elm[:, :NG5_NL - 1])
+        # ssh / hbar / Wvel
+        _stat("ssh_rhs", st.ssh_rhs, io_dump.ale_component(fsh, "sshsolve", "ssh_rhs"), clean_node)
+        R[_sN, "d_eta"] = _stat("d_eta", st.d_eta, io_dump.ale_component(fsh, "sshsolve", "d_eta"), clean_node)
+        R[_sN, "hbar"] = _stat("hbar", st.hbar, io_dump.ale_component(fsh, "hbar", "hbar"), clean_node)
+        R[_sN, "eta_n"] = _stat("eta_n", st.eta_n, io_dump.ale_component(fsh, "hbar", "eta_n"), clean_node)
+        R[_sN, "Wvel"] = _stat("Wvel", st.w, fwv["Wvel"], clean_node[:, None] & nim)
+
+    # --- deferred per-class gates (all 3 steps' prints already emitted; calibrated 2026-06-12
+    #     from the run above, ~2× headroom over the observed bounded divergence) ---
+    def mx(s, t):
+        return R[s, t].max()
+
+    def pc(s, t, q):
+        return np.percentile(R[s, t], q)
+
+    for s in (1, 2, 3):
+        # pgf — the STRONG JZ.6 gate. Step 1 live==static ⇒ bit (max<1e-14); steps ≥2 the
+        # geometry is genuinely live ⇒ p99<1e-6 (observed s2/s3 p99~3.7e-7), max<1e-5 (~4.5e-6).
+        pgf_p99 = 1e-15 if s == 1 else 1e-6
+        pgf_max = 1e-14 if s == 1 else 1e-5
+        assert pc(s, "pgf_x", 99) < pgf_p99 and pc(s, "pgf_y", 99) < pgf_p99, \
+            f"pgf p99 x={pc(s, 'pgf_x', 99):.2e} y={pc(s, 'pgf_y', 99):.2e} step {s} (JZ.6 geom regressed)"
+        assert mx(s, "pgf_x") < pgf_max and mx(s, "pgf_y") < pgf_max, \
+            f"pgf max x={mx(s, 'pgf_x'):.2e} y={mx(s, 'pgf_y'):.2e} step {s} (JZ.6 geom regressed)"
+
+        # SSH-solve-derived fields — the warm-started CG early-stop class. Step 1 (x0=0, same seed)
+        # is tight (~5.5e-7); steps ≥2 carry the ~mm slow-mode early-stop (bounded, s2≈s3). A
+        # loose "no blow-up" gate (NOT a precision gate — the dump is an early-stopped iterate).
+        cg_p99 = 1e-6 if s == 1 else 5e-3      # observed: s1~2.5e-7, s2/s3~1.2e-3/1.8e-3
+        cg_max = 1e-6 if s == 1 else 1.5e-2    # observed: s1~5.5e-7, s2/s3~7.3e-3/7.7e-3
+        for t in ("d_eta", "hbar", "eta_n", "zbar_3d_n", "Z_3d_n"):
+            assert pc(s, t, 99) < cg_p99 and mx(s, t) < cg_max, \
+                f"{t} p99={pc(s, t, 99):.2e} max={mx(s, t):.2e} step {s} (SSH early-stop class blew up)"
+        # per-layer thickness — a fraction of the cumulative-geometry class.
+        th_p99 = 1e-6 if s == 1 else 5e-4      # observed s2/s3 p99~6e-5/8e-5
+        th_max = 1e-6 if s == 1 else 5e-3      # observed s2/s3 max~1.5e-3/1.2e-3
+        for t in ("hnode", "helem"):
+            assert pc(s, t, 99) < th_p99 and mx(s, t) < th_max, \
+                f"{t} p99={pc(s, t, 99):.2e} max={mx(s, t):.2e} step {s}"
+        # Wvel — bit-faithful bulk (÷area crushes the scatter) + CG-class tail.
+        wv_p50 = 1e-9 if s == 1 else 1e-6      # observed s1~1e-10, s2/s3~1.7e-7/3.3e-7
+        assert pc(s, "Wvel", 50) < wv_p50 and mx(s, "Wvel") < cg_max, \
+            f"Wvel p50={pc(s, 'Wvel', 50):.2e} max={mx(s, 'Wvel'):.2e} step {s}"

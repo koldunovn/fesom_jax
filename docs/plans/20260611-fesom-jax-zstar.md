@@ -347,24 +347,28 @@ correctness (steps ≥2, where live≠static) is the JZ.7 gate. The "un-hoist st
 (JZ.4 overrides `hnode_new` after vert_vel; GM substep-2 reads the OLD `st.hnode`-hoist, downstream reads
 the new — the C dual-geometry, no rename needed).
 
-- [~] re-point every §2-listed consumer to live geometry under zstar (grep-by-array audit; lesson #5);
-      un-hoist `step.py:157` ✅ (JZ.4 override — see Audited design above). **PARTIAL (2026-06-12):**
-      ✅ `eos.py` (density compressibility depth + N² spacing `Z3d=Z3d_live`), ✅ `pp.py` (shear `dz`,
-      `Z3d_live`), ✅ `tracer_diff.py` (impl-diff layer spacings from `hnode_new` ⇒ `Z3d=Z3d_new`, the
-      dual-geometry "new" side) — all byte-neutral (`Z3d=None` ⇒ exact static path; test_step_pi + the
-      kernel tests + the pi-zstar assembled smoke all green; **full suite OCEAN 524 + ICE 47, 0 fail —
-      job 25535224, 2026-06-12**). ⬜ REMAINING (intricate, do alongside the
-      JZ.7 multi-step gate that validates the live branch — at step 1 live==static so they're no-ops):
-      `tracer_adv` QR4C (needs `_z_stencil` 2-D + `Z3d_live`/`zbar3_live` through the FCT driver),
-      `momentum` impl_vert_visc (element geometry from `helem`, the shchepetkin `Z_n`-stack pattern),
-      `gm`/`gm_redi` (fer on `hnode_new`, horizontal Redi on `st.hnode`), `kpp` (5 sites), `forcing`
-      sw-penetration (`zbar3_live`; needs the hoist moved before the forcing block).
-- [ ] dual-geometry exactly as the C: QR4C on committed (st.hnode) geometry, flux-limited + impl-diff
-      + GM fer on `hnode_new`, horizontal Redi on `st.hnode` (lesson #6)
-- [ ] confirm the existing unconditional salinity floor (`step.py:282`) stays untouched (mirrors the
-      C; do NOT ale-gate — plan-review 2026-06-12)
-- [ ] tests: per-consumer linfs bitwise-neutrality (live==static); zstar-ON 1-step runs finite
-- [ ] full suite green
+- [x] re-point every §2-listed consumer to live geometry under zstar (grep-by-array audit; lesson #5);
+      un-hoist `step.py:157` ✅ (JZ.4 override). **COMPLETE (2026-06-12):** all consumers re-pointed
+      via the `Z3d=None`/`zbar3=None` byte-neutral threading + the **C-confirmed which-side map**
+      (4-agent extraction of `fesom_gm.c`/`fesom_momentum.c`/`fesom_tracer_diff.c`):
+      ✅ `eos.py` (density depth + N² + **`compute_dbsfc`** — the grep-by-array audit caught the
+      "dbsfc denom" the comment-scan missed), ✅ `pp.py`, ✅ `tracer_diff.py` (impl-diff on `Z3d_new`),
+      ✅ `tracer_adv.py` (QR4C 2-D `_z_stencil` on `Z3d_live`/`zbar3_live`), ✅ `momentum.py`
+      (impl_vert_visc per-ELEMENT geom from `st.helem` via a NEW `ale.live_geometry_elem` helper —
+      the C rebuilds `zbar_n`/`Z_n` per element from `helem`, `fesom_momentum.c:321-333`),
+      ✅ `gm.py` (fer_solve_gamma TDMA + zscaling on `Z3d_live`/`zbar3_live` = `hnode_new`@prev ≡
+      `st.hnode`), ✅ `gm_redi.py` (G7a vert-Redi geom on `Z3d_live` OLD + the existing `÷hnode_new`
+      divisor; K33 on `Z3d_new`/`zbar3_new` NEW side; G7b needs no change — already on
+      `st.hnode`/`helem`/`hnode_new`), ✅ `kpp.py` (5 sites on `Z3d_live`/`zbar3_live`), ✅ `forcing.py`
+      sw-pen on `zbar3_live` (hoist moved before the forcing block). All byte-neutral.
+- [x] dual-geometry exactly as the C: QR4C + horizontal Redi on committed (`st.hnode`/`Z3d_live`),
+      impl-diff + GM K33 on `hnode_new`/`Z3d_new`, the `÷hnode_new` divisors on the new side (lesson #6).
+- [x] salinity floor (`step.py:282`) untouched — unconditional, mirrors the C (do NOT ale-gate).
+- [x] tests: per-consumer linfs bitwise-neutrality (live==static — pi suite 69 + the full ocean suite);
+      zstar-ON runs finite (pi-zstar smoke + the JZ.7 assembled multi-step).
+- [x] full suite green — **OCEAN 529 + ICE 47, 0 fail (job 25550512, 2026-06-12)**; `ale_cfg=None`
+      byte-identical across all re-pointed consumers (eos/pp/dbsfc/kpp/gm/gm_redi/momentum/tracer_adv/
+      forcing). Sharding group times out (pre-existing Phase-8b ragged halo — not a zstar regression).
 
 ### JZ.7 — Assembled zstar step: 3-step dump-diff + sharded N-vs-1
 
@@ -392,9 +396,21 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       `test_phc_ic.py` serial dumps now byte-exact (`np.array_equal`) + `test_dist16_*` (16r postload
       bit-identity + cache currency for BOTH caches). ⚠️ TWO IC caches (the legacy CORE2 oracles were
       1-rank runs — one IC can't serve both partitions): `data/ic_core2` = serial (legacy gates),
-      `data/ic_core2_dist16` = dist_16 (all z2_cdump-gated zstar tests point here). ⬜ MULTI-STEP
-      (steps 2-3) needs JZ.6 complete (the live geometry re-points are step-1 no-ops); jit-twice
-      no-leak pending.
+      `data/ic_core2_dist16` = dist_16 (all z2_cdump-gated zstar tests point here).
+      **MULTI-STEP DONE (steps 1-3, 2026-06-12, job 25550843, `test_jz7_assembled_zstar_steps123` +
+      `scripts/jz7_multistep_gate.sbatch`):** the assembled model chained 3 steps vs the z2_cdump
+      3-step set — the REAL validation of the JZ.6 live-geometry re-points (live≠static at steps ≥2).
+      **pgf stays bit-faithful on genuinely-live geometry** (s2/s3 p50≈4e-9, p99≈3.7e-7, max≈4.5e-6 vs
+      step-1 4e-16) — since pgf reads BOTH density (T/S) AND live `Z_3d_n`, this certifies the geometry
+      reconstruction AND the re-pointed tracer chain. ⚠️ KEY FINDING: the SSH-solve-derived fields
+      (`d_eta`/`hbar`/`eta_n` + the hbar-built `zbar_3d_n`/`Z_3d_n`) diverge to ~mm at step ≥2 (s2≈s3≈
+      7e-3, BOUNDED) — the **warm-started early-stop** of the near-null-space CG (verified JAX & C both
+      use soltol=1e-5/maxiter=500: step 1 same-seed x0=0 ⇒ 5.5e-7, step ≥2 warm-start from
+      5.5e-7-different seeds ⇒ slow modes at ~soltol·‖ssh_rhs‖, amplified by ‖ssh_rhs‖~1e6 during
+      spin-up). NOT a bug (pgf is the discriminating gate; the D2 increment is validated
+      config-independently in JZ.3, below this noise floor). Gates: pgf tight (the JZ.6 precision
+      gate); d_eta/hbar/geometry the bounded "no-blow-up" CG class; finiteness hard. jit-twice no-leak:
+      the eager 3-step chain runs clean (both is_first_step branches compile).
 - [ ] sharded N-vs-1 (CPU fake devices ×4) with `ale_cfg` ON — generic State-field loops cover
       hnode/helem/hbar; hnode_new exchange row asserted
 - [ ] full suite green
