@@ -3288,3 +3288,41 @@ Cite the C source (`file:line`) or dump probe that proves it.
   building the reader — "replay" named a C validation run, not the replay-injection set the JAX needs;
   the cdump's self-contained input+output bundle is what makes controlled-replay a pure-algebra gate.**
   (`io_dump.py` `TKE_TAGS`/`load_tke_dump`, `test_tke_replay.py`, Task JT.0.)
+
+## Phase 9b — classical-TKE vertical mixing (Task JT.1 — column core, replay-gated bit-exact)
+
+- **[port/tke] A CONSTANT `1e-8` (= `mxl_min`) replay diff on ~0.3% of nodes is a STRUCTURAL
+  off-by-one in the scan range, NOT a "threshold flip" — trace it, don't wave it through.** The
+  Blanke–Delecluse mxl wall is THREE passes with DIFFERENT ranges: a forward min-scan `k=1..nlev-1`
+  (`fesom_cvmix_tke.c:678`), a special pre-step AT `nlev-1` (`mxl[nlev-1]=min(mxl[nlev-1],
+  mxl_min+dzw[nlev-1])`, `:681`), then a backward min-scan `k=nlev-2..1` (`:682`). I reused the
+  forward's `is_interior` mask (`1..nlev-1`) for the BACKWARD pass, so it also updated `k=nlev-1` —
+  and `min(mxl_min+dzw[nlev-1], mxl[nlev]+dzw[nlev-1]) = min(dzw+1e-8, dzw) = dzw` silently dropped
+  the just-set special value by exactly `mxl_min`. The trap: the diff was EXACTLY `mxl_min` and
+  *looked* like the documented min-scan flip class, so I nearly accepted it as noise. But a flip is
+  RANDOM (1-ulp either way, ~machine-eps); a diff that equals a NAMED CONSTANT on a value-dependent
+  subset is deterministic ⇒ an index/range bug. Excluding `nlev-1` from the backward mask
+  (`is_interior_bwd = is_interior & ~(k==nlev-1)`) made the column core BIT-EXACT (≤3e-17, from
+  ~1e-8). It ALSO collapsed the "`tke` 1e-12" residual — that was downstream (wrong mxl → wrong
+  KappaM → wrong `ke` → wrong tridiagonal). **Moral: in a multi-pass min/max-scan with per-node
+  bounds, the loop RANGES differ between passes; port each range literally and gate per-tag — a
+  constant-offset replay diff (≠ random 1-ulp) is an off-by-one, a class apart from FP flips.**
+  (`cvmix_tke.py` `mixing_length`, `test_column_core_replay`, Task JT.1.)
+- **[oracle/tke] ⚠️ The cdump replay oracle was STALE — built with the `(float)6.6` literal bug the
+  port was specifically warned against — so my CORRECT port (double `6.6`) "failed" the prandtl tags
+  until I REGENERATED it.** The plan's #1 landmine: "all `-r8` literals are DOUBLE; port `6.6` as
+  float64." I did. But the cdump (SHA `8260deae`, dumped from UNTRACKED TKE files BEFORE the fix was
+  committed as `45afc01`) compiled `TKE_C66` as `(double)(float)6.6 = 6.5999999046`, so its
+  `pr`/`tkekv`/`tbpr` carried the bug on the ~0.6% UNCLAMPED prandtl nodes (the clamped 1/10 nodes
+  absorb it ⇒ p99=0, p99.9=1e-7 — a bimodal "exact-or-1e-7" distribution, NOT FP noise). Smoking gun:
+  the diff was a CONSTANT *relative* factor `0.9999999856 = (float)6.6/(double)6.6`, and recomputing
+  prandtl with `(float)6.6` reproduced the cdump to **0.0** while double-6.6 differed by `1.45e-7`.
+  `git show 8260deae:src/fesom_cvmix_tke.c` confirmed the file didn't exist at that SHA (untracked).
+  Fix = regenerate with the fixed binary (`build/fesom_port` rebuilt 20:23, but the cdump was 00:36
+  — never refreshed): 29 s, my port then bit-exact across all 13 tags. **Moral: when a
+  controlled-replay diff is a clean constant *relative* factor on a value-dependent SUBSET (the
+  unclamped band) with a bimodal exact-or-X distribution, suspect a LITERAL-PRECISION bug in the
+  ORACLE'S build, not the port — check the oracle's SHA vs the validated source and the binary's
+  mtime vs the dump's. A replay oracle is only as good as the build that made it; a stale one fails a
+  correct port.** (cdump regenerated → canonical; stale preserved as `cdump/dump_stale_6.6f`,
+  `jobs/job_tke_cdump_v2`, Task JT.1.)

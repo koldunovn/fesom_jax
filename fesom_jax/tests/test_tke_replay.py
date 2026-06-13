@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -195,3 +196,142 @@ def test_load_tke_dump_all_three_steps():
     for step in (1, 2, 3):
         f, _ = load_tke_dump(TKE_CDUMP, ["tke"], step=step)
         assert f["tke"].shape == (126858, 48) and not np.isnan(f["tke"]).any()
+
+
+# ============================================================================
+# JT.1 — column core controlled-replay gate (cvmix_tke.py)
+#
+# Feed the cdump's OWN per-column inputs (vshear2/bvfreq2/dztrr/tkeold/normstress)
+# through the pure JAX column core and compare the 13 column-core output tags (tke,
+# KappaM=tkeav, KappaH=tkekv + 10 diags) — pure-algebra, no live forcing in the loop
+# (the JZ.7/K6 replay methodology). The kv/av wired tags are driver-level ⇒ JT.2.
+#
+# The cdump was regenerated 2026-06-13 with the fixed C (TKE_C66=6.6 DOUBLE); the prior
+# build's (float)6.6 literal bug perturbed the unclamped prandtl on ~0.6% of nodes (the
+# stale dumps are preserved under cdump/dump_stale_6.6f). Against the fixed oracle the
+# port is bit-exact (≤3e-17 ≪ the 1e-13 bar).
+# ============================================================================
+MESH_DIR = ROOT / "data" / "mesh_core2"
+# the 13 column-core tags → the integrate_tke_column diag keys (tke/KappaM/KappaH are returns)
+_CORE_TAGS = {"tke": None, "tkeav": None, "tkekv": None, "tbpr": "Tbpr", "tspr": "Tspr",
+              "tdif": "Tdif", "tdis": "Tdis", "twin": "Twin", "tiwf": "Tiwf", "tbck": "Tbck",
+              "ttot": "Ttot", "lmix": "Lmix", "pr": "Pr"}
+_TKE_CST = dict(c_k=0.1, c_eps=0.7, cd=3.75, alpha_tke=30.0,
+                mxl_min=1e-8, tke_min=1e-6, kappaM_max=100.0, dt=1800.0)
+
+_replay_skip = pytest.mark.skipif(
+    not (MESH_DIR.is_dir() and TKE_CDUMP.is_dir()),
+    reason="CORE2 mesh / TKE cdump oracle missing")
+
+
+@pytest.fixture(scope="module")
+def replay_geom():
+    """The static linfs column geometry the C passes as ``dzw``/``nlev`` — built from the
+    mesh exactly as ``mesh->hnode`` (verified bit-identical to the dztrr-reconstructed
+    thickness). ``dzw[k]=zbar[k]-zbar[k+1]`` (masked); ``nlev=nlevels_nod2D-1``."""
+    mesh = load_mesh(MESH_DIR)
+    nl = mesh.nl
+    zbar = np.asarray(mesh.zbar)
+    dz = np.zeros(nl)
+    dz[:-1] = zbar[:-1] - zbar[1:]
+    dzw = np.where(np.asarray(mesh.node_layer_mask), dz[None, :], 0.0)
+    nlev = (np.asarray(mesh.nlevels_nod2D) - 1).astype(np.int32)
+    return mesh, dzw, nlev
+
+
+def _run_core(f, dzw, nlev, with_diags=True):
+    from fesom_jax.cvmix_tke import integrate_tke_column
+    return integrate_tke_column(
+        jnp.asarray(f["tkeold"]), jnp.asarray(f["vshear2"]), jnp.asarray(f["bvfreq2"]),
+        jnp.asarray(dzw), jnp.asarray(f["dztrr"]), jnp.asarray(f["normstress"][:, 0]),
+        jnp.asarray(nlev), with_diags=with_diags, **_TKE_CST)
+
+
+@_replay_skip
+@pytest.mark.parametrize("step", [1, 2, 3])
+def test_column_core_replay(replay_geom, step):
+    """The 13 column-core output tags match the (fixed) cdump ≤1e-13 per tag — bit-exact
+    in practice (≤3e-17). Step 1 is cold-start pure algebra (exact); steps 2–3 exercise
+    the full shear-production / dissipation / mxl-wall path via the injected tke_old."""
+    from fesom_jax.io_dump import load_tke_dump
+    mesh, dzw, nlev = replay_geom
+    nl = mesh.nl
+    tags = ["tkeold", "vshear2", "bvfreq2", "dztrr", "normstress"] + list(_CORE_TAGS)
+    f, _ = load_tke_dump(TKE_CDUMP, tags, step=step)
+    tk, KM, KH, dg = _run_core(f, dzw, nlev)
+    # the driver zeroes KappaM/KappaH at the surface (k=0) + below-bottom (k=nlev) interface
+    # (fesom_tke.c:446-449); mirror that for the tkeav/tkekv comparison.
+    kk = np.arange(nl)[None, :]
+    zero_ends = (kk == 0) | (kk == nlev[:, None])
+    got = {"tke": np.asarray(tk),
+           "tkeav": np.where(zero_ends, 0.0, np.asarray(KM)),
+           "tkekv": np.where(zero_ends, 0.0, np.asarray(KH))}
+    for tag, key in _CORE_TAGS.items():
+        if key is not None:
+            got[tag] = np.asarray(dg[key])
+    for tag in _CORE_TAGS:
+        d = float(np.abs(got[tag] - f[tag]).max())
+        assert d <= 1e-13, f"step {step} tag {tag!r}: max|Δ|={d:.3e} > 1e-13"
+
+
+@_replay_skip
+def test_budget_closure(replay_geom):
+    """The closure identity ``Ttot ≈ Σ(Tbpr+Tspr+Tdif+Tdis+Twin+Tiwf+Tbck)`` ≤1e-14 — a
+    FREE internal oracle (independent of the C dump; the C measured ~4e-15). A standing
+    test that the 8 budget terms account for the full tendency."""
+    from fesom_jax.io_dump import load_tke_dump
+    mesh, dzw, nlev = replay_geom
+    for step in (1, 2, 3):
+        f, _ = load_tke_dump(
+            TKE_CDUMP, ["tkeold", "vshear2", "bvfreq2", "dztrr", "normstress"], step=step)
+        _, _, _, dg = _run_core(f, dzw, nlev)
+        terms = sum(np.asarray(dg[t]) for t in
+                    ["Tbpr", "Tspr", "Tdif", "Tdis", "Twin", "Tiwf", "Tbck"])
+        closure = float(np.abs(np.asarray(dg["Ttot"]) - terms).max())
+        assert closure <= 1e-14, f"step {step} budget closure {closure:.3e} > 1e-14"
+
+
+@_replay_skip
+def test_diag_invariance(replay_geom):
+    """``with_diags=True/False`` give bit-identical model outputs (tke/KappaM/KappaH) — the
+    diagnostics are pure scratch, never feeding the state (the GATE 9b diag-invariance row)."""
+    from fesom_jax.io_dump import load_tke_dump
+    mesh, dzw, nlev = replay_geom
+    f, _ = load_tke_dump(
+        TKE_CDUMP, ["tkeold", "vshear2", "bvfreq2", "dztrr", "normstress"], step=2)
+    tk_d, KM_d, KH_d, _ = _run_core(f, dzw, nlev, with_diags=True)
+    tk, KM, KH = _run_core(f, dzw, nlev, with_diags=False)
+    for a, b in [(tk, tk_d), (KM, KM_d), (KH, KH_d)]:
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+
+
+@_replay_skip
+def test_column_grad_finite(replay_geom):
+    """AD-safety (§4): ``jax.grad`` of a column loss is finite everywhere — the safe-sqrt
+    (cold-start tke=0), safe-pow (zero wind), and clamped denominators keep the backward
+    pass NaN-free — and the gradient is exactly 0 on the dry (below-bottom) lanes
+    (masked-inert: the padded tridiagonal rows are identity, the min-scans don't leak)."""
+    from fesom_jax.io_dump import load_tke_dump
+    from fesom_jax.cvmix_tke import integrate_tke_column
+    mesh, dzw, nlev = replay_geom
+    f, _ = load_tke_dump(
+        TKE_CDUMP, ["tkeold", "vshear2", "bvfreq2", "dztrr", "normstress"], step=2)
+    sl = slice(0, 3000)                                   # a slice keeps the grad light
+    Ssqr = jnp.asarray(f["vshear2"][sl]); Nsqr = jnp.asarray(f["bvfreq2"][sl])
+    dzw_s = jnp.asarray(dzw[sl]); dzt = jnp.asarray(f["dztrr"][sl])
+    fcol = jnp.asarray(f["normstress"][sl, 0]); nlev_s = jnp.asarray(nlev[sl])
+    tke0 = jnp.asarray(f["tkeold"][sl])
+
+    def loss(tke_old, c_k):
+        _, KM, _ = integrate_tke_column(tke_old, Ssqr, Nsqr, dzw_s, dzt, fcol, nlev_s,
+                                        c_k=c_k, c_eps=0.7, cd=3.75, alpha_tke=30.0,
+                                        mxl_min=1e-8, tke_min=1e-6, kappaM_max=100.0, dt=1800.0)
+        return jnp.sum(KM)                                # active-region momentum mixing
+
+    g_tke, g_ck = jax.grad(loss, argnums=(0, 1))(tke0, jnp.asarray(0.1))
+    g_tke = np.asarray(g_tke)
+    assert np.all(np.isfinite(g_tke)), "non-finite gradient wrt tke_old"
+    assert np.isfinite(float(g_ck)), "non-finite gradient wrt c_k"
+    kk = np.arange(mesh.nl)[None, :]
+    dry = kk > np.asarray(nlev[sl])[:, None]
+    assert np.all(g_tke[dry] == 0.0), "gradient leaked into the dry (below-bottom) lanes"

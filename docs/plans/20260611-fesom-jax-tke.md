@@ -236,21 +236,24 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
 
 **Files:** Create: `fesom_jax/cvmix_tke.py`. Modify: `fesom_jax/tests/test_tke_replay.py`.
 
-- [ ] mixing length (sqrttke, stability bound, the two directional min-scans + special pre-step +
-      floor) — ⚠️ alpha_tke does NOT appear in mxl (it is only the TKE-diffusivity multiplier)
-- [ ] KappaM/Pr/KappaH (TKE_C66 as a *double*; clamp order = C compare-select semantics)
-- [ ] forcing terms; tridiagonal assembly (interface-indexed; the `ke` index quirk; Neumann BCs
-      overwrite boundary rows AFTER the interior fill; Patankar dissipation on interior rows only);
-      Thomas solve in reciprocal-multiply form; `tke_min` floor (keep pre-floor value for Tbck)
-- [ ] the 13 diagnostics computed in column scratch in Fortran order — the real ordering deps:
-      `K_diss_v`/`P_diss_v` seed `forc`/`Tbpr`/`Tspr` (`:260-266`), pre-floor `tke_unrest` seeds
-      `Tbck` (the Tdif→Twin coupling is the UNPORTED Dirichlet branch — no such dep here; plan-review
-      correction) — returned only under `with_diags`
-- [ ] padded-row identity + safe-sqrt/safe-divide guards per §4
-- [ ] tests: **controlled replay** — cdump inputs s1–s3 → the **13 column-core output tags** (tke,
-      KappaM, KappaH + 10 diags) ≤1e-13 (the `kv`/`av` wired tags are driver-level ⇒ JT.2); budget
-      closure ≤1e-14 rel; masked-lane finiteness of a `jax.grad` through one column
-- [ ] full suite green
+- [x] mixing length (sqrttke, stability bound, the two directional min-scans + special pre-step +
+      floor) — alpha_tke NOT in mxl. ⚠️ **the backward min-scan runs k=nlev-2..1, NOT 1..nlev-1**
+      (it must NOT re-touch the special-pre-step `nlev-1` value, else `min(mxl_min+dzw, mxl[nlev]+dzw)`
+      drops it by exactly mxl_min — a constant-offset bug that masquerades as a flip; lesson JT.1).
+      Implemented as two `lax.scan`s (sequential carry handles the special-value seeding naturally).
+- [x] KappaM/Pr/KappaH (TKE_C66 = 6.6 *double*; jnp.maximum/minimum = the C compare-select).
+- [x] forcing; tridiagonal (interface-indexed; the `ke` `take_along_axis` index quirk
+      `kp1=min(k+1,nlev-1)`/`kk=max(k,1)`; Neumann surface+bottom overrides AFTER the interior fill;
+      Patankar on interior rows only); Thomas in the **reciprocal-multiply** form (`fxa=1/m; cp=c*fxa`);
+      `tke_min` floor (pre-floor `tke_solve` kept for Tdif/Tdis/Tbck).
+- [x] the 13 diagnostics in Fortran order (`_diagnostics`): K/P_diss seed forc/Tbpr/Tspr; pre-floor
+      `tke_unrest` seeds Tbck; Tdif/Tdis on the pre-floor solve — returned only under `with_diags`.
+- [x] padded-row identity (a=c=0,b=1,d=0) + `_safe_sqrt`/`_safe_pow32` + clamped denominators per §4.
+- [x] tests: **controlled replay vs the FIXED cdump** s1–s3 → 13 tags **bit-exact ≤3e-17** (≪1e-13);
+      budget closure ≤4e-19; diag invariance; masked-grad finite + 0 on dry lanes. **22/22 pass.**
+      ⚠️ DISCOVERED: the cdump was STALE (built with `(float)6.6`); regenerated with the fixed binary
+      (6.6 double) → bit-exact. Stale preserved as `cdump/dump_stale_6.6f` (lesson JT.1).
+- [ ] full suite green (regression) — submitting
 
 ### JT.2 — Driver (`tke.py`): column assembly + Kv/Av wiring
 
