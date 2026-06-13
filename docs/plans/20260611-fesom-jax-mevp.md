@@ -181,15 +181,19 @@ Regeneration: `mevp`-branch binary, `FESOM_WHICH_EVP=1 FESOM_EVP_DUMP_DIR=…`, 
 **Files:** Modify: `fesom_jax/ice.py`, `fesom_jax/ice_step.py`, `fesom_jax/io_dump.py`.
 Create: `fesom_jax/ice_mevp.py` (stub), `fesom_jax/tests/test_mevp.py`.
 
-- [ ] `IceConfig` fields + raises (NamedTuple has no `__init__` hook ⇒ a `__new__` override or a
-      validating factory); dispatch stub (whichEVP=1 ⇒ NotImplemented for now)
-- [ ] `EVP_DUMP_TAGS` readers on the shared `read_gid_table` (base = the existing gid-keyed
-      `read_kpp_table`, `io_dump.py:236`; hoist from JZ.0/JT.0, or JM.0 owns the generalization if 9c
-      runs first); audit `/work/ab0995/a270088/port/mevp/{cdump_16r,fdump_16r}`; regeneration job
-      documented (C filename format `evp_dump_s<step>_<point>_<kind>_rank<R>.txt`,
-      `fesom_ice_maevp.c:52-54`)
-- [ ] tests: whichEVP=0 byte-identical (suite); whichEVP=2 raises; readers round-trip all points
-- [ ] full suite green
+- [x] `IceConfig` fields + raises (post-creation `__new__` patch — NamedTuple forbids it in the
+      class body; `_replace` cleanly skips it, dispatch re-guards); `mevp_det1`/`mevp_det2` props;
+      dispatch stub (whichEVP=1 ⇒ `ice_mevp.mevp_dynamics`, a `NotImplementedError` stub until JM.2;
+      whichEVP=0 ⇒ `ice_evp.evp_dynamics` unchanged) — `ice.py`, `ice_step.py`, `ice_mevp.py`
+- [x] EVP-dump readers `read_evp_table`/`load_mevp_dump`/`evp_component` (`io_dump.py`): the C
+      header has **no `ncomp`** (varies per point) ⇒ infer from row width; multi-rank merge-by-gid
+      (ALE/TKE precedent); `EVP_POINT_LAYOUT` registry (C value order). Audited
+      `/work/ab0995/a270088/port/mevp/cdump_16r/dump` (16r, 2 steps; points Q/U0/F/P/it1/it2/it60/
+      it120/UF, node+elem). Regeneration: `mevp`-branch binary, `FESOM_EVP_DUMP_DIR=…`, filename
+      `evp_dump_s<step>_<point>_<array>_rank<R>.txt` (`fesom_ice_maevp.c:52-54`)
+- [x] tests (`test_mevp.py`): whichEVP=0 byte-identical (full ice suite green); whichEVP=2 raises;
+      whichEVP=1 stub routes; readers round-trip all node+elem points (disjoint-union/boundary-ring)
+- [x] full suite green (ice group 39 + mEVP 6)
 
 ### JM.1 — Shared-helper extraction + bc_index (EVP-path graph-identity)
 

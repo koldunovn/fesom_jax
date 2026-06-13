@@ -588,6 +588,146 @@ def load_tke_dump(
     return fields, meta
 
 
+# ---------------------------------------------------------------------------
+# mEVP reference dumps (Phase 9c) — the C ``fesom_ice_maevp.c`` harness (env
+# ``FESOM_EVP_DUMP_DIR``) writes a gid-keyed text format like KPP/ALE/TKE, **multi-rank**:
+# each rank dumps only its OWNED rows (``myDim_nod2D`` / ``myDim_elem2D``, keyed by
+# ``myList_*``). ⚠️ The header is ``# step=.. point=.. array=.. rank=.. N=..`` — **no
+# ``ncomp``** (it varies per point: Q=4, U0/UF=2, F=4, P_node=4, P_elem=1, it*_node=2,
+# it*_elem=3), so :func:`read_evp_table` infers it from the row width. Node partitions are
+# disjoint (union = 1..nod2D); element partitions overlap on a thin boundary ring but the
+# redundantly-computed rows are bit-identical (the per-substep halo exchange keeps the element
+# vertex velocities current ⇒ identical strain). Files:
+# ``evp_dump_s<step>_<point>_<array>_rank<R>.txt`` (``fesom_ice_maevp.c:52-54``). The
+# 16-rank cdump oracle (2 steps, dt=1800) lives on ``/work/ab0995/a270088/port/mevp/cdump_16r``.
+# ---------------------------------------------------------------------------
+
+# Per-(point, array) component layout — the dump value order in the C maevp_dump calls
+# (``fesom_ice_maevp.c:127-135, 215-219, 331-335, 359-360``). it1/it2/it60/it120 share a layout.
+_EVP_IT_NODE = ("u_aux", "v_aux")
+_EVP_IT_ELEM = ("sigma11", "sigma12", "sigma22")
+EVP_POINT_LAYOUT: dict[tuple[str, str], tuple[str, ...]] = {
+    ("Q",  "node"): ("a_ice", "m_ice", "m_snow", "elevation"),       # entry inputs (:127-129)
+    ("U0", "node"): ("u_ice", "v_ice"),                              # entry velocity (:130-132)
+    ("F",  "node"): ("stress_atmice_x", "stress_atmice_y", "u_w", "v_w"),  # entry forcing (:133-135)
+    ("P",  "node"): ("inv_thickness", "mass", "rhs_a", "rhs_m"),     # precompute (:215-217)
+    ("P",  "elem"): ("pressure_fac",),                               # precompute (:218-220)
+    ("UF", "node"): ("u_ice", "v_ice"),                             # final (:359-361)
+}
+
+
+def evp_point_layout(point: str, array: str) -> tuple[str, ...]:
+    """Component names for one mEVP dump (point, array) — the C value order. it* points
+    (``it1``/``it2``/``it60``/``it120``) share the iterate layout."""
+    if point.startswith("it"):
+        return _EVP_IT_NODE if array == "node" else _EVP_IT_ELEM
+    return EVP_POINT_LAYOUT[(point, array)]
+
+
+def _parse_evp_header(line: str) -> dict:
+    """Parse a ``# step=1 point=Q array=node rank=0 N=7928`` header (no ``ncomp`` — inferred
+    by :func:`read_evp_table` from the data width)."""
+    if not line.startswith("#"):
+        raise IOError(f"evp dump: expected '# step=...' header, got {line!r}")
+    out: dict = {}
+    for tok in line.lstrip("#").split():
+        if "=" in tok:
+            k, v = tok.split("=", 1)
+            out[k] = v
+    for k in ("step", "rank", "N"):
+        out[k] = int(out[k])
+    return out
+
+
+def read_evp_table(path: Union[str, Path]) -> tuple[np.ndarray, np.ndarray, dict]:
+    """Read one mEVP gid-keyed dump → ``(gids, values, meta)``. Like :func:`read_gid_table`
+    but the header carries no ``ncomp`` — it is inferred from the row width
+    (``ncomp = total/N - 1``). ``gids`` is ``int64[N]`` (1-based, file/``myList`` order),
+    ``values`` is ``float64[N, ncomp]``; ``meta`` has ``step/point/array/rank/N/ncomp``."""
+    path = Path(path)
+    with open(path) as fh:
+        meta = _parse_evp_header(fh.readline())
+        flat = np.fromstring(fh.read(), sep=" ", dtype=np.float64)
+    N = meta["N"]
+    if N <= 0 or flat.size % N != 0:
+        raise ValueError(f"evp dump {path.name}: {flat.size} numbers not divisible by N={N}")
+    width = flat.size // N
+    ncomp = width - 1
+    if ncomp < 1:
+        raise ValueError(f"evp dump {path.name}: row width {width} has no value columns")
+    flat = flat.reshape(N, width)
+    meta["ncomp"] = ncomp
+    return flat[:, 0].astype(np.int64), np.ascontiguousarray(flat[:, 1:]), meta
+
+
+def load_mevp_dump(
+    dirpath: Union[str, Path], points: Iterable[str] | None = None,
+    *, step: int = 1, array: str = "node", n_nod: int | None = None,
+    n_elem: int | None = None, strict: bool = True,
+) -> tuple[dict, dict]:
+    """Read the multi-rank mEVP dump for ``(step, array)``, merging ranks by gid into JAX mesh
+    index order (``out[gid-1] = row``). ``array`` selects node vs elem files (``P`` and the
+    ``it*`` points have both). ``points`` selects which to load (``None`` ⇒ every point present
+    for ``(step, array)``). Returns ``(fields, meta)``: ``fields[point]`` is
+    ``float64[Nglobal, ncomp]`` (``Nglobal`` = ``n_nod``/``n_elem`` or the max gid seen).
+    ``meta[point]`` records ``{N, ncomp, array, layout, nranks}``. With ``strict`` a node point
+    missing any gid in ``1..N`` raises, and overlapping element rows are asserted bit-identical
+    (the boundary-ring invariant — the redundant element compute is identical post-halo)."""
+    d = Path(dirpath)
+    if points is None:
+        present = set()
+        for p in d.glob(f"evp_dump_s{step}_*_{array}_rank*.txt"):
+            present.add(p.name[len(f"evp_dump_s{step}_"):].rsplit(f"_{array}_rank", 1)[0])
+        points = sorted(present)
+    Ng_default = n_nod if array == "node" else n_elem
+    fields: dict = {}
+    meta: dict = {}
+    for point in points:
+        paths = sorted(d.glob(f"evp_dump_s{step}_{point}_{array}_rank*.txt"),
+                       key=lambda p: int(p.name.rsplit("_rank", 1)[1].split(".")[0]))
+        if not paths:
+            raise FileNotFoundError(
+                f"mEVP dump {point!r} step {step} array {array}: "
+                f"{d}/evp_dump_s{step}_{point}_{array}_rank*.txt missing")
+        chunks = [read_evp_table(p) for p in paths]
+        ncomp = chunks[0][2]["ncomp"]
+        gmax = max(int(g.max()) for g, _, _ in chunks)
+        Ng = Ng_default or gmax
+        out = np.full((Ng, ncomp), np.nan, np.float64)
+        seen = np.zeros(Ng, dtype=bool)
+        for g, v, hdr in chunks:
+            if hdr["ncomp"] != ncomp:
+                raise ValueError(f"mEVP dump {point}: rank {hdr['rank']} ncomp "
+                                 f"{hdr['ncomp']} != {ncomp}")
+            idx = g - 1
+            if strict:
+                dup = seen[idx]
+                if dup.any() and not np.array_equal(out[idx[dup]], v[dup]):
+                    raise ValueError(
+                        f"mEVP dump {point}: overlapping gids disagree across ranks "
+                        f"(stale-halo dump?) — boundary-ring rows must be bit-identical")
+            out[idx] = v
+            seen[idx] = True
+        if strict and not seen.all():
+            raise ValueError(
+                f"mEVP dump {point}: {int((~seen).sum())} of {Ng} gids never written "
+                f"(incomplete rank set or wrong n_{'nod' if array == 'node' else 'elem'})")
+        fields[point] = out
+        meta[point] = {"N": Ng, "ncomp": ncomp, "array": array,
+                       "layout": evp_point_layout(point, array), "nranks": len(paths)}
+    return fields, meta
+
+
+def evp_component(fields: dict, meta: dict, point: str, name: str) -> np.ndarray:
+    """Pick one named component column out of a loaded mEVP ``point`` block
+    (e.g. ``evp_component(f, m, "P", "inv_thickness")`` → ``[Nglobal]``), using the
+    layout recorded in ``meta`` (:func:`evp_point_layout`)."""
+    layout = meta[point]["layout"]
+    if name not in layout:
+        raise KeyError(f"mEVP point {point!r} has no component {name!r}; one of {layout}")
+    return fields[point][:, layout.index(name)]
+
+
 def _summary_main(argv: list[str]) -> int:  # pragma: no cover - debug CLI
     if not argv:
         print("usage: python -m fesom_jax.io_dump <dumpfile> [more...]")

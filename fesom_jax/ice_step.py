@@ -26,7 +26,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 
 from . import forcing as _forcing
-from . import ice_adv, ice_coupling, ice_evp, ice_thermo
+from . import ice_adv, ice_coupling, ice_evp, ice_mevp, ice_thermo
 from .config import VCPW
 from .ice import IceConfig
 from .mesh import Mesh
@@ -91,7 +91,11 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
 
     # --- fesom_ice_step: ocean2ice → EVP → FCT → cut_off → thermo → oce_fluxes ---
     srf = ice_coupling.ocean2ice(state)         # slices of already-exchanged ocean state
-    u_ice, v_ice, s11, s12, s22 = ice_evp.evp_dynamics(
+    # mEVP dispatch (Phase 9c): a static Python branch — whichEVP is a config constant, not a
+    # traced value, so this is a trace-time selection (no lax.cond). whichEVP=0 ⇒ standard EVP
+    # (byte-identical); =1 ⇒ mEVP (ice_mevp.mevp_dynamics, same signature + outputs).
+    _evp = ice_mevp.mevp_dynamics if cfg.whichEVP == 1 else ice_evp.evp_dynamics
+    u_ice, v_ice, s11, s12, s22 = _evp(
         cfg, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow,
         u_ice=state.u_ice, v_ice=state.v_ice,
         sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,

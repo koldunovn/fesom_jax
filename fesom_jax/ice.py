@@ -50,6 +50,10 @@ class IceConfig(NamedTuple):
     cd_oce_ice: float = 5.5e-3    # ocean-ice drag coefficient
     theta_io: float = 0.0         # ice-ocean rotation angle [rad]
     ice_free_slip: int = 0
+    # --- mEVP rheology (Phase 9c; fesom_ice_maevp.c) — whichEVP=0 ⇒ byte-identical ---
+    whichEVP: int = 0             # 0 = standard EVP (default); 1 = mEVP. aEVP (=2) NOT ported.
+    alpha_evp: float = 250.0      # mEVP stress relaxation constant (Bouillon et al. 2013)
+    beta_evp: float = 250.0       # mEVP momentum relaxation constant
     # --- FCT advection (fesom_ice.c:61-64) ---
     ice_gamma_fct: float = 0.5    # CORE2 namelist value (NOT the 0.25 module default)
     ice_diff: float = 10.0        # stabilising diffusion
@@ -125,6 +129,37 @@ class IceConfig(NamedTuple):
     def vale(self) -> float:
         """Yield-curve factor 1/ellipse² (fesom_ice_evp.c:83)."""
         return 1.0 / (self.ellipse * self.ellipse)
+
+    # ---- mEVP relaxation weights (fesom_ice_maevp.c:110-111) ----
+    @property
+    def mevp_det2(self) -> float:
+        """mEVP stress-update weight = 1/(1+alpha_evp) (fesom_ice_maevp.c:110)."""
+        return 1.0 / (1.0 + self.alpha_evp)
+
+    @property
+    def mevp_det1(self) -> float:
+        """mEVP stress-memory weight = alpha_evp·det2 (fesom_ice_maevp.c:111)."""
+        return self.alpha_evp * self.mevp_det2
+
+
+# ``typing.NamedTuple`` forbids a ``__new__`` in the class body and has no ``__init__`` hook,
+# so we patch a validating ``__new__`` on post-creation: a DIRECT ``IceConfig(whichEVP=2)``
+# raises (C parity — ``fesom_ice_init`` aborts on aEVP, which has no reference oracle). Honored
+# at call time; ``_replace`` rebuilds via ``tuple.__new__`` and cleanly skips it (the dispatch
+# in ``ice_step`` re-guards), and the NamedTuple stays a pytree.
+_ice_config_new = IceConfig.__new__
+
+
+def _validating_ice_config_new(cls, *args, **kwargs):
+    self = _ice_config_new(cls, *args, **kwargs)
+    if self.whichEVP not in (0, 1):
+        raise ValueError(
+            f"IceConfig.whichEVP={self.whichEVP} unsupported — only 0 (standard EVP) or "
+            "1 (mEVP). aEVP (whichEVP=2) is not ported (no C reference oracle).")
+    return self
+
+
+IceConfig.__new__ = _validating_ice_config_new
 
 
 def ice_initial_state(mesh: Mesh, sst):

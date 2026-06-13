@@ -3459,3 +3459,25 @@ Cite the C source (`file:line`) or dump probe that proves it.
   with this one?" — a 30-second 3-way check (your_code vs oracle_A vs oracle_B) beats hours of
   mechanism-hunting, and `code==oracle_A≠oracle_B` immediately fingers oracle_B, not your code.**
   (`test_tke_step.py::_FORCING_GAP`, `data/kpp_dump_core2`, Task JT.5.)
+
+## Phase 9c — mEVP sea-ice rheology
+
+- **[mevp/JM.0] Validating a `typing.NamedTuple` constructor: patch `__new__` POST-creation
+  (the class body forbids it).** The plan wanted `IceConfig(whichEVP=2)` to raise (C abort
+  parity for unported aEVP), but `typing.NamedTuple` raises `AttributeError: Cannot overwrite
+  NamedTuple attribute __new__` if you put `__new__` in the class body, and it has no `__init__`
+  hook. The clean fix: after the class is created, save `_orig = IceConfig.__new__`, define a
+  wrapper that calls `_orig`, validates, and returns, then assign `IceConfig.__new__ = wrapper`.
+  Python looks up `__new__` on the type at call time, so direct construction validates;
+  `_replace` rebuilds via `tuple.__new__` (`_make`) and cleanly SKIPS the wrapper (fine — the
+  dispatch re-guards); the NamedTuple stays a JAX pytree. Verified empirically before wiring
+  (`fesom_jax/ice.py`, the `_validating_ice_config_new` patch).
+- **[mevp/JM.0] The mEVP dump header carries NO `ncomp` — infer it from the row width.** Unlike
+  the KPP/ALE/TKE gid tables (`# step=.. tag=.. N=.. ncomp=..`), the C `maevp_dump`
+  (`fesom_ice_maevp.c:57`) writes `# step=.. point=.. array=.. rank=.. N=..` because the column
+  count varies per point (Q=4, U0/UF=2, F=4, P_node=4, P_elem=1, it*_node=2, it*_elem=3). So the
+  shared `read_gid_table` parser (which int-casts `ncomp`) can't read it; `read_evp_table` reads
+  the header without `ncomp` and computes `ncomp = total_numbers/N − 1` from the data. Same
+  multi-rank merge-by-gid as ALE/TKE otherwise (`io_dump.py`). Confirmed the C bc_index build
+  (`fesom_ice.c:249-258`) is exactly `1.0 − boundary_node_mask` (1.0 everywhere, 0.0 at
+  boundary-edge endpoints) — the plan's bc_index claim verified against source.
