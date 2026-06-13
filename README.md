@@ -74,7 +74,10 @@ fesom_jax/
   momentum.py tracer_adv.py tracer_diff.py   # momentum; FCT tracer advection; diffusion
   ssh.py                       # SSH stiffness operator + CG solve (custom_linear_solve, AD-safe)
   kpp.py gm.py gm_redi.py      # KPP vertical mixing; GM bolus + Redi eddy fluxes
-  ice*.py                      # prognostic sea ice: EVP dynamics, advection, thermo, coupling
+  cvmix_tke.py tke.py          # CVMix classical-TKE prognostic mixing (opt-in tke_cfg; Phase 9b)
+  ice*.py                      # prognostic sea ice: EVP + mEVP (ice_mevp.py) dynamics, FCT, thermo
+  # Phase-9 differentiable options, each config-gated (None/0 ⇒ byte-identical):
+  #   zstar moving coordinate (ale_cfg), classical-TKE mixing (tke_cfg), mEVP rheology (whichEVP=1)
   forcing.py core2_forcing.py jra55.py phc_ic.py sss_runoff.py   # bulk fluxes; JRA55; PHC IC; SSS
   halo.py halo_points.py reductions.py        # halo exchange (all_gather + ragged); psum reductions
   shard_mesh.py integrate_sharded.py          # per-device sharded mesh/state; shard_map runners
