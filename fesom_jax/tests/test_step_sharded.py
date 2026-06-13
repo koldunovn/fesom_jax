@@ -29,6 +29,7 @@ from fesom_jax import partit, shard_mesh, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.gm import GMConfig
 from fesom_jax.kpp import KppConfig
+from fesom_jax.tke import TkeConfig
 from fesom_jax.mesh import load_mesh
 from fesom_jax.state import State
 
@@ -481,6 +482,51 @@ def test_kpp_sharded_step_owned_matches(npes, core2_forced):
     st_dense, st_N = _forced_sharded_step(core2_forced, part, npes, kpp_cfg=KppConfig())
     mesh = core2_forced["mesh"]
     _owned_match(st_dense, st_N, mesh, part, npes, tag="kpp", fct_atol=2e-2)
+
+
+# --------------------------------------------------------------------------
+# 5b. TKE-ON (Phase 9b, JT.5): the prognostic-TKE forced-path exchange
+# --------------------------------------------------------------------------
+# The structural risk TKE adds: the internal node-`tke_Av` exchange in `tke._wire_kv_av`
+# (exchange node KappaM BEFORE the node→elem 3-vertex Av mean — a boundary OWNED element has
+# halo vertices). Omit it and the port passes eager/1-device but corrupts Av on owned boundary
+# elements by O(mixing) ≫ 1e-7 (the plan-review MAJOR). The new prognostic `tke` field is NEVER
+# exchanged (each column self-contained on owned data) — the generic field loop in `_owned_match`
+# proves that holds (owned `tke` == dense). The Av match is the direct proof the exch is correct.
+@avail
+@have_forcing
+def test_tke_serial_sharded_step_matches_dense(core2_forced):
+    """The forced TKE step under ``shard_map`` on ONE device == the dense forced TKE step,
+    byte-identically (the exchanges collapse to identity at 1 device)."""
+    fx = core2_forced
+    mesh = fx["mesh"]
+    ser = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
+    st_dense, st_N = _forced_sharded_step(fx, ser, 1, tke_cfg=TkeConfig())
+    worst = 0.0
+    for fld in dataclasses.fields(State):
+        a = np.asarray(getattr(st_dense, fld.name))
+        b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
+        if a.size:
+            worst = max(worst, float(np.max(np.abs(a - b))))
+    assert worst < _BYTE_ID_ATOL, \
+        f"serial TKE sharded step max|Δ|={worst:.3e} (expected byte-id, floor {_BYTE_ID_ATOL:.0e})"
+
+
+@avail
+@have_forcing
+@pytest.mark.parametrize("npes", [2])
+def test_tke_sharded_step_owned_matches(npes, core2_forced):
+    """The forced TKE sharded step matches single-device on OWNED entities — the direct proof
+    the internal node-``tke_Av`` exchange (``_wire_kv_av``, before the node→elem mean) is
+    correct: a missing one corrupts **Av** on owned BOUNDARY elements by O(mixing) ≫ 1e-7. The
+    new prognostic **tke** field (never exchanged, column-self-contained) is covered by the
+    generic field loop in ``_owned_match`` — owned tke == dense confirms the no-exchange design."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    part = partit.read_partition(CORE2_DIST, npes)
+    st_dense, st_N = _forced_sharded_step(core2_forced, part, npes, tke_cfg=TkeConfig())
+    mesh = core2_forced["mesh"]
+    _owned_match(st_dense, st_N, mesh, part, npes, tag="tke", fct_atol=2e-2)
 
 
 # --------------------------------------------------------------------------

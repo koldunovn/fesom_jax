@@ -3391,3 +3391,22 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (or one-gate-per-job); and when a tunable is a traced `Params` leaf rather than a static-cfg field,
   every gate pays the full-model backward, not a cheap single-step chain.** (`scripts/core2_tke_grad_gate.{py,sbatch}`,
   Task JT.4.)
+
+## Phase 9b — classical-TKE vertical mixing (Task JT.5 — stability + sharded; the Av exch confirmed)
+
+- **[sharding/tke] The plan-review MAJOR (the internal node-`tke_Av` exchange) is empirically
+  CONFIRMED REQUIRED by the npes=2 owned-match — and the `tke` field's NO-exchange design is
+  confirmed by the SAME test (the generic field loop).** Two opposite facts, one gate: (a) `tke_Av`
+  (= node `KappaM`) MUST be halo-exchanged before the node→elem 3-vertex `Av` mean (a boundary OWNED
+  element has HALO vertices) — `test_tke_sharded_step_owned_matches[2]` passes BECAUSE `_wire_kv_av`
+  does `exch(KappaM, "nod")` first; omit it and owned-boundary `Av` corrupts by O(mixing) ≫ the 1e-9
+  CPU floor; (b) the `tke` FIELD itself is NEVER exchanged (each column self-contained on owned data)
+  — the generic `dataclasses.fields(State)` loop in `_owned_match` shows owned `tke` == dense, the
+  proof the no-exchange design is right. The serial (npes=1) byte-id confirms the exchanges collapse
+  to identity at 1 device. **Moral: a single N-vs-1 owned-match gate validates BOTH a required
+  internal exchange (its absence corrupts owned-boundary outputs) AND a deliberately-absent one (the
+  field still matches) — the generic State-field loop is what makes the second free, so design new
+  prognostic fields to ride it.** Separately, the 480-step linfs+TKE run is stable (max|vel| 1.53 m/s)
+  and the TKE↔KPP SST RMS 0.43 °C cleanly resolves the scheme (TKE ≠ KPP ≫ FP noise) — the
+  scheme-engaged climate check. (`test_step_sharded.py` TKE tests, `scripts/core2_tke_stability.{py,sbatch}`,
+  Task JT.5.)

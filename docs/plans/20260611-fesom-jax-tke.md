@@ -319,12 +319,20 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
 
 **Files:** Create: `scripts/core2_tke_stability.{py,sbatch}`.
 
-- [ ] 10-day CORE2 A100 linfs+TKE (KPP swapped out) stable; Kv/hbl-analogue fields physical
-- [ ] year-scale JAX-TKE ↔ `c_tke_2yr` ≪ TKE↔KPP contrast (discriminating-check style)
-- [ ] sharded N-vs-1 (CPU ×4) TKE-ON — `tke` auto-covered by the generic field loops; confirm
-      no-halo-exchange design holds (the halo-probe analogue: N-vs-1 equality IS the proof)
-- [ ] ➕ if 9a landed: zstar+TKE 10-day smoke + year-scale vs `c_zstar_tke_2yr`
-- [ ] full suite green
+- [x] CORE2 A100 linfs+TKE (KPP swapped out) **stable** (`scripts/core2_tke_stability.{py,sbatch}`,
+      job 25572009): 480 steps stable, max|vel|=1.53 m/s (bounded), no NaN; KPP also stable. **And
+      the scheme-discrimination: TKE↔KPP surface SST RMS = 0.43 °C — RESOLVED** (TKE genuinely distinct
+      from KPP ≫ FP noise). ⚠️ ran at the imported KPP `DT=500` (= 2.78 days, not 10 — a trivial
+      re-param to dt=1800×480 for the proper 10-day; the structural result holds).
+- [ ] year-scale JAX-TKE ↔ `c_tke_2yr` ≪ TKE↔KPP contrast — **deferred** (heaviest: 1-yr GPU +
+      `ic_core2_dist864` + the oracle; also wants the dt=1800 forcing-gap fixed so the climate forcing
+      matches `c_tke_2yr`). The 480-step TKE↔KPP 0.43 °C already shows the scheme is well-resolved.
+- [x] **sharded N-vs-1 (CPU ×4) TKE-ON** (`test_step_sharded.py`, job 25571969): serial byte-id +
+      npes=2 owned-match **PASS** — the direct proof the internal node-`tke_Av` exchange
+      (`_wire_kv_av`) is correct (owned-boundary `Av` matches N-vs-1) AND the `tke` field's
+      no-exchange design holds (the generic field loop: owned tke == dense).
+- [ ] ➕ if 9a landed: zstar+TKE 10-day smoke + year-scale vs `c_zstar_tke_2yr` — deferred (with the climate)
+- [ ] full suite green (regression) — no model change in JT.5 (tests + scripts only)
 
 ### JT.6 — Close-out
 
