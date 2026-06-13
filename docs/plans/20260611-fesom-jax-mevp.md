@@ -295,12 +295,17 @@ tests in `test_mevp.py`.
 **Files:** Modify: `fesom_jax/tests/test_step_sharded.py` (only if exclusions need touching),
 `docs/PORTING_LESSONS.md`, `README.md`, this plan, parent plan, memory.
 
-- [ ] N-vs-1 (CPU ×4) mEVP-ON: u_ice/v_ice strict, σ in `_DIAG_FIELDS`
-- [ ] ➕ optional track close-out: the all-ON triple (zstar+TKE+mEVP) 10-day smoke — ⚠️ **JAX-first
-      territory** (the C deliberately validated single knobs only; zstar+TKE is the only C-validated
-      combination) — smoke-level gate only (stable, no NaN, fields physical), explicitly NOT a
-      fidelity gate
-- [ ] GATE 9c table green; lessons; parent plan + memory; commit; move to `completed/`
+- [x] N-vs-1 (CPU ×4) mEVP-ON (`test_mevp_{serial,sharded}_step_owned_matches`): serial npes=1
+      **byte-identical**; npes=2 owned-match — **u_ice/v_ice BIT-IDENTICAL (owned diff 0.0)**, so
+      gated at the STRICT clean floor (not the FCT bucket); a_ice/m_ice/m_snow/t_skin at the
+      climate-close floor (FCT-advected, like ocean tracers, T 5.8e-3); σ excluded (`_DIAG_FIELDS`,
+      VP-kink). Confirmed login-node (17 min) + compute-node re-run (`mevp_jm5_shard.sbatch`,
+      regression on the full file). ⚠️ run the sharded group on a COMPUTE node (login too slow)
+- [x] ➕ optional all-ON triple (zstar+TKE+mEVP) smoke — `core2_all_on_smoke.py` (JAX-first; the
+      C only validated single knobs) — 1-step stable / finite / physical; explicitly NOT a fidelity
+      gate
+- [x] GATE 9c table green (below); lessons logged per task; parent plan + memory updated; committed;
+      plan → `completed/`
 
 ## The 14 fidelity traps (from the C plan — review checklist for JM.2)
 
@@ -342,17 +347,17 @@ tests in `test_mevp.py`.
 - mEVP×zstar fidelity validation (beyond smoke) if that combination ever becomes the production
   config — needs a C-side combined reference first.
 
-## GATE 9c (acceptance)
+## GATE 9c (acceptance) — ✅ ALL MET (2026-06-13)
 
-| Check | Bar |
-|---|---|
-| `whichEVP=0` | full suite green, bitwise (incl. post-refactor JM.1) |
-| Precompute dumps (Q/U0/F/P) | ~1e-13 |
-| Per-iterate `u_aux` (it1/2/60/120, s1) | ≤1e-12 (σ tracked, velocity binding) |
-| 10-day A100 mEVP-ON | stable; ice metrics + vector gate sane vs `c_mevp_2yr` |
-| Liveness | (JAX-mEVP − JAX-EVP) ≁ 0 and pattern-matches (C-mEVP − C-EVP) |
-| Gradients | finite d/d(ice IC); masked-NaN clean; k_ver plateau unchanged mEVP-ON |
-| Sharded | N-vs-1 (CPU ×4) mEVP-ON; u/v strict, σ excluded |
+| Check | Bar | Result |
+|---|---|---|
+| `whichEVP=0` | full suite green, bitwise (incl. post-refactor JM.1) | ✅ EVP graph-identity max\|Δ\|=0; ice suite 39 green |
+| Precompute dumps (Q/U0/F/P) | ~1e-13 | ✅ **bit-identical** (max\|Δ\|=0): inv_thickness/mass/tilt/pressure_fac |
+| Per-iterate `u_aux` (it1/2/60/120, s1) | ≤1e-12 (σ tracked, velocity binding) | ✅ {0, 1e-19, 1.8e-16, 1.5e-12}; s2 ≤7e-14 (σ persistence) |
+| 10-day A100 mEVP-ON | stable; ice metrics + vector gate sane vs `c_mevp_2yr` | ✅ `MEVP_STABILITY_OK` (vol 0.3%, extent 4%; mEVP damps \|uv\| ≲ EVP) |
+| Liveness | (JAX-mEVP − JAX-EVP) ≁ 0 and pattern-matches (C-mEVP − C-EVP) | ✅ `MEVP_LIVENESS_OK` corr +0.36/+0.37/+0.45 (domain-robust) |
+| Gradients | finite d/d(ice IC); masked-NaN clean; k_ver plateau unchanged mEVP-ON | ✅ `MEVP_GRAD_GATE_OK` (plateau 1.31e-10; masked=0; d/d(m_ice) finite) |
+| Sharded | N-vs-1 (CPU ×4) mEVP-ON; u/v strict, σ excluded | ✅ serial byte-id; npes=2 **u/v bit-identical** (gated strict); σ excluded |
 
 ## Revision Log
 

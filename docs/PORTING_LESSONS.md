@@ -3564,3 +3564,20 @@ Cite the C source (`file:line`) or dump probe that proves it.
   when adding an option, the gradient gate isn't just "does it differentiate" — it's "does turning
   it on perturb the EXISTING trainable seams"; the plateau-unchanged check is the one that matters
   for a hybrid-ML codebase.** (`core2_mevp_grad_gate.py`, 25GB/40% on the A100-80 at N=4.)
+
+- **[mevp/JM.5] mEVP's sharded velocity came out BIT-IDENTICAL N-vs-1 (owned diff = exactly 0),
+  tighter than std-EVP — the cold-start it1 wind-map has no scatter, and per-owned-node scatter
+  preserves order.** The sharded N-vs-1 (CPU 4 fake-devices, npes=2) printed only FCT tracers
+  (T 5.8e-3, S 4.8e-3) and clean fields (eta_n 1.2e-13, uv 1.5e-16) — u_ice/v_ice/a_ice/m_ice/σ
+  did NOT appear, meaning their owned max|Δ| is 0.0 (`_owned_match` prints `if diff>0`). So I
+  moved u_ice/v_ice OUT of the FCT bucket into the STRICT clean-floor gate (the plan's intent),
+  keeping only the FCT-advected ice scalars (a/m/snow/t_skin) at the climate-close floor and σ
+  excluded (`_DIAG_FIELDS`, VP-kink). Why bit-identical: at step 1 from the cold IC the velocity
+  is a pure per-node wind-stress map at it1 (no scatter), and for the later iterates an owned
+  node's incident-element scatter is the same set in the same relative order on each partition
+  (the halo exch makes the vertex velocities identical). **Moral: don't assume a scatter-based
+  field needs the loose reassociation floor under sharding — MEASURE it; mEVP's owned velocity is
+  bit-exact, so gate it strictly and let the result document the fidelity.** ⚠️ Practical: the
+  full-model `shard_map` compiles are too heavy for the login node (~17 min for 2 tests) — run the
+  sharded group on a COMPUTE node (`-p compute --cpus-per-task=16 --mem=200G`, the suite-sbatch
+  pattern), not the login node. (`test_mevp_sharded_step_owned_matches`, `mevp_jm5_shard.sbatch`.)

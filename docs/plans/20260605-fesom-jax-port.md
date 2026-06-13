@@ -698,8 +698,19 @@ the `None/0 ⇒ bit-identical` guarantee, each gated against its own C dump orac
   internal `tke_Av` exch), stable, **year-scale climate SST 4.68e-3 ≈ the C↔Fortran floor**. Lone
   xfail: the live-step-1 forward gate (a forcing-init transient that washes out in the climate — a
   C-branch low-wind gustiness/bulk diff; optional polish to port behind a flag).
-- **9c — mEVP rheology:** `docs/plans/20260611-fesom-jax-mevp.md` (contained `ice_evp.py` variant;
-  the C's 14-trap fidelity checklist is the core risk).
+- **9c — mEVP rheology: ✅ COMPLETE (GATE 9c MET 2026-06-13)** —
+  `docs/plans/completed/20260611-fesom-jax-mevp.md`. The Bouillon-2013 modified-EVP solver
+  (`fesom_jax/ice_mevp.py`) behind `IceConfig.whichEVP=1` (=0 byte-identical; aEVP=2 raises). The
+  120-iteration backward-Euler pseudo-time fixed point (additive-δmin VP rheology, α/β relaxation,
+  frozen-entry rhs anchor) — a checkpointed `lax.scan` sharing the strain/scatter helpers with
+  `ice_evp.py` (extracted JM.1, EVP path **bitwise-identical** after refactor). **BIT-FAITHFUL vs
+  the 16-rank cdump**: precompute bit-identical, per-iterate velocity {it1=0, it2=1e-19,
+  it60=1.8e-16, it120=1.5e-12}, all **14 fidelity traps** cited + verified; s2 replay (≤7e-14)
+  validates σ persistence. **`MEVP_STABILITY_OK`** (10-day A100; mEVP damps |uv_ice| ≲ EVP, the C's
+  direction), **`MEVP_LIVENESS_OK`** (diff-of-diffs corr +0.36/+0.37/+0.45), **`MEVP_GRAD_GATE_OK`**
+  (k_ver plateau 1.31e-10 UNCHANGED mEVP-ON, masked-NaN clean, ice-IC finite). Sharded N-vs-1
+  (CPU ×4): u_ice/v_ice **bit-identical** (gated strict), σ excluded. All-ON triple (zstar+TKE+mEVP)
+  smoke stable (JAX-first, no C oracle). 24 CPU tests + 3 GPU/compute gates green.
 
 Recommended order 9a→9b→9c (mirrors the C; geometry seam first), but the plans are **independent** —
 TKE was C-validated under linfs, mEVP composes with either coordinate. **GATE 9 (per sub-plan):**

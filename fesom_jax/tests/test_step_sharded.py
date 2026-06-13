@@ -651,8 +651,12 @@ def test_mevp_sharded_step_owned_matches(npes, core2_forced):
     bn_p = _global_boundary_node_p(mesh, part)
     st_dense, st_N = _forced_sharded_step(fx, part, npes, ice_cfg=IceConfig(whichEVP=1),
                                           boundary_node_p=bn_p)
+    # u_ice/v_ice gated STRICTLY (the clean floor, not the FCT bucket): the mEVP velocity is the
+    # binding fidelity check — it came out bit-identical N-vs-1 (the it1 wind-map + the per-owned-
+    # node scatter preserve order). Only the FCT-advected ice SCALARS (a/m/snow/t_skin, like the
+    # ocean FCT tracers) get the climate-close floor; σ stays excluded (_DIAG_FIELDS, VP-kink).
     _owned_match(st_dense, st_N, mesh, part, npes, tag="mevp", fct_atol=2e-2,
-                 extra_fct=_ICE_FIELDS)
+                 extra_fct=("a_ice", "m_ice", "m_snow", "t_skin"))
 
 
 # --------------------------------------------------------------------------
