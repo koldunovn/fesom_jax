@@ -25,6 +25,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 MESH_DIR = ROOT / "data" / "mesh_core2"
 MEVP_DUMP = Path("/work/ab0995/a270088/port/mevp/cdump_16r/dump")
+EVPD = ROOT / "data" / "ice_evp_dump_core2"          # std-EVP dump (JM.1 graph-identity)
+EVP_BASELINE = ROOT / "fesom_jax" / "tests" / "data" / "evp_baseline_jm1.npz"
+DIST16_PARENT = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2")  # holds dist_16/
 
 pytestmark = pytest.mark.skipif(
     not (MESH_DIR.is_dir() and MEVP_DUMP.is_dir()
@@ -118,3 +121,86 @@ def test_evp_reader_infers_ncomp():
     assert g.min() >= 1                                   # 1-based gids
     g2, v2, m2 = io_dump.read_evp_table(MEVP_DUMP / "evp_dump_s1_it1_elem_rank0.txt")
     assert m2["ncomp"] == 3                               # σ11/σ12/σ22
+
+
+# ==========================================================================
+# JM.1 — shared-helper extraction (EVP graph-identity, BITWISE) + bc_index
+# ==========================================================================
+@pytest.mark.skipif(not (EVPD.is_dir() and EVP_BASELINE.is_file()),
+                    reason="std-EVP dump / pre-refactor baseline missing")
+def test_evp_graph_identity(mesh):
+    """The JM.1 refactor (extracting ``strain_rates`` + ``stress_div_scatter`` shared with mEVP)
+    must leave the EVP path **bitwise-identical** — max|Δ|==0 vs the pre-refactor baseline (the
+    binding gate; HLO comparison advisory). Covers σ, the rhs scatter, the velocity update, the
+    full 120-subcycle ``evp_dynamics``, and the bare ``strain_rates`` block on a random field."""
+    import jax.numpy as jnp
+    from fesom_jax.ice import IceConfig
+    from fesom_jax import ice_evp as ie
+    b = np.load(EVP_BASELINE)
+    cfg = IceConfig()
+
+    def L(pt, cls):
+        return np.loadtxt(EVPD / f"evp_dump_s1_{pt}_{cls}_rank0.txt")
+    Q = L("Q", "node"); F = L("F", "node")
+    a_ice, m_ice, m_snow, elev = (jnp.asarray(Q[:, i]) for i in (1, 2, 3, 4))
+    sax, say, u_w, v_w = (jnp.asarray(F[:, i]) for i in (1, 2, 3, 4))
+    z = jnp.zeros(int(mesh.nod2D)); ze = jnp.zeros(int(mesh.elem2D))
+    bn = ie.boundary_node_mask(mesh)
+
+    st = ie.evp_setup(cfg, mesh, a_ice, m_ice, m_snow, elev)
+    s11, s12, s22 = ie.stress_tensor(cfg, mesh, z, z, ze, ze, ze, st.ice_strength)
+    ur, vr = ie.stress2rhs(cfg, mesh, s11, s12, s22, st.ice_strength,
+                           st.inv_areamass, st.tilt_u, st.tilt_v)
+    u4, v4 = ie.velocity_update(cfg, mesh, z, z, ur, vr, u_w, v_w, sax, say,
+                                st.inv_mass, a_ice, bn)
+    ue, ve, *_ = ie.evp_dynamics(
+        cfg, mesh, a_ice=a_ice, m_ice=m_ice, m_snow=m_snow, u_ice=z, v_ice=z,
+        sigma11=ze, sigma12=ze, sigma22=ze, srfoce_u=u_w, srfoce_v=v_w,
+        elevation=elev, stress_ax=sax, stress_ay=say, boundary_node=bn)
+    e11, e22, e12 = ie.strain_rates(mesh, jnp.asarray(b["utest"]), jnp.asarray(b["vtest"]))
+
+    pairs = [(s11, "s11"), (s12, "s12"), (s22, "s22"), (ur, "ur"), (vr, "vr"),
+             (u4, "u4"), (v4, "v4"), (ue, "ue"), (ve, "ve"),
+             (e11, "strain_e11"), (e22, "strain_e22"), (e12, "strain_e12")]
+    for j, k in pairs:
+        d = float(np.abs(np.asarray(j) - b[k]).max())
+        assert d == 0.0, f"EVP refactor changed {k}: max|Δ|={d:.3e} (must be bitwise 0)"
+
+
+def test_bc_index_complement(mesh):
+    """``bc_index_nod2D = 1 − boundary_node_mask``: binary, complement of the coastal mask,
+    interior-majority (== the C ``fesom_ice.c:249-258`` build)."""
+    import jax.numpy as jnp
+    from fesom_jax import ice_evp as ie
+    bn = ie.boundary_node_mask(mesh)
+    bc = np.asarray(ie.bc_index_nod2D(bn))
+    bnf = np.asarray(bn).astype(np.float64)
+    assert np.all((bc == 0.0) | (bc == 1.0))             # binary
+    assert np.allclose(bc + bnf, 1.0, atol=0, rtol=0)    # exact complement
+    assert (bc == 0.0).sum() == int(bnf.sum()) > 1000    # coastal nodes zeroed
+    assert (bc == 1.0).sum() > 10 * (bc == 0.0).sum()    # interior-majority
+
+
+@pytest.mark.skipif(not (DIST16_PARENT / "dist_16").is_dir(), reason="dist_16 partition missing")
+def test_bc_index_no_seam_flagged(mesh):
+    """dist_16 spot-check (C trap #1): bc_index from the GLOBAL mask flags NO partition-seam
+    node as coastal. Seam nodes = halo nodes (owned elsewhere, in some rank's stencil) that are
+    interior in the global mesh — a LOCAL submesh recompute would wrongly zero them."""
+    import jax.numpy as jnp
+    from fesom_jax import ice_evp as ie
+    from fesom_jax.partit import read_partition
+    part = read_partition(DIST16_PARENT, 16)
+    mask = np.asarray(ie.boundary_node_mask(mesh))       # global coastal mask
+    bc = np.asarray(ie.bc_index_nod2D(jnp.asarray(mask)))
+    # union of every rank's HALO nodes (the eDim tail of myList_nod2D — owned by other ranks)
+    halo = set()
+    for r in range(16):
+        ml = np.asarray(part.myList_nod2D[r])
+        my = int(part.myDim_nod2D[r])
+        halo.update(int(g) for g in ml[my:])             # 0-based gids
+    halo = np.array(sorted(halo), dtype=np.int64)
+    assert (halo >= 0).all() and (halo < int(mesh.nod2D)).all()
+    seam_interior = halo[mask[halo] == False]            # noqa: E712  partition-boundary interior
+    assert seam_interior.size > 1000, "no interior seam nodes — vacuous test"
+    assert np.all(bc[seam_interior] == 1.0), \
+        f"{int((bc[seam_interior] != 1.0).sum())} seam nodes wrongly flagged coastal"

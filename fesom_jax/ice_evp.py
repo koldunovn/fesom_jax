@@ -55,6 +55,65 @@ def boundary_node_mask(mesh: Mesh) -> jnp.ndarray:
     return cnt > 0
 
 
+def bc_index_nod2D(boundary_node: jnp.ndarray) -> jnp.ndarray:
+    """Interior-node indicator (``1.0`` interior / ``0.0`` coastal) — the C ``bc_index_nod2D``
+    (``fesom_ice.c:249-258``: 1 everywhere, 0 at boundary-edge endpoints) == ``1.0 −
+    boundary_node_mask``. mEVP multiplies it into the node-solve determinant
+    (``fesom_ice_maevp.c:304``). ⚠️ Sharding: pass the GLOBAL boundary mask (partitioned in),
+    never a local-mesh recompute — a partition-seam edge mis-flags an interior node as coastal
+    (the C reads ``partit->myList_edge2D``; the same trap the std-EVP ``boundary_node`` guards)."""
+    return 1.0 - boundary_node.astype(jnp.float64)
+
+
+# --------------------------------------------------------------------------
+# Shared rheology helpers (extracted JM.1) — EVP and mEVP use these IDENTICALLY.
+# ⚠️ The EVP association ``mfac·(ΣV)/3`` is kept here; the C mEVP writes ``meancos=mfac/3``
+# (``fesom_ice_maevp.c:236``), a ~1e-16 FP-association difference that is NOT chased in the
+# mEVP it-dumps (plan JM.1). The per-module tails (``·inv_areamass+tilt`` for EVP,
+# ``·mass+rhs_a`` for mEVP) stay in their own modules — only the raw blocks are shared.
+# --------------------------------------------------------------------------
+def strain_rates(mesh: Mesh, u_ice, v_ice):
+    """Element strain-rate tensor ``(eps11, eps22, eps12)`` from the node velocities at the
+    element vertices (``fesom_ice_evp.c:88-105`` / ``fesom_ice_maevp.c:241-246``). Shared,
+    bit-identical formula; the metric term uses the EVP association ``mfac·(ΣV)/3``."""
+    gs = mesh.gradient_sca
+    mfac = mesh.metric_factor
+    en = mesh.elem_nodes
+    U = u_ice[en]
+    V = v_ice[en]
+    eps11 = (gs[:, 0] * U[:, 0] + gs[:, 1] * U[:, 1] + gs[:, 2] * U[:, 2]
+             - mfac * (V[:, 0] + V[:, 1] + V[:, 2]) / 3.0)
+    eps22 = gs[:, 3] * V[:, 0] + gs[:, 4] * V[:, 1] + gs[:, 5] * V[:, 2]
+    eps12 = 0.5 * (gs[:, 3] * U[:, 0] + gs[:, 4] * U[:, 1] + gs[:, 5] * U[:, 2]
+                   + gs[:, 0] * V[:, 0] + gs[:, 1] * V[:, 1] + gs[:, 2] * V[:, 2]
+                   + mfac * (U[:, 0] + U[:, 1] + U[:, 2]) / 3.0)
+    return eps11, eps22, eps12
+
+
+def stress_div_scatter(mesh: Mesh, s11, s12, s22, act):
+    """Element→node scatter of the σ divergence — the RAW scatter (``fesom_ice_evp.c:159-166``
+    / ``fesom_ice_maevp.c:265-272``), BEFORE the per-module ``·mass/inv_areamass + tilt`` tail.
+    ``act`` (per-element bool) zeroes ice-free element contributions (the C ``continue``):
+    EVP passes ``ice_strength>0``, mEVP passes ``ice_el``. Returns ``(u_rhs, v_rhs)``."""
+    gs = mesh.gradient_sca
+    mfac = mesh.metric_factor
+    en = mesh.elem_nodes
+    a = mesh.elem_area
+    val3 = 1.0 / 3.0
+    sx11 = jnp.where(act, s11, 0.0)
+    sx12 = jnp.where(act, s12, 0.0)
+    sx22 = jnp.where(act, s22, 0.0)
+    cu = jnp.stack(
+        [-a * (sx11 * gs[:, k] + sx12 * gs[:, k + 3] + sx12 * val3 * mfac) for k in range(3)],
+        axis=1)
+    cv = jnp.stack(
+        [-a * (sx12 * gs[:, k] + sx22 * gs[:, k + 3] - sx11 * val3 * mfac) for k in range(3)],
+        axis=1)
+    u_rhs = ops.scatter_add(cu, en, mesh.nod2D)
+    v_rhs = ops.scatter_add(cv, en, mesh.nod2D)
+    return u_rhs, v_rhs
+
+
 # --------------------------------------------------------------------------
 # Setup: mass / inv_mass / ice_strength / SSH-tilt rhs — fesom_ice_evp.c:263-350
 # --------------------------------------------------------------------------
@@ -109,17 +168,7 @@ def evp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation) -> EV
 # --------------------------------------------------------------------------
 def stress_tensor(cfg: IceConfig, mesh: Mesh, u_ice, v_ice, s11, s12, s22, ice_strength):
     """Strain rates → Δ → ζ → the Hunke det1/det2 σ update. σ frozen where ice_strength≤0."""
-    gs = mesh.gradient_sca
-    mfac = mesh.metric_factor
-    en = mesh.elem_nodes
-    U = u_ice[en]
-    V = v_ice[en]
-    eps11 = (gs[:, 0] * U[:, 0] + gs[:, 1] * U[:, 1] + gs[:, 2] * U[:, 2]
-             - mfac * (V[:, 0] + V[:, 1] + V[:, 2]) / 3.0)
-    eps22 = gs[:, 3] * V[:, 0] + gs[:, 4] * V[:, 1] + gs[:, 5] * V[:, 2]
-    eps12 = 0.5 * (gs[:, 3] * U[:, 0] + gs[:, 4] * U[:, 1] + gs[:, 5] * U[:, 2]
-                   + gs[:, 0] * V[:, 0] + gs[:, 1] * V[:, 1] + gs[:, 2] * V[:, 2]
-                   + mfac * (U[:, 0] + U[:, 1] + U[:, 2]) / 3.0)
+    eps11, eps22, eps12 = strain_rates(mesh, u_ice, v_ice)   # shared block (JM.1)
     vale = cfg.vale
     radicand = ((eps11 * eps11 + eps22 * eps22) * (1.0 + vale)
                 + 4.0 * vale * eps12 * eps12
@@ -145,25 +194,9 @@ def stress_tensor(cfg: IceConfig, mesh: Mesh, u_ice, v_ice, s11, s12, s22, ice_s
 # --------------------------------------------------------------------------
 def stress2rhs(cfg: IceConfig, mesh: Mesh, s11, s12, s22, ice_strength,
                inv_areamass, tilt_u, tilt_v):
-    """Element→node scatter of the σ divergence, then ``·inv_areamass + tilt``."""
-    gs = mesh.gradient_sca
-    mfac = mesh.metric_factor
-    en = mesh.elem_nodes
-    a = mesh.elem_area
-    val3 = 1.0 / 3.0
+    """Element→node scatter of the σ divergence (shared raw scatter), then ``·inv_areamass + tilt``."""
     act = ice_strength > 0.0                                   # skip ice-free (C continue)
-    sx11 = jnp.where(act, s11, 0.0)
-    sx12 = jnp.where(act, s12, 0.0)
-    sx22 = jnp.where(act, s22, 0.0)
-    # contrib[el,k] = -area·(s11·∂N_k/∂x + s12·∂N_k/∂y + s12·mfac/3)   (u),  v analogous
-    cu = jnp.stack(
-        [-a * (sx11 * gs[:, k] + sx12 * gs[:, k + 3] + sx12 * val3 * mfac) for k in range(3)],
-        axis=1)
-    cv = jnp.stack(
-        [-a * (sx12 * gs[:, k] + sx22 * gs[:, k + 3] - sx11 * val3 * mfac) for k in range(3)],
-        axis=1)
-    u_rhs = ops.scatter_add(cu, en, mesh.nod2D)
-    v_rhs = ops.scatter_add(cv, en, mesh.nod2D)
+    u_rhs, v_rhs = stress_div_scatter(mesh, s11, s12, s22, act)
     use = inv_areamass > 0.0
     return (jnp.where(use, u_rhs * inv_areamass + tilt_u, 0.0),
             jnp.where(use, v_rhs * inv_areamass + tilt_v, 0.0))

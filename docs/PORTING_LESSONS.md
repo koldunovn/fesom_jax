@@ -3481,3 +3481,22 @@ Cite the C source (`file:line`) or dump probe that proves it.
   multi-rank merge-by-gid as ALE/TKE otherwise (`io_dump.py`). Confirmed the C bc_index build
   (`fesom_ice.c:249-258`) is exactly `1.0 − boundary_node_mask` (1.0 everywhere, 0.0 at
   boundary-edge endpoints) — the plan's bc_index claim verified against source.
+- **[mevp/JM.1] To prove a "pure refactor" is BITWISE-identical, capture a baseline BEFORE
+  touching the code, then assert max|Δ|==0 — passing the C-dump gate is necessary but not
+  sufficient.** JM.1 extracts `strain_rates` + `stress_div_scatter` from `ice_evp.py` so mEVP can
+  share them. The existing EVP gate (vs the C dump, tol 1e-10/1e-12) would catch a *typo* but NOT
+  a within-tolerance reassociation (e.g. reordering a sum), which is exactly what a "graph-identity"
+  claim must exclude. So I ran the pre-refactor `ice_evp` once, saved σ/rhs/velocity/`evp_dynamics`
+  outputs to a committed `.npz`, refactored, then asserted the new outputs equal the baseline to
+  the bit (all 12 fields max|Δ|=0.000e+00). Cheap, and it makes "I only moved code" a *measured*
+  fact rather than a hope. (`fesom_jax/tests/data/evp_baseline_jm1.npz`, `test_evp_graph_identity`.)
+- **[mevp/JM.1] The bc_index partition-seam trap needs a NON-VACUOUS test: assert seam nodes
+  EXIST, then assert none are flagged.** `bc_index = 1 − boundary_node_mask` derived from the GLOBAL
+  mask is correct by construction, so naively "assert no interior node is coastal" passes
+  vacuously. The meaningful check loads the real dist_16 partition, takes the union of every rank's
+  HALO nodes (the eDim tail of `myList_nod2D` — nodes owned elsewhere, i.e. partition-boundary),
+  keeps the ones that are interior in the global mesh (>1000 of them — proves seams exist), and
+  asserts bc_index==1 there. That contrasts the global-mask build against the local-recompute trap
+  the C documented (`fesom_ice.c:243-247`). ⚠️ `read_partition(mesh_dir, npes)` wants
+  `mesh_dir/dist_<npes>/` — pass the pool parent `/pool/.../core2`, not the mesh data dir.
+  (`test_bc_index_no_seam_flagged`.)

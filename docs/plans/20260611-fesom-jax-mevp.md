@@ -199,18 +199,18 @@ Create: `fesom_jax/ice_mevp.py` (stub), `fesom_jax/tests/test_mevp.py`.
 
 **Files:** Modify: `fesom_jax/ice_evp.py`. Create: tests in `test_mevp.py`.
 
-- [ ] extract the strain-rate block + the **raw** elem→node σ-divergence scatter (the
-      `·inv_areamass + tilt` / `·mass + rhs_a` tails STAY in their respective modules — do not pull
-      EVP-specific masking into the shared helper) + reuse `_safe_sqrt`/safe-speed/
-      `boundary_node_mask` — pure refactor. ⚠️ keep the **EVP association** (`mfac·(ΣV)/3.0`,
-      `ice_evp.py:118`); mEVP then differs from the C's `meancos = val3·metric_factor` form by ~1e-16
-      association — do NOT chase that residual in the it-dumps. (Fallback if the refactor fights:
-      duplicate the ~15 lines — the C's own monolith choice)
-- [ ] `bc_index = 1.0 − boundary_node_mask` (float; sharded from the global mask)
-- [ ] tests: EVP path bitwise-unchanged after refactor — `max|Δ|=0` on the existing EVP dump gates +
-      sharded EVP gates (the BINDING gate; HLO comparison advisory only); bc_index complement
-      property on the CORE2 mesh; dist_16 partition spot-check (no seam nodes flagged — the C trap #1)
-- [ ] full suite green
+- [x] extracted `strain_rates` + `stress_div_scatter` to `ice_evp.py` (the `·inv_areamass+tilt` /
+      `·mass+rhs_a` tails STAY in their modules; the `act` mask is a param: EVP=`ice_strength>0`,
+      mEVP=`ice_el`). Kept the **EVP association** `mfac·(ΣV)/3.0` (mEVP's C `meancos=mfac/3` differs
+      ~1e-16 — not chased). `_safe_sqrt`/`_safe_speed`/`boundary_node_mask` reused as-is.
+- [x] `bc_index_nod2D(boundary_node) = 1.0 − mask` (float; the C `fesom_ice.c:249-258` build,
+      verified). Sharded callers pass the GLOBAL mask (the `boundary_node_p` precedent — JM.5).
+- [x] tests (`test_mevp.py`): EVP path **bitwise-unchanged** — `max|Δ|=0` on σ/rhs/velocity/
+      `evp_dynamics`/`strain_rates` vs a captured pre-refactor baseline (the BINDING gate; HLO
+      advisory). bc_index complement+binary+interior-majority. dist_16 seam spot-check (>1000 interior
+      seam nodes, NONE flagged coastal — C trap #1). ⚠️ sharded EVP N-vs-1 re-validation deferred to
+      JM.5 (graph-identity ⇒ the sharded path calls the same refactored fns ⇒ unchanged).
+- [x] full suite green (EVP 8 + ice_step 4 + mEVP 9)
 
 ### JM.2 — The mEVP kernel (`ice_mevp.py`), per-iterate dump-gated
 
