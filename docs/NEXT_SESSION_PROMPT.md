@@ -12,12 +12,18 @@ sharded/stability ticked.
 1. **JT.5 year-scale climate** — JAX-TKE ↔ the `c_tke_2yr` oracle (SST/SSS RMS ≪ the TKE↔KPP
    contrast). Heaviest: a 1-yr GPU run (~35 min) + **`ic_core2_dist864`** (that oracle is 864-rank —
    the per-oracle IC-provenance rule [[zstar-forcing-dump-config-gap]], it bit the zstar climate 41×).
-2. **The dt=1800 forcing-gap** (`test_tke_step.py::_FORCING_GAP` xfail) — the JAX `build_core_forcing`
-   step-1 wind stress at dt=1800 differs from the cdump's by ~7e-4 (IC-independent ⇒ a forcing
-   time/convention mismatch, not TKE). Fix it (align the dt=1800 step-1 forcing time, OR a
-   forcing-matched re-dump) — this ALSO unblocks the climate (so its forcing matches `c_tke_2yr`) and
-   flips the 2 xfails to real gates. Likely the same root: check `core2_forcing.dates_for_steps` /
-   the JRA55 interpolation time vs the C's first-step convention at dt=1800.
+2. **The forcing-gap** (`test_tke_step.py::_FORCING_GAP` xfail) — **NOW SHARPLY CHARACTERIZED**
+   (2026-06-13 probes): it is NOT a time/date convention (all candidate step-1 times t=0/900/1800/
+   −1800 give the SAME 7.185e-4 Δ) and NOT the IC (identical under ic_core2 vs dist_16) and NOT ice
+   (all the off nodes are open-water a_ice=0). It IS a **low-wind bulk difference**: **~90% of nodes
+   match EXACTLY** (median ratio jax/cdump = 1.000, p90=1.0), but ~10% (16812 open-water LOW-WIND
+   nodes; the max-Δ node has jax_forc ≈ 1/5 of the cdump) have the **cdump stress ~5× the JAX** —
+   the signature of a **gustiness / minimum-wind-speed term** in the C TKE-branch's bulk that the JAX
+   lacks (the JAX bulk matches the KPP-branch dump <1e-12, so the two C dumps used DIFFERENT bulk
+   configs). Fix: find the gustiness/min-wind term in the C TKE-branch's bulk (`fesom_forcing.c` /
+   the JRA bulk) and port it behind a config flag (don't break the KPP <1e-12 match), OR regenerate
+   a forcing-matched TKE step dump with the JAX bulk. This unblocks the live forward gate (flips the
+   2 xfails) AND the climate (so its forcing matches `c_tke_2yr`).
 
 Then **JT.6** close-out: GATE 9b table (replay ✓, budget ✓, gradients ✓, sharded ✓, stability ✓ —
 only the year-scale-climate row open), lessons appended (8 banked), move plan to `completed/`.
