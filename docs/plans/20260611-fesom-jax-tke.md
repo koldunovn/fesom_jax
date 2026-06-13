@@ -281,11 +281,20 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
 
 **Files:** Modify: `fesom_jax/step.py`, `fesom_jax/tests/test_tke_step.py` (create).
 
-- [ ] dispatch + conditional `tke` replace + `tke_cfg` threading live end-to-end (eager + jit)
-- [ ] tests (the K.8 pattern): assembled 3-step vs cdump live tags (~1e-12 expected; flip-methodology
-      fallback documented); scheme-engaged (TKE ≠ KPP rel > 0.1); pi-path raise; **both-cfgs-set
-      raise** (`kpp_cfg` + `tke_cfg` ⇒ error); jit-twice no-leak
-- [ ] full suite green
+- [x] dispatch + conditional `tke` replace + `tke_cfg` threading live end-to-end (eager + jit) —
+      done in JT.0/JT.2; `test_tke_step.py` confirms a full CORE2 TKE step runs eager + jit.
+- [x] tests (`test_tke_step.py`, the K.8 pattern): **4 pass** — `state.tke` evolves off zero (TKE
+      genuinely running); **scheme-engaged** TKE≠KPP (cold-start Kv=0 vs KPP OBL Kv>0, rel≫0.1);
+      **both-cfgs-set raise** through the forced step; **jit-twice** bit-identical (static cfg). pi-path
+      raise is in `test_tke_replay.py` (JT.0).
+- [~] ⚠️ the cdump-matching FORWARD gate (step-1 `tke`/`forc_tke_surf` vs cdump) is **xfail** — the
+      JAX `build_core_forcing` dt=1800 step-1 wind stress differs from the cdump's C-run by ~7e-4
+      (≈60% of scale), **IC-independent** (identical under ic_core2 vs dist_16) ⇒ a forcing step-1
+      **time/convention** mismatch, NOT FP and NOT the TKE port (which is bit-exact via the JT.1/JT.2
+      replay gates; the KPP forcing gate matched <1e-12 at dt=500 with its own forcing-matched dump).
+      A `core2_forcing` dt=1800 alignment (or a forcing-matched TKE step re-dump) unblocks it — handle
+      in JT.5/follow-up. (lesson JT.3)
+- [ ] full suite green (regression) — submitting
 
 ### JT.4 — Gradient gates (the ML seam, GATE 9b core)
 
