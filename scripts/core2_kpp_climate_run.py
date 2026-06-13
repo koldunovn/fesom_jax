@@ -41,6 +41,7 @@ from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
 from fesom_jax.kpp import KppConfig
+from fesom_jax.tke import TkeConfig
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import core2_initial_state
 
@@ -167,6 +168,9 @@ def main():
     ap.add_argument("--out", type=str, default="")
     ap.add_argument("--ale", choices=["on", "off"], default="off",
                     help="on ⇒ zstar (ale_cfg=AleConfig() + the dist16 IC); off ⇒ linfs (default)")
+    ap.add_argument("--tke", choices=["on", "off"], default="off",
+                    help="on ⇒ classical-TKE mixing (tke_cfg=TkeConfig(), KPP off — the c_tke_2yr "
+                         "config; use --ic-dir data/ic_core2_dist864 to match that 864r oracle)")
     ap.add_argument("--ic-dir", type=str, default="",
                     help="override the IC cache dir (e.g. data/ic_core2_dist864 to match an 864r oracle)")
     ap.add_argument("--steps", type=int, default=0, help="override n_steps (smoke test)")
@@ -186,7 +190,10 @@ def main():
     dates = core2_forcing.dates_for_steps(args.start_year, dt, n_steps)
     cf_year = args.start_year
     cf = core2_forcing.build_core_forcing(mesh, cf_year, sst_ic=sst0)
-    ice_cfg, gm_cfg, kpp_cfg = IceConfig(), GMConfig(), KppConfig()
+    ice_cfg, gm_cfg = IceConfig(), GMConfig()
+    # 3-way mixing: --tke on ⇒ classical-TKE (KPP off, the c_tke_2yr config); else KPP.
+    tke_cfg = TkeConfig() if args.tke == "on" else None
+    kpp_cfg = None if args.tke == "on" else KppConfig()
     diag = make_diag(mesh)
     nz1 = int(mesh.nl) - 1
     writer = MonthlyWriter(out, mesh, nz1)
@@ -225,7 +232,8 @@ def main():
         ts = time.time()
         state = stepmod.step_jit(state, mesh, op, None, dt=dt, is_first_step=(i == 0),
                                  step_forcing=sf, forcing_static=cf.static,
-                                 ice_cfg=ice_cfg, gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, ale_cfg=ale_cfg)
+                                 ice_cfg=ice_cfg, gm_cfg=gm_cfg, kpp_cfg=kpp_cfg,
+                                 tke_cfg=tke_cfg, ale_cfg=ale_cfg)
         if (y, month) != (am_year, am_month):              # entered a new month → flush prev
             flush(am_year, am_month, acc, count, last_doy)
             acc, count = zero_acc(), 0

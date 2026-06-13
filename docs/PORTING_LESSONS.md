@@ -3410,3 +3410,20 @@ Cite the C source (`file:line`) or dump probe that proves it.
   and the TKE↔KPP SST RMS 0.43 °C cleanly resolves the scheme (TKE ≠ KPP ≫ FP noise) — the
   scheme-engaged climate check. (`test_step_sharded.py` TKE tests, `scripts/core2_tke_stability.{py,sbatch}`,
   Task JT.5.)
+
+- **[verify/tke] ⚠️ DON'T pre-judge a climate from a step-1 forcing snapshot — RUN it. The 7e-4
+  step-1 stress diff vs the cdump WASHES OUT: the 1-yr climate matches the C oracle at SST/SSS RMS
+  4.68e-3/2.74e-3 ≈ the C↔Fortran floor (0.0049/0.0028).** I characterized a step-1 forcing
+  difference (the JAX `build_core_forcing` stress ~5× smaller than the cdump at ~10% low-wind
+  open-water nodes) and OVER-REACHED to "a bulk difference that blocks the climate" — then deferred
+  the climate behind that assumption. A reviewer's objection ("the KPP/zstar climates ran fine, why
+  a forcing gap now?") forced the right test: run the JAX-TKE 1-yr climate (`ic_core2_dist864` to
+  match the 864r oracle) and compare. Result: stable 365 days, **A(JAX↔C-TKE) ≈ C0(C↔Fortran)** for
+  both SST and SSS ⇒ the JAX TKE climate is as faithful as the C is to Fortran, the step-1 diff is a
+  pure transient (consistent with the C's own live s1–s3 diffs vs Fortran being threshold-flips that
+  replay sidesteps). The live-step-1 forward gate stays xfail BECAUSE it is transient-sensitive — but
+  that does NOT block the climate, which is the gate that matters. **Moral: a step-1 forward
+  comparison and a year-scale climate measure DIFFERENT things; a step-1 mismatch (even a structured
+  one) can be a forcing-init transient that integrates out — never conclude "climate-blocked" from a
+  single-step snapshot; the climate run is cheap relative to being wrong, and IS the arbiter.**
+  (`scripts/core2_tke_climate{,_compare}.py`, Task JT.5.)

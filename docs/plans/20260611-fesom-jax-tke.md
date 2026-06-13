@@ -324,9 +324,13 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
       the scheme-discrimination: TKE↔KPP surface SST RMS = 0.43 °C — RESOLVED** (TKE genuinely distinct
       from KPP ≫ FP noise). ⚠️ ran at the imported KPP `DT=500` (= 2.78 days, not 10 — a trivial
       re-param to dt=1800×480 for the proper 10-day; the structural result holds).
-- [ ] year-scale JAX-TKE ↔ `c_tke_2yr` ≪ TKE↔KPP contrast — **deferred** (heaviest: 1-yr GPU +
-      `ic_core2_dist864` + the oracle; also wants the dt=1800 forcing-gap fixed so the climate forcing
-      matches `c_tke_2yr`). The 480-step TKE↔KPP 0.43 °C already shows the scheme is well-resolved.
+- [x] **year-scale JAX-TKE ↔ `c_tke_2yr`** (`scripts/core2_tke_climate{,_compare}.py`, job 25574435,
+      1-yr `ic_core2_dist864`): **stable 17520 steps** (max|vel| 2.80), and **SST RMS = 4.68e-3 °C /
+      SSS 2.74e-3 psu** vs the C oracle — **≈ the C↔Fortran reference 0.0049/0.0028** (A ≈ C0) ⇒ the
+      JAX TKE climate is as faithful as the C is to Fortran, and **≪ the TKE↔KPP 0.43 °C contrast**.
+      `TKE_CLIMATE_OK`. ⇒ **the step-1 forcing-gap WASHES OUT — it is a transient, NOT a climate
+      blocker** (it never propagates; the live-step-1 gate stays xfail as transient-sensitive). The
+      `--tke` flag was added to `core2_kpp_climate_run.py`.
 - [x] **sharded N-vs-1 (CPU ×4) TKE-ON** (`test_step_sharded.py`, job 25571969): serial byte-id +
       npes=2 owned-match **PASS** — the direct proof the internal node-`tke_Av` exchange
       (`_wire_kv_av`) is correct (owned-boundary `Av` matches N-vs-1) AND the `tke` field's
