@@ -28,6 +28,7 @@ MEVP_DUMP = Path("/work/ab0995/a270088/port/mevp/cdump_16r/dump")
 EVPD = ROOT / "data" / "ice_evp_dump_core2"          # std-EVP dump (JM.1 graph-identity)
 EVP_BASELINE = ROOT / "fesom_jax" / "tests" / "data" / "evp_baseline_jm1.npz"
 DIST16_PARENT = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2")  # holds dist_16/
+IC_CORE2 = ROOT / "data" / "ic_core2"                # PHC IC (live-dispatch harness)
 
 pytestmark = pytest.mark.skipif(
     not (MESH_DIR.is_dir() and MEVP_DUMP.is_dir()
@@ -379,3 +380,86 @@ def test_mevp_trap13_nonice_retained(mesh):
                                  z, z, z, z, z, z, cfg.ice_dt)
     assert float(np.asarray(u1)[n_int]) == 5.0, "non-ice interior node was NOT retained (trap 13)"
     assert float(np.asarray(u1)[n_bnd]) == 0.0, "boundary node was not zeroed by the edge-BC"
+
+
+# ==========================================================================
+# JM.3 — step wiring: s2 controlled replay (σ persistence) + live end-to-end dispatch
+# ==========================================================================
+def test_mevp_s2_replay(mesh):
+    """s2 controlled replay: feed the C's STEP-2 entry (Q/U0/F) + the s1-final σ (it120) and
+    reproduce step-2 it*/UF. Two things at once: (1) the FULL rheology under realistic ocean
+    state (|u_w|=0.39, |elev|=0.35, entry |u_ice|=0.23, nonzero σ), tighter than s1's wind-only
+    cold start; (2) σ PERSISTENCE (T11) — feeding s1's final σ as the s2 entry reproduces s2, so
+    σ is NOT zeroed on entry (a wrong zero would diverge here)."""
+    import jax.numpy as jnp
+    from fesom_jax.ice import IceConfig
+    from fesom_jax import ice_evp as ie, ice_mevp as im, io_dump
+    n_nod, n_elem = int(mesh.nod2D), int(mesh.elem2D)
+    cfg = IceConfig(whichEVP=1, ice_dt=1800.0)
+    fn, mn = io_dump.load_mevp_dump(MEVP_DUMP, ["Q", "U0", "F"], step=2, array="node", n_nod=n_nod)
+
+    def g(p, c):
+        return jnp.asarray(io_dump.evp_component(fn, mn, p, c))
+    a_ice, m_ice, m_snow, elev = g("Q", "a_ice"), g("Q", "m_ice"), g("Q", "m_snow"), g("Q", "elevation")
+    u0, v0 = g("U0", "u_ice"), g("U0", "v_ice")
+    sax, say, u_w, v_w = (g("F", n) for n in ("stress_atmice_x", "stress_atmice_y", "u_w", "v_w"))
+    fe, me = io_dump.load_mevp_dump(MEVP_DUMP, ["it120"], step=1, array="elem", n_elem=n_elem)
+    s11_0, s12_0, s22_0 = (jnp.asarray(io_dump.evp_component(fe, me, "it120", s))
+                           for s in ("sigma11", "sigma12", "sigma22"))   # σ carried from s1 (T11)
+    bn = ie.boundary_node_mask(mesh)
+    st = im.mevp_setup(cfg, mesh, a_ice, m_ice, m_snow, elev, bn)
+    carry = (u0, v0, s11_0, s12_0, s22_0)
+    snaps = {}
+    for it in range(1, 121):
+        carry = im.mevp_iterate(cfg, mesh, *carry, st, u0, v0, u_w, v_w, sax, say, cfg.ice_dt)
+        if it in (1, 2, 60, 120):
+            snaps[it] = tuple(np.asarray(x) for x in carry)
+    tol = {1: 1e-13, 2: 1e-13, 60: 1e-11, 120: 5e-12}
+    for it in (1, 2, 60, 120):
+        f, m = io_dump.load_mevp_dump(MEVP_DUMP, [f"it{it}"], step=2, array="node", n_nod=n_nod)
+        ua = io_dump.evp_component(f, m, f"it{it}", "u_aux")
+        va = io_dump.evp_component(f, m, f"it{it}", "v_aux")
+        du = float(np.abs(snaps[it][0] - ua).max()); dv = float(np.abs(snaps[it][1] - va).max())
+        assert du < tol[it] and dv < tol[it], f"s2 it{it} u|Δ|={du:.2e} v|Δ|={dv:.2e}"
+    f, m = io_dump.load_mevp_dump(MEVP_DUMP, ["UF"], step=2, array="node", n_nod=n_nod)
+    duf = float(np.abs(snaps[120][0] - io_dump.evp_component(f, m, "UF", "u_ice")).max())
+    assert duf < 5e-12, f"s2 UF u|Δ|={duf:.2e}"
+
+
+@pytest.fixture(scope="module")
+def ice_harness(mesh):
+    """The assembled-ice-step harness (PHC IC + cold-start ice + Jan-1958 forcing) for the live
+    mEVP dispatch test."""
+    import jax.numpy as jnp                                  # noqa: F401
+    from fesom_jax import core2_forcing, ice
+    from fesom_jax.phc_ic import core2_initial_state
+    sst = np.asarray(core2_initial_state(mesh, IC_CORE2).T[:, 0])
+    state0 = ice.seed_ice(core2_initial_state(mesh, IC_CORE2), mesh, sst)
+    cf = core2_forcing.build_core_forcing(mesh, 1958, sst_ic=sst)
+    sf = cf.step_forcing(1958, 1, 0.0, 1)                    # 1958-01-01 00:00, January
+    return state0, cf, sf
+
+
+@pytest.mark.skipif(not (IC_CORE2 / "T_ic.npy").is_file(), reason="PHC IC (data/ic_core2) missing")
+def test_mevp_live_dispatch(mesh, ice_harness):
+    """The whichEVP=1 dispatch routes the ASSEMBLED ice step (setup→mEVP→FCT→thermo→coupling)
+    to the mEVP kernel — eager AND jit. Confirms: (1) finite, physical ice velocity; (2) the
+    dispatch is LIVE (mEVP u_ice ≠ EVP u_ice); (3) jit traces the static-branch dispatch."""
+    import jax
+    from fesom_jax.ice import IceConfig
+    from fesom_jax.ice_step import ice_surface_step
+    state0, cf, sf = ice_harness
+    DT = 1800.0
+    out0 = ice_surface_step(IceConfig(whichEVP=0), mesh, state0, sf, cf.static, dt=DT)  # EVP
+    out1 = ice_surface_step(IceConfig(whichEVP=1), mesh, state0, sf, cf.static, dt=DT)  # mEVP
+    for o, nm in [(out0, "EVP"), (out1, "mEVP")]:
+        ui = np.asarray(o.u_ice); vi = np.asarray(o.v_ice)
+        assert np.isfinite(ui).all() and np.isfinite(vi).all(), f"{nm} non-finite u_ice"
+        assert max(np.abs(ui).max(), np.abs(vi).max()) < 2.0, f"{nm} unphysical ice speed"
+    d = float(np.abs(np.asarray(out1.u_ice) - np.asarray(out0.u_ice)).max())
+    assert d > 1e-3, f"mEVP u_ice == EVP u_ice ({d:.2e}) — dispatch not live"
+    # jit the mEVP step (cfg/mesh/sf/static closed over ⇒ the whichEVP branch is trace-time)
+    j = jax.jit(lambda st: ice_surface_step(IceConfig(whichEVP=1), mesh, st, sf, cf.static, dt=DT))
+    out1j = j(state0)
+    dj = float(np.abs(np.asarray(out1j.u_ice) - np.asarray(out1.u_ice)).max())
+    assert dj < 1e-10, f"jit vs eager mEVP u_ice |Δ|={dj:.2e}"
