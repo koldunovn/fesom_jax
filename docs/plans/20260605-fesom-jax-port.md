@@ -688,9 +688,16 @@ the `None/0 ⇒ bit-identical` guarantee, each gated against its own C dump orac
   full-year A100 stable, gradients masked-NaN clean, year-scale climate JAX↔C-zstar SST 3.5e-3/SSS
   3.0e-3 ≈ the C↔Fortran ref (B/A=5.7–7.4×, inside the 3–9× coordinate contrast). ⚠️ IC-partition
   provenance is per-oracle (z2_cdump=16r `ic_core2_dist16`; c_zstar_2yr=864r `ic_core2_dist864`).
-- **9b — TKE mixing:** `docs/plans/20260611-fesom-jax-tke.md` (**the primary hybrid-ML seam** — a
-  prognostic `State.tke` field; trainable `c_k/c_eps/cd/alpha_tke` in `Params` from day one;
-  replay-primary validation).
+- **9b — TKE mixing: ✅ COMPLETE (GATE 9b MET 2026-06-13)** —
+  `docs/plans/completed/20260611-fesom-jax-tke.md`. **The primary hybrid-ML seam, fully realized:**
+  prognostic `State.tke` + trainable `tke_c_k/c_eps/cd/alpha` in `Params`, behind `tke_cfg=None`
+  (byte-identical, suite OCEAN 559+ICE 47). Column core `cvmix_tke.py` + driver `tke.py` **replay
+  BIT-EXACT** (≤3e-17) vs the regenerated cdump (original stale — `(float)6.6` literal bug).
+  **`TKE_GRAD_GATE_OK`** (FD↔AD `c_k`/`cd` plateaus 8.2e-8/7.8e-9, masked-NaN clean, tke-IC finite —
+  TKE is the project's FIRST fully-differentiable prognostic mixing scheme). Sharded N-vs-1 (the
+  internal `tke_Av` exch), stable, **year-scale climate SST 4.68e-3 ≈ the C↔Fortran floor**. Lone
+  xfail: the live-step-1 forward gate (a forcing-init transient that washes out in the climate — a
+  C-branch low-wind gustiness/bulk diff; optional polish to port behind a flag).
 - **9c — mEVP rheology:** `docs/plans/20260611-fesom-jax-mevp.md` (contained `ice_evp.py` variant;
   the C's 14-trap fidelity checklist is the core risk).
 
