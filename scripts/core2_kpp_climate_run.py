@@ -171,6 +171,9 @@ def main():
     ap.add_argument("--tke", choices=["on", "off"], default="off",
                     help="on ⇒ classical-TKE mixing (tke_cfg=TkeConfig(), KPP off — the c_tke_2yr "
                          "config; use --ic-dir data/ic_core2_dist864 to match that 864r oracle)")
+    ap.add_argument("--mevp", choices=["on", "off"], default="off",
+                    help="on ⇒ mEVP sea-ice rheology (ice_cfg whichEVP=1 — the c_mevp_2yr config; "
+                         "use --ic-dir data/ic_core2_dist864 to match that 864r oracle)")
     ap.add_argument("--ic-dir", type=str, default="",
                     help="override the IC cache dir (e.g. data/ic_core2_dist864 to match an 864r oracle)")
     ap.add_argument("--steps", type=int, default=0, help="override n_steps (smoke test)")
@@ -190,7 +193,10 @@ def main():
     dates = core2_forcing.dates_for_steps(args.start_year, dt, n_steps)
     cf_year = args.start_year
     cf = core2_forcing.build_core_forcing(mesh, cf_year, sst_ic=sst0)
-    ice_cfg, gm_cfg = IceConfig(), GMConfig()
+    # --mevp on ⇒ the Bouillon-2013 modified-EVP rheology (whichEVP=1, the c_mevp_2yr config);
+    # off ⇒ standard EVP (the c_evp_2yr control).
+    ice_cfg = IceConfig(whichEVP=1) if args.mevp == "on" else IceConfig()
+    gm_cfg = GMConfig()
     # 3-way mixing: --tke on ⇒ classical-TKE (KPP off, the c_tke_2yr config); else KPP.
     tke_cfg = TkeConfig() if args.tke == "on" else None
     kpp_cfg = None if args.tke == "on" else KppConfig()
@@ -198,7 +204,8 @@ def main():
     nz1 = int(mesh.nl) - 1
     writer = MonthlyWriter(out, mesh, nz1)
     print(f"[setup] built in {time.time()-t0:.1f}s; {n_steps} steps × dt={dt:.0f} = "
-          f"{n_steps*dt/86400:.1f} days; ale={args.ale}; monthly means → {out}", flush=True)
+          f"{n_steps*dt/86400:.1f} days; ale={args.ale} tke={args.tke} mevp={args.mevp} "
+          f"ic={ic_dir.name}; monthly means → {out}", flush=True)
 
     @jax.jit
     def accumulate(acc, st):

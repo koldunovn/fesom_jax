@@ -54,11 +54,79 @@ def ice_metrics(aice, mice, area, wet):
     return ext, vol
 
 
+def _annual_surface(path, var):
+    """Annual-mean surface field (mean over the 12 monthly records), ``(nod2,)``."""
+    import netCDF4
+    with netCDF4.Dataset(path) as d:
+        a = np.asarray(d.variables[var][:], dtype=np.float64)        # (12, nod2)
+    a = np.ma.filled(a, np.nan) if np.ma.isMaskedArray(a) else a
+    return np.nanmean(a, axis=0)
+
+
+def annual_compare(jax_dir, year):
+    """Year-scale C comparison (the treatment zstar/TKE got, which mEVP lacked): the annual-mean
+    surface SST/SSS RMS, 4-way (mirrors `core2_zstar_climate_compare.py`):
+      A  = RMS(JAX-mEVP , C-mEVP)        — the JAX port fidelity (should be small).
+      A′ = RMS(JAX-mEVP , Fortran-mEVP)  — JAX vs the Fortran ground truth.
+      C₀ = RMS(C-mEVP   , Fortran-mEVP)  — the C port's own fidelity (the climate-close floor).
+      B  = RMS(C-mEVP   , C-EVP)         — the mEVP↔EVP RHEOLOGY contrast (the signal).
+    Gate: A is climate-close — A ≲ max(B, 3·C₀), i.e. the port adds no more than the rheology
+    signal / a few × the C↔Fortran floor (a rheology's SST/SSS contrast B is modest, unlike a
+    coordinate change — so A≈C₀ is the binding statement, like TKE's SST 4.68e-3 ≈ the floor)."""
+    y = year
+    jd = Path(jax_dir)
+    runs = {
+        "jax_mevp":     jd / f"{{v}}.fesom.{y}.monthly.nc",
+        "c_mevp":       ORACLE / "c_mevp_2yr" / f"{{v}}.fesom.{y}.monthly.nc",
+        "c_evp":        ORACLE / "c_evp_2yr" / f"{{v}}.fesom.{y}.monthly.nc",
+        "fortran_mevp": ORACLE / "fortran_mevp_2yr" / f"{{v}}.fesom.{y}.nc",
+    }
+    for name, p in runs.items():
+        f = Path(str(p).format(v="sst"))
+        if not f.is_file():
+            raise SystemExit(f"MISSING {name}: {f}  (run the climate job first?)")
+    print(f"=== mEVP year-{y} climate comparison (annual mean) ===")
+    out = {}
+    for var in ("sst", "sss"):
+        fld = {n: _annual_surface(Path(str(p).format(v=var)), var) for n, p in runs.items()}
+        mask = np.ones_like(fld["jax_mevp"], dtype=bool)
+        for a in fld.values():
+            mask &= np.isfinite(a)
+
+        def rms(a, b):
+            d = (fld[a] - fld[b])[mask]
+            return float(np.sqrt(np.mean(d * d)))
+        A = rms("jax_mevp", "c_mevp"); Ap = rms("jax_mevp", "fortran_mevp")
+        C0 = rms("c_mevp", "fortran_mevp"); B = rms("c_mevp", "c_evp")
+        u = "°C" if var == "sst" else "psu"
+        print(f"\n[{var}] wet nodes={int(mask.sum())}")
+        print(f"  A  = RMS(JAX-mEVP , C-mEVP)        = {A:.4e} {u}")
+        print(f"  A′ = RMS(JAX-mEVP , Fortran-mEVP)  = {Ap:.4e} {u}")
+        print(f"  C₀ = RMS(C-mEVP   , Fortran-mEVP)  = {C0:.4e} {u}   (the C↔Fortran floor)")
+        print(f"  B  = RMS(C-mEVP   , C-EVP)         = {B:.4e} {u}   (the mEVP↔EVP rheology contrast)")
+        print(f"  ⇒ A/C₀ = {A/max(C0,1e-30):.2f}   B/A = {B/max(A,1e-30):.1f}")
+        out[var] = dict(A=A, Ap=Ap, B=B, C0=C0)
+    ok = all(out[v]["A"] < max(out[v]["B"], 3.0 * out[v]["C0"]) for v in ("sst", "sss"))
+    print(f"\n{'PASS' if ok else 'FAIL'}: JAX-mEVP reproduces the C-mEVP climate "
+          f"(SST A={out['sst']['A']:.3e} vs C₀={out['sst']['C0']:.3e}; "
+          f"SSS A={out['sss']['A']:.3e} vs C₀={out['sss']['C0']:.3e})")
+    print("MEVP_CLIMATE_COMPARE_" + ("OK" if ok else "FAIL"), flush=True)
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", default=str(ROOT / "scripts" / "mevp_liveness_fields.npz"))
     ap.add_argument("--month", type=int, default=0)      # January 1958 = the early period
+    ap.add_argument("--annual", action="store_true",
+                    help="year-scale 4-way annual-mean RMS vs c_mevp_2yr/fortran_mevp_2yr "
+                         "(the C comparison; needs the year-1 climate run first)")
+    ap.add_argument("--jax-dir", default=str(ROOT / "data" / "mevp_climate_1yr"))
+    ap.add_argument("--year", type=int, default=1958)
     args = ap.parse_args()
+
+    if args.annual:                                       # the year-scale C comparison
+        return annual_compare(args.jax_dir, args.year)
 
     from fesom_jax.mesh import load_mesh
     mesh = load_mesh(MESH_DIR)
