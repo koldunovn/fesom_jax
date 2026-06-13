@@ -1,10 +1,20 @@
-# Next session — Phase 9b: TKE — resume at JT.4 (gradient gates) + the forcing-gap fix
+# Next session — Phase 9b: TKE — resume at JT.5 (stability/climate/sharded) + the forcing-gap fix
 
-**JT.0 → JT.3 DONE + committed 2026-06-13** (`d023f75` seam → `b67b3b6` column core →
-`60ed77d` driver → `776f3be` step wiring). Column core `cvmix_tke.py` AND driver
-`tke.py mixing_tke` are **replay-gated BIT-EXACT** (≤3e-17) vs the regenerated cdump; TKE is live in
-the `step.py` 3-way dispatch behind `tke_cfg`; `test_tke_step.py` confirms the step runs eager+jit,
-the prognostic evolves, TKE≠KPP, both-cfgs raises. Suites green (OCEAN 559+). Plan has JT.0–JT.3 ticked.
+**JT.0 → JT.4 DONE + committed 2026-06-13** (`d023f75` seam → `b67b3b6` column core →
+`60ed77d` driver → `776f3be` step wiring → `da670fa` gradient gates). Column core `cvmix_tke.py`
+AND driver `tke.py mixing_tke` are **replay-gated BIT-EXACT** (≤3e-17); TKE is live in the `step.py`
+3-way dispatch; `test_tke_step.py` confirms the step runs eager+jit. **JT.4 `TKE_GRAD_GATE_OK`**
+(`scripts/core2_tke_grad_gate.py`, A100): FD↔AD plateau on `tke_c_k` (**8.2e-8**) + `tke_cd`
+(7.8e-9), masked-NaN `d(SST)/d(T0)` clean, `d(SST)/d(tke-IC)` finite — the ML seam is fully
+differentiable. Suites green (OCEAN 559+ / now 563). Plan has JT.0–JT.4 ticked.
+
+**Resume at JT.5** — stability + climate + sharded: 10-day A100 linfs+TKE (KPP swapped out) stable +
+physical Kv; year-scale JAX-TKE ↔ the `c_tke_2yr` climate oracle (use **`ic_core2_dist864`** — that
+oracle is 864-rank, the per-oracle IC-provenance rule [[zstar-forcing-dump-config-gap]]) ≪ the
+TKE↔KPP scheme contrast (the C measured 11–18×); **sharded N-vs-1 (CPU ×4) TKE-ON** — the generic
+field loops cover `tke`, and this is what STRESSES the internal node-`tke_Av` exchange in
+`_wire_kv_av` (the plan-review MAJOR — omit the exch and N-vs-1 fails on boundary-element Av). Then
+**JT.6** close-out (GATE 9b table, move plan to completed/).
 
 **⚠️ ONE TRACKED GAP (do this first or alongside JT.5):** the cdump-matching LIVE forward gate is
 **xfail** (`test_tke_step.py::_FORCING_GAP`). The JAX `build_core_forcing` step-1 wind stress at
