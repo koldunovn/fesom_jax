@@ -1,16 +1,15 @@
 # Next session — Phase 9b: TKE — JT.6 close-out (GATE 9b MET)
 
-**GATE 9b MET 2026-06-13** (7/8 rows green; the 8th is an understood transient). The year-scale
+**GATE 9b MET 2026-06-13** (7/8 rows green; the 8th is a persistent UNDIAGNOSED low-wind forcing diff (small climate impact)). The year-scale
 climate VALIDATED: JAX-TKE ↔ `c_tke_2yr` **SST RMS 4.68e-3 / SSS 2.74e-3 ≈ the C↔Fortran floor**
 (0.0049/0.0028) and ≪ the TKE↔KPP 0.43 °C contrast (`TKE_CLIMATE_OK`, job 25574435). This RESOLVED
-the forcing-gap question: the 7e-4 step-1 stress diff is a pure **transient that washes out** — NOT
-a bulk difference, NOT a blocker (a reviewer caught my over-reach; running the climate was the
+the forcing-gap question: the 7e-4 step-1 stress diff has SMALL climate impact (A~=C0) but is a PERSISTENT, UNDIAGNOSED low-wind forcing diff — NOT a "transient", NOT root-caused (a reviewer caught my over-reach; running the climate was the
 arbiter). So the only remaining `xfail` is the live-step-1 forward gate (`test_tke_step.py::_FORCING_GAP`),
-which is transient-sensitive by nature and does NOT gate the physics — leave it xfail, or as an
+which exposes the persistent low-wind forcing diff (undiagnosed; small climate impact) and does NOT gate the physics — leave it xfail, or as an
 OPTIONAL polish port the C TKE-branch's low-wind gustiness/min-wind bulk term behind a flag.
 
 **JT.6 — close-out (housekeeping):** GATE 9b table (replay ✓ / budget ✓ / gradients ✓ / sharded ✓
-/ stability ✓ / climate ✓ — all green; live-step-1 xfail documented as a transient); confirm the
+/ stability ✓ / climate ✓ — all green; live-step-1 xfail = the undiagnosed low-wind forcing diff (small climate impact)); confirm the
 full suite green once more; move `docs/plans/20260611-fesom-jax-tke.md` → `completed/`; update the
 parent plan (`20260605-fesom-jax-port.md` Phase 9) + memory ([[fesom-jax-port]]); commit. TKE is the
 project's first FULLY-DIFFERENTIABLE prognostic mixing scheme — the primary hybrid-ML seam, done.

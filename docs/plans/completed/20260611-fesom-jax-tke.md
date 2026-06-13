@@ -10,7 +10,7 @@ simply static under linfs. If 9b runs before 9a, the only obligation is JT.2's g
 core + driver replay BIT-EXACT ≤3e-17, `TKE_GRAD_GATE_OK`, sharded N-vs-1, stable, year-scale
 climate SST 4.68e-3 ≈ the C↔Fortran floor). TKE is the project's first fully-differentiable
 prognostic mixing scheme. The lone xfail (live-step-1 forward) is an understood forcing-init
-transient that washes out in the climate — not a blocker.
+PERSISTENT undiagnosed low-wind forcing diff (small climate impact, not a blocker; NOT a "transient").
 
 **Why TKE matters most for this project:** TKE is the **primary hybrid-ML seam** — a prognostic
 1-equation mixing closure whose constants (`c_k`, `c_eps`, `cd`, `alpha_tke`) are exactly the kind of
@@ -331,7 +331,7 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
       1-yr `ic_core2_dist864`): **stable 17520 steps** (max|vel| 2.80), and **SST RMS = 4.68e-3 °C /
       SSS 2.74e-3 psu** vs the C oracle — **≈ the C↔Fortran reference 0.0049/0.0028** (A ≈ C0) ⇒ the
       JAX TKE climate is as faithful as the C is to Fortran, and **≪ the TKE↔KPP 0.43 °C contrast**.
-      `TKE_CLIMATE_OK`. ⇒ **the step-1 forcing-gap WASHES OUT — it is a transient, NOT a climate
+      `TKE_CLIMATE_OK`. ⇒ **the step-1 forcing-gap has SMALL climate impact (A~=C0) but is PERSISTENT + UNDIAGNOSED — NOT a "transient", NOT a climate
       blocker** (it never propagates; the live-step-1 gate stays xfail as transient-sensitive). The
       `--tke` flag was added to `core2_kpp_climate_run.py`.
 - [x] **sharded N-vs-1 (CPU ×4) TKE-ON** (`test_step_sharded.py`, job 25571969): serial byte-id +

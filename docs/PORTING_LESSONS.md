@@ -3427,3 +3427,19 @@ Cite the C source (`file:line`) or dump probe that proves it.
   one) can be a forcing-init transient that integrates out — never conclude "climate-blocked" from a
   single-step snapshot; the climate run is cheap relative to being wrong, and IS the arbiter.**
   (`scripts/core2_tke_climate{,_compare}.py`, Task JT.5.)
+- **[verify/tke] ⚠️ CORRECTION to the lesson above: "transient" was WRONG too (a reviewer pushed a
+  second time, rightly). The forcing-gap is a PERSISTENT, UNDIAGNOSED low-wind diff — not washed-out.**
+  Same bulk inputs → different stress is a per-node FORMULA/INPUT difference, not a step-1 artifact. I
+  disproved every mechanism I confidently floated: NOT gustiness (the C stress is plain
+  `cd*rho*|U_rel|*U_rel`, no such term); NOT the `BULK_U10MIN=0.3` min-wind floor (the JAX ports it
+  faithfully, `forcing.py:151,195`); and `fesom_bulk.c` is UNCHANGED across the KPP & TKE C builds
+  (`git log`) — yet the JAX matches the KPP dumps <1e-12 and differs from the TKE cdump by ~7e-4 at
+  ~10% open-water LOW-WIND nodes. So it is NOT the bulk formula; it must be the INPUTS the C fed its
+  bulk when generating the cdump (the JRA55 wind field, or the node's surface state) — and it remains
+  **OPEN**. The climate still passes (low wind ⇒ tiny absolute stress ⇒ ~floor-level impact), so TKE
+  is climate-faithful and the gate is legitimately green — but the diff is real and persistent. To
+  close it: a C-side instrumented re-run dumping the bulk inputs (`u_wind/v_wind/T_oc/u_w`) + the
+  computed `cd` at the max-Δ node vs the JAX. **Moral: a year-scale climate match proves SMALL IMPACT,
+  not NO DIFFERENCE; an unverified mechanism-story ("gustiness", "transient") dressing an undiagnosed
+  diff is WORSE than logging it honestly OPEN. State what you've ruled out + what's still unknown.**
+  (`test_tke_step.py::_FORCING_GAP`, Task JT.5.)
