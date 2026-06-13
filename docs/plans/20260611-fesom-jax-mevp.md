@@ -281,10 +281,14 @@ tests in `test_mevp.py`.
 **Files:** Modify: `fesom_jax/tests/test_gradient.py` (or `test_mevp.py`). Create:
 `scripts/core2_mevp_grad_gate.{py,sbatch}` if GPU-scale needed.
 
-- [ ] finite `d(loss)/d(ice IC)` through the assembled mEVP step (stiffness scale documented)
-- [ ] masked-NaN probe over `a_ice=0` lanes
-- [ ] trainable-seam plateaus unchanged mEVP-ON (`d(SST)/d(k_ver)`)
-- [ ] full suite green
+- [x] finite `d(loss)/d(ice IC)` — kernel `d/d(m_ice)` finite (`test_mevp_grad_ice_ic_finite`);
+      assembled `[I] d(SST)/d(m_ice0)`=6.3e9 finite (the documented stiff-but-finite rheology class)
+- [x] masked-NaN probe — kernel `d/d(stress_ax)` finite incl. ice-free lanes
+      (`test_mevp_grad_masked_nan`) + Δ-singularity finite at u_aux=0 (additive-δmin C¹,
+      `test_mevp_delta_singularity`); assembled `[3] d(SST)/d(T0)` non-finite=0, masked=0 (clean)
+- [x] **trainable-seam plateau UNCHANGED mEVP-ON**: `[1] d(SST)/d(k_ver)` plateau=1.31e-10
+      (well-conditioned, == the EVP-ON class — k_ver is ocean-side, mEVP ice-side) — `MEVP_GRAD_GATE_OK`
+- [x] full suite green (CPU kernel gates + GPU `core2_mevp_grad_gate.py`, A100 25GB/40% @ N=4)
 
 ### JM.5 — Sharded N-vs-1 + close-out matrix
 
