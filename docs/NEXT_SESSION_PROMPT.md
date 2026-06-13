@@ -1,21 +1,29 @@
-# Next session — Phase 9b: TKE — resume at JT.3 (assembled live gate)
+# Next session — Phase 9b: TKE — resume at JT.4 (gradient gates) + the forcing-gap fix
 
-**JT.0 → JT.2 DONE + committed 2026-06-13** (`d023f75` cfg seam/State.tke/Params/reader →
-`b67b3b6` column core → `60ed77d` driver). The column core `cvmix_tke.py` AND the driver
-`tke.py mixing_tke` are both **replay-gated BIT-EXACT** (≤3e-17) against the regenerated cdump;
-TKE is live in the `step.py` 3-way dispatch behind `tke_cfg`. Suites green (OCEAN 559 + ICE 47).
-Plan `docs/plans/20260611-fesom-jax-tke.md` has JT.0–JT.2 ticked.
+**JT.0 → JT.3 DONE + committed 2026-06-13** (`d023f75` seam → `b67b3b6` column core →
+`60ed77d` driver → `776f3be` step wiring). Column core `cvmix_tke.py` AND driver
+`tke.py mixing_tke` are **replay-gated BIT-EXACT** (≤3e-17) vs the regenerated cdump; TKE is live in
+the `step.py` 3-way dispatch behind `tke_cfg`; `test_tke_step.py` confirms the step runs eager+jit,
+the prognostic evolves, TKE≠KPP, both-cfgs raises. Suites green (OCEAN 559+). Plan has JT.0–JT.3 ticked.
 
-**Resume at JT.3** — step wiring + the **assembled live gate** (the K.8 pattern): a full CORE2
-step-1/3-step with `tke_cfg` vs the cdump `kv`/`av`/`tke` LIVE tags (~1e-12, flip-fallback), the
-scheme-engaged check (TKE ≠ KPP rel > 0.1), the **both-cfgs-set raise** + pi-path raise (already
-wired in `step.py`, add the tests), jit-twice no-leak. This is the only piece that exercises
-`vshear2` with nonzero `uv` (it reuses the gated `kpp.ri_iwmix` shear). Then **JT.4** gradient
-gates (FD↔AD plateau on `tke_c_k`/`tke_cd`; masked-NaN; `d/d(tke-IC)` through the scan — the
-column-core AD is already verified, `test_column_grad_finite`), **JT.5** stability/climate/sharded
-(10-day A100 linfs+TKE vs `c_tke_2yr`; sharded N-vs-1 stresses the internal Av exch), **JT.6**
-close-out. Two key learnings already banked in PORTING_LESSONS (JT.1): the backward min-scan
-off-by-one and the **stale `(float)6.6` cdump** (regenerated → canonical; stale = `cdump/dump_stale_6.6f`).
+**⚠️ ONE TRACKED GAP (do this first or alongside JT.5):** the cdump-matching LIVE forward gate is
+**xfail** (`test_tke_step.py::_FORCING_GAP`). The JAX `build_core_forcing` step-1 wind stress at
+**dt=1800** differs from the cdump's C-run by ~7e-4 (≈60% of scale), **IC-independent** (identical
+under `ic_core2` vs `ic_core2_dist16`) ⇒ a forcing step-1 **time/convention** mismatch, NOT a TKE bug
+(the port is bit-exact via the JT.1/JT.2 replay gates; KPP's forcing matched <1e-12 at dt=500 with a
+forcing-MATCHED dump). Fix = align `core2_forcing` dt=1800 step-1 forcing time to the C, OR regenerate
+a forcing-matched TKE step dump (the KPP-dump pattern). Until then the LIVE forward validation is
+open; the bit-exact replay gates carry the port's correctness.
+
+**Resume at JT.4** — gradient gates (the ML seam, GATE 9b core): FD↔AD plateau on `d(loss)/d(tke_c_k)`
++ `d(loss)/d(tke_cd)` (active-region loss; the `test_gradient.py:89-121` pattern); masked-NaN
+`d(SST)/d(T0)` finite + 0 on masked lanes TKE-ON; `d(loss)/d(tke-IC)` through the N-step checkpointed
+scan (the carry path). The COLUMN-CORE AD is already verified (`test_column_grad_finite`: grad finite,
+0 on dry lanes, grad thru a `Params` leaf) + a driver-level grad (`test_mixing_tke_composition_and_grad`).
+Then **JT.5** stability/climate/sharded (10-day A100 linfs+TKE vs `c_tke_2yr` using `ic_core2_dist864`;
+sharded N-vs-1 stresses the internal Av exch), **JT.6** close-out. Lessons banked: backward min-scan
+off-by-one, stale `(float)6.6` cdump (regenerated; stale=`cdump/dump_stale_6.6f`), the JT.2 redundant-tag
++ JT.3 forcing-gap findings.
 
 ---
 ## (original Phase 9b kickoff context — still the source of truth for the ladder)
