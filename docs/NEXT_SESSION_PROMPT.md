@@ -1,20 +1,26 @@
-# Next session — Phase 9b: TKE — resume at JT.5 (stability/climate/sharded) + the forcing-gap fix
+# Next session — Phase 9b: TKE — finish JT.5 climate + JT.6 close-out (+ the forcing-gap fix)
 
-**JT.0 → JT.4 DONE + committed 2026-06-13** (`d023f75` seam → `b67b3b6` column core →
-`60ed77d` driver → `776f3be` step wiring → `da670fa` gradient gates). Column core `cvmix_tke.py`
-AND driver `tke.py mixing_tke` are **replay-gated BIT-EXACT** (≤3e-17); TKE is live in the `step.py`
-3-way dispatch; `test_tke_step.py` confirms the step runs eager+jit. **JT.4 `TKE_GRAD_GATE_OK`**
-(`scripts/core2_tke_grad_gate.py`, A100): FD↔AD plateau on `tke_c_k` (**8.2e-8**) + `tke_cd`
-(7.8e-9), masked-NaN `d(SST)/d(T0)` clean, `d(SST)/d(tke-IC)` finite — the ML seam is fully
-differentiable. Suites green (OCEAN 559+ / now 563). Plan has JT.0–JT.4 ticked.
+**JT.0 → JT.5 (most) DONE + committed 2026-06-13** (`d023f75` seam → `b67b3b6` column core →
+`60ed77d` driver → `776f3be` step wiring → `da670fa` gradient gates → `033826d` sharded+stability).
+Column core + driver **replay BIT-EXACT** (≤3e-17); TKE live in the dispatch; **`TKE_GRAD_GATE_OK`**
+(FD↔AD `tke_c_k` 8.2e-8 / `tke_cd` 7.8e-9, masked-NaN clean, tke-IC finite — fully differentiable);
+**sharded N-vs-1 PASS** (the internal `tke_Av` exch proven correct); **stability PASS** (480 steps,
+max|vel| 1.53, TKE↔KPP SST RMS 0.43 °C resolved). Suites green. Plan has JT.0–JT.4 + JT.5
+sharded/stability ticked.
 
-**Resume at JT.5** — stability + climate + sharded: 10-day A100 linfs+TKE (KPP swapped out) stable +
-physical Kv; year-scale JAX-TKE ↔ the `c_tke_2yr` climate oracle (use **`ic_core2_dist864`** — that
-oracle is 864-rank, the per-oracle IC-provenance rule [[zstar-forcing-dump-config-gap]]) ≪ the
-TKE↔KPP scheme contrast (the C measured 11–18×); **sharded N-vs-1 (CPU ×4) TKE-ON** — the generic
-field loops cover `tke`, and this is what STRESSES the internal node-`tke_Av` exchange in
-`_wire_kv_av` (the plan-review MAJOR — omit the exch and N-vs-1 fails on boundary-element Av). Then
-**JT.6** close-out (GATE 9b table, move plan to completed/).
+**Two things left (then JT.6):**
+1. **JT.5 year-scale climate** — JAX-TKE ↔ the `c_tke_2yr` oracle (SST/SSS RMS ≪ the TKE↔KPP
+   contrast). Heaviest: a 1-yr GPU run (~35 min) + **`ic_core2_dist864`** (that oracle is 864-rank —
+   the per-oracle IC-provenance rule [[zstar-forcing-dump-config-gap]], it bit the zstar climate 41×).
+2. **The dt=1800 forcing-gap** (`test_tke_step.py::_FORCING_GAP` xfail) — the JAX `build_core_forcing`
+   step-1 wind stress at dt=1800 differs from the cdump's by ~7e-4 (IC-independent ⇒ a forcing
+   time/convention mismatch, not TKE). Fix it (align the dt=1800 step-1 forcing time, OR a
+   forcing-matched re-dump) — this ALSO unblocks the climate (so its forcing matches `c_tke_2yr`) and
+   flips the 2 xfails to real gates. Likely the same root: check `core2_forcing.dates_for_steps` /
+   the JRA55 interpolation time vs the C's first-step convention at dt=1800.
+
+Then **JT.6** close-out: GATE 9b table (replay ✓, budget ✓, gradients ✓, sharded ✓, stability ✓ —
+only the year-scale-climate row open), lessons appended (8 banked), move plan to `completed/`.
 
 **⚠️ ONE TRACKED GAP (do this first or alongside JT.5):** the cdump-matching LIVE forward gate is
 **xfail** (`test_tke_step.py::_FORCING_GAP`). The JAX `build_core_forcing` step-1 wind stress at
