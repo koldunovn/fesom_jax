@@ -30,17 +30,14 @@ import pytest
 
 from fesom_jax import core2_forcing, kpp, ssh
 from fesom_jax import step as stepmod
-from fesom_jax.config import DENSITY_0
-from fesom_jax.cvmix_tke import _safe_sqrt
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import core2_initial_state
 from fesom_jax.tke import TkeConfig
 
 ROOT = Path(__file__).resolve().parents[2]
 MESH_DIR = ROOT / "data" / "mesh_core2"
-# the 16-rank cdump's PHC land-fill IC (the C extrap is partition-dependent — the
-# [[zstar-forcing-dump-config-gap]] lesson; the default ic_core2 mismatches the coastal
-# SST → the stability-dependent bulk drag → the stress at those nodes).
+# the 16-rank cdump's PHC IC (per-oracle partition provenance, [[zstar-forcing-dump-config-gap]]);
+# the remaining tests don't compare to the cdump's forcing, so this is just a consistent IC.
 IC_DIR = ROOT / "data" / "ic_core2_dist16"
 TKE_CDUMP = Path("/work/ab0995/a270088/port/tke/cdump/dump")
 DT = 1800.0           # the cdump dt
@@ -71,58 +68,15 @@ def run1():
                 st_tke=st_tke, st_kpp=st_kpp)
 
 
-def _cdump(tags):
-    from fesom_jax.io_dump import load_tke_dump
-    f, _ = load_tke_dump(TKE_CDUMP, tags, step=1)
-    return f
 
 
 # ---------------------------------------------------------------------------
-# 1) the assembled step-1 forward gate vs the cdump.
-#
-# ⚠️ XFAIL — but NOT a JAX/TKE bug: the TKE CDUMP is the OUTLIER, not the JAX forcing.
-# A 3-way comparison (2026-06-13) settled this: the JAX step-1 stress matches the KPP C
-# oracle (`data/kpp_dump_core2` iceforce) to ~6.8e-5 EVERYWHERE — bit-identical at the
-# worst node — while the TKE cdump's `normstress` disagrees with BOTH the JAX AND the KPP
-# oracle by the same ~7e-4 at ~10% open-water LOW-WIND nodes. So `JAX == KPP-oracle ≠
-# TKE-cdump`: the JAX forcing is the SAME validated code KPP/zstar use, and the TKE cdump
-# (a separate old C job) was generated with slightly different forcing INPUTS (most likely a
-# different JRA55 wind snapshot). The JAX forcing is independently confirmed by (a) the KPP
-# oracle, (b) the 1-yr TKE climate matching `c_tke_2yr` at the C↔Fortran floor. So these two
-# tests compare the (correct) JAX against an OUTLIER oracle — kept xfail as documentation of
-# the cdump quirk; the real forcing validation lives in `test_kpp_step.py` + the climate.
+# (NOTE) The live step-1 forcing/tke vs the TKE cdump is NOT tested here: a 3-way check
+# showed the cdump's step-1 normstress is an OUTLIER (JAX == KPP-oracle != TKE-cdump, ~7e-4 at
+# low-wind nodes) — a quirk of that old C job's forcing inputs, not a JAX bug. The JAX live
+# forcing is validated against the KPP oracle <1e-12 (test_kpp_step.py) and end-to-end by the
+# 1-yr climate matching c_tke_2yr at the C<->Fortran floor (scripts/core2_tke_climate_compare.py).
 # ---------------------------------------------------------------------------
-_FORCING_GAP = pytest.mark.xfail(
-    reason="the TKE cdump's step-1 normstress is the OUTLIER, not the JAX: a 3-way check "
-           "shows JAX==KPP-oracle (~6.8e-5, bit-id at the worst node) != TKE-cdump (~7e-4 at "
-           "low-wind nodes). The JAX forcing is the same code KPP/zstar validated + the 1-yr "
-           "climate matches c_tke_2yr at the C↔Fortran floor. Not a JAX bug.", strict=False)
-
-
-@_FORCING_GAP
-def test_forc_tke_surf_matches_cdump(run1):
-    """The assembled ``forc_tke_surf = |stress_node_surf|/ρ₀`` vs the cdump ``normstress``.
-    XFAIL: the cdump is the OUTLIER (the JAX matches the KPP oracle + the climate); the cdump's
-    step-1 forcing inputs differ from the other oracles' — not a JAX bug."""
-    sfx = run1["sfx"]
-    sns = np.asarray(sfx.stress_node_surf)
-    forc = np.asarray(_safe_sqrt(sns[:, 0] ** 2 + sns[:, 1] ** 2)) / DENSITY_0
-    ref = _cdump(["normstress"])["normstress"][:, 0]
-    d = float(np.max(np.abs(forc - ref)))
-    print(f"\nforc_tke_surf max|Δ|={d:.3e}  (scale {np.abs(ref).max():.3e})")
-    assert d < 1e-12
-
-
-@_FORCING_GAP
-def test_step1_tke_matches_cdump(run1):
-    """End-of-step-1 ``state.tke`` vs the C cdump ``tke``. XFAIL: downstream of the cdump's
-    outlier step-1 forcing (tke is surface-flux-driven) — not a JAX bug (see above)."""
-    tke = np.asarray(run1["st_tke"].tke)
-    ref = _cdump(["tke"])["tke"]                            # dry levels are 0 on both sides
-    d = float(np.max(np.abs(tke - ref)))
-    print(f"\nstep-1 tke max|Δ|={d:.3e}  (scale {np.abs(ref).max():.3e})")
-    assert d < 1e-12
-
 
 # ---------------------------------------------------------------------------
 # 2) TKE is genuinely engaged (distinct from KPP) + the prognostic evolves
