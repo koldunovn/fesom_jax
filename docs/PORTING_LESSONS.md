@@ -3500,3 +3500,33 @@ Cite the C source (`file:line`) or dump probe that proves it.
   the C documented (`fesom_ice.c:243-247`). ⚠️ `read_partition(mesh_dir, npes)` wants
   `mesh_dir/dist_<npes>/` — pass the pool parent `/pool/.../core2`, not the mesh data dir.
   (`test_bc_index_no_seam_flagged`.)
+- **[mevp/JM.2] The mEVP kernel ported BIT-FAITHFUL on the first run — the 14-trap checklist did
+  its job.** Loading the cdump entry inputs (Q/U0/F merged across 16 ranks), running `mevp_setup`
+  + 120 eager `mevp_iterate` calls, and diffing vs the C: P-precompute (inv_thickness/mass/tilt/
+  pressure_fac) ALL max|Δ|=0.000e+00 (bit-identical maps); it1 velocity =0 (cold start is wind-
+  driven — u_w=elev=0 at rest ⇒ it1 is a pure per-node `det·obd·rdt·inv_thickness·stress` map,
+  NO scatter); it2=1e-19, it60=1.8e-16, it120=1.5e-12 (the accumulated element→node scatter-
+  reassociation floor, 16-rank-C vs single-device-JAX). The traps that would have silently broken
+  it (rdt=dte not ice_dt; the 0.5 in pressure_fac; max-clamp δmin; EVP's else-zero; has_ice on the
+  tilt) were all pre-identified — porting straight from the C with each `[Tn]` cited inline meant
+  zero debugging. **Moral: when the C plan hands you a fidelity-trap list with line citations, port
+  trap-by-trap with the citation in the code, not "port then debug against the dump".**
+- **[mevp/JM.2] The entry-anchor is LOAD-BEARING and the cold-start it2 dump proves it — make the
+  anchor an explicit argument so you can test the wrong version.** mEVP's backward-Euler rhs anchors
+  on the FROZEN ENTRY velocity (`rhsu = u_ice + … + β·u_aux`), NOT the current iterate like std-EVP.
+  I gave `mevp_iterate(…, u_anchor, v_anchor, …)` an explicit anchor arg; production passes the
+  frozen entry, and the test runs 2 iterations BOTH ways: entry-anchored matches the C it2 at
+  1.08e-19, iterate-anchored (the std-EVP-template bug) diverges to 1.4e-5. At it1 the two coincide
+  (iterate==entry==0 at cold start), so ONLY it2 catches it — exactly why the C plan flagged the
+  "cold-start it2 dump" as the discriminator. **Moral: when two implementations differ only after
+  ≥2 iterations, a 1-step gate is blind; thread the disputed choice as a parameter so the test can
+  drive both and show the dump fingerprints the right one.** (`test_mevp_entry_anchor`.)
+- **[mevp/JM.2] lax.scan (jitted) ≠ the eager Python loop bit-for-bit (~1e-11), and that's fine —
+  σ amplifies it to 1e-4, velocity stays 1e-11.** The per-iterate gates drive `mevp_iterate` in an
+  eager loop (to snapshot it1/2/60/120 — scan hides intermediates); the production `mevp_dynamics`
+  (checkpointed `lax.scan`, jitted) differs from that eager loop by ~2e-11 on velocity (XLA fuses
+  the scan body and reassociates the scatter reductions differently than op-by-op eager). σ, being
+  VP-kink noise-amplified near rigid pack, blows that to 1.4e-4 — while velocity stays bound. BOTH
+  paths match the cdump within the scatter floor (eager-vs-it120 1.5e-12; scan-vs-UF 6e-11). So:
+  gate the kernel MATH eagerly (tight, intermediate access), gate the WIRING via scan-vs-final
+  (looser, fusion floor), and keep σ out of the binding set (the std-EVP `_DIAG_FIELDS` precedent).

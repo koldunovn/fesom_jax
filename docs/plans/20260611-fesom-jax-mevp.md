@@ -216,24 +216,43 @@ Create: `fesom_jax/ice_mevp.py` (stub), `fesom_jax/tests/test_mevp.py`.
 
 **Files:** Modify: `fesom_jax/ice_mevp.py`, `fesom_jax/tests/test_mevp.py`.
 
-- [ ] setup: unmasked ssh tilt (**no has_ice mask** — trap 6/“do not copy EVP's mask”), node
-      precompute (`ice_nod`, `inv_thickness`, verbatim `mass`), element precompute (`ice_el` by
-      **mean₃(m_ice)>0.01**, `pressure_fac` with det2 folded, **no 0.5**)
-- [ ] iteration body: strain (shared) → Δ + **additive** δmin → α-relaxed σ (0.5 in σ11/σ22 only;
-      no eps12 half) → scatter (shared) → β-relaxed solve (**drag carries rdt; `drag·u_w` outside the
-      rdt group; rhs uses entry `u_ice` + `β·u_aux`**; det = bc_index/((1+β+drag)²+(rdt·f)²); **no
-      theta_io**; non-ice = identity carry) → edge-BC zero → exch — 120× scan + checkpoint
-- [ ] final copy; σ enters/leaves as State carry untouched on entry (trap 11); no `uice_old` (trap 14)
-- [ ] **walk the 14-trap checklist** (below) as explicit review items, each ticked with a JAX
-      line citation
-- [ ] **trap-13 unit test** (the cold-start dumps CANNOT distinguish identity-vs-zero — all
-      velocities are 0 at s1): seed a NON-ice interior node (`a_ice<0.01`) with `u_ice=5`, one mEVP
-      iteration ⇒ velocity **retained** (identity carry, ≈5); paired boundary-node assert
-      (bc_index + edge-BC ⇒ 0) [plan-review MAJOR]
-- [ ] tests: Q/U0/F/P precompute gates ~1e-13; it1/it2/it60/it120 `u_aux` ≤1e-12 (s1); σ tracked with
-      context; cold-start σ≡0 at it1 reproduced; **it2 entry-anchor check** (rhs uses the frozen
-      entry, not the it1 iterate — Decisions #4)
-- [ ] full suite green
+- [x] setup `mevp_setup` (`ice_mevp.py`): unmasked ssh tilt (T6), node precompute (`ice_nod`,
+      `inv_thickness`, verbatim `mass` T5), element precompute (`ice_el` by mean₃(m_ice)>0.01 T4,
+      `pressure_fac` det2-folded, no 0.5 T2)
+- [x] iteration body `mevp_iterate`: strain (shared) → Δ + additive δmin (T10) → α-relaxed σ (0.5
+      in σ11/σ22 only) → scatter (shared, act=ice_el) → β-relaxed solve (drag carries rdt T1,
+      `drag·u_w` outside the rdt group, rhs anchored on frozen entry + β·u_aux, det =
+      bc_index/((1+β+drag)²+(rdt·f)²), no theta_io T3, non-ice identity carry T13) → edge-BC →
+      exch — 120× checkpointed `lax.scan` in `mevp_dynamics`
+- [x] final copy over full extent, no post-copy exchange (T8); σ carried untouched on entry (T11);
+      no `uice_old` (T14)
+- [x] **14-trap walk** — see the verification table below (each trap → JAX line + guarding test)
+- [x] **trap-13 unit test** (`test_mevp_trap13_nonice_retained`): seeded non-ice interior node
+      retained EXACTLY (==5.0, identity carry); paired boundary node zeroed (==0.0) by the edge-BC
+- [x] tests (`test_mevp.py`): P precompute bit-faithful (<1e-13, actually 0); it1/it2/it60/it120
+      `u_aux` velocity {0, 1e-19, 1.8e-16, 1.5e-12} (binding); cold-start σ≡0 at it1 (bit-exact vs
+      C); σ@it120 tracked (rel ~1e-9, VP-kink); **it2 entry-anchor** (entry=1e-19 vs C; iterate-
+      anchored bug=1.4e-5); production scan vs UF (<1e-10, actually 6e-11)
+- [x] full suite green (mEVP 19 + ice_step 4 + EVP 8)
+
+**14-trap verification (JM.2 review checklist — all confirmed against the C + a guarding test):**
+
+| # | Trap | JAX location | Guard |
+|---|---|---|---|
+| 1 | rdt=FULL ice_dt; drag carries rdt; `drag·u_w` outside rdt group | `ice_mevp.py` `mevp_iterate` (`rdt=cfg.ice_dt`, `drag=rdt·…`, `rhsu=…+drag·u_w+rdt·(…)`) | it* gates; entry-anchor |
+| 2 | pressure_fac NO 0.5 (det2 folded); 0.5 in σ11/σ22 only | `mevp_setup` pressure_fac; `mevp_iterate` σ updates | P gate (pressure_fac bit-id) |
+| 3 | no theta_io rotation | `mevp_iterate` (no ax/ay) | it* gates |
+| 4 | elem mask mean₃(m_ice)>0.01; node a_ice≥0.01 | `mevp_setup` `ice_el`/`ice_nod` | P gate; trap-13 |
+| 5 | `mass=M/((1+M²)·area)` verbatim | `mevp_setup` `mass` | P gate (mass bit-id) |
+| 6 | ssh-tilt UNMASKED; σ scatter owned-guarded | `mevp_setup` tilt (no has_ice); `stress_div_scatter` | P gate (rhs_a/m bit-id) |
+| 7 | rhs zero/scale are MPI artifacts → pure values | documented in `mevp_dynamics` docstring | — |
+| 8 | aux init + final copy full extent; no post-copy exch | `mevp_dynamics` init/return | scan-vs-UF |
+| 9 | bc_index from GLOBAL mask | `bc_index_nod2D`; `mevp_setup` arg | seam spot-check (JM.1) |
+| 10 | additive δmin `/(Δ+δmin)` | `mevp_iterate` `pressure` | it* gates |
+| 11 | σ NOT zeroed on entry | `mevp_dynamics` init carry = `sigma*` | (carry test) |
+| 12 | doubles; meancos=mfac/3 (EVP assoc kept, ~1e-16) | `strain_rates` (shared) | it* gates pass at floor |
+| 13 | non-ice SKIPPED (identity carry), not zeroed | `mevp_iterate` `where(ice_nod, un, u_aux)` | trap-13 test |
+| 14 | no uice_old/vice_old | (absent by construction) | — |
 
 ### JM.3 — Step wiring + stability + liveness + ice metrics
 

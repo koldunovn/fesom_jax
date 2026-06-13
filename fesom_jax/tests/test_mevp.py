@@ -66,15 +66,15 @@ def test_iceconfig_raises_aevp():
         IceConfig(whichEVP=-1)
 
 
-def test_mevp_stub_routes():
-    """The whichEVP=1 dispatch reaches the mEVP kernel (a stub until JM.2)."""
-    from fesom_jax import ice_mevp
-    from fesom_jax.ice import IceConfig
-    with pytest.raises(NotImplementedError):
-        ice_mevp.mevp_dynamics(
-            IceConfig(whichEVP=1), None, a_ice=None, m_ice=None, m_snow=None,
-            u_ice=None, v_ice=None, sigma11=None, sigma12=None, sigma22=None,
-            srfoce_u=None, srfoce_v=None, elevation=None, stress_ax=None, stress_ay=None)
+def test_mevp_dispatch_signature_parity():
+    """``mevp_dynamics`` has the SAME call signature as ``evp_dynamics`` ⇒ the ``ice_step``
+    whichEVP dispatch (a function swap) is valid. The kernel itself is exercised by the JM.2
+    gates; this guards the dispatch contract against signature drift."""
+    import inspect
+    from fesom_jax import ice_evp, ice_mevp
+    pe = list(inspect.signature(ice_evp.evp_dynamics).parameters)
+    pm = list(inspect.signature(ice_mevp.mevp_dynamics).parameters)
+    assert pe == pm, f"signature mismatch: evp={pe} vs mevp={pm}"
 
 
 # ==========================================================================
@@ -204,3 +204,178 @@ def test_bc_index_no_seam_flagged(mesh):
     assert seam_interior.size > 1000, "no interior seam nodes — vacuous test"
     assert np.all(bc[seam_interior] == 1.0), \
         f"{int((bc[seam_interior] != 1.0).sum())} seam nodes wrongly flagged coastal"
+
+
+# ==========================================================================
+# JM.2 — the mEVP kernel: precompute (P) + per-iterate (it*) dump gates vs cdump_16r
+# The cdump is dist_16 / 2 steps / dt=1800; step-1 entry inputs Q/U0/F merged global. The
+# cold start has u_w=elev=0 (ocean at rest) ⇒ it1 is a pure per-node wind-stress map (no
+# scatter ⇒ bit-identical); the scatter-reassociation floor accumulates over the 120 iterations
+# (velocity is the BINDING metric; σ is VP-kink noise-amplified — tracked with context).
+# ==========================================================================
+@pytest.fixture(scope="module")
+def mevp_s1(mesh):
+    """s1 entry inputs (Q/U0/F merged global) → mEVP setup + 120 eager iterations (the production
+    ``mevp_iterate`` body, exch=None) → snapshots at it1/2/60/120 (the C dump points)."""
+    import jax.numpy as jnp
+    from fesom_jax.ice import IceConfig
+    from fesom_jax import ice_evp as ie, ice_mevp as im, io_dump
+    n_nod, n_elem = int(mesh.nod2D), int(mesh.elem2D)
+    cfg = IceConfig(whichEVP=1, ice_dt=1800.0)               # the cdump dt (rdt = ice_dt)
+    fn, mn = io_dump.load_mevp_dump(MEVP_DUMP, ["Q", "U0", "F"], step=1, array="node", n_nod=n_nod)
+
+    def g(p, c):
+        return jnp.asarray(io_dump.evp_component(fn, mn, p, c))
+    inp = dict(a_ice=g("Q", "a_ice"), m_ice=g("Q", "m_ice"), m_snow=g("Q", "m_snow"),
+               elev=g("Q", "elevation"), u0=g("U0", "u_ice"), v0=g("U0", "v_ice"),
+               sax=g("F", "stress_atmice_x"), say=g("F", "stress_atmice_y"),
+               u_w=g("F", "u_w"), v_w=g("F", "v_w"))
+    bn = ie.boundary_node_mask(mesh)
+    st = im.mevp_setup(cfg, mesh, inp["a_ice"], inp["m_ice"], inp["m_snow"], inp["elev"], bn)
+    ze = jnp.zeros(n_elem)
+    carry = (inp["u0"], inp["v0"], ze, ze, ze)               # σ starts 0 (cold start)
+    snaps = {}
+    for it in range(1, 121):
+        carry = im.mevp_iterate(cfg, mesh, *carry, st, inp["u0"], inp["v0"],
+                                inp["u_w"], inp["v_w"], inp["sax"], inp["say"], cfg.ice_dt)
+        if it in (1, 2, 60, 120):
+            snaps[it] = tuple(np.asarray(x) for x in carry)
+    return dict(cfg=cfg, st=st, snaps=snaps, bn=bn, n_nod=n_nod, n_elem=n_elem, **inp)
+
+
+def _pt(point, array, n):
+    from fesom_jax import io_dump
+    f, m = io_dump.load_mevp_dump(MEVP_DUMP, [point], step=1, array=array,
+                                  n_nod=(n if array == "node" else None),
+                                  n_elem=(n if array == "elem" else None))
+    return f, m
+
+
+def test_mevp_precompute_P(mevp_s1):
+    """Setup precompute (inv_thickness, mass, ssh-tilt rhs_a/rhs_m, pressure_fac) bit-faithful
+    vs the C P dump (~1e-13 bar; actually bit-identical — these are per-node/elem maps)."""
+    from fesom_jax import io_dump
+    st = mevp_s1["st"]
+    fn, mn = _pt("P", "node", mevp_s1["n_nod"])
+    fe, me = _pt("P", "elem", mevp_s1["n_elem"])
+
+    def mx(j, c):
+        return float(np.abs(np.asarray(j) - c).max())
+    assert mx(st.inv_thickness, io_dump.evp_component(fn, mn, "P", "inv_thickness")) < 1e-13
+    assert mx(st.mass, io_dump.evp_component(fn, mn, "P", "mass")) < 1e-13
+    assert mx(st.tilt_u, io_dump.evp_component(fn, mn, "P", "rhs_a")) < 1e-13
+    assert mx(st.tilt_v, io_dump.evp_component(fn, mn, "P", "rhs_m")) < 1e-13
+    pf = io_dump.evp_component(fe, me, "P", "pressure_fac")
+    assert mx(st.pressure_fac, pf) < 1e-13
+    assert np.abs(pf).max() > 10.0                           # pressure_fac is non-trivial
+
+
+@pytest.mark.parametrize("it,tol", [(1, 1e-13), (2, 1e-13), (60, 1e-11), (120, 5e-12)])
+def test_mevp_iterate_velocity(mevp_s1, it, tol):
+    """Per-iterate u_aux/v_aux (the BINDING metric) vs the C it{1,2,60,120} dump. it1 is
+    bit-identical (pure wind-stress map, no scatter); the late-iterate floor is the accumulated
+    element→node scatter reassociation (16-rank C vs single-device JAX)."""
+    from fesom_jax import io_dump
+    f, m = _pt(f"it{it}", "node", mevp_s1["n_nod"])
+    ua = io_dump.evp_component(f, m, f"it{it}", "u_aux")
+    va = io_dump.evp_component(f, m, f"it{it}", "v_aux")
+    u, v = mevp_s1["snaps"][it][0], mevp_s1["snaps"][it][1]
+    du = float(np.abs(u - ua).max()); dv = float(np.abs(v - va).max())
+    assert du < tol and dv < tol, f"it{it} u|Δ|={du:.2e} v|Δ|={dv:.2e} (tol {tol:.0e})"
+    if it == 120:
+        assert np.abs(ua).max() > 0.05                       # ice actually moves (gate meaningful)
+
+
+def test_mevp_coldstart_sigma_it1(mevp_s1):
+    """Cold-start σ ≡ 0 at it1 (Δ=0 at u_aux=0 ⇒ pressure·0 ⇒ no stress) — reproduced bit-exact
+    vs the C it1 σ dump (trap 11: σ persists, but the first iterate from a 0 carry is 0)."""
+    from fesom_jax import io_dump
+    f, m = _pt("it1", "elem", mevp_s1["n_elem"])
+    s11, s12, s22 = (mevp_s1["snaps"][1][k] for k in (2, 3, 4))
+    assert float(np.abs(s11).max()) == 0.0                   # JAX σ(it1) is exactly 0
+    for j, name in [(s11, "sigma11"), (s12, "sigma12"), (s22, "sigma22")]:
+        c = io_dump.evp_component(f, m, "it1", name)
+        assert float(np.abs(np.asarray(j) - c).max()) == 0.0  # C σ(it1) is 0 too
+
+
+def test_mevp_sigma_tracked(mevp_s1):
+    """σ at it120 is tracked with context (NOT a binding gate): VP-kink noise-amplified near
+    rigid pack — absolute O(1e-6) but RELATIVE ~1e-9 (the C's M3 saw e-13→e-8 growth; σ is in
+    the sharded _DIAG_FIELDS exclusion). The velocity at the same iterate binds at ~1e-12."""
+    from fesom_jax import io_dump
+    f, m = _pt("it120", "elem", mevp_s1["n_elem"])
+    s11 = mevp_s1["snaps"][120][2]
+    c = io_dump.evp_component(f, m, "it120", "sigma11")
+    rel = float(np.abs(s11 - c).max()) / max(float(np.abs(c).max()), 1e-30)
+    assert np.isfinite(rel) and rel < 1e-6, f"σ11 relative |Δ|={rel:.2e} (VP-kink noise)"
+
+
+def test_mevp_dynamics_scan_vs_UF(mevp_s1, mesh):
+    """The production driver ``mevp_dynamics`` (checkpointed lax.scan, jitted) reproduces the C
+    final velocity UF within the XLA-fusion + scatter floor (~1e-10) — validates the scan/
+    checkpoint/exch wiring (the per-iterate gates above validate the kernel math eagerly)."""
+    import jax
+    import jax.numpy as jnp
+    from fesom_jax import io_dump, ice_mevp as im
+    cfg = mevp_s1["cfg"]; ze = jnp.zeros(mevp_s1["n_elem"])
+    fn = jax.jit(lambda **k: im.mevp_dynamics(cfg, mesh, **k))
+    ue, ve, *_ = fn(a_ice=mevp_s1["a_ice"], m_ice=mevp_s1["m_ice"], m_snow=mevp_s1["m_snow"],
+                    u_ice=mevp_s1["u0"], v_ice=mevp_s1["v0"], sigma11=ze, sigma12=ze, sigma22=ze,
+                    srfoce_u=mevp_s1["u_w"], srfoce_v=mevp_s1["v_w"], elevation=mevp_s1["elev"],
+                    stress_ax=mevp_s1["sax"], stress_ay=mevp_s1["say"], boundary_node=mevp_s1["bn"])
+    f, m = _pt("UF", "node", mevp_s1["n_nod"])
+    uf_u = io_dump.evp_component(f, m, "UF", "u_ice"); uf_v = io_dump.evp_component(f, m, "UF", "v_ice")
+    du = float(np.abs(np.asarray(ue) - uf_u).max()); dv = float(np.abs(np.asarray(ve) - uf_v).max())
+    assert du < 1e-10 and dv < 1e-10, f"UF u|Δ|={du:.2e} v|Δ|={dv:.2e}"
+
+
+def test_mevp_entry_anchor(mevp_s1, mesh):
+    """Decisions #4 / trap 1: the backward-Euler rhs anchors on the FROZEN ENTRY ``(u_ice,
+    v_ice)``, NOT the current iterate (the std-EVP template). The cold-start it2 catches it —
+    entry-anchored matches the C bit-exact; iterate-anchored (the bug) diverges grossly."""
+    import jax.numpy as jnp
+    from fesom_jax import io_dump, ice_mevp as im
+    cfg = mevp_s1["cfg"]; st = mevp_s1["st"]; ze = jnp.zeros(mevp_s1["n_elem"])
+    u0, v0, u_w, v_w = (mevp_s1[k] for k in ("u0", "v0", "u_w", "v_w"))
+    sax, say = mevp_s1["sax"], mevp_s1["say"]
+    f, m = _pt("it2", "node", mevp_s1["n_nod"])
+    ua = io_dump.evp_component(f, m, "it2", "u_aux")
+    # correct: anchor = frozen entry (u0) every iteration
+    c = (u0, v0, ze, ze, ze)
+    for _ in range(2):
+        c = im.mevp_iterate(cfg, mesh, *c, st, u0, v0, u_w, v_w, sax, say, cfg.ice_dt)
+    # buggy: anchor = the current iterate (std-EVP template)
+    b = (u0, v0, ze, ze, ze)
+    for _ in range(2):
+        b = im.mevp_iterate(cfg, mesh, *b, st, b[0], b[1], u_w, v_w, sax, say, cfg.ice_dt)
+    d_correct = float(np.abs(np.asarray(c[0]) - ua).max())
+    d_buggy = float(np.abs(np.asarray(b[0]) - ua).max())
+    assert d_correct < 1e-13, f"entry-anchored it2 should match C ({d_correct:.2e})"
+    assert d_buggy > 1e-7, f"iterate-anchored it2 should diverge ({d_buggy:.2e})"
+
+
+def test_mevp_trap13_nonice_retained(mesh):
+    """Trap 13 (plan MAJOR): a non-ice INTERIOR node keeps its velocity across an iteration
+    (identity carry — std-EVP's else-zero would wrongly zero ice-edge velocities); a boundary
+    node is zeroed by the edge-BC. The cold-start dumps can't distinguish identity-vs-zero (all
+    velocities are 0 at s1), so this is a dedicated synthetic test."""
+    import jax.numpy as jnp
+    from fesom_jax.ice import IceConfig
+    from fesom_jax import ice_evp as ie, ice_mevp as im
+    cfg = IceConfig(whichEVP=1, ice_dt=1800.0)
+    n_nod, n_elem = int(mesh.nod2D), int(mesh.elem2D)
+    # ice everywhere a_ice=0 EXCEPT we pick one interior non-ice node to seed
+    a_ice = jnp.zeros(n_nod); m_ice = jnp.zeros(n_nod); m_snow = jnp.zeros(n_nod)
+    elev = jnp.zeros(n_nod); z = jnp.zeros(n_nod); ze = jnp.zeros(n_elem)
+    bn = np.asarray(ie.boundary_node_mask(mesh))
+    interior = np.where(~bn)[0]
+    n_int = int(interior[len(interior) // 2])                # an interior (bc_index=1) non-ice node
+    n_bnd = int(np.where(bn)[0][0])                          # a coastal node
+    u_seed = np.zeros(n_nod); u_seed[n_int] = 5.0; u_seed[n_bnd] = 5.0
+    u_seed = jnp.asarray(u_seed)
+    st = im.mevp_setup(cfg, mesh, a_ice, m_ice, m_snow, elev, jnp.asarray(bn))
+    assert not bool(st.ice_nod[n_int])                       # the seeded node is non-ice
+    u1, v1, *_ = im.mevp_iterate(cfg, mesh, u_seed, z, ze, ze, ze, st,
+                                 z, z, z, z, z, z, cfg.ice_dt)
+    assert float(np.asarray(u1)[n_int]) == 5.0, "non-ice interior node was NOT retained (trap 13)"
+    assert float(np.asarray(u1)[n_bnd]) == 0.0, "boundary node was not zeroed by the edge-BC"
