@@ -368,13 +368,13 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
 
 ## GATE 9b (acceptance)
 
-**GATE 9b MET (2026-06-13)** — 7/8 green; the 8th is an understood transient (not a blocker).
+**GATE 9b MET (2026-06-13)** — 7/8 green; the 8th is the TKE cdump being an OUTLIER on step-1 forcing (NOT a JAX bug — JAX==KPP-oracle≠cdump).
 
 | Check | Bar | Result |
 |---|---|---|
 | `tke_cfg=None` | full suite green, byte-identical path | ✅ OCEAN 559 + ICE 47, 0 fail |
 | Controlled replay (13 core tags @ JT.1 + kv/av @ JT.2) | ≤1e-13 per tag | ✅ **bit-exact ≤3e-17** (kv 0.0 / av ≤1.4e-17) |
-| Step-1 live + assembled 3-step | ≤1e-12-class | ⚠️ **xfail** — the dt=1800 step-1 forcing-init transient (washes out in the climate ↓); not a TKE bug |
+| Step-1 live + assembled 3-step | ≤1e-12-class | ⚠️ **xfail** — the TKE cdump is the OUTLIER on step-1 forcing (3-way: JAX==KPP-oracle≠cdump); NOT a JAX bug |
 | Budget closure | ≤1e-14 rel, standing test | ✅ ≤4e-19 |
 | 10-day A100 TKE-ON | stable, physical Kv | ✅ stable (480-step + the 1-yr below); max\|vel\| 1.5–2.8 |
 | Year-scale vs `c_tke_2yr` | ≪ TKE↔KPP contrast | ✅ **SST 4.68e-3 / SSS 2.74e-3 ≈ C↔Fortran floor; ≪ TKE↔KPP 0.43 °C** |

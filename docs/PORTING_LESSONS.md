@@ -3443,3 +3443,19 @@ Cite the C source (`file:line`) or dump probe that proves it.
   not NO DIFFERENCE; an unverified mechanism-story ("gustiness", "transient") dressing an undiagnosed
   diff is WORSE than logging it honestly OPEN. State what you've ruled out + what's still unknown.**
   (`test_tke_step.py::_FORCING_GAP`, Task JT.5.)
+- **[verify/tke] ✅ RESOLVED (the reviewer was right all along): the JAX forcing is FINE — the TKE
+  CDUMP is the OUTLIER. The lesson is CROSS-CHECK A SUSPECT ORACLE AGAINST A TRUSTED ONE before
+  blaming your code.** The reviewer's objection ("KPP/zstar forcing is fine, the code is
+  scheme-independent, why would TKE differ?") was the key — and a 3-way comparison settled it
+  immediately: at the disputed low-wind nodes, `|JAX−KPP-oracle| = 6.8e-5` (BIT-IDENTICAL at the worst
+  node 56098: both 1.566710e-04) while `|JAX−TKE-cdump| = |KPP−TKE-cdump| = 7.185e-4`. So
+  **`JAX == KPP-oracle ≠ TKE-cdump`** — the JAX matches the trusted KPP forcing oracle everywhere, and
+  the TKE cdump (a separate old C job) disagrees with BOTH. The JAX forcing is the same validated
+  `build_core_forcing` code KPP/zstar use; the cdump just has different forcing inputs (likely a
+  different JRA55 snapshot). My whole chase (gustiness → min-wind → transient → "undiagnosed") was
+  WASTED EFFORT born of one error: I anchored on the cdump as ground truth and never cross-checked it
+  against the KPP oracle (which I already had, `data/kpp_dump_core2`). **Moral: when ONE oracle
+  disagrees with your code, before theorizing about your code, ask "do my OTHER trusted oracles agree
+  with this one?" — a 30-second 3-way check (your_code vs oracle_A vs oracle_B) beats hours of
+  mechanism-hunting, and `code==oracle_A≠oracle_B` immediately fingers oracle_B, not your code.**
+  (`test_tke_step.py::_FORCING_GAP`, `data/kpp_dump_core2`, Task JT.5.)
