@@ -300,12 +300,20 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
 
 **Files:** Create: `scripts/core2_tke_grad_gate.{py,sbatch}`. Modify: `fesom_jax/tests/test_gradient.py`.
 
-- [ ] FD↔AD plateau on `d(loss)/d(tke_c_k)` and `d(loss)/d(tke_cd)` (active-region loss; plateau
-      ≤1e-4; the `test_gradient.py:89-121` pattern)
-- [ ] masked-NaN probe: `d(SST)/d(T0)` finite everywhere, 0 on masked lanes, TKE-ON
-- [ ] `d(loss)/d(tke-IC)` finite through the N-step checkpointed scan (the carry path)
-- [ ] physical-sign sanity at defaults (e.g. d(mixed-layer Kv)/d(c_k) > 0)
-- [ ] full suite green
+- [x] **FD↔AD plateau** (`scripts/core2_tke_grad_gate.{py,sbatch}`, GPU job 25570878, n=4):
+      `d(mean ML Kv)/d(tke_c_k)` plateau **8.2e-8** + `d(mean surf tke)/d(tke_cd)` plateau **7.8e-9**
+      (both ≪1e-4) — the two ML-seam parameters, well-conditioned. (Params leaves ⇒ traced through
+      the full `integrate`, no static-cfg trick.)
+- [x] **masked-NaN** `d(mean SST)/d(T0)` TKE-ON: non-finite=0, wet max|g|=2.0e-4, **masked max|g|=0.0**.
+- [x] **`d(mean SST)/d(tke-IC)` finite** through the N-step checkpointed scan: non-finite=0, wet
+      max|g|=1.2e-3, **dry max|g|=0.0** — the new tke scan-carry path (`d_tri = tke_old + dt·forc` ⇒
+      the IC propagates linearly even at cold start). **`TKE_GRAD_GATE_OK`.**
+- [x] physical-sign sanity: `d(mean ML Kv)/d(tke_c_k) = +2.97e-2 > 0` (more c_k ⇒ more mixing ✓).
+- [~] ⚠️ GPU OOM fix banked: the script runs 4 separate full-`integrate` grads (vs KPP's 1) + TKE's
+      heavier backward (the tke carry + mxl/thomas scans) ⇒ `jax.clear_caches()` between gates frees
+      executables (lesson JT.4). The column-core + driver AD are also gated in pytest
+      (`test_column_grad_finite`, `test_mixing_tke_composition_and_grad`).
+- [ ] full suite green (regression) — no model change in JT.4 (the script is the deliverable)
 
 ### JT.5 — Stability + climate + sharded
 

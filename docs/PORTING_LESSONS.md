@@ -3370,3 +3370,24 @@ Cite the C source (`file:line`) or dump probe that proves it.
   DIFFERENT consumer (here C-vs-Fortran) compares its physics, not your forcing; isolate forcing
   mismatches with an IC-swap (IC-independent ⇒ it's the forcing config, not the IC).** (`test_tke_step.py`
   `_FORCING_GAP` xfail, Task JT.3.)
+
+## Phase 9b — classical-TKE vertical mixing (Task JT.4 — gradient gates, the ML seam)
+
+- **[AD/tke] The ML-seam parameter gradients are EXCELLENT (FD↔AD plateau ~1e-8); the only snag was
+  GPU MEMORY, not differentiability — a multi-gate grad script must `jax.clear_caches()` between
+  full-`integrate` backward passes.** TKE is the project's primary hybrid-ML hook, and the headline
+  result confirms the seam: `d(mean ML Kv)/d(tke_c_k)` = +2.97e-2 with a plateau of **8.2e-8**, and
+  `d(mean surf tke)/d(tke_cd)` plateau **7.8e-9** (both ≪1e-4) — both well-conditioned because the
+  tunables enter linearly where `tke>0` (`KappaM = c_k·mxl·√tke`, `forc = cd·|stress|^{3/2}`). The
+  masked-NaN `d(SST)/d(T0)` is clean (0 on masked lanes) and the new `tke` scan-carry path is finite
+  (`d_tri = tke_old + dt·forc` ⇒ the IC propagates linearly even at the cold-start `tke=0`, where the
+  safe-sqrt zeros the COEFFICIENT path but not the RHS). The trap: unlike the KPP gate (ONE full
+  `integrate` grad + a cheap replicated-chain param grad), TKE's tunables are `Params` leaves, so
+  ALL four gates trace the full `integrate` — and TKE's backward is heavier (the extra `tke` carry +
+  the two mxl `lax.scan`s + the thomas scan), so the 4 compiled grad executables blew the 40 GB A100
+  on the 2nd gate. `jax.clear_caches()` after each gate frees the executables; `n=2`–`4` is plenty
+  (step 1 spins `tke` up so `c_k` engages `KappaM` at step 2). **Moral: a script that grads several
+  losses through a big checkpointed model accumulates GPU executables — `clear_caches()` between them
+  (or one-gate-per-job); and when a tunable is a traced `Params` leaf rather than a static-cfg field,
+  every gate pays the full-model backward, not a cheap single-step chain.** (`scripts/core2_tke_grad_gate.{py,sbatch}`,
+  Task JT.4.)
