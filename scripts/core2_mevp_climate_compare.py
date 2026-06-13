@@ -114,6 +114,40 @@ def annual_compare(jax_dir, year):
     return 0 if ok else 1
 
 
+def all3_compare(jax_dir, c_dir, year):
+    """All-3 (zstar+TKE+mEVP) port fidelity: annual-mean surface SST/SSS RMS of JAX-all-3 vs the
+    C-all-3 oracle (`c_dir`). ⚠️ The combination is unvalidated vs Fortran (no all-3 Fortran
+    ground truth) — this proves **JAX reproduces the C port for the combination** (port fidelity),
+    NOT physical correctness. Reference: the single-option C↔Fortran floor is ~5.3e-3/2.5e-3
+    (SST/psu); a climate-close A_all3 in that ballpark ⇒ the JAX all-3 == the C all-3."""
+    y = year
+    jd, cd = Path(jax_dir), Path(c_dir)
+    out = {}
+    for var in ("sst", "sss"):
+        jf = jd / f"{var}.fesom.{y}.monthly.nc"
+        cf = cd / f"{var}.fesom.{y}.monthly.nc"
+        for f in (jf, cf):
+            if not f.is_file():
+                raise SystemExit(f"MISSING {f}  (both JAX-all-3 and C-all-3 runs must finish first)")
+        a = _annual_surface(jf, var); b = _annual_surface(cf, var)
+        mask = np.isfinite(a) & np.isfinite(b)
+        d = (a - b)[mask]
+        A = float(np.sqrt(np.mean(d * d))); bi = float(np.mean(d))
+        u = "°C" if var == "sst" else "psu"
+        print(f"[{var}] wet nodes={int(mask.sum())}  "
+              f"A_all3 = RMS(JAX-all3, C-all3) = {A:.4e} {u}  bias={bi:+.3e}  "
+              f"(single-option C↔Fortran floor ~{5.29e-3 if var=='sst' else 2.49e-3:.2e})")
+        out[var] = A
+    # climate-close ⇒ JAX reproduces the C all-3 (allow a few× the single-option floor — the
+    # combination compounds three options' reassociation, but should stay well under ~2e-2).
+    ok = out["sst"] < 2e-2 and out["sss"] < 1e-2
+    print(f"\n{'PASS' if ok else 'FAIL'}: JAX-all-3 {'reproduces' if ok else 'DIVERGES from'} "
+          f"the C-all-3 (SST {out['sst']:.3e}, SSS {out['sss']:.3e}) — port fidelity "
+          f"(NOT a physical-validation, the combination is unvalidated vs Fortran)")
+    print("ALL3_CLIMATE_COMPARE_" + ("OK" if ok else "FAIL"), flush=True)
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--npz", default=str(ROOT / "scripts" / "mevp_liveness_fields.npz"))
@@ -123,9 +157,14 @@ def main():
                          "(the C comparison; needs the year-1 climate run first)")
     ap.add_argument("--jax-dir", default=str(ROOT / "data" / "mevp_climate_1yr"))
     ap.add_argument("--year", type=int, default=1958)
+    ap.add_argument("--all3", action="store_true",
+                    help="all-3 (zstar+TKE+mEVP) JAX-vs-C-oracle port-fidelity RMS")
+    ap.add_argument("--c-dir", default="/work/ab0995/a270088/port/mevp/c_all3_1yr")
     args = ap.parse_args()
 
-    if args.annual:                                       # the year-scale C comparison
+    if args.all3:                                         # JAX-all-3 ↔ C-all-3 (port fidelity)
+        return all3_compare(args.jax_dir, args.c_dir, args.year)
+    if args.annual:                                       # the year-scale mEVP C comparison
         return annual_compare(args.jax_dir, args.year)
 
     from fesom_jax.mesh import load_mesh
