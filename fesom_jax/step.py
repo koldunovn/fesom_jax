@@ -36,7 +36,8 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from . import ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh, tracer_adv, tracer_diff
+from . import (ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh, tke,
+               tracer_adv, tracer_diff)
 from .config import DENSITY_0, DT_DEFAULT
 from .mesh import Mesh
 from .params import Params
@@ -51,7 +52,8 @@ S_FLOOR = 0.5
 def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
          *, dt: float = DT_DEFAULT, is_first_step: bool = False,
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
-         kpp_cfg=None, ale_cfg=None, halo_ctx=None, boundary_node=None) -> State:
+         kpp_cfg=None, tke_cfg=None, ale_cfg=None, halo_ctx=None,
+         boundary_node=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -95,6 +97,19 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     does → ``Kv`` feeds the tracer vertical diffusion (still augmented by GM's K33 when
     ``gm_cfg`` is on) and ``Av`` the momentum viscosity. ``kpp_cfg=None`` ⇒ the existing PP
     branch, **byte-identical** (a dead branch — no trace).
+
+    **TKE (Phase 9b).** ``tke_cfg`` (a :class:`fesom_jax.tke.TkeConfig`, static/hashable —
+    the ``kpp_cfg`` precedent) selects the **classical-TKE** prognostic mixing closure in
+    place of PP/KPP at the mixing seam (substep 4): unlike PP/KPP/GM (all stateless), TKE
+    carries ``State.tke`` (interface-indexed turbulent kinetic energy) across steps — it
+    joins both ``State`` and the ``lax.scan`` carry. It emits the same ``(Kv, Av, uvnode)``
+    PP/KPP do PLUS the advanced ``tke_new`` (written via a conditional ``replace`` so the
+    ``None`` path never touches ``state.tke``). Like KPP it is a **forced-path feature**
+    (the surface flux ``cd·|stress|^{3/2}`` needs ``stress_node_surf``) so it raises on the
+    pi path, and it is an **error to set both ``kpp_cfg`` and ``tke_cfg``** (the C runs
+    exactly one mixing scheme per process — fail loudly). The trainable constants
+    ``tke_c_k``/``tke_c_eps``/``tke_cd``/``tke_alpha`` enter via ``params`` (the PRIMARY
+    ML-hook seam). ``tke_cfg=None`` ⇒ the KPP/PP branch, **byte-identical** (a dead branch).
 
     **zstar ALE (Phase 9a).** ``ale_cfg`` (an :class:`fesom_jax.ale.AleConfig`, static/hashable —
     the ``gm_cfg``/``kpp_cfg``/``ice_cfg`` precedent) selects the **zstar vertical coordinate**
@@ -204,11 +219,29 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     pgf_x = _exch(pgf_x, "elem")
     pgf_y = _exch(pgf_y, "elem")
 
-    # 4 — vertical mixing. kpp_cfg ⇒ KPP (the real CORE2 default); else PP (k_ver/a_ver
-    #     are the ML-hook seam). Both emit (Kv, Av, uvnode) post-mo_convect (the shared
-    #     convective adjustment, fesom_step.c:264) ⇒ KPP is a drop-in. KPP is a forced-path
-    #     feature (needs ustar/Bo) ⇒ it requires CORE2 surface forcing (locked decision 7).
-    if kpp_cfg is not None:
+    # 4 — vertical mixing. 3-way: tke_cfg ⇒ classical-TKE (the PROGNOSTIC closure, Phase 9b);
+    #     elif kpp_cfg ⇒ KPP (the real CORE2 default); else PP (k_ver/a_ver are the ML-hook
+    #     seam). All emit (Kv, Av, uvnode) post-mo_convect (the shared convective adjustment,
+    #     fesom_step.c:264) ⇒ a drop-in; TKE additionally returns tke_new. KPP & TKE are
+    #     forced-path features (need ustar/Bo resp. |stress|) ⇒ they require CORE2 surface
+    #     forcing (locked decision 7); and the C runs ONE scheme per process ⇒ both-set is an
+    #     error. tke_new=None on the non-TKE branches (the conditional replace below skips it).
+    tke_new = None
+    if tke_cfg is not None:
+        if kpp_cfg is not None:
+            raise ValueError(
+                "kpp_cfg and tke_cfg are both set — the C runs exactly one mixing scheme "
+                "per process (KPP xor TKE). Pass only one of them.")
+        tke_cfg.validate()                       # the C fesom_tke_alloc:247-253 abort parity
+        if stress_node_surf is None:
+            raise ValueError(
+                "TKE (tke_cfg) requires CORE2 surface forcing (step_forcing): the surface "
+                "flux cd·|stress_node_surf|^{3/2} needs the ice-blended nodal wind stress. "
+                "The pi analytical path has no surface forcing — keep tke_cfg=None there.")
+        Kv, Av, uvnode, tke_new = tke.mixing_tke(
+            mesh, st.uv, bvfreq, st.tke, stress_node_surf, st.hnode, tke_cfg, params,
+            exch=_exch, Z3d=Z3d_live, zbar3=zbar3_live)
+    elif kpp_cfg is not None:
         if heat_flux is None:
             raise ValueError(
                 "KPP (kpp_cfg) requires CORE2 surface forcing (step_forcing): it needs "
@@ -379,6 +412,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         density=density, hpressure=hpressure, bvfreq=bvfreq, Kv=Kv, Av=Av,
         pgf_x=pgf_x, pgf_y=pgf_y,
     )
+    # Phase 9b: carry the advanced prognostic TKE (a conditional replace keyed on the cfg —
+    # the ice precedent — so the tke_cfg=None path never touches state.tke ⇒ byte-identical).
+    if tke_cfg is not None:
+        new = dataclasses.replace(new, tke=tke_new)
     # Phase 6: carry the updated prognostic ice state (the ice step ran before the ocean step).
     if ice_out is not None:
         new = dataclasses.replace(
@@ -393,13 +430,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 # are static (the latter ⇒ two compiled variants: the step-1 AB2 branch and the rest).
 step_jit = jax.jit(step,
                    static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg", "kpp_cfg",
-                                    "ale_cfg"))
+                                    "tke_cfg", "ale_cfg"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         params: Params = None, *, dt: float = DT_DEFAULT,
         step_forcings=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
-        kpp_cfg=None, ale_cfg=None) -> State:
+        kpp_cfg=None, tke_cfg=None, ale_cfg=None) -> State:
     """Run ``n_steps`` jitted forward steps from ``state`` (a plain Python loop;
     Phase 3 adds :func:`fesom_jax.integrate.integrate`, a checkpointed ``lax.scan``,
     for the differentiable path). ``is_first_step`` is set on the first iteration
@@ -413,5 +450,5 @@ def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         state = step_jit(state, mesh, op, stress_surf, params, dt=dt,
                          is_first_step=(i == 0), step_forcing=sf,
                          forcing_static=forcing_static, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
-                         kpp_cfg=kpp_cfg, ale_cfg=ale_cfg)
+                         kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg)
     return state

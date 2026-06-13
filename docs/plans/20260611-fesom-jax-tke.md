@@ -6,7 +6,8 @@
 9a → **9b** → 9c, but **TKE has NO hard zstar dependency**: the C validated TKE under **linfs**
 (deliberately, to isolate the mixing knob), and TKE reads geometry through per-node arrays that are
 simply static under linfs. If 9b runs before 9a, the only obligation is JT.2's geometry-seam rule.
-**Created:** 2026-06-11. **Status:** ☐ NOT STARTED.
+**Created:** 2026-06-11. **Status:** 🚧 IN PROGRESS — **JT.0 GATE met 2026-06-13** (`tke_cfg=None`
+byte-identical: OCEAN 550 + ICE 47 pass; sharded `tke` N-vs-1 confirmed). Next: JT.1 column core.
 
 **Why TKE matters most for this project:** TKE is the **primary hybrid-ML seam** — a prognostic
 1-equation mixing closure whose constants (`c_k`, `c_eps`, `cd`, `alpha_tke`) are exactly the kind of
@@ -202,17 +203,34 @@ Modify: `fesom_jax/state.py`, `fesom_jax/step.py`, `fesom_jax/integrate.py`,
 `fesom_jax/integrate_sharded.py`, `fesom_jax/io_dump.py`, `fesom_jax/zarr_output.py`,
 `fesom_jax/params.py`, `fesom_jax/tests/test_state.py`.
 
-- [ ] `TkeConfig` (with un-ported-option raises) + 3-way dispatch skeleton (raise if kpp+tke) +
-      threading + static_argnames
-- [ ] `State.tke` + the 9-point checklist (incl. `test_state` tripwire updates, zarr field)
-- [ ] `Params` + `tke_c_k/tke_c_eps/tke_cd/tke_alpha` (default_factory; defaults == config constants;
-      ⚠️ also update `register_dataclass` data_fields `params.py:76` AND `Params.defaults()`
-      `params.py:67-72`)
-- [ ] `TKE_TAGS` (20 tags) on the shared `read_gid_table` (hoist it from JZ.0 if 9b runs first);
-      audit `/work/ab0995/a270088/port/tke/{cdump,replay}`; regeneration job documented if stale
-- [ ] tests: None ⇒ bit-identical step; reader round-trip; `pytest.raises` on un-ported `TkeConfig`
-      combos (Dirichlet / `mxl_choice≠2` / IDEMIX — the `fesom_tke_alloc:247-253` parity); updated
-      suite green
+- [x] `TkeConfig` (with un-ported-option raises) + 3-way dispatch skeleton (raise if kpp+tke) +
+      threading + static_argnames — `tke.py` `TkeConfig.validate` (IDEMIX/Langmuir/Dirichlet/
+      mxl_choice≠2), `step.py` 3-way (tke→kpp→pp; both-set + pi-path raises), threaded through
+      step/run/integrate/integrate_sharded + static_argnames; `integrate_sharded` closes over cfg.
+- [x] `State.tke` + the 9-point checklist — state.py decl+zeros (IC=0), conditional replace
+      (`step.py`, ice precedent), integrate + integrate_sharded threaded, partition_state/pytree
+      generic (no change), `zarr_output.DEFAULT_FIELDS += "tke"`, halo TWO FACTS documented near
+      `OCEAN_SCHEDULE` (field never exchanged; node-Av exch is internal to `mixing_tke`), ICs inherit
+      0, `test_state.py:_expected_shapes += tke`.
+- [x] `Params` + `tke_c_k/tke_c_eps/tke_cd/tke_alpha` (default_factory; defaults == config constants
+      `config.py:TKE_*`; ⚠️ also updated `register_dataclass` data_fields AND `Params.defaults()` —
+      8 leaves; verified `jax.tree_leaves` count + grad-visibility).
+- [x] `TKE_TAGS` (20 tags) + `load_tke_dump` (multi-rank merge-by-gid, the `load_ale_dump` clone) on
+      the shared `read_gid_table`; cdump audited (16r × 20 tags × 3 steps = 960 files, nod2D=126858 /
+      elem2D=244659, clean strict merge); `replay/` is a C-internal nc artifact (NOT the JAX gate
+      input — the cdump's self-contained input+output bundle is). Oracles fresh (no regen needed).
+- [x] tests: `test_tke_replay.py` — None ⇒ pi step leaves `state.tke=0` (dead branch); reader
+      round-trip (3 steps); `pytest.raises` on un-ported `TkeConfig` combos + both-cfgs + pi-path;
+      Params defaults/leaves; mixing_tke stub raises. **16/16 pass; test_state 4/4.** Suite (job
+      25558155): **OCEAN 550 + ICE 47 passed, 0 fail** (byte-identity GREEN — incl. test_tke_replay,
+      the tripwire, test_partition_state's generic `tke` coverage). Sharded `tke` N-vs-1 confirmed
+      separately (job 25560355): `test_{local_mesh_reconstruction_serial,serial_sharded_step_matches_
+      dense,sharded_step_owned_matches[2]}` PASS — the generic State-field loops fold/partition/
+      reconstruct the new `tke` field correctly. (The full sharded suite hit the pre-existing
+      `[[sharded-suite-slow-phase8b]]` wall-time timeout in `test_gradient_sharded`, not a regression.)
+
+**GATE JT.0 met** — `tke_cfg=None` byte-identical; the cfg seam + State.tke + Params + reader are in.
+Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 core tags ≤1e-13).**
 
 ### JT.1 — Column core (`cvmix_tke.py`): the pure function, replay-gated
 

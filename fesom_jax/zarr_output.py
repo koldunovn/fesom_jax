@@ -26,8 +26,9 @@ import numpy as np
 import jax
 
 # Key prognostic fields a typical run wants on disk (override via ``fields=``).
+# ``tke`` (Phase 9b) is prognostic — written so a TKE run is restartable / analysable.
 DEFAULT_FIELDS = ("T", "S", "uv", "eta_n", "w",
-                  "a_ice", "m_ice", "m_snow", "u_ice", "v_ice")
+                  "a_ice", "m_ice", "m_snow", "u_ice", "v_ice", "tke")
 
 
 def _kind_of(lead: int, P: int, Lmax: dict) -> str:

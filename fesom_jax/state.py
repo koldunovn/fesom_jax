@@ -75,6 +75,14 @@ class State:
     pgf_x: jax.Array        # (elem2D,nl) pressure-gradient force x (layer)
     pgf_y: jax.Array        # (elem2D,nl) pressure-gradient force y (layer)
 
+    # --- TKE turbulent kinetic energy (Phase 9b, PROGNOSTIC) — g_cvmix_tke ---
+    # The ONE prognostic mixing field (KPP/PP/GM are stateless): the classical-TKE
+    # closure carries `tke` at interfaces across steps, so it joins both State and the
+    # lax.scan carry. IC = 0 (cold start, fesom_tke_alloc calloc): the first TKE call
+    # floors the wet column to tke_min and emits Kv/Av ≈ 0 — the exact C mirror. Stays
+    # 0 forever outside the wet slice (masked-inert). Unused while tke_cfg is None.
+    tke: jax.Array          # (nod2D,nl) turbulent kinetic energy (interface)
+
     # --- sea ice (Phase 6, surface-only 2-D) — fesom_ice ---
     # Prognostic ice state carried across steps. All default-zero ⇒ the ocean-only
     # (pi / Phase-5 no-ice) path is bit-identical (nothing reads these until Phase 6).
@@ -113,6 +121,7 @@ class State:
             hnode=Z(n, nl), hnode_new=Z(n, nl), helem=Z(e, nl), hbar=Z(n), hbar_old=Z(n),
             density=Z(n, nl), hpressure=Z(n, nl), bvfreq=Z(n, nl), Kv=Z(n, nl),
             Av=Z(e, nl), pgf_x=Z(e, nl), pgf_y=Z(e, nl),
+            tke=Z(n, nl),
             a_ice=Z(n), m_ice=Z(n), m_snow=Z(n), u_ice=Z(n), v_ice=Z(n), t_skin=Z(n),
             sigma11=Z(e), sigma12=Z(e), sigma22=Z(e),
         )

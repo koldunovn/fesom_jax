@@ -466,6 +466,128 @@ def ale_component(fields: dict, tag: str, name: str) -> np.ndarray:
     return fields[tag][:, spec.comps.index(name)]
 
 
+# ---------------------------------------------------------------------------
+# TKE reference dumps (Phase 9b) — the C ``fesom_tke.c`` harness (env
+# ``FESOM_TKE_DUMP_DIR`` / ``FESOM_TKE_DUMP_STEPS``) writes the SAME gid-keyed text format
+# as KPP/ALE, **multi-rank**: each rank dumps only its OWNED rows (``myDim_nod2D`` /
+# ``myDim_elem2D``, keyed by ``myList_*``). 20 tags per step: 5 column inputs + 3
+# column-core outputs + 10 budget/aux diagnostics + 2 driver-wired final fields. Node
+# partitions are disjoint (union = 1..nod2D); ``av`` is the only element tag (boundary-ring
+# overlap is bit-identical). The replay/cdump oracle is the **16-rank linfs** set (3 steps,
+# dt=1800) — use ``data/ic_core2_dist16``; the climate oracle ``c_tke_2yr`` is 864-rank — use
+# ``data/ic_core2_dist864`` (IC-partition provenance is per-oracle, [[zstar-forcing-dump-config-gap]]).
+# Files: ``tke_dump_s<step>_<tag>_rank<R>.txt``. Reuses :func:`read_gid_table` + the ALE
+# merge-by-gid logic.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TkeTag:
+    """One TKE dump tag's layout (the source of truth = the C ``fesom_tke.c`` dump call).
+    ``entity`` selects the global size (node vs element); ``kind`` the level convention
+    (``"iface"`` = per-interface column ``ncomp == nl``; ``"scalar"`` = one per-node value);
+    ``role`` groups the tags for selective gating (the JT.1 column-core gate requests the 13
+    ``output``+``diag`` tags; ``input`` is the replay-injection set; ``wired`` are the
+    driver-level final ``Kv``/``Av`` ⇒ JT.2)."""
+
+    name: str
+    entity: str       # "nod" | "elem"
+    kind: str         # "iface" | "scalar"
+    role: str         # "input" | "output" | "diag" | "wired"
+
+
+# The 20 tags (`fesom_tke.c:456-509`). Column tags carry the full ``nl`` interfaces; the JAX
+# gate slices/masks to the wet column ``[ulevels-1, nlevels-1]``. The 3 outputs map to the
+# column core's returns: ``tke`` = tke_new, ``tkeav`` = KappaM, ``tkekv`` = KappaH.
+TKE_TAGS: dict[str, TkeTag] = {
+    # 5 column inputs (the controlled-replay injection set, fesom_tke.c:456-460)
+    "normstress": TkeTag("normstress", "nod", "scalar", "input"),  # |stress|/ρ₀ (forc_tke_surf)
+    "vshear2":    TkeTag("vshear2", "nod", "iface", "input"),      # Ssqr
+    "bvfreq2":    TkeTag("bvfreq2", "nod", "iface", "input"),      # Nsqr (smoothed)
+    "dztrr":      TkeTag("dztrr", "nod", "iface", "input"),        # dzt (hnode/2 end caps)
+    "tkeold":     TkeTag("tkeold", "nod", "iface", "input"),       # tke_old (the recurrent state)
+    # 3 column-core outputs (fesom_tke.c:461-463)
+    "tke":        TkeTag("tke", "nod", "iface", "output"),         # tke_new
+    "tkeav":      TkeTag("tkeav", "nod", "iface", "output"),       # KappaM
+    "tkekv":      TkeTag("tkekv", "nod", "iface", "output"),       # KappaH
+    # 10 budget/aux diagnostics (fesom_tke.c:465-474; only when diag_on)
+    "tbpr":       TkeTag("tbpr", "nod", "iface", "diag"),          # buoyancy production
+    "tspr":       TkeTag("tspr", "nod", "iface", "diag"),          # shear production
+    "tdif":       TkeTag("tdif", "nod", "iface", "diag"),          # vertical diffusion
+    "tdis":       TkeTag("tdis", "nod", "iface", "diag"),          # dissipation
+    "twin":       TkeTag("twin", "nod", "iface", "diag"),          # wind/surface input
+    "tiwf":       TkeTag("tiwf", "nod", "iface", "diag"),          # iw forcing (≡0, only_tke)
+    "tbck":       TkeTag("tbck", "nod", "iface", "diag"),          # background (floor) reset
+    "ttot":       TkeTag("ttot", "nod", "iface", "diag"),          # total tendency (closure Σ)
+    "lmix":       TkeTag("lmix", "nod", "iface", "diag"),          # mixing length mxl
+    "pr":         TkeTag("pr", "nod", "iface", "diag"),            # Prandtl number
+    # 2 driver-wired final fields (fesom_tke.c:508-509)
+    "kv":         TkeTag("kv", "nod", "iface", "wired"),           # aux->Kv (full-slab copy)
+    "av":         TkeTag("av", "elem", "iface", "wired"),          # aux->Av (node→elem mean)
+}
+
+
+def load_tke_dump(
+    dirpath: Union[str, Path], tags: Iterable[str] | None = None,
+    *, step: int = 1, n_nod: int | None = None, n_elem: int | None = None,
+    strict: bool = True,
+) -> tuple[dict, dict]:
+    """Read the multi-rank TKE dump for ``step``, merging ranks by gid — the
+    :func:`load_ale_dump` pattern for the ``tke_dump_s<step>_<tag>_rank*.txt`` set.
+
+    ``tags`` selects which to load (``None`` ⇒ every tag present for ``step``). Returns
+    ``(fields, meta)``: ``fields[tag]`` is ``float64[Nglobal, ncomp]`` in **JAX mesh index
+    order** (``out[gid-1] = row``), ``Nglobal`` = ``n_nod`` (node tags) / ``n_elem``
+    (element tags) or the max gid seen when those are ``None``. ``meta[tag]`` records
+    ``{N, ncomp, entity, kind, role, nranks}``. Gids never written stay ``NaN``; with
+    ``strict`` (default) a node tag missing any gid in ``1..N`` raises and overlapping
+    element rows are asserted bit-identical (the boundary-ring invariant)."""
+    d = Path(dirpath)
+    if tags is None:
+        present = set()
+        prefix = f"tke_dump_s{step}_"
+        for p in d.glob(f"{prefix}*_rank*.txt"):
+            present.add(p.name[len(prefix):].rsplit("_rank", 1)[0])
+        tags = sorted(present)
+    fields: dict = {}
+    meta: dict = {}
+    for tag in tags:
+        paths = sorted(d.glob(f"tke_dump_s{step}_{tag}_rank*.txt"),
+                       key=lambda p: int(p.name.rsplit("_rank", 1)[1].split(".")[0]))
+        if not paths:
+            raise FileNotFoundError(
+                f"TKE dump tag {tag!r} step {step} missing: {d}/tke_dump_s{step}_{tag}_rank*.txt")
+        chunks = [read_gid_table(p) for p in paths]
+        ncomp = chunks[0][2]["ncomp"]
+        spec = TKE_TAGS.get(tag)
+        entity = spec.entity if spec else None
+        gmax = max(int(g.max()) for g, _, _ in chunks)
+        Ng = (n_nod if entity == "nod" else n_elem if entity == "elem" else None) or gmax
+        out = np.full((Ng, ncomp), np.nan, np.float64)
+        seen = np.zeros(Ng, dtype=bool)
+        for g, v, hdr in chunks:
+            if hdr["ncomp"] != ncomp:
+                raise ValueError(f"TKE dump {tag}: rank {hdr['rank']} ncomp "
+                                 f"{hdr['ncomp']} != {ncomp}")
+            idx = g - 1
+            if strict:
+                dup = seen[idx]
+                if dup.any() and not np.array_equal(out[idx[dup]], v[dup]):
+                    raise ValueError(
+                        f"TKE dump {tag}: overlapping gids disagree across ranks "
+                        f"(stale-halo dump?) — expected the boundary-ring rows bit-identical")
+            out[idx] = v
+            seen[idx] = True
+        if strict and not seen.all():
+            raise ValueError(
+                f"TKE dump {tag}: {int((~seen).sum())} of {Ng} gids never written "
+                f"(incomplete rank set or wrong n_{entity})")
+        fields[tag] = out
+        meta[tag] = {"N": Ng, "ncomp": ncomp, "entity": entity,
+                     "kind": spec.kind if spec else None,
+                     "role": spec.role if spec else None, "nranks": len(paths)}
+    return fields, meta
+
+
 def _summary_main(argv: list[str]) -> int:  # pragma: no cover - debug CLI
     if not argv:
         print("usage: python -m fesom_jax.io_dump <dumpfile> [more...]")

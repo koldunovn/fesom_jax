@@ -72,6 +72,17 @@ C_D = 0.0025  # bottom-drag coefficient
 K_GM_MAX = 1000.0   # GM thickness-diffusivity ceiling (namelist K_GM_max)
 REDI_KMAX = 1000.0  # Redi isoneutral-diffusivity ceiling (auto-sync = K_GM_max)
 
+# CVMix classical-TKE tunable constants — the PRIMARY ML-hook seam (Phase 9b). The 4
+# differentiable `params.py` leaves (default = the namelist.cvmix reference values,
+# echo-verified in docs/tke_reference_namelists/PROVENANCE.md:43-58). The structural
+# switches (mxl_min/tke_min/kappaM_max/mxl_choice/…) stay static in `tke.TkeConfig`;
+# the Pr-law literal 6.6 stays a static double in `cvmix_tke.py` (TKE_C66). These are
+# exactly the constants Phase 7a tunes / Phase 7 NN-replaces (fesom_tke.c:227-241).
+TKE_C_K = 0.1      # mixing-length→KappaM coefficient c_k (KappaM = c_k·mxl·√tke)
+TKE_C_EPS = 0.7    # dissipation coefficient c_eps (Patankar quasi-implicit term)
+TKE_CD = 3.75      # surface-flux coefficient cd (namelist beats module default 1.0)
+TKE_ALPHA = 30.0   # TKE self-diffusivity multiplier alpha_tke (NOT in mxl)
+
 # Adams-Bashforth order for Coriolis (single-slot history — FRESH_START §14.4)
 AB_ORDER = 2
 

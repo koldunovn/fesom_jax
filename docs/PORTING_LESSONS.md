@@ -3245,3 +3245,46 @@ Cite the C source (`file:line`) or dump probe that proves it.
   the climate oracle (c_zstar_2yr=864r) were different decompositions, and an order-dependent IC fill
   makes each demand its own matched IC.** (`scripts/rebuild_ic_dist864.{py,sbatch}`,
   `scripts/core2_zstar_climate_compare.py`, Task JZ.8.)
+
+## Phase 9b — classical-TKE vertical mixing (Task JT.0 — scaffolding, NO behavior change)
+
+- **[seam/tke] TKE is the FIRST prognostic mixing scheme — the new-State-field checklist, not the
+  config-gate, is the load-bearing part of the scaffolding.** PP/KPP/GM are all stateless (Kv/Av
+  recomputed each step from T/S/N²); TKE carries `tke [nod2D, nl]` across steps, so it touches every
+  State-enumeration site at once. Adding the field is one line in `state.py`; keeping the
+  `tke_cfg=None` path byte-identical is the discipline: (a) the `zeros`/`rest`/PHC-IC default of 0 is
+  inherited for free (rest builds on zeros, ICs `replace` only T/S) — cold start needs NO extra
+  wiring; (b) the carry is written via a **conditional `dataclasses.replace(new, tke=tke_new)` keyed
+  on `tke_cfg is not None`** (the ice precedent) so the None path never touches `state.tke`; (c)
+  `partition_state` + the sharded field loops + the pytree registration are all GENERIC over
+  `dataclasses.fields(State)` ⇒ zero changes; (d) the deliberate `test_state.py:_expected_shapes`
+  tripwire is the guard that the inventory didn't silently drift. **Moral: for a new prognostic field,
+  the only hand-written sites are the declaration, the zeros entry, the conditional carry-replace, and
+  the test tripwire — everything else (IC, partition, pytree, zarr) is generic or default-inherited;
+  audit the checklist rather than trusting that "it's just one field".** (`state.py`, `step.py`,
+  `test_state.py`, Task JT.0.)
+- **[seam/tke] The mixing dispatch goes 3-way, and the two un-ported guards belong at DIFFERENT
+  layers.** `tke_cfg`'s structural-validity guard (IDEMIX/Langmuir/Dirichlet/mxl_choice≠2) is a
+  `TkeConfig.validate()` (the `AleConfig` parity — a `NamedTuple` can't override `__new__`, so the
+  C `fesom_tke_alloc:247-253` abort is a method called at the seam); the OPERATIONAL guards
+  (both-`kpp_cfg`-and-`tke_cfg`-set ⇒ "one scheme per process"; TKE on the pi path ⇒ no
+  `stress_node_surf`) live in `step.py` at the dispatch. Order matters: check `tke_cfg` first, and
+  inside it check `kpp_cfg`-also-set BEFORE the forcing guard, so "both set" wins over "no forcing"
+  (a both-set call on the pi path reports the real misconfiguration). The trainable constants
+  (`tke_c_k/c_eps/cd/alpha`) go in `Params` (the GM `k_gm` `default_factory` precedent — a deliberate
+  divergence from KPP's static-only constants, justified by TKE being the designated ML seam), which
+  means THREE edits move together: the dataclass field, `Params.defaults()`, AND the
+  `register_dataclass` `data_fields` — miss the last and the leaf silently drops out of `jax.grad`.
+  (`tke.py`, `params.py`, `step.py`, Task JT.0.)
+- **[oracle/tke] The cdump IS the replay gate; the `replay/` dir is a C-internal artifact, not a JAX
+  input.** The 16-rank `cdump/dump/` carries all 20 tags PER STEP — the 5 column inputs (normstress,
+  vshear2, bvfreq2, dztrr, tkeold) AND the 3 outputs + 10 diags + 2 wired (kv/av) — so the JAX column
+  gate (JT.1) reads the inputs and compares the outputs with NO live forcing in the loop. The
+  separate `replay/` dir is the C model run *with Fortran-injected inputs* (its outputs are .nc, used
+  to validate C-vs-Fortran) — irrelevant to the JAX port. The reader is the multi-rank merge-by-gid
+  (`load_tke_dump`, the `load_ale_dump` clone): 16 disjoint owned-node partitions reassemble to the
+  dense `[126858, nl]` global with no NaN (strict), `av` the one element tag (`[244659, nl]`,
+  boundary-ring overlap bit-identical). **Moral: confirm WHICH oracle dir is the gate input before
+  building the reader — "replay" named a C validation run, not the replay-injection set the JAX needs;
+  the cdump's self-contained input+output bundle is what makes controlled-replay a pure-algebra gate.**
+  (`io_dump.py` `TKE_TAGS`/`load_tke_dump`, `test_tke_replay.py`, Task JT.0.)

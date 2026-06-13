@@ -58,6 +58,15 @@ OCEAN_SCHEDULE: tuple[Exch, ...] = (
     Exch("4 mixing (pp/kpp)", "uvnode", "nod",  "post", "compute_vel_nodes row (oce_dyn.F90:225)"),
     Exch("4 mixing (pp/kpp)", "Kv",     "nod",  "post", "pp_mixing/mo_convect row"),
     Exch("4 mixing (pp/kpp)", "Av",     "elem", "post", "pp_mixing/mo_convect row"),
+    # TKE (Phase 9b) two distinct halo facts (NOT schedule rows):
+    #  (a) the `tke` FIELD is NEVER exchanged — each column is self-contained on owned
+    #      data (the C probe-verified no reader needs its halo, fesom_tke.c:11). Do NOT
+    #      add an Exch for it; the post row above refreshes Kv/Av as for pp/kpp.
+    #  (b) the node `tke_Av` IS exchanged INSIDE mixing_tke (via exch=) BEFORE the
+    #      node→elem 3-vertex Av mean — boundary owned elements have halo vertices
+    #      (fesom_tke.c:491; the kpp.py:787-789 internal-viscA precedent). That internal
+    #      exchange is a kernel detail, not a step-seam row; the final Av reuses the
+    #      "4 mixing" Av post row above.
     Exch("5 momentum.compute_vel_rhs", "uv_rhs",   "elem", "post", "compute_vel_rhs row"),
     Exch("5 momentum.compute_vel_rhs", "uv_rhsAB", "elem", "post", "compute_vel_rhs row"),
     # 6 visc_filt_bidiff is a FUSED bilaplacian: the C exchanges u_b/v_b mid-kernel,

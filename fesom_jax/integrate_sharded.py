@@ -260,7 +260,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      stress_p, *, dt: float, is_first_step: bool, npes: int,
                      wire_halo: bool = True, params=None, step_forcing=None,
                      forcing_static=None, ice_cfg=None, gm_cfg=None,
-                     kpp_cfg=None, ale_cfg=None, boundary_node_p=None,
+                     kpp_cfg=None, tke_cfg=None, ale_cfg=None, boundary_node_p=None,
                      use_ragged: bool = False) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
     return the ``[P, Lmax, …]`` next State.
@@ -312,7 +312,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
         return stepmod.step(s, m, o, stress, params, dt=dt,
                             is_first_step=is_first_step, step_forcing=sf_,
                             forcing_static=fs_, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
-                            kpp_cfg=kpp_cfg, ale_cfg=ale_cfg, halo_ctx=ctx,
+                            kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg, halo_ctx=ctx,
                             boundary_node=bn_)
 
     if not wire_halo:
@@ -347,7 +347,8 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
 
 def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       stress_p, n_steps: int, *, dt: float, npes: int, params=None,
-                      gm_cfg=None, kpp_cfg=None, ale_cfg=None, use_ragged: bool = False,
+                      gm_cfg=None, kpp_cfg=None, tke_cfg=None, ale_cfg=None,
+                      use_ragged: bool = False,
                       ice_cfg=None, step_forcing=None, forcing_static=None,
                       boundary_node_p=None, return_executable: bool = False):
     """Multi-step (S.7 part 3): step-1 eager (``is_first_step=True``) + ``lax.scan`` of steps
@@ -404,8 +405,8 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
         def one(carry, is_first):
             return stepmod.step(carry, m, o, stress, params, dt=dt, is_first_step=is_first,
                                 step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
-                                gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, ale_cfg=ale_cfg,
-                                halo_ctx=ctx, boundary_node=bn_)
+                                gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
+                                ale_cfg=ale_cfg, halo_ctx=ctx, boundary_node=bn_)
 
         st = one(s, True)                            # step 1 eager (AB2 first-step branch)
         if n_steps > 1:

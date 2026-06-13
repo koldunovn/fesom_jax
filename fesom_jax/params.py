@@ -32,6 +32,18 @@ Both GM leaves carry **defaults** (the config constants) so the Phase-2/3 two-fi
 construction ``Params(k_ver=…, a_ver=…)`` stays valid and numerically identical
 (when ``gm_cfg is None`` the GM leaves are simply unused → ``d/d(k_gm)=0``).
 
+Phase 9b adds the CVMix classical-TKE constants (the **PRIMARY ML-hook seam** — TKE is
+a prognostic mixing closure whose constants are exactly what Phase 7a tunes / Phase 7
+NN-replaces, so ``Params``-exposure is first-class, not an add-on):
+
+* ``tke_c_k`` — mixing-length→KappaM coefficient (``KappaM = c_k·mxl·√tke``);
+* ``tke_c_eps`` — dissipation coefficient (the Patankar quasi-implicit ``c_eps·√tke/mxl``);
+* ``tke_cd`` — surface-flux coefficient (Neumann BC ``cd·forc^{3/2}/dzt[0]``);
+* ``tke_alpha`` — TKE self-diffusivity multiplier (``ke = alpha·½(KappaM[k+1]+KappaM[k])``).
+
+Like the GM leaves they carry **defaults** so older constructions stay valid; when
+``tke_cfg is None`` they are unused → ``d/d(tke_c_k)=0``.
+
 :meth:`Params.defaults` reproduces the config constants exactly (so passing
 ``Params.defaults()`` is numerically identical to the un-parameterised path).
 """
@@ -44,7 +56,8 @@ import jax
 import jax.numpy as jnp
 from jax import tree_util
 
-from .config import A_VER, K_GM_MAX, K_VER, REDI_KMAX
+from .config import (A_VER, K_GM_MAX, K_VER, REDI_KMAX,
+                     TKE_ALPHA, TKE_C_EPS, TKE_C_K, TKE_CD)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,6 +72,16 @@ class Params:
         default_factory=lambda: jnp.asarray(K_GM_MAX, jnp.float64))
     redi_kmax: jax.Array = dataclasses.field(
         default_factory=lambda: jnp.asarray(REDI_KMAX, jnp.float64))
+    # CVMix classical-TKE constants (the PRIMARY ML-hook, Phase 9b). Defaults so the
+    # older constructions are unchanged; unused (→ d/d=0) when tke_cfg is None.
+    tke_c_k: jax.Array = dataclasses.field(
+        default_factory=lambda: jnp.asarray(TKE_C_K, jnp.float64))
+    tke_c_eps: jax.Array = dataclasses.field(
+        default_factory=lambda: jnp.asarray(TKE_C_EPS, jnp.float64))
+    tke_cd: jax.Array = dataclasses.field(
+        default_factory=lambda: jnp.asarray(TKE_CD, jnp.float64))
+    tke_alpha: jax.Array = dataclasses.field(
+        default_factory=lambda: jnp.asarray(TKE_ALPHA, jnp.float64))
 
     @staticmethod
     def defaults() -> "Params":
@@ -69,9 +92,16 @@ class Params:
             a_ver=jnp.asarray(A_VER, jnp.float64),
             k_gm=jnp.asarray(K_GM_MAX, jnp.float64),
             redi_kmax=jnp.asarray(REDI_KMAX, jnp.float64),
+            tke_c_k=jnp.asarray(TKE_C_K, jnp.float64),
+            tke_c_eps=jnp.asarray(TKE_C_EPS, jnp.float64),
+            tke_cd=jnp.asarray(TKE_CD, jnp.float64),
+            tke_alpha=jnp.asarray(TKE_ALPHA, jnp.float64),
         )
 
 
 tree_util.register_dataclass(
-    Params, data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax"], meta_fields=[]
+    Params,
+    data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
+                 "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha"],
+    meta_fields=[],
 )
