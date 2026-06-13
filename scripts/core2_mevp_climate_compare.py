@@ -54,11 +54,22 @@ def ice_metrics(aice, mice, area, wet):
     return ext, vol
 
 
-def _annual_surface(path, var):
-    """Annual-mean surface field (mean over the 12 monthly records), ``(nod2,)``."""
+def _n_records(path, var):
+    """Number of time records in a monthly file (12 = a complete year). Guards against averaging
+    a still-running run's PARTIAL output (a 10-month mean differs seasonally from a 12-month one)."""
     import netCDF4
     with netCDF4.Dataset(path) as d:
-        a = np.asarray(d.variables[var][:], dtype=np.float64)        # (12, nod2)
+        return int(d.variables[var].shape[0])
+
+
+def _annual_surface(path, var, require_full=True):
+    """Annual-mean surface field (mean over the 12 monthly records), ``(nod2,)``. With
+    ``require_full`` raises if the file has <12 records (an incomplete, still-running run)."""
+    import netCDF4
+    with netCDF4.Dataset(path) as d:
+        a = np.asarray(d.variables[var][:], dtype=np.float64)        # (n_rec, nod2)
+    if require_full and a.shape[0] < 12:
+        raise ValueError(f"{Path(path).name}: only {a.shape[0]}/12 months (run still in progress?)")
     a = np.ma.filled(a, np.nan) if np.ma.isMaskedArray(a) else a
     return np.nanmean(a, axis=0)
 
@@ -125,7 +136,8 @@ def all3_compare(jax_dir, c_dir, year, fortran_dir=None):
     y = year
     jd, cd = Path(jax_dir), Path(c_dir)
     fd = Path(fortran_dir) if fortran_dir else None
-    have_ftn = fd is not None and (fd / f"sst.fesom.{y}.nc").is_file()
+    have_ftn = (fd is not None and (fd / f"sst.fesom.{y}.nc").is_file()
+                and _n_records(fd / f"sst.fesom.{y}.nc", "sst") >= 12)   # full year only (not partial)
     out = {}
     for var in ("sst", "sss"):
         jf = jd / f"{var}.fesom.{y}.monthly.nc"
