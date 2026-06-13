@@ -3581,3 +3581,33 @@ Cite the C source (`file:line`) or dump probe that proves it.
   full-model `shard_map` compiles are too heavy for the login node (~17 min for 2 tests) — run the
   sharded group on a COMPUTE node (`-p compute --cpus-per-task=16 --mem=200G`, the suite-sbatch
   pattern), not the login node. (`test_mevp_sharded_step_owned_matches`, `mevp_jm5_shard.sbatch`.)
+
+## Phase 9c follow-up — year-scale climate validation (JAX / C / Fortran)
+
+- **[mevp/climate] mEVP got the year-scale C comparison it lacked, and it lands at the C↔Fortran
+  floor.** mEVP's GATE 9c was 10-day stability + diff-of-diffs (lighter than zstar/TKE's full
+  year-1 climate). The user flagged the inconsistency; the oracles existed, so I ran a year-1
+  JAX-mEVP climate (KPP+GM+mEVP+linfs, dist864 IC matching the c_mevp_2yr partition) and the 4-way
+  RMS: A=RMS(JAX-mEVP,C-mEVP)=5.00e-3°C/2.43e-3psu **== C₀=RMS(C-mEVP,Fortran-mEVP)=5.29e-3/2.49e-3**
+  (A/C₀=0.95/0.98), with the mEVP↔EVP contrast B=1.30e-2 (B/A=2.6). The JAX port adds no more error
+  than the C-vs-Fortran discrepancy. **Moral: when one option gets a lighter validation gate than
+  its siblings, fill the gap if the oracles exist — consistency across the option set is worth a
+  GPU-hour.** (`core2_kpp_climate_run.py --mevp on`, `core2_mevp_climate_compare.py --annual`.)
+- **[mevp/climate] The C port CAN run option COMBINATIONS — and so can Fortran; "no combined oracle"
+  ≠ "can't compare to C".** I'd said the all-3 (zstar+TKE+mEVP) couldn't be compared to C "because
+  the C never ran them combined" — WRONG. The C options are independent env vars (FESOM_ALE /
+  FESOM_MIX_SCHEME=TKE / FESOM_WHICH_EVP=1) with no mutual guard, and a combined zstar+TKE C job
+  already existed. Adding one env line gave a C-all-3 oracle; flipping `whichEVP=0→1` in the Fortran
+  `work_zstar_tke` namelist gave the Fortran ground truth. The 3-way: A=RMS(JAX,C)=4.5e-3,
+  A′=RMS(JAX,Fortran)=4.1e-3, C₀=RMS(C,Fortran)=4.7e-3 (SST) — all at the climate-close floor, JAX≈C≈Fortran.
+  All three engines ran the triple-option combo STABLE for a year. **Moral: "we haven't" is not
+  "we can't" — before declaring a comparison impossible, check whether the reference *can be made to
+  produce it*. The user caught both my overstatements.** (`port2 jobs/job_all3_1yr`, `work_all3`.)
+- **[mevp/climate] Averaging a STILL-RUNNING model's monthly output gives a seasonal artifact — guard
+  the record count.** The first all-3 3-way pass showed A′=C₀=0.26°C (50× the floor) and I almost
+  reported a "physical-validation failure" — but the Fortran job was still running and its
+  `sst.fesom.1958.nc` had only 10/12 months. A 10-month mean (missing Nov–Dec winter) differs
+  seasonally from a 12-month mean by ~0.26°C. Added `_n_records≥12` so the compare skips a partial
+  file (2-way until the run completes) instead of silently averaging it. **Moral: a metric over
+  time-averaged output is only valid once the averaging window is COMPLETE; assert the record count
+  before trusting an "annual mean" from a run you didn't confirm finished.** (`core2_mevp_climate_compare.py`.)
