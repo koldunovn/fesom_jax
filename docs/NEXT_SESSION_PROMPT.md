@@ -1,4 +1,21 @@
-# Next session — Phase 9b: TKE — finish JT.5 climate + JT.6 close-out (+ the forcing-gap fix)
+# Next session — Phase 9b: TKE — JT.6 close-out (GATE 9b MET)
+
+**GATE 9b MET 2026-06-13** (7/8 rows green; the 8th is an understood transient). The year-scale
+climate VALIDATED: JAX-TKE ↔ `c_tke_2yr` **SST RMS 4.68e-3 / SSS 2.74e-3 ≈ the C↔Fortran floor**
+(0.0049/0.0028) and ≪ the TKE↔KPP 0.43 °C contrast (`TKE_CLIMATE_OK`, job 25574435). This RESOLVED
+the forcing-gap question: the 7e-4 step-1 stress diff is a pure **transient that washes out** — NOT
+a bulk difference, NOT a blocker (a reviewer caught my over-reach; running the climate was the
+arbiter). So the only remaining `xfail` is the live-step-1 forward gate (`test_tke_step.py::_FORCING_GAP`),
+which is transient-sensitive by nature and does NOT gate the physics — leave it xfail, or as an
+OPTIONAL polish port the C TKE-branch's low-wind gustiness/min-wind bulk term behind a flag.
+
+**JT.6 — close-out (housekeeping):** GATE 9b table (replay ✓ / budget ✓ / gradients ✓ / sharded ✓
+/ stability ✓ / climate ✓ — all green; live-step-1 xfail documented as a transient); confirm the
+full suite green once more; move `docs/plans/20260611-fesom-jax-tke.md` → `completed/`; update the
+parent plan (`20260605-fesom-jax-port.md` Phase 9) + memory ([[fesom-jax-port]]); commit. TKE is the
+project's first FULLY-DIFFERENTIABLE prognostic mixing scheme — the primary hybrid-ML seam, done.
+
+--- (the pre-close-out detail, for reference) ---
 
 **JT.0 → JT.5 (most) DONE + committed 2026-06-13** (`d023f75` seam → `b67b3b6` column core →
 `60ed77d` driver → `776f3be` step wiring → `da670fa` gradient gates → `033826d` sharded+stability).
