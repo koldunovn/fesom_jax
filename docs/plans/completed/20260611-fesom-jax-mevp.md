@@ -380,3 +380,16 @@ tests in `test_mevp.py`.
   (ρᵢ·m_ice+ρₛ·m_snow, not /a_ice), reader base named (`read_kpp_table`, `io_dump.py:236`),
   NamedTuple-validation mechanism noted. Review verified all spot-checked traps (1, 10, 13, bc_index
   complement, det1/β numbers) against the C and the M0–M6 completeness.
+- **2026-06-13 — Phase 9c COMPLETE, GATE 9c MET (all 7 rows green; plan → `completed/`).** JM.0→JM.5
+  executed in one session. The kernel (`ice_mevp.py`) ported **bit-faithful on the first run** —
+  the 14-trap checklist did its job (zero debugging): precompute bit-identical, per-iterate velocity
+  {it1=0, it2=1e-19, it60=1.8e-16, it120=1.5e-12}, s2 replay ≤7e-14 (σ persistence). EVP path
+  bitwise-identical after the JM.1 shared-helper extraction (vs a captured baseline). GPU/compute
+  gates: `MEVP_STABILITY_OK` (10-day, mEVP damps |uv| ≲ EVP), `MEVP_LIVENESS_OK` (diff-of-diffs
+  +0.36/+0.37/+0.45), `MEVP_GRAD_GATE_OK` (k_ver plateau 1.31e-10 UNCHANGED mEVP-ON). Sharded N-vs-1:
+  u_ice/v_ice **bit-identical** (gated strict), σ excluded. `ALL_ON_SMOKE_OK` (zstar+TKE+mEVP).
+  Key findings (in `docs/PORTING_LESSONS.md`): the post-creation `__new__` validation patch; the
+  EVP-dump header has no ncomp (inferred); the entry-anchor is load-bearing (the cold-start it2 dump
+  discriminates); the diff-of-diffs correlation is sampling-capped at ~0.4 (snapshot vs monthly) but
+  still a valid liveness proof; the sharded velocity is bit-exact (gate it strict). All three Phase-9
+  options (zstar/TKE/mEVP) now ported, differentiable, config-gated.
