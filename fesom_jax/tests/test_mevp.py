@@ -463,3 +463,98 @@ def test_mevp_live_dispatch(mesh, ice_harness):
     out1j = j(state0)
     dj = float(np.abs(np.asarray(out1j.u_ice) - np.asarray(out1.u_ice)).max())
     assert dj < 1e-10, f"jit vs eager mEVP u_ice |Δ|={dj:.2e}"
+
+
+# ==========================================================================
+# JM.4 — gradient gates (the differentiability contract; the mEVP kernel)
+# ==========================================================================
+@pytest.fixture(scope="module")
+def mevp_grad_inputs(mesh):
+    """s1 entry inputs (a subset) + a SHORT-scan mEVP cfg for the CPU AD probes."""
+    import jax.numpy as jnp
+    from fesom_jax.ice import IceConfig
+    from fesom_jax import io_dump
+    n_nod, n_elem = int(mesh.nod2D), int(mesh.elem2D)
+    fn, mn = io_dump.load_mevp_dump(MEVP_DUMP, ["Q", "U0", "F"], step=1, array="node", n_nod=n_nod)
+
+    def g(p, c):
+        return jnp.asarray(io_dump.evp_component(fn, mn, p, c))
+    return dict(
+        cfg=IceConfig(whichEVP=1, ice_dt=1800.0, evp_rheol_steps=6),   # short scan for CPU AD
+        a_ice=g("Q", "a_ice"), m_ice=g("Q", "m_ice"), m_snow=g("Q", "m_snow"),
+        elev=g("Q", "elevation"), u0=g("U0", "u_ice"), v0=g("U0", "v_ice"),
+        sax=g("F", "stress_atmice_x"), say=g("F", "stress_atmice_y"),
+        u_w=g("F", "u_w"), v_w=g("F", "v_w"), n_nod=n_nod, n_elem=n_elem)
+
+
+def test_mevp_grad_masked_nan(mevp_grad_inputs, mesh):
+    """Masked-NaN probe: ``d(Σu_ice²)/d(stress_ax)`` through the mEVP scan is FINITE everywhere
+    — including the ice-free (``a_ice<0.01``) lanes where the mass/thickness divides and the
+    identity carry could leak a ``0·inf`` backward (the AD-safe masked divides + safe-sqrt +
+    safe-speed + identity carry). Nonzero on the iced lanes (the gradient flows)."""
+    import jax
+    import jax.numpy as jnp
+    from fesom_jax import ice_evp as ie, ice_mevp as im
+    gi = mevp_grad_inputs
+    ze = jnp.zeros(gi["n_elem"]); bn = ie.boundary_node_mask(mesh)
+
+    def loss(stress_ax):
+        u, v, *_ = im.mevp_dynamics(
+            gi["cfg"], mesh, a_ice=gi["a_ice"], m_ice=gi["m_ice"], m_snow=gi["m_snow"],
+            u_ice=gi["u0"], v_ice=gi["v0"], sigma11=ze, sigma12=ze, sigma22=ze,
+            srfoce_u=gi["u_w"], srfoce_v=gi["v_w"], elevation=gi["elev"],
+            stress_ax=stress_ax, stress_ay=gi["say"], boundary_node=bn)
+        return jnp.sum(u ** 2 + v ** 2)
+
+    grad = np.asarray(jax.grad(loss)(gi["sax"]))
+    nbad = int((~np.isfinite(grad)).sum())
+    assert nbad == 0, f"{nbad} non-finite gradient entries (masked-NaN leak)"
+    assert np.any(grad != 0.0), "gradient is identically zero (no flow)"
+    # the ice-free lanes must be finite too (the binding masked-NaN check)
+    icefree = np.asarray(gi["a_ice"]) < 0.01
+    assert np.all(np.isfinite(grad[icefree])), "non-finite gradient on ice-free lanes"
+
+
+def test_mevp_grad_ice_ic_finite(mevp_grad_inputs, mesh):
+    """``d(loss)/d(m_ice)`` (an ice IC field) through the assembled mEVP scan is FINITE (the
+    rheology gradient is stiff — `∂p/∂Δ` near rigid pack is huge — but finite by construction;
+    finiteness is the contract, magnitude is documented as the std-EVP ~1e16 stiff class)."""
+    import jax
+    import jax.numpy as jnp
+    from fesom_jax import ice_evp as ie, ice_mevp as im
+    gi = mevp_grad_inputs
+    ze = jnp.zeros(gi["n_elem"]); bn = ie.boundary_node_mask(mesh)
+
+    def loss(m_ice):
+        u, v, *_ = im.mevp_dynamics(
+            gi["cfg"], mesh, a_ice=gi["a_ice"], m_ice=m_ice, m_snow=gi["m_snow"],
+            u_ice=gi["u0"], v_ice=gi["v0"], sigma11=ze, sigma12=ze, sigma22=ze,
+            srfoce_u=gi["u_w"], srfoce_v=gi["v_w"], elevation=gi["elev"],
+            stress_ax=gi["sax"], stress_ay=gi["say"], boundary_node=bn)
+        return jnp.sum(u ** 2 + v ** 2)
+
+    grad = np.asarray(jax.grad(loss)(gi["m_ice"]))
+    assert np.all(np.isfinite(grad)), f"{int((~np.isfinite(grad)).sum())} non-finite d/d(m_ice)"
+    assert np.any(grad != 0.0)
+
+
+def test_mevp_delta_singularity(mevp_grad_inputs, mesh):
+    """``d(Σσ²)/d(u_aux)`` is FINITE at u_aux=0 (Δ→0): the additive δmin (``pressure =
+    pf/(Δ+δmin)``) is C¹-continuous — stiff (pressure ~ pf/δmin ~ 1e13) but never 1/√0. Contrast
+    std-EVP's ``max(Δ,δmin)`` kink; both are finite, mEVP's is large-but-smooth."""
+    import jax
+    import jax.numpy as jnp
+    from fesom_jax import ice_evp as ie, ice_mevp as im
+    gi = mevp_grad_inputs
+    st = im.mevp_setup(gi["cfg"], mesh, gi["a_ice"], gi["m_ice"], gi["m_snow"], gi["elev"],
+                       ie.boundary_node_mask(mesh))
+    ze = jnp.zeros(gi["n_elem"])
+
+    def loss(u):
+        _, _, s11, s12, s22 = im.mevp_iterate(
+            gi["cfg"], mesh, u, u, ze, ze, ze, st, u, u,
+            gi["u_w"], gi["v_w"], gi["sax"], gi["say"], gi["cfg"].ice_dt)
+        return jnp.sum(s11 ** 2 + s12 ** 2 + s22 ** 2)
+
+    grad = np.asarray(jax.grad(loss)(jnp.zeros(gi["n_nod"])))
+    assert np.all(np.isfinite(grad)), f"{int((~np.isfinite(grad)).sum())} non-finite at Δ=0"

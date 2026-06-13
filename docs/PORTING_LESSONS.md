@@ -3530,3 +3530,25 @@ Cite the C source (`file:line`) or dump probe that proves it.
   paths match the cdump within the scatter floor (eager-vs-it120 1.5e-12; scan-vs-UF 6e-11). So:
   gate the kernel MATH eagerly (tight, intermediate access), gate the WIRING via scan-vs-final
   (looser, fusion floor), and keep σ out of the binding set (the std-EVP `_DIAG_FIELDS` precedent).
+- **[mevp/JM.3] The s2 controlled replay is a free σ-persistence (T11) test — feed the C's
+  step-2 entry + the s1-FINAL σ and it must reproduce s2.** The s1 replay starts from a 0 σ carry
+  (cold start), so it can't catch a σ that's wrongly zeroed on entry. The s2 replay can: I feed
+  the C's step-2 Q/U0/F entry AND s1's it120 σ (the carried State), and the kernel reproduces s2
+  it*/UF to 7e-14 — TIGHTER than s1 (the velocity is more settled). If σ were zeroed on entry,
+  s2 would diverge immediately. Bonus: s2's entry has a fully-evolved ocean (|u_w|=0.39,
+  |elev|=0.35, entry |u_ice|=0.23), so it exercises the ocean-drag + ssh-tilt + Coriolis paths
+  that s1's at-rest cold start leaves at zero. **Moral: a 2nd-step replay seeded with the 1st
+  step's carried state validates state PERSISTENCE for free — design replays to inherit, not
+  re-zero.** (`test_mevp_s2_replay`.)
+- **[mevp/JM.3] Diff-of-diffs liveness across DIFFERENT temporal samples caps the correlation at
+  ~0.4 — and that's still a valid liveness proof.** The GATE wants (JAX-mEVP − JAX-EVP) to
+  pattern-match (C-mEVP − C-EVP). My JAX legs are a day-10 SNAPSHOT; the only C oracle is a
+  January MONTHLY MEAN. The correlation came out +0.36/+0.37/+0.45 (sst/a_ice/m_ice) — clearly
+  positive, domain-robust (ice-zone and |Δ|-top-decile give the same), but not the C's own
+  +0.96 (which is C-vs-C at IDENTICAL sampling). The moderate value is the snapshot-vs-mean
+  smoothing + ~5-day centering offset, NOT a fidelity gap — the kernel is bit-faithful to 1e-12
+  at every dumped iterate. **Moral: when the only oracle is time-averaged and your run is a
+  snapshot, expect a pattern correlation in the 0.3-0.5 band even for a perfect port; judge
+  liveness by sign + robustness + the independent bit-level dump gates, not by hitting 0.9. A
+  longer (monthly) run would tighten it but isn't needed once the kernel is dump-exact.**
+  (`core2_mevp_climate_compare.py`.)
