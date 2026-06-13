@@ -606,6 +606,55 @@ def test_ice_sharded_step_owned_matches(npes, core2_forced):
                  extra_fct=_ICE_FIELDS)
 
 
+@avail
+@have_forcing
+def test_mevp_serial_sharded_step_matches_dense(core2_forced):
+    """Phase 9c JM.5: mEVP (whichEVP=1) under ``shard_map`` on ONE device == the dense mEVP step,
+    byte-identically. The lowering test for the mEVP path: the 120-iteration ``u_aux``/``v_aux``
+    halo exchange (the per-iteration ``all_gather`` INSIDE the ``lax.scan`` inside ``shard_map``,
+    ``check_vma=False``) + the global ``boundary_node`` (bc_index) collapse to ``v1.0`` at 1
+    device (identity exchange)."""
+    from fesom_jax.ice import IceConfig
+    fx = dict(core2_forced)
+    fx["state"] = _seed_ice_state(core2_forced)
+    mesh = fx["mesh"]
+    ser = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
+    bn_p = _global_boundary_node_p(mesh, ser)
+    st_dense, st_N = _forced_sharded_step(fx, ser, 1, ice_cfg=IceConfig(whichEVP=1),
+                                          boundary_node_p=bn_p)
+    worst = 0.0
+    for fld in dataclasses.fields(State):
+        a = np.asarray(getattr(st_dense, fld.name))
+        b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
+        if a.size:
+            worst = max(worst, float(np.max(np.abs(a - b))))
+    assert worst < _BYTE_ID_ATOL, \
+        f"serial mEVP sharded step max|Δ|={worst:.3e} (expected byte-id, floor {_BYTE_ID_ATOL:.0e})"
+
+
+@avail
+@have_forcing
+@pytest.mark.parametrize("npes", [2])
+def test_mevp_sharded_step_owned_matches(npes, core2_forced):
+    """Phase 9c JM.5: the forced mEVP sharded step matches single-device on OWNED entities.
+    ``u_ice``/``v_ice`` are GATED (the mEVP velocity is the binding fidelity check — the same
+    N-vs-1 class as std-EVP); the VP-kink internal stress σ stays in ``_DIAG_FIELDS`` (excluded —
+    a near-rigid-pack branch-flip diagnostic that amplifies noise over the 120 iterations while
+    the velocity it drives stays correct, the std-EVP S.9 precedent)."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    from fesom_jax.ice import IceConfig
+    fx = dict(core2_forced)
+    fx["state"] = _seed_ice_state(core2_forced)
+    mesh = fx["mesh"]
+    part = partit.read_partition(CORE2_DIST, npes)
+    bn_p = _global_boundary_node_p(mesh, part)
+    st_dense, st_N = _forced_sharded_step(fx, part, npes, ice_cfg=IceConfig(whichEVP=1),
+                                          boundary_node_p=bn_p)
+    _owned_match(st_dense, st_N, mesh, part, npes, tag="mevp", fct_atol=2e-2,
+                 extra_fct=_ICE_FIELDS)
+
+
 # --------------------------------------------------------------------------
 # 7. Multi-step scan (S.7 part 3.5) + the PRIMARY assembled gate (S.7 part 3.6)
 # --------------------------------------------------------------------------

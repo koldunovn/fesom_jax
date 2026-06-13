@@ -3552,3 +3552,15 @@ Cite the C source (`file:line`) or dump probe that proves it.
   liveness by sign + robustness + the independent bit-level dump gates, not by hitting 0.9. A
   longer (monthly) run would tighten it but isn't needed once the kernel is dump-exact.**
   (`core2_mevp_climate_compare.py`.)
+- **[mevp/JM.4] mEVP-ON leaves the trainable-seam gradient UNCHANGED — the rheology and the
+  mixing seam are cleanly decoupled.** The whole point of the mEVP port is that it doesn't break
+  the hybrid-ML seams. The assembled GPU gate (`MEVP_GRAD_GATE_OK`) confirms it: d(SST)/d(k_ver)
+  plateau = 1.31e-10 (well-conditioned, FD↔AD agree) — IDENTICAL class to the EVP-ON value,
+  because k_ver is an OCEAN-column mixing parameter and mEVP is an ICE-momentum solver; they only
+  couple weakly through the surface fluxes. The assembled masked-NaN probe d(SST)/d(T0) is clean
+  (non-finite=0, masked-lane=0 exactly) through the 120-iteration mEVP scan + thermo Newton + FCT
+  limiter. The ice→ocean path d(SST)/d(m_ice0) is finite at 6.3e9 — the documented stiff-but-finite
+  rheology class (∂p/∂Δ near rigid pack is huge but the additive δmin keeps it finite). **Moral:
+  when adding an option, the gradient gate isn't just "does it differentiate" — it's "does turning
+  it on perturb the EXISTING trainable seams"; the plateau-unchanged check is the one that matters
+  for a hybrid-ML codebase.** (`core2_mevp_grad_gate.py`, 25GB/40% on the A100-80 at N=4.)
