@@ -240,7 +240,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 "The pi analytical path has no surface forcing — keep tke_cfg=None there.")
         Kv, Av, uvnode, tke_new = tke.mixing_tke(
             mesh, st.uv, bvfreq, st.tke, stress_node_surf, st.hnode, tke_cfg, params,
-            exch=_exch, Z3d=Z3d_live, zbar3=zbar3_live)
+            dt=dt, exch=_exch, Z3d=Z3d_live)
     elif kpp_cfg is not None:
         if heat_flux is None:
             raise ValueError(

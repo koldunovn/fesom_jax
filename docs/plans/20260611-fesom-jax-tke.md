@@ -259,19 +259,23 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
 
 **Files:** Modify: `fesom_jax/tke.py`, `fesom_jax/tests/test_tke_replay.py`.
 
-- [ ] per-node assembly: `forc_tke_surf = safe|stress_node_surf|/ρ₀`; `vshear2` (zero at surface +
-      bottom interfaces); `bvfreq2` (the shared smoothed N², **zeroed at surface + bottom interfaces**
-      — nonzero only on `[nzmin+1, nzmax−1]`, `fesom_tke.c:362-364`; a naive slice leaks a nonzero
-      surface value); `dz_trr` with **hnode/2 end caps**; `dzw = hnode` slice — ALL geometry via the
-      §2 seam inputs
-- [ ] post-solve: zero Kv/Av at surface + below-bottom interfaces (faithful); full Kv adoption;
-      **exchange node `tke_Av` (`exch`) BEFORE** the node→elem 3-vertex Av mean over interior levels
-      (`fesom_tke.c:491`; the `kpp.py:787-789` idiom — plan-review MAJOR); `mo_convect` inside;
-      return `(Kv, Av, uvnode, tke_new)`
-- [ ] tests: step-1 live gate (cold-start pure algebra vs cdump, target ≤1e-12); driver-level replay
-      (inject inputs at the driver boundary) incl. the **`kv`/`av` wired tags**; diag invariance
-      (with_diags on/off bit-identical model outputs)
-- [ ] full suite green
+- [x] per-node assembly (`mixing_tke`): `forc_tke_surf = _safe_sqrt(|stress|²)/ρ₀`; `vshear2` (the
+      kpp.ri_iwmix `_shift_down(Z)-Z` shear, masked to interior); `bvfreq2 = where(is_interior, bvfreq,
+      0)` (zeroed surface+bottom — the naive-slice surface leak avoided); `dz_trr` interior `|ΔZ|` +
+      `hnode/2` surface & bottom caps; `dzw = hnode`. ALL geometry via `_layer_center_Z(mesh, Z3d)`
+      (static `mesh.Z` padded / live zstar — byte-identical under linfs).
+- [x] post-solve (`_wire_kv_av`): zero Kv/Av at surface + below-bottom; `Kv = KappaH` full slab;
+      **exchange node `KappaM` (`exch`) BEFORE** the node→elem 3-vertex mean over interior element
+      interfaces; `mo_convect` inside; return `(Kv, Av, uvnode, tke_new)`. (Driver passes `dt`; dropped
+      the unused `zbar3`.)
+- [x] tests: **driver-replay** — inject cdump `tkeav`/`tkekv` at the driver boundary → `kv`/`av` wired
+      tags **bit-exact** (kv 0.0, av ≤1.4e-17; the C exchange leaves owned rows unchanged ⇒ `kv≡tkekv`);
+      `dz_trr` assembly vs cdump `dztrr` **0.0**; `mixing_tke` composition (cold-start Kv/Av=0, shapes,
+      finite) + `jax.grad` wrt `tke_cd` finite; diag invariance (JT.1 `test_diag_invariance`). 25/25.
+      ⤷ the full step-1/3-step LIVE gate (with CORE2 forcing) is folded into **JT.3** (the assembled
+      gate) — the assembly's non-trivial pieces (`dz_trr`, the wiring) are already bit-exact here, and
+      `vshear2` reuses the gated kpp shear.
+- [ ] full suite green (regression) — submitting
 
 ### JT.3 — Step wiring + assembled live gate
 

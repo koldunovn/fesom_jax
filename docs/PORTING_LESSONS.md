@@ -3326,3 +3326,25 @@ Cite the C source (`file:line`) or dump probe that proves it.
   mtime vs the dump's. A replay oracle is only as good as the build that made it; a stale one fails a
   correct port.** (cdump regenerated → canonical; stale preserved as `cdump/dump_stale_6.6f`,
   `jobs/job_tke_cdump_v2`, Task JT.1.)
+
+## Phase 9b — classical-TKE vertical mixing (Task JT.2 — driver tke.py, bit-exact wiring)
+
+- **[port/tke] The driver is a clean composition — its only genuinely-new logic (the node→elem `Av`
+  mean + the geometry assembly) is bit-exact by REUSING already-gated kernels; and the cdump's `kv`
+  tag is REDUNDANT with `tkekv` (owned-row exchange invariance), so it validates the full-slab `Kv`
+  adoption for free.** `mixing_tke` assembles 5 column inputs and wires `Kv`/`Av`: `vshear2` is the
+  `kpp.ri_iwmix` interface shear (`_shift_down(Z)-Z`, already gated) masked to the TKE interior;
+  `dz_trr` is interior `|ΔZ|` + `hnode/2` end caps (bit-exact 0.0 vs the dumped `dztrr` — the same
+  geometry the JT.1 dzw-reconstruction confirmed); `bvfreq2 = where(is_interior, bvfreq, 0)` (the
+  surface-leak the plan flagged, avoided); the `Av` is the node→elem 3-vertex mean over INTERIOR
+  element interfaces (`pp.pp_mixing`'s `gather_nodes_to_elem`, minus KPP's `minmix` floor). Replay of
+  the WIRING (inject the dumped `tkeav`/`tkekv` at the driver boundary) hit **kv 0.0 / av ≤1.4e-17**
+  first try. The non-obvious part: the C dumps `tkekv` (the zeroed node `KappaH`, owned rows) AND `kv`
+  (`aux->Kv` after `exchange_nod`, owned rows) — but the exchange only fills HALO rows, so the OWNED
+  rows are identical ⇒ `kv ≡ tkekv` on every dumped node. So the full-slab `Kv = KappaH` adoption
+  needs no separate check; the `av` (node→elem mean) is the only wiring step the `kv`/`av` tags
+  genuinely exercise. **Moral: when a driver is a thin shell over gated column kernels + a stdlib
+  scatter, the replay gate is a formality (bit-exact first try) — spend the rigor on the ONE new op
+  (here the boundary-vertex `Av` mean, whose exch the sharded N-vs-1 gate at JT.5 will stress), and
+  recognize when an oracle tag is redundant with another.** (`tke.py` `mixing_tke`/`_wire_kv_av`,
+  `test_driver_wiring_replay`, Task JT.2.)

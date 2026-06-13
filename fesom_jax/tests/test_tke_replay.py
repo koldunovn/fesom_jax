@@ -32,7 +32,7 @@ from fesom_jax.kpp import KppConfig
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
 from fesom_jax.params import Params
 from fesom_jax.state import State
-from fesom_jax.tke import TkeConfig, mixing_tke
+from fesom_jax.tke import TkeConfig
 from fesom_jax.config import TKE_ALPHA, TKE_C_EPS, TKE_C_K, TKE_CD
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -155,13 +155,6 @@ def test_tke_cfg_none_leaves_tke_zero(pi_step):
     assert np.all(np.asarray(nxt.tke) == 0.0)
     # the field is preserved across the step (carry threads it untouched)
     assert nxt.tke.shape == st.tke.shape
-
-
-def test_mixing_tke_is_stub():
-    """The driver is a stub until JT.2 — calling it fails loudly (so a premature valid
-    tke_cfg wiring can't silently run nothing)."""
-    with pytest.raises(NotImplementedError, match="JT.2"):
-        mixing_tke(None, None, None, None, None, None, TkeConfig(), Params.defaults())
 
 
 # --------------------------------------------------------------------------
@@ -335,3 +328,78 @@ def test_column_grad_finite(replay_geom):
     kk = np.arange(mesh.nl)[None, :]
     dry = kk > np.asarray(nlev[sl])[:, None]
     assert np.all(g_tke[dry] == 0.0), "gradient leaked into the dry (below-bottom) lanes"
+
+
+# ============================================================================
+# JT.2 — driver (tke.py): the Kv/Av wiring + geometry assembly, replay-gated
+# ============================================================================
+@_replay_skip
+@pytest.mark.parametrize("step", [1, 2, 3])
+def test_driver_wiring_replay(replay_geom, step):
+    """Driver-level replay of the Kv/Av WIRING (`_wire_kv_av`) + the dz_trr geometry
+    assembly — bit-exact (≤1e-13) vs the cdump `kv`/`av`/`dztrr` tags. Injects the dumped
+    column-core outputs (`tkeav`=KappaM, `tkekv`=KappaH) at the driver boundary, so this
+    isolates the wiring from the column algebra (JT.1) and the live forcing (JT.3). On the
+    merged global field the node→elem mean needs no exchange (exch=None); the sharded path
+    is gated by the N-vs-1 suite (JT.5)."""
+    from fesom_jax.io_dump import load_tke_dump
+    from fesom_jax.tke import _wire_kv_av, _layer_center_Z
+    from fesom_jax.cvmix_tke import _shift_down
+    mesh, dzw, nlev = replay_geom
+    nl = mesh.nl
+    f, _ = load_tke_dump(TKE_CDUMP, ["tkeav", "tkekv", "kv", "av", "dztrr"], step=step)
+    k = np.arange(nl)[None, :]
+    nzmin = (np.asarray(mesh.ulevels_nod2D) - 1)[:, None]
+    nzmax = nlev[:, None]
+    is_surf = jnp.asarray(k == nzmin)
+    is_bot = jnp.asarray(k == nzmax)
+    # the wiring: cdump KappaM/KappaH (already zero-ended) → Kv (=KappaH) + Av (node→elem mean)
+    Kv, Av = _wire_kv_av(mesh, jnp.asarray(f["tkeav"]), jnp.asarray(f["tkekv"]),
+                         is_surf, is_bot, None)
+    assert float(np.abs(np.asarray(Kv) - f["kv"]).max()) <= 1e-13, f"step {step} Kv wiring"
+    assert float(np.abs(np.asarray(Av) - f["av"]).max()) <= 1e-13, f"step {step} Av wiring"
+    # the dz_trr geometry assembly (interior |ΔZ| + hnode/2 surface & bottom caps) vs cdump dztrr
+    Z = _layer_center_Z(mesh, None)
+    dZ = np.asarray(_shift_down(Z) - Z)
+    is_int = (k >= nzmin + 1) & (k <= nzmax - 1)
+    dztrr = np.where(is_int, np.abs(np.broadcast_to(dZ, (len(nlev), nl))), 0.0)
+    dztrr = np.where(np.asarray(is_surf), dzw[:, :1] / 2.0, dztrr)
+    hb = np.take_along_axis(dzw, (nlev - 1)[:, None], axis=1)
+    dztrr = np.where(np.asarray(is_bot), hb / 2.0, dztrr)
+    assert float(np.abs(dztrr - f["dztrr"]).max()) <= 1e-13, f"step {step} dz_trr assembly"
+
+
+@_replay_skip
+def test_mixing_tke_composition_and_grad(replay_geom):
+    """The assembled driver `mixing_tke` composes correctly + is differentiable: returns the
+    right shapes, cold start (uv=0, tke=0) ⇒ Kv/Av≈0 (KappaM=KappaH=0; mo_convect inert under
+    stable N²) with a floored `tke_new`, and `jax.grad` wrt a `Params` leaf (`tke_cd`, the
+    surface-flux coefficient) is finite. The full live-forcing gate is JT.3."""
+    from fesom_jax.tke import mixing_tke, TkeConfig
+    from fesom_jax.params import Params
+    mesh, dzw, nlev = replay_geom
+    n, e, nl = mesh.nod2D, mesh.elem2D, mesh.nl
+    uv = jnp.zeros((e, nl, 2))                              # cold start ⇒ uvnode=0 ⇒ vshear2=0
+    tke = jnp.zeros((n, nl))
+    bvfreq = jnp.where(jnp.asarray(mesh.node_layer_mask), 1.0e-5, 0.0)   # stable (N²>0)
+    stress = jnp.full((n, 2), 0.05)                        # a modest wind stress
+    hnode = jnp.asarray(dzw)
+    cfg, prm = TkeConfig(), Params.defaults()
+
+    Kv, Av, uvnode, tke_new = mixing_tke(mesh, uv, bvfreq, tke, stress, hnode, cfg, prm, dt=1800.0)
+    assert Kv.shape == (n, nl) and Av.shape == (e, nl)
+    assert uvnode.shape == (n, nl, 2) and tke_new.shape == (n, nl)
+    assert np.all(np.isfinite(np.asarray(Kv))) and np.all(np.isfinite(np.asarray(tke_new)))
+    # cold start: KappaM=KappaH=0 (sqrttke=0) ⇒ Kv/Av = 0 (stable N² ⇒ mo_convect inert)
+    assert float(np.abs(np.asarray(Kv)).max()) == 0.0
+    assert float(np.abs(np.asarray(Av)).max()) == 0.0
+    # tke_new floored to tke_min on the wet column (surface flux drives the surface interface)
+    assert float(np.asarray(tke_new)[np.asarray(mesh.node_layer_mask)].min()) >= 0.0
+
+    def loss(cd):
+        p = Params(k_ver=prm.k_ver, a_ver=prm.a_ver, k_gm=prm.k_gm, redi_kmax=prm.redi_kmax,
+                   tke_c_k=prm.tke_c_k, tke_c_eps=prm.tke_c_eps, tke_cd=cd, tke_alpha=prm.tke_alpha)
+        _, _, _, tk = mixing_tke(mesh, uv, bvfreq, tke, stress, hnode, cfg, p, dt=1800.0)
+        return jnp.sum(tk)
+    g = float(jax.grad(loss)(jnp.asarray(3.75)))
+    assert np.isfinite(g), "non-finite gradient wrt tke_cd through the assembled driver"
