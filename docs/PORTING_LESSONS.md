@@ -3611,3 +3611,75 @@ Cite the C source (`file:line`) or dump probe that proves it.
   file (2-way until the run completes) instead of silently averaging it. **Moral: a metric over
   time-averaged output is only valid once the averaging window is COMPLETE; assert the record count
   before trusting an "annual mean" from a run you didn't confirm finished.** (`core2_mevp_climate_compare.py`.)
+
+## Paper experiments (PART A infra) — `docs/plans/20260614-fesom-jax-paper-experiments.md`
+
+- **[calibrate/A3] The optimizer seam is generic over the tunable pytree — keep it that way; don't
+  bake in physics couplings.** `calibrate.optimize` jits `value_and_grad` once and host-loops; the
+  *same* call trains a scalar `{'k_gm': θ}`, a `[nod2D]` field, or the `tke_nn` MLP because array
+  leaves already differentiate. `build_params(dict)->Params` is the dict→pytree seam — deliberately
+  generic: it does NOT auto-sync `Redi_Kmax=K_GM_max` (the GM caller passes both keys; the namelist
+  writer enforces the sync on the Fortran side). A hidden coupling in the seam would surprise every
+  *other* tunable. `stop_fn` is checked BEFORE the optax update so the returned params are the exact
+  iterate that crossed the threshold. (`fesom_jax/calibrate.py`, `test_calibrate.py`; CALIBRATE_SEAM_OK.)
+
+- **[obs_compare/A2] A differentiable model→obs operator must recompute the VERTICAL interp
+  from live geometry; only the HORIZONTAL node→cell map is static.** `build_h_map` host-precomputes
+  the node→obs-cell index (nodes are horizontally static); `to_obs` does a masked area-weighted
+  node→cell `segment_mean` of BOTH the field and the live `Z_3d_n`, then a per-cell linear interp
+  on the live depth axis — so `d(misfit)/d(hnode)` flows through the zstar coordinate (FD-probe
+  nonzero, AD==FD confirmed). Pre-baking vertical weights would silently sever that gradient. Key
+  AD-safety details: (1) the interp bracket index is a non-diff step but the WEIGHTS differentiate
+  w.r.t. the gathered depths (guarded denom, clipped weight) — no `jnp.interp` needed; (2) empty
+  cells use the `ops` 0/0 sentinel-mask; (3) below-bottom levels are filled with a strictly-
+  decreasing nominal axis so the interp stays monotone; (4) MLD is the linear-interpolated σ-excess
+  crossing (NOT an argmax), and the EOS gets safe `S>0` at dry lanes (its `sqrt(S)` has ∞ grad at 0).
+  Obs depths above the top layer constant-extrapolate (the standard model↔surface-obs convention) —
+  analytic exactness holds only strictly within `[cell_bottom, cell_top]`. (`fesom_jax/obs_compare.py`,
+  `test_obs_compare.py`; OBS_OPERATOR_OK.)
+
+- **[obs_ice/A2b] The sea-ice obs operator is forward-only — no live-geometry path — but the
+  pole hole and hemisphere mask are load-bearing.** Sea-ice concentration is a 2-D surface field,
+  so `obs_ice` is a plain area-weighted node→polar-stereo-cell mean (no vertical interp, no AD
+  contract — nothing calibrates through it). The polar-stereographic projection is the spherical
+  NSIDC convention (true scale at the standard parallel; verified pole→origin, lat_ts→R·cos(lat_ts)).
+  Two masks matter: wrong-hemisphere nodes → `node_cell=-1` (ops sentinel), and the passive-microwave
+  **pole hole** (cells with radius < ρ(87.2°)) is dropped in BOTH model and obs for a consistent
+  comparison. Test trap: a ±3000 km north grid only reaches ~64°N, so test nodes must sit at high
+  latitude (ρ(lat) < grid extent) or they project outside and silently drop. (`fesom_jax/obs_ice.py`,
+  `test_obs_ice.py`; OBS_ICE_OK.)
+
+- **[tke_nn/A5] A structure-preserving NN closure = `m = exp(s·tanh(raw))` on the constants, with
+  a ZERO last layer for an exact-identity fallback.** The bounded multiplier `m ∈ (1/m_max, m_max)`
+  is ALWAYS positive (exp) ⇒ positive-definite diffusivities for any weights/inputs (the structural-
+  stability guarantee, no clamping). Zero last layer ⇒ `raw≡0` ⇒ `tanh(0)=0` ⇒ `m≡1` EXACTLY, so
+  `c_k·m == c_k` bit-for-bit ⇒ default TKE recovered to the ULP — this is BOTH the `params=None`
+  regression invariant AND the deployment net. Wiring trap: `m=1` only bit-identical if the multiply
+  is `scalar·ones[N,1]` then `c_k·mxl` (broadcast commutes, products identical) AND the FEATURES are
+  finite everywhere — a NaN feature at a dry column would survive the zero last layer as `0·NaN=NaN`,
+  so `column_features` arcsinh-normalizes with count-guarded interior means (finite for every finite
+  input). `tke_nn` is a `Params` leaf (`None`⇒no leaves, structure unchanged ⇒ the `len(leaves)==8`
+  test still holds), trained by the same `grad(loss)(params)`. (`fesom_jax/tke_nn.py`, `tke.py` consume
+  site, `test_tke_nn.py`; TKE_NN_OK.)
+
+- **[eki/A4] EKI is the right tool where the adjoint can't reach — a forward-only, vmap-parallel
+  ensemble update, no adjoint anywhere.** `eki_update` is pure ensemble linear algebra
+  (`θ_j += C_θg(C_gg+Γ)⁻¹(y*+η_j−g_j)`); `eki_step`/`eki_run` vmap the single-member forward over
+  the ensemble. The ensemble MEAN converges to the minimizer (verified: recovers known scalars +
+  multi-param vectors from noisy linear AND mildly-nonlinear forwards to <2%). Γ accepts scalar σ²
+  / diagonal / full matrix. This is the slow-target (GM→stratification) calibrator the chaos+memory
+  ceiling rules out for the adjoint, and the §1 cross-check partner on `k_gm`. The real-model budget
+  (warm-started 16–32-member few-year ensemble) is the plan's; the unit test is analytic.
+  (`fesom_jax/eki.py`, `test_eki.py`; EKI_OK.)
+
+- **[write_namelist/A6] Scalar→Fortran transfer = a FORMAT-PRESERVING namelist patcher, exact-key
+  match, with the Redi auto-sync honored on EVERY input path.** The "killer app" (tuned scalar →
+  operational Fortran, zero code) needs a writer that replaces only the named value and leaves every
+  comment/column/blank byte-identical (regex captures indent/key/`=`/value/comment; re-pad comment
+  with 2 spaces). Two traps: (1) match the EXACT key token before `=` — `K_GM_max` must not touch
+  `K_GM_min`/`K_GM_bvref`; (2) the K_GM_max↔Redi_Kmax auto-sync (`Redi_Kmax<=0`⇒Fortran syncs) must
+  fire on BOTH the Params-leaf path AND the raw-namelist-key/CLI path, else `--set K_GM_max=1500`
+  silently leaves Redi_Kmax at 0 — moved the sync into a `_sync_redi_keys` helper applied to the final
+  namelist-keyed dict. Real keys verified against `fesom2/work_all3` (oce: K_GM_max/Redi_Kmax; cvmix:
+  tke_c_k/c_eps/cd/alpha). Test lives in `scripts/tests/` (pure-Python, runs outside the JAX suite).
+  (`scripts/write_namelist.py`, `scripts/tests/test_write_namelist.py`; FORTRAN_TRANSFER_OK.)

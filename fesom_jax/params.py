@@ -82,6 +82,13 @@ class Params:
         default_factory=lambda: jnp.asarray(TKE_CD, jnp.float64))
     tke_alpha: jax.Array = dataclasses.field(
         default_factory=lambda: jnp.asarray(TKE_ALPHA, jnp.float64))
+    # Structure-preserving NN-on-TKE closure (the §3 hybrid-ML hook, Phase A5). An OPTIONAL
+    # pytree leaf: ``None`` (default) ⇒ unused (no leaves, byte-identical to the scalar-TKE
+    # path); a :class:`fesom_jax.tke_nn.TkeNN` ⇒ ``tke.mixing_tke`` scales ``c_k/c_eps/c_d`` by
+    # the NN's bounded multiplier. A zero-last-layer NN ⇒ multiplier 1 ⇒ STILL bit-identical
+    # (the regression invariant + deployment fallback). Kept un-annotated as a concrete type to
+    # avoid an import cycle (tke_nn need not be imported to construct a baseline ``Params``).
+    tke_nn: object = None
 
     @staticmethod
     def defaults() -> "Params":
@@ -102,6 +109,6 @@ class Params:
 tree_util.register_dataclass(
     Params,
     data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
-                 "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha"],
+                 "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn"],
     meta_fields=[],
 )

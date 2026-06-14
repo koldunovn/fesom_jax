@@ -28,6 +28,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 
 from . import ops, pp
+from . import tke_nn as _tke_nn
 from .config import DENSITY_0, DT_DEFAULT
 from .cvmix_tke import _safe_sqrt, _shift_down, integrate_tke_column
 
@@ -170,10 +171,27 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
     hnode_bot = jnp.take_along_axis(hnode, (nlev - 1)[:, None], axis=-1)   # hnode[nln0]
     dz_trr = jnp.where(is_bot, hnode_bot / 2.0, dz_trr)        # dz_trr[nln0+1]=hnode[nln0]/2
 
+    # --- optional structure-preserving NN multiplier on c_k/c_eps/c_d (the §3 hybrid-ML hook,
+    # Phase A5). ``params.tke_nn is None`` ⇒ the scalar constants pass through UNCHANGED
+    # (byte-identical to the pre-A5 model); a zero-last-layer NN ⇒ multiplier 1 ⇒ STILL
+    # bit-identical (``c_k·1 == c_k``). The NN reads the LIVE per-column inputs assembled above
+    # (forcing, f, depth, interior-mean N²/shear², surface TKE) → a bounded, positive-definite
+    # multiplier ``[N, 3]``, broadcast over levels via the ``[N,1]`` shape. ---
+    c_k, c_eps, cd = params.tke_c_k, params.tke_c_eps, params.tke_cd
+    nn = getattr(params, "tke_nn", None)
+    if nn is not None:
+        feats = _tke_nn.column_features(
+            forc_tke_surf, mesh.coriolis_node, mesh.depth,
+            bvfreq2, vshear2, tke, is_interior)
+        m = _tke_nn.multiplier(nn, feats)                      # [N, 3] ∈ (1/m_max, m_max)
+        c_k = params.tke_c_k * m[:, 0:1]                       # [N,1] → broadcast over levels
+        c_eps = params.tke_c_eps * m[:, 1:2]
+        cd = params.tke_cd * m[:, 2:3]
+
     # --- column core (fesom_tke.c:421-442) ---
     tke_new, KappaM, KappaH = integrate_tke_column(
         tke, vshear2, bvfreq2, hnode, dz_trr, forc_tke_surf, nlev,
-        c_k=params.tke_c_k, c_eps=params.tke_c_eps, cd=params.tke_cd,
+        c_k=c_k, c_eps=c_eps, cd=cd,
         alpha_tke=params.tke_alpha, mxl_min=cfg.mxl_min, tke_min=cfg.tke_min,
         kappaM_max=cfg.kappaM_max, dt=dt, with_diags=False)
 
