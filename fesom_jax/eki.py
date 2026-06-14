@@ -75,33 +75,54 @@ def eki_update(thetas, g, y_obs, gamma, *, key=None, perturb_obs: bool = True):
     return thetas + update
 
 
+def _vmap_eval(forward_fn, thetas):
+    """Default ensemble evaluator — ``vmap`` the forward over members (all members resident
+    at once; right for a cheap/analytic forward)."""
+    return jax.vmap(forward_fn)(thetas)
+
+
+def sequential_eval(forward_fn, thetas):
+    """Memory-safe ensemble evaluator — a host loop over members (one forward resident at a
+    time). The right ``map_fn`` for a **heavy** forward (a full CORE2 run): the EKI ensemble
+    can be 16–32 members and the all-on model's working set is GB-scale, so ``vmap`` (J
+    members co-resident) OOMs where a sequential loop does not. Reuses the (jitted)
+    ``forward_fn``'s single compiled executable across members."""
+    return jnp.stack([forward_fn(thetas[j]) for j in range(thetas.shape[0])])
+
+
 def eki_step(thetas, forward_fn: Callable, y_obs, gamma, *, key=None,
-             perturb_obs: bool = True):
-    """One EKI step: ``vmap`` the forward over the ensemble, then :func:`eki_update`.
-    ``forward_fn`` maps a single ``θ`` ``[p]`` → an observable ``[d]``."""
-    g = jax.vmap(forward_fn)(jnp.asarray(thetas, jnp.float64))
+             perturb_obs: bool = True, map_fn: Callable | None = None):
+    """One EKI step: evaluate the forward over the ensemble (``map_fn``, default ``vmap``),
+    then :func:`eki_update`. ``forward_fn`` maps a single ``θ`` ``[p]`` → an observable ``[d]``;
+    ``map_fn(forward_fn, thetas) -> g[J, d]`` (pass :func:`sequential_eval` for a heavy
+    forward)."""
+    ev = map_fn or _vmap_eval
+    g = ev(forward_fn, jnp.asarray(thetas, jnp.float64))
     return eki_update(thetas, g, y_obs, gamma, key=key, perturb_obs=perturb_obs)
 
 
 def eki_run(theta0, forward_fn: Callable, y_obs, gamma, *, n_iters: int,
-            key=None, perturb_obs: bool = True, on_step: Callable | None = None):
+            key=None, perturb_obs: bool = True, on_step: Callable | None = None,
+            map_fn: Callable | None = None):
     """Run EKI for ``n_iters`` iterations from the initial ensemble ``theta0`` ``[J, p]``.
 
-    Each iteration evaluates the forward **once** (``vmap`` over members), logs the data misfit
-    of the ensemble-mean prediction + the parameter spread, then applies the EKI update. Returns
-    ``(theta_mean[p], history, ensemble[J, p])`` — the recovered parameters are the final
-    ensemble mean. ``on_step(record)`` is called per iter for live logging."""
+    Each iteration evaluates the forward **once** over the ensemble (``map_fn``, default
+    ``vmap``; pass :func:`sequential_eval` to loop members for a heavy/GB-scale forward), logs
+    the data misfit of the ensemble-mean prediction + the parameter spread, then applies the
+    EKI update. Returns ``(theta_mean[p], history, ensemble[J, p])`` — the recovered parameters
+    are the final ensemble mean. ``on_step(record)`` is called per iter for live logging."""
     thetas = jnp.asarray(theta0, jnp.float64)
     y = jnp.asarray(y_obs, jnp.float64)
     d = y.shape[0]
     Gamma = _as_cov(gamma, d)
     Ginv = jnp.linalg.inv(Gamma)
+    ev = map_fn or _vmap_eval
     history: list[dict] = []
     if key is None:
         key = jax.random.PRNGKey(0)
     for it in range(1, n_iters + 1):
         key, sub = jax.random.split(key)
-        g = jax.vmap(forward_fn)(thetas)                 # [J, d]
+        g = ev(forward_fn, thetas)                       # [J, d]
         gbar = jnp.mean(g, axis=0)
         resid = y - gbar
         misfit = float(resid @ Ginv @ resid)

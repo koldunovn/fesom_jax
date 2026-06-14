@@ -266,6 +266,37 @@ def mld_density_threshold(T, S, Z_3d_n, node_mask, *, ref_depth: float = 10.0,
 
 
 # ==========================================================================
+# Spatial aggregation: basin-mean vertical profiles (the GM/stratification observable)
+# ==========================================================================
+def basin_mean_profiles(cell_field, cell_valid, basin_weight):
+    """Area-weighted **basin-mean vertical profiles** from regridded obs-grid cells —
+    the low-dimensional **stratification** observable the §2 GM→T/S calibration (D2b/EKI)
+    inverts on.
+
+    Reduces a regridded field ``cell_field[n_cells, n_depth]`` (e.g. the output of
+    :func:`to_obs`) to per-basin mean profiles ``[n_basins, n_depth]``, area-weighted and
+    masked. ``basin_weight[n_basins, n_cells]`` is a non-negative weight (obs-cell area ×
+    basin membership — a cell belongs to one basin, by latitude band). ``cell_valid[n_cells,
+    n_depth]`` (bool or {0,1}) drops invalid (below-bottom / empty / land) cell-levels.
+
+    An empty ``(basin, depth)`` (no valid cell) → 0 (finite — the AD masked-NaN rule; a
+    forward ``where`` plus the guarded denominator keeps the backward clean). Applying the
+    **same** fixed reduction (same ``basin_weight`` and ``cell_valid``) to the model and to
+    the obs target makes the basin-stratification comparison apples-to-apples by construction
+    — the EKI observable is then a fixed *linear* readout of the regridded field, so members
+    differ only through the physics. Float64; differentiable in ``cell_field`` (EKI does not
+    need the gradient, but the C1 adjoint↔EKI cross-check and any adjoint use of the same
+    observable do)."""
+    cf = jnp.asarray(cell_field, jnp.float64)
+    cv = jnp.asarray(cell_valid, jnp.float64)
+    bw = jnp.asarray(basin_weight, jnp.float64)
+    w = bw[:, :, None] * cv[None, :, :]                  # [n_basins, n_cells, n_depth]
+    num = jnp.sum(w * cf[None, :, :], axis=1)            # [n_basins, n_depth]
+    den = jnp.sum(w, axis=1)
+    return jnp.where(den > 0.0, num / jnp.where(den > 0.0, den, 1.0), 0.0)
+
+
+# ==========================================================================
 # Temporal aggregation + misfit
 # ==========================================================================
 def aggregate_windows(model_stats, spec: dict | None = None):

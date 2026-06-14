@@ -3812,3 +3812,34 @@ Cite the C source (`file:line`) or dump probe that proves it.
   ⚠️ The 2-param `{c_k,c_eps}` fit overfits — `c_eps`→0 (unphysical) — the structural-bias compensation
   the recovered-value plausibility report catches; use `--params ck` or bound `c_eps`.
   (`scripts/core2_paper_calib_tke_obs.py`.)
+
+- **[Calibration / EKI] The slow-target GM→T/S calibration uses gradient-free EKI on the FULL all-on
+  model with LIVE mEVP ice — forward-only ⇒ immune to the A8 sea-ice-rheology adjoint instability** (no
+  frozen-ice approximation the adjoint twins D1/D2a needed; the whole point of the adjoint↔EKI split). D2b's
+  perfect-model EKI twin (`scripts/core2_paper_calib_gm_eki.py --mode twin`) recovered a planted `k_gm=1500`
+  to **0.065 %** (1500.97; ensemble 1501.0±0.6) in **3 EKI iters** at a **2-day** window, misfit −5.5 orders,
+  peak **18 GB** (forward-only is light — no tape). Observable = basin-mean upper-ocean/thermocline T/S
+  profiles (5 lat bands × 8 WOA levels × {T,S} = an 80-vec) via the tested `obs_compare.{to_obs,
+  basin_mean_profiles}`; the SAME fixed reduction (fixed basin weights + a fixed common-validity mask) hits
+  model AND obs ⇒ a clean *linear* observable where members differ only through the physics. ⚠️ The GM→T/S
+  signal over a short window is TINY (~3e-4 °C / 1.9e-4 psu RMS across `k_gm`∈[600,1800] at 2 days) but CLEAN
+  (≫ float64 noise) — EKI's covariance update is scale-free so it recovers it, **but only if Γ ≪ the
+  signal²**: use auto-Γ = `(ε·ensemble-signal)²` (ε=0.05) for the twin. A *physical* absolute σ_T=0.5 °C
+  would swamp the 3e-4 °C signal (Γ ≫ C_gg ⇒ no update) — the EKI analogue of D1's "normalize the loss by
+  J0". This is also exactly why the short-window *obs* calibration (which must use physical σ) is weakly
+  constrained: the equilibrium GM→stratification adjustment is multi-year, the production ensemble.
+  (`scripts/core2_paper_calib_gm_eki.py`, `fesom_jax/obs_compare.basin_mean_profiles`, `fesom_jax/eki.py`.)
+
+- **[AD / JAX / perf] A jit that closes over the pre-stacked CORE2 forcing makes XLA constant-fold the
+  `to_obs` node→cell scatter over the mesh constants — a slow ONE-TIME compile** (D2b: a single
+  `scatter-add f64[64800,48]` folded for ~20 s, plus `reduce-window`/`gather` alarms over mesh constants). It
+  completes (XLA's guard caps the folding) and is amortized over the many forwards of an EKI run (one compile
+  per mode), so it is tolerable — but for the multi-year production EKI, pass the forcing as a **traced
+  argument** (not a closed-over constant) to skip it. Two hard limits the forward-only EKI also exposed:
+  **(1)** `StepForcing` is ~10 MB/step ⇒ `cf.stack(N)` caps a single pre-stacked window at ~weeks (N=480 ≈
+  4.8 GB), so a multi-year window needs **chunked re-stacking** (carry state across chunks — the
+  `core2_kpp_climate_run.py` per-step pattern, but in fast scanned chunks). **(2)** The all-on forward runs
+  **~4.3 steps/s on an A100-80** (forward-only, mEVP live, peak 18 GB) ⇒ a few-year × 16-member × 8-iter
+  production EKI is hundreds of GPU-h — a production run, NOT overnight; the overnight EKI is a scoped
+  demonstration + the GPU-h projection (`--mode budget`, the EKI analogue of A7's adjoint-window de-risking).
+  (`scripts/core2_paper_calib_gm_eki.py`.)
