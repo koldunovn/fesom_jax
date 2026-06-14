@@ -3735,3 +3735,16 @@ Cite the C source (`file:line`) or dump probe that proves it.
   the map peaks in the **Weddell/Labrador/Southern-Ocean deep-convection regions** (physically correct —
   where TKE mixing controls MLD). Single-GPU, `--gres=gpu:a100_80:1`, PREALLOCATE=false, MEM_FRACTION=0.95.
   (`scripts/core2_paper_sensitivity.{py,sbatch}`; **SENSITIVITY_MAP_OK**.)
+
+- **[sensitivity/C1 FD spot-check] A single-h single-node FD verifies a map node UNRELIABLY — use an
+  h-sweep over the top-K |g| nodes.** Validating one map cell by `(J(θ+h·eᵢ)−J(θ−h·eᵢ))/2h` at the |g|-max
+  node with ONE step (h=1e-3·θ) gave rel **0.79** for the tiny-signal GM target (ts_kgm map max|g|≈6.5e-10),
+  even though the AGGREGATE scalar adjoint==FD was perfect (plateau 6.5e-7). Cause was NOT a true kink and
+  NOT round-off (signal ≫ floor): the secant over Δk_gm=1.0 crossed local curvature; the SAME node is clean
+  to **1.2e-4 at h_rel=1e-4**. Fix = sweep h ∈{1e-2,1e-3,1e-4} at the top-3 |g| nodes and take the best
+  plateau (one strong-signal SMOOTH node passing proves the map values are FD-correct; robust to a single
+  extremal node). After the fix BOTH targets pass (mld_ck 3.4e-7 @ Weddell, ts_kgm 3.0e-5 @ Fram Strait).
+  Lesson: a per-cell FD check needs the same h-plateau rigor as the scalar gate — never trust one h. Also
+  reconfirmed: the GM short-window adjoint signal is **tiny** (6.5e-10 vs MLD/c_k's 2e-2) ⇒ the slow GM→T/S
+  equilibrium is beyond the adjoint window — exactly why §2 GM calib uses EKI (the adjoint↔EKI rel-6.6%
+  cross-check ties them). (`scripts/core2_paper_sensitivity.py`; **SENSITIVITY_MAP_OK**.)
