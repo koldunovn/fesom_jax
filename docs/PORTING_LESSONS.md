@@ -3719,3 +3719,19 @@ Cite the C source (`file:line`) or dump probe that proves it.
   locally-linear `k_gm`) validates both tools and motivates EKI for the slow equilibrium the adjoint
   can't reach. (`scripts/core2_paper_sensitivity.py`+`.sbatch`, `scripts/fig_sensitivity.py`,
   `fesom_jax/tests/test_sensitivity.py`; **SENSITIVITY_SEAM_OK** (CPU) + **SENSITIVITY_MAP_OK** (GPU).)
+
+- **[sensitivity/C1 GPU memory] The FIELD-leaf backward is heavier than the SCALAR backward → its N_max
+  is SMALLER than A7's (TKE+MLD: N_max=12, not 20). Two distinct OOM traps, both real.** (1) **CUDA-graph
+  command buffers**: a driver that compiles several big executables (loss + grad) accumulates CUDA graphs;
+  the first run OOMed not on the working set but on `instantiate command buffer ... (38 alive graphs)`. Fix
+  = `XLA_FLAGS=--xla_gpu_enable_command_buffer=` (the error recommends it) AND reuse ONE jitted forward for
+  every scalar eval (FD sweep + EKI ensemble) instead of separate executables. (2) **A 63.27 GiB "Failed to
+  allocate" message is a NON-FATAL XLA probe, NOT the verdict** — XLA tries a big fused buffer, fails, and
+  falls back to a streamed path; mld_ck N=20 genuinely OOMed (working set too big) but N=12 SUCCEEDED at
+  peak **44.5 GB** *with the same 63 GiB failure printed*. So don't trust the scary alloc line; trust the
+  exit code / the reported `peak`. ⇒ a **descending-N safety net** in the .sbatch (20→12→6, the script
+  returns exit 2 on OOM so the loop tries smaller) finds the field N_max in one job — measure it, like A7.
+  Result: mld_ck N=12 clean (d(meanMLD)/d(c_k)=+2.91, plateau **8.3e-7**, FD spot-check rel **1.8e-6**), and
+  the map peaks in the **Weddell/Labrador/Southern-Ocean deep-convection regions** (physically correct —
+  where TKE mixing controls MLD). Single-GPU, `--gres=gpu:a100_80:1`, PREALLOCATE=false, MEM_FRACTION=0.95.
+  (`scripts/core2_paper_sensitivity.{py,sbatch}`; **SENSITIVITY_MAP_OK**.)

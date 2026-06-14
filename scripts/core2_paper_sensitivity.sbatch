@@ -29,7 +29,7 @@ export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 # optimization, not needed here. (The error itself recommends this; C1 lesson.)
 export XLA_FLAGS=--xla_gpu_enable_command_buffer=
 RESULTS=scripts/sensitivity_results.jsonl
-NLIST=${1:-"20 12 6"}        # descend N per target until the field-leaf backward fits (safety net)
+NLIST=${1:-"12 6"}           # field-leaf N_max measured = 12 (N=20 OOMs); descend as a safety net
 
 echo "=== $(hostname) $(date)  NLIST='$NLIST' ==="
 nvidia-smi -L 2>/dev/null || true
