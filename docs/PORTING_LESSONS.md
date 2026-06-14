@@ -3786,3 +3786,26 @@ Cite the C source (`file:line`) or dump probe that proves it.
   the right OMIP metric for TKE calibration (fast ⇒ adjoint, not EKI). No CPU twin: TKE raises on the pi
   `integrate` path (`mixing_tke` is the faithful site) — the recipe is guarded by the D1 `test_calib_twin`.
   (`scripts/core2_paper_calib_tke.py`; **TKE_TWIN_OK**.)
+
+- **[obs] A density-threshold MLD must be computed PER MONTH then averaged — never from the
+  annual-mean WOA profile (Jensen's inequality).** dBM is IFREMER-blocked, so we derive the MLD
+  climatology from WOA. Computing it from the annual-mean T/S profile collapses to ~20 m everywhere
+  (Labrador crosses 0.03 kg/m³ by 20 m) because the deep winter convection averages out — MLD(mean
+  profile) ≠ mean(MLD per profile). Fix: compute MLD for each of the 12 monthly WOA files (the model's
+  own `obs_compare.mld_density_threshold`, for a consistent comparison) then average → a real seasonal
+  cycle, max 319 m. (Still under-represents sporadic deep convection vs dBM's individual profiles —
+  ice-masked out anyway.) Also: WOA SST is NaN on land ⇒ the obs misfit needs `where(isfinite & ok, x,
+  0)` or `0·NaN=NaN` poisons the weighted sum even at weight 0 (the masked-NaN rule, obs side).
+  (`scripts/make_woa_targets.py`.)
+
+- **[AD / GPU] An obs-operator-augmented all-on backward run in an optimization LOOP hits an XLA/CUDA
+  CUBIN-reload OOM that the perfect-model twin's loop does not.** D2a-obs (TKE→WOA MLD+SST) is VALIDATED
+  to the gradient — spin-up, the `obs_compare` operator on real WOA (baseline gaps ~33 m / ~0.81 °C),
+  and iteration 1 of the adjoint (sane, descending `|g|`) all work — but iteration 2 reliably dies with
+  `RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN`, **independent of config (all3/tkegm), N (12→4),
+  and MEM_FRACTION (0.95/0.85)**, with tens of GB free. The twin's loop (`calibrate.optimize`) runs 43
+  iters fine; the obs-operator executable won't re-stage in the loop (cause not pinned down remotely —
+  module staging, not a tensor alloc). Spin-up was moved to a separate process (its retained pool was a
+  separate, real OOM). **Resolution: do the obs calibration via EKI** (`fesom_jax.eki`, forward-only ⇒
+  no backward ⇒ no loop/CUBIN issue), which also gives an adjoint↔EKI cross-check on the TKE parameter.
+  The §2 capability is proven by the twins regardless. (`scripts/core2_paper_calib_tke_obs.py`.)
