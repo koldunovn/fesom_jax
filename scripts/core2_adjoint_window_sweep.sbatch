@@ -23,6 +23,8 @@ source /sw/etc/profile.levante
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false     # allocate on demand (avoids OOM-during-module-load)
+export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95     # use ~76GB of the 80GB card (default 0.80 caps at 64GB →
+                                               # N=50 OOMs at 71GB even though it fits a full card)
 RESULTS=scripts/adjoint_window_sweep_results.jsonl
 
 echo "=== $(hostname) $(date) ==="

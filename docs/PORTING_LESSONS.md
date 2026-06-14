@@ -3683,3 +3683,16 @@ Cite the C source (`file:line`) or dump probe that proves it.
   namelist-keyed dict. Real keys verified against `fesom2/work_all3` (oce: K_GM_max/Redi_Kmax; cvmix:
   tke_c_k/c_eps/cd/alpha). Test lives in `scripts/tests/` (pure-Python, runs outside the JAX suite).
   (`scripts/write_namelist.py`, `scripts/tests/test_write_namelist.py`; FORTRAN_TRANSFER_OK.)
+
+- **[adjoint-window/A7] The CORE2 TKE→MLD adjoint window is ~1 day (N≈50) on an 80GB A100 — measured,
+  and it reconciles the inherited 37.8 GB figure.** A single-GPU N-sweep of `d(mean MLD)/d(tke_c_k)`
+  (zstar+TKE) gives a CLEAN gradient (FD↔AD plateau 1e-5→1e-7, the signal is real) with peak backward
+  memory ≈ **35 + 0.8·N GB**: N=4→37GB, N=20→52GB, N=50→71GB, N=100→114GB. So the fast targets
+  (MLD/SST, days–seasonal) are adjoint-reachable at ~1-day BATCHED windows; the slow GM→T/S
+  (multi-year) is not ⇒ EKI. TKE+zstar+MLD is ~40% heavier than GM at N=20 (52 vs 37.8 GB — the tke
+  scan-carry + live-geometry + density + MLD diagnostic). TWO infra traps cost a GPU run each: (1)
+  Levante's `gpu` partition mixes **a100_40 and a100_80** nodes — `--gres=gpu:1` can land on a 40GB
+  card; request `--gres=gpu:a100_80:1` explicitly. (2) With `XLA_PYTHON_CLIENT_PREALLOCATE=false`
+  (needed to avoid OOM-on-CUBIN-load), XLA's default 0.80 mem fraction caps usable memory at 64GB on
+  an 80GB card, so N=50 (71GB) OOMs spuriously — set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` to use the
+  full card. (`scripts/core2_adjoint_window_sweep.py`+`.sbatch`, `fig_window_snr.py`; WINDOW_DERISK pending final pin.)
