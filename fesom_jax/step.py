@@ -173,6 +173,18 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt,
                 owned_mask=_red_mask, axis_name=_red_axis, exch=_exch,
                 boundary_node=boundary_node, use_virt_salt=use_virt_salt, zbar3=zbar3_live)
+            # Frozen-ice adjoint (paper §2): run the FULL mEVP ice in the forward but
+            # stop_gradient the whole ice update so the backward never enters the (unstable)
+            # mEVP rheology adjoint. stop_gradient is the identity in the forward ⇒ forward
+            # values are bit-identical to "exact"; only the gradient skips the ice. Tames the
+            # rheology adjoint blow-up for ocean-parameter calibration (drops the ice-mediated
+            # sensitivity). See IceConfig.adjoint_mode; "free_drift" is the planned upgrade.
+            if ice_cfg.adjoint_mode == "frozen":
+                ice_out = jax.tree.map(jax.lax.stop_gradient, ice_out)
+            elif ice_cfg.adjoint_mode != "exact":
+                raise NotImplementedError(
+                    f"IceConfig.adjoint_mode={ice_cfg.adjoint_mode!r} not implemented "
+                    "(planned: 'free_drift' custom_vjp adjoint); use 'exact' or 'frozen'.")
             stress_surf = ice_out.stress_surf
             bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
             heat_flux, water_flux = ice_out.heat_flux, ice_out.water_flux

@@ -12,13 +12,17 @@ optimizer-grade signal — the short-window twin target IS adjoint-reachable (un
 *obs* GM→T/S equilibrium of D2b, which needs EKI; the adjoint↔EKI boundary A7/C1 measured).
 
 **Proper ocean model, not a toy (user steer 2026-06-14).** The default config is the FULL
-paper model — **zstar + TKE + mEVP + GM/Redi all live** (``--config all3``) — exactly the
-``core2_all_on_smoke`` / mEVP-grad-gate seam, with sea ice seeded (:func:`fesom_jax.ice.seed_ice`)
-and the ice backward flowing through :func:`fesom_jax.integrate.integrate`. The adjoint therefore
-threads GM **through** the TKE mixing and the mEVP ice-momentum solve — the realistic calibration
-setting. (``--config gm`` keeps the C1-style isolated zstar+GM path as a lighter methodological
-control / fallback.) The all-on backward is heavy, so the window ``--n`` is small and the
-``.sbatch`` descends N on OOM; a perfect-model twin stays well-posed at any N (J=0 at the truth).
+paper model — **zstar + TKE + mEVP + GM/Redi all live** (``--config all3``), sea ice seeded
+(:func:`fesom_jax.ice.seed_ice`) — so the FORWARD is the real all-on ocean. ⚠️ The naive all-on
+*adjoint* explodes through the **mEVP sea-ice rheology** (the 120-iter plastic-yield solver;
+``|g|~9e51`` at N=12 — the classic VP/EVP sea-ice adjoint instability), even though the ocean-only
+adjoint is clean (C1). So the twin uses the **frozen-ice adjoint** (``IceConfig.adjoint_mode="frozen"``,
+Task A8): the full mEVP runs in the forward, but ``stop_gradient`` keeps the backward out of the ice
+rheology — the gradient threads GM through the TKE mixing while treating the (forward-real) ice as
+fixed. ``stop_gradient`` is the identity in the forward ⇒ the bowl is bit-identical to ``"exact"``.
+(``--config tkegm`` = ocean-only no-ice control; ``gm`` = the C1 isolated path. The planned
+free-drift adjoint will restore ice-momentum sensitivity — A8 Option B.) The window ``--n`` is small
+and the ``.sbatch`` descends N on OOM; a perfect-model twin stays well-posed at any N (J=0 at truth).
 
 Two pieces, both reusing the calibrate seam (:mod:`fesom_jax.calibrate`):
   1. **grid-scan the misfit bowl FIRST** (forward-only): confirm ``argmin_k J(k)`` sits at the
@@ -103,8 +107,13 @@ def build(year, n, config):
     if config == "all3":
         sst = np.asarray(base.T[:, 0])
         state = ice.seed_ice(base, mesh, sst)                       # mEVP needs an ice IC
+        # frozen-ice adjoint: full mEVP ice in the forward, gradient skips the unstable rheology
+        # adjoint (the mitgcm/ECCO-style cheap path; see IceConfig.adjoint_mode + the §2 finding).
         cfgs = dict(gm_cfg=GMConfig(), tke_cfg=TkeConfig(),
-                    ice_cfg=IceConfig(whichEVP=1), ale_cfg=AleConfig())
+                    ice_cfg=IceConfig(whichEVP=1, adjoint_mode="frozen"), ale_cfg=AleConfig())
+    elif config == "tkegm":
+        state = base
+        cfgs = dict(gm_cfg=GMConfig(), tke_cfg=TkeConfig(), ale_cfg=AleConfig())  # ocean-only, no ice
     elif config == "gm":
         state = base
         cfgs = dict(gm_cfg=GMConfig(), ale_cfg=AleConfig())         # C1-style isolation / fallback
@@ -152,8 +161,12 @@ def wmse(T, truth, w):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=8, help="adjoint window (steps); all-on is heavy")
-    ap.add_argument("--config", choices=("all3", "gm"), default="all3",
-                    help="all3 = zstar+TKE+mEVP+GM (proper model); gm = isolated zstar+GM (fallback)")
+    ap.add_argument("--config", choices=("all3", "tkegm", "gm"), default="all3",
+                    help="all3 = zstar+TKE+mEVP+GM (proper model); tkegm = ocean-only (no ice); "
+                         "gm = isolated zstar+GM (fallback)")
+    ap.add_argument("--grad-check", action="store_true",
+                    help="diagnostic: report |grad| of the normalized loss at init, then exit "
+                         "(probes adjoint sanity per config/N — no grid scan / recovery)")
     ap.add_argument("--truth", type=float, default=1500.0, help="injected k_gm truth")
     ap.add_argument("--init", type=float, default=800.0, help="recovery start k_gm")
     ap.add_argument("--band", type=int, default=10, help="# top layers for the upper-ocean T metric")
@@ -191,6 +204,31 @@ def main():
               f"peak={peak_gb():.1f}/{gpu_gb:.0f} GB", flush=True)
     except Exception as e:
         return _bail(args, rec, "truth", e)
+
+    # ---------- diagnostic: adjoint sanity (|grad| of the normalized loss at init), then exit ----
+    if args.grad_check:
+        try:
+            J0 = float(wmse(model_T(jnp.asarray(args.init, jnp.float64)), truth, w))
+
+            def loss_norm_gc(uu):
+                return wmse(model_T(1000.0 * uu), truth, w) / J0
+
+            t1 = time.time()
+            g = float(jax.grad(loss_norm_gc)(jnp.asarray(args.init / 1000.0, jnp.float64)))
+            dt_g = time.time() - t1
+        except Exception as e:
+            return _bail(args, rec, "gradcheck", e)
+        sane = bool(np.isfinite(g) and abs(g) < 1e6)        # a well-conditioned normalized grad is O(1)
+        pk = peak_gb()
+        print(f"\n  [grad-check] config={cfg_name} N={n}  J0={J0:.3e}  d(J/J0)/du@init={g:+.4e}  "
+              f"|g|={abs(g):.3e}  finite={np.isfinite(g)}  sane(|g|<1e6)={sane}  "
+              f"peak={pk:.1f}/{gpu_gb:.0f} GB  ({dt_g:.1f}s)", flush=True)
+        rec.update(dict(grad_check=True, J0=J0, grad_u=g, grad_sane=sane, peak_gb=pk))
+        args.results.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.results, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"TWIN_GRADCHECK_{'OK' if sane else 'BAD'}", flush=True)
+        return 0 if sane else 1
 
     # ---------- (1) grid-scan the misfit bowl FIRST (forward-only) ----------
     # bracket both init and truth; include the truth exactly so argmin can land on it.

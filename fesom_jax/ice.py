@@ -103,6 +103,16 @@ class IceConfig(NamedTuple):
     ch_atm_ice: float = CH_ATM_ICE  # 1.75e-3 sensible-heat over ice
     ce_atm_ice: float = CE_ATM_ICE  # 1.75e-3 evaporation over ice
     cd_atm_ice: float = CD_ATM_ICE  # 1.2e-3  atm-ice momentum drag
+    # --- adjoint mode (paper §2; how the ice block is treated in the BACKWARD pass) ---
+    #   "exact"      : autodiff the full ice step (default; forward == backward transpose).
+    #   "frozen"     : stop_gradient the ice update in the backward — the FORWARD still runs the
+    #                  full mEVP ice (identity under stop_gradient), only the gradient skips it.
+    #                  Tames the mEVP rheology adjoint blow-up for OCEAN-parameter calibration
+    #                  (the ice-mediated sensitivity is dropped). The MITgcm/ECCO-style cheap path.
+    #   "free_drift" : (PLANNED) custom_vjp free-drift adjoint — drop the internal-stress ∇·σ in
+    #                  the backward, keep wind/ocean-drag/Coriolis/tilt; retains ice-momentum
+    #                  sensitivity (and enables adjoint sea-ice calibration). NOT yet implemented.
+    adjoint_mode: str = "exact"
 
     # ---- derived (fesom_ice.c:85-86, 233, 84) ----
     @property

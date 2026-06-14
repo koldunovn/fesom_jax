@@ -3748,3 +3748,29 @@ Cite the C source (`file:line`) or dump probe that proves it.
   reconfirmed: the GM short-window adjoint signal is **tiny** (6.5e-10 vs MLD/c_k's 2e-2) ⇒ the slow GM→T/S
   equilibrium is beyond the adjoint window — exactly why §2 GM calib uses EKI (the adjoint↔EKI rel-6.6%
   cross-check ties them). (`scripts/core2_paper_sensitivity.py`; **SENSITIVITY_MAP_OK**.)
+
+- **[AD / sea ice] The all-on (zstar+TKE+mEVP+GM) FORWARD is fine but the naive ADJOINT explodes
+  through the mEVP sea-ice rheology — fix with a frozen-ice adjoint (full forward, `stop_gradient`
+  the ice in the backward).** D1's perfect-model `k_gm` twin on the FULL model had a textbook-clean
+  misfit bowl (argmin exactly at the truth) yet the backward gave `|g|≈9e51`, *mis-directed* (k_gm ran
+  800→516→159). The ocean-only adjoints are clean at N=12 (C1: zstar+TKE, zstar+GM) and the mEVP
+  grad-gate already showed huge ice gradients (`d/d(m_ice)=6e9`) at N=4 ⇒ the culprit is the mEVP
+  120-iter plastic-yield solver's adjoint — the classic VP/EVP sea-ice adjoint instability MITgcm/ECCO
+  hit. Fix (`IceConfig.adjoint_mode="frozen"`, `step.py`): run the full mEVP in the forward but
+  `jax.tree.map(jax.lax.stop_gradient, ice_out)` so the backward never enters the rheology adjoint.
+  `stop_gradient` is the identity in the forward ⇒ **forward bit-identical** (verified: frozen
+  J0=2.676528e-06 == exact). Result: `|g|` 9e51→**2.31**, and the all-on twin recovered **k_gm=1498.88
+  (rel 0.075%)**, misfit 2.68e-6→1.78e-10. Lesson: in AD you can run the full physics forward and
+  substitute a stable adjoint for one block — `stop_gradient` (skip) or `custom_vjp` (the planned
+  free-drift adjoint = drop ∇·σ, keep wind/ocean/Coriolis/tilt). An approximate adjoint ⇒ FD≠AD by
+  construction; validate by descent + EKI cross-check, not a gradient check. (`fesom_jax/ice.py`,
+  `fesom_jax/step.py`, `scripts/core2_paper_calib_twin.py`; **TWIN_RECOVER_OK**.)
+
+- **[optimizer] A tiny-signal misfit needs the loss normalized by its initial value, or Adam's `eps`
+  swamps the gradient.** The GM short-window misfit is ~1e-6 (the GM→T signal is ~1e-9; C1), so the raw
+  `d(loss)/dθ` is ~1e-11 — far below Adam's default `eps=1e-8`, making the `m/(√v+eps)` step ≈ `lr·g/eps`
+  ≈ tiny ⇒ the parameter barely moves (a CPU pi-twin caught this: recovery stalled at the start). Fix:
+  optimize `loss/J0` (J0 = the misfit at the start; an O(1) loss ⇒ O(1) gradient) on a scale-free leaf
+  `u=θ/θ_ref`. A pi convergence probe then sets `lr`/`iters` (lr=0.05/80→2.2%, *missed* the 2% bar;
+  lr=0.1/100→<0.1%) — probe the cheap mesh first, the normalized-bowl dynamics are mesh-independent.
+  (`scripts/core2_paper_calib_twin.py`, `fesom_jax/tests/test_calib_twin.py`; **TWIN_RECIPE_OK**.)
