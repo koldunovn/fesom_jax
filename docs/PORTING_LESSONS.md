@@ -3774,3 +3774,15 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `u=θ/θ_ref`. A pi convergence probe then sets `lr`/`iters` (lr=0.05/80→2.2%, *missed* the 2% bar;
   lr=0.1/100→<0.1%) — probe the cheap mesh first, the normalized-bowl dynamics are mesh-independent.
   (`scripts/core2_paper_calib_twin.py`, `fesom_jax/tests/test_calib_twin.py`; **TWIN_RECIPE_OK**.)
+
+- **[calibration / §2] MLD is a strong FAST adjoint target — the TKE→MLD twin recovers in the FULL
+  all-on model via the frozen-ice adjoint, far faster than the GM→T twin.** D2a injects `tke_c_k=0.15`,
+  freezes the model's density-threshold MLD field (`obs_compare.mld_density_threshold`) as the synthetic
+  obs, and recovers from 0.08 through the all-on + frozen-ice adjoint (`calibrate.optimize`): **c_k=0.14974
+  (rel 0.176%) in 9 iterations**, MLD misfit 3.74→3.69e-6 m² (6 orders). vs the GM twin's 43 iters — the
+  MLD↔c_k signal is ~10 orders larger (C1: ∂MLD/∂c_k=+2.91 vs ∂T/∂k_gm~1e-7), so MLD calibration is cheap
+  and well-conditioned (loss-normalization barely needed, J0~O(m²)). Confirms (a) the C1 sensitivity
+  signal is optimizer-grade, and (b) the frozen-ice adjoint generalizes to a 2nd parameter/target. MLD is
+  the right OMIP metric for TKE calibration (fast ⇒ adjoint, not EKI). No CPU twin: TKE raises on the pi
+  `integrate` path (`mixing_tke` is the faithful site) — the recipe is guarded by the D1 `test_calib_twin`.
+  (`scripts/core2_paper_calib_tke.py`; **TKE_TWIN_OK**.)
