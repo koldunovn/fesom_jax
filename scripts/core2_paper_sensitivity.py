@@ -163,13 +163,15 @@ def make_loss(target, mesh, st0, op, fs, sfs, n, band):
     raise ValueError(f"unknown target {target!r}; choose from {TARGETS}")
 
 
-def fd_scalar_sweep(loss_field, to_field, s0):
-    """Central relative FD of the SCALAR functional J(loss_field(to_field(s))) at s0."""
-    f = jax.jit(lambda s: loss_field(to_field(s)))
+def fd_scalar_sweep(loss_jit, to_field, s0):
+    """Central relative FD of the SCALAR functional at s0, reusing the ALREADY-jitted forward
+    ``loss_jit`` (a uniform field ``to_field(s)``) — no extra executable (fewer CUDA graphs)."""
     rows = []
     for h in H_SWEEP:
         sp, sm = s0 * (1.0 + h), s0 * (1.0 - h)
-        rows.append((h, float((f(sp) - f(sm)) / (sp - sm))))
+        fp = float(loss_jit(to_field(sp)))
+        fm = float(loss_jit(to_field(sm)))
+        rows.append((h, (fp - fm) / (sp - sm)))
     return rows
 
 
@@ -206,10 +208,24 @@ def main():
     # ---------- (2)+(1) ONE backward pass: the [nod2D] map; scalar AD = Σ map ----------
     loss_jit = jax.jit(loss_field)
     grad_jit = jax.jit(jax.grad(loss_field))
-    J0 = float(loss_jit(th0_field))
-    t1 = time.time()
-    g = np.asarray(grad_jit(th0_field))                        # [N] or [N,1]
-    bwd_s = time.time() - t1
+    try:
+        J0 = float(loss_jit(th0_field))
+        t1 = time.time()
+        g = np.asarray(grad_jit(th0_field))                    # [N] or [N,1]
+        bwd_s = time.time() - t1
+    except Exception as e:                                     # OOM (working set OR CUDA-graph)
+        msg = type(e).__name__ + ": " + str(e)[:240]
+        is_oom = ("RESOURCE_EXHAUSTED" in str(e).upper() or "OUT_OF_MEMORY" in str(e).upper()
+                  or "memory" in str(e).lower())
+        pk = peak_gb()
+        rec.update(dict(oom=is_oom, peak_gb=pk, ok=False, error=msg))
+        args.results.parent.mkdir(parents=True, exist_ok=True)
+        with open(args.results, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        print(f"\n  N={n} {tgt}: FAILED ({msg})", flush=True)
+        # exit 2 = "OOM, retry a smaller N" (the .sbatch descends N on this code); 1 = hard fail
+        print(f"SENSITIVITY_{tgt.upper()}_{'OOM' if is_oom else 'FAIL'}", flush=True)
+        return 2 if is_oom else 1
     pk = peak_gb()
     g_flat = g.reshape(-1)                                     # squeeze the [N,1] c_k case
     g_ad_scalar = float(np.sum(g_flat))                        # = dJ/dθ_scalar (uniform broadcast)
@@ -221,7 +237,7 @@ def main():
           f"max|g|={amax:.3e}  peak={pk:.2f}/{gpu_gb:.0f} GB  bwd={bwd_s:.1f}s", flush=True)
 
     # ---------- (1) adjoint == FD on the scalar θ (the proof; plateau over h) ----------
-    rows = fd_scalar_sweep(loss_field, to_field, th0_scalar)
+    rows = fd_scalar_sweep(loss_jit, to_field, th0_scalar)
     plateau = min(abs(g_ad_scalar - gf) / max(abs(gf), 1e-300) for _, gf in rows)
     print(f"  --- adjoint==FD proof (scalar θ={th0_scalar:g}) ---")
     for h, gf in rows:
@@ -259,8 +275,8 @@ def main():
         # deterministic ±spread sample (no Math.random in-graph); forward-only, sequential
         zs = np.linspace(-1.0, 1.0, J)
         thetas = th0_scalar * (1.0 + args.ens_sigma * zs)          # [J]
-        fsc = jax.jit(lambda s: loss_field(to_field(s)))
-        gs = np.array([float(fsc(jnp.asarray(t, jnp.float64))) for t in thetas])
+        # reuse the already-jitted forward (uniform field) — no extra executable / CUDA graphs
+        gs = np.array([float(loss_jit(to_field(jnp.asarray(t, jnp.float64)))) for t in thetas])
         # forward-ensemble gradient estimate = cov(θ,J)/var(θ) — the regression slope that is
         # exactly the core of eki.eki_update's C_θg (validated against eki_update below).
         th_c = thetas - thetas.mean()

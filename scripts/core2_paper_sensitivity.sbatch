@@ -23,10 +23,15 @@ PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
+# Disable CUDA-graph command buffers: the field-leaf driver compiles several big executables
+# (loss + grad) and the accumulated command buffers ("38 alive graphs") OOM at N=20 even though
+# the working set (~52 GB TKE / ~40 GB GM) fits 80 GB. Command buffers are a launch-latency
+# optimization, not needed here. (The error itself recommends this; C1 lesson.)
+export XLA_FLAGS=--xla_gpu_enable_command_buffer=
 RESULTS=scripts/sensitivity_results.jsonl
-N=${1:-20}
+NLIST=${1:-"20 12 6"}        # descend N per target until the field-leaf backward fits (safety net)
 
-echo "=== $(hostname) $(date)  N=$N ==="
+echo "=== $(hostname) $(date)  NLIST='$NLIST' ==="
 nvidia-smi -L 2>/dev/null || true
 
 # fresh results file for this run
@@ -35,8 +40,15 @@ nvidia-smi -L 2>/dev/null || true
 for TGT in mld_ck ts_kgm; do
     echo ""
     echo "===== target=$TGT  $(date) ====="
-    "$PY" scripts/core2_paper_sensitivity.py --target "$TGT" --n "$N" --results "$RESULTS"
-    echo "  ($TGT exit: $?)"
+    for N in $NLIST; do
+        echo "  --- $TGT N=$N ---"
+        "$PY" scripts/core2_paper_sensitivity.py --target "$TGT" --n "$N" --results "$RESULTS"
+        rc=$?
+        echo "  ($TGT N=$N exit: $rc)"
+        # 0 = success (map written) → next target; 2 = OOM → try smaller N; else hard fail → stop target
+        if [ "$rc" -eq 0 ]; then break; fi
+        if [ "$rc" -ne 2 ]; then echo "  ($TGT hard-failed rc=$rc; not retrying)"; break; fi
+    done
 done
 
 echo ""
