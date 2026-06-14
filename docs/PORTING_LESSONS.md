@@ -3701,3 +3701,21 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (avoids the CUBIN-load OOM), XLA's default 0.80 fraction caps usable memory at 64GB on an 80GB card;
   set `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` for the full card. (`core2_adjoint_window_sweep.py`+`.sbatch`,
   `fig_window_snr.py`; **WINDOW_DERISK_OK**, N_max=20.)
+
+- **[sensitivity/C1] A scalar→`[nod2D]` field-leaf sensitivity map costs ZERO kernel change, and ONE
+  backward delivers BOTH the map AND the scalar grad-gate proof.** Promoting a `Params` scalar to a
+  field is just `build_params({'k_gm': field})` — the seam already differentiates array leaves (the
+  "scalar calibration is the zeroth-order NN" thesis). The only trap is the **broadcast shape**, which
+  differs per consumption site: `k_gm` promotes to `[nod2D]` (it enters as `scaling*k_gm` with
+  `scaling=area[:,0]` → `[nod2D]`, then `[:,None]` over levels), but `tke_c_k` MUST be `[nod2D,1]` (it
+  enters as `c_k*mxl*√tke` with `mxl` being `[nod2D,nl]` — a bare `[nod2D]` mis-aligns with the level
+  axis). Verify the broadcast on the pi mesh BEFORE the GPU run (a 2-line `jax.grad` probe). **The
+  uniform-broadcast identity** `dJ/dθ_scalar == Σ_x ∂J/∂θ_field(x)` (a uniform field's cotangent sums)
+  is exact (pi mesh: rel 2.8e-16) — so the field map's SUM *is* the scalar gradient the existing grad
+  gates report, FD-verified with one forward sweep ⇒ no separate scalar backward needed. The pi-mesh GM
+  `d(meanT)/d(k_gm)` is tiny (~7e-10) yet FD↔AD-clean to 1e-9 (smooth GM response) — small magnitude ≠
+  noisy gradient. Label the map HONESTLY as the **fast/instantaneous** (single ~10-h window) sensitivity,
+  NOT the equilibrium; the **adjoint↔EKI cross-check** (`cov(θ,J)/var(θ)` == adjoint scalar grad for the
+  locally-linear `k_gm`) validates both tools and motivates EKI for the slow equilibrium the adjoint
+  can't reach. (`scripts/core2_paper_sensitivity.py`+`.sbatch`, `scripts/fig_sensitivity.py`,
+  `fesom_jax/tests/test_sensitivity.py`; **SENSITIVITY_SEAM_OK** (CPU) + **SENSITIVITY_MAP_OK** (GPU).)
