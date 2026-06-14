@@ -3798,14 +3798,17 @@ Cite the C source (`file:line`) or dump probe that proves it.
   0)` or `0·NaN=NaN` poisons the weighted sum even at weight 0 (the masked-NaN rule, obs side).
   (`scripts/make_woa_targets.py`.)
 
-- **[AD / GPU] An obs-operator-augmented all-on backward run in an optimization LOOP hits an XLA/CUDA
-  CUBIN-reload OOM that the perfect-model twin's loop does not.** D2a-obs (TKE→WOA MLD+SST) is VALIDATED
-  to the gradient — spin-up, the `obs_compare` operator on real WOA (baseline gaps ~33 m / ~0.81 °C),
-  and iteration 1 of the adjoint (sane, descending `|g|`) all work — but iteration 2 reliably dies with
-  `RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN`, **independent of config (all3/tkegm), N (12→4),
-  and MEM_FRACTION (0.95/0.85)**, with tens of GB free. The twin's loop (`calibrate.optimize`) runs 43
-  iters fine; the obs-operator executable won't re-stage in the loop (cause not pinned down remotely —
-  module staging, not a tensor alloc). Spin-up was moved to a separate process (its retained pool was a
-  separate, real OOM). **Resolution: do the obs calibration via EKI** (`fesom_jax.eki`, forward-only ⇒
-  no backward ⇒ no loop/CUBIN issue), which also gives an adjoint↔EKI cross-check on the TKE parameter.
-  The §2 capability is proven by the twins regardless. (`scripts/core2_paper_calib_tke_obs.py`.)
+- **[AD / JAX] A `RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN` OOM at iteration 2 of an optimizer
+  loop is a WEAK-TYPE RECOMPILE, not a memory limit.** D2a-obs (TKE→WOA MLD+SST) died at it=2 with this
+  error for 8 attempts, **independent of config (all3/tkegm), N (12→4), and MEM_FRACTION (0.95/0.85)**,
+  with tens of GB free — while the twin's loop ran 43 iters fine. Root cause (CPU-confirmed with a trace
+  counter): the init `u0 = {"ck": jnp.asarray(1.0)}` is **weakly typed**; the first Adam update produces
+  a **strongly** typed float64, so the loop calls the jitted step with a *different signature* at it=2 →
+  XLA **recompiles** → a 2nd executable's CUBIN loads atop it=1's still-resident one → OOM. The twin
+  never hit it because its init was explicit `jnp.asarray(x, jnp.float64)` (strong). Fix: strong-type the
+  optimizer init (`jnp.asarray(1.0, jnp.float64)`). Lesson: "Failed to load CUBIN" mid-loop ⇒ suspect a
+  per-iter **recompile** (weak types, Python-int/shape drift), not the allocator — verify with a trace
+  counter. Then the obs calib runs all-on (job 25601631, 32 it, 52.6 GB; MLD misfit −8.3%, SST −4.8%).
+  ⚠️ The 2-param `{c_k,c_eps}` fit overfits — `c_eps`→0 (unphysical) — the structural-bias compensation
+  the recovered-value plausibility report catches; use `--params ck` or bound `c_eps`.
+  (`scripts/core2_paper_calib_tke_obs.py`.)

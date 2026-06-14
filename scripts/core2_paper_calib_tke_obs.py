@@ -5,16 +5,17 @@ global adjoint through the FULL paper model (zstar+TKE+mEVP+GM) with the frozen-
 perfect-model twin (``core2_paper_calib_tke.py``) proved the inversion is well-posed; this applies it
 to real observations through the differentiable obs operator (:mod:`fesom_jax.obs_compare`).
 
-⚠️ **STATUS (2026-06-14): VALIDATED to the gradient, but the optimization LOOP is GPU-blocked.**
-The spin-up, the WOA MLD+SST obs operator (baseline gaps ~33 m / ~0.81 °C — the keystone operator's
-first real-data use), and the obs **gradient** (iteration 1: sane, descending ``|g|``) all work. But
-iteration 2 reliably dies with ``RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN`` — an XLA/CUDA
-module re-staging OOM — **independent of config (all3/tkegm), window N (12→4), and MEM_FRACTION
-(0.95/0.85)**, even with tens of GB free. The perfect-model twin's loop (``calibrate.optimize``) runs
-43 iters fine; the obs-operator-augmented executable does not re-stage in the loop. Remotely
-intractable. **Path forward: run the obs calibration via EKI** (:mod:`fesom_jax.eki`, forward-only ⇒
-no backward ⇒ no CUBIN/loop issue; uses the proper config), or debug the CUBIN issue interactively.
-The §2 capability is already proven by the twins; this is the obs application only.
+**STATUS (2026-06-14): WORKS in the all-on model.** Earlier the loop died at iteration 2 with
+``RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN`` — which looked like a memory OOM but was a
+**weak-type recompile**: ``jnp.asarray(1.0)`` makes ``u0`` *weakly* typed, the first Adam update
+strengthens it, and that type change re-triggers ``jit_step`` compilation at it=2 → a 2nd CUBIN
+loaded atop it=1's → OOM. (The twin never hit it: its init was explicitly ``jnp.float64``.) Fix:
+strong-typed ``u0`` (below) ⇒ no recompile ⇒ the loop runs (job 25601631, all-on N=12, 32 iters).
+⚠️ The **2-parameter** ``{c_k, c_eps}`` fit overfits: ``c_eps`` collapses to ~0 (unphysical) to
+squeeze out misfit — the structural-bias compensation the plausibility report is designed to catch
+(over a short window MLD is mainly controlled by ``c_k``, so ``c_eps`` is weakly constrained). Use
+``--params ck`` (well-constrained) for the headline, or bound ``c_eps``; held-out validation (D2c)
+also catches it.
 
 **Obs target = WOA monthly-derived MLD + SST** (de Boyer Montégut is IFREMER-blocked). The MLD is
 computed from **monthly** WOA T/S with the model's *own* diagnostic and averaged
@@ -224,7 +225,11 @@ def main():
     # Fixed O(1) scales balance MLD (~1e3 m²) and SST (~1 °C²) without a baseline pre-pass; the
     # baseline is just the FIRST iter's misfits (default params).
     SCALE_MLD, SCALE_SST = 1000.0, 1.0
-    u0 = {"ck": jnp.asarray(1.0)} | ({"ceps": jnp.asarray(1.0)} if args.params == "ck_ceps" else {})
+    # ⚠️ STRONG float64 (not jnp.asarray(1.0), which is WEAK): a weak→strong type change after the
+    # first Adam update re-triggers jit_step compilation at it=2 → a 2nd CUBIN load on top of it=1's
+    # → the "Failed to load in-memory CUBIN" OOM. (The twin's init was explicitly float64 ⇒ no recompile.)
+    one = jnp.asarray(1.0, jnp.float64)
+    u0 = {"ck": one} | ({"ceps": one} if args.params == "ck_ceps" else {})
 
     def loss_aux(u):
         jm, js = misfits(u)

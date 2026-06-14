@@ -18,10 +18,7 @@ source /sw/etc/profile.levante
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false
-# 0.85 (not 0.95): leave persistent GPU room for the obs-operator-augmented executable MODULE to
-# (re)load each iter — at 0.95 BFC grabs ~76 GB and the CUBIN can't re-stage at it=2 (the twin's
-# smaller executable fit at 0.95, the obs calib's doesn't). tkegm backward (~30 GB) fits 0.85·80.
-export XLA_PYTHON_CLIENT_MEM_FRACTION=${MEMFRAC:-0.85}
+export XLA_PYTHON_CLIENT_MEM_FRACTION=${MEMFRAC:-0.95}
 export XLA_FLAGS=--xla_gpu_enable_command_buffer=
 RESULTS=scripts/calib_tke_obs_results.jsonl
 NSPIN=${1:-480}
