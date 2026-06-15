@@ -3817,8 +3817,9 @@ Cite the C source (`file:line`) or dump probe that proves it.
   model with LIVE mEVP ice — forward-only ⇒ immune to the A8 sea-ice-rheology adjoint instability** (no
   frozen-ice approximation the adjoint twins D1/D2a needed; the whole point of the adjoint↔EKI split). D2b's
   perfect-model EKI twin (`scripts/core2_paper_calib_gm_eki.py --mode twin`) recovered a planted `k_gm=1500`
-  to **0.065 %** (1500.97; ensemble 1501.0±0.6) in **3 EKI iters** at a **2-day** window, misfit −5.5 orders,
-  peak **18 GB** (forward-only is light — no tape). Observable = basin-mean upper-ocean/thermocline T/S
+  to **0.034 %** (1500.51; ensemble 1500.5±0.5) in **5 EKI iters** at a **5-day** window (10 members; the 2-day/
+  6-member de-risk gave 0.065 %), misfit 1.4e-5→4.2e-11, peak **24 GB** (forward-only is light — no tape).
+  Observable = basin-mean upper-ocean/thermocline T/S
   profiles (5 lat bands × 8 WOA levels × {T,S} = an 80-vec) via the tested `obs_compare.{to_obs,
   basin_mean_profiles}`; the SAME fixed reduction (fixed basin weights + a fixed common-validity mask) hits
   model AND obs ⇒ a clean *linear* observable where members differ only through the physics. ⚠️ The GM→T/S
@@ -3827,7 +3828,13 @@ Cite the C source (`file:line`) or dump probe that proves it.
   signal²**: use auto-Γ = `(ε·ensemble-signal)²` (ε=0.05) for the twin. A *physical* absolute σ_T=0.5 °C
   would swamp the 3e-4 °C signal (Γ ≫ C_gg ⇒ no update) — the EKI analogue of D1's "normalize the loss by
   J0". This is also exactly why the short-window *obs* calibration (which must use physical σ) is weakly
-  constrained: the equilibrium GM→stratification adjustment is multi-year, the production ensemble.
+  constrained — **empirically confirmed**: the obs run (`--mode obs`, WOA basin T/S over a 10-day window) recovered
+  `k_gm=1356` but with an ensemble spread of **±347 (26 %, no collapse)** and a misfit that barely moved (−0.2 %,
+  bowl flat ≈2.35–2.40 across [600,1800], argmin at the grid edge). The WOA misfit is IC/spin-up-dominated over
+  short windows ⇒ the **twin proves the OPTIMIZER works, the obs proves the WINDOW is the limiting factor** (so the
+  equilibrium GM→stratification calibration needs the multi-year production ensemble — short-window adjoint OR
+  short-window EKI both under-constrain it). The recovered-value-with-uncertainty report (±347) is the rigor catch,
+  the D2a `c_eps`→0 analogue: report VALUES + plausibility, never just "misfit reduced".
   (`scripts/core2_paper_calib_gm_eki.py`, `fesom_jax/obs_compare.basin_mean_profiles`, `fesom_jax/eki.py`.)
 
 - **[AD / JAX / perf] A jit that closes over the pre-stacked CORE2 forcing makes XLA constant-fold the
