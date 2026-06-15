@@ -177,6 +177,9 @@ def main():
     ap.add_argument("--ic-dir", type=str, default="",
                     help="override the IC cache dir (e.g. data/ic_core2_dist864 to match an 864r oracle)")
     ap.add_argument("--steps", type=int, default=0, help="override n_steps (smoke test)")
+    ap.add_argument("--save-state", type=str, default="",
+                    help="pickle the FINAL model State (jax.device_get) here — a restartable, "
+                         "developed spun-up state for downstream twins/calibration (e.g. §3 E1)")
     args = ap.parse_args()
     dt = args.dt
     n_steps = args.steps if args.steps > 0 else int(round(args.years * 365 * 86400 / dt))
@@ -257,6 +260,12 @@ def main():
                 return 1
     flush(am_year, am_month, acc, count, last_doy)         # final month
     writer.close()
+    if args.save_state:
+        import pickle
+        sp = Path(args.save_state); sp.parent.mkdir(parents=True, exist_ok=True)
+        with open(sp, "wb") as fpk:
+            pickle.dump(jax.device_get(state), fpk)
+        print(f"[save-state] final developed State ({n_steps*dt/86400:.0f} d) → {sp}", flush=True)
     print(f"\nPASS: {n_steps} steps ({n_steps*dt/86400:.1f} days) stable; worst |vel|={worst_vel:.3e}; "
           f"monthly means → {args.out}", flush=True)
     print("KPP_CLIMATE_RUN_OK", flush=True)

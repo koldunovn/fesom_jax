@@ -3868,3 +3868,32 @@ Cite the C source (`file:line`) or dump probe that proves it.
   ΔRMSE (~0.003 °C) sits UNDER the C↔Fortran 0.0049 °C floor** — honestly, MLD is the constrained channel, not
   SST (and the EN4 interannual-spread bar needs the multi-year series, not the staged seasonal climatology).
   (`scripts/core2_paper_calib_tke_obs.py` `--holdout`/`build_holdout`, `scripts/fig_calibration.py`.)
+
+- **[§3 hybrid-ML / AD memory] The CORE2 NN-of-TKE backward is RUNTIME-peak-bound, not compile-temp-bound
+  — `memory_analysis()` underpredicts by ~2.4×, and a SECOND large jitted program is what actually OOMs.**
+  Training a `tke_nn` end-to-end through the full all-on global model (zstar+TKE+mEVP+GM, frozen-ice adjoint)
+  OOMed the 80 GB A100 at EVERY window N≤12 — not from un-checkpointed unrolling (`integrate` already wraps
+  each step in `jax.checkpoint`), but from the **single-step VJP working set** (one step recomputed during the
+  scan reverse tapes ALL its full-3D-mesh intermediates — FCT edge fields at 143 MB, Redi/GM/momentum — at
+  once). Decompose the OOM-vs-N requests (43.66 GiB@N12 → 38.57@N6): **~0.85 GiB/step (scan carries) + ~34 GiB
+  fixed (the per-step tape, independent of window length)** — so descending N never helps. Two fixes that
+  compose: **(1) nested in-step remat** — a `remat_blocks` flag through `integrate`→`step` wrapping each heavy
+  block (GM, TKE/KPP/PP, momentum×3, FCT×2, Redi, vert-diff, EOS, pgf) in its OWN `jax.checkpoint` so the
+  reverse sweep recomputes ONE block at a time (`jax.checkpoint` is the identity in the forward ⇒ bit-identical
+  values, gradient-identical; `remat_blocks=False` default ⇒ byte-identical no-trace-change path — verified
+  pi forward Δ=0, grad rel=0). **(2) driver: compute baseline/final misfits by reusing the already-compiled
+  `model_ts` executable, NOT a separate `jax.jit(raw_loss_TS)`** — with `XLA_PYTHON_CLIENT_PREALLOCATE=false`
+  (mandatory — `=true` OOMs the truth forward's CUBIN load, the D2a it=2 gotcha) BFC never returns a freed
+  region, so a second ~11 GiB executable arena fragments the pool and the grad can't grow its ~38 GiB region.
+  RESULT: runs at **N=10** (peak 39.3/81 GB) where it OOMed before — grad-check FD↔AD `rel=1.6%` (the
+  NN-weight gradient through the GLOBAL model is correct) and the T/S evolution recovers (misfit 0.15×). Two
+  measured truths: **(a)** the **recovery LOOP** (`value_and_grad`) has huge headroom (39/81 GB at N=10) — only
+  the OPTIONAL standalone grad-check OOMs above N=10 (a fragmenting 2nd program right after the truth forward),
+  so `--no-grad-check` (gradient already proven) admits a much longer window. **(b)** a 5-h window recovers the
+  T/S evolution + the gradient but NOT the induced-mixing FIELD (corr_active 0.118 ≪ 0.9): a rich per-column NN
+  multiplier is **under-constrained** by short-window evolution (classic non-uniqueness; cf. D2c spatial
+  transfer) — field recovery needs a longer window (or the cheap-long-window pi recipe `test_nn_twin.py`).
+  Build a compile-only `memory_analysis()` probe to size forward-vs-backward and validate a remat fix BEFORE a
+  full GPU run — but trust RUNTIME OOM (the BFC `bfc_allocator.cc` "ran out trying to allocate" line + the
+  region-growth attempts) for the true ceiling, not the compile-temp. (`fesom_jax/step.py` `remat_blocks`/`_ckpt`,
+  `fesom_jax/integrate.py`, `scripts/core2_paper_nn_twin.py`, `scripts/core2_nn_twin_memprobe.py`.)

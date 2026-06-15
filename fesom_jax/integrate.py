@@ -44,7 +44,7 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
               params: Params = None, *, dt: float = DT_DEFAULT,
               checkpoint: bool = True, step_forcings=None, forcing_static=None,
               ice_cfg=None, gm_cfg=None, kpp_cfg=None, tke_cfg=None,
-              ale_cfg=None) -> State:
+              ale_cfg=None, remat_blocks: bool = False) -> State:
     """Integrate ``n_steps`` ocean timesteps from ``state`` via a checkpointed scan.
 
     Returns the final :class:`~fesom_jax.state.State`. Differentiable end-to-end
@@ -69,13 +69,15 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
     if step_forcings is None:
         # pi path (unchanged): static stress_surf, no per-step forcing, xs=None.
         state = step(state, mesh, op, stress_surf, params, dt=dt, is_first_step=True,
-                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg)
+                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
+                     remat_blocks=remat_blocks)
         if n_steps <= 1:
             return state
 
         def body(carry, _):
             nxt = step(carry, mesh, op, stress_surf, params, dt=dt, is_first_step=False,
-                       gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg)
+                       gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
+                       remat_blocks=remat_blocks)
             return nxt, None
 
         body_fn = jax.checkpoint(body) if checkpoint else body
@@ -87,7 +89,8 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
     sf0 = jax.tree.map(lambda x: x[0], step_forcings)
     state = step(state, mesh, op, stress_surf, params, dt=dt, is_first_step=True,
                  step_forcing=sf0, forcing_static=forcing_static, ice_cfg=ice_cfg,
-                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg)
+                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
+                 remat_blocks=remat_blocks)
     if n_steps <= 1:
         return state
 
@@ -96,7 +99,8 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
     def body_core(carry, sf):
         nxt = step(carry, mesh, op, stress_surf, params, dt=dt, is_first_step=False,
                    step_forcing=sf, forcing_static=forcing_static, ice_cfg=ice_cfg,
-                   gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg)
+                   gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
+                   remat_blocks=remat_blocks)
         return nxt, None
 
     body_fn = jax.checkpoint(body_core) if checkpoint else body_core
@@ -110,4 +114,4 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
 integrate_jit = jax.jit(
     integrate,
     static_argnames=("n_steps", "dt", "checkpoint", "ice_cfg", "gm_cfg", "kpp_cfg",
-                     "tke_cfg", "ale_cfg"))
+                     "tke_cfg", "ale_cfg", "remat_blocks"))
