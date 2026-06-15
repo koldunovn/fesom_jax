@@ -3850,3 +3850,21 @@ Cite the C source (`file:line`) or dump probe that proves it.
   production EKI is hundreds of GPU-h — a production run, NOT overnight; the overnight EKI is a scoped
   demonstration + the GPU-h projection (`--mode budget`, the EKI analogue of A7's adjoint-window de-risking).
   (`scripts/core2_paper_calib_gm_eki.py`.)
+
+- **[calibration / rigor] Held-out CV answers TWO different questions for a global scalar — pick the split to
+  match the question.** Validating the TKE `c_k`→WOA-MLD calibration on independent cells: a **random** 50/50
+  cell split (train+held-out share the bias structure) gives held-out reduction **≈ train** (~+2 % each) ⇒ the
+  clean "**not overfitting**" test (it fits real signal, not per-cell noise). A **blocked** 60° longitude split
+  (spatially independent) instead exposes spatial **transferability**: the recovered `c_k` stays robust
+  (~0.22–0.24 either fold) but the held-out misfit moves **asymmetrically** — a global `c_k` *helps* the
+  held-out deep-convection sectors (**+2.75 %**) yet slightly *over-mixes* the held-out low-bias sectors
+  (**−0.15 %**), because the `c_k`-sensitive bias is spatially concentrated (matches the §1 C1 map). A single
+  global scalar can't fix a spatially-structured bias ⇒ report BOTH (random gates "not overfitting"; blocked
+  motivates spatially-varying params). The recovered VALUE being robust across ALL splits (here spread 7.3 %,
+  random cross-fold scatter 1.2 %) is the strongest rigor metric — report values + plausibility, never just
+  "misfit reduced". Two practical notes: **(1)** score the held-out cells via `has_aux` (their weights never
+  enter the loss) so no gradient leaks from them; `--holdout none` then stays bit-identical to the full-domain
+  path. **(2)** A short-window calibration only moves what the window constrains: MLD ΔRMSE is real but **SST
+  ΔRMSE (~0.003 °C) sits UNDER the C↔Fortran 0.0049 °C floor** — honestly, MLD is the constrained channel, not
+  SST (and the EN4 interannual-spread bar needs the multi-year series, not the staged seasonal climatology).
+  (`scripts/core2_paper_calib_tke_obs.py` `--holdout`/`build_holdout`, `scripts/fig_calibration.py`.)

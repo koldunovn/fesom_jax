@@ -107,7 +107,8 @@ def build(year, config):
 
 
 def load_woa(mesh, month):
-    """WOA MLD+SST target for ``month`` (1-12) on the WOA grid → Hmap + flattened cell targets."""
+    """WOA MLD+SST target for ``month`` (1-12) on the WOA grid → Hmap + flattened cell targets +
+    per-cell (lat, lon) (for the D2c held-out region split)."""
     d = np.load(WOA_NPZ)
     lat, lon = d["lat"], d["lon"]
     mi = month - 1
@@ -121,7 +122,43 @@ def load_woa(mesh, month):
     sst = np.where(np.isfinite(sst) & sst_ok, sst, 0.0)
     obs_grid = obs_compare.ObsGrid(lat=lat, lon=lon, depth=np.array([10.0, 100.0]))  # depth unused (surface)
     Hmap = obs_compare.build_h_map(mesh, obs_grid)
-    return Hmap, (jnp.asarray(mld), jnp.asarray(mld_ok), jnp.asarray(sst), jnp.asarray(sst_ok))
+    cell_lat = np.repeat(lat, lon.size)                          # [n_cells] C-order (lat-major)
+    cell_lon = np.tile(lon, lat.size)
+    return (Hmap, (jnp.asarray(mld), jnp.asarray(mld_ok), jnp.asarray(sst), jnp.asarray(sst_ok)),
+            (cell_lat, cell_lon))
+
+
+# C↔Fortran SST RMSE reproducibility floor (core2_tke_climate_compare.py, year 1) — the numerical
+# noise floor the D2c held-out improvement must EXCEED to count (NOT merely "reduced").
+FLOOR_SST = 0.0049
+
+
+def build_holdout(kind, cell_lat, cell_lon, deg, fold):
+    """Held-out cell mask (1=held-out, 0=train) for D2c cross-validation; ``fold`` (0/1) is the
+    complementary half (run both → 2-fold CV). Two regimes, complementary questions:
+      ``random`` — a seeded 50/50 cell split. Train+held-out have IDENTICAL bias structure ⇒ the
+        train-optimal c_k is also held-out-optimal ⇒ held-out reduction ≈ train reduction. This is
+        the clean **overfitting** test (does the calibration fit signal, not per-cell noise?).
+      ``lon``/``lat`` — alternating ``deg``-wide sectors/bands: spatially **blocked** (independent),
+        testing whether a single GLOBAL c_k transfers across regions. The recovered c_k staying
+        consistent across blocked folds is robustness; the held-out misfit may move less where the
+        c_k-sensitive deep-convection signal is sparse (the bias is spatially concentrated)."""
+    if kind == "none":
+        return np.zeros_like(cell_lat)
+    if kind == "random":
+        u = np.random.default_rng(12345).random(cell_lat.size)
+        return (u < 0.5).astype(np.float64) if fold == 0 else (u >= 0.5).astype(np.float64)
+    if kind == "nh":
+        return (cell_lat > 0).astype(np.float64)
+    if kind == "sh":
+        return (cell_lat < 0).astype(np.float64)
+    if kind == "lat":
+        block = np.floor((cell_lat + 90.0) / deg).astype(int)
+    elif kind == "lon":
+        block = np.floor((cell_lon % 360.0) / deg).astype(int)
+    else:
+        raise ValueError(f"unknown --holdout {kind!r}")
+    return ((block % 2) == fold).astype(np.float64)
 
 
 def main():
@@ -133,6 +170,15 @@ def main():
                     help="tkegm = zstar+TKE+GM (ocean-only; obs calib fits — over ice-masked water); "
                          "all3 = +mEVP (the twins' config; obs-calib backward OOMs on mEVP recompute)")
     ap.add_argument("--params", choices=("ck", "ck_ceps"), default="ck_ceps")
+    ap.add_argument("--holdout", choices=("none", "random", "lon", "lat", "nh", "sh"), default="none",
+                    help="D2c held-out cross-validation: calibrate on the TRAIN cells, score the "
+                         "INDEPENDENT held-out cells. none = full-domain (the D2a headline).")
+    ap.add_argument("--holdout-deg", type=float, default=60.0,
+                    help="sector/band width (deg) for --holdout lon/lat (alternating folds)")
+    ap.add_argument("--fold", type=int, choices=(0, 1), default=0,
+                    help="which alternating set is held out (0/1) — run both for 2-fold CV")
+    ap.add_argument("--ck-full", type=float, default=0.243,
+                    help="full-domain recovered c_k (D2a) — the held-out c_k must agree (no overfit)")
     ap.add_argument("--w-sst", type=float, default=1.0, help="SST weight in the combined loss")
     ap.add_argument("--ice-sst", type=float, default=-1.0,
                     help="obs ice mask: drop cells with WOA SST below this °C (freezing ⇒ ice)")
@@ -155,9 +201,10 @@ def main():
     fs = cf.static
     node_mask = jnp.asarray(mesh.node_layer_mask)
     all_dates = core2_forcing.dates_for_steps(args.year, DT, args.n_spin + args.n)
-    Hmap, (woa_mld, woa_mld_ok, woa_sst, woa_sst_ok) = load_woa(mesh, args.month)
+    Hmap, (woa_mld, woa_mld_ok, woa_sst, woa_sst_ok), (cell_lat, cell_lon) = load_woa(mesh, args.month)
     rec = {"target": "tke_obs", "config": "zstar+TKE+mEVP+GM(frozen-ice)", "N": args.n,
-           "n_spin": args.n_spin, "month": args.month, "params": args.params}
+           "n_spin": args.n_spin, "month": args.month, "params": args.params,
+           "holdout": args.holdout, "holdout_deg": args.holdout_deg, "fold": args.fold}
     print(f"[setup] built in {time.time()-t0:.1f}s; spin {args.n_spin} ({args.n_spin*DT/86400:.1f} d) "
           f"+ window {args.n}; WOA month {args.month:02d}", flush=True)
 
@@ -198,6 +245,15 @@ def main():
     ice_ok = woa_sst > args.ice_sst
     w_mld = Hmap.cell_area * woa_mld_ok * ice_ok * cell_valid
     w_sst = Hmap.cell_area * woa_sst_ok * ice_ok * cell_valid
+    # D2c held-out split: TRAIN cells drive the loss; HELD-OUT cells are scored only (independent).
+    # --holdout none ⇒ hmask=0 ⇒ train=full, held=0 (bit-identical to the D2a headline path).
+    hmask = jnp.asarray(build_holdout(args.holdout, cell_lat, cell_lon, args.holdout_deg, args.fold))
+    w_mld_tr, w_mld_ho = w_mld * (1.0 - hmask), w_mld * hmask
+    w_sst_tr, w_sst_ho = w_sst * (1.0 - hmask), w_sst * hmask
+    if args.holdout != "none":
+        print(f"[xval] holdout={args.holdout} deg={args.holdout_deg} fold={args.fold}: "
+              f"train cells (MLD w>0)={int((w_mld_tr>0).sum())}  held-out={int((w_mld_ho>0).sum())}",
+              flush=True)
 
     def model_surf(tun):
         fin = integrate(S0, mesh, op, None, n_steps=args.n, dt=DT, step_forcings=sfs_win,
@@ -215,9 +271,13 @@ def main():
         return d
 
     def misfits(u):
+        # train + held-out MLD/SST misfits from ONE forward (held-out is forward-only-scored: its
+        # weights enter only the aux, never the loss ⇒ no gradient leak from the held-out cells).
         cell_mld, cell_sst = model_surf(tun_of(u))
-        return (obs_compare.misfit(cell_mld, woa_mld, w_mld),
-                obs_compare.misfit(cell_sst, woa_sst, w_sst))
+        return (obs_compare.misfit(cell_mld, woa_mld, w_mld_tr),
+                obs_compare.misfit(cell_sst, woa_sst, w_sst_tr),
+                obs_compare.misfit(cell_mld, woa_mld, w_mld_ho),
+                obs_compare.misfit(cell_sst, woa_sst, w_sst_ho))
 
     # ---------- calibrate {c_k(, c_eps)} via the global adjoint ----------
     # ONE fwd+bwd executable (has_aux returns the MLD/SST misfits per iter) — NO separate baseline
@@ -232,8 +292,8 @@ def main():
     u0 = {"ck": one} | ({"ceps": one} if args.params == "ck_ceps" else {})
 
     def loss_aux(u):
-        jm, js = misfits(u)
-        return jm / SCALE_MLD + args.w_sst * js / SCALE_SST, (jm, js)
+        jm, js, jmh, jsh = misfits(u)
+        return jm / SCALE_MLD + args.w_sst * js / SCALE_SST, (jm, js, jmh, jsh)
 
     opt = optax.adam(optax.cosine_decay_schedule(args.lr, args.iters))
 
@@ -241,34 +301,37 @@ def main():
     def step(u, opt_state):
         # ONE executable for the WHOLE update (value_and_grad + Adam) — separate optax executables
         # OOM on CUBIN-load when the fwd+bwd pool already fills the card (the v5 failure).
-        (lval, (jm, js)), grads = jax.value_and_grad(loss_aux, has_aux=True)(u)
+        (lval, (jm, js, jmh, jsh)), grads = jax.value_and_grad(loss_aux, has_aux=True)(u)
         gn = optax.tree.norm(grads)
         updates, opt_state = opt.update(grads, opt_state, u)
-        return optax.apply_updates(u, updates), opt_state, lval, jm, js, gn
+        return optax.apply_updates(u, updates), opt_state, lval, jm, js, jmh, jsh, gn
 
     try:
         t1 = time.time()
         print(f"\n  --- calibrate {args.params} to WOA MLD+SST (Adam lr={args.lr}, ≤{args.iters} it; "
               f"single jitted step) ---", flush=True)
         u, opt_state, hist = u0, opt.init(u0), []
-        m0_mld = m0_sst = None
+        m0_mld = m0_sst = m0_mld_ho = m0_sst_ho = None
         for it in range(1, args.iters + 1):
             ck = CK0 * float(u["ck"])                          # the iterate being EVALUATED this step
             ceps = CEPS0 * float(u["ceps"]) if args.params == "ck_ceps" else CEPS0
-            u, opt_state, lval, jm, js, gn = step(u, opt_state)
-            jm, js, lval = float(jm), float(js), float(lval)
+            u, opt_state, lval, jm, js, jmh, jsh, gn = step(u, opt_state)
+            jm, js, jmh, jsh, lval = float(jm), float(js), float(jmh), float(jsh), float(lval)
             if m0_mld is None:
-                m0_mld, m0_sst = jm, js
+                m0_mld, m0_sst, m0_mld_ho, m0_sst_ho = jm, js, jmh, jsh
             extra = f" c_eps={ceps:.4f}" if args.params == "ck_ceps" else ""
-            print(f"    it={it:3d}  c_k={ck:.5f}{extra}  MLD={jm:.4e} m²  SST={js:.4e} °C²  "
+            ho = f"  HO-MLD={jmh:.4e}" if args.holdout != "none" else ""
+            print(f"    it={it:3d}  c_k={ck:.5f}{extra}  MLD={jm:.4e} m²  SST={js:.4e} °C²{ho}  "
                   f"|g|={float(gn):.2e}", flush=True)
-            hist.append({"it": it, "ck": ck, "ceps": ceps, "jm": jm, "js": js, "loss": lval})
+            hist.append({"it": it, "ck": ck, "ceps": ceps, "jm": jm, "js": js,
+                         "jmh": jmh, "jsh": jsh, "loss": lval})
             # plateau early-stop (the obs misfit bottoms out at the irreducible model-obs gap)
             if it > 8 and hist[-9]["loss"] - lval < 1e-3 * hist[0]["loss"]:
                 print(f"    (plateau — stop at it={it})", flush=True)
                 break
         ck_fin, ceps_fin = hist[-1]["ck"], hist[-1]["ceps"]   # last EVALUATED iterate (jm/js consistent)
         mf_mld, mf_sst = hist[-1]["jm"], hist[-1]["js"]
+        mf_mld_ho, mf_sst_ho = hist[-1]["jmh"], hist[-1]["jsh"]
         bwd_s = time.time() - t1
     except Exception as e:
         return _bail(args, rec, "calibrate", e)
@@ -288,23 +351,56 @@ def main():
     print(f"  SST misfit {m0_sst:.4e} -> {mf_sst:.4e} °C²  ({100*(1-mf_sst/m0_sst):+.1f}%)  "
           f"in {len(hist)} it / {bwd_s:.1f}s  peak={pk:.1f} GB", flush=True)
 
-    ok = bool(mld_red and ck_ok)            # MLD reduced + c_k physically plausible (D2c sets the bar)
+    # ---------- D2c held-out (independent-cell) validation + falsifiable bar ----------
+    # The TRAIN-only c_k must ALSO reduce the held-out misfit (generalization, not overfitting),
+    # the recovered value must stay plausible AND agree with the full-domain c_k, and the SST
+    # improvement must EXCEED the C↔Fortran numerical floor to count (NOT merely "reduced").
+    import math
+    if args.holdout != "none":
+        mld_ho_red = mf_mld_ho < m0_mld_ho
+        drmse_ho = math.sqrt(max(m0_sst_ho, 0.0)) - math.sqrt(max(mf_sst_ho, 0.0))   # °C
+        sst_ho_beats_floor = bool(drmse_ho > FLOOR_SST)
+        ck_consistent = bool(abs(ck_fin - args.ck_full) / args.ck_full < 0.25)
+        print(f"\n  [HELD-OUT, fold {args.fold}] MLD {m0_mld_ho:.4e} -> {mf_mld_ho:.4e} m²  "
+              f"({100*(1-mf_mld_ho/m0_mld_ho):+.1f}%)   "
+              f"SST {m0_sst_ho:.4e} -> {mf_sst_ho:.4e} °C²  (ΔRMSE={drmse_ho:+.4f} °C)", flush=True)
+        print(f"  bars: held-out MLD reduced={mld_ho_red}  c_k agrees w/ full ({ck_fin:.4f} vs "
+              f"{args.ck_full:.4f})={ck_consistent}  SST ΔRMSE>{FLOOR_SST} floor={sst_ho_beats_floor}",
+              flush=True)
+        ok = bool(mld_ho_red and ck_ok and ck_consistent)   # the D2c held-out gate
+        rec.update(dict(m0_mld_ho=m0_mld_ho, mf_mld_ho=mf_mld_ho, m0_sst_ho=m0_sst_ho,
+                        mf_sst_ho=mf_sst_ho, drmse_ho=drmse_ho, mld_ho_red=mld_ho_red,
+                        sst_ho_beats_floor=sst_ho_beats_floor, ck_consistent=ck_consistent,
+                        ck_full=args.ck_full, floor_sst=FLOOR_SST))
+    else:
+        ok = bool(mld_red and ck_ok)        # full-domain: MLD reduced + c_k physically plausible
     rec.update(dict(ck0=CK0, ceps0=CEPS0, ck_fin=ck_fin, ceps_fin=ceps_fin, ck_ok=ck_ok,
                     ceps_ok=ceps_ok, m0_mld=m0_mld, mf_mld=mf_mld, m0_sst=m0_sst, mf_sst=mf_sst,
                     mld_red=mld_red, sst_red=sst_red, n_iters=len(hist), peak_gb=pk, ok=ok))
     args.outdir.mkdir(parents=True, exist_ok=True)
-    np.savez(args.outdir / "calib_tke_obs.npz",
+    tag = "" if args.holdout == "none" else f"_{args.holdout}{args.fold}"
+    np.savez(args.outdir / f"calib_tke_obs{tag}.npz",
              hist_it=np.array([r["it"] for r in hist]),
              hist_ck=np.array([r["ck"] for r in hist]),
              hist_mld=np.array([r["jm"] for r in hist]),
              hist_sst=np.array([r["js"] for r in hist]),
+             hist_mld_ho=np.array([r["jmh"] for r in hist]),
+             hist_sst_ho=np.array([r["jsh"] for r in hist]),
              hist_loss=np.array([r["loss"] for r in hist]),
              ck0=CK0, ck_fin=ck_fin, ceps_fin=ceps_fin, m0_mld=m0_mld, mf_mld=mf_mld,
-             m0_sst=m0_sst, mf_sst=mf_sst, month=args.month, n_spin=args.n_spin)
+             m0_sst=m0_sst, mf_sst=mf_sst, m0_mld_ho=(m0_mld_ho or 0.0), mf_mld_ho=(mf_mld_ho or 0.0),
+             m0_sst_ho=(m0_sst_ho or 0.0), mf_sst_ho=(mf_sst_ho or 0.0),
+             holdout=args.holdout, fold=args.fold, ck_full=args.ck_full,
+             month=args.month, n_spin=args.n_spin)
     args.results.parent.mkdir(parents=True, exist_ok=True)
     with open(args.results, "a") as f:
         f.write(json.dumps(rec) + "\n")
-    print(f"\n  gate: MLD reduced={mld_red}  c_k plausible={ck_ok}  (SST reduced={sst_red})", flush=True)
+    if args.holdout != "none":
+        print(f"\n  gate (held-out fold {args.fold}): MLD reduced={mld_ho_red}  c_k plausible={ck_ok}"
+              f"  c_k agrees w/ full={ck_consistent}", flush=True)
+    else:
+        print(f"\n  gate: MLD reduced={mld_red}  c_k plausible={ck_ok}  (SST reduced={sst_red})",
+              flush=True)
     print(f"TKE_CALIB_{'OK' if ok else 'FAIL'}", flush=True)
     return 0 if ok else 1
 
