@@ -171,6 +171,9 @@ def main():
                          "~3× so the CORE2 NN backward fits the 80 GB A100); on by default")
     ap.add_argument("--no-remat-blocks", dest="remat_blocks", action="store_false",
                     help="disable nested remat (the un-checkpointed baseline; OOMs on CORE2)")
+    ap.add_argument("--remat-segments", type=int, default=0,
+                    help="O(√N) two-level checkpointing for LONG continuous windows: -1=auto S≈√N "
+                         "(stores ~2√N carries not N ⇒ N≫10 fits one GPU), >1=explicit S, 0=per-step")
     args = ap.parse_args()
     n, cfg = args.n, args.config
 
@@ -199,7 +202,8 @@ def main():
         # so no second 'full-state' executable coexists with the grad ⇒ the all3 backward fits.
         p = calibrate.build_params({"tke_nn": nn})
         fin = integrate(state, mesh, op, None, n_steps=n, dt=DT, step_forcings=sfs,
-                        forcing_static=fs, params=p, remat_blocks=args.remat_blocks, **cfgs)
+                        forcing_static=fs, params=p, remat_blocks=args.remat_blocks,
+                        remat_segments=args.remat_segments, **cfgs)
         return fin.T, fin.S
 
     def wmse(a, b):
@@ -209,7 +213,7 @@ def main():
     rec = {"target": "nn_twin", "config": cfg_name, "N": n, "days": n * DT / 86400.0, "dt": DT,
            "seed": args.seed, "truth_amp": args.truth_amp, "truth_bias": args.truth_bias,
            "hidden": list(args.hidden), "from_s0": bool(args.from_s0), "gpu_gb": gpu_gb,
-           "remat_blocks": bool(args.remat_blocks)}
+           "remat_blocks": bool(args.remat_blocks), "remat_segments": int(args.remat_segments)}
 
     # ---------- truth injection (seeded NN → synthetic T/S evolution) ----------
     try:

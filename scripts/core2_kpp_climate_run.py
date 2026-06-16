@@ -180,6 +180,12 @@ def main():
     ap.add_argument("--save-state", type=str, default="",
                     help="pickle the FINAL model State (jax.device_get) here — a restartable, "
                          "developed spun-up state for downstream twins/calibration (e.g. §3 E1)")
+    ap.add_argument("--snapshot-dir", type=str, default="",
+                    help="save PERIODIC State pickles here (snap_step<N>.pkl) for seasonally-diverse "
+                         "chunk-start states — the §3/E2 batched-window twin needs states from "
+                         "different months, not consecutive chunks (see core2_paper_nn_twin_batched.py)")
+    ap.add_argument("--snapshot-every", type=int, default=0,
+                    help="snapshot stride in steps (0=off); e.g. 1440 ≈ 30 d at dt=1800")
     args = ap.parse_args()
     dt = args.dt
     n_steps = args.steps if args.steps > 0 else int(round(args.years * 365 * 86400 / dt))
@@ -250,6 +256,13 @@ def main():
             am_year, am_month = y, month
         acc = accumulate(acc, state); count += 1; last_doy = doy
         step = i + 1
+        if args.snapshot_dir and args.snapshot_every and step % args.snapshot_every == 0:
+            import pickle
+            sd = Path(args.snapshot_dir); sd.mkdir(parents=True, exist_ok=True)
+            with open(sd / f"snap_step{step:06d}.pkl", "wb") as fpk:
+                pickle.dump(jax.device_get(state), fpk)
+            print(f"  [snapshot] step {step} (day {step*dt/86400:.1f}, {y}-{month:02d}) -> {sd}",
+                  flush=True)
         if step % args.every == 0 or step <= 2 or step == n_steps:
             d = jax.device_get(diag(state)); ok, why = stable(d)
             worst_vel = max(worst_vel, float(d["vel_absmax"]))

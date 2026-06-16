@@ -3897,3 +3897,30 @@ Cite the C source (`file:line`) or dump probe that proves it.
   full GPU run — but trust RUNTIME OOM (the BFC `bfc_allocator.cc` "ran out trying to allocate" line + the
   region-growth attempts) for the true ceiling, not the compile-temp. (`fesom_jax/step.py` `remat_blocks`/`_ckpt`,
   `fesom_jax/integrate.py`, `scripts/core2_paper_nn_twin.py`, `scripts/core2_nn_twin_memprobe.py`.)
+
+- **[§3 hybrid-ML / identifiability] The per-column NN mixing FIELD is NOT recoverable from short-window
+  T/S evolution — equifinality — and batching DIVERSE short windows does NOT fix it; only a CONTINUOUS
+  long window can (O(√N) checkpointing makes one fit a single GPU).** The CORE2 single-window adjoint is
+  memory-capped at N≈10 (~5 h). At that window the NN-weight gradient is exact (FD↔AD 1.6 %) and the T/S
+  evolution recovers (misfit ratio 0.05–0.15), but the induced c_k-multiplier FIELD does NOT: corr_active
+  +0.118 (early-stop) → **−0.006** (converged, N=10) → **−0.246** (K=8 consecutive 1.67-d chunks) →
+  **−0.484** (K=8 SEASONAL chunks, Apr–Dec). Recovery gets *more anti-correlated with more/diverse
+  windows* — classic mixing-closure equifinality: over a 5-h window the multiplier PATTERN barely imprints
+  on T/S (only the net mixing does), so the optimizer fits the evolution via a compensating, uncorrelated
+  field. **Batching adds STATE diversity but each chunk's gradient is severed (independent) ⇒ each is still
+  a 5-h problem ⇒ no imprint.** What imprints the field is a CONTINUOUS gradient over a long window (days).
+  Three practical results: **(1) batched windows** (`core2_paper_nn_twin_batched.py`) — K chained/seasonal
+  N-step chunks, FULL-BATCH grad accumulation (G=Σ_k g_k, one chunk backward live at a time via
+  device_put/free) — memory is K-INDEPENDENT (peak ~43 GB at any K), the right tool for E2 obs-training
+  (reduce obs misfit, which does NOT need field identifiability) but NOT for perfect-field recovery.
+  Seasonal-diverse chunk states come from `core2_kpp_climate_run.py --snapshot-every` (monthly State
+  pickles; `core2_nn_snapshots_1yr.sbatch`). **(2) O(√N) two-level checkpointing**
+  (`integrate.py` `remat_segments=-1`) — restructures the scan into S≈√N outer segments × M inner steps,
+  both checkpointed ⇒ the backward stores ~**2√N** carries not N (the N×|State| stack is what OOMs long
+  adjoints). Forward bit-identical, gradient identical (pi Δ=0, rel=0) ⇒ a *continuous* N≫10 window fits
+  one A100. **(3) multi-GPU adjoint workaround:** the ragged_all_to_all transpose is the buggy collective
+  ([[jax-ragged-a2a-grad-bug]]); the **all_gather halo (`use_ragged=False`) is autodiff-correct** (tested
+  sharded-grad==dense, `test_gradient_sharded`) and `run_steps_sharded` already routes the full all-on NN
+  config — so per-device tape ~1/P for even longer windows, composes with O(√N). New time bottleneck once
+  memory is solved: a continuous N-step backward costs ~N×recompute/iter, so very long windows (N≫100) are
+  GPU-h-bound, not memory-bound. (`fesom_jax/integrate.py` `_run_steps`/`remat_segments`.)
