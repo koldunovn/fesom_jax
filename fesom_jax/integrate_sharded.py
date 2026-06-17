@@ -350,7 +350,8 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       gm_cfg=None, kpp_cfg=None, tke_cfg=None, ale_cfg=None,
                       use_ragged: bool = False,
                       ice_cfg=None, step_forcing=None, forcing_static=None,
-                      boundary_node_p=None, return_executable: bool = False):
+                      boundary_node_p=None, return_executable: bool = False,
+                      return_grad_fn: bool = False):
     """Multi-step (S.7 part 3): step-1 eager (``is_first_step=True``) + ``lax.scan`` of steps
     2..N under ONE ``shard_map`` — the :func:`fesom_jax.integrate.integrate` pattern, sharded.
     Returns the ``[P, Lmax, …]`` final State after ``n_steps``.
@@ -413,6 +414,49 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
             st, _ = lax.scan(jax.checkpoint(lambda c, _: (one(c, False), None)),
                              st, xs=None, length=n_steps - 1)
         return st
+
+    # GRAD path (S.8 multi-step, e.g. the §3 sharded NN twin): make `params` a REPLICATED shard_map
+    # INPUT so jax.grad can differentiate w.r.t. it, and device-place the CONSTANT folded args ONCE
+    # here (eager ⇒ _to_global_sharded's np.asarray sees concrete host numpy). The returned run(p)
+    # only calls the jitted shard_map jfng(p, *placed) — so the grad trace never reaches np.asarray
+    # (the bug when run_steps_sharded itself is wrapped in jax.grad). jit-around-shard_map kept (the
+    # jax.checkpoint'd scan backward needs it). `params`/`p` REPLACES the closed-over `params`.
+    if return_grad_fn:
+        def bodyg(p, m, s, o, stress, h, *ex):
+            exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
+            ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
+                               owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
+                               ragged=_ragged_ctx(h)["nod"] if use_ragged else None,
+                               recv_max=recv_max["nod"] if use_ragged else 0, use_ragged=use_ragged)
+            ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
+                          owned_mask={"nod": h["owned_nod"]},
+                          exch_ragged=_ragged_ctx(h) if use_ragged else None,
+                          recv_max=recv_max, use_ragged=use_ragged)
+            sf_, fs_ = (ex[0], ex[1]) if have_forcing else (None, None)
+            bn_ = ex[2 if have_forcing else 0] if have_bn else None
+
+            def one(carry, is_first):
+                return stepmod.step(carry, m, o, stress, p, dt=dt, is_first_step=is_first,
+                                    step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
+                                    gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
+                                    ale_cfg=ale_cfg, halo_ctx=ctx, boundary_node=bn_)
+
+            st = one(s, True)
+            if n_steps > 1:
+                st, _ = lax.scan(jax.checkpoint(lambda c, _: (one(c, False), None)),
+                                 st, xs=None, length=n_steps - 1)
+            return st
+
+        gspecs = (_R, fm_spec, fs_spec, fop_spec, _P, ha_spec) + extras_spec
+        jfng = jax.jit(jax.shard_map(bodyg, mesh=jmesh, in_specs=gspecs, out_specs=fs_spec,
+                                     check_vma=False))
+        cargs = (fm, fs, fop, fstress, ha, *extras)
+        cspecs = (fm_spec, fs_spec, fop_spec, _P, ha_spec) + extras_spec
+        cargs = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(cargs, cspecs))
+
+        def run(p):
+            return unfold_state(jfng(p, *cargs), npes)
+        return run
 
     # ⚠️ jax.jit AROUND the shard_map is REQUIRED for the BACKWARD (S.8): the scan body is
     # jax.checkpoint'd (a ``closed_call`` primitive), and grad of a closed_call inside a

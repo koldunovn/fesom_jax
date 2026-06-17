@@ -3924,3 +3924,45 @@ Cite the C source (`file:line`) or dump probe that proves it.
   config — so per-device tape ~1/P for even longer windows, composes with O(√N). New time bottleneck once
   memory is solved: a continuous N-step backward costs ~N×recompute/iter, so very long windows (N≫100) are
   GPU-h-bound, not memory-bound. (`fesom_jax/integrate.py` `_run_steps`/`remat_segments`.)
+
+- **[§3 hybrid-ML / multi-GPU adjoint] The sharded all_gather adjoint is CORRECT (sharded NN-grad == dense,
+  twin reproduces the dense recovery), but it took two fixes — and the multi-GPU run FALSIFIES the "only a
+  long continuous window imprints the field" hypothesis: the stiff all3 adjoint amplifies EXPONENTIALLY with
+  window length (the chaotic-adjoint horizon), so the usable window is SHORT and field recovery is BEST at the
+  SHORTEST window, not the longest.** Unblocking the multi-GPU NN twin ([[e1-nn-twin-memory-fix]]) over the
+  all_gather halo (`use_ragged=False`, the autodiff-correct collective; ragged_all_to_all's transpose is the
+  buggy one, [[jax-ragged-a2a-grad-bug]]) needed: **(1) the TracerArrayConversionError** — wrapping
+  `run_steps_sharded` in `jax.grad` hit `_to_global_sharded`'s eager `np.asarray` on tracers; fix
+  (`integrate_sharded.py` `return_grad_fn`): make `params` a REPLICATED `shard_map` INPUT and device-place the
+  constant folded mesh/state/forcing/op ONCE outside the returned closure, so the grad trace never reaches the
+  placement. **(2) The sharded-grad NaN** (forward finite, `|g|=nan`, sharding+multi-step ONLY) — a
+  **masked-NaN-in-reverse-mode** bug. Sharding pads local arrays to `Lmax` (`_default_pad`: float→1.0,
+  bool→False, int→0), creating all-dry PADDING columns the dense mesh never has. `cvmix_tke`'s surface-flux
+  denom `dzt_surf = where(is_surf, dzt, 1)` divided by `dzt[0]=0` there: the driver only sets
+  `dz_trr[0]=hnode/2` where ITS `is_surf=(k==nzmin)` fires, but a padding node has `nlevels_nod2D=0` ⇒
+  `nzmin=-1` ⇒ `dz_trr[0]` stays 0, while the core's hardcoded `is_surf=(k==0)` still computes the flux. The
+  forward is MASKED finite (`is_wet_iface` all-False on the padding column ⇒ the `d_tri` identity override
+  drops it), but REVERSE hits `cotangent(0)·∂surf_flux/∂cd(inf)=NaN` that leaks via `cd=tke_cd·m_NN` into the
+  NN weights. Fix: the `dzt>0` guard `where(is_surf & (dzt>0), dzt, 1)` (mirrors Part 4's `dzt_s`) —
+  **bit-identical on real meshes, 38/38 TKE tests pass.** GENERAL RULE: a forward that is finite-because-masked
+  can still NaN in reverse — guard the non-smooth op (`/ sqrt pow log`) at its SOURCE (double-where), not at
+  the masked output; and SHARDING introduces degenerate (all-dry padding) lanes a dense-clean adjoint never
+  exercised, so re-audit every masked op for the sharded path. (XLA's CPU `shard_map` backend SEGFAULTS at the
+  CORE2 mesh size ⇒ verify sharded autodiff on GPU, not CPU.) **(3) The validated capability + the falsified
+  hypothesis.** Sharded multi-step NN-grad == dense (`|g|`=9.62 vs 9.63 at N=4) and the sharded twin reproduces
+  the dense recovery (evolution misfit ratio ~0.14, corr_all ~0.80, corr_active ~0.25 at N=4) for the full
+  TKE+NN+GM+ice(frozen)+zstar config at P=4 N=48, 24.7 GB/dev — so the all_gather reduce-scatter transpose is
+  autodiff-correct end-to-end. BUT the it=0 gradient norm explodes with window: `|g|` = 9.6(N4) → 12(N6) →
+  **2.5e4(N8)** → 4.6e15(N12) → 2.4e124(N48), a sharp onset between N=6 and N=8; recovery (evolution gate)
+  holds only for **N≤6**, N≥8 DIVERGES (loss 2→8). This is the recurrent state-transition Jacobian compounding
+  (stiff/chaotic adjoint): finite post-NaN-fix, but the gradient DIRECTION becomes the fastest-growing unstable
+  mode, so `optax.clip_by_global_norm` bounds the magnitude (no float64 g²-overflow) yet does NOT fix the
+  divergence (raw AND clipped Adam both diverge at N≥8). AND field corr is BEST at the SHORTEST window (N=4:
+  corr_all 0.80–0.83) and DEGRADES with N (N=6 0.51, N=8 negative) — so the multi-GPU run FALSIFIES the
+  [[d2-calibration-complete]] "only a continuous long window imprints the field" expectation: longer continuous
+  windows do not help and (N≥8) break the adjoint. Equifinality is fundamental for this stiff closure; the
+  usable-adjoint window is shorter than any window that would push corr past ~0.83. **Multi-node N≫48 is moot
+  for field recovery** (it explodes harder, not better) — the binding constraint is the chaotic-adjoint horizon,
+  not memory; gradient-based stiff-closure recovery needs shadowing/regularization, not bigger windows.
+  (`fesom_jax/cvmix_tke.py`, `fesom_jax/integrate_sharded.py`, `scripts/core2_paper_nn_twin_sharded.py`,
+  `scripts/verify_sharded_tke_grad.py`, `scripts/repro_sharded_grad_nan.py`.)

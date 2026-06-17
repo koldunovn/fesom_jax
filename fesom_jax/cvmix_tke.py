@@ -214,8 +214,16 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
     P_diss_v = Nsqr * KappaH                                            # :731-732
     P_diss_v = jnp.where(is_surf, 0.0, P_diss_v)   # :733 = −forc_rho_surf·g/ρ (≡0 here)
     forc = K_diss_v - P_diss_v                                          # :734
-    # surface Neumann flux cd·forc_surf^{3/2}/dzt[0] added to forc[0] (:793)
-    dzt_surf = jnp.where(is_surf, dzt, 1.0)        # safe denom on the surface row only
+    # surface Neumann flux cd·forc_surf^{3/2}/dzt[0] added to forc[0] (:793). The `dzt>0` guard
+    # (mirroring `dzt_s` in Part 4) keeps the denom finite on a degenerate/padding column whose
+    # dzt[0]=0. The driver only sets dz_trr[0]=hnode/2 where its `is_surf=(k==nzmin)` fires, but a
+    # SHARDED padding node has nlevels_nod2D=0 (int _default_pad) ⇒ nzmin=-1 ⇒ dz_trr[0] stays 0,
+    # while the core's `is_surf=(k==0)` still computes surf_flux here. Without `>0` that is x/0=inf
+    # (or 0/0): the forward masks it away (is_wet_iface all-False on the all-dry padding column) but
+    # REVERSE-mode hits 0·inf=NaN that leaks into c_k/c_eps/cd — and via the NN multiplier into the
+    # NN weights (the §3 sharded-twin |g|=nan). Real wet cols have dzt[0]=hnode_surf/2>0 ⇒ untouched
+    # (bit-identical; the Phase-9b replay gate is unaffected, it uses padding-free meshes).
+    dzt_surf = jnp.where(is_surf & (dzt > 0.0), dzt, 1.0)
     surf_flux = cd * _safe_pow32(fcol) / dzt_surf
     forc = jnp.where(is_surf, forc + surf_flux, forc)
 
