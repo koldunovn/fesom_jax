@@ -3975,3 +3975,32 @@ Cite the C source (`file:line`) or dump probe that proves it.
   ~0.88) = `NN_TWIN_SHARDED_OK`. (`fesom_jax/cvmix_tke.py`, `fesom_jax/integrate_sharded.py`,
   `scripts/core2_paper_nn_twin_sharded.py`, `scripts/verify_sharded_tke_grad.py`,
   `scripts/repro_sharded_grad_nan.py`.)
+- **[§3 hybrid-ML / obs training / offline-online gap] An NN mixing closure trains end-to-end through the
+  global adjoint to reduce REAL held-out obs misfit — but the short-window optimum does NOT deploy, and the
+  fix for the *instability* does not fix the *misalignment*.** E2 (`scripts/core2_paper_nn_obs.py`, all3
+  frozen-ice adjoint) trains `tke_nn` over the 12 monthly snapshots (batched SEASONAL short windows, N=12,
+  gradient accumulated) to reduce MLD/SST-vs-WOA through the D2a obs operator. It WORKS as an obs reducer:
+  held-out MLD **−2.1%** = train −2.1% (the D2c clean no-overfit bar), bounded multiplier ⇒ PD diffusivities,
+  a spatially-structured correction a global scalar can't make. BUT a long forward-only deployment (90 d,
+  default NN→0 vs trained) exposes the **offline-trained/online-deployed gap** in two layers: **(1) naive
+  training is UNSTABLE** — minimizing the 5-h MLD misfit drives a **bang-bang over-mixing** multiplier (mean
+  2.8×, saturating BOTH [1/3,3] caps) that lowers the short misfit but **blows up the 90-d MLD ×2–4**; the
+  data loss itself OVERSHOOTS (non-monotonic — best at it≈15, worse by it≈43). **(2) even when stabilized,
+  the benefit does NOT persist** — three fixes (KEEP-BEST iterate not last; a **trust-region reg** =
+  area-weighted penalty on `(log m)²` toward default mixing, which is 0 at NN→0 so the bit-identical
+  invariant holds; a tighter `m_max`=2) make the NN deploy STABLY (drift ≈ default, T/S 1.01×, finite +
+  physical throughout) but its long-forward MLD is still WORSE than default at EVERY horizon (+11%
+  seasonal-mean). Root cause: the short-window adjoint optimizes the **FAST** (6-h) MLD response, which is
+  **misaligned** with the **SLOW** deployed equilibrium — the recovered net multiplier even flips *below* 1
+  (less mixing helps 6 h) opposite D2a's held-out-validated "more mixing deepens MLD" equilibrium direction.
+  A **uniform-multiplier deployment diagnostic** (`--const-mult`) PROVES the misalignment is a wrong-sign, not
+  an unimprovable metric: a global **2× IMPROVES** the 90-d MLD (+0.5%, stable) and a **0.7× WORSENS** it
+  (−0.4%) — monotone in D2a's direction — yet the short-window-trained NN sits at net 0.97× (wrong side).
+  So the **deployed MLD is a SLOW target** (a longer differentiable rollout or EKI, or a physically-informed
+  prior toward the D2a optimum), the SAME adjoint↔EKI
+  boundary as GM→T/S ([[d2-calibration-complete]] D2b) — now for the NN closure. **Methodological takeaway:
+  the long-forward drift+persisted-benefit gate is ESSENTIAL** — a held-out *short-window* obs reduction is
+  necessary but NOT sufficient for a deployable closure; reporting it alone (as offline ML-closure papers
+  do) hides the online failure. The structure-preserving bounded multiplier + trust-region reg are what buy
+  *stability*; *persisted benefit* needs the slow-target tool. (`scripts/core2_paper_nn_obs.{py,sbatch}`,
+  `scripts/core2_paper_nn_obs_diag.sbatch`, `scripts/fig_hybridml.py`.)
