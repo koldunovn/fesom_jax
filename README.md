@@ -23,6 +23,9 @@ sea-ice EVP scan).
 
 - **Differentiable**: `jax.grad` of any scalar loss flows back through the whole timestep to
   the physics parameters *and* the initial state / forcing — e.g. `d(sea-ice)/d(air-temperature)`.
+- **Calibratable & learnable**: that gradient drives adjoint sensitivity maps, perfect-model +
+  real-obs parameter calibration, and a learned (NN) TKE closure — see
+  [Differentiable capabilities](#differentiable-capabilities).
 - **Scales**: `shard_map` over a 1-D device mesh, **halo-only point-to-point exchange**
   (`ragged_all_to_all`), `jax.distributed` across nodes. Per-step communication is GPU↔GPU
   halo + reductions only; the host↔GPU transfer is one-time.
@@ -177,6 +180,49 @@ $PY scripts/bench_forward_scaling.py --mesh-dir data/mesh_core2 \
     --dt 1800 --full 1 --ic-dir data/ic_core2 --ragged 1 --out-zarr /work/.../core2_out.zarr
 # multi-node: submit the prebuilt sbatch (sets JDIST, srun, paths) — see below.
 ```
+
+---
+
+## Differentiable capabilities
+
+What the end-to-end gradient is *for*. Three capabilities — built on `jax.grad` of the global
+model, plus a gradient-free **EKI** (ensemble Kalman inversion) for the slow targets the adjoint
+can't reach — each proven **perfect-model-first, then applied to real OMIP-style obs** (MLD vs de
+Boyer Montégut / WOA, T/S vs WOA, sea-ice vs OSI-SAF). Drivers: `scripts/core2_paper_*.py`;
+headline figures: `scripts/fig_{sensitivity,calibration,hybridml}.png`.
+
+- **Sensitivity maps** (`fig_sensitivity.png`). One backward pass promotes a scalar physics
+  parameter to a `[nod2D]` field leaf → an adjoint sensitivity map: `∂(mean MLD)/∂(c_k field)`
+  peaks in the Weddell/Labrador deep-convection regions, `∂(upper-ocean T)/∂(k_gm field)` in the
+  polar eddy band. Adjoint==FD to ~7 digits, and cross-checked against an EKI forward-ensemble
+  estimate of the same `k_gm` sensitivity (agree to 6.6 %). Honestly labelled as the
+  *fast/instantaneous* (~6-h-window) sensitivity, not the equilibrium.
+
+- **Calibration** (`fig_calibration.png`). Perfect-model twins recover injected parameters through
+  the global adjoint — `k_gm` 800→1500 (0.075 %), `tke_c_k` (0.18 %). On real obs, the TKE
+  `c_k`→WOA-MLD calibration reduces the MLD misfit and *generalizes*: a random held-out fold
+  improves as much as train (not overfitting), while a blocked-region split exposes the honest
+  limit that one global scalar can't fix a spatially-structured bias. The **slow** GM→T/S target
+  uses EKI (forward-only ⇒ immune to the adjoint's chaos/memory ceiling *and* to the
+  sea-ice-rheology adjoint instability) — the EKI twin recovers `k_gm` to 0.034 %. Adjoint and EKI
+  agree on the shared scalar, so each is used where it is correct. Calibrated scalars transfer to
+  the operational Fortran `namelist.oce` (`scripts/write_namelist.py`).
+
+- **Hybrid-ML — a learned TKE closure** (`fig_hybridml.png`). A small structure-preserving MLP maps
+  local column features → a bounded multiplier on `c_k/c_eps/c_d` (bounded ⇒ positive-definite
+  diffusivities; **NN→0 ⇒ default TKE bit-identical**, the deployment fallback). Trained end-to-end
+  through the global adjoint, it recovers a known NN-twin's evolution + bulk mixing field, and
+  reduces *real held-out* MLD misfit (−2.1 %, = train ⇒ no overfit). **Honest finding (the
+  offline/online gap):** the short-window optimum deploys *stably* on a 90-day forward (a
+  trust-region regulariser keeps drift ≈ default) but its obs benefit does **not** persist — the
+  short-window adjoint optimises the fast MLD response, misaligned with the slow deployed
+  equilibrium (the same adjoint↔EKI boundary). A held-out short-window obs reduction is necessary
+  but not sufficient for a deployable closure, so the long-forward drift+persisted-benefit gate is
+  essential.
+
+> These are research capabilities on the CORE2 (127 k-node) configuration, not a turnkey DA
+> product. The honest limits — the chaotic gradient horizon, the adjoint↔EKI split, the
+> offline/online closure gap — are reported as first-class findings, not hidden.
 
 ---
 
