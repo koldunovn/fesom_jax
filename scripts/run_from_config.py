@@ -20,9 +20,17 @@ the staged mesh (Task A5/B0). Example, not part of the unit-tested surface (the 
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 import jax
+
+# Multi-node (dars/NG5): 1 process per NODE, each owning all its local GPUs. Must run BEFORE any
+# jax device op. JDIST=1 + srun (1 task/node) — see run_from_config.sbatch. Single-node leaves it off.
+if os.environ.get("JDIST"):
+    jax.distributed.initialize(
+        local_device_ids=list(range(int(os.environ.get("GPUS_PER_NODE", "4")))))
+_IS_LEAD = (not os.environ.get("JDIST")) or jax.process_index() == 0
 
 from fesom_jax import core2_forcing, partit, shard_mesh, ssh
 from fesom_jax.mesh import load_mesh
@@ -80,14 +88,15 @@ def main():
     sst0 = None if state0 is None else __import__("numpy").asarray(state0.T[:, 0])
     forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0)
 
-    print(f"[run] mesh={mesh_dir} npes={part.npes} devices={len(jax.devices())} "
-          f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in}")
+    if _IS_LEAD:
+        print(f"[run] mesh={mesh_dir} npes={part.npes} devices={len(jax.devices())} "
+              f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in}")
     res = run_from_config(cfg, mesh=mesh, part=part, sm=sm, sop=sop, forcing=forcing,
                           state0=state0, start_step=0, year=args.year,
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out)
-    print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} "
-          f"restart_out={cfg.restart_out}")
-    print("RUN_DRIVER_OK")
+    if _IS_LEAD:
+        print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
+        print("RUN_DRIVER_OK")
 
 
 if __name__ == "__main__":
