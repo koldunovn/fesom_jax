@@ -168,10 +168,12 @@ mld_field, dmld_dck = jax.jvp(                         # forward-mode: d(MLD fie
     lambda ck: window_mean_mld_field(ck, state0), (ck0,), (1.0,))
 ```
 
-**Cost scales with the small dimension:** reverse mode ∝ #outputs, forward mode ∝ #inputs. The two
-are *transposes of the same linearization* — they agree on a shared directional derivative
-(validated to **0.7 %**) **and share the same chaotic horizon** (see Limitations). The long-window
-driver exposes both via `--mode {adjoint,tlm}` (`scripts/core2_lw_avgadj.py`).
+**Rule of thumb — pay for the small side:** reverse mode costs about one extra model run per
+*output*, forward mode about one per *input* — so pick the one whose count is smaller (many params →
+one number: reverse; one knob → a whole map: forward). They are two views of the same underlying
+calculation, so they agree where they overlap (checked to **0.7 %**) and run into the same
+short-window limit (see Limitations). The long-window driver exposes both via `--mode {adjoint,tlm}`
+(`scripts/core2_lw_avgadj.py`).
 
 ### 3. Multi-GPU / multi-node forward
 
@@ -377,26 +379,26 @@ sbatch scripts/run_suite.sbatch                                 # full suite on 
 **Forward model — what runs, what doesn't, and why** (the forward integration; the gradient modes are
 the next table):
 
-| forward configuration | runs? | note / why |
+| forward configuration | runs? | what it means in plain terms |
 |---|---|---|
-| Single-device, ocean-only **or full** model (KPP+GM/Redi+ice+JRA55), float64 | ✅ | the Quick-start path (`integrate` / `step`) |
-| Forced multi-step, **pre-stacked** (`integrate(step_forcings=…)`) | ✅ but **≤ ~weeks** | all per-step forcing is stacked in memory ⇒ caps at ~weeks; longer OOMs |
-| **Multi-year** forced forward | ✅ | per-year-**chunked** forcing + `--load-state` restart (`scripts/core2_kpp_climate_run.py`) — *not* the pre-stack path; this produced the spin-up + 10-yr reference |
-| Multi-GPU / multi-node, **ragged** halo | ✅ **GPU only** | halo-only point-to-point comms; `ragged_all_to_all` is GPU/NCCL-only (#4) |
-| Multi-GPU, **all_gather** halo | ✅ CPU **and** GPU | correct everywhere but O(P·N_local) memory ⇒ OOMs at dars-8 / NG5 (#1) |
-| Big mesh on too few nodes | ❌ OOM | dars **≥ 2 nodes**, NG5 **≥ 8** — the XLA remat floor is ~4× Kokkos's hand-managed memory (#3) |
-| Long **bit-reproducible** climate run | ❌ | reduction-order chaos diverges N-vs-1 and run-to-run (same as the C/Fortran ports) (#5, #7) |
+| Single-device, ocean-only **or full** model (KPP+GM/Redi+ice+JRA55), float64 | ✅ | the normal way to run it on one GPU — see Quick start |
+| Forced multi-step, **pre-stacked** (`integrate(step_forcings=…)`) | ✅ but **≤ ~weeks** | the simple path loads every timestep's atmospheric forcing into memory up front, so it runs out of room after a few weeks of simulated time |
+| **Multi-year** forced forward | ✅ | a separate driver (`scripts/core2_kpp_climate_run.py`) feeds the forcing one year at a time and saves/reloads the model state, so it can run for years — this is how we made the 5-yr spin-up and the 10-yr reference |
+| Multi-GPU / multi-node, **ragged** halo | ✅ **GPU only** | the fast, lean way the GPUs swap their shared edges only exists on GPUs, not CPUs (#4) |
+| Multi-GPU, **all_gather** halo | ✅ CPU **and** GPU | works anywhere (CPU too), but every GPU has to hold a copy of all the others' edge data, so the biggest meshes run out of memory (#1) |
+| Big mesh on too few nodes | ❌ out of memory | the model needs more memory per node than the original C/Fortran, so the largest meshes only fit if spread over enough nodes: dars needs **≥ 2 nodes**, NG5 **≥ 8** (#3) |
+| Long **bit-for-bit repeatable** run | ❌ | the ocean is chaotic and tiny rounding differences (from adding numbers in a different order across GPUs) grow over time, so two runs never end up identical — exactly like the original models (#5, #7) |
 
 **Differentiation modes — status, limits, and the reason** (the forward model runs at every scale
 above; these are the constraints on the *gradient* modes):
 
-| mode | status | limitation & **why** |
+| mode | status | what it means in plain terms |
 |---|---|---|
-| Reverse-mode **adjoint**, single-GPU | ✅ used everywhere | chaotic horizon (#2); the sea-ice rheology adjoint must be **frozen** past ~1 day (#9) |
-| Reverse-mode adjoint, **sharded** (multi-GPU) | ❌ wrong gradient | the ragged-halo AD-transpose bug (#1) ⇒ **all gradient work is single-GPU**, parallelised as *independent* jobs |
-| Forward-mode **TLM** (`jax.jvp`), single-GPU | ✅ | **same** chaotic horizon as the adjoint — they are transposes (share the linearization's singular values); cheap only when #inputs ≪ #outputs |
-| **Ensemble-averaged** climate adjoint | ✅ research | needs frozen-ice + bursts *within* the clean window (N ≤ ~1 day) + MAD-filtering of early-blow-up seeds; runs as many independent single-GPU jobs |
-| **EKI** (gradient-free) | ✅ | for the *slow* targets the short-window adjoint can't reach (#10); ensemble cost, returns the scalar not the spatial gradient |
+| Reverse-mode **adjoint**, single-GPU | ✅ used everywhere | the gradient is only trustworthy over short windows because the ocean is chaotic (#2); the sea-ice part of the gradient blows up soonest, so we switch it off in the gradient beyond ~1 day (#9) |
+| Reverse-mode adjoint, **sharded** (multi-GPU) | ❌ wrong gradient | a bug in JAX's multi-GPU data exchange makes the multi-GPU gradient wrong (the forward is fine), so every gradient runs on **one** GPU — we get scale by launching many separate jobs instead (#1) |
+| Forward-mode **TLM** (`jax.jvp`), single-GPU | ✅ | the same calculation run forwards instead of backwards; handy when you turn **one** knob and want the whole map of its effects. It hits the same short-window limit as the adjoint (it's the same gradient, the other way round) |
+| **Ensemble-averaged** climate adjoint | ✅ research | a single long gradient would blow up, so we average many short ones taken along a long run (the chaos cancels out); we freeze sea ice in the gradient and throw out the few short runs that still blew up early |
+| **EKI** (gradient-free) | ✅ | for slow effects a short gradient can't see, an ensemble method that needs no gradient at all — more expensive, and it gives a single number rather than a full map (#10) |
 
 ### Can
 - **Full forward ocean** (ALE/EOS/PGF/FCT/SSH-CG/KPP/GM-Redi/EVP-ice) with real JRA55 + PHC,
