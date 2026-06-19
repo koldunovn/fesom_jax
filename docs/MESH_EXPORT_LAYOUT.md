@@ -4,6 +4,15 @@ The C port (`fesom2_port`, branch `jax-mesh-export`) writes its **static
 mesh/geometry** arrays so the JAX port consumes *exactly* what the C kernels
 compute (gradients, areas, Coriolis, edge geometry) rather than re-deriving them.
 
+> **Standalone preparation (no C build needed) — `scripts/prepare_mesh.py` (Task A8).** A pure-numpy
+> port of `fesom_mesh.c`'s mesh setup produces **this exact layout** from the raw FESOM ASCII
+> (`nod2d/elem2d/aux3d.out` + `nlvls/elvls/edges/edge_tri.out`), run **once, offline**:
+> `python scripts/prepare_mesh.py RAW_MESH_DIR OUT_DIR`. It is verified byte-faithful against the C
+> export below (all 32 arrays on CORE2: ints exact, floats rel ≤1e-13 — `prepare_mesh.py --verify
+> C_EXPORT_DIR`). So a shipped model can prepare a mesh in Python; the C exporter is no longer
+> required (it remains the original provenance / cross-check). The format below is the contract both
+> producers honour.
+
 ## How it is produced
 
 `src/fesom_mesh_export.c` adds `fesom_mesh_export(mesh, partit, dir)`, called
