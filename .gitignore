@@ -25,6 +25,9 @@ jax_cache/
 *.swp
 .DS_Store
 
+# --- Claude Code agent state (per-machine memory/config; never project content) ---
+.claude/
+
 # --- Large / regenerated reference data ---
 # Mesh exports (Task 0.3) and NetCDF snapshots are reproducible from the C/Fortran
 # side; keep them out of git. Small per-substep probe dumps under

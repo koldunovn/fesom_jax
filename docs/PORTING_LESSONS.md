@@ -4004,3 +4004,136 @@ Cite the C source (`file:line`) or dump probe that proves it.
   do) hides the online failure. The structure-preserving bounded multiplier + trust-region reg are what buy
   *stability*; *persisted benefit* needs the slow-target tool. (`scripts/core2_paper_nn_obs.{py,sbatch}`,
   `scripts/core2_paper_nn_obs_diag.sbatch`, `scripts/fig_hybridml.py`.)
+
+## Long-window experiments (PART A) — `docs/plans/20260618-fesom-jax-longwindow-experiments.md`
+
+- **Task A1 — Foundation multi-year DRIFT VERDICT (`FOUNDATION_MULTIYEAR_OK`).** The 3-yr all-on foundation
+  climate (zstar+TKE+mEVP+GM, job 25740424) is a USABLE base — and the verdict is decided by NUMERIC bars on
+  the drift **slope**, never a field's level. Upper-ocean (0–700 m) volume-weighted basin-mean T drift
+  **halves year-over-year** (−0.049 → −0.024 °C yr⁻¹; tail ≪ the 0.1 bar), S is flat (−0.0006 PSU yr⁻¹), and
+  Arctic m_ice annual-mean drift decelerates (+0.32 → +0.15 m yr⁻¹, multi-year ice building toward
+  equilibrium). Physical across ALL 36 monthly snapshots: finite, min wet-layer hnode 4.55 m, max|vel| 2.43,
+  |SSH| 1.98. **Two gotchas that would false-fail a naive check:** (1) the **hnode>0 test MUST mask to wet
+  layers** (`node_layer_mask`) — the raw `min(hnode)` is 0 on dry/below-bottom lanes; (2) the local-SST
+  physicality floor must be the **salinity-dependent freezing point** (`T_f ≈ −0.054·S` ⇒ ~−2.1 °C at
+  S≈39), NOT −1.9 — an instantaneous ice-edge SST of −2.11 °C is physical, and a −1.9 floor would wrongly
+  reject it. The drift-metric reducer (area/volume-weighted, NaN-as-mask, guarded-denominator → finite) is
+  unit-tested (`LW_DRIFT_SEAM_OK`). Drift source = the monthly-mean netCDF (snapshot sampling noise would
+  swamp the signal); snapshots give only the hnode/|vel|/finite physicality series. (`scripts/
+  core2_lw_foundation_check.{py,sbatch}`, `scripts/tests/test_lw_foundation_check.py`.)
+
+- **Task A3 — restartable + parameter-injectable forward seam (`LW_FORWARD_SEAM_OK`).** `core2_kpp_climate_run.py`
+  gains `--load-state` (restart from a saved State pickle) and `--ck` / `--nn-pkl` (inject `Params` via
+  `calibrate.build_params({'tke_c_k': …})` / `{'tke_nn': …}`) — the one fix B1 (restart from the spin-up),
+  D2 (restart + c_k±δ FD) and F (restart + the trained NN) all needed. **The LOAD-BEARING restart detail:**
+  a State saved after step k already carries the AB2 history (`T_old`/`S_old`/`uv_rhsAB`/…), so the
+  continuation must run **`is_first_step=False` throughout** (`is_first_step=(i==0) and not loaded`) — re-
+  cold-starting the AB2 first step would corrupt it. With that, a restart is **BYTE-IDENTICAL** to never
+  having stopped (pi-mesh save→pickle-roundtrip→continue test, k=1 and k=3). **Second subtlety:** even on
+  restart `sst0` is STILL computed from the IC (`core2_initial_state`), because it builds the forcing's
+  static `a_ice` mask — deriving it from the restart state would change the mask and break continuity with
+  the trajectory being continued. No-flags ⇒ `params=None` passed (not `Params.defaults()`) ⇒ the byte-
+  identical default path is untouched. Plus a `/work`-discipline guard: `--save-state`/`--snapshot-dir` must
+  resolve under `/work` or the run aborts. (`scripts/tests/test_lw_forward_seam.py`.)
+
+- **Task B0 — the ensemble-averaged adjoint seam (`LONGWINDOW_SEAM_OK`).** `fesom_jax/longwindow.py` is the
+  GENERIC mechanism (no physics) for the Lea/Allen/Haine 2000 ensemble adjoint: `spread_indices`/
+  `seed_starts` (host-side seed selection along a reference trajectory — even-spaced or rng-jittered,
+  works for in-memory stacks AND on-disk snapshot files), `average_grads` (Welford **streaming** mean +
+  across-burst **standard error**, leafwise over a pytree, masking non-finite burst lanes per the project
+  masked-NaN contract — a diverged burst's NaN doesn't poison the mean), `convergence` (the running-mean-
+  vs-#bursts diagnostic + the burst count at which it settles). **Validated on Lorenz-63** (the canonical
+  chaotic benchmark): FD truth d⟨z⟩/dρ = **1.009**; a SINGLE long-window adjoint **DIVERGES** (+1.1 at
+  T=0.5 → −368 at T=10 → +9.5e5 at T=20 — exponential in the window); the ENSEMBLE AVERAGE of K=4000 short
+  bursts (T=0.5, N=50 dt=0.01) recovers it within **16.2%** (T=0.75 → 12.8%), the running mean stabilizing
+  well before K. **The window-length sweet spot is the empirical preview of the C1 crux:** too short
+  (T=0.3 → 44% err, the climate response undeveloped) OR too long (T≥1.5 → >27% err with huge across-burst
+  stderr, bursts starting to blow up) both degrade — only a MODERATE window both develops the response AND
+  stays below the chaotic blow-up. Efficiency gotcha: collect the reference trajectory with ONE `lax.scan`
+  emitting the full state per step + host-subsample, NOT a Python loop of many short scans (10000 scan
+  dispatches → minutes; one scan → ~1 s). Total test 2.2 s on CPU. (`fesom_jax/tests/test_longwindow.py`.)
+
+- **Task C1 — frozen-ice clean-gradient horizon + the sign-flip (`SIGNFLIP_HORIZON_OK` → Part D).** THE make-
+  or-break long-window measurement. Frozen-ice adjoint (`IceConfig(adjoint_mode="frozen")`), full all-on
+  config, **window-mean MLD** observable = the per-step area-weighted mean MLD accumulated into a **(State,
+  MLD-acc) tuple carry** run through `integrate._run_steps` (the tested √N two-level checkpointing — reused,
+  NOT re-implemented; scripts-only, zero library surface). Seeding at a DEVELOPED snapshot ⇒ `is_first_step=
+  False` throughout ⇒ a uniform scan, **no eager first step** (the simplification that makes the accumulator
+  clean). Swept N at two foundation yr-3 seasonal states (NH deep-winter `037440` + summer `044640`).
+  **RESULT (both seeds, near-identical):** `d(window-mean MLD)/d(c_k)` is **+slow/right** (D2a's "more mixing
+  DEEPENS MLD") from the SHORTEST window (N=12 = 6 h: winter +0.77, summer +0.90) — **there is NO fast-wrong
+  regime to flip from** — and stays clean (|grad| O(1), best-h FD sign-agree, 37–43 GB) through **N=48 (1 d)**,
+  then **BLOWS UP EXPONENTIALLY**: N=96 (2 d) |grad| 2e4 / 1e6, N=192 (4 d) **5e15 / 2e10**. So **N\* ≤ 12 ≪
+  N_blow = 96** ⇒ a clean, well-conditioned, slow-signed window (≤ 1 d) exists below the blow-up ⇒ **simple
+  ensemble-averaging (Part D) is VIABLE; the adjoint-escalation Part E (shadowing/NILSAS) is NOT needed.**
+  D1 burst window = **N=24 (0.5 d)** (cleanest; summer N=48 plateau 0.61 = blow-up onset). **Two methodology
+  notes:** (1) the MLD density-threshold crossing is piecewise-constant in the level it picks ⇒ the SECANT
+  FD is **kink-noisy across h** (winter N=12 h=1e-4 gave FD −7.56 vs AD +0.77 — a level-straddle artifact, NOT
+  an AD error) ⇒ gate blow-up on **|grad| magnitude + best-h FD SIGN agreement, NOT plateau<1%**; (2) the
+  frozen-ice clean horizon (N≤48, 1 d) is much LONGER than the stiff EXACT-ice NN-twin's (N≤6,
+  [[multigpu-sharded-adjoint-horizon]]) — **freezing the mEVP rheology adjoint is what buys the usable window**.
+  The §3 "wrong sign" ([[e2-nn-obs-offline-online]]) was the deployed-NN-over-90-d problem, NOT this window-
+  mean adjoint sensitivity (correctly signed even at 6 h). (`scripts/core2_lw_signflip.{py,sbatch}`,
+  `scripts/fig_signflip.py`.)
+
+- **Task A2 — 5-yr spin-up: a "blow-up" that was a PHYSICAL current vs a too-tight cap (`SPINUP_5YR_OK`).**
+  The 5-yr all-on spin-up tripped the run's `max|vel|≥3.0` stability abort at year ~4.6. **Lesson: localize
+  before assuming a model instability.** Loading the last pre-trip snapshot and finding the max-velocity
+  elements showed it was **LOCALIZED** (~13 elements, 0.017% of the domain) at **lon~47°E lat~4°N — the
+  Somali Current** — at the **surface**, **ice-free**, in **July**: exactly where/when the real Somali
+  Current peaks (~3–3.5 m/s under the SW monsoon, one of Earth's fastest currents). So the 3.0 cap was an
+  arbitrary safety threshold too tight for a *physical* boundary current (and a 10-yr reference hits it every
+  summer). **Fix:** raised `VEL_ABSMAX` 3.0→5.0; a restart-probe from the pre-trip snapshot showed the jet
+  **peaks ~3 and SUBSIDES** (worst |vel|=2.96 over the next 175 d, did NOT climb to 5.0) ⇒ physical, base
+  recoverable. The completed base equilibrated: upper-ocean 0-700 m T drift yr3→4 0.018 °C yr⁻¹ (falling).
+  Also added `--start-month/--start-day` to the driver for mid-year `--load-state` restarts (the probe needed
+  the July forcing; ±1-day forcing offset is negligible for a developed base). (`scripts/core2_lw_spinup_finish.sbatch`.)
+
+- **Task D1 — probing-design findings (multi-target + window choice + robust ensemble).** The 10-yr reference
+  is target-agnostic: `core2_lw_avgadj.py --target {mld_ck, t100_kgm}` gives d(any climate diagnostic)/d(any
+  param) from ONE reference (2 swaps: observable + parameter; all-on config drives both). **Window:** N=48
+  (1 d) beats N=24 (0.5 d) — it captures MORE of the slow response (MLD +2.5 vs +1.5 m; GM d(100m-T)/d(k_gm)
+  **+7.9e-7 vs +2.4e-7 — ~3×**, the GM signal is window-dependent ⇒ still developing ⇒ the slow eddy
+  response, the adjoint↔EKI boundary visible as window-growth ⇒ FD likely larger). **But N=48 is the C1
+  clean-horizon EDGE:** individual unstable (summer) seeds amplify before the N_blow=96 average, contaminating
+  the plain MEAN (smoke: mld_ck mean +52 vs median +3, one burst +303). **Fix = a MAD robust filter** (drop
+  bursts with |g−median| > 5×MAD — the seeds past THEIR clean horizon; a no-op at N=24). ⚠️ a `median(|g|)×k`
+  threshold is FRAGILE at small K (multiple outliers inflate the median → one slips through, even flipping the
+  kept-mean sign) — use **MAD from the median**, the standard robust scale. (`scripts/core2_lw_avgadj.{py,sbatch}`.)
+
+- **Task B1 — the 10-yr reference + REF_10YR_OK verdict.** The 10-yr all-on forward (restart from
+  `spinup5_state.pkl`, job 25748365, 8.6 h) ran clean: **worst |vel|=2.735 over the entire decade** — the
+  Task-A2 Somali-Current cap (5.0) held with margin at the full 10-yr scale, the strongest possible validation
+  of that fix (the per-step monitor is a far tighter physicality check than any snapshot spot-check). The
+  verdict script (`core2_lw_ref_check.py`) **reuses the A1 reducers verbatim** (`load_weights`, `read_climate`,
+  `decel`, `lin_slope_per_year`) — the same falsifiable drift instrument over 10 yr, only the VEL cap bumped
+  3.0→5.0 — and adds the climate observable itself: the 10-yr-mean MLD computed **on the actual snapshot
+  States via `ale.live_geometry` + `obs_compare.mld_density_threshold`** (the EXACT D1 code path, NOT a static-Z
+  monthly-mean proxy). Two findings that gate D1: (i) the upper ocean has **essentially equilibrated** by yr 6
+  — T0700 half-drift −0.018→−0.0007 °C/yr, decade lin-slope −0.0071 (a 5-yr spin-up + 10-yr ref reaches a near-
+  stationary base, vs the 3-yr foundation's −0.024); (ii) the **MLD is stationary** across the decade (35.1–37.8
+  m, mean 36.6 m), so "d(10-yr-mean MLD)/d(c_k)" is well-posed — a drifting observable would make the long-mean
+  target ambiguous. **Sizing gotcha:** the frozen-ice adjoint burst is ~60 s steady-state at N=48 (1 d) after a
+  ~200 s first-burst JIT compile (~32 s at N=24) ⇒ K=200 ≈ 3.4 h **per target**. The two-target `for`-loop in
+  one 3.5-h sbatch would time-cut the second target — **split into independent single-target jobs** (matches the
+  "parallelism = many INDEPENDENT burst jobs" design) with a 5-h wall each. (`scripts/core2_lw_ref_check.py`.)
+
+- **Task D1 — the adjoint↔TLM `--mode` switch (forward-mode mirror) + a free transpose validation.** The
+  ensemble-averaged-sensitivity harness is **direction-agnostic**: both modes seed the SAME reference snapshots,
+  same forcing-at-seed-date, same N-window, same MAD filter + streaming average — only the AD transform + the
+  parameter/observable SHAPE flip. `--mode adjoint` (reverse, `jax.grad`): param = [nod2D] FIELD, observable =
+  SCALAR ⇒ map `d(scalar)/d(param_i)` ("where to tune"), scalar = Σ map. `--mode tlm` (forward, `jax.jvp`): param
+  = SCALAR (one global knob, broadcast to the field inside `params_from` so the unit tangent = a uniform bump),
+  observable = [nod2D] FIELD ⇒ map `d(field_j)/d(param)` ("spatial fingerprint"), scalar = area/vol-weighted mean
+  of the map. **The two scalars are the SAME directional derivative `dO/d(uniform θ)` — a built-in transpose
+  check:** on 4 shared seeds the adjoint Σ-map (+1.52493) and the TLM weighted-mean (+1.51373) agreed to **0.73%**
+  (per-burst ~1%). **Implementation:** ONE `window_mean(theta, …)` serves both (mode-set `acc0`: scalar vs field;
+  the observable's reduction); only the outer transform differs (`jax.grad` vs `jax.jvp(…, (jnp.ones_like(θ),))`).
+  A unified per-node weight `u` (1 for adjoint → Σ; normalized `w_scalar` for tlm → weighted mean) reduces a map
+  to its scalar in both. **Forward-mode is leaner+faster:** no tape ⇒ `checkpoint=False` (plain scan) ⇒ peak **22
+  GB vs 39 GB** and ~14 s/burst vs ~31 s (N=24) — only a longer first compile. **Map magnitudes are transposes:**
+  TLM `|map|max`~5000 (a single convection node's MLD is very sensitive to `c_k`) vs adjoint ~0.03 (each node is a
+  sliver of the GLOBAL-mean sensitivity) — large local TLM values with a moderate +1.5 global mean is correct,
+  not a blow-up. The chaotic `N_blow` horizon + the need for ensemble-averaging apply to BOTH (TLM and adjoint
+  share the linearization's singular values) — forward vs reverse changes only WHICH dimension is cheap.
+  (`scripts/core2_lw_avgadj.py --mode`, validation smoke job 25762879.)

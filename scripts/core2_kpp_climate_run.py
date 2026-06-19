@@ -50,7 +50,11 @@ MESH_DIR = ROOT / "data" / "mesh_core2"
 IC_DIR = ROOT / "data" / "ic_core2"
 IC_DIR_ZSTAR = ROOT / "data" / "ic_core2_dist16"   # --ale on: the zstar-canonical IC
 
-SSH_ABSMAX, VEL_ABSMAX, MICE_MAX = 5.0, 3.0, 20.0
+# VEL_ABSMAX raised 3.0→5.0 (2026-06-18): the 5-yr spin-up tripped 3.0 at a LOCALIZED summer
+# Somali Current jet (lon~47E lat~4N, surface, ice-free, July) — that current really peaks ~3–3.5
+# m/s under the SW monsoon, so 3.0 was too tight (a multi-year / 10-yr run hits it every summer).
+# 5.0 still catches a genuine grid-wide blow-up; the finite/NaN check catches hard explosions.
+SSH_ABSMAX, VEL_ABSMAX, MICE_MAX = 5.0, 5.0, 20.0
 # C-port variable names / metadata (the m32_climate_compare surface fields + 3-D T/S)
 VARS_2D = [("sst", "degC", "sea surface temperature"),
            ("sss", "psu", "sea surface salinity"),
@@ -159,6 +163,29 @@ class MonthlyWriter:
             ds.close()
 
 
+def build_run_params(ck=None, nn_pkl: str = ""):
+    """The injected forward ``Params`` (or ``None`` — the bit-identical default).
+
+    ``ck`` sets the TKE ``c_k`` (the D2 finite-difference knob: ``params = build_params(
+    {'tke_c_k': ck})``); ``nn_pkl`` loads a trained ``tke_nn`` closure (the F deployment:
+    ``build_params({'tke_nn': nn})``, reading ``pickle['nn']`` per the nn_obs save format).
+    Both unset ⇒ ``None`` ⇒ byte-identical to the un-parameterised forward (the ``params=None``
+    invariant the whole port preserves). The two may combine (NN multiplier on a perturbed c_k)."""
+    if ck is None and not nn_pkl:
+        return None
+    from fesom_jax import calibrate
+    tun = {}
+    if nn_pkl:
+        import pickle
+        with open(nn_pkl, "rb") as f:
+            blob = pickle.load(f)
+        nn = blob["nn"] if (isinstance(blob, dict) and "nn" in blob) else blob
+        tun["tke_nn"] = jax.device_put(nn)
+    if ck is not None:
+        tun["tke_c_k"] = ck
+    return calibrate.build_params(tun)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--years", type=int, default=2)
@@ -186,7 +213,27 @@ def main():
                          "different months, not consecutive chunks (see core2_paper_nn_twin_batched.py)")
     ap.add_argument("--snapshot-every", type=int, default=0,
                     help="snapshot stride in steps (0=off); e.g. 1440 ≈ 30 d at dt=1800")
+    ap.add_argument("--load-state", type=str, default="",
+                    help="RESTART from a saved State pickle (skip the IC init). is_first_step=False "
+                         "throughout — the loaded State already carries the AB2 history (T_old/S_old/…), "
+                         "so the continuation is bit-identical to never having stopped. The forcing "
+                         "a_ice mask is STILL built from the IC SST, so the run continues the same "
+                         "calendar (set --start-year to the restart year). The long-window B1/D2/F path.")
+    ap.add_argument("--ck", type=float, default=None,
+                    help="inject a TKE c_k override (the D2 finite-difference knob); "
+                         "None ⇒ no injection (the byte-identical params=None default path)")
+    ap.add_argument("--nn-pkl", type=str, default="",
+                    help="inject a trained tke_nn closure (the F deployment); loads pickle['nn']")
+    ap.add_argument("--start-month", type=int, default=1,
+                    help="forcing-calendar start month (for a MID-YEAR --load-state restart)")
+    ap.add_argument("--start-day", type=int, default=1,
+                    help="forcing-calendar start day (for a MID-YEAR --load-state restart)")
     args = ap.parse_args()
+    # /work-discipline guard (long-window plan): heavy outputs (final state, snapshots) must
+    # live on /work, never $HOME — a multi-GB pickle under $HOME blows the home quota.
+    for label, p in (("--save-state", args.save_state), ("--snapshot-dir", args.snapshot_dir)):
+        if p and not str(Path(p).resolve()).startswith("/work"):
+            raise SystemExit(f"refusing {label}={p!r}: heavy outputs must be under /work, not $HOME")
     dt = args.dt
     n_steps = args.steps if args.steps > 0 else int(round(args.years * 365 * 86400 / dt))
     ale_cfg = AleConfig() if args.ale == "on" else None
@@ -196,10 +243,24 @@ def main():
     print(f"[setup] backend={jax.default_backend()} devices={jax.devices()}", flush=True)
     t0 = time.time()
     mesh = load_mesh(MESH_DIR)
+    # IC SST is ALWAYS computed (it builds the forcing's static a_ice mask, held fixed) — even
+    # on restart, so the continued run uses the SAME forcing as the trajectory it continues.
     sst0 = np.asarray(core2_initial_state(mesh, ic_dir).T[:, 0])
-    state = ice.seed_ice(core2_initial_state(mesh, ic_dir), mesh, sst0)
+    if args.load_state:
+        import pickle
+        with open(args.load_state, "rb") as fpk:
+            state = jax.device_put(pickle.load(fpk))
+        loaded = True
+        print(f"[load-state] RESTART from {args.load_state} (is_first_step=False throughout)", flush=True)
+    else:
+        state = ice.seed_ice(core2_initial_state(mesh, ic_dir), mesh, sst0)
+        loaded = False
+    run_params = build_run_params(args.ck, args.nn_pkl)
+    if run_params is not None:
+        print(f"[params] injecting ck={args.ck} nn_pkl={args.nn_pkl or '-'}", flush=True)
     op = ssh.build_ssh_operator(mesh, dt=dt)
-    dates = core2_forcing.dates_for_steps(args.start_year, dt, n_steps)
+    dates = core2_forcing.dates_for_steps(args.start_year, dt, n_steps,
+                                          start_month=args.start_month, start_day=args.start_day)
     cf_year = args.start_year
     cf = core2_forcing.build_core_forcing(mesh, cf_year, sst_ic=sst0)
     # --mevp on ⇒ the Bouillon-2013 modified-EVP rheology (whichEVP=1, the c_mevp_2yr config);
@@ -246,7 +307,8 @@ def main():
             print(f"  [forcing] rebuilt for year {y}", flush=True)
         sf = cf.step_forcing(y, doy, sec, month)
         ts = time.time()
-        state = stepmod.step_jit(state, mesh, op, None, dt=dt, is_first_step=(i == 0),
+        state = stepmod.step_jit(state, mesh, op, None, run_params, dt=dt,
+                                 is_first_step=((i == 0) and not loaded),
                                  step_forcing=sf, forcing_static=cf.static,
                                  ice_cfg=ice_cfg, gm_cfg=gm_cfg, kpp_cfg=kpp_cfg,
                                  tke_cfg=tke_cfg, ale_cfg=ale_cfg)

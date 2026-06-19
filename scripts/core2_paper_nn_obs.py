@@ -134,6 +134,7 @@ def run_train(args, mesh, op, fs, cfgs, cf, node_mask, w3d, Hmap, cell_lat, cell
     hmask = build_hmask(args, cell_lat, cell_lon)
     w_sst_coef = args.w_sst
     reg_coef = args.reg
+    reg_tgt = float(np.log(args.reg_target))      # A1(b): anchor toward log(target mult); 0.0 ⇒ E2 (toward default)
     wnode = jnp.asarray(area0 * wet.astype(np.float64))                 # area-wt wet mask (reg weight)
 
     # ---------- chunk starts (monthly snapshots) + per-month forcing + WOA targets + weights ----------
@@ -188,7 +189,7 @@ def run_train(args, mesh, op, fs, cfgs, cf, node_mask, w3d, Hmap, cell_lat, cell
             jmh = obs_compare.misfit(cell_mld, wmld, wmld_ho)
             jsh = obs_compare.misfit(cell_sst, wsst, wsst_ho)
             lm = nn_.log_m_max * jnp.tanh(tke_nn.mlp_raw(nn_, feats_k))      # log-multiplier [N, 3]
-            reg = jnp.sum(wnode[:, None] * lm * lm) / (jnp.sum(wnode) * lm.shape[1])
+            reg = jnp.sum(wnode[:, None] * (lm - reg_tgt) ** 2) / (jnp.sum(wnode) * lm.shape[1])
             return jm / j0m + w_sst_coef * js / j0s + reg_coef * reg, (jm, js, jmh, jsh)
         (l, aux), g = jax.value_and_grad(L, has_aux=True)(nn)
         return l, aux, g
@@ -226,7 +227,12 @@ def run_train(args, mesh, op, fs, cfgs, cf, node_mask, w3d, Hmap, cell_lat, cell
 
     # ---------- batched recovery: per-chunk value_and_grad, accumulate G=Σ g_k, one Adam step ----------
     opt = optax.adam(optax.cosine_decay_schedule(args.lr, args.iters))
-    params, opt_state, losshist = trainee0, None, []
+    warm = (uniform_nn(args.reg_target, tuple(args.hidden), args.m_max)
+            if args.reg_target != 1.0 else trainee0)        # A1(b): start AT the anchor, refine around it
+    params, opt_state, losshist = warm, None, []
+    if args.reg_target != 1.0:
+        print(f"  [A1(b)] warm-start at uniform {args.reg_target:g}× + reg anchored there (m_max={args.m_max:g}); "
+              f"baseline j0/NN→0 unchanged ⇒ reductions are still vs DEFAULT", flush=True)
     t1 = time.time()
     print(f"\n  --- train NN→0 → reduce WOA MLD+SST over K={K} seasonal chunks "
           f"(Adam lr={args.lr}, cosine, ≤{args.iters} it; per-chunk MLD/J0+{args.w_sst:g}·SST/J0) ---",
@@ -473,8 +479,13 @@ def main():
     ap.add_argument("--hidden", type=int, nargs="+", default=[16, 16])
     ap.add_argument("--w-sst", type=float, default=0.3, help="SST weight in the loss (MLD is primary)")
     ap.add_argument("--reg", type=float, default=0.03,
-                    help="trust-region reg: area-wt penalty on (log multiplier)² ⇒ keep the closure "
-                         "MILD (near default mixing) so it DEPLOYS — the offline/online-gap fix")
+                    help="trust-region reg: area-wt penalty on (log multiplier − log reg_target)² ⇒ keep "
+                         "the closure near the anchor so it DEPLOYS — the offline/online-gap fix")
+    ap.add_argument("--reg-target", type=float, default=1.0,
+                    help="A1(b): anchor the trust-region reg toward THIS uniform multiplier (1.0 = E2 "
+                         "default/no-blow-up behavior; 2.0 = the const-mult-validated 'more mixing' side "
+                         "that improves the DEPLOYED MLD — warm-started so the NN refines spatial "
+                         "structure around the right anchor)")
     ap.add_argument("--m-max", type=float, default=2.0,
                     help="bounded multiplier ∈ (1/m_max, m_max) — the structural-stability cap; tighter "
                          "than the twin's 3.0 to bound the deployed over-mixing")
