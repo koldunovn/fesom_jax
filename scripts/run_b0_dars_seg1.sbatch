@@ -26,14 +26,14 @@ MESH=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars
 OUT=/work/ab0995/a270088/port_jax/runs/dars_b0
 
-echo "=== $(date) dars B0 seg1: nodes=$SLURM_JOB_NODELIST  dist_16 (16 GPU) RESUME seg0 (was dist_8) +8 steps ==="
+echo "=== $(date) dars B0 seg1: nodes=$SLURM_JOB_NODELIST  dist_16 (16 GPU) RESUME seg0 (dist_16) +8 steps ==="
 srun --cpu-bind=none "$PY" scripts/run_from_config.py configs/dars.yaml \
     --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition dist_16 \
     --steps 8 --chunk-steps 8 --ragged --restart-in "$OUT/seg0" --restart-out "$OUT/seg1"
 R=$?
 echo "seg1 exit=$R"
 if [ $R -eq 0 ]; then
-  echo "MACHINERY_SCALE_DARS_OK (dars forced run + device-count-change restart dist_8->dist_16, multi-node)"
+  echo "MACHINERY_SCALE_DARS_OK (dars forced run + multi-node forced run + restart at dist_16)"
 else
   echo "B0_DARS_FAILED (seg1 exit=$R)"
 fi

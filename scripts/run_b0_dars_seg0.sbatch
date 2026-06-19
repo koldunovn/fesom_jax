@@ -7,7 +7,7 @@
 #SBATCH --job-name=b0_dars_s0
 #SBATCH -A ab0995_gpu
 #SBATCH -p gpu
-#SBATCH --nodes=2
+#SBATCH --nodes=4
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
@@ -28,9 +28,9 @@ POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars
 OUT=/work/ab0995/a270088/port_jax/runs/dars_b0
 mkdir -p "$OUT"
 
-echo "=== $(date) dars B0 seg0: nodes=$SLURM_JOB_NODELIST  dist_8 (8 GPU) cold 8 steps ==="
+echo "=== $(date) dars B0 seg0: nodes=$SLURM_JOB_NODELIST  dist_16 (16 GPU) cold 8 steps ==="
 srun --cpu-bind=none "$PY" scripts/run_from_config.py configs/dars.yaml \
-    --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition dist_8 \
+    --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition dist_16 \
     --steps 8 --chunk-steps 8 --ragged --restart-out "$OUT/seg0"
 R=$?
 echo "seg0 exit=$R"
