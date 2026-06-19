@@ -85,8 +85,9 @@ fesom_jax/
   halo.py halo_points.py reductions.py        # halo exchange (all_gather + ragged); psum reductions
   shard_mesh.py integrate_sharded.py          # per-device sharded mesh/state; shard_map runners
   zarr_output.py               # sharded, gather-free model output to Zarr
+  longwindow.py                # ensemble-averaged (climate-timescale) adjoint seam: seed-spread + streaming mean+SE
   tests/                       # ~55 verification + gradient + sharding gates
-scripts/                       # benchmarks + SLURM sbatch (forward scaling, gates, plots)
+scripts/                       # benchmarks + SLURM sbatch + differentiable-capability drivers (core2_paper_*, core2_lw_*)
 docs/                          # ENV, plans, porting lessons, scaling, the ragged-bug record
 data/  mesh_core2/ ic_core2/   # CORE2 dense mesh + cached PHC IC (small, in-repo)
 ```
@@ -149,6 +150,25 @@ print(g.k_ver, g.a_ver, g.k_gm, g.redi_kmax)         # mixing / eddy sensitiviti
 `d(a_ice)/d(air-temperature)`) — flowing through the CG solve and the EVP scan. See
 `fesom_jax/tests/test_gradient_sharded.py` for validated examples. (Read
 **[Limitations](#limitations--what-it-can-and-cant-do)** on the useful time horizon.)
+
+### 2b. Reverse-mode (adjoint) vs forward-mode (tangent-linear)
+
+`jax.grad` above is **reverse-mode** (the adjoint): one backward pass gives `d(one scalar)/d(all
+inputs)` — the right tool for **few outputs, many inputs**, e.g. a `[nod2D]` parameter *field* → one
+global metric (`∂(mean MLD)/∂c_k(x)`). For the **mirror case** — **one scalar input → a field of
+outputs**, the spatial *response* to a single global knob — use **forward-mode** (`jax.jvp`, the
+tangent-linear model): one forward sweep carries the tangent alongside the primal, no tape.
+
+```python
+ck0 = jnp.float64(Params.defaults().tke_c_k)          # one global scalar knob
+mld_field, dmld_dck = jax.jvp(                         # forward-mode: d(MLD field)/d(c_k)
+    lambda ck: window_mean_mld_field(ck, state0), (ck0,), (1.0,))
+```
+
+**Cost scales with the small dimension:** reverse mode ∝ #outputs, forward mode ∝ #inputs. The two
+are *transposes of the same linearization* — they agree on a shared directional derivative
+(validated to **0.7 %**) **and share the same chaotic horizon** (see Limitations). The long-window
+driver exposes both via `--mode {adjoint,tlm}` (`scripts/core2_lw_avgadj.py`).
 
 ### 3. Multi-GPU / multi-node forward
 
@@ -219,6 +239,32 @@ headline figures: `scripts/fig_{sensitivity,calibration,hybridml}.png`.
   equilibrium (the same adjoint↔EKI boundary). A held-out short-window obs reduction is necessary
   but not sufficient for a deployable closure, so the long-forward drift+persisted-benefit gate is
   essential.
+
+- **Climate-timescale sensitivity — the ensemble-averaged adjoint** (`scripts/core2_lw_avgadj.py`,
+  `fig_avgadj.py`). A single burst's gradient is clean only for hours→days (chaos, below); to reach
+  the **10-yr-mean** response, *don't* backprop a long window — **average many short frozen-ice
+  adjoint bursts** seeded along a 10-yr reference trajectory (Lea/Allen/Haine): the chaotic part
+  cancels, the slow climate signal survives. Gives `d(10-yr-mean MLD)/d(c_k) = +1.46 ± 0.50 m` (more
+  mixing deepens the climate-mean MLD — the calibration sign, now at the climate horizon), with the
+  full `[nod2D]` map, across-burst SE, and a **MAD robust filter** that drops the few summer-convection
+  bursts that blow up before the others. Runs in both `--mode {adjoint, tlm}` (the *where-to-tune* map
+  and the *spatial-fingerprint* response). The slow GM→interior-T target (`d(mean 0–100 m T)/d(k_gm)`)
+  is reachable but small at a 1-day window — the adjoint↔EKI boundary again, pending finite-difference
+  validation against two 10-yr `k_gm ± δ` forwards.
+
+**Run them** — each driver has an `.sbatch` sibling with the Levante GPU directives, and `--help` lists
+its knobs. Heavy state goes to `/work`; results are small `scripts/*.jsonl` + `*_map.npz` (gitignored):
+
+```bash
+PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
+$PY scripts/core2_paper_sensitivity.py  --help     # Fig 2 — instantaneous adjoint sensitivity maps
+$PY scripts/core2_paper_calib_twin.py    --help     # perfect-model calibration (k_gm / c_k recovery)
+$PY scripts/core2_paper_nn_twin.py       --help     # learned-TKE hybrid-ML twin
+# climate-timescale sensitivity (needs a 10-yr reference of state snapshots), reverse- OR forward-mode:
+$PY scripts/core2_lw_avgadj.py --mode adjoint --target mld_ck \
+    --snap-dir /work/ab0995/a270088/port_jax/longwindow/ref10_snaps --K 200 --n 48
+$PY scripts/fig_avgadj.py --maps scripts/lw_avgadj_mld_ck_adjoint_map.npz   # render the climate map
+```
 
 > These are research capabilities on the CORE2 (127 k-node) configuration, not a turnkey DA
 > product. The honest limits — the chaotic gradient horizon, the adjoint↔EKI split, the
@@ -325,6 +371,17 @@ sbatch scripts/run_suite.sbatch                                 # full suite on 
 
 ## Limitations — what it can and can't do
 
+**Differentiation modes — status, limits, and the reason** (the *forward* model itself runs at every
+scale; these are the constraints on the *gradient* modes):
+
+| mode | status | limitation & **why** |
+|---|---|---|
+| Reverse-mode **adjoint**, single-GPU | ✅ used everywhere | chaotic horizon (#2); the sea-ice rheology adjoint must be **frozen** past ~1 day (#9) |
+| Reverse-mode adjoint, **sharded** (multi-GPU) | ❌ wrong gradient | the ragged-halo AD-transpose bug (#1) ⇒ **all gradient work is single-GPU**, parallelised as *independent* jobs |
+| Forward-mode **TLM** (`jax.jvp`), single-GPU | ✅ | **same** chaotic horizon as the adjoint — they are transposes (share the linearization's singular values); cheap only when #inputs ≪ #outputs |
+| **Ensemble-averaged** climate adjoint | ✅ research | needs frozen-ice + bursts *within* the clean window (N ≤ ~1 day) + MAD-filtering of early-blow-up seeds; runs as many independent single-GPU jobs |
+| **EKI** (gradient-free) | ✅ | for the *slow* targets the short-window adjoint can't reach (#10); ensemble cost, returns the scalar not the spatial gradient |
+
 ### Can
 - **Full forward ocean** (ALE/EOS/PGF/FCT/SSH-CG/KPP/GM-Redi/EVP-ice) with real JRA55 + PHC,
   float64; N-vs-1 correct vs single-device (field-appropriate; see below).
@@ -338,11 +395,15 @@ sbatch scripts/run_suite.sbatch                                 # full suite on 
    `use_ragged=True` is **forward-only**. For gradients use `use_ragged=False` (the `all_gather`
    halo — correct AD, but O(P·N_local) communication). Full record + minimal repro + the planned
    `custom_vjp` fix: **[`docs/JAX_RAGGED_A2A_BUG.md`](docs/JAX_RAGGED_A2A_BUG.md)**.
-2. **Gradient time horizon ≈ predictability window.** The model is chaotic: gradients are clean and
-   useful over **hours→weeks** (forcing→fast-variable sensitivities — ice, SST, mixed layer), but a
-   free-running trajectory's gradient **explodes exponentially** after the Lyapunov/predictability
-   time (months→years). Long-window training needs shadowing-type methods (the differentiable-chaos
-   frontier), not just more memory.
+2. **Gradient time horizon ≈ predictability window (both adjoint AND tangent-linear).** The model is
+   chaotic: a single burst's gradient is clean over **hours→days** (forcing→fast-variable
+   sensitivities — ice, SST, mixed layer) but **explodes exponentially** past the Lyapunov time (for
+   the all-on CORE2 config the window-mean-MLD gradient is clean to ~1 day and blows up by ~2 days).
+   Forward-mode (TLM) does **not** escape this — it shares the adjoint's linearization (same singular
+   values). To get a **climate-mean** sensitivity anyway, *don't* backprop a long window: **average
+   many short frozen-ice bursts along a reference trajectory** (the ensemble-averaged adjoint — the
+   chaotic part cancels, the slow signal survives). Long-window *training* still needs shadowing-type
+   methods (the differentiable-chaos frontier), not just more memory.
 3. **Big meshes need a minimum node count** (memory). dars **≥ 2 nodes**, NG5 **≥ 8 nodes** — the
    compiled full-step working set (XLA rematerialization floor) is ~4× heavier per node-level than
    Kokkos's hand-managed memory, so JAX needs *more* nodes than Kokkos for the biggest mesh
@@ -359,6 +420,18 @@ sbatch scripts/run_suite.sbatch                                 # full suite on 
    (chaotic) — same as the C; a separate follow-up, out of scope here.
 8. **Forced gradient at large scale** is memory-bounded by the EVP-scan backward (validated on CPU
    fake-devices + GPU ocean grad; the full forced grad on many GPUs is deferred).
+9. **Sea-ice rheology adjoint is unstable → the "frozen-ice" adjoint for multi-day windows.** The
+   (m)EVP rheology's iterative pseudo-time solve has a backward that amplifies far faster than the
+   ocean's, so any gradient window beyond ~1 day runs the **frozen-ice adjoint** — the ice forward
+   runs in full; only its *backward* is `stop_gradient`'d (`IceConfig(adjoint_mode="frozen")`). Ice
+   *thermodynamic* sensitivities over hours→days are fine; the *rheology* gradient over long windows
+   is not. (Every climate-sensitivity burst uses this.)
+10. **Slow targets need EKI, not the short-window adjoint (the adjoint↔EKI boundary).** Sensitivities
+    that develop over months — GM/Redi → interior T/S, the deployed-closure equilibrium — are *small
+    and under-resolved* in a clean short adjoint window, so the short-window adjoint optimum can be the
+    wrong target for a long deployment (the offline/online closure gap). Those use the forward-only
+    **EKI** ensemble (immune to the chaos/memory ceiling and the ice-adjoint instability); adjoint and
+    EKI agree on the shared scalar and are each used where correct.
 
 ---
 
