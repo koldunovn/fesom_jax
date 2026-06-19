@@ -181,7 +181,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         raise ValueError("run_from_config: provide forcing (CoreForcing) or forcing_stack")
     fstatic = forcing.static
     fs_p = shard_mesh.partition_forcing_static(fstatic, part)
-    stress_p = jnp.zeros((npes, sm.Lmax["elem"], 2))
+    stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)
 
     # --- chunk loop -------------------------------------------------------
     stats = None

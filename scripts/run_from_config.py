@@ -85,11 +85,14 @@ def main():
     sop = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=cfg.dt), part)
 
     # cold IC vs restart: run_from_config reads cfg.restart_in itself; only build the cold IC here.
+    # HOST-build (xp=np) so the global State is never materialized on GPU 0 (the dars/NG5 setup-OOM
+    # fix — a device-built 3.16 M State is ~50-80 GB, OOMs one GPU before partition_state can shard it).
+    import numpy as np
     state0 = None
     if cfg.restart_in is None:
         from fesom_jax.phc_ic import core2_initial_state
-        state0 = core2_initial_state(mesh, args.ic_dir)
-    sst0 = None if state0 is None else __import__("numpy").asarray(state0.T[:, 0])
+        state0 = core2_initial_state(mesh, args.ic_dir, xp=np)
+    sst0 = None if state0 is None else np.asarray(state0.T[:, 0])
     forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0)
 
     if _IS_LEAD:

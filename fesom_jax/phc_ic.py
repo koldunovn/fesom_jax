@@ -426,10 +426,16 @@ def build_and_cache_ic(mesh, path: str = DEFAULT_PHC_PATH,
 
 
 def core2_initial_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR,
-                        base_T: float = 10.0, base_S: float = 35.0):
+                        base_T: float = 10.0, base_S: float = 35.0, *, xp=None):
     """Build a CORE2 :class:`~fesom_jax.state.State` from the cached PHC IC: a rest
     state (uv=0, eta=0, ``hnode`` from ``zbar_3d_n``) with ``T``/``S`` set to the PHC
     fields.
+
+    ``xp`` selects the array backend: the default ``jnp`` is byte-identical to before (builds
+    on the default device). ``xp=np`` builds the WHOLE State on the HOST — required for big
+    meshes (dars/NG5), where the device-built global State (~50-80 GB at 3.16 M) OOMs GPU 0
+    before ``partition_state`` can shard it (the Phase-8b B.3 setup-OOM fix; mirrors
+    ``State.rest(xp=np)`` + ``bench_forward_scaling``'s host build).
 
     ⚠️ **``T_old``/``S_old`` (the AB2 step-1 history) are the CONSTANT BASE
     (``base_T``/``base_S`` = 10/35), NOT the PHC field.** The C sets
@@ -441,11 +447,13 @@ def core2_initial_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR,
     step-1 FCT advection (~2e-3 in surface T)."""
     import jax.numpy as jnp
     from .state import State
+    if xp is None:
+        xp = jnp
     ic_dir = Path(ic_dir)
-    T = jnp.asarray(np.load(ic_dir / "T_ic.npy"))
-    S = jnp.asarray(np.load(ic_dir / "S_ic.npy"))
-    mask = mesh.node_layer_mask
-    T_old = jnp.where(mask, base_T, 0.0)
-    S_old = jnp.where(mask, base_S, 0.0)
-    st = State.rest(mesh, T0=base_T, S0=base_S)            # hnode/helem from zbar_3d_n
+    T = xp.asarray(np.load(ic_dir / "T_ic.npy"))
+    S = xp.asarray(np.load(ic_dir / "S_ic.npy"))
+    mask = np.asarray(mesh.node_layer_mask) if xp is np else mesh.node_layer_mask
+    T_old = xp.where(mask, base_T, 0.0)
+    S_old = xp.where(mask, base_S, 0.0)
+    st = State.rest(mesh, T0=base_T, S0=base_S, xp=xp)     # hnode/helem from zbar_3d_n
     return dataclasses.replace(st, T=T, S=S, T_old=T_old, S_old=S_old)

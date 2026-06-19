@@ -32,4 +32,6 @@ echo "=== $(date) dars B0 seg0: nodes=$SLURM_JOB_NODELIST  dist_8 (8 GPU) cold 8
 srun --cpu-bind=none "$PY" scripts/run_from_config.py configs/dars.yaml \
     --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition dist_8 \
     --steps 8 --chunk-steps 8 --restart-out "$OUT/seg0"
-echo "seg0 exit=$?"
+R=$?
+echo "seg0 exit=$R"
+exit $R    # propagate the failure so seg1's --dependency=afterok cancels (no stale-restart resume)
