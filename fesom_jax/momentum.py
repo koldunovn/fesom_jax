@@ -29,13 +29,12 @@ from .config import (
     DT_DEFAULT,
     G,
     SSH_THETA,
-    VISC_GAMMA0,
-    VISC_GAMMA0_H,
-    VISC_GAMMA1,
-    VISC_GAMMA1_H,
-    VISC_GAMMA2,
+    ViscConfig,
 )
 from .mesh import Mesh
+
+# Default γ's = the module constants ⇒ ``visc_cfg=None`` is bit-identical to the bare path.
+_DEFAULT_VISC = ViscConfig()
 
 _EPS_AB = 0.1                     # FESOM AB2 stabilization offset (oce_modules.F90:92)
 _AB1 = -(0.5 + _EPS_AB)
@@ -185,11 +184,14 @@ def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
     return uv_rhs, uv_rhsAB_new
 
 
-def _bidiff_edge_terms(mesh: Mesh, uv):
+def _bidiff_edge_terms(mesh: Mesh, uv, vc: ViscConfig = _DEFAULT_VISC):
     """Shared per-edge per-level quantities for both biharmonic stages: the
     velocity difference ``(u1,v1)=uv[el1]-uv[el2]``, ``coef=sqrt(max(g0,inner)·len)``
     (``inner=max(g1·|du|, g2·|du|²)``), the per-edge overlap level mask, and the
-    safe element indices/areas. Interior edges only (el1≥0 AND el2≥0)."""
+    safe element indices/areas. Interior edges only (el1≥0 AND el2≥0).
+
+    ``vc`` (a :class:`~fesom_jax.config.ViscConfig`) supplies the γ's; the default reproduces
+    the module constants exactly ⇒ bit-identical to before."""
     et = mesh.edge_tri
     el1, el2 = et[:, 0], et[:, 1]
     interior = (el1 >= 0) & (el2 >= 0)
@@ -211,12 +213,12 @@ def _bidiff_edge_terms(mesh: Mesh, uv):
     v1 = ops.gather(uv[:, :, 1], el1s) - ops.gather(uv[:, :, 1], el2s)
     vi2 = u1 * u1 + v1 * v1
     sq = _safe_sqrt(vi2)
-    inner = jnp.maximum(VISC_GAMMA1 * sq, VISC_GAMMA2 * vi2)
-    coef = _safe_sqrt(jnp.maximum(VISC_GAMMA0, inner) * length)          # (edge,nl)
+    inner = jnp.maximum(vc.gamma1 * sq, vc.gamma2 * vi2)
+    coef = _safe_sqrt(jnp.maximum(vc.gamma0, inner) * length)            # (edge,nl)
     return el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef
 
 
-def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None):
+def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_cfg=None):
     """Biharmonic flow-aware horizontal viscosity (opt_visc=7), two edge→element
     scatter stages added into ``uv_rhs``. Returns the updated ``uv_rhs``
     ``[elem2D, nl, 2]``. Mirror of ``fesom_visc_filt_bidiff`` (``fesom_momentum.c:654``).
@@ -226,9 +228,13 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None):
     edge's two cells) needs the **halo** ``Uc/Vc`` refreshed — the C exchanges them
     between the stages (``oce_dyn.F90:367``). ``exch=None`` (single device) ⇒ the
     identity ⇒ byte-identical to ``v1.0``.
+
+    ``visc_cfg`` (a :class:`~fesom_jax.config.ViscConfig`) supplies the γ's; ``None`` ⇒ the
+    module-constant defaults ⇒ byte-identical (NG5 passes ``gamma1=0.2``).
     """
     _exch = exch if exch is not None else (lambda f, kind: f)
-    el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef = _bidiff_edge_terms(mesh, uv)
+    vc = visc_cfg if visc_cfg is not None else _DEFAULT_VISC
+    el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef = _bidiff_edge_terms(mesh, uv, vc)
 
     # Stage 1: U_c[el1] -= u1·coef, U_c[el2] += u1·coef  (antisymmetric scatter)
     du = jnp.where(emask, u1 * coef, 0.0)                          # (edge,nl)
@@ -242,7 +248,7 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None):
 
     # Stage 2: update = -dt·coef·(U_c[el1]-U_c[el2]) + viLapl·u1, scatter /area
     coef2 = -dt * coef
-    viLapl = dt * jnp.maximum(VISC_GAMMA0_H, VISC_GAMMA1_H * sq) * length   # 0 for CORE2
+    viLapl = dt * jnp.maximum(vc.gamma0_h, vc.gamma1_h * sq) * length   # 0 for CORE2
     Uc_d = ops.gather(Uc, el1s) - ops.gather(Uc, el2s)
     Vc_d = ops.gather(Vc, el1s) - ops.gather(Vc, el2s)
     upd_u = jnp.where(emask, coef2 * Uc_d + viLapl * u1, 0.0)

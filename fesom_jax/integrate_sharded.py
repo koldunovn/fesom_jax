@@ -42,6 +42,7 @@ from .state import State
 
 _P = PartitionSpec("p")          # sharded on the device axis (folded leading dim)
 _R = PartitionSpec()             # replicated (every device gets the full array)
+_TP = PartitionSpec(None, "p")   # [n_steps, P*Lmax]: time replicated, the folded dim sharded (A4)
 
 
 def _to_global_sharded(x, spec, mesh):
@@ -161,6 +162,25 @@ def _fold_forcing(f):
     return type(f)(**data), type(f)(**spec)
 
 
+def _fold_forcing_seq(sf_seq):
+    """Fold a **stacked** ``[P, n_steps, Lmax_nod, …]``-leaf ``StepForcing`` (from
+    :func:`shard_mesh.partition_step_forcing` of an ``[n_steps, nod2D]`` stack) into a per-step
+    scan ``xs``: ``[n_steps, P*Lmax_nod, …]`` leaves + a ``PartitionSpec(None,'p')`` spec-tree
+    (the ``n_steps`` axis replicated, the folded device axis sharded). Each ``shard_map`` device
+    then sees its ``[n_steps, Lmax_nod, …]`` slice; ``lax.scan`` over axis 0 hands one step's
+    local forcing to each step (Task A4 — vs the device-CONSTANT ``_fold_forcing`` the timing
+    path uses). Mirrors :func:`_fold` (host numpy in ⇒ host numpy out, never staged on a device)."""
+    data, spec = {}, {}
+    for name in sf_seq._fields:
+        arr = np.asarray(getattr(sf_seq, name))            # [P, T, Lmax, …]
+        P, T = arr.shape[0], arr.shape[1]
+        rest = arr.shape[2:]                                # (Lmax, …)
+        moved = np.transpose(arr, (1, 0) + tuple(range(2, arr.ndim)))   # [T, P, Lmax, …]
+        data[name] = moved.reshape((T, P * rest[0]) + rest[1:])         # [T, P*Lmax, …]
+        spec[name] = _TP
+    return type(sf_seq)(**data), type(sf_seq)(**spec)
+
+
 def folded_operator(sop: ShardedSSHOperator) -> tuple[SSHOperator, SSHOperator]:
     """Fold the per-device :class:`ShardedSSHOperator` to a ``shard_map`` input
     :class:`SSHOperator` (``[P*nnz_max]`` rows/cols/vals, ``[P*Lmax_nod]`` diag,
@@ -260,7 +280,8 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      stress_p, *, dt: float, is_first_step: bool, npes: int,
                      wire_halo: bool = True, params=None, step_forcing=None,
                      forcing_static=None, ice_cfg=None, gm_cfg=None,
-                     kpp_cfg=None, tke_cfg=None, ale_cfg=None, boundary_node_p=None,
+                     kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None,
+                     tracer_cfg=None, boundary_node_p=None,
                      use_ragged: bool = False) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
     return the ``[P, Lmax, …]`` next State.
@@ -312,7 +333,8 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
         return stepmod.step(s, m, o, stress, params, dt=dt,
                             is_first_step=is_first_step, step_forcing=sf_,
                             forcing_static=fs_, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
-                            kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg, halo_ctx=ctx,
+                            kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
+                            visc_cfg=visc_cfg, tracer_cfg=tracer_cfg, halo_ctx=ctx,
                             boundary_node=bn_)
 
     if not wire_halo:
@@ -348,6 +370,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
 def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       stress_p, n_steps: int, *, dt: float, npes: int, params=None,
                       gm_cfg=None, kpp_cfg=None, tke_cfg=None, ale_cfg=None,
+                      visc_cfg=None, tracer_cfg=None,
                       use_ragged: bool = False,
                       ice_cfg=None, step_forcing=None, forcing_static=None,
                       boundary_node_p=None, return_executable: bool = False,
@@ -407,7 +430,8 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
             return stepmod.step(carry, m, o, stress, params, dt=dt, is_first_step=is_first,
                                 step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
                                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
-                                ale_cfg=ale_cfg, halo_ctx=ctx, boundary_node=bn_)
+                                ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
+                                halo_ctx=ctx, boundary_node=bn_)
 
         st = one(s, True)                            # step 1 eager (AB2 first-step branch)
         if n_steps > 1:
@@ -439,7 +463,8 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                 return stepmod.step(carry, m, o, stress, p, dt=dt, is_first_step=is_first,
                                     step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
                                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
-                                    ale_cfg=ale_cfg, halo_ctx=ctx, boundary_node=bn_)
+                                    ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
+                                    halo_ctx=ctx, boundary_node=bn_)
 
             st = one(s, True)
             if n_steps > 1:
@@ -480,6 +505,100 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     # can compile ONCE then time a SECOND call that reuses the executable — otherwise every
     # run_steps_sharded call rebuilds the shard_map + re-jits (a fresh closure ⇒ cache miss ⇒
     # recompile), so a one-shot call's wall-time is dominated by XLA COMPILE, not stepping.
+    if return_executable:
+        return jfn, args, npes
+    return unfold_state(jfn(*args), npes)
+
+
+def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
+                             stress_p, step_forcing_seq, forcing_static, n_steps: int, *,
+                             dt: float, npes: int, params=None, gm_cfg=None, kpp_cfg=None,
+                             tke_cfg=None, ale_cfg=None, ice_cfg=None, visc_cfg=None,
+                             tracer_cfg=None, boundary_node_p=None, use_ragged: bool = False,
+                             bootstrap_ab2: bool = True, return_executable: bool = False):
+    """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
+
+    Like :func:`run_steps_sharded` but the surface forcing **changes every step** — the real
+    seasonal cycle NG5/dars need — instead of being held constant across the scan (which is
+    correct only for TIMING, where the per-step cost is forcing-value-independent). The
+    mechanism: ``step_forcing_seq`` (a ``StepForcing`` pre-partitioned to ``[P, n_steps, Lmax]``
+    by :func:`shard_mesh.partition_step_forcing`) is folded to a ``[n_steps, P*Lmax]`` scan
+    ``xs`` with a ``PartitionSpec(None,'p')`` spec and threaded through the ``lax.scan`` so step
+    ``i`` consumes ``step_forcing_seq[i]``. ``forcing_static`` is constant ⇒ a device-constant
+    input (as before). ``stress_p`` is unused under forcing (the bulk recomputes the stress from
+    the live SST/current), kept for signature parity with :func:`run_steps_sharded`.
+
+    **Chunk/memory policy (the A6 driver's contract):** pre-stacking a whole NG5 year is
+    infeasible (~0.6 GB/step × ~175 k steps/yr). ``step_forcing_seq`` must therefore cover a
+    **fine time-chunk (≈ a few days)**; the A6 driver loops chunks in Python, re-stacks the
+    forcing per chunk, and continues the State across chunks (forward-only). ``return_executable``
+    hands back ``(jfn, const_args, npes)`` so the driver compiles ONCE and reuses the executable
+    across chunks of equal length (a fresh forcing stack each call ⇒ same shapes ⇒ cache hit).
+
+    Forward-only (no ``return_grad_fn``): the model paper is forward at scale; the differentiable
+    path stays single-GPU dense (the sharded ragged-halo AD bug)."""
+    fm, fm_spec = folded_mesh(sm)
+    fs, fs_spec = folded_state(state_p)
+    fop, fop_spec = folded_operator(sop)
+    fstress = _fold(stress_p)
+    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    n_global = sm.nod2D
+    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged)
+    recv_max = _recv_max(sm) if use_ragged else None
+
+    if forcing_static is None:
+        raise ValueError("run_steps_sharded_forced needs forcing_static (the CORE2 forced path)")
+    seq_folded, seq_spec = _fold_forcing_seq(step_forcing_seq)
+    # leaf 0's leading dim is n_steps — every forcing field must be stacked to n_steps.
+    T = int(np.asarray(getattr(seq_folded, seq_folded._fields[0])).shape[0])
+    if T != n_steps:
+        raise ValueError(f"step_forcing_seq has {T} steps but n_steps={n_steps}")
+
+    # forcing_static (device-constant) + the optional global boundary_node, as in run_steps_sharded.
+    fsf, fsf_spec = _fold_forcing(forcing_static)
+    extras, extras_spec = [fsf], [fsf_spec]
+    have_bn = boundary_node_p is not None
+    if have_bn:
+        extras.append(_fold(boundary_node_p)); extras_spec.append(_P)
+    extras, extras_spec = tuple(extras), tuple(extras_spec)
+
+    def body(m, s, o, stress, h, seq, *ex):
+        exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
+        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
+                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
+                           ragged=_ragged_ctx(h)["nod"] if use_ragged else None,
+                           recv_max=recv_max["nod"] if use_ragged else 0,
+                           use_ragged=use_ragged)
+        ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
+                      owned_mask={"nod": h["owned_nod"]},
+                      exch_ragged=_ragged_ctx(h) if use_ragged else None,
+                      recv_max=recv_max, use_ragged=use_ragged)
+        fs_ = ex[0]
+        bn_ = ex[1] if have_bn else None
+
+        def one(carry, is_first, sf_step):
+            return stepmod.step(carry, m, o, stress, params, dt=dt, is_first_step=is_first,
+                                step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
+                                gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
+                                ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
+                                halo_ctx=ctx, boundary_node=bn_)
+
+        sf0 = jax.tree.map(lambda x: x[0], seq)             # this chunk's first-step forcing
+        # bootstrap_ab2: True ⇒ cold start / post-dt-ramp (AB2 first-step branch); False ⇒ a
+        # restart-continuation chunk carries the AB2 history forward (is_first_step=False), so a
+        # chained run is bit-identical to a continuous one (the A6 restart-seam invariant).
+        st = one(s, bootstrap_ab2, sf0)
+        if n_steps > 1:
+            rest = jax.tree.map(lambda x: x[1:], seq)       # [n_steps-1, Lmax] per leaf
+            st, _ = lax.scan(jax.checkpoint(lambda c, sf: (one(c, False, sf), None)),
+                             st, xs=rest, length=n_steps - 1)
+        return st
+
+    in_specs = (fm_spec, fs_spec, fop_spec, _P, ha_spec, seq_spec) + extras_spec
+    jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
+                                out_specs=fs_spec, check_vma=False))
+    args = (fm, fs, fop, fstress, ha, seq_folded, *extras)
+    args = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(args, in_specs))
     if return_executable:
         return jfn, args, npes
     return unfold_state(jfn(*args), npes)

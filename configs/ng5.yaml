@@ -1,0 +1,36 @@
+# NG5 (~5 km, 7.4 M nodes) — the eddy-resolving flagship, COLD PHC spin-up.
+#
+# Physics pinned 2026-06-19 (GMD model-description paper): GM OFF (resolution resolves the
+# eddies), visc_gamma1 = 0.2 (CORE2 uses the 0.1 default), dt 180 cold → 240 prod ramp, tracers
+# = the implemented MFCT/QR4C/FCT with num_ord (0,1) [= NG5's nml_tracer_list 'MFCT','QR4C','FCT'
+# 0.,1.]. Vertical mixing = KPP (the FESOM2 default); mEVP sea ice ON (the NG5 LKF figure needs
+# it); zstar ALE ON. One YAML file drives the whole run (load restart/IC → N steps → restart).
+
+ale: {}            # zstar vertical coordinate
+gm: null           # GM OFF — eddies are resolved at ~5 km
+kpp: {}            # KPP vertical mixing (FESOM2 default)
+tke: null          # (KPP xor TKE — exactly one mixing scheme)
+ice: {}            # mEVP sea ice (required for the LKF deformation figure, Task B4)
+
+visc:
+  gamma1: 0.2      # NG5 horizontal viscosity γ1 (the one promoted, mesh-dependent γ)
+
+tracer: {}         # MFCT/QR4C/FCT, num_ord (0,1) — exactly the implemented kernel path
+
+dt: 180.0          # cold-start timestep [s]
+dt_ramp:
+  after_step: 175200   # ≈ 1 simulated year at dt=180 (the R2 rung): cold 180 → prod 240
+  dt: 240.0            # ⇒ the driver re-bootstraps AB2 (is_first_step) at the ramp boundary
+
+# --- run orchestration (consumed by the A6 driver; placeholders — confirm before B2) ---
+mesh: /work/ab0995/a270088/meshes/ng5        # TODO: confirm the staged NG5 mesh path
+partition: dist_64                            # ≥8 nodes (×4 A100-80 GPU); device-count portable
+forcing:
+  kind: core2                                 # JRA55 + L&Y09 bulk (mesh-agnostic by interp; A5 stages it)
+  start_year: 1958
+output_dir: /work/ab0995/a270088/port_jax/runs/ng5
+snapshot_every: 480      # steps (~1/day at dt=180) — time-subsampled instantaneous snapshots
+checkpoint_every: 2400   # steps (~5 days) — portable restart cadence
+restart_in: null         # null ⇒ cold PHC IC; else a prior restart store (any device count)
+restart_out: /work/ab0995/a270088/port_jax/runs/ng5/restart
+duration: 3yr            # ladder-gated R0→R3 (the SLURM chain steps it; A6 parses the string)

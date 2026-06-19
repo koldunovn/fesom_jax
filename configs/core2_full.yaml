@@ -1,0 +1,35 @@
+# CORE2 (~1°, 127 k nodes) — the mean-state fidelity flagship.
+# Reuse the existing 5-yr spin-up + 10-yr reference; the matched-Fortran comparison is statistical.
+#
+# ⚠️ PLACEHOLDER — the exact CORE2 matched-Fortran PHYSICS config is an OPEN ITEM (confirm with the
+# user before the CORE2 Fortran run): GM on + its viscosity + its tracer num_ord/scheme vs the
+# implemented (0,1). If CORE2's num_ord differs from (0,1), the tracer selector becomes a KERNEL
+# sub-task (new reconstruction), not a config toggle — TracerConfig.validate() will raise. The
+# values below mirror the existing JAX all-on CORE2 (zstar+TKE+mEVP+GM) as a starting point.
+
+ale: {}            # zstar vertical coordinate
+gm: {}             # GM on (CORE2 ~1° needs the mesoscale-eddy parameterization)
+                   # TODO: confirm k_gm / Redi_Kmax against the matched-Fortran namelist.oce
+kpp: null          # vertical mixing: the existing JAX CORE2 used TKE — TODO confirm KPP vs TKE
+tke: {}            # classical-TKE prognostic mixing (the JAMES-paper all-on default)
+ice: {}            # mEVP sea ice
+
+visc: {}           # CORE2 default γ's (gamma1 = 0.1)
+
+tracer: {}         # ⚠️ TODO: confirm CORE2's num_ord/scheme == the implemented (0,1);
+                   #     if not, this needs a kernel change (new reconstruction), not a toggle.
+
+dt: 1800.0         # CORE2 timestep [s] (127 k / 48 levels)
+
+# --- run orchestration (consumed by the A6 driver; placeholders) ---
+mesh: /work/ab0995/a270088/meshes/core2      # TODO confirm
+partition: dist_16
+forcing:
+  kind: core2
+  start_year: 1958
+output_dir: /work/ab0995/a270088/port_jax/runs/core2
+snapshot_every: 48        # steps (~1/day at dt=1800)
+checkpoint_every: 1460    # steps (~1 month)
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/core2/restart
+duration: 10yr

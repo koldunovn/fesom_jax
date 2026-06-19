@@ -52,8 +52,8 @@ S_FLOOR = 0.5
 def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params = None,
          *, dt: float = DT_DEFAULT, is_first_step: bool = False,
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
-         kpp_cfg=None, tke_cfg=None, ale_cfg=None, halo_ctx=None,
-         boundary_node=None, remat_blocks: bool = False) -> State:
+         kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
+         halo_ctx=None, boundary_node=None, remat_blocks: bool = False) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -126,6 +126,12 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # parity; static arg ⇒ this is a trace-time Python guard, no runtime cost).
     if ale_cfg is not None:
         ale_cfg.validate()
+    # Tracer scheme selector (Phase 4 MFCT/QR4C/FCT): num_ord is hard-coded into the
+    # reconstruction kernels, so ``tracer_cfg`` only VALIDATES the requested scheme matches
+    # the implemented (= NG5) path — a different num_ord raises (a kernel change, not a toggle).
+    # ``None`` ⇒ the implemented path, unchanged. The advection calls below are unaffected.
+    if tracer_cfg is not None:
+        tracer_cfg.validate()
     # zstar ⇒ real freshwater/salt fluxes (use_virt_salt=False, is_nonlinfs=1); linfs ⇒
     # virtual salt (use_virt_salt=True, is_nonlinfs=0). Drives the forcing flip + the bc terms.
     use_virt_salt = True if ale_cfg is None else ale_cfg.use_virt_salt
@@ -298,7 +304,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     uv_rhsAB = _exch(uv_rhsAB, "elem")
 
     # 6 — biharmonic horizontal viscosity (splits internally to exchange u_b/v_b)
-    uv_rhs = _ckpt(lambda: momentum.visc_filt_bidiff(mesh, st.uv, uv_rhs, dt=dt, exch=_exch))()
+    uv_rhs = _ckpt(lambda: momentum.visc_filt_bidiff(mesh, st.uv, uv_rhs, dt=dt, exch=_exch,
+                                                     visc_cfg=visc_cfg))()
     uv_rhs = _exch(uv_rhs, "elem")
 
     # 7 — implicit vertical viscosity → increment du (the C keeps it in uv_rhs). zstar (JZ.6):
@@ -463,13 +470,14 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 # are static (the latter ⇒ two compiled variants: the step-1 AB2 branch and the rest).
 step_jit = jax.jit(step,
                    static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg", "kpp_cfg",
-                                    "tke_cfg", "ale_cfg", "remat_blocks"))
+                                    "tke_cfg", "ale_cfg", "visc_cfg", "tracer_cfg",
+                                    "remat_blocks"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         params: Params = None, *, dt: float = DT_DEFAULT,
         step_forcings=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
-        kpp_cfg=None, tke_cfg=None, ale_cfg=None) -> State:
+        kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None) -> State:
     """Run ``n_steps`` jitted forward steps from ``state`` (a plain Python loop;
     Phase 3 adds :func:`fesom_jax.integrate.integrate`, a checkpointed ``lax.scan``,
     for the differentiable path). ``is_first_step`` is set on the first iteration
@@ -483,5 +491,6 @@ def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         state = step_jit(state, mesh, op, stress_surf, params, dt=dt,
                          is_first_step=(i == 0), step_forcing=sf,
                          forcing_static=forcing_static, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
-                         kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg)
+                         kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
+                         visc_cfg=visc_cfg, tracer_cfg=tracer_cfg)
     return state

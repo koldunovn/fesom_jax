@@ -21,6 +21,8 @@ Keep the truncated literal.
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import jax
 
 # --------------------------------------------------------------------------
@@ -109,6 +111,61 @@ VISC_GAMMA2 = 0.285
 VISC_GAMMA0_H = 0.0
 VISC_GAMMA1_H = 0.0
 VISC_EASYBSRETURN = 1.0  # opt_visc=5 backscatter return (unused at opt_visc=7)
+
+
+class ViscConfig(NamedTuple):
+    """Per-run horizontal-viscosity γ coefficients (opt_visc=7 biharmonic).
+
+    A **promoted** view of the ``VISC_GAMMA*`` module constants so a run can override them
+    from config — NG5 wants ``gamma1 = 0.2`` (CORE2 uses the 0.1 default). The defaults
+    reproduce the module constants EXACTLY ⇒ ``ViscConfig()`` is bit-identical to the bare
+    module path (the regression-guard invariant). Static/hashable (a ``NamedTuple``) ⇒ a valid
+    ``jax.jit`` static arg, like the other ``*Config`` sub-configs. Note there is **no
+    ``gamma2_h``** (only ``0_h``/``1_h``) — mirrors ``fesom_momentum.c``."""
+    gamma0: float = VISC_GAMMA0       # floor inside max(g0, inner)·len
+    gamma1: float = VISC_GAMMA1       # |Δu| flow-aware coefficient (NG5: 0.2)
+    gamma2: float = VISC_GAMMA2       # |Δu|² flow-aware coefficient
+    gamma0_h: float = VISC_GAMMA0_H   # harmonic-stage floor (0 ⇒ pure biharmonic)
+    gamma1_h: float = VISC_GAMMA1_H   # harmonic-stage |Δu| coefficient
+
+
+# Tracer advection scheme (Phase 4 MFCT/QR4C/FCT). num_ord is HARD-CODED into the
+# reconstruction kernels (horizontal MFCT num_ord=0, vertical QR4C num_ord=1) — NOT a
+# runtime flag — so this config is currently a SELECTOR/validator, not a kernel switch:
+# the implemented (and NG5) path is exactly ('MFCT', 'QR4C', 'FCT') / (0, 1). A different
+# num_ord would be a kernel change (new reconstruction), flagged via TracerConfig.validate.
+TRACER_HOR_SCHEME = "MFCT"
+TRACER_VER_SCHEME = "QR4C"
+TRACER_LIMITER = "FCT"
+TRACER_NUM_ORD_HOR = 0
+TRACER_NUM_ORD_VER = 1
+
+
+class TracerConfig(NamedTuple):
+    """Tracer-advection scheme selector (the implemented MFCT/QR4C/FCT, num_ord (0,1)).
+
+    ``num_ord`` is hard-coded in the reconstruction kernels (not a runtime flag), so this is a
+    **validator** over the implemented path, not a kernel switch — :meth:`validate` raises
+    ``NotImplementedError` for any other ``(scheme, num_ord)`` (which would require new kernel
+    work). The defaults == the implemented = the NG5 ``nml_tracer_list`` ``'MFCT','QR4C','FCT'``
+    / ``0., 1.`` ⇒ NG5 needs zero tracer work; CORE2's scheme is OPEN (confirm before its run)."""
+    hor_scheme: str = TRACER_HOR_SCHEME
+    ver_scheme: str = TRACER_VER_SCHEME
+    limiter: str = TRACER_LIMITER
+    num_ord_hor: int = TRACER_NUM_ORD_HOR
+    num_ord_ver: int = TRACER_NUM_ORD_VER
+
+    def validate(self) -> None:
+        impl = (TRACER_HOR_SCHEME, TRACER_VER_SCHEME, TRACER_LIMITER,
+                TRACER_NUM_ORD_HOR, TRACER_NUM_ORD_VER)
+        got = (self.hor_scheme, self.ver_scheme, self.limiter,
+               self.num_ord_hor, self.num_ord_ver)
+        if got != impl:
+            raise NotImplementedError(
+                f"tracer scheme {got} != the implemented {impl}: num_ord is hard-coded into "
+                "the MFCT/QR4C reconstruction kernels, so a different scheme/num_ord is a "
+                "kernel change (new reconstruction), not a config toggle. The implemented "
+                "path matches NG5; confirm the CORE2 matched config before its Fortran run.")
 
 # PP mixing — oce_modules.F90:25-78
 MIX_COEFF_PP = 0.01  # PP scaling coefficient
