@@ -171,9 +171,9 @@ mld_field, dmld_dck = jax.jvp(                         # forward-mode: d(MLD fie
 **Rule of thumb — pay for the small side:** reverse mode costs about one extra model run per
 *output*, forward mode about one per *input* — so pick the one whose count is smaller (many params →
 one number: reverse; one knob → a whole map: forward). They are two views of the same underlying
-calculation, so they agree where they overlap (checked to **0.7 %**) and run into the same
-short-window limit (see Limitations). The long-window driver exposes both via `--mode {adjoint,tlm}`
-(`scripts/core2_lw_avgadj.py`).
+calculation, so on a matched run they give the same answer (checked to **~1 %** per burst) and run
+into the same short-window limit (see Limitations). The long-window driver exposes both via
+`--mode {adjoint,tlm}` (`scripts/core2_lw_avgadj.py`).
 
 ### 3. Multi-GPU / multi-node forward
 
