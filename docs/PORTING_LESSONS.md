@@ -4137,3 +4137,26 @@ Cite the C source (`file:line`) or dump probe that proves it.
   not a blow-up. The chaotic `N_blow` horizon + the need for ensemble-averaging apply to BOTH (TLM and adjoint
   share the linearization's singular values) — forward vs reverse changes only WHICH dimension is cheap.
   (`scripts/core2_lw_avgadj.py --mode`, validation smoke job 25762879.)
+
+- **Task D1 — the production climate-sensitivity RESULTS + the K=200 transpose nuance (per-burst exact,
+  ensemble-mean noisy).** The Part-D payoff on the 10-yr reference (K=200, N=48, ~18-d cadence, MAD-filtered;
+  jobs 25758787/8 adjoint, 25763255 tlm): **`d(10-yr-mean MLD)/d(c_k) = +1.458 ± 0.498 m`** (+slow/right —
+  more mixing DEEPENS the climate-mean MLD, the D2a sign at the CLIMATE horizon; converged n_stable 134/144,
+  full-domain finite map) and **`d(mean 0-100m T)/d(k_gm) = +4.12e-7 ± 1.50e-7 °C`** (positive, ~36% SE —
+  small at a 1-d window, the adjoint↔EKI boundary). Both `AVG_ADJ_SENS_*_OK`. **The KEY ensemble lesson:**
+  the adjoint↔TLM transpose is exact PER BURST (the K=4 matched-seed smoke agreed to 0.73%), but the K=200
+  ENSEMBLE means diverge — adjoint filtered-mean **+1.458** vs TLM **+1.749** (**20%**) — while the robust
+  MEDIANS agree (+1.70 vs +1.59, **6.7%**). **Why:** the TLM *response* field `d(MLD_j)/d(c_k)` is heavy-
+  tailed (sharp deep-convection nodes, `|map|max ~1.7e6`), so its area-weighted MEAN is tail-dominated and
+  noisy (SE **±4.92** vs the adjoint's smooth global-mean-sensitivity SE **±0.50**); the two means are
+  statistically CONSISTENT (the 0.29 gap ≪ the TLM SE) but the **median is the right ensemble comparator**,
+  not the mean. Takeaway: when comparing a reverse-mode (smooth, well-determined) reduction against a forward-
+  mode (sharp, tail-dominated) one, validate the transpose on MATCHED SEEDS per-burst and compare ensemble
+  MEDIANS — don't expect the heavy-tailed mean to land on the smooth one. The TLM filter still dropped 56/200
+  (same June/Dec amplifiers) and kept-mean≈median, so it IS well-behaved — just intrinsically noisier per the
+  physics, not a bug. **Plotting (`scripts/fig_avgadj.py`):** one script renders any `lw_avgadj_*_map.npz`
+  (map panel + across-burst convergence panel); the heavy-tailed TLM map needs a **signed-log (`SymLogNorm`)**
+  colour (`--symlog auto` ⇒ on for tlm, off for adjoint) or the few extreme nodes wash out the broad
+  fingerprint — adjoint maps stay linear (99th-pct symmetric clip). Figures: `fig_avgadj_climate.png` (both
+  adjoint targets), `fig_avgadj_tlm.png` (the TLM fingerprint), `fig_avgadj_transpose.png` (adjoint-smooth vs
+  TLM-sharp side-by-side — the transpose made visual). (`scripts/{core2_lw_avgadj,fig_avgadj}.py`.)
