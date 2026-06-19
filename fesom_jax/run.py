@@ -113,11 +113,14 @@ def _chunk_dates(year: int, dt: float, start_step: int, count: int):
 # Restart-state plumbing ([P,Lmax] → folded sharded, for write_restart)
 # --------------------------------------------------------------------------
 def _place_folded(state_p, npes, devices=None):
-    """``[P,Lmax]`` State → folded ``[P*Lmax]`` device-sharded State (the form
-    :func:`~fesom_jax.zarr_output.write_restart` writes from)."""
-    fs, spec = folded_state(state_p)
-    devs = jax.devices()[:npes] if devices is None else list(devices)
-    return _to_global_sharded(fs, spec, halo.device_mesh("p", devices=devs))
+    """``[P,Lmax]`` device-sharded State → folded ``[P*Lmax]`` device-sharded State for
+    :func:`~fesom_jax.zarr_output.write_restart`.
+
+    ``state_p`` is ALREADY device-sharded (the run output / ``read_restart``), so fold it **on
+    device** (``folded_state``'s ``jnp`` reshape) and hand it straight to ``write_restart`` (which
+    writes via ``addressable_shards``). Do NOT round-trip through ``_to_global_sharded`` — its
+    ``np.asarray`` would pull a MULTI-PROCESS global array to host (`spans non-addressable devices`)."""
+    return folded_state(state_p)[0]
 
 
 class RunResult(NamedTuple):

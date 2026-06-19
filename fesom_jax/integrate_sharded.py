@@ -63,6 +63,12 @@ def _to_global_sharded(x, spec, mesh):
                              is_leaf=lambda v: isinstance(v, PartitionSpec))
 
     def _place(leaf, sharding):
+        # A device-resident jax.Array (a resumed/multi-chunk State, multi-node) is ALREADY sharded —
+        # reshard on device to the target (no-op if it matches). np.asarray-ing it would pull a
+        # MULTI-PROCESS global array to host ("spans non-addressable devices"). Host numpy (the
+        # cold-start build pipeline) takes the per-shard callback path (no global staged on a device).
+        if isinstance(leaf, jax.Array):
+            return leaf if leaf.sharding == sharding else jax.device_put(leaf, sharding)
         a = np.asarray(leaf)                      # already host numpy (the host-build pipeline)
         return jax.make_array_from_callback(a.shape, sharding, lambda idx, a=a: a[idx])
 
