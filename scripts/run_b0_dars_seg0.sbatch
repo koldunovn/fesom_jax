@@ -26,6 +26,7 @@ export JDIST=1 GPUS_PER_NODE=4
 MESH=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars
 OUT=/work/ab0995/a270088/port_jax/runs/dars_b0
+rm -rf "$OUT"/seg0 "$OUT"/seg1    # clear stale restart stores (a prior dist_N's shape would conflict)
 mkdir -p "$OUT"
 
 echo "=== $(date) dars B0 seg0: nodes=$SLURM_JOB_NODELIST  dist_16 (16 GPU) cold 8 steps ==="
