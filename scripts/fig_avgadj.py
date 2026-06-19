@@ -42,16 +42,28 @@ def _summary(npz):
     )
 
 
-def _map_panel(ax, npz, s):
+def _map_panel(ax, npz, s, symlog=False):
+    import matplotlib.colors as mcolors
     lon = npz["lon"]; lat = npz["lat"]; g = npz["mean_map"]
     wet = npz["node_wet"].astype(bool) if "node_wet" in npz else np.ones_like(g, bool)
     sel = wet & np.isfinite(g)
-    vmax = np.percentile(np.abs(g[sel]), 99) if sel.any() else 1.0
-    vmax = float(vmax) if vmax > 0 else 1.0
-    sc = ax.scatter(lon[sel], lat[sel], c=g[sel], s=3, cmap="RdBu_r",
-                    vmin=-vmax, vmax=vmax, linewidths=0, rasterized=True)
+    ag = np.abs(g[sel])
+    if symlog:
+        # heavy-tailed (TLM) response field: a signed-log scale reveals the broad fingerprint UNDER
+        # the few extreme convection nodes; capture more of the tail (99.9th) + a robust linthresh.
+        vmax = float(np.percentile(ag, 99.9)) if sel.any() else 1.0
+        pos = ag[ag > 0]
+        lt = float(np.percentile(pos, 75)) if pos.size else 1e-6
+        norm = mcolors.SymLogNorm(linthresh=max(lt, vmax * 1e-4), vmin=-vmax, vmax=vmax, base=10)
+        sc = ax.scatter(lon[sel], lat[sel], c=g[sel], s=3, cmap="RdBu_r", norm=norm,
+                        linewidths=0, rasterized=True)
+    else:
+        vmax = float(np.percentile(ag, 99)) if sel.any() else 1.0
+        vmax = vmax if vmax > 0 else 1.0
+        sc = ax.scatter(lon[sel], lat[sel], c=g[sel], s=3, cmap="RdBu_r",
+                        vmin=-vmax, vmax=vmax, linewidths=0, rasterized=True)
     cb = ax.figure.colorbar(sc, ax=ax, shrink=0.85, pad=0.02)
-    cb.set_label(f"{s['label']}\n[{s['unit']}]", fontsize=8)
+    cb.set_label(f"{s['label']}\n[{s['unit']}]" + ("  (symlog)" if symlog else ""), fontsize=8)
     ax.set_xlim(-180, 180); ax.set_ylim(-90, 90)
     ax.set_xlabel("lon", fontsize=8); ax.set_ylabel("lat", fontsize=8)
     role = ("where-to-tune (Σ→global)" if s["mode"] == "adjoint" else "spatial fingerprint (1 knob)")
@@ -76,7 +88,7 @@ def _conv_panel(ax, npz, s):
     ax.legend(fontsize=6, loc="best")
 
 
-def make_figure(maps, out: Path):
+def make_figure(maps, out: Path, symlog="auto"):
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -93,7 +105,9 @@ def make_figure(maps, out: Path):
                              gridspec_kw=dict(width_ratios=[2.3, 1.0]))
     for i, (p, npz) in enumerate(npzs):
         s = _summary(npz)
-        _map_panel(axes[i, 0], npz, s)
+        # auto: symlog only for the heavy-tailed TLM response fields (smooth adjoint maps stay linear)
+        sl = (s["mode"] == "tlm") if symlog == "auto" else bool(symlog)
+        _map_panel(axes[i, 0], npz, s, symlog=sl)
         _conv_panel(axes[i, 1], npz, s)
     fig.suptitle("Fig D1 — ensemble-averaged climate sensitivity maps (many short frozen-ice bursts "
                  "along the 10-yr reference)", fontsize=11)
@@ -107,7 +121,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--maps", nargs="+", required=True, help="lw_avgadj_*_map.npz files")
     ap.add_argument("--out", type=Path, default=Path("scripts/fig_avgadj_climate.png"))
+    ap.add_argument("--symlog", choices=("auto", "on", "off"), default="auto",
+                    help="signed-log map colour: auto = on for tlm (heavy-tailed response), off for adjoint")
     args = ap.parse_args()
+    symlog = {"auto": "auto", "on": True, "off": False}[args.symlog]
 
     print("\n  mode     target      label                          scalar ± SE              K   N")
     print("  " + "-" * 92)
@@ -117,7 +134,7 @@ def main():
         s = _summary(np.load(p, allow_pickle=True))
         print(f"  {s['mode']:<8s} {s['target']:<11s} {s['label']:<28s} "
               f"{s['scalar']:+.4e} ± {s['se']:.2e} {s['unit']:<4s} {s['K']:>4d} {s['N']:>3d}")
-    ok = make_figure(args.maps, args.out)
+    ok = make_figure(args.maps, args.out, symlog=symlog)
     print(f"\nAVGADJ_FIG_{'OK' if ok else 'SKIPPED'}", flush=True)
     return 0
 
