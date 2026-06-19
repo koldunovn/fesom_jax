@@ -4160,3 +4160,122 @@ Cite the C source (`file:line`) or dump probe that proves it.
   fingerprint — adjoint maps stay linear (99th-pct symmetric clip). Figures: `fig_avgadj_climate.png` (both
   adjoint targets), `fig_avgadj_tlm.png` (the TLM fingerprint), `fig_avgadj_transpose.png` (adjoint-smooth vs
   TLM-sharp side-by-side — the transpose made visual). (`scripts/{core2_lw_avgadj,fig_avgadj}.py`.)
+
+## GMD model-description paper (usability: portable restart, streaming output, YAML config)
+
+- **Task A1 — device-count-portable sharded restart (`RESTART_PORTABLE_OK`).** `write_restart`/`read_restart`
+  in `zarr_output.py` round-trip the **FULL** prognostic `State` across **any** device count (save P=4 → load
+  P=2 AND P=2 → P=4, both bit-identity). **Two load-bearing details:** (1) enumerate leaves via
+  **`dataclasses.fields(State)`** (pytree-flatten-equivalent), NOT a `*_old` name-glob — a glob silently drops
+  the momentum AB2 slot `uv_rhsAB`, `sigma11/12/22`, `tke`; the test asserts every leaf has its own on-disk
+  dataset (no-silent-drop) with a per-leaf distinct signature so a dropped/zeroed/mis-scattered entity is
+  caught. (2) the **read is field-by-field streaming** — `reconstruct_global` ONE leaf to a dense global
+  (partition-INDEPENDENT, the gid/owned maps already dedupe redundantly-owned elem/edge), `device_put`-shard to
+  the new partition, free, next leaf ⇒ host peak ≈ one global field (~4 GB at NG5), never the ~40-leaf State
+  co-resident (~80 GB). Portability is free because the on-disk format is gid-keyed/global-canonical: re-gathering
+  from the COMPLETE global field fills the NEW partition's halo lanes correctly (a halo lane is just another gid
+  in `myList`). Tested on CPU fake-devices with a new **halo-free block partition** (`partit.synth_block_partition`)
+  — restart never exchanges halos, so it needs no real `dist_<NP>` files (and no `ragged_all_to_all`, which is
+  GPU-only).
+
+- **Task A2 — streaming time-mean/variance output (`STREAM_OUTPUT_OK`).** `OnlineStats` (Welford single-pass) in
+  `zarr_output.py` accumulates per-grid-point mean+variance over a `{name: array}` dict **without storing every
+  step** ⇒ a multi-year run yields the mean state AND the EKE map (`eke_from_stats` = ½⟨u'²+v'²⟩ from the velocity
+  variance) at the cost of 2 extra copies per tracked field. It is a **registered pytree** (leaves = `count` scalar
+  + the mean/M2 dicts) so it flows through `lax.scan` (accumulate INSIDE the sharded step loop) or a Python chunk
+  loop — every op is element-wise ⇒ sharding-preserving. **Masked/dry-lane finiteness for free:** the Welford
+  denominator `count` is ≥1 after the first sample, so a constant-0 dry lane has mean 0 / var 0, no `0/0` (the AD
+  masked-lane rule, here for the forward accumulator). Matched offline `numpy.var`/`mean` to ≤1e-12. Snapshots are
+  a thin cadence wrapper (`snapshot_due`/`write_snapshot`) over the existing gather-free `write_state_zarr`.
+
+- **Task A3 — unified `RunConfig` + single-YAML (`RUN_CONFIG_OK`).** `run_config.py` composes the existing
+  per-physics sub-configs (Ale/GM/Kpp/Tke/Ice) + the **promoted** run-dependent scalars (the viscosity γ's,
+  dt + a cold→prod ramp, the tracer scheme selector) + the run-orchestration spec, all from ONE YAML. **The
+  bit-identity mechanism:** every promoted constant becomes a `NamedTuple` (`ViscConfig`/`TracerConfig`) whose
+  DEFAULTS equal the `config.py` module constants, threaded as a `visc_cfg=None`→`_DEFAULT_VISC` kwarg through
+  `momentum.visc_filt_bidiff` → `step` → `step_jit`(static_argnames) → `integrate`/`run`/`run_step(s)_sharded`
+  — so `None`/defaults trace to the SAME float literals ⇒ byte-identical (43 momentum + 90 step/ale gates
+  unmoved; `RunConfig.defaults()` step == bare `step()` over 5 steps). **Two gotchas worth recording:** (1) the
+  NG5 `visc_gamma1=0.2` promotion is INVISIBLE on the pi mesh — the flow-aware term `max(gamma0, gamma1·|Δu|)`
+  is dominated by the `gamma0=0.003` floor at pi's tiny velocities, so γ1 only bites for `|Δu| ∈ ~(0.03, 0.35)`;
+  test the threading by driving `visc_filt_bidiff` directly with a velocity field in that band, NOT a pi forward.
+  (2) tracer **num_ord is hard-coded into the MFCT/QR4C reconstruction kernels**, so `TracerConfig` is a
+  *validator*, not a switch: it raises `NotImplementedError` for any scheme ≠ the implemented `(0,1)` (NG5
+  matches ⇒ zero tracer work; CORE2's scheme is OPEN — a mismatch is a kernel change, not a toggle). YAML schema
+  is sparse (`null`=physics-off, `{}`=on-with-defaults, only NON-default overrides emitted); unknown top-level
+  or sub-config keys raise (no silent typos). `configs/ng5.yaml` pinned; `configs/core2_full.yaml` = placeholder
+  + TODO. pyyaml added to the env (A7 pins it in `pyproject.toml`).
+
+- **Task A4 — per-step time-varying forcing on the SHARDED multi-step path (`SHARDED_FORCING_OK`).** The
+  forcing itself was always built (`core2_forcing.py`, JRA55+L&Y bulk — it drove the CORE2 5+10 yr); the gap
+  was that `run_steps_sharded` holds forcing CONSTANT across its `lax.scan` (the multi-node path only ever ran
+  TIMING benchmarks, where the per-step cost is forcing-value-independent). NG5 is the first run that is BOTH
+  multi-node AND needs a seasonal cycle ⇒ `run_steps_sharded_forced` folds the partitioned forcing
+  (`partition_step_forcing` → `[P, n_steps, Lmax]`) to a `[n_steps, P*Lmax]` scan `xs` with
+  `PartitionSpec(None,'p')` (`_fold_forcing_seq`: transpose P↔T then fold) so each `shard_map` device scans its
+  `[n_steps, Lmax]` slice and step `i` gets its own forcing. Kept as a SEPARATE function ⇒ the constant
+  timing/scaling path is byte-unchanged. **`bootstrap_ab2` flag** = the restart-continuation seam: a cold/
+  post-dt-ramp chunk does step-1 `is_first_step=True`, a mid-run chunk carries AB2 forward (False) ⇒ chained ==
+  continuous. **Two test gotchas:** (1) JRA55 is piecewise-constant over its 3-hourly window, so 3 consecutive
+  30-min steps share one record (Tair identical) — a per-step gate over consecutive steps can't tell per-step
+  from constant; use WELL-SEPARATED dates (Jan/Jul/Oct) injected as the stack. (2) over a few forced steps the
+  sharded-vs-dense match is the FCT climate-close floor (~1.6e-4), NOT byte-id — the FCT limiter's upwind flips
+  amplify the reassociation floor; gate on that PLUS a non-triviality check (the per-step result must differ
+  from a constant-forcing run by ≫ the match, here 5e5 vs 1.6e-4) so the comparison can't pass trivially. The
+  exact wiring is separately pinned by a pure-host fold-unit test (`seq[i]` == the independent fold of step i).
+
+- **Task A6 — single-invocation config-driven run driver (`RUN_DRIVER_OK`).** `run.py` = load restart (or cold
+  IC) → chunked forced steps → write portable restart → exit; no in-model orchestration (multi-segment campaigns
+  = a SLURM `--dependency=afterok` chain, `scripts/chain_submit.sh`). **The headline gate is the RESTART SEAM:**
+  a continuous N-step run == the same run done as two chained invocations (N/2 → `write_restart` → `read_restart`
+  → N/2) to **5.7e-8** — essentially exact (the A1 restart is bit-faithful + AB2 continues). **The load-bearing
+  detail** (the `core2_kpp_climate_run` precedent, now in the sharded driver): a restart-continuation chunk must
+  NOT cold-start AB2 — `plan_chunks` sets `bootstrap_ab2=True` ONLY for step 0 of a cold run or the chunk that
+  begins exactly at the dt-ramp boundary (a dt CHANGE invalidates the AB2 history formed at the old dt); every
+  other chunk carries `uv_rhsAB`/`T_old` forward. **dt-ramp gotcha:** the SSH operator is dt-DEPENDENT (the
+  implicit-solve matrix), so the driver rebuilds/caches a `sop` per dt — a stale operator at the new dt would be
+  a silent error. **Forcing memory:** the per-step forcing is fed in fine (≈ few-day, `--chunk-steps`) chunks so
+  a multi-year run never pre-stacks (~280 GB/day at NG5); `plan_chunks` also never straddles the ramp boundary.
+  The chunk-to-chunk State handoff currently round-trips host (fine at CORE2/farc/dars; the NG5 on-device-chaining
+  via `return_executable` is the noted B2 optimization — de-risk on the smaller meshes first per the user steer).
+
+- **Task A5 — verify the RUNTIME forcing pipeline (CORE2 done; `NG5_FORCING_OK`).** Key correction (user): the
+  port interpolates forcing **at runtime, exactly like FESOM** — `JRA55Reader.__init__(mesh, year)` builds the
+  bilinear weights ONCE at setup (`sbc_ini`), then `.step()` reads disk + bilinear-interp + time-interp every
+  step; SSS/runoff/chl readers too. **Nothing is pre-interpolated/pre-staged.** So A5 is NOT data prep — it is
+  verifying the runtime setup initializes for a mesh (the only mesh-dependent step) + that the SOURCE files
+  resolve (all do: JRA55 + PHC2_salx + CORE2_runoff + Sweeney chl on `/pool`). `scripts/check_forcing.py MESH_DIR`
+  builds the readers + does a 1-step finite-flux smoke; CORE2 (126 858 nodes) → all 10 fields finite, physical
+  ranges. **The one per-mesh step is the JAX mesh EXPORT** (`load_mesh` needs the exported layout, not the raw
+  FESOM `nod2d.out`); farc/dars/NG5 raw meshes are on `/pool/.../MESHES_FESOM2.1` but need the export (B0) before
+  the same one-line check runs. `docs/FORCING_MESHES.md` records sources + per-mesh status.
+
+- **Task A7 — release engineering (`RELEASE_OK`).** A **data-free** CI gate (`.github/workflows/ci.yml` +
+  `test_release.py`): the repo's `data/` is a gitignored symlink to `/work`, so GitHub CI has no mesh — it runs
+  only the gates that need none (the RunConfig bit-identity default invariant + YAML round-trip, OnlineStats
+  correctness, the run-driver chunk/duration logic, the sharded-forcing FOLD wiring, the shipped configs
+  parse+validate). The heavy bit-identity STEP gate + the forced/gradient suites stay on Levante
+  (`run_suite.sbatch`) and SKIP cleanly in CI (their skipif sees the data absent). `pyproject.toml` pins pyyaml;
+  `docs/USER_GUIDE.md` (YAML schema + restart/output + SLURM chaining + mesh/dt table) + a README quick-start
+  pointer + a data-free `examples/tutorial.ipynb` (config → chunk-plan → OnlineStats, runs headless without data)
+  round out the release surface.
+
+- **Task A8 — standalone Python mesh preparation (`MESH_PREP_OK`).** For a SHIP-able model the C-export
+  dependency (`load_mesh` reads 32 `.npy` arrays the C-FESOM `jax-mesh-export` branch dumps) is an adoption
+  wall — users would need a C build to prepare a mesh. `scripts/prepare_mesh.py` is a pure-numpy port of
+  `fesom_mesh.c`'s `compute_metrics`: raw FESOM ASCII (`nod2d/elem2d/aux3d.out` + `nlvls/elvls/edges/edge_tri.out`)
+  to the EXACT C-export `.npy` layout, run ONCE offline (NOT online per-run — too heavy). **Verified byte-faithful
+  against the C oracle (`data/mesh_core2`): all 32 arrays, ints EXACT, floats rel <=1.05e-13** (float64 order-of-
+  ops). **The byte-identity gotchas that mattered** (all caught by diffing against the C export): (1) **TWO
+  pi's** — the truncated `3.14159265358979` for RAD/OMEGA/CYCLIC, but `mesh_resolution` hardcodes FULL-precision
+  pi; mixing them perturbs the last bits. (2) **off-by-one level in `area`** — the C accumulates `nz in [0,
+  nlevels[e]-1)`, NOT `[0, nlevels[e])`; slicing one level too many blew `area`/`areasvol` up by ~1e10 (a full
+  `elem_area`) while everything else was already ~1e-15 — the oracle caught it instantly. (3) **CSR ascending-
+  element order** — `area`/`mesh_resolution` sum over a node's cells in ascending global element id; build the
+  CSR by element-ascending iteration (or `np.add.at` on element-ordered pairs) so the float accumulation matches.
+  (4) **two cyclic conventions** (`elem_center` min-anchored `>=/<` vs the simple `>/<` trim elsewhere) — at
+  their own sites. (5) `nlevels`/edges are READ from `nlvls/elvls/edges/edge_tri.out` (already built by the FESOM
+  partitioner), NOT reconstructed. **The lesson: a precise C-derivation spec + the existing C export as a
+  per-array oracle makes even a 1350-line mesh-setup port converge fast** — 30/32 arrays matched on the first
+  pass; only the area off-by-one + the verify-gate tolerance (relative, since arrays span 1e10->1e-20) needed a
+  fix. The MFCT `edge_up_dn_tri` scan matched EXACTLY first try.
