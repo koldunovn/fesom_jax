@@ -96,6 +96,20 @@ data/  mesh_core2/ ic_core2/   # CORE2 dense mesh + cached PHC IC (small, in-rep
 
 ## Quick start
 
+### 0. Config-driven run (single YAML → load → run → restart)
+
+The release path: one [`RunConfig`](fesom_jax/run_config.py) YAML drives a whole run — **load restart
+(or cold IC) → run N steps (or a duration) → write a portable restart → exit.** Restarts are portable
+across device counts (save on 64 GPU, resume on 8); multi-job campaigns are a SLURM `--dependency`
+chain (no in-model orchestration). See [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) for the schema.
+
+```bash
+# one segment (cold start; resume by adding --restart-in DIR — any device count):
+python scripts/run_from_config.py configs/core2_full.yaml --steps 480 --restart-out runs/core2/seg0
+# a chained multi-segment campaign on SLURM (de-risk on farc/dars before NG5):
+scripts/chain_submit.sh configs/dars.yaml 6 4800 /work/.../runs/dars
+```
+
 ### 1. Forward — single device (CORE2, ocean-only)
 
 ```python

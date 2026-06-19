@@ -14,6 +14,7 @@ dependencies = [
     "scipy>=1.10",       # host-side SSH stiffness assembly (ssh.build_ssh_operator)
     "netCDF4>=1.6",      # NetCDF-4 PHC/JRA55/SSS readers (Phase 5)
     "zarr>=2.17,<3",     # sharded gather-free model output (fesom_jax.zarr_output, Phase 8b)
+    "pyyaml>=6.0",       # single-YAML RunConfig (fesom_jax.run_config, model-paper A3)
 ]
 
 [project.optional-dependencies]

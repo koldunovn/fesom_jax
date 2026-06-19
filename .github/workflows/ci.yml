@@ -1,0 +1,35 @@
+name: ci
+
+# Fast, data-free regression on every push / PR (no GPU, no Levante data). Runs the CPU unit gates
+# that need NO external mesh/forcing: the RunConfig bit-identity invariant + YAML round-trip, the
+# streaming-output (OnlineStats) correctness, the run-driver chunk-planning / duration logic, the
+# sharded per-step-forcing FOLD wiring, and the release gate (the shipped configs parse + validate).
+#
+# The data-heavy gates (the few-step BIT-IDENTITY step on the pi/CORE2 mesh, the CORE2 forced sharded
+# runs, the gradient/adjoint suite) need the Levante data symlink and run there via
+# scripts/run_suite.sbatch — they SKIP cleanly here (their skipif sees the data absent).
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  cpu-units:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install (CPU)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Data-free unit gates
+        run: |
+          python -m pytest -q -p no:cacheprovider \
+            fesom_jax/tests/test_release.py \
+            fesom_jax/tests/test_run_config.py \
+            fesom_jax/tests/test_stream_output.py \
+            fesom_jax/tests/test_run_entry.py \
+            fesom_jax/tests/test_forcing_sharded.py
