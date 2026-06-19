@@ -32,12 +32,16 @@ def main():
     mesh = load_mesh(args.mesh_dir)
     print(f"[forcing] mesh={args.mesh_dir}  nod2D={mesh.nod2D}  elem2D={mesh.elem2D}  nl={mesh.nl}")
 
-    # cold SST for the static a_ice mask (if the IC cache is present); else ice-free
+    # cold SST for the static a_ice mask (if a SIZE-MATCHING IC cache is present); else ice-free.
+    # (A mesh-specific IC is needed to seed the a_ice mask; a CORE2 IC can't be used on farc/dars/NG5.)
     sst0 = None
     ic = Path(args.ic_dir) / "T_ic.npy"
-    if ic.exists():
+    if ic.exists() and np.load(ic, mmap_mode="r").shape[0] == mesh.nod2D:
         from fesom_jax.phc_ic import core2_initial_state
         sst0 = np.asarray(core2_initial_state(mesh, args.ic_dir).T[:, 0])
+    elif ic.exists():
+        print(f"[forcing] IC {ic} ({np.load(ic, mmap_mode='r').shape[0]} nodes) != mesh "
+              f"({mesh.nod2D}) — ice-free smoke (a_ice≡0)")
 
     # SETUP — builds the bilinear interpolation weights ONCE (the only mesh-dependent step)
     cf = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0)

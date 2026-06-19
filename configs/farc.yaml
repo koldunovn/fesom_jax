@@ -1,0 +1,27 @@
+# farc (638 k nodes, 48 levels) — Part-B machinery de-risk (the small intermediate before NG5).
+# Exercises the full A1–A6 path at a real multi-GPU scale cheaply: forced run -> checkpoint ->
+# restart on a DIFFERENT device count -> streaming output. Physics is a reasonable all-on config
+# (the de-risk targets the MACHINERY, not a tuned climate); confirm before any fidelity claim.
+
+ale: {}            # zstar
+gm: null           # GM off (de-risk; cheap)
+kpp: {}            # KPP vertical mixing
+tke: null
+ice: {}            # mEVP sea ice
+
+visc: {}           # CORE2-default γ's (gamma1=0.1)
+tracer: {}         # MFCT/QR4C/FCT (0,1)
+
+dt: 900.0          # farc timestep [s]
+
+mesh: /work/ab0995/a270088/meshes/farc_jax    # prepared by scripts/prepare_mesh.py (Task A8)
+partition: dist_4                              # 1 node ×4 A100; restart-portable to dist_8
+forcing:
+  kind: core2
+  start_year: 1958
+output_dir: /work/ab0995/a270088/port_jax/runs/farc
+snapshot_every: 96       # ~1/day at dt=900
+checkpoint_every: 480    # ~5 days
+restart_in: null         # cold PHC IC
+restart_out: /work/ab0995/a270088/port_jax/runs/farc/restart
+duration: 1mo            # short de-risk run (ladder-gated; extend after it's green)
