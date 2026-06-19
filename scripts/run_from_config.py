@@ -60,6 +60,8 @@ def main():
     ap.add_argument("--restart-in", help="override cfg.restart_in (resume here; any device count)")
     ap.add_argument("--restart-out", help="override cfg.restart_out (write the restart here)")
     ap.add_argument("--steps", type=int, help="override cfg.n_steps")
+    ap.add_argument("--partition", help="override cfg.partition (e.g. dist_8 -> dist_16 for a "
+                                        "device-count-change restart)")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -71,6 +73,8 @@ def main():
         repl["restart_out"] = args.restart_out
     if args.steps is not None:
         repl["n_steps"] = args.steps
+    if args.partition is not None:
+        repl["partition"] = args.partition
     if repl:
         cfg = dataclasses.replace(cfg, **repl)
 
