@@ -114,9 +114,12 @@ state_N = integrate(state0, mesh, op, stress, n_steps=10, dt=1800.0)
 print(state_N.T[:, 0].mean())                        # surface temperature after 10 steps
 ```
 
-**Full model** (KPP + GM/Redi + prognostic ice + real JRA55) — add the configs + forcing
-(`step()` takes one step's forcing; for forced *multi*-step use `run_steps_sharded`, or pass
-`integrate(step_forcings=...)` a per-step stack):
+**Full model** (KPP + GM/Redi + prognostic ice + real JRA55) — add the configs + forcing.
+`step()` takes one step's forcing; for a forced *multi*-step run use `run_steps_sharded` (per-step
+forcing) or `integrate(step_forcings=...)` (a pre-stacked stack — simplest, but it holds all forcing
+in memory and so caps at **~weeks**). For **multi-year** forwards use the per-year-chunked driver
+`scripts/core2_kpp_climate_run.py` (`--load-state` restart, `is_first_step=False`) — the tool that
+produced the 5-yr spin-up + 10-yr climate reference:
 
 ```python
 from fesom_jax.step import step
@@ -371,8 +374,21 @@ sbatch scripts/run_suite.sbatch                                 # full suite on 
 
 ## Limitations — what it can and can't do
 
-**Differentiation modes — status, limits, and the reason** (the *forward* model itself runs at every
-scale; these are the constraints on the *gradient* modes):
+**Forward model — what runs, what doesn't, and why** (the forward integration; the gradient modes are
+the next table):
+
+| forward configuration | runs? | note / why |
+|---|---|---|
+| Single-device, ocean-only **or full** model (KPP+GM/Redi+ice+JRA55), float64 | ✅ | the Quick-start path (`integrate` / `step`) |
+| Forced multi-step, **pre-stacked** (`integrate(step_forcings=…)`) | ✅ but **≤ ~weeks** | all per-step forcing is stacked in memory ⇒ caps at ~weeks; longer OOMs |
+| **Multi-year** forced forward | ✅ | per-year-**chunked** forcing + `--load-state` restart (`scripts/core2_kpp_climate_run.py`) — *not* the pre-stack path; this produced the spin-up + 10-yr reference |
+| Multi-GPU / multi-node, **ragged** halo | ✅ **GPU only** | halo-only point-to-point comms; `ragged_all_to_all` is GPU/NCCL-only (#4) |
+| Multi-GPU, **all_gather** halo | ✅ CPU **and** GPU | correct everywhere but O(P·N_local) memory ⇒ OOMs at dars-8 / NG5 (#1) |
+| Big mesh on too few nodes | ❌ OOM | dars **≥ 2 nodes**, NG5 **≥ 8** — the XLA remat floor is ~4× Kokkos's hand-managed memory (#3) |
+| Long **bit-reproducible** climate run | ❌ | reduction-order chaos diverges N-vs-1 and run-to-run (same as the C/Fortran ports) (#5, #7) |
+
+**Differentiation modes — status, limits, and the reason** (the forward model runs at every scale
+above; these are the constraints on the *gradient* modes):
 
 | mode | status | limitation & **why** |
 |---|---|---|
