@@ -116,7 +116,7 @@ class RunResult(NamedTuple):
 
 def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=None,
                     state0=None, forcing_stack=None, start_step=0, year=1958,
-                    chunk_steps=None, devices=None, out_dir=None,
+                    chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
                     accumulate_stats=False, stats_fields=("T", "S", "uv")):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
@@ -186,7 +186,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         state_p = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
-            **cfg.physics_kwargs())
+            use_ragged=use_ragged, **cfg.physics_kwargs())
         folded_in = True                                     # the scan output is folded [P*Lmax]
         if accumulate_stats:
             leaves = {k: getattr(state_p, k) for k in stats_fields}   # already folded [P*Lmax]

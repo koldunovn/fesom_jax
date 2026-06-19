@@ -62,6 +62,9 @@ def main():
     ap.add_argument("--steps", type=int, help="override cfg.n_steps")
     ap.add_argument("--partition", help="override cfg.partition (e.g. dist_8 -> dist_16 for a "
                                         "device-count-change restart)")
+    ap.add_argument("--ragged", action="store_true",
+                    help="ragged-halo path (no global all_gather) — needed at dars/NG5 scale; "
+                         "GPU-only, forward-only (the sharded ragged AD bug doesn't apply here)")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -100,7 +103,8 @@ def main():
               f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in}")
     res = run_from_config(cfg, mesh=mesh, part=part, sm=sm, sop=sop, forcing=forcing,
                           state0=state0, start_step=0, year=args.year,
-                          chunk_steps=args.chunk_steps, out_dir=cfg.restart_out)
+                          chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
+                          use_ragged=args.ragged)
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")

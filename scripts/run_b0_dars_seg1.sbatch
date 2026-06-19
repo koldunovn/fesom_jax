@@ -29,7 +29,7 @@ OUT=/work/ab0995/a270088/port_jax/runs/dars_b0
 echo "=== $(date) dars B0 seg1: nodes=$SLURM_JOB_NODELIST  dist_16 (16 GPU) RESUME seg0 (was dist_8) +8 steps ==="
 srun --cpu-bind=none "$PY" scripts/run_from_config.py configs/dars.yaml \
     --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition dist_16 \
-    --steps 8 --chunk-steps 8 --restart-in "$OUT/seg0" --restart-out "$OUT/seg1"
+    --steps 8 --chunk-steps 8 --ragged --restart-in "$OUT/seg0" --restart-out "$OUT/seg1"
 R=$?
 echo "seg1 exit=$R"
 if [ $R -eq 0 ]; then
