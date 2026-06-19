@@ -30,12 +30,10 @@ import datetime
 from typing import NamedTuple
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
-from . import halo, shard_mesh, ssh, zarr_output
-from .integrate_sharded import (_fold, _to_global_sharded, folded_state,
-                                run_steps_sharded_forced, unfold_state)
+from . import shard_mesh, ssh, zarr_output
+from .integrate_sharded import run_steps_sharded_forced
 from .run_config import RunConfig
 
 _SECONDS = {"s": 1.0, "h": 3600.0, "d": 86400.0, "mo": 30 * 86400.0, "yr": 365 * 86400.0}
@@ -109,22 +107,8 @@ def _chunk_dates(year: int, dt: float, start_step: int, count: int):
     return out
 
 
-# --------------------------------------------------------------------------
-# Restart-state plumbing ([P,Lmax] → folded sharded, for write_restart)
-# --------------------------------------------------------------------------
-def _place_folded(state_p, npes, devices=None):
-    """``[P,Lmax]`` device-sharded State → folded ``[P*Lmax]`` device-sharded State for
-    :func:`~fesom_jax.zarr_output.write_restart`.
-
-    ``state_p`` is ALREADY device-sharded (the run output / ``read_restart``), so fold it **on
-    device** (``folded_state``'s ``jnp`` reshape) and hand it straight to ``write_restart`` (which
-    writes via ``addressable_shards``). Do NOT round-trip through ``_to_global_sharded`` — its
-    ``np.asarray`` would pull a MULTI-PROCESS global array to host (`spans non-addressable devices`)."""
-    return folded_state(state_p)[0]
-
-
 class RunResult(NamedTuple):
-    state_p: object     # [P, Lmax] final State
+    state_p: object     # FOLDED [P*Lmax] final State (device-sharded; restart-ready)
     stats: object       # OnlineStats over chunk-final folded states, or None
     step: int           # absolute step index after the run
     dt_stage: float     # the dt the run ended at (persisted for resume)
@@ -160,12 +144,16 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             _sop_cache[d] = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=d), part)
         return _sop_cache[d]
 
-    # --- initial [P, Lmax] State ------------------------------------------
+    # --- initial State: cold = HOST [P,Lmax]; resume = FOLDED [P*Lmax] device (read_restart) ---
+    # The State is kept FOLDED through the chunk loop + restart (no [P,Lmax]↔[P*Lmax] reshape, which
+    # MATERIALIZES the global array on one device under multi-node ⇒ OOM). Cold start is the one
+    # [P,Lmax] (host) entry; run_steps_sharded_forced folds it once and returns folded thereafter.
     if state0 is not None:
-        state_p = shard_mesh.partition_state(state0, part)
+        state_p = shard_mesh.partition_state(state0, part)   # [P, Lmax] HOST
+        folded_in = False
     elif cfg.restart_in is not None:
-        folded, meta = zarr_output.read_restart(cfg.restart_in, mesh, part, devices=devices)
-        state_p = unfold_state(folded, npes)
+        state_p, meta = zarr_output.read_restart(cfg.restart_in, mesh, part, devices=devices)
+        folded_in = True                                     # read_restart returns folded [P*Lmax]
         start_step = int(meta.get("step", start_step))
     else:
         raise ValueError("run_from_config: provide state0 (cold IC) or cfg.restart_in")
@@ -197,19 +185,21 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         seq_p = shard_mesh.partition_step_forcing(seq, part)
         state_p = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
-            bootstrap_ab2=ch.bootstrap_ab2, **cfg.physics_kwargs())
+            bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
+            **cfg.physics_kwargs())
+        folded_in = True                                     # the scan output is folded [P*Lmax]
         if accumulate_stats:
-            folded = {k: _fold(getattr(state_p, k)) for k in stats_fields}   # [P*Lmax] leaves
-            stats = (zarr_output.OnlineStats.init(folded) if stats is None
-                     else stats).update(folded)
+            leaves = {k: getattr(state_p, k) for k in stats_fields}   # already folded [P*Lmax]
+            stats = (zarr_output.OnlineStats.init(leaves) if stats is None
+                     else stats).update(leaves)
 
     end_step = start_step + n_steps
     end_dt = chunks[-1].dt if chunks else cfg.dt
 
-    # --- write the portable restart ---------------------------------------
+    # --- write the portable restart (state_p is already folded [P*Lmax]) ---
     target = out_dir if out_dir is not None else cfg.restart_out
     if target is not None:
         yr, doy, _, _ = _chunk_dates(year, end_dt, end_step, 1)[0]
-        zarr_output.write_restart(target, _place_folded(state_p, npes, devices=devices), sm, part,
+        zarr_output.write_restart(target, state_p, sm, part,
                                   step=end_step, calendar_date=f"{yr}-doy{doy:03d}", dt_stage=end_dt)
     return RunResult(state_p=state_p, stats=stats, step=end_step, dt_stage=float(end_dt))

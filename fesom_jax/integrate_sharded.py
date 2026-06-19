@@ -521,7 +521,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              dt: float, npes: int, params=None, gm_cfg=None, kpp_cfg=None,
                              tke_cfg=None, ale_cfg=None, ice_cfg=None, visc_cfg=None,
                              tracer_cfg=None, boundary_node_p=None, use_ragged: bool = False,
-                             bootstrap_ab2: bool = True, return_executable: bool = False):
+                             bootstrap_ab2: bool = True, state_is_folded: bool = False,
+                             return_folded: bool = False, return_executable: bool = False):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     Like :func:`run_steps_sharded` but the surface forcing **changes every step** — the real
@@ -542,9 +543,20 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     across chunks of equal length (a fresh forcing stack each call ⇒ same shapes ⇒ cache hit).
 
     Forward-only (no ``return_grad_fn``): the model paper is forward at scale; the differentiable
-    path stays single-GPU dense (the sharded ragged-halo AD bug)."""
+    path stays single-GPU dense (the sharded ragged-halo AD bug).
+
+    **Folded I/O (multi-node, the A6 chunk/restart chaining).** ``state_is_folded`` ⇒ ``state_p`` is
+    ALREADY a folded ``[P*Lmax]`` device-sharded State (a prior chunk's output / ``read_restart``);
+    skip ``folded_state`` (whose ``[P,Lmax]→[P*Lmax]`` reshape MATERIALIZES the global array on one
+    device under multi-node ⇒ OOM). ``return_folded`` ⇒ return the folded ``[P*Lmax]`` scan output
+    directly (no ``unfold_state`` reshape). Cold start passes a HOST ``[P,Lmax]`` (``state_is_folded
+    =False``); the driver chains the folded output between chunks and to ``write_restart``."""
     fm, fm_spec = folded_mesh(sm)
-    fs, fs_spec = folded_state(state_p)
+    if state_is_folded:
+        fs = state_p                                      # already folded [P*Lmax] device-sharded
+        fs_spec = jax.tree.map(lambda _: _P, fs)
+    else:
+        fs, fs_spec = folded_state(state_p)               # [P,Lmax] (host cold-start) → [P*Lmax]
     fop, fop_spec = folded_operator(sop)
     fstress = _fold(stress_p)
     jmesh = halo.device_mesh(devices=jax.devices()[:npes])
@@ -607,4 +619,5 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     args = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(args, in_specs))
     if return_executable:
         return jfn, args, npes
-    return unfold_state(jfn(*args), npes)
+    out = jfn(*args)                                       # folded [P*Lmax] sharded scan output
+    return out if return_folded else unfold_state(out, npes)

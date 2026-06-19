@@ -127,7 +127,10 @@ def test_restart_seam_continuous_equals_chained(core2_setup, tmp_path):
                               forcing=fx["cf"], forcing_stack=rest, **common)
 
     assert chained.step == n, f"resumed step counter {chained.step} != {n}"
-    worst = _owned_worst(cont.state_p, chained.state_p, fx["part"], fx["sm"], 1)
+    # RunResult.state_p is FOLDED [P*Lmax] (the restart-ready form); unfold to [P,Lmax] to compare
+    from fesom_jax.integrate_sharded import unfold_state
+    worst = _owned_worst(unfold_state(cont.state_p, 1), unfold_state(chained.state_p, 1),
+                         fx["part"], fx["sm"], 1)
     # restart round-trip is bit-faithful (A1) + AB2 continues ⇒ chained == continuous to the FCT
     # climate-close floor (the one-scan vs two-scan reassociation; a cold-AB2 bug would be O(1)).
     assert worst < 5e-3, f"restart-seam continuous-vs-chained owned max|Δ|={worst:.3e}"
