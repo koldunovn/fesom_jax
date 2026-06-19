@@ -4279,3 +4279,27 @@ Cite the C source (`file:line`) or dump probe that proves it.
   per-array oracle makes even a 1350-line mesh-setup port converge fast** — 30/32 arrays matched on the first
   pass; only the area off-by-one + the verify-gate tolerance (relative, since arrays span 1e10->1e-20) needed a
   fix. The MFCT `edge_up_dn_tri` scan matched EXACTLY first try.
+
+- **Task B0 — multi-node forced run + portable restart de-risk (farc green, dars `MACHINERY_SCALE_DARS_OK`).**
+  The config-driven `run.py` driver works **single-node** at farc (638 k / 4 GPU) first try, but the dars
+  (3.16 M, multi-node `jax.distributed`) B0 surfaced FIVE distinct scale/multi-process issues — each invisible
+  single-node, each a genuine blocker for ANY multi-node run (incl. NG5), and the ladder caught them all cheaply
+  on dars instead of the NG5 flagship. In peel order: **(1) GPU-0 setup OOM** — `core2_initial_state` built the
+  global State on GPU 0 (~50-80 GB at 3.16 M); fix = host-build (`xp=np`, the Phase-8b B.3 pattern; value-
+  identical). **(2) `np.asarray` on a cross-process global** — `write_restart`/resume pulled a multi-process
+  sharded array to host (`spans non-addressable devices`); fix = fold on-device + let `_to_global_sharded` pass
+  a device `jax.Array` through (reshard, not host-pull). **(3) multi-process reshape materialization** — the
+  `[P,Lmax]↔[P*Lmax]` unfold/fold of a sharded array gathers the WHOLE global on one device (34.8 GiB OOM,
+  `jit_reshape`); fix = keep the State **FOLDED `[P*Lmax]` end-to-end** (`run_steps_sharded_forced` gains
+  `state_is_folded`/`return_folded`; the driver never unfolds). **(4) all_gather global materialization in the
+  step** — `use_ragged=False` gathers global fields per device (34.8→still OOM); fix = the **ragged-halo path**
+  (`use_ragged=True`, GPU-only, forward-only-safe — the scaling-benchmark path; cut it to 22 GiB). **(5)
+  provisioning + stale store** — dars all-on physics needs **>8 GPUs** (dist_8 OOMed at 22 GiB; dist_16 cleared
+  it — the per-device working set, not a global), and a prior dist_N's restart store shape-conflicts
+  (`8*Lmax_8 != 16*Lmax_16`) ⇒ clear it first. **Through all five the restart seam stayed BIT-EXACT (5.68e-8)** —
+  every failure was infrastructure (memory / multi-process I/O), never the physics. **The lesson: single-node
+  GPU validation is necessary but NOT sufficient — multi-node has its own class of bugs (cross-process host
+  pulls, sharded-reshape materialization, per-device provisioning) that only a real multi-node run surfaces;
+  de-risk them on the cheap mesh (dars) before the flagship (NG5).** Still TODO: the device-count CHANGE
+  (dist_16→dist_32) — this run was dist_16→dist_16 (same count); the cross-count restart is the headline A1
+  feature at multi-node scale, a quick follow-up now that dars RUNS.
