@@ -1,0 +1,26 @@
+# dars (3.16 M nodes, 57 levels) — Part-B machinery de-risk + scaling (the larger intermediate).
+# Multi-node (>=2 nodes); exercises the device-count-portable restart on a REAL multi-node run
+# (save dist_16 -> resume dist_32). Physics = a reasonable all-on config (de-risk the machinery).
+
+ale: {}            # zstar
+gm: null           # GM off (de-risk; cheap)
+kpp: {}            # KPP vertical mixing
+tke: null
+ice: {}            # mEVP sea ice
+
+visc: {}           # CORE2-default γ's
+tracer: {}         # MFCT/QR4C/FCT (0,1)
+
+dt: 180.0          # dars timestep [s]
+
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars   # C-export (== prepare_mesh.py); has the IC
+partition: dist_16                                       # >=2 nodes; restart-portable to dist_32
+forcing:
+  kind: core2
+  start_year: 1958
+output_dir: /work/ab0995/a270088/port_jax/runs/dars
+snapshot_every: 480      # ~1/day at dt=180
+checkpoint_every: 2400   # ~5 days
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars/restart
+duration: 1mo            # short de-risk (ladder-gated; extend after green)
