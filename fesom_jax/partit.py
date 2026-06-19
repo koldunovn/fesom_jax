@@ -426,3 +426,56 @@ def synth_serial(nod2D: int, elem2D: int, edge2D: int) -> Partition:
         elem2D=elem2D,
         edge2D=edge2D,
     )
+
+
+def synth_block_partition(nod2D: int, elem2D: int, edge2D: int, npes: int) -> Partition:
+    """A **halo-free** block partition over ``npes`` ranks — for restart / I/O testing.
+
+    Each entity kind (node / element / edge) is split into ``npes`` disjoint
+    contiguous blocks (:func:`numpy.array_split`); rank ``d`` owns exactly its block
+    with **zero halo** (``eDim==eXDim==0``) and no neighbours. This is a valid
+    *ownership cover* — every global entity is interior on exactly one rank — which is
+    all the restart / Zarr-output path needs: it gather/scatters entities **by global
+    id, partition-independently** (:func:`fesom_jax.zarr_output.reconstruct_global`),
+    and never exchanges halos. ``npes==1`` reproduces :func:`synth_serial`.
+
+    It is **NOT a runnable partition**: with no halos the step's stencils would read
+    pad lanes at the block boundaries. Use :func:`read_partition` for real runs; use
+    this only to exercise the device-count-portable restart on CPU fake-devices
+    without depending on external ``dist_<NP>`` files.
+    """
+    if npes < 1:
+        raise ValueError(f"npes must be >= 1, got {npes}")
+
+    def empty_com() -> ComStruct:
+        z = np.zeros(0, dtype=np.int32)
+        z1 = np.zeros(1, dtype=np.int32)
+        return ComStruct(rPE=z, rptr=z1, rlist=z, sPE=z, sptr=z1.copy(), slist=z)
+
+    nod_b = [b.astype(np.int32) for b in np.array_split(np.arange(nod2D), npes)]
+    elem_b = [b.astype(np.int32) for b in np.array_split(np.arange(elem2D), npes)]
+    edge_b = [b.astype(np.int32) for b in np.array_split(np.arange(edge2D), npes)]
+    myDim_nod = np.array([b.size for b in nod_b], dtype=np.int32)
+    myDim_elem = np.array([b.size for b in elem_b], dtype=np.int32)
+    myDim_edge = np.array([b.size for b in edge_b], dtype=np.int32)
+    zero = np.zeros(npes, dtype=np.int32)
+    # part[k] = #nodes owned by ranks [0..k); blocks are contiguous in rank order ⇒
+    # the prefix-sum maps id→owner here (unlike a real scattered myList).
+    part = np.concatenate([[0], np.cumsum(myDim_nod)]).astype(np.int32)
+
+    return Partition(
+        myDim_nod2D=myDim_nod, eDim_nod2D=zero.copy(),
+        myDim_elem2D=myDim_elem, eDim_elem2D=zero.copy(), eXDim_elem2D=zero.copy(),
+        myDim_edge2D=myDim_edge, eDim_edge2D=zero.copy(),
+        myList_nod2D=tuple(nod_b),
+        myList_elem2D=tuple(elem_b),
+        myList_edge2D=tuple(edge_b),
+        com_nod2D=tuple(empty_com() for _ in range(npes)),
+        com_elem2D=tuple(empty_com() for _ in range(npes)),
+        com_elem2D_full=tuple(empty_com() for _ in range(npes)),
+        part=part,
+        npes=npes,
+        nod2D=nod2D,
+        elem2D=elem2D,
+        edge2D=edge2D,
+    )
