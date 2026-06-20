@@ -299,7 +299,7 @@ class JRA55Reader:
     def __init__(self, mesh, year: int, jra_dir: str | Path = DEFAULT_JRA_DIR):
         self.year = int(year)
         self.N = int(mesh.nod2D)
-        jra_dir = Path(jra_dir)
+        self.jra_dir = Path(jra_dir)
 
         # geographic node coords (deg), with only the <0 wrap (C :306-308).
         geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64) / RAD
@@ -312,21 +312,51 @@ class JRA55Reader:
         self.rlat = np.asarray(mesh.coord_nod2D, dtype=np.float64)[:, 1]
         self.M = _rotation_matrix()
 
-        # open the 8 fields for the year.
-        self.fields: list[_Field] = []
-        for var in JRA_VARS:
-            path = str(jra_dir / f"{var}.{self.year:04d}.nc")
-            self.fields.append(_Field(var, path, self.year))
-
-        # The 8 files share one (lon,lat) grid → build the gather stencil ONCE.
+        # Open the 8 per-year fields; build the gather stencil ONCE from their shared (lon,lat)
+        # grid. That grid is FIXED across years, so a multi-year run rolls the year via
+        # `reopen_year` (swap the file handles) and REUSES idx4/weights — never rebuilt.
+        self.fields = self._open_fields(self.year)
         f0 = self.fields[0]
-        for f in self.fields[1:]:
+        self.idx4, self.dx4, self.dy4, self.denom = self._build_stencil(
+            f0.nc_lon, f0.nc_lat, f0.Nlon, f0.Nlat)
+        self._grid_lon, self._grid_lat = f0.nc_lon, f0.nc_lat   # reopen_year invariance guard
+
+    def _open_fields(self, year: int) -> "list[_Field]":
+        """Open the 8 JRA fields for ``year`` (``{var}.{year:04d}.nc``) and verify they share one
+        (lon,lat) grid — the precondition for the single shared bilinear stencil."""
+        fields = [_Field(var, str(self.jra_dir / f"{var}.{int(year):04d}.nc"), int(year))
+                  for var in JRA_VARS]
+        f0 = fields[0]
+        for f in fields[1:]:
             if not (np.array_equal(f.nc_lon, f0.nc_lon)
                     and np.array_equal(f.nc_lat, f0.nc_lat)):
                 raise ValueError("JRA55 fields do not share a common lon/lat grid; "
                                  "the shared-stencil assumption is violated.")
-        self.idx4, self.dx4, self.dy4, self.denom = self._build_stencil(
-            f0.nc_lon, f0.nc_lat, f0.Nlon, f0.Nlat)
+        return fields
+
+    def reopen_year(self, year: int):
+        """Switch the forcing year IN PLACE — swap ONLY the 8 per-year file handles + time axes.
+
+        The bilinear stencil (``idx4``/``dx4``/``dy4``/``denom``) and the wind-rotation factors
+        depend only on (mesh, JRA grid), which is IDENTICAL every year, so they are KEPT — not
+        rebuilt. This is the multi-year-run fix: a full reader rebuild would re-pay the per-node
+        stencil setup (~seconds–tens-of-seconds at NG5 scale) every January 1 and discard the
+        per-device interpolation knowledge we paid to build. Cheap here: open 8 files + read their
+        1-D time axes (the field data is still read lazily per step). Returns ``self``."""
+        year = int(year)
+        if year == self.year:
+            return self
+        new_fields = self._open_fields(year)
+        g0 = new_fields[0]
+        if not (np.array_equal(g0.nc_lon, self._grid_lon)
+                and np.array_equal(g0.nc_lat, self._grid_lat)):
+            raise ValueError(f"JRA55 year {year}'s grid differs from the build year's — the "
+                             "shared interpolation stencil cannot be reused.")
+        for f in self.fields:                  # release the old year's open Datasets
+            f.close()
+        self.fields = new_fields
+        self.year = year
+        return self
 
     # ---- stencil -------------------------------------------------------
     def _build_stencil(self, nc_lon, nc_lat, Nlon, Nlat):

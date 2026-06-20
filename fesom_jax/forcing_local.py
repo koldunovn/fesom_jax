@@ -87,6 +87,12 @@ class LocalForcing:
             out[name] = full
         return StepForcing(**out)
 
+    def reopen_year(self, year: int):
+        """Roll the local forcing to ``year`` (delegates to the wrapped CoreForcing/JRA reader; the
+        local sub-mesh stencil is year-independent and kept). Returns ``self``."""
+        self.cf.reopen_year(year)
+        return self
+
 
 def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None,
                         jra_dir=jra55.DEFAULT_JRA_DIR,

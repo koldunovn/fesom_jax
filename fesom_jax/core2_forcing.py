@@ -233,6 +233,13 @@ class CoreForcing:
         return StepForcing(*[xp.stack(leaves, axis=0)
                              for leaves in zip(*steps)])
 
+    def reopen_year(self, year: int):
+        """Roll the JRA reader to ``year`` IN PLACE (keeps the year-independent interpolation
+        stencil; see :meth:`fesom_jax.jra55.JRA55Reader.reopen_year`). SSS-restoring and chl are
+        monthly CLIMATOLOGIES (year-independent), so only the JRA reader rolls. Returns ``self``."""
+        self.jra.reopen_year(year)
+        return self
+
 
 def build_core_forcing(mesh: Mesh, year: int, *, sst_ic=None,
                        jra_dir: str = jra55.DEFAULT_JRA_DIR,

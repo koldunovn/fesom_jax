@@ -66,6 +66,26 @@ def jra():
                 c_d1=_load("d1_s0"), c_in=_load("interior"))
 
 
+def test_reopen_year_keeps_stencil_and_switches_data(jra):
+    """``reopen_year`` swaps the forcing YEAR in place: the bilinear stencil (idx4/weights) and the
+    wind rotation are year-independent and KEPT (same array objects) — only the data source moves
+    to the new year's files. Backs the multi-year run (run.py rolls the reader at a year boundary)."""
+    from fesom_jax import jra55
+    if not (JRA_DIR / f"uas.{YEAR + 1}.nc").is_file():
+        pytest.skip(f"JRA {YEAR + 1} data not available")
+    r = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+    idx4, dx4, dy4, denom, M = r.idx4, r.dx4, r.dy4, r.denom, r.M
+    f0 = r.step(YEAR, 1, 0.0)                              # Jan 1 of YEAR
+    assert r.reopen_year(YEAR) is r and r.year == YEAR     # same-year reopen is a no-op
+    r.reopen_year(YEAR + 1)
+    assert r.year == YEAR + 1
+    # the expensive interpolation knowledge is REUSED, not rebuilt (identity)
+    assert r.idx4 is idx4 and r.dx4 is dx4 and r.dy4 is dy4 and r.denom is denom and r.M is M
+    f1 = r.step(YEAR + 1, 1, 0.0)                          # Jan 1 of YEAR+1
+    assert not np.array_equal(np.asarray(f0.u_wind), np.asarray(f1.u_wind))  # weather differs
+    r.close()
+
+
 def test_dump_is_full_mesh_in_order(jra):
     for key in ("c_d1", "c_in"):
         gid = jra[key][:, 0].astype(np.int64)

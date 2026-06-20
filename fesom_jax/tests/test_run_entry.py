@@ -20,7 +20,7 @@ import pytest
 
 from fesom_jax import core2_forcing, partit, shard_mesh, ssh
 from fesom_jax.mesh import load_mesh
-from fesom_jax.run import Chunk, parse_duration, plan_chunks, run_from_config
+from fesom_jax.run import Chunk, _year_boundaries, parse_duration, plan_chunks, run_from_config
 from fesom_jax.run_config import DtRamp, RunConfig
 from fesom_jax.state import State
 from fesom_jax.kpp import KppConfig
@@ -68,6 +68,25 @@ def test_plan_chunks_dt_ramp():
     # re-bootstraps AB2 (the dt change invalidates the AB2 history formed at the old dt)
     ch = plan_chunks(8, 10, start_step=0, dt_ramp=DtRamp(after_step=4, dt=240.0), dt=180.0)
     assert ch == [Chunk(0, 4, 180.0, True), Chunk(4, 4, 240.0, True)]
+
+
+def test_year_boundaries():
+    # 3 model years from 1958 at dt=180: the reader must roll at the first step of 1959 and 1960
+    n = parse_duration("3yr", 180.0)                      # 3*365 days = 525600 steps
+    assert _year_boundaries(1958, 180.0, 0, n) == [175200, 350400]
+    # a sub-year run has no boundary; a mid-year RESUME only reports boundaries ahead of start
+    assert _year_boundaries(1958, 180.0, 0, 1000) == []
+    assert _year_boundaries(1958, 180.0, 200000, 200000) == [350400]
+
+
+def test_plan_chunks_splits_at_year_boundary():
+    # a forcing-year boundary forces a chunk boundary (so the reader rolls cleanly) WITHOUT
+    # re-bootstrapping AB2 — a year switch is forcing-only; the dynamics are continuous.
+    ch = plan_chunks(200, 48, start_step=0, dt=180.0, split_at=[100])
+    assert 100 in [c.start for c in ch]
+    assert all(not (c.start < 100 < c.start + c.count) for c in ch)    # none straddles 100
+    assert next(c for c in ch if c.start == 100).bootstrap_ab2 is False
+    assert ch[0].start == 0 and sum(c.count for c in ch) == 200        # exact, contiguous cover
 
 
 # ==========================================================================

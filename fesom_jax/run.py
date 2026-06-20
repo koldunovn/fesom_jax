@@ -27,6 +27,7 @@ noted, not yet wired (de-risk on the smaller meshes first per the run plan).
 from __future__ import annotations
 
 import datetime
+import math
 import time
 from typing import NamedTuple
 
@@ -70,24 +71,32 @@ class Chunk(NamedTuple):
 
 
 def plan_chunks(n_steps: int, chunk_steps: int, *, start_step: int = 0, dt_ramp=None,
-                dt: float) -> list:
+                dt: float, split_at=None) -> list:
     """Split ``[start_step, start_step+n_steps)`` into ``Chunk``s of ≤ ``chunk_steps``, also
-    splitting at the **dt-ramp boundary** so no chunk straddles a dt change.
+    splitting at the **dt-ramp boundary** so no chunk straddles a dt change, and at each step in
+    ``split_at`` (the **forcing-year boundaries**, :func:`_year_boundaries`) so no chunk straddles
+    a forcing-year switch.
 
     ``bootstrap_ab2`` is True only for (a) the very first step of a COLD run (``start_step==0``,
     first chunk) and (b) the chunk that begins exactly at ``dt_ramp.after_step`` (the dt changed ⇒
     the AB2 history is stale). A restart-continuation chunk (``start_step>0``, same dt) carries AB2
-    forward ⇒ a chained run is bit-identical to a continuous one (the restart-seam invariant)."""
+    forward ⇒ a chained run is bit-identical to a continuous one (the restart-seam invariant). A
+    ``split_at`` (year) boundary is forcing-only — same dt, AB2 continuous ⇒ it does NOT bootstrap."""
     if chunk_steps <= 0:
         raise ValueError("chunk_steps must be > 0")
     end = start_step + n_steps
     ramp_at = dt_ramp.after_step if dt_ramp is not None else None
+    splits = sorted(x for x in (split_at or ()) if start_step < x < end)
     chunks, s = [], start_step
     while s < end:
         cdt = dt_ramp.dt if (ramp_at is not None and s >= ramp_at) else dt
         stop = min(end, s + chunk_steps)
         if ramp_at is not None and s < ramp_at < stop:    # don't straddle the dt change
             stop = ramp_at
+        for sp in splits:                                 # don't straddle a forcing-year boundary
+            if s < sp < stop:
+                stop = sp
+                break
         boot = (s == 0) or (s == ramp_at)
         chunks.append(Chunk(start=s, count=stop - s, dt=float(cdt), bootstrap_ab2=boot))
         s = stop
@@ -106,6 +115,30 @@ def _chunk_dates(year: int, dt: float, start_step: int, count: int):
         doy = (d - datetime.datetime(d.year, 1, 1)).days + 1
         out.append((d.year, doy, d.hour * 3600.0 + d.minute * 60.0 + d.second, d.month))
     return out
+
+
+def _year_boundaries(year: int, dt: float, start_step: int, n_steps: int):
+    """Absolute step indices in ``(start_step, start_step+n_steps)`` where the model CALENDAR YEAR
+    changes — passed to :func:`plan_chunks` as ``split_at`` so no chunk straddles a forcing-year
+    switch (the JRA reader holds one year; :meth:`fesom_jax.jra55.JRA55Reader.reopen_year` rolls it
+    AT a boundary).
+
+    Uses the same step→date map as :func:`_chunk_dates` (``datetime(year,1,1) + n·dt``), so it is
+    exact incl. leap years. Assumes a CONSTANT ``dt`` over the span — the dt-ramp only fires at
+    cold start, far from any year boundary, and multi-year runs resume from a spun-up restart."""
+    base = datetime.datetime(int(year), 1, 1)
+    end = int(start_step) + int(n_steps)
+    bounds = []
+    y = (base + datetime.timedelta(seconds=int(start_step) * float(dt))).year
+    while True:
+        secs = (datetime.datetime(y + 1, 1, 1) - base).total_seconds()
+        nb = int(math.ceil(secs / float(dt)))
+        if nb >= end:
+            break
+        if nb > int(start_step):
+            bounds.append(nb)
+        y += 1
+    return bounds
 
 
 class RunResult(NamedTuple):
@@ -168,7 +201,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     else:
         raise ValueError("run_from_config: set cfg.n_steps or cfg.duration")
     cs = int(chunk_steps) if chunk_steps else max(1, n_steps)
-    chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt)
+    chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt,
+                         split_at=_year_boundaries(year, cfg.dt, start_step, n_steps))
 
     if forcing is None and forcing_stack is None:
         raise ValueError("run_from_config: provide forcing (CoreForcing) or forcing_stack")
@@ -209,8 +243,19 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                                   calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv)
 
     t_loop0 = time.perf_counter()
+    cur_year = int(year)                     # the year the forcing reader was built for
     for ci, ch in enumerate(chunks):
         tc0 = time.perf_counter()
+        # Roll the forcing reader to this chunk's CALENDAR YEAR if it changed (calendar paths only;
+        # chunks never straddle a year boundary — plan_chunks split_at=_year_boundaries). reopen_year
+        # swaps only the per-year file handles and KEEPS the interpolation stencil (year-independent).
+        if forcing_stack is None:
+            cy = _chunk_dates(year, ch.dt, ch.start, 1)[0][0]
+            if cy != cur_year:
+                (local_forcing if local_forcing is not None else forcing).reopen_year(cy)
+                cur_year = cy
+                if progress:
+                    print(f"[run.progress] forcing → year {cy} @ step {ch.start}", flush=True)
         if forcing_stack is not None:
             lo = ch.start - start_step
             seq = jax.tree.map(lambda x, lo=lo: x[lo: lo + ch.count], forcing_stack)

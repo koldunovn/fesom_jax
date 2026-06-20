@@ -4384,3 +4384,34 @@ Cite the C source (`file:line`) or dump probe that proves it.
   end-to-end run, not just green unit tests. And domain-expert eyeballing of the actual fields (the user) catches
   what the gates don't. TODO: consolidate the cold-start setup into ONE shared helper used by `run_from_config` AND
   the run scripts, so it can't drift again.**
+
+- **[model-paper / multi-year forcing / THE SAME consolidation gap, third instance] (`MULTIYEAR_FORCING_ROLLOVER_OK`)
+  Multi-year forcing rollover WAS implemented and CORE-tested — but in the OLD per-step climate driver, not the new
+  `run_from_config`.** The user asked "can we start a dars 3-yr run?" and I first claimed multi-year forcing wasn't
+  implemented — WRONG (the user pushed: "I thought it was tested on CORE?"). It was: `core2_kpp_climate_run.py:303-308`
+  rebuilds the forcing when the model year changes (`if y != cf_year: cf = build_core_forcing(mesh, y)`), and the
+  `kpp_climate_2yr` run logged `[forcing] rebuilt for year 1959` → a full 1959 of monthly means. The REAL gap: that
+  rollover lives in the old per-step loop; the new consolidated **sharded/chunked `run_from_config`** builds the
+  forcing ONCE for `cfg.forcing.start_year` and its chunk loop never rolled it — `_chunk_dates` correctly advances the
+  CALENDAR into 1959/1960 (datetime), but `JRA55Reader` holds a single year's files (`{var}.{year}.nc`), so year-2 dates
+  extrapolate off the end of the year-1 time axis (`step`: `rdate > hi` → clamped coeffs). Invisible because EVERY
+  multi-year CORE validation went through the OLD driver; the new driver's e2e de-risk was sub-day (never crossed Jan 1).
+  Same class as the `seed_ice`/`boundary_node_p` gaps above — the re-implemented driver dropped something the old ones had.
+  **The fix, done the RIGHT way (the user's insight: "we spend a lot of time to interpolate on each device — all this
+  knowledge is lost?").** The expensive part of "build forcing" — the per-node bilinear gather stencil (`idx4`/`dx4`/
+  `dy4`/`denom`, built over every node) and the wind rotation — depends ONLY on (mesh, JRA grid), which is IDENTICAL
+  every year. So DON'T rebuild it: `JRA55Reader.reopen_year(y)` (`jra55.py`) swaps only the 8 per-year `_Field` handles +
+  1-D time axes and KEEPS the stencil/rotation (a full `build_core_forcing(mesh, y)` rebuild — what the old loop did —
+  would re-pay the per-node setup ~seconds–tens-of-seconds at NG5 scale every Jan 1 and discard the per-device interp
+  knowledge; negligible vs ~55 h/yr compute, but wasteful and trivially avoidable). `CoreForcing.reopen_year` /
+  `LocalForcing.reopen_year` delegate (SSS-restoring + chl are year-independent monthly climatologies; only JRA rolls).
+  Wiring in `run_from_config`: `_year_boundaries(year, dt, start_step, n_steps)` (the absolute steps where the calendar
+  year flips, exact incl. leap via `datetime`) → `plan_chunks(split_at=…)` so no chunk straddles a year; the loop reopens
+  the ACTIVE reader (`local_forcing` if sharded-local, else `forcing`) when the chunk's year changes. A year boundary is
+  FORCING-ONLY ⇒ same dt, AB2 continuous, NO re-bootstrap (unlike the dt-ramp split); `_write_restart_at` rolls the
+  restart `calendar_date` too (same date fn). Tested: `reopen_year` keeps stencil IDENTITY + the data genuinely switches
+  (real 1958→1959 Jan-1 wind differs, `test_jra55`); `_year_boundaries` + `plan_chunks` split (`test_run_entry`, pure).
+  **The lesson (reinforced): when a NEW consolidated driver supersedes bespoke scripts, every multi-step behaviour the
+  old scripts had (ice seed, coastal mask, year rollover) is a candidate gap — the validation ladder that ran through the
+  OLD path won't catch it. And "rebuild" is often the wrong verb: separate the mesh/grid-invariant setup (build once) from
+  the per-period data (swap cheaply) — here it turned a per-year full rebuild into a file-handle swap.**
