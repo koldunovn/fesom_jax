@@ -138,6 +138,32 @@ def test_restart_seam_continuous_equals_chained(core2_setup, tmp_path):
 
 
 @have_forcing
+def test_inrun_multichunk_equals_singlechunk(core2_setup):
+    """In ONE ``run_from_config`` call, splitting into multiple fine forcing-chunks (the A4/A6
+    memory contract — NG5 can't pre-stack a whole year) carries the FOLDED state chunk→chunk
+    **on-device** (no disk round-trip, unlike the restart seam) ⇒ near-bit-identical to running
+    it as a single chunk. Guards the in-job multi-chunk path the NG5 ladder runs at scale; the
+    dars B0 only ever drove 1 chunk per job, so this is otherwise unexercised."""
+    fx = core2_setup
+    common = dict(mesh=fx["mesh"], part=fx["part"], sm=fx["sm"], sop=fx["sop"], year=YEAR)
+    kw = dict(kpp=KppConfig(), dt=DT)
+    n = fx["n"]                                            # 4 steps, run as 1×4 vs 2×2
+    one_chunk = run_from_config(RunConfig(n_steps=n, **kw), state0=fx["state"], forcing=fx["cf"],
+                                forcing_stack=fx["stack"], chunk_steps=n, **common)
+    two_chunk = run_from_config(RunConfig(n_steps=n, **kw), state0=fx["state"], forcing=fx["cf"],
+                                forcing_stack=fx["stack"], chunk_steps=n // 2, **common)
+    from fesom_jax.integrate_sharded import unfold_state
+    worst = _owned_worst(unfold_state(one_chunk.state_p, 1), unfold_state(two_chunk.state_p, 1),
+                         fx["part"], fx["sm"], 1)
+    # The chunk BOUNDARY step is a direct bootstrap-`one()` call instead of a scan iteration ⇒ XLA
+    # reassociates it at the SAME ~5.7e-8 float64 floor as the restart seam (the seam's error is this
+    # boundary step, NOT the bit-faithful disk round-trip). Meaningless physically (≈3e-10 rel on T),
+    # while an O(1) chaining bug — wrong forcing slice / dropped state / bad bootstrap flag — is caught.
+    assert worst < 1e-6, f"in-run multichunk vs singlechunk owned max|Δ|={worst:.3e}"
+    print(f"MULTICHUNK_OK (in-run 2-chunk vs 1-chunk owned max|Δ|={worst:.2e})")
+
+
+@have_forcing
 def test_single_step_run(core2_setup):
     fx = core2_setup
     res = run_from_config(RunConfig(n_steps=1, kpp=KppConfig(), dt=DT), mesh=fx["mesh"],

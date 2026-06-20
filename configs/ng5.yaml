@@ -22,9 +22,9 @@ dt_ramp:
   after_step: 175200   # ≈ 1 simulated year at dt=180 (the R2 rung): cold 180 → prod 240
   dt: 240.0            # ⇒ the driver re-bootstraps AB2 (is_first_step) at the ramp boundary
 
-# --- run orchestration (consumed by the A6 driver; placeholders — confirm before B2) ---
-mesh: /work/ab0995/a270088/meshes/ng5        # TODO: confirm the staged NG5 mesh path
-partition: dist_64                            # ≥8 nodes (×4 A100-80 GPU); device-count portable
+# --- run orchestration (consumed by the A6 driver; run_ng5.sbatch overrides via CLI flags) ---
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_ng5   # staged C-export mesh (== prepare_mesh.py); has T_ic/S_ic
+partition: dist_64                            # 16 nodes ×4 A100-80 = 64 GPU; device-count portable
 forcing:
   kind: core2                                 # JRA55 + L&Y09 bulk (mesh-agnostic by interp; A5 stages it)
   start_year: 1958

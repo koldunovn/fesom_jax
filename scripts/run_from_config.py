@@ -65,6 +65,10 @@ def main():
     ap.add_argument("--ragged", action="store_true",
                     help="ragged-halo path (no global all_gather) — needed at dars/NG5 scale; "
                          "GPU-only, forward-only (the sharded ragged AD bug doesn't apply here)")
+    ap.add_argument("--diagnostics", action="store_true",
+                    help="after the run, reduce the final State to gather-free scalar health "
+                         "numbers (NaN/Inf scan + magnitude bounds) and print a finite/non-finite "
+                         "verdict — the NG5 cold-spin-up stability gate (Task B2/R0)")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -108,6 +112,17 @@ def main():
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")
+
+    if args.diagnostics:
+        # Gather-free scalar reductions on the FOLDED sharded final State (no restart re-read, no
+        # global gathered to one device) — runs on EVERY process (each global reduction is a
+        # replicated all-reduce ⇒ same scalars everywhere); only the lead prints + emits the token.
+        from fesom_jax.diagnostics import format_diagnostics, state_diagnostics, verdict
+        diags = state_diagnostics(res.state_p)
+        ok, _ = verdict(diags)
+        if _IS_LEAD:
+            print(format_diagnostics(diags, label=f"step{res.step}"))
+            print("NG5_R0_FINITE" if ok else "NG5_R0_NONFINITE")
 
 
 if __name__ == "__main__":
