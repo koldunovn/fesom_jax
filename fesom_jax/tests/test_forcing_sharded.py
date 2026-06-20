@@ -109,7 +109,24 @@ def core2_forced_seq():
     f = np.asarray(stack.Tair)
     assert not np.allclose(f[0], f[1]) and not np.allclose(f[1], f[2]), \
         "forcing must vary per step for a meaningful per-step gate"
-    return dict(mesh=mesh, state=state, op=op, stack=stack, fs=cf.static, n=len(dates))
+    return dict(mesh=mesh, state=state, op=op, stack=stack, fs=cf.static, n=len(dates),
+                cf=cf, dates=dates)
+
+
+@have_forcing
+def test_host_forcing_stack_equals_device(core2_forced_seq):
+    """``stack(xp=np)`` HOST-builds the per-step forcing (the NG5 forcing-OOM fix: a global
+    ``[n_steps, nod2D]`` stack is ~2.65 GB/field at 7.4 M × 48 steps, OOMs GPU 0 before sharding)
+    and is **value-identical** to the default device ``stack(xp=jnp)``; the host path returns plain
+    numpy so the stack — and the intermediate list of per-date forcings — is never staged on a
+    device. Guards the bit-identity of the default path AND that ``xp=np`` is a pure host build."""
+    fx = core2_forced_seq
+    host = fx["cf"].stack(fx["dates"], xp=np)
+    dev = fx["stack"]                                  # xp=jnp default (device)
+    for fld in host._fields:
+        h = getattr(host, fld)
+        assert isinstance(h, np.ndarray), f"{fld} is not host numpy under xp=np"
+        np.testing.assert_array_equal(h, np.asarray(getattr(dev, fld)))
 
 
 def _dense_forced(fx, stack=None):

@@ -181,7 +181,10 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             lo = ch.start - start_step
             seq = jax.tree.map(lambda x, lo=lo: x[lo: lo + ch.count], forcing_stack)
         else:
-            seq = forcing.stack(_chunk_dates(year, ch.dt, ch.start, ch.count))
+            # HOST-build the per-chunk forcing (xp=np): a global [n_steps, nod2D] stack is
+            # ~2.65 GB/field at NG5 (7.4 M × 48 steps) — building it on GPU 0 OOMs before
+            # partition_step_forcing can shard it (the forcing analog of the host-IC fix).
+            seq = forcing.stack(_chunk_dates(year, ch.dt, ch.start, ch.count), xp=np)
         seq_p = shard_mesh.partition_step_forcing(seq, part)
         state_p = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,

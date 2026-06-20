@@ -200,25 +200,37 @@ class CoreForcing:
     chl_clim: "object"              # np.ndarray [12, nod2D]
     static: ForcingStatic
 
-    def step_forcing(self, year: int, day: int, sec: float, month: int) -> StepForcing:
+    def step_forcing(self, year: int, day: int, sec: float, month: int,
+                     *, xp=jnp) -> StepForcing:
         """Per-step :class:`StepForcing` for a model date (1-based ``day`` of year,
         ``sec`` of day, 1-based ``month``). Runs the host JRA reader + selects the
-        month's SSS target + chl."""
+        month's SSS target + chl.
+
+        ``xp`` selects the array backend (mirrors :meth:`State.zeros`): the default ``jnp``
+        is byte-identical to before (device arrays); ``xp=np`` builds the StepForcing on the
+        HOST. The readers already return host numpy, so ``xp=np`` is a pure host op — used by
+        the run driver so a big-mesh per-chunk stack is never staged on GPU 0 (the NG5 forcing
+        OOM: a global ``[n_steps, nod2D]`` stack is ~2.65 GB/field at 7.4 M × 48 steps)."""
         f = self.jra.step(int(year), int(day), float(sec))
         return StepForcing(
-            u_air=jnp.asarray(f.u_wind), v_air=jnp.asarray(f.v_wind),
-            shum=jnp.asarray(f.shum), shortwave=jnp.asarray(f.shortwave),
-            longwave=jnp.asarray(f.longwave), Tair=jnp.asarray(f.Tair),
-            prec_rain=jnp.asarray(f.prec_rain), prec_snow=jnp.asarray(f.prec_snow),
-            Ssurf_month=jnp.asarray(self.sss.month(int(month))),
-            chl=jnp.asarray(self.chl_clim[int(month) - 1]))
+            u_air=xp.asarray(f.u_wind), v_air=xp.asarray(f.v_wind),
+            shum=xp.asarray(f.shum), shortwave=xp.asarray(f.shortwave),
+            longwave=xp.asarray(f.longwave), Tair=xp.asarray(f.Tair),
+            prec_rain=xp.asarray(f.prec_rain), prec_snow=xp.asarray(f.prec_snow),
+            Ssurf_month=xp.asarray(self.sss.month(int(month))),
+            chl=xp.asarray(self.chl_clim[int(month) - 1]))
 
-    def stack(self, dates) -> StepForcing:
+    def stack(self, dates, *, xp=jnp) -> StepForcing:
         """Stack per-step forcings for an iterable of ``(year, day, sec, month)`` into a
         single :class:`StepForcing` with leading axis ``[n_steps]`` (for :func:`lax.scan`
-        / :func:`fesom_jax.integrate.integrate`)."""
-        steps = [self.step_forcing(*d) for d in dates]
-        return StepForcing(*[jnp.stack(leaves, axis=0)
+        / :func:`fesom_jax.integrate.integrate`).
+
+        ``xp=np`` builds the whole stack on the HOST (the NG5 forcing-OOM fix — the driver
+        passes ``xp=np`` so the ``[n_steps, nod2D]`` per-chunk forcing AND the intermediate
+        list of ``n_steps`` per-date forcings are never materialized on GPU 0 before
+        :func:`shard_mesh.partition_step_forcing` shards them). Default ``jnp`` = unchanged."""
+        steps = [self.step_forcing(*d, xp=xp) for d in dates]
+        return StepForcing(*[xp.stack(leaves, axis=0)
                              for leaves in zip(*steps)])
 
 
