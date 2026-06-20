@@ -1,8 +1,8 @@
 #!/bin/bash
-# B0 de-risk (dars, 3.16 M nodes) — SEGMENT 0: cold forced run on dist_8 (2 nodes x4 A100 = 8 GPU,
+# B0 de-risk (dars, 3.16 M nodes) — SEGMENT 0: cold forced run on dist_16 (4 nodes x4 A100 = 16 GPU,
 # MULTI-NODE jax.distributed), write a portable restart. Segment 1 (run_b0_dars_seg1.sbatch) then
-# RESUMES it on dist_16 (4 nodes = 16 GPU) — the device-count-change restart at multi-node scale,
-# the first multi-node test of run.py / run_from_config.py.
+# RESUMES it on dist_32 (8 nodes = 32 GPU) — the device-count-CHANGE restart at multi-node scale
+# (save on 16 devices, resume on 32), the headline A1 feature exercised across nodes.
 #
 #SBATCH --job-name=b0_dars_s0
 #SBATCH -A ab0995_gpu

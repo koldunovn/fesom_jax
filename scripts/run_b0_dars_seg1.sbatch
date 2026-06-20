@@ -1,12 +1,14 @@
 #!/bin/bash
-# B0 de-risk (dars, 3.16 M nodes) — SEGMENT 1: RESUME seg0's restart on dist_16 (4 nodes x4 A100 =
-# 16 GPU) — a DIFFERENT device count than seg0's dist_8 (8 GPU). This is the headline A1 feature at
-# multi-node scale: save on 8 devices, resume on 16. Submit with --dependency=afterok on seg0.
+# B0 de-risk (dars, 3.16 M nodes) — SEGMENT 1: RESUME seg0's restart on dist_32 (8 nodes x4 A100 =
+# 32 GPU) — a DIFFERENT device count than seg0's dist_16 (16 GPU). This is the headline A1 feature at
+# multi-node scale: save on 16 devices, resume on 32. The restart store is partition-independent
+# (read_restart reconstructs each field to the global by gid, then reshards onto dist_32), so this
+# exercises a fresh new_part with no code change. Submit with --dependency=afterok on seg0.
 #
 #SBATCH --job-name=b0_dars_s1
 #SBATCH -A ab0995_gpu
 #SBATCH -p gpu
-#SBATCH --nodes=4
+#SBATCH --nodes=8
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
@@ -26,14 +28,14 @@ MESH=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars
 OUT=/work/ab0995/a270088/port_jax/runs/dars_b0
 
-echo "=== $(date) dars B0 seg1: nodes=$SLURM_JOB_NODELIST  dist_16 (16 GPU) RESUME seg0 (dist_16) +8 steps ==="
+echo "=== $(date) dars B0 seg1: nodes=$SLURM_JOB_NODELIST  dist_32 (32 GPU) RESUME seg0 (dist_16) +8 steps ==="
 srun --cpu-bind=none "$PY" scripts/run_from_config.py configs/dars.yaml \
-    --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition dist_16 \
+    --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition dist_32 \
     --steps 8 --chunk-steps 8 --ragged --restart-in "$OUT/seg0" --restart-out "$OUT/seg1"
 R=$?
 echo "seg1 exit=$R"
 if [ $R -eq 0 ]; then
-  echo "MACHINERY_SCALE_DARS_OK (dars forced run + multi-node forced run + restart at dist_16)"
+  echo "RESTART_DEVCOUNT_OK (dars restart saved dist_16 -> resumed dist_32, multi-node device-count CHANGE)"
 else
-  echo "B0_DARS_FAILED (seg1 exit=$R)"
+  echo "B0_DARS_DEVCOUNT_FAILED (seg1 exit=$R)"
 fi
