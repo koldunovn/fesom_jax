@@ -19,6 +19,7 @@ Layout (matches ushow's unstructured test fixture):
 """
 from __future__ import annotations
 
+import jax
 import numpy as np
 
 NODE_DIM = "nod2"      # in ushow's NODE_NAMES
@@ -63,3 +64,90 @@ def node_lonlat(mesh):
     """Node ``(lon, lat)`` in **degrees** from a mesh (``geo_coord_nod2D`` is radians)."""
     geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64) / np.pi * 180.0
     return geo[:, 0], geo[:, 1]
+
+
+# A sentinel coord for non-owned (halo + pad) lanes: deep Antarctic interior (no ocean), so a
+# masked-out point there is never the nearest-neighbour of any real ocean target (ushow regrids
+# by NN within an influence radius). Paired with FILL so ushow masks the value too — FILL is set
+# ABOVE ushow's INVALID_DATA_THRESHOLD (1e37) so it's excluded from BOTH the display AND the
+# colour-range scan (1e20 = ushow's DEFAULT_FILL_VALUE is only masked in display, not the range).
+_SENT_LON, _SENT_LAT, FILL = 0.0, -89.99, 1e38
+
+
+def write_ushow_sharded(out_dir, fields, sm, part, mesh, *, attrs=None):
+    """Write an ushow-readable zarr **directly from a sharded run, gather-free** (Task B2 output).
+
+    ``fields``: ``{name: folded [P*Lmax_nod, …] array}`` — node diagnostic fields (e.g. ``sst``,
+    ``speed``, or 3-D ``temp``), each a device-sharded ``jax.Array`` (production) or host numpy
+    (test). Reuses the restart's per-shard write: rank 0 creates the metadata + the single
+    ``lon``/``lat`` coordinate arrays (folded ``[P*Lmax_nod]``), then every process writes ONLY its
+    addressable shards — **no ``all_gather``, no global on one device** (cost ≈ a restart write).
+
+    **Why it's correct for a point-cloud viewer:** every lane carries its own ``lon``/``lat``. The
+    UNIQUE-owner lane of each node writes the real coord + value; **non-owned lanes (halo + pad) are
+    set to the Antarctic sentinel coord + ``FILL`` value**, so ushow's KDTree never lets them win a
+    real ocean target (and masks them anyway). Result: each ocean node appears once, correctly —
+    the same gather-free guarantee as :func:`write_state_zarr`, in viewer layout."""
+    import zarr
+
+    out_dir = str(out_dir)
+    gid, owned = _folded_gid_owned_nod(part, sm)              # [P*Lmax_nod] each
+    PL = gid.shape[0]
+    Lmax = sm.Lmax["nod"]
+    glon, glat = node_lonlat(mesh)                            # [nod2D] degrees
+    safe = np.clip(gid, 0, None)                              # gid=-1 (pad) → index 0; overwritten below
+    lon = np.where(owned, glon[safe], _SENT_LON).astype(np.float64)
+    lat = np.where(owned, glat[safe], _SENT_LAT).astype(np.float64)
+
+    is0 = (jax.process_index() == 0)
+    if is0:
+        root = zarr.open_group(out_dir, mode="w")
+        zlon = root.create_dataset("lon", shape=(PL,), chunks=(Lmax,), dtype="f8", overwrite=True)
+        zlat = root.create_dataset("lat", shape=(PL,), chunks=(Lmax,), dtype="f8", overwrite=True)
+        zlon[:] = lon; zlon.attrs["_ARRAY_DIMENSIONS"] = [NODE_DIM]
+        zlat[:] = lat; zlat.attrs["_ARRAY_DIMENSIONS"] = [NODE_DIM]
+        for name, arr in fields.items():
+            shp = tuple(int(s) for s in arr.shape)
+            nlev = shp[1] if len(shp) > 1 else 0
+            store_shape = (nlev, PL) if nlev else (PL,)
+            store_chunks = (nlev, Lmax) if nlev else (Lmax,)
+            z = root.create_dataset(name, shape=store_shape, chunks=store_chunks,
+                                    dtype="f4", fill_value=FILL, overwrite=True)
+            z.attrs["_ARRAY_DIMENSIONS"] = ([DEPTH_DIM, NODE_DIM] if nlev else [NODE_DIM])
+        root.attrs.update(nod2D=int(sm.nod2D), P=int(sm.P), **(attrs or {}))
+
+    _barrier("ushow_meta")
+    root = zarr.open_group(out_dir, mode="a")
+    for name, arr in fields.items():
+        z = root[name]
+        for lane_slice, data in _addressable_lane_chunks(arr):
+            o = owned[lane_slice]                            # [chunk] bool for these lanes
+            masked = np.where(o.reshape((-1,) + (1,) * (data.ndim - 1)), data, FILL).astype(np.float32)
+            if data.ndim == 1:
+                z[lane_slice] = masked                       # [P*Lmax] node-only field
+            else:
+                z[:, lane_slice] = masked.T                  # [nlev, P*Lmax]: transpose [chunk,nlev]→[nlev,chunk]
+    _barrier("ushow_data")
+    return out_dir
+
+
+def _folded_gid_owned_nod(part, sm):
+    from .zarr_output import _folded_gid_owned
+    return _folded_gid_owned(part, sm, "nod")
+
+
+def _barrier(tag):
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+        multihost_utils.sync_global_devices(tag)
+
+
+def _addressable_lane_chunks(arr):
+    """Yield ``(lane_slice, host_data)`` for each addressable shard of a folded ``[P*Lmax, …]``
+    leaf — a device ``jax.Array`` (its ``addressable_shards``) or a plain host numpy (one chunk)."""
+    if isinstance(arr, jax.Array):
+        for shard in arr.addressable_shards:
+            yield shard.index[0], np.asarray(shard.data)
+    else:
+        a = np.asarray(arr)
+        yield slice(0, a.shape[0]), a
