@@ -4415,3 +4415,33 @@ Cite the C source (`file:line`) or dump probe that proves it.
   old scripts had (ice seed, coastal mask, year rollover) is a candidate gap — the validation ladder that ran through the
   OLD path won't catch it. And "rebuild" is often the wrong verb: separate the mesh/grid-invariant setup (build once) from
   the per-period data (swap cheaply) — here it turned a per-year full rebuild into a file-handle swap.**
+
+- **[model-paper / dt-ramp calendar / a mid-run dt change breaks a single-dt step→date map] (`RAMP_CALENDAR_OK`,
+  commit 4a434d8) The forcing CALENDAR must track the PIECEWISE model clock when dt changes mid-run.** The user wants
+  the dars 3-yr run to bump dt 180→240 after year 1 ("the model is stable enough by then"). The dt-ramp already existed
+  for COLD-START (small dt for the first ~100 steps, `plan_chunks` splits + re-bootstraps AB2 at `after_step`), but its
+  CALENDAR half was missing: `_chunk_dates` mapped absolute step `n` → `base + n·dt` with a SINGLE dt. That's only exact
+  up to the ramp; past it, using either dt absolutely mis-dates every step (at the year-1 ramp, step 175200+k is read as
+  `base + (175200+k)·240` ≈ 120 days too late and growing) → years 2-3 forcing wrong. Fix: `_elapsed_seconds(n,dt0,ramp)`
+  = `n·dt0` up to `after_step`, then `R·dt0 + (n-R)·dt1` (the real model clock), with `_step_at_elapsed` its inverse;
+  `_chunk_dates` AND `_year_boundaries` take the base dt + ramp and use them (the 1959 boundary stays at the dt0 step
+  175200, but 1960 moves to the dt1 step 306600 — the year-split must follow the ramp or the forcing reopens at the wrong
+  step). The callers pass `cfg.dt`+`cfg.dt_ramp` for the calendar while STEPPING still uses `ch.dt` (the two are
+  independent: `plan_chunks` already gives the right per-chunk dt). `dt_ramp=None` ⇒ `n·dt0` ⇒ **bit-identical** to before
+  (the off-path invariant; all constant-dt runs unchanged). 3 model years with the ramp = 438000 steps (175200@180 +
+  262800@240), not 525600. **Lesson: a "switch dt mid-run" feature is TWO things — the integrator's dt (handled) AND the
+  forcing clock (easy to forget); when an absolute step index indexes a calendar, any non-constant dt breaks it.**
+
+- **[model-paper / w_split / a JAX capability gap that blocks an exact Fortran match] (`WSPLIT_JAX_GAP`) The JAX port
+  cannot do `w_split=true` — it only implements `use_wsplit=0`.** Setting up the dars 3-yr JAX-vs-Fortran comparison, the
+  user asked to "turn on `w_split` for large meshes." But the JAX/C reference config was `use_wsplit=0`
+  (`fesom_constants.h:56`; `config.py:103 USE_WSPLIT=False`), and the actual vertical-velocity split is an un-ported
+  "Phase-5/CORE2 item" — `compute_wvel_split` (`ale.py:405`) early-returns `w_e=w, w_i=0` for `use_wsplit=0`, and the
+  split terms were never added (`ale.py:396-404`). So JAX has NO `w_split=true` path. This directly conflicts with "all
+  settings the same between JAX and Fortran": you can match w_split OR honor the user's `w_split=true`, not both. (Aside:
+  the porting log notes the split *seeded a Fortran day-92 barotropic blow-up*, so OFF was the deliberately-stable
+  reference.) Surfaced for the user to resolve (match at `w_split=.false.`, recommended; or accept it as one known
+  difference). **Lesson: before claiming a "config-matched" cross-model comparison, audit which reference options the port
+  actually IMPLEMENTS — a setting the baseline turns on may simply not exist in the port, and that's a result to report,
+  not paper over.** Documented in `docs/memo/FORTRAN_dars_setup.md` (full JAX→FESOM2 namelist mapping; Fortran STAGED, not
+  launched, pending the user's w_split call + the plan's "confirm Fortran config" gate).
