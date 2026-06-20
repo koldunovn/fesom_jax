@@ -172,7 +172,7 @@ def _validating_ice_config_new(cls, *args, **kwargs):
 IceConfig.__new__ = _validating_ice_config_new
 
 
-def ice_initial_state(mesh: Mesh, sst):
+def ice_initial_state(mesh: Mesh, sst, *, xp=jnp):
     """Cold-start ice IC (``fesom_ice_initial_state``, ``fesom_ice.c:246-277``).
 
     Where (non-cavity ``ulevels_nod2D<=1`` AND IC ``sst < 0``): ``a_ice=0.9``;
@@ -180,8 +180,10 @@ def ice_initial_state(mesh: Mesh, sst):
     m_snow=0.5``. Else open water (all 0). ``u_ice=v_ice=0`` (caller seeds via State).
 
     ``sst`` is the IC surface temperature [°C] (``[nod2D]``, e.g. ``state.T[:, 0]`` from
-    :func:`fesom_jax.phc_ic.core2_initial_state`). Host setup (numpy). Returns
-    ``(a_ice, m_ice, m_snow)`` as float64 ``jnp`` arrays ``[nod2D]``."""
+    :func:`fesom_jax.phc_ic.core2_initial_state`). ``xp`` selects the backend (mirrors
+    :meth:`State.zeros`): default ``jnp`` (device, byte-identical to before); ``xp=np`` keeps
+    the result on the HOST — needed for the big-mesh (dars/NG5) host-build path so the 2-D ice
+    fields are not staged on GPU 0. Returns ``(a_ice, m_ice, m_snow)`` ``[nod2D]`` float64."""
     sst = np.asarray(sst, dtype=np.float64)
     non_cavity = np.asarray(mesh.ulevels_nod2D) <= 1
     lat = np.asarray(mesh.geo_coord_nod2D)[:, 1]      # radians; > 0 ⇒ Northern hemisphere
@@ -190,15 +192,16 @@ def ice_initial_state(mesh: Mesh, sst):
     a_ice = np.where(cold, 0.9, 0.0)
     m_ice = np.where(cold, np.where(nh, 1.0, 2.0), 0.0)
     m_snow = np.where(cold, np.where(nh, 0.1, 0.5), 0.0)
-    return (jnp.asarray(a_ice, jnp.float64),
-            jnp.asarray(m_ice, jnp.float64),
-            jnp.asarray(m_snow, jnp.float64))
+    return (xp.asarray(a_ice, xp.float64),
+            xp.asarray(m_ice, xp.float64),
+            xp.asarray(m_snow, xp.float64))
 
 
-def seed_ice(state: State, mesh: Mesh, sst) -> State:
+def seed_ice(state: State, mesh: Mesh, sst, *, xp=jnp) -> State:
     """Return ``state`` with the cold-start ice IC seeded into ``a_ice``/``m_ice``/
     ``m_snow`` (:func:`ice_initial_state`). ``u_ice``/``v_ice``/``t_skin``/``sigma*`` stay
     at their (zero) values — the C cold-start sets ``u_ice=v_ice=0`` and ``t_skin`` starts
-    0 (the first thermo step's Newton warm-starts from it)."""
-    a_ice, m_ice, m_snow = ice_initial_state(mesh, sst)
+    0 (the first thermo step's Newton warm-starts from it). ``xp=np`` keeps the seeded fields
+    on the HOST (the big-mesh host-build path; the rest of ``state`` must match the backend)."""
+    a_ice, m_ice, m_snow = ice_initial_state(mesh, sst, xp=xp)
     return dataclasses.replace(state, a_ice=a_ice, m_ice=m_ice, m_snow=m_snow)

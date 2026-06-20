@@ -113,8 +113,14 @@ def main():
     import numpy as np
     state0 = None
     if cfg.restart_in is None:
+        from fesom_jax import ice
         from fesom_jax.phc_ic import core2_initial_state
         state0 = core2_initial_state(mesh, args.ic_dir, xp=np); _lap("cold_IC")
+        # Seed the cold-start sea-ice IC (fesom_ice_initial_state: a_ice=0.9 where SST<0, NH/SH
+        # m_ice/m_snow split) — the C/Fortran cold start, and what EVERY other run entry point
+        # does via ice.seed_ice. Omitting it cold-starts the prognostic ice at 0 ⇒ no polar ice
+        # (esp. the summer hemisphere) until it slowly spins up. xp=np keeps the 2-D fields host.
+        state0 = ice.seed_ice(state0, mesh, np.asarray(state0.T[:, 0]), xp=np); _lap("seed_ice")
     sst0 = None if state0 is None else np.asarray(state0.T[:, 0])
     forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0); _lap("forcing_setup")
 

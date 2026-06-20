@@ -95,6 +95,22 @@ def test_ic_structure(core2):
     assert np.all(np.asarray(mesh.ulevels_nod2D)[iced] <= 1)
 
 
+def test_ic_host_build_matches_device(core2):
+    """``ice_initial_state(xp=np)`` is value-identical to the default device build and returns
+    HOST numpy — the big-mesh (dars/NG5) host-build path the model-paper run driver now uses to
+    seed the cold-start ice (so the prognostic ice starts at the C ``a_ice=0.9`` where SST<0, in
+    BOTH hemispheres, not at 0)."""
+    from fesom_jax.ice import ice_initial_state
+    mesh, _state, sst, a, m, ms = core2
+    a_h, m_h, ms_h = ice_initial_state(mesh, sst, xp=np)
+    assert isinstance(a_h, np.ndarray) and isinstance(m_h, np.ndarray)
+    np.testing.assert_array_equal(a_h, np.asarray(a))
+    np.testing.assert_array_equal(m_h, np.asarray(m))
+    np.testing.assert_array_equal(ms_h, np.asarray(ms))
+    lat = np.asarray(mesh.geo_coord_nod2D)[:, 1]
+    assert (a_h > 0).sum() > 1000 and ((a_h > 0) & (lat < 0)).sum() > 0   # ice in BOTH hemispheres
+
+
 def test_ic_consistent_with_phase5_mask(core2):
     """The a_ice component equals the Phase-5 static mask (core2_forcing.ice_ic_aice)."""
     mesh, _state, sst, a, _m, _ms = core2
