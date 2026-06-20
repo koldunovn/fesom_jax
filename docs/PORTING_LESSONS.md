@@ -4303,3 +4303,34 @@ Cite the C source (`file:line`) or dump probe that proves it.
   de-risk them on the cheap mesh (dars) before the flagship (NG5).** Still TODO: the device-count CHANGE
   (dist_16→dist_32) — this run was dist_16→dist_16 (same count); the cross-count restart is the headline A1
   feature at multi-node scale, a quick follow-up now that dars RUNS.
+
+- **Task B0 follow-up — the multi-node device-count CHANGE restart (`RESTART_DEVCOUNT_OK`).** Chained dars seg0
+  (cold, **dist_16**, 16 GPU, writes a portable restart) → seg1 (**dist_32**, 8 nodes = 32 GPU, `--dependency=
+  afterok`) and seg1 resumed cleanly (`npes=32 devices=32`, step 8→16, exit 0). **Zero code change** — the only
+  edit was the sbatch `--nodes`/`--partition`; `read_restart` is partition-INDEPENDENT by construction
+  (reconstruct each field to the dense global by gid, then reshard onto whatever `new_part` is asked for; the
+  on-disk format keys by gid/owned-index, not device count). Its guard checks the *global* mesh counts
+  (nod2D/elem2D/edge2D), never the device count, so a dist_16-written store loads onto dist_32 with the halo
+  lanes re-filled from the complete global ⇒ byte-identical to partitioning the original State on dist_32. **The
+  lesson: a genuinely partition-portable restart needs NO per-target-count code — gid-keyed reconstruct +
+  reshard makes save-N/resume-M just two different `new_part` values; the headline A1 feature cost one sbatch
+  edit once the dars run existed.** This closes the dars B0 device-count story (dist_16↔dist_32 both directions
+  exercisable); the seam stayed bit-exact through the count change too.
+
+- **Task B2 prep — the NG5 stability gate is a gather-free in-job reduction, NOT a restart re-read
+  (`fesom_jax/diagnostics.py` + `run_ng5.sbatch`).** The R0→R3 cold-spin-up ladder gates each rung on
+  "finite / CFL-stable", and the cheapest robust signal is `state_diagnostics(state)`: per-leaf
+  `jnp.sum(~isfinite)` + `jnp.max(jnp.abs(.))` over the FOLDED sharded final State ⇒ only a **scalar all-reduce**
+  crosses the device mesh, never a gathered global field. So R0's verdict (`NG5_R0_FINITE`/`NONFINITE`) runs
+  in the SAME 7.4 M / 64-GPU job (`--diagnostics`), no second allocation, no restart re-read — and the identical
+  function works on a dense single-device State (the unit test) and a multi-process folded one. **Padding/dry
+  lanes are 0 ⇒ finite ⇒ never a false NaN, and 0 never inflates a max**, so the blow-up detectors are mask-free;
+  the masked min-layer-thickness>0 check (zstar stability, needs the layer mask) lives in the OFFLINE
+  `scripts/ng5_ladder_check.py`, which streams a saved restart one global field at a time. **A second lesson
+  from the in-job multichunk test**: splitting a run into fine forcing-chunks (the A4/A6 NG5-memory contract)
+  is NOT bit-identical to one big scan — the chunk-BOUNDARY step is a direct bootstrap-`one()` call instead of a
+  scan iteration, so XLA reassociates it at the **same ~5.7e-8 float64 floor as the restart seam** (the seam's
+  error was always this boundary step, NOT the bit-faithful disk round-trip). Physically meaningless (~3e-10 rel
+  on T), but it sets the right tolerance and means "chunked == continuous" is a climate-close, not bit-exact,
+  invariant. Cheap canary first (96 steps / 2 chunks on the real dist_64 sharding) before the full R0 — a rung
+  failing ⇒ STOP + diagnose (NG5 ≈ 1,500 GPU-h/yr).
