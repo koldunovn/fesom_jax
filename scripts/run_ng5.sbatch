@@ -39,6 +39,7 @@ CHUNK=${CHUNK:-48}          # per-chunk forcing steps (memory knob); 1440/48 = 3
 TAG=${TAG:-r0}
 RIN=${RIN:-}               # restart-in (empty ⇒ cold PHC IC)
 PROGRESS=${PROGRESS:-1}    # 1 ⇒ flushed per-phase/per-chunk timing (diagnose a long run live)
+LOCALF=${LOCALF:-1}        # 1 ⇒ local-node forcing build (~npes× less host work; bit-identical)
 
 MESH=/work/ab0995/a270088/fesom_jax_meshes/mesh_ng5
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/ng5
@@ -51,6 +52,7 @@ else
   EXTRA+=(--restart-in "$RIN")
 fi
 [ "$PROGRESS" = "1" ] && EXTRA+=(--progress)
+[ "$LOCALF" = "1" ] && EXTRA+=(--local-forcing)
 mkdir -p "$OUT"
 
 echo "=== $(date) NG5 $TAG: nodes=$SLURM_JOB_NODELIST  dist_64 (64 GPU)  STEPS=$STEPS CHUNK=$CHUNK RIN=${RIN:-cold} ==="

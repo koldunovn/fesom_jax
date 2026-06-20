@@ -129,6 +129,33 @@ def test_host_forcing_stack_equals_device(core2_forced_seq):
         np.testing.assert_array_equal(h, np.asarray(getattr(dev, fld)))
 
 
+@have_forcing
+def test_local_forcing_equals_global_partition(core2_forced_seq):
+    """``build_local_forcing`` + ``stack_partitioned`` == ``forcing.stack`` +
+    ``partition_step_forcing``, **byte for byte** (the NG5 host-forcing fix: interpolate only the
+    local nodes, scatter into ``[P, n_steps, Lmax]``). With ``local_parts`` = ALL partitions
+    (single process) every shard is filled, so the full array must match the global build — this
+    locks the scatter/lane/pad logic before the multi-node run relies on it. At NG5 the local set
+    is ~1/16 of the nodes; here (one process) it's all of them, which is the strict-equality case."""
+    from fesom_jax import partit, shard_mesh
+    from fesom_jax.forcing_local import build_local_forcing
+    fx = core2_forced_seq
+    mesh, cf = fx["mesh"], fx["cf"]
+    npes = 4
+    part = partit.synth_block_partition(mesh.nod2D, mesh.elem2D, mesh.edge2D, npes)
+    dates = fx["dates"]
+
+    seq_p_global = shard_mesh.partition_step_forcing(cf.stack(dates, xp=np), part)
+    lf = build_local_forcing(mesh, YEAR, part, npes, local_parts=list(range(npes)),
+                             static=cf.static)
+    seq_p_local = lf.stack_partitioned(dates, xp=np)
+
+    for name in seq_p_global._fields:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(seq_p_local, name)), np.asarray(getattr(seq_p_global, name)),
+            err_msg=f"local vs global partitioned forcing differs in {name}")
+
+
 def _dense_forced(fx, stack=None):
     mesh = fx["mesh"]
     return integ.integrate(fx["state"], mesh, fx["op"], jnp.zeros((mesh.elem2D, 2)),

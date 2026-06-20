@@ -72,6 +72,9 @@ def main():
     ap.add_argument("--progress", action="store_true",
                     help="flushed per-setup-phase + per-chunk timing (host build vs device steps) "
                          "so a long multi-node run is diagnosable live (lead process only)")
+    ap.add_argument("--local-forcing", action="store_true",
+                    help="interpolate the per-step forcing for ONLY this process's local-partition "
+                         "nodes (~npes× less host work; bit-identical) — the NG5 host-forcing fix")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -115,14 +118,24 @@ def main():
     sst0 = None if state0 is None else np.asarray(state0.T[:, 0])
     forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0); _lap("forcing_setup")
 
+    # The NG5 host-forcing fix: build a LOCAL-node forcing (interp only this process's owned
+    # partitions, ~npes× less). forcing.static is reused for the (cheap, once) static path.
+    local_forcing = None
+    if args.local_forcing:
+        from fesom_jax.forcing_local import build_local_forcing
+        local_forcing = build_local_forcing(mesh, args.year, part, part.npes,
+                                             static=forcing.static, sst_ic=sst0)
+        _lap("local_forcing_setup")
+
     if _IS_LEAD:
         print(f"[run] mesh={mesh_dir} npes={part.npes} devices={len(jax.devices())} "
-              f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in}",
-              flush=True)
+              f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in} "
+              f"local_forcing={args.local_forcing}", flush=True)
     res = run_from_config(cfg, mesh=mesh, part=part, sm=sm, sop=sop, forcing=forcing,
                           state0=state0, start_step=0, year=args.year,
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
-                          use_ragged=args.ragged, progress=(args.progress and _IS_LEAD))
+                          use_ragged=args.ragged, progress=(args.progress and _IS_LEAD),
+                          local_forcing=local_forcing)
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")

@@ -118,7 +118,8 @@ class RunResult(NamedTuple):
 def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=None,
                     state0=None, forcing_stack=None, start_step=0, year=1958,
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
-                    accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False):
+                    accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
+                    local_forcing=None):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -191,12 +192,19 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if forcing_stack is not None:
             lo = ch.start - start_step
             seq = jax.tree.map(lambda x, lo=lo: x[lo: lo + ch.count], forcing_stack)
+            seq_p = shard_mesh.partition_step_forcing(seq, part)
+        elif local_forcing is not None:
+            # LOCAL forcing build (the NG5 host-forcing fix): interpolate ONLY this process's
+            # local-partition nodes (~npes× less) and scatter into [P, n_steps, Lmax] — bit-
+            # identical to the global build's local shards (the non-local rows are never read).
+            seq_p = local_forcing.stack_partitioned(
+                _chunk_dates(year, ch.dt, ch.start, ch.count), xp=np)
         else:
             # HOST-build the per-chunk forcing (xp=np): a global [n_steps, nod2D] stack is
             # ~2.65 GB/field at NG5 (7.4 M × 48 steps) — building it on GPU 0 OOMs before
             # partition_step_forcing can shard it (the forcing analog of the host-IC fix).
             seq = forcing.stack(_chunk_dates(year, ch.dt, ch.start, ch.count), xp=np)
-        seq_p = shard_mesh.partition_step_forcing(seq, part)
+            seq_p = shard_mesh.partition_step_forcing(seq, part)
         tc_host = time.perf_counter()
         state_p = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
