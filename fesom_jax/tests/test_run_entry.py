@@ -158,6 +158,32 @@ def test_run_boundary_node_is_global_coastal_mask():
 
 
 @have_forcing
+def test_checkpoint_cadence(core2_setup, tmp_path, monkeypatch):
+    """`checkpoint_every` writes a ROLLING intermediate restart each time a chunk crosses a
+    step-boundary (crash-safety / segment hand-off), then the final restart — and NOT a double
+    write on the last chunk. Spy on write_restart to lock the cadence (the resume == continuous
+    correctness is the restart-seam test; this is the new when-to-write logic)."""
+    from fesom_jax import zarr_output
+    fx = core2_setup
+    common = dict(mesh=fx["mesh"], part=fx["part"], sm=fx["sm"], sop=fx["sop"], year=YEAR)
+    calls = []
+    orig = zarr_output.write_restart
+    monkeypatch.setattr(zarr_output, "write_restart",
+                        lambda *a, **kw: (calls.append(int(kw["step"])), orig(*a, **kw))[1])
+    # 4 steps, 1/chunk, checkpoint_every=2 ⇒ checkpoint at step 2 (chunk 4 is last ⇒ no ckpt) + final at 4
+    run_from_config(RunConfig(n_steps=4, kpp=KppConfig(), dt=DT), state0=fx["state"],
+                    forcing=fx["cf"], forcing_stack=fx["stack"], chunk_steps=1,
+                    out_dir=str(tmp_path / "r"), checkpoint_every=2, **common)
+    assert calls == [2, 4], f"checkpoint steps {calls} != [2, 4]"
+    # no checkpoint_every ⇒ only the final restart (unchanged default behavior)
+    calls.clear()
+    run_from_config(RunConfig(n_steps=4, kpp=KppConfig(), dt=DT), state0=fx["state"],
+                    forcing=fx["cf"], forcing_stack=fx["stack"], chunk_steps=1,
+                    out_dir=str(tmp_path / "r2"), **common)
+    assert calls == [4], f"without checkpoint_every, only the final restart; got {calls}"
+
+
+@have_forcing
 def test_inrun_multichunk_equals_singlechunk(core2_setup):
     """In ONE ``run_from_config`` call, splitting into multiple fine forcing-chunks (the A4/A6
     memory contract — NG5 can't pre-stack a whole year) carries the FOLDED state chunk→chunk

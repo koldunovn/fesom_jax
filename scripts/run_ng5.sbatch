@@ -30,7 +30,11 @@ source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
-export XLA_FLAGS="--xla_gpu_enable_command_buffer="
+# CUDA-graph command buffers: disabled by default (the ADJOINT driver OOMed on accumulated graphs,
+# PORTING_LESSONS). A FORWARD run has only 1-2 executables ⇒ safe + may cut kernel-launch overhead.
+# CMDBUF=1 ⇒ leave them ON (XLA default) to MEASURE the speedup.
+CMDBUF=${CMDBUF:-0}
+if [ "$CMDBUF" = "1" ]; then export XLA_FLAGS=""; else export XLA_FLAGS="--xla_gpu_enable_command_buffer="; fi
 export JDIST=1 GPUS_PER_NODE=4
 export PYTHONUNBUFFERED=1   # flush python stdout to the .out file live (a walltime kill won't lose it)
 

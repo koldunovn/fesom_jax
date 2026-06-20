@@ -119,7 +119,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     state0=None, forcing_stack=None, start_step=0, year=1958,
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
                     accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
-                    local_forcing=None):
+                    local_forcing=None, checkpoint_every=None):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -197,6 +197,17 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         print(f"[run.progress] setup done @ {time.perf_counter():.0f}s; {len(chunks)} chunks "
               f"x ~{chunks[0].count if chunks else 0} steps, n_steps={n_steps} npes={npes}",
               flush=True)
+    # restart/checkpoint target + a small writer (used for the rolling checkpoint AND the final
+    # restart). Intermediate checkpoints make a multi-hour run crash-safe (resume from the last
+    # one), give the segment-chaining hand-off, and are a gather-free sharded write (~one restart
+    # cost) so a coarse cadence (checkpoint_every steps) is <<1% overhead.
+    target = out_dir if out_dir is not None else cfg.restart_out
+
+    def _write_restart_at(sp, step, dtv):
+        yr, doy, _, _ = _chunk_dates(year, dtv, step, 1)[0]
+        zarr_output.write_restart(target, sp, sm, part, step=step,
+                                  calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv)
+
     t_loop0 = time.perf_counter()
     for ci, ch in enumerate(chunks):
         tc0 = time.perf_counter()
@@ -233,20 +244,31 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             stats = (zarr_output.OnlineStats.init(leaves) if stats is None
                      else stats).update(leaves)
 
+        # rolling intermediate checkpoint: when this chunk crossed a `checkpoint_every` step
+        # boundary (and it's not the last chunk — the final restart covers that), overwrite the
+        # restart so a crash resumes from here. start_step from the restart metadata.
+        step_now = ch.start + ch.count
+        if (checkpoint_every and target is not None and ci < len(chunks) - 1
+                and step_now // checkpoint_every > ch.start // checkpoint_every):
+            if progress:
+                jax.block_until_ready(state_p)
+            tw = time.perf_counter()
+            _write_restart_at(state_p, step_now, ch.dt)
+            if progress:
+                print(f"[run.progress] checkpoint @ step {step_now} -> {target} "
+                      f"({time.perf_counter() - tw:.1f}s)", flush=True)
+
     end_step = start_step + n_steps
     end_dt = chunks[-1].dt if chunks else cfg.dt
 
-    # --- write the portable restart (state_p is already folded [P*Lmax]) ---
-    target = out_dir if out_dir is not None else cfg.restart_out
+    # --- write the final portable restart (state_p is already folded [P*Lmax]) ---
     if target is not None:
         if progress:
             jax.block_until_ready(state_p)
             print(f"[run.progress] chunk loop done @ {time.perf_counter() - t_loop0:.0f}s; "
                   f"writing restart -> {target}", flush=True)
         tw = time.perf_counter()
-        yr, doy, _, _ = _chunk_dates(year, end_dt, end_step, 1)[0]
-        zarr_output.write_restart(target, state_p, sm, part,
-                                  step=end_step, calendar_date=f"{yr}-doy{doy:03d}", dt_stage=end_dt)
+        _write_restart_at(state_p, end_step, end_dt)
         if progress:
             print(f"[run.progress] restart written in {time.perf_counter() - tw:.1f}s", flush=True)
     return RunResult(state_p=state_p, stats=stats, step=end_step, dt_stage=float(end_dt))

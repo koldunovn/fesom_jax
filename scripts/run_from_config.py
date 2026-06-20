@@ -75,6 +75,9 @@ def main():
     ap.add_argument("--local-forcing", action="store_true",
                     help="interpolate the per-step forcing for ONLY this process's local-partition "
                          "nodes (~npes× less host work; bit-identical) — the NG5 host-forcing fix")
+    ap.add_argument("--checkpoint-every", type=int, default=None,
+                    help="write a rolling intermediate restart every N steps (crash-safety on a "
+                         "multi-hour run + segment-chaining); gather-free, coarse cadence ⇒ <<1%%")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -138,7 +141,7 @@ def main():
                           state0=state0, start_step=0, year=args.year,
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
                           use_ragged=args.ragged, progress=(args.progress and _IS_LEAD),
-                          local_forcing=local_forcing)
+                          local_forcing=local_forcing, checkpoint_every=args.checkpoint_every)
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")
