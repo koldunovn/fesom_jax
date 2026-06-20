@@ -4362,3 +4362,25 @@ Cite the C source (`file:line`) or dump probe that proves it.
   CHEAPEST resource that reproduces it (the host forcing is pure numpy ⇒ a no-GPU compute node), then fix the part
   the data points at — the redundant ×16 global interp, not the setup I'd have guessed.** Separately the data also
   revealed the device floor (2.1 s/step ⇒ ~6,500 GPU-h/NG5-yr, ~4× the plan's line) — a paper-scope input, surfaced.
+
+- **Task B2 — a NEW driver that re-implements setup SILENTLY DRIFTS from the validated path (2 cold-start gaps in
+  `run_from_config`; the user caught one by EYE).** Looking at the NG5 R0 fields the user asked "where is the
+  Southern Ocean ice?" — there was none. Root cause: `run_from_config.py` (the A6 model-paper driver) re-implemented
+  the cold-start setup separately from the older, validated run scripts and dropped TWO steps every other entry
+  point has. **(1) `ice.seed_ice` missing** — it cold-started the prognostic ice at `a_ice=0` instead of the C
+  `fesom_ice_initial_state` (`a_ice=0.9` where SST<0, NH `m_ice=1`/SH `m_ice=2`). So in a 3-day Jan run there was
+  no Antarctic (summer-hemisphere) ice; the Arctic grew from 0. EVERY validated run (`core2_kpp_climate_run`, all
+  `core2_*_stability_run`, `bench_forward_scaling`, all ice tests) does `ice.seed_ice(core2_initial_state(...),
+  mesh, sst)` — so the ladder was sound; only the new driver missed it. **(2) `boundary_node_p` missing** — the
+  sharded mEVP fell back to `boundary_node_mask(LOCAL mesh)`, which marks PARTITION CUTS as coasts (the EVP zeros
+  `u_ice`/`v_ice` at "boundary" nodes, `fesom_ice_evp.c:430-437`) ⇒ artificial ice-velocity walls on interior
+  partition boundaries; the comment (`ice_evp.py:251`) says it MUST be the GLOBAL coastal mask partitioned in
+  (what `bench_forward_scaling` passes). Fix: seed ice on cold start (`xp=np` host build) + pass
+  `boundary_node_p = _shard_along_axis(boundary_node_mask(mesh), …)` when ice is on. Audited the REST of the driver
+  against the references + the `run_steps_sharded_forced` kwargs and it's clean (IC incl `T_old/S_old=10/35` AB2
+  history + zstar-cold thickness, forcing, the 7 physics cfgs, `params=None` = the off calibration slot, `stress=0`
+  the bulk recomputes, AB2 bootstrap). **The lesson: step-level bit-tests miss IC/setup drift because they load
+  state from C dumps (bypassing the cold-start wiring) — so a re-implemented driver needs a DIFF against a known-good
+  end-to-end run, not just green unit tests. And domain-expert eyeballing of the actual fields (the user) catches
+  what the gates don't. TODO: consolidate the cold-start setup into ONE shared helper used by `run_from_config` AND
+  the run scripts, so it can't drift again.**
