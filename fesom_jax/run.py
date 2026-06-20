@@ -176,6 +176,17 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     fs_p = shard_mesh.partition_forcing_static(fstatic, part)
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)
 
+    # mEVP sea-ice boundary condition (the EVP zeros u_ice/v_ice at PHYSICAL-coast nodes,
+    # fesom_ice_evp.c:430-437). MUST be the GLOBAL coastal mask, partitioned in — else the sharded
+    # fallback computes it from each device's LOCAL mesh, wrongly treating PARTITION CUTS as coasts
+    # (artificial walls between partitions). Only ice runs need it. Mirrors bench_forward_scaling.
+    boundary_node_p = None
+    if cfg.ice is not None:
+        from . import ice_evp
+        bn = np.asarray(ice_evp.boundary_node_mask(mesh))   # GLOBAL [nod2D] bool (device→host, ~MB)
+        boundary_node_p = shard_mesh._shard_along_axis(
+            bn, part.myList_nod2D, sm.Lmax["nod"], 0, False)
+
     # --- chunk loop -------------------------------------------------------
     # `progress` (diagnostic, default off ⇒ no behavior change): flushed per-chunk timing split
     # into HOST forcing build (stack+partition) vs DEVICE steps (block_until_ready forces a sync so
@@ -209,7 +220,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         state_p = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
-            use_ragged=use_ragged, **cfg.physics_kwargs())
+            use_ragged=use_ragged, boundary_node_p=boundary_node_p, **cfg.physics_kwargs())
         folded_in = True                                     # the scan output is folded [P*Lmax]
         if progress:
             jax.block_until_ready(state_p)

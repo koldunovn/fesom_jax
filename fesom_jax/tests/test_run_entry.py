@@ -137,6 +137,26 @@ def test_restart_seam_continuous_equals_chained(core2_setup, tmp_path):
     print(f"RUN_DRIVER_OK (restart-seam max|Δ|={worst:.2e})")
 
 
+def test_run_boundary_node_is_global_coastal_mask():
+    """run_from_config seeds the mEVP boundary condition from the GLOBAL coastal mask, partitioned
+    in (`boundary_node_p`), NOT the per-device local-mesh fallback — which would treat PARTITION
+    CUTS as coasts and zero ice velocity on artificial interior walls. Verify the sharded mask
+    run.py builds reconstructs to `ice_evp.boundary_node_mask(mesh)` exactly (host-only)."""
+    from fesom_jax import ice_evp, partit, shard_mesh
+    from fesom_jax.zarr_output import _folded_gid_owned
+    mesh = load_mesh(CORE2_MESH)
+    part = partit.synth_block_partition(mesh.nod2D, mesh.elem2D, mesh.edge2D, 4)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    bn = np.asarray(ice_evp.boundary_node_mask(mesh)).astype(bool)         # GLOBAL [nod2D]
+    bn_p = shard_mesh._shard_along_axis(bn, part.myList_nod2D, sm.Lmax["nod"], 0, False)
+    gid, owned = _folded_gid_owned(part, sm, "nod")                        # [P*Lmax]
+    flat = np.asarray(bn_p).reshape(-1).astype(bool)
+    recon = np.zeros(int(mesh.nod2D), bool)
+    recon[gid[owned]] = flat[owned]
+    np.testing.assert_array_equal(recon, bn)                               # exact global mask
+    assert bn.sum() > 100                                                  # the BC is meaningful
+
+
 @have_forcing
 def test_inrun_multichunk_equals_singlechunk(core2_setup):
     """In ONE ``run_from_config`` call, splitting into multiple fine forcing-chunks (the A4/A6
