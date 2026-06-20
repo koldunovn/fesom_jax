@@ -4334,3 +4334,31 @@ Cite the C source (`file:line`) or dump probe that proves it.
   on T), but it sets the right tolerance and means "chunked == continuous" is a climate-close, not bit-exact,
   invariant. Cheap canary first (96 steps / 2 chunks on the real dist_64 sharding) before the full R0 — a rung
   failing ⇒ STOP + diagnose (NG5 ≈ 1,500 GPU-h/yr).
+
+- **Task B2 — the NG5 forcing perf journey: MEASURE, don't guess (OOM fix → instrument → profile → local build,
+  `RESTART`-grade discipline).** Three NG5-only failures the smaller meshes hid, each caught + fixed by data, not
+  hypothesis. **(a) Forcing GPU-0 OOM.** The first R0 canary OOM'd in `jit_stack`: `CoreForcing.stack` built the
+  per-chunk forcing `[n_steps, nod2D]` on GPU 0 (`jnp`) — ~2.65 GB/field at 7.4 M × 48 steps, plus the intermediate
+  list of 48 per-date forcings co-resident — before `partition_step_forcing` could shard it. dars (chunk=8, 3.16 M)
+  hid it. Fix = the **host-build pattern** (`step_forcing`/`stack` gain `xp=jnp` default vs `xp=np`; the driver uses
+  `np`), the forcing analog of the host-IC fix; everything downstream was already host-then-sharded. **(b) The
+  buffered-log blindness.** R0 then TIMED OUT at 90 min with a log showing ONLY the header — a walltime SIGKILL
+  loses Python's block-buffered stdout ⇒ zero diagnostics. **You cannot diagnose what you cannot see**: fix =
+  `PYTHONUNBUFFERED=1` + `flush=True` on every progress line, then ADD instrumentation (`run_from_config(...,
+  progress=)`: per-setup-phase laps + per-chunk `host=`/`device=` split via a `block_until_ready`, gated off by
+  default ⇒ suite/bit-identity untouched). **(c) The measured bottleneck.** With flushing: setup 3.5 min (cheap,
+  NOT the suspect), steady per 48-step chunk **host 110 s + device 102 s, serial** ⇒ R0 ~112 min (the 90-min
+  timeout). A **CPU compute-node profiler** (`scripts/prof_ng5_forcing.py`, pure numpy ⇒ no GPUs) split the host:
+  **84 % is `cf.stack` = the JRA interp at 4 s/step over all 7.4 M nodes, run REDUNDANTLY on every one of the 16
+  nodes** (each owns ~472 k). **The fix (`fesom_jax/forcing_local.py`):** interpolate ONLY this process's local-
+  partition nodes (a fresh reader on a `_SubMesh` of those nodes — independent state, dodging the JRA `_Field`
+  mutable-coef trap) and scatter into `[P,n_steps,Lmax]` with only the local rows filled. **Bit-identical because**
+  `_to_global_sharded`'s `make_array_from_callback` reads ONLY the local shards' slices of the host array — the
+  non-local rows are never touched (so they can be anything; the local pad lanes must still be `_default_pad`=1.0 to
+  byte-match `partition_step_forcing`). Validated: a CPU test (`build_local_forcing` == `stack`+`partition_step_
+  forcing` byte-for-byte) AND a multi-node 96-step run whose diagnostics were **identical to every digit** of the
+  global-forcing probe (`max|uv|=1.575`, `T[-2.076,30.06]`, `a_ice_max=0.1258`) — host **110 s → 14 s (~8×)**, NG5
+  now device-bound. **The meta-lesson: at a new scale, instrument first (flushed, gated), measure the split on the
+  CHEAPEST resource that reproduces it (the host forcing is pure numpy ⇒ a no-GPU compute node), then fix the part
+  the data points at — the redundant ×16 global interp, not the setup I'd have guessed.** Separately the data also
+  revealed the device floor (2.1 s/step ⇒ ~6,500 GPU-h/NG5-yr, ~4× the plan's line) — a paper-scope input, surfaced.
