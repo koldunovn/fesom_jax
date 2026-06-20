@@ -457,3 +457,33 @@ def core2_initial_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR,
     S_old = xp.where(mask, base_S, 0.0)
     st = State.rest(mesh, T0=base_T, S0=base_S, xp=xp)     # hnode/helem from zbar_3d_n
     return dataclasses.replace(st, T=T, S=S, T_old=T_old, S_old=S_old)
+
+
+def cold_start_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR, base_T: float = 10.0,
+                     base_S: float = 35.0, *, xp=None, seed_sea_ice: bool = True):
+    """THE canonical cold-start :class:`~fesom_jax.state.State` — **use this for any cold start.**
+
+    Composes the two steps every run needs, which must NOT be re-implemented piecemeal:
+      1. :func:`core2_initial_state` — the PHC IC (``T``/``S`` + the AB2 ``T_old``/``S_old`` base +
+         the rest layer thickness).
+      2. :func:`fesom_jax.ice.seed_ice` — the sea-ice IC (``fesom_ice_initial_state``,
+         ``fesom_ice.c:246-277``: ``a_ice=0.9`` where SST<0; NH ``m_ice=1``/``m_snow=0.1``, SH
+         ``m_ice=2``/``m_snow=0.5``).
+
+    Every validated entry point does ``ice.seed_ice(core2_initial_state(...), mesh, sst)``; the
+    model-paper ``run_from_config`` driver originally re-typed step 1 only and DROPPED step 2,
+    cold-starting the prognostic ice at 0 (no polar ice until it spins up over months). Routing
+    callers through this one helper makes that drift impossible. ``xp`` selects the backend
+    (``np`` ⇒ the big-mesh HOST build, mirrors :func:`core2_initial_state`). ``seed_sea_ice=False``
+    returns the bare PHC IC (ice State at 0) for the rare ocean-only case that wants no ice IC.
+
+    (Note: ``scripts/bench_forward_scaling.py`` keeps its own ``phc_state`` — a host build with a
+    live-PHC-interp FALLBACK when no cached ``T_ic.npy`` exists — which this helper does not cover.)"""
+    import jax.numpy as jnp
+    if xp is None:
+        xp = jnp
+    state = core2_initial_state(mesh, ic_dir, base_T=base_T, base_S=base_S, xp=xp)
+    if seed_sea_ice:
+        from . import ice
+        state = ice.seed_ice(state, mesh, state.T[:, 0], xp=xp)
+    return state

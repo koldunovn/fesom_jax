@@ -43,7 +43,7 @@ from fesom_jax.ice import IceConfig
 from fesom_jax.kpp import KppConfig
 from fesom_jax.tke import TkeConfig
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import cold_start_state, core2_initial_state
 
 ROOT = Path(__file__).resolve().parents[1]
 MESH_DIR = ROOT / "data" / "mesh_core2"
@@ -253,7 +253,7 @@ def main():
         loaded = True
         print(f"[load-state] RESTART from {args.load_state} (is_first_step=False throughout)", flush=True)
     else:
-        state = ice.seed_ice(core2_initial_state(mesh, ic_dir), mesh, sst0)
+        state = cold_start_state(mesh, ic_dir)             # PHC IC + seeded sea-ice IC (canonical)
         loaded = False
     run_params = build_run_params(args.ck, args.nn_pkl)
     if run_params is not None:

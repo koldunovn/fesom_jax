@@ -28,7 +28,7 @@ from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import cold_start_state
 from fesom_jax.tke import TkeConfig
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -45,8 +45,8 @@ def main():
     print(f"[setup] backend={jax.default_backend()} devices={jax.devices()}", flush=True)
 
     mesh = load_mesh(MESH_DIR)
-    sst = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])
-    state = ice.seed_ice(core2_initial_state(mesh, IC_DIR), mesh, sst)
+    state = cold_start_state(mesh, IC_DIR)                 # PHC IC + seeded sea-ice IC (canonical)
+    sst = np.asarray(state.T[:, 0])
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst)
     dates = core2_forcing.dates_for_steps(args.year, DT, args.steps)

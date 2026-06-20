@@ -111,6 +111,28 @@ def test_ic_host_build_matches_device(core2):
     assert (a_h > 0).sum() > 1000 and ((a_h > 0) & (lat < 0)).sum() > 0   # ice in BOTH hemispheres
 
 
+def test_cold_start_state_equals_manual_seed(core2):
+    """``cold_start_state`` == ``ice.seed_ice(core2_initial_state(...))`` **byte-for-byte** — the ONE
+    canonical cold-start builder that ``run_from_config`` + the run scripts now share, so the IC +
+    ice-seed sequence can't drift (the bug that left run_from_config's prognostic ice at 0).
+    ``seed_sea_ice=False`` returns the bare PHC IC (ice State at 0)."""
+    import dataclasses
+
+    from fesom_jax import ice
+    from fesom_jax.phc_ic import cold_start_state
+    mesh = core2[0]
+    base = core2_initial_state(mesh, IC_DIR)
+    manual = ice.seed_ice(base, mesh, base.T[:, 0])          # the pattern every run script uses
+    helper = cold_start_state(mesh, IC_DIR)
+    for f in dataclasses.fields(type(helper)):
+        np.testing.assert_array_equal(
+            np.asarray(getattr(helper, f.name)), np.asarray(getattr(manual, f.name)),
+            err_msg=f"cold_start_state differs from the manual seed in {f.name}")
+    assert (np.asarray(helper.a_ice) > 0).sum() > 1000      # the helper DID seed ice
+    bare = cold_start_state(mesh, IC_DIR, seed_sea_ice=False)
+    assert np.all(np.asarray(bare.a_ice) == 0.0)            # opt-out ⇒ bare PHC IC, ice at 0
+
+
 def test_ic_consistent_with_phase5_mask(core2):
     """The a_ice component equals the Phase-5 static mask (core2_forcing.ice_ic_aice)."""
     mesh, _state, sst, a, _m, _ms = core2
