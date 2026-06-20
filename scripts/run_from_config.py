@@ -69,6 +69,9 @@ def main():
                     help="after the run, reduce the final State to gather-free scalar health "
                          "numbers (NaN/Inf scan + magnitude bounds) and print a finite/non-finite "
                          "verdict — the NG5 cold-spin-up stability gate (Task B2/R0)")
+    ap.add_argument("--progress", action="store_true",
+                    help="flushed per-setup-phase + per-chunk timing (host build vs device steps) "
+                         "so a long multi-node run is diagnosable live (lead process only)")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -85,11 +88,21 @@ def main():
     if repl:
         cfg = dataclasses.replace(cfg, **repl)
 
+    # Flushed setup-phase timing (only the lead, only with --progress): the NG5 setup (16-node
+    # 7.4 M mesh load, dist_64 partition, sharded-mesh build, host IC) is a candidate slow phase;
+    # measure each so a re-run isn't a guess. Python block-buffers stdout to a file ⇒ flush=True.
+    import time as _time
+    _t0 = _time.perf_counter()
+
+    def _lap(label):
+        if args.progress and _IS_LEAD:
+            print(f"[run.setup] {label}: +{_time.perf_counter() - _t0:.1f}s", flush=True)
+
     mesh_dir = args.mesh_dir or cfg.mesh
-    mesh = load_mesh(mesh_dir)
-    part = _build_partition(mesh, cfg.partition, args.dist_dir or mesh_dir)
-    sm = shard_mesh.build_sharded_mesh(mesh, part)
-    sop = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=cfg.dt), part)
+    mesh = load_mesh(mesh_dir); _lap("load_mesh")
+    part = _build_partition(mesh, cfg.partition, args.dist_dir or mesh_dir); _lap("partition")
+    sm = shard_mesh.build_sharded_mesh(mesh, part); _lap("sharded_mesh")
+    sop = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=cfg.dt), part); _lap("ssh_op")
 
     # cold IC vs restart: run_from_config reads cfg.restart_in itself; only build the cold IC here.
     # HOST-build (xp=np) so the global State is never materialized on GPU 0 (the dars/NG5 setup-OOM
@@ -98,17 +111,18 @@ def main():
     state0 = None
     if cfg.restart_in is None:
         from fesom_jax.phc_ic import core2_initial_state
-        state0 = core2_initial_state(mesh, args.ic_dir, xp=np)
+        state0 = core2_initial_state(mesh, args.ic_dir, xp=np); _lap("cold_IC")
     sst0 = None if state0 is None else np.asarray(state0.T[:, 0])
-    forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0)
+    forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0); _lap("forcing_setup")
 
     if _IS_LEAD:
         print(f"[run] mesh={mesh_dir} npes={part.npes} devices={len(jax.devices())} "
-              f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in}")
+              f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in}",
+              flush=True)
     res = run_from_config(cfg, mesh=mesh, part=part, sm=sm, sop=sop, forcing=forcing,
                           state0=state0, start_step=0, year=args.year,
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
-                          use_ragged=args.ragged)
+                          use_ragged=args.ragged, progress=(args.progress and _IS_LEAD))
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")

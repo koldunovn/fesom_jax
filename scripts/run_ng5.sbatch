@@ -32,11 +32,13 @@ cd /home/a/a270088/port_jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export XLA_FLAGS="--xla_gpu_enable_command_buffer="
 export JDIST=1 GPUS_PER_NODE=4
+export PYTHONUNBUFFERED=1   # flush python stdout to the .out file live (a walltime kill won't lose it)
 
 STEPS=${STEPS:-1440}        # 3 days at dt=180 (= R0); probe with STEPS=60
 CHUNK=${CHUNK:-48}          # per-chunk forcing steps (memory knob); 1440/48 = 30 chunks exactly
 TAG=${TAG:-r0}
 RIN=${RIN:-}               # restart-in (empty ⇒ cold PHC IC)
+PROGRESS=${PROGRESS:-1}    # 1 ⇒ flushed per-phase/per-chunk timing (diagnose a long run live)
 
 MESH=/work/ab0995/a270088/fesom_jax_meshes/mesh_ng5
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/ng5
@@ -48,6 +50,7 @@ if [ -z "$RIN" ]; then
 else
   EXTRA+=(--restart-in "$RIN")
 fi
+[ "$PROGRESS" = "1" ] && EXTRA+=(--progress)
 mkdir -p "$OUT"
 
 echo "=== $(date) NG5 $TAG: nodes=$SLURM_JOB_NODELIST  dist_64 (64 GPU)  STEPS=$STEPS CHUNK=$CHUNK RIN=${RIN:-cold} ==="

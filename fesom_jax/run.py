@@ -27,6 +27,7 @@ noted, not yet wired (de-risk on the smaller meshes first per the run plan).
 from __future__ import annotations
 
 import datetime
+import time
 from typing import NamedTuple
 
 import jax
@@ -117,7 +118,7 @@ class RunResult(NamedTuple):
 def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=None,
                     state0=None, forcing_stack=None, start_step=0, year=1958,
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
-                    accumulate_stats=False, stats_fields=("T", "S", "uv")):
+                    accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -175,8 +176,18 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)
 
     # --- chunk loop -------------------------------------------------------
+    # `progress` (diagnostic, default off ⇒ no behavior change): flushed per-chunk timing split
+    # into HOST forcing build (stack+partition) vs DEVICE steps (block_until_ready forces a sync so
+    # the device time is real — it removes the natural host/device overlap, so this is for measuring
+    # WHERE the wall-clock goes, not a production fast-path). Lets a long NG5 run be diagnosed live.
     stats = None
-    for ch in chunks:
+    if progress:
+        print(f"[run.progress] setup done @ {time.perf_counter():.0f}s; {len(chunks)} chunks "
+              f"x ~{chunks[0].count if chunks else 0} steps, n_steps={n_steps} npes={npes}",
+              flush=True)
+    t_loop0 = time.perf_counter()
+    for ci, ch in enumerate(chunks):
+        tc0 = time.perf_counter()
         if forcing_stack is not None:
             lo = ch.start - start_step
             seq = jax.tree.map(lambda x, lo=lo: x[lo: lo + ch.count], forcing_stack)
@@ -186,11 +197,18 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             # partition_step_forcing can shard it (the forcing analog of the host-IC fix).
             seq = forcing.stack(_chunk_dates(year, ch.dt, ch.start, ch.count), xp=np)
         seq_p = shard_mesh.partition_step_forcing(seq, part)
+        tc_host = time.perf_counter()
         state_p = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
             use_ragged=use_ragged, **cfg.physics_kwargs())
         folded_in = True                                     # the scan output is folded [P*Lmax]
+        if progress:
+            jax.block_until_ready(state_p)
+            now = time.perf_counter()
+            print(f"[run.progress] chunk {ci + 1}/{len(chunks)} step{ch.start}->{ch.start+ch.count} "
+                  f"host={tc_host - tc0:.1f}s device={now - tc_host:.1f}s "
+                  f"(loop elapsed {now - t_loop0:.0f}s)", flush=True)
         if accumulate_stats:
             leaves = {k: getattr(state_p, k) for k in stats_fields}   # already folded [P*Lmax]
             stats = (zarr_output.OnlineStats.init(leaves) if stats is None
@@ -202,7 +220,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # --- write the portable restart (state_p is already folded [P*Lmax]) ---
     target = out_dir if out_dir is not None else cfg.restart_out
     if target is not None:
+        if progress:
+            jax.block_until_ready(state_p)
+            print(f"[run.progress] chunk loop done @ {time.perf_counter() - t_loop0:.0f}s; "
+                  f"writing restart -> {target}", flush=True)
+        tw = time.perf_counter()
         yr, doy, _, _ = _chunk_dates(year, end_dt, end_step, 1)[0]
         zarr_output.write_restart(target, state_p, sm, part,
                                   step=end_step, calendar_date=f"{yr}-doy{doy:03d}", dt_stage=end_dt)
+        if progress:
+            print(f"[run.progress] restart written in {time.perf_counter() - tw:.1f}s", flush=True)
     return RunResult(state_p=state_p, stats=stats, step=end_step, dt_stage=float(end_dt))
