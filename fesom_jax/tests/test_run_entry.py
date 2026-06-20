@@ -20,7 +20,8 @@ import pytest
 
 from fesom_jax import core2_forcing, partit, shard_mesh, ssh
 from fesom_jax.mesh import load_mesh
-from fesom_jax.run import Chunk, _year_boundaries, parse_duration, plan_chunks, run_from_config
+from fesom_jax.run import (Chunk, _chunk_dates, _elapsed_seconds, _step_at_elapsed,
+                           _year_boundaries, parse_duration, plan_chunks, run_from_config)
 from fesom_jax.run_config import DtRamp, RunConfig
 from fesom_jax.state import State
 from fesom_jax.kpp import KppConfig
@@ -87,6 +88,27 @@ def test_plan_chunks_splits_at_year_boundary():
     assert all(not (c.start < 100 < c.start + c.count) for c in ch)    # none straddles 100
     assert next(c for c in ch if c.start == 100).bootstrap_ab2 is False
     assert ch[0].start == 0 and sum(c.count for c in ch) == 200        # exact, contiguous cover
+
+
+def test_calendar_ramp_aware_dt_change():
+    # dt 180→240 after year 1 (the production dars run): the calendar must stay EXACT across the
+    # mid-run dt change, else years 2-3 forcing is mis-dated (a single n·dt map drifts past the ramp).
+    from fesom_jax.run_config import DtRamp
+    R = 175200                                   # 1 year at dt=180 (365*86400/180)
+    ramp = DtRamp(after_step=R, dt=240.0)
+    # the elapsed clock is piecewise (dt0 up to R, dt1 after); _step_at_elapsed inverts it
+    assert _elapsed_seconds(R, 180.0, ramp) == R * 180.0                 # exactly 1 model year
+    assert _elapsed_seconds(R + 10, 180.0, ramp) == R * 180.0 + 10 * 240.0
+    assert _step_at_elapsed(R * 180.0, 180.0, ramp) == R
+    assert _step_at_elapsed(2 * 365 * 86400, 180.0, ramp) == 306600      # 1960 boundary (post-ramp)
+    assert _step_at_elapsed(3 * 365 * 86400, 180.0, ramp) == 438000      # 3 model years total
+    # the first post-ramp step is 1959-01-01 (NOT mis-dated by an absolute n·240)
+    assert _chunk_dates(1958, 180.0, R, 1, ramp)[0] == (1959, 1, 0.0, 1)
+    # year boundaries WITH the ramp: 1959 at the dt0 step, 1960 at the dt1 step
+    assert _year_boundaries(1958, 180.0, 0, 438000, ramp) == [175200, 306600]
+    # dt_ramp=None ⇒ bit-identical to the plain calendar (the off-path invariant)
+    assert _chunk_dates(1958, 180.0, 200000, 3) == _chunk_dates(1958, 180.0, 200000, 3, None)
+    assert _year_boundaries(1958, 180.0, 0, 525600) == [175200, 350400]
 
 
 # ==========================================================================

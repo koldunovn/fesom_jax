@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 
 import jax
@@ -156,6 +157,11 @@ def main():
         if _IS_LEAD:
             print(format_diagnostics(diags, label=f"step{res.step}"))
             print("NG5_R0_FINITE" if ok else "NG5_R0_NONFINITE")
+        if not ok:
+            # non-finite ⇒ FAIL the process (every rank computes the same replicated verdict) so a
+            # self-chaining runner STOPS the chain instead of propagating NaNs into the next restart.
+            sys.stdout.flush()
+            sys.exit(1)
 
 
 if __name__ == "__main__":

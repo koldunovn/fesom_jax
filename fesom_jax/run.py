@@ -103,36 +103,57 @@ def plan_chunks(n_steps: int, chunk_steps: int, *, start_step: int = 0, dt_ramp=
     return chunks
 
 
-def _chunk_dates(year: int, dt: float, start_step: int, count: int):
+def _elapsed_seconds(n: int, dt0: float, dt_ramp=None) -> float:
+    """Model elapsed time AT absolute step ``n`` = ``n·dt0``, but PIECEWISE if a dt-ramp fires at
+    ``dt_ramp.after_step`` (steps ≥ after_step are taken with ``dt_ramp.dt``). Mirrors the per-step
+    model clock so the forcing CALENDAR stays exact across a mid-run dt change (e.g. 180→240 after
+    year 1) — a single ``n·dt`` map would mis-date every step past the ramp."""
+    if dt_ramp is None or n <= dt_ramp.after_step:
+        return n * float(dt0)
+    R = dt_ramp.after_step
+    return R * float(dt0) + (n - R) * float(dt_ramp.dt)
+
+
+def _step_at_elapsed(T: float, dt0: float, dt_ramp=None) -> int:
+    """Inverse of :func:`_elapsed_seconds`: the smallest absolute step ``n`` with elapsed ≥ ``T``."""
+    if dt_ramp is None or T <= dt_ramp.after_step * float(dt0):
+        return int(math.ceil(T / float(dt0)))
+    R = dt_ramp.after_step
+    return R + int(math.ceil((T - R * float(dt0)) / float(dt_ramp.dt)))
+
+
+def _chunk_dates(year: int, dt: float, start_step: int, count: int, dt_ramp=None):
     """Model ``(year, doy, sec, month)`` tuples for the ``count`` steps starting at absolute
     ``start_step`` — the chunk-local slice of
     :func:`fesom_jax.core2_forcing.dates_for_steps`, computed without materializing the whole
-    multi-year date list (NG5 has ~175 k steps/yr)."""
+    multi-year date list (NG5 has ~175 k steps/yr). ``dt`` is the BASE timestep; ``dt_ramp`` (if
+    set) makes the elapsed-time clock PIECEWISE (:func:`_elapsed_seconds`) so the calendar is exact
+    across a mid-run dt change. ``dt_ramp=None`` ⇒ the plain ``n·dt`` map (bit-identical to before)."""
     base = datetime.datetime(int(year), 1, 1)
     out = []
     for n in range(start_step, start_step + count):
-        d = base + datetime.timedelta(seconds=n * float(dt))
+        d = base + datetime.timedelta(seconds=_elapsed_seconds(n, dt, dt_ramp))
         doy = (d - datetime.datetime(d.year, 1, 1)).days + 1
         out.append((d.year, doy, d.hour * 3600.0 + d.minute * 60.0 + d.second, d.month))
     return out
 
 
-def _year_boundaries(year: int, dt: float, start_step: int, n_steps: int):
+def _year_boundaries(year: int, dt: float, start_step: int, n_steps: int, dt_ramp=None):
     """Absolute step indices in ``(start_step, start_step+n_steps)`` where the model CALENDAR YEAR
     changes — passed to :func:`plan_chunks` as ``split_at`` so no chunk straddles a forcing-year
     switch (the JRA reader holds one year; :meth:`fesom_jax.jra55.JRA55Reader.reopen_year` rolls it
     AT a boundary).
 
-    Uses the same step→date map as :func:`_chunk_dates` (``datetime(year,1,1) + n·dt``), so it is
-    exact incl. leap years. Assumes a CONSTANT ``dt`` over the span — the dt-ramp only fires at
-    cold start, far from any year boundary, and multi-year runs resume from a spun-up restart."""
+    Ramp-aware: inverts :func:`_elapsed_seconds` via :func:`_step_at_elapsed`, so with a dt-ramp the
+    1959 boundary is still at the dt0 step but 1960+ land at their dt1 steps (exact incl. leap years).
+    ``dt_ramp=None`` ⇒ the plain ``ceil(secs/dt)`` map (unchanged)."""
     base = datetime.datetime(int(year), 1, 1)
     end = int(start_step) + int(n_steps)
     bounds = []
-    y = (base + datetime.timedelta(seconds=int(start_step) * float(dt))).year
+    y = (base + datetime.timedelta(seconds=_elapsed_seconds(int(start_step), dt, dt_ramp))).year
     while True:
         secs = (datetime.datetime(y + 1, 1, 1) - base).total_seconds()
-        nb = int(math.ceil(secs / float(dt)))
+        nb = _step_at_elapsed(secs, dt, dt_ramp)
         if nb >= end:
             break
         if nb > int(start_step):
@@ -202,7 +223,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         raise ValueError("run_from_config: set cfg.n_steps or cfg.duration")
     cs = int(chunk_steps) if chunk_steps else max(1, n_steps)
     chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt,
-                         split_at=_year_boundaries(year, cfg.dt, start_step, n_steps))
+                         split_at=_year_boundaries(year, cfg.dt, start_step, n_steps, cfg.dt_ramp))
 
     if forcing is None and forcing_stack is None:
         raise ValueError("run_from_config: provide forcing (CoreForcing) or forcing_stack")
@@ -238,7 +259,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     target = out_dir if out_dir is not None else cfg.restart_out
 
     def _write_restart_at(sp, step, dtv):
-        yr, doy, _, _ = _chunk_dates(year, dtv, step, 1)[0]
+        yr, doy, _, _ = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
         zarr_output.write_restart(target, sp, sm, part, step=step,
                                   calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv)
 
@@ -250,7 +271,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         # chunks never straddle a year boundary — plan_chunks split_at=_year_boundaries). reopen_year
         # swaps only the per-year file handles and KEEPS the interpolation stencil (year-independent).
         if forcing_stack is None:
-            cy = _chunk_dates(year, ch.dt, ch.start, 1)[0][0]
+            cy = _chunk_dates(year, cfg.dt, ch.start, 1, cfg.dt_ramp)[0][0]
             if cy != cur_year:
                 (local_forcing if local_forcing is not None else forcing).reopen_year(cy)
                 cur_year = cy
@@ -265,12 +286,12 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             # local-partition nodes (~npes× less) and scatter into [P, n_steps, Lmax] — bit-
             # identical to the global build's local shards (the non-local rows are never read).
             seq_p = local_forcing.stack_partitioned(
-                _chunk_dates(year, ch.dt, ch.start, ch.count), xp=np)
+                _chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), xp=np)
         else:
             # HOST-build the per-chunk forcing (xp=np): a global [n_steps, nod2D] stack is
             # ~2.65 GB/field at NG5 (7.4 M × 48 steps) — building it on GPU 0 OOMs before
             # partition_step_forcing can shard it (the forcing analog of the host-IC fix).
-            seq = forcing.stack(_chunk_dates(year, ch.dt, ch.start, ch.count), xp=np)
+            seq = forcing.stack(_chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), xp=np)
             seq_p = shard_mesh.partition_step_forcing(seq, part)
         tc_host = time.perf_counter()
         state_p = run_steps_sharded_forced(

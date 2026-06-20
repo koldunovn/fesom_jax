@@ -1,0 +1,32 @@
+# dars (3.16 M nodes, 57 levels) — the model-paper PRODUCTION physics: TKE + mEVP + zstar.
+# Differs from dars.yaml (the machinery de-risk, which ran KPP + standard-EVP) in exactly the
+# three physics slots the paper wants: TKE replaces KPP, whichEVP=1 selects mEVP (NOT the
+# whichEVP=0 standard-EVP default), zstar (ale) unchanged. GM stays off (as dars.yaml).
+# This combo has NOT been run at dars scale — canary it (finiteness + s/step) before the 3-yr run.
+
+ale: {}                 # zstar
+gm: null                # GM off (as dars.yaml)
+kpp: null               # KPP OFF — TKE replaces it (mutually exclusive)
+tke: {}                 # TKE vertical mixing (the paper's mixing scheme)
+ice: {whichEVP: 1}      # mEVP sea-ice rheology (whichEVP=1; the default 0 is standard EVP)
+
+visc: {}                # CORE2-default γ's
+tracer: {}              # MFCT/QR4C/FCT (0,1)
+
+dt: 180.0               # dars timestep [s] for year 1 (the cold/spin-up year)
+# After year 1 the model is stable enough to bump dt 180→240 (user, 2026-06-21). after_step = 175200
+# = exactly 1 model year at dt=180 (365*86400/180). The ramp-aware calendar (_elapsed_seconds) keeps
+# the forcing dates exact across the change; plan_chunks re-bootstraps AB2 at the boundary.
+dt_ramp: {after_step: 175200, dt: 240.0}
+
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing:
+  kind: core2
+  start_year: 1958
+output_dir: /work/ab0995/a270088/port_jax/runs/dars_tke_mevp
+snapshot_every: 480      # ~1/day at dt=180
+checkpoint_every: 2400   # ~5 days
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars_tke_mevp/restart
+duration: 1d             # canary; extend to 3yr after the combo is green at scale
