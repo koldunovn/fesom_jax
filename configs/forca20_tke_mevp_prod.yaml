@@ -1,0 +1,16 @@
+# FORCA20 PRODUCTION: TKE + mEVP (whichEVP=1) + zstar, GM off, dt 180 (yr1) -> 240 (yr2+).
+# All de-risked at FORCA20/dist_32: TKE compiles multi-node, mEVP stable, dt=240 stable, dt=180 finite.
+ale: {}
+gm: null
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+dt: 180.0
+dt_ramp: {after_step: 175200, dt: 240.0}   # bump to 240 after 1 model year (ramp-aware calendar)
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20
+partition: dist_32
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/forca20_3yr/restart

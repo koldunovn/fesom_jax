@@ -1,0 +1,16 @@
+# FORCA20 (2.13M nodes, 70 levels, ~uniform with a small ~2.8km patch) — KPP + standard-EVP +
+# zstar, GM off, dt=180 flat. Testing whether a uniform-ish mesh runs at dt=180 where dars's
+# 1.2km refined patch couldn't (the port-lineage 2Δx threshold scales with the finest cell).
+ale: {}
+gm: null
+kpp: {}
+tke: null
+ice: {}
+visc: {}
+tracer: {}
+dt: 180.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20
+partition: dist_32
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/forca20_canary/restart

@@ -34,15 +34,17 @@ export JDIST=1 GPUS_PER_NODE=4 PYTHONUNBUFFERED=1
 
 CONFIG=${CONFIG:-$REPO/configs/dars_tke_mevp.yaml}   # override at launch for a fallback config
 TAG=${TAG:-dars_3yr}                                  # names the output subdir (per-config)
-MESH=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
-POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars
-PART=dist_16
+MESH=${MESH:-/work/ab0995/a270088/fesom_jax_meshes/mesh_dars}
+POOL=${POOL:-/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars}
+PART=${PART:-dist_16}
+IC=${IC:-$MESH}
+NODES=${NODES:-4}     # GPU nodes (dist_16=4, dist_32=8); the resubmit re-requests --nodes=$NODES
 OUT=/work/ab0995/a270088/port_jax/runs/$TAG
 RESTART=$OUT/restart
 SELF=$REPO/scripts/run_dars_3yr.sbatch
-TOTAL=438000          # 3 model years: 1958@180 (175200) + 1959-60@240 (262800). = _step_at_elapsed(3*365d)
-CANARY=1440           # first (cold) job: 3 model days — de-risk TKE+mEVP finiteness cheaply
-PERJOB=20000          # ~9-10 h at ≤1.7 s/step (margin under 11:45); a walltime-kill safely stops the chain
+TOTAL=${TOTAL:-438000}          # 3 model years: 1958@180 (175200) + 1959-60@240 (262800).
+CANARY=1440           # first (cold) job: 3 model days — de-risk finiteness cheaply
+PERJOB=${PERJOB:-20000}          # ~9-10 h margin under 11:45; a walltime-kill safely stops the chain
 CHUNK=48
 
 mkdir -p $OUT
@@ -65,7 +67,7 @@ fi
 echo "running $STEPS steps from $CUR (${RIN:-cold})"
 
 srun --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
-    --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition "$PART" \
+    --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$IC" --partition "$PART" \
     --steps "$STEPS" --chunk-steps "$CHUNK" --ragged --local-forcing \
     --checkpoint-every 2400 --diagnostics --progress \
     --restart-out "$RESTART" $RIN
@@ -77,7 +79,8 @@ fi
 
 NEWCUR=$((CUR+STEPS))
 if [ "$NEWCUR" -lt "$TOTAL" ]; then
-  echo "resubmitting from $NEWCUR/$TOTAL"; cd $REPO && sbatch --export=ALL,CONFIG="$CONFIG",TAG="$TAG" $SELF
+  echo "resubmitting from $NEWCUR/$TOTAL"; cd $REPO && sbatch --nodes=$NODES \
+    --export=ALL,CONFIG="$CONFIG",TAG="$TAG",MESH="$MESH",POOL="$POOL",PART="$PART",IC="$IC",NODES="$NODES",PERJOB="$PERJOB",TOTAL="$TOTAL" $SELF
 else
   echo "DARS_3YR_DONE ($NEWCUR steps = 3 model years)"
 fi

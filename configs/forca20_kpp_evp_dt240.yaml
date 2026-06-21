@@ -1,0 +1,13 @@
+ale: {}
+gm: null
+kpp: {}
+tke: null
+ice: {whichEVP: 0}
+visc: {}
+tracer: {}
+dt: 240.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20
+partition: dist_32
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/forca20_canary/kpp_evp_dt240
