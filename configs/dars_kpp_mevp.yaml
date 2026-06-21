@@ -1,0 +1,16 @@
+# dars FALLBACK if TKE hangs: KPP + mEVP + zstar, GM off, dt 180->240. Keeps the user's mEVP
+# rheology; KPP (validated at dars scale by B0/perf) replaces the hanging TKE. dt_ramp @ 1 yr.
+ale: {}
+ice: {whichEVP: 1}
+gm: null
+kpp: {}
+tke: null
+visc: {}
+tracer: {}
+dt: 180.0
+dt_ramp: {after_step: 175200, dt: 240.0}
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars_3yr_kpp_mevp/restart

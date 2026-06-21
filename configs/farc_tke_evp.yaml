@@ -1,0 +1,14 @@
+# farc diagnostic: TKE + standard-EVP (isolate TKE; whichEVP=0)
+ale: {}
+kpp: null
+tke: {}
+ice: {}
+gm: null
+visc: {}
+tracer: {}
+dt: 900.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_farc
+partition: dist_4
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/farc_diag/tke_evp

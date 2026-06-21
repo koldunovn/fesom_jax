@@ -32,11 +32,12 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export XLA_FLAGS="--xla_gpu_enable_command_buffer="   # cmdbuf off (compile dead-end, PORTING_LESSONS)
 export JDIST=1 GPUS_PER_NODE=4 PYTHONUNBUFFERED=1
 
-CONFIG=$REPO/configs/dars_tke_mevp.yaml
+CONFIG=${CONFIG:-$REPO/configs/dars_tke_mevp.yaml}   # override at launch for a fallback config
+TAG=${TAG:-dars_3yr}                                  # names the output subdir (per-config)
 MESH=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars
 PART=dist_16
-OUT=/work/ab0995/a270088/port_jax/runs/dars_3yr
+OUT=/work/ab0995/a270088/port_jax/runs/$TAG
 RESTART=$OUT/restart
 SELF=$REPO/scripts/run_dars_3yr.sbatch
 TOTAL=438000          # 3 model years: 1958@180 (175200) + 1959-60@240 (262800). = _step_at_elapsed(3*365d)
@@ -76,7 +77,7 @@ fi
 
 NEWCUR=$((CUR+STEPS))
 if [ "$NEWCUR" -lt "$TOTAL" ]; then
-  echo "resubmitting from $NEWCUR/$TOTAL"; cd $REPO && sbatch $SELF
+  echo "resubmitting from $NEWCUR/$TOTAL"; cd $REPO && sbatch --export=ALL,CONFIG="$CONFIG",TAG="$TAG" $SELF
 else
   echo "DARS_3YR_DONE ($NEWCUR steps = 3 model years)"
 fi

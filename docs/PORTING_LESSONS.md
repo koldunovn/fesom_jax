@@ -4445,3 +4445,18 @@ Cite the C source (`file:line`) or dump probe that proves it.
   actually IMPLEMENTS — a setting the baseline turns on may simply not exist in the port, and that's a result to report,
   not paper over.** Documented in `docs/memo/FORTRAN_dars_setup.md` (full JAX→FESOM2 namelist mapping; Fortran STAGED, not
   launched, pending the user's w_split call + the plan's "confirm Fortran config" gate).
+
+- **[model-paper / scaling / a config that works single-node can HANG the compile multi-node] (`TKE_MULTINODE_HANG`)
+  TKE+mEVP compiles+runs fine at farc/1-node but HANGS the XLA compile at dars/4-node — measured, not guessed.** The
+  requested dars production config (TKE + mEVP + zstar) hung the first-chunk compile >66 min at dars/dist_16 (4 nodes,
+  3.16 M nodes), 0 chunks — killed (don't burn budget on a failing rung). Bisected CHEAPLY on farc (`run_farc_diag.sbatch`,
+  1 node/dist_4): TKE+EVP, KPP+mEVP, AND TKE+mEVP ALL compile + run FINITE in ~100 s. So it is NOT a TKE or mEVP code bug
+  and NOT a single-node graph-size issue. The dars KPP+EVP perf runs (also dist_16/4-node) compiled fine, so it is
+  **TKE-specific × multi-node** — almost certainly TKE's extra halo-exchange collectives (KPP is column-local, no halo)
+  blowing up the XLA compile once the ragged halo is an INTER-node `ragged_all_to_all` at dars scale (cf. the known
+  Phase-8b sharded-ragged slowness). Fallback that preserves the user's intent: **KPP + mEVP** (KPP works at dars; mEVP
+  shares the EVP `lax.scan` that works at dars), de-risked by a timeout-guarded `run_dars_canary.sbatch` before committing
+  the multi-day chain. **Lessons: (1) de-risk a NEW physics combo at the TARGET scale+node-count, not just small/1-node —
+  the multi-node compiler path is a different beast; (2) a `timeout`-wrapped compile-canary turns a silent 66-min hang
+  into a clean exit-124 you can branch on; (3) the cheap small-mesh bisection (farc) proved "not a code bug" in ~5 min of
+  compute instead of hours of dars node-time — measure at the cheapest scale that can still answer the question.**

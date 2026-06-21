@@ -1,0 +1,14 @@
+# farc diagnostic: KPP + mEVP (isolate mEVP; whichEVP=1)
+ale: {}
+kpp: {}
+tke: null
+ice: {whichEVP: 1}
+gm: null
+visc: {}
+tracer: {}
+dt: 900.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_farc
+partition: dist_4
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/farc_diag/kpp_mevp
