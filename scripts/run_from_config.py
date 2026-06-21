@@ -79,6 +79,12 @@ def main():
     ap.add_argument("--checkpoint-every", type=int, default=None,
                     help="write a rolling intermediate restart every N steps (crash-safety on a "
                          "multi-hour run + segment-chaining); gather-free, coarse cadence ⇒ <<1%%")
+    ap.add_argument("--daily-out", default=None,
+                    help="write daily-mean ushow zarrs (sst/sss/temp100/u100/v100) to this dir, "
+                         "one day_<YYYY>_<DOY> per calendar day; gather-free")
+    ap.add_argument("--daily-start-step", type=int, default=0,
+                    help="begin daily output only after this absolute step (e.g. the year-1 end "
+                         "175200 ⇒ daily output from year 2 onward)")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -142,7 +148,8 @@ def main():
                           state0=state0, start_step=0, year=args.year,
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
                           use_ragged=args.ragged, progress=(args.progress and _IS_LEAD),
-                          local_forcing=local_forcing, checkpoint_every=args.checkpoint_every)
+                          local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
+                          daily_out=args.daily_out, daily_start_step=args.daily_start_step)
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")

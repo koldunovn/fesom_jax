@@ -34,7 +34,7 @@ from typing import NamedTuple
 import jax
 import numpy as np
 
-from . import shard_mesh, ssh, zarr_output
+from . import shard_mesh, ssh, ushow_output, zarr_output
 from .integrate_sharded import run_steps_sharded_forced
 from .run_config import RunConfig
 
@@ -173,7 +173,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     state0=None, forcing_stack=None, start_step=0, year=1958,
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
                     accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
-                    local_forcing=None, checkpoint_every=None):
+                    local_forcing=None, checkpoint_every=None,
+                    daily_out=None, daily_start_step=0):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -263,6 +264,23 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         zarr_output.write_restart(target, sp, sm, part, step=step,
                                   calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv)
 
+    # daily-mean output (requested SST/SSS/T@100m/u@100m/v@100m), gather-free, active for absolute
+    # steps > daily_start_step (set to the year-1 end so daily output begins in year 2). The chunk-
+    # final surface/100m slices are folded into a per-calendar-day OnlineStats (~10 samples/day at
+    # dt=180, ~7.5 at dt=240); each day's mean is written as one ushow-readable zarr at the rollover.
+    # A day straddling a chain-job boundary is the post-boundary samples only (~1% of days) — the
+    # daily_stats does not persist across the separate per-job processes.
+    daily_stats = daily_day = k100 = None
+    if daily_out is not None:
+        k100 = int(np.argmin(np.abs(np.asarray(mesh.Z) - (-100.0))))
+
+        def _write_daily(day, st):
+            yr, doy = day
+            ushow_output.write_ushow_sharded(
+                f"{daily_out}/day_{yr:04d}_{doy:03d}", st.mean_dict(), sm, part, mesh,
+                attrs={"calendar_date": f"{yr:04d}-doy{doy:03d}", "n_samples": st.nobs(),
+                       "depth_100m_level": int(k100)})
+
     t_loop0 = time.perf_counter()
     cur_year = int(year)                     # the year the forcing reader was built for
     for ci, ch in enumerate(chunks):
@@ -299,6 +317,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
             use_ragged=use_ragged, boundary_node_p=boundary_node_p, **cfg.physics_kwargs())
         folded_in = True                                     # the scan output is folded [P*Lmax]
+        step_now = ch.start + ch.count
         if progress:
             jax.block_until_ready(state_p)
             now = time.perf_counter()
@@ -310,10 +329,21 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             stats = (zarr_output.OnlineStats.init(leaves) if stats is None
                      else stats).update(leaves)
 
+        if daily_out is not None and step_now > daily_start_step:
+            yr, doy, _, _ = _chunk_dates(year, cfg.dt, step_now, 1, cfg.dt_ramp)[0]
+            day = (int(yr), int(doy))
+            samp = {"sst": state_p.T[:, 0], "sss": state_p.S[:, 0], "temp100": state_p.T[:, k100],
+                    "u100": state_p.uvnode[:, k100, 0], "v100": state_p.uvnode[:, k100, 1]}
+            if daily_stats is not None and day != daily_day:
+                _write_daily(daily_day, daily_stats)         # the previous calendar day completed
+                daily_stats = None
+            daily_stats = (zarr_output.OnlineStats.init(samp) if daily_stats is None
+                           else daily_stats.update(samp))
+            daily_day = day
+
         # rolling intermediate checkpoint: when this chunk crossed a `checkpoint_every` step
         # boundary (and it's not the last chunk — the final restart covers that), overwrite the
         # restart so a crash resumes from here. start_step from the restart metadata.
-        step_now = ch.start + ch.count
         if (checkpoint_every and target is not None and ci < len(chunks) - 1
                 and step_now // checkpoint_every > ch.start // checkpoint_every):
             if progress:
@@ -337,4 +367,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         _write_restart_at(state_p, end_step, end_dt)
         if progress:
             print(f"[run.progress] restart written in {time.perf_counter() - tw:.1f}s", flush=True)
+
+    # flush the final (partial) calendar day so the last day of the run/job is written too
+    if daily_out is not None and daily_stats is not None:
+        _write_daily(daily_day, daily_stats)
     return RunResult(state_p=state_p, stats=stats, step=end_step, dt_stage=float(end_dt))

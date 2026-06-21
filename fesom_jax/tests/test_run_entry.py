@@ -259,3 +259,35 @@ def test_single_step_run(core2_setup):
                           year=YEAR)
     assert res.step == 1
     assert np.all(np.isfinite(np.asarray(res.state_p.T)))
+
+
+@have_forcing
+def test_daily_output(core2_setup, tmp_path):
+    """Daily-mean output: one ushow-readable zarr per calendar day with SST/SSS/T@100m/u@100m/v@100m,
+    gather-free, gated on ``daily_start_step``. A 60-step run at DT=1800 (48 steps/day) crosses ONE
+    day boundary ⇒ a completed day (mid-loop rollover write) + a partial day (final flush)."""
+    import zarr
+    fx = core2_setup
+    n = 60                                                # 1.25 days at DT=1800 (48 steps/day)
+    stack = fx["cf"].stack(_chunk_dates(YEAR, DT, 0, n, None))
+    common = dict(forcing=fx["cf"], forcing_stack=stack, mesh=fx["mesh"], part=fx["part"],
+                  sm=fx["sm"], sop=fx["sop"], year=YEAR, chunk_steps=12)
+    daily = tmp_path / "daily"
+    run_from_config(RunConfig(n_steps=n, kpp=KppConfig(), dt=DT), state0=fx["state"],
+                    daily_out=str(daily), daily_start_step=0, **common)
+    days = sorted(p.name for p in daily.glob("day_*"))
+    assert len(days) >= 2, f"expected >=2 daily zarrs (crossed a day boundary), got {days}"
+    g = zarr.open_group(str(daily / days[0]), "r")
+    keys = set(g.array_keys())
+    assert {"sst", "sss", "temp100", "u100", "v100", "lon", "lat"} <= keys, f"fields {keys}"
+    assert tuple(g["sst"].shape) == tuple(g["lon"].shape), "sst must be node-shaped (2-D field)"
+    lat, sst = np.asarray(g["lat"]), np.asarray(g["sst"])
+    owned = lat > -89.0                                   # non-sentinel (real-owner) lanes
+    assert owned.any() and np.all(np.isfinite(sst[owned])), "owned SST daily means must be finite"
+
+    # the start-step gate: with daily_start_step past the run, NOTHING is written (year-2 behaviour)
+    daily2 = tmp_path / "daily2"
+    run_from_config(RunConfig(n_steps=n, kpp=KppConfig(), dt=DT), state0=fx["state"],
+                    daily_out=str(daily2), daily_start_step=10_000, **common)
+    assert not list(daily2.glob("day_*")), "daily_start_step gate must suppress output before it"
+    print(f"DAILY_OUTPUT_OK ({len(days)} day zarrs {days}; fields {sorted(keys - {'lon', 'lat'})})")

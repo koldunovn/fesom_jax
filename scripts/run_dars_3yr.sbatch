@@ -70,6 +70,7 @@ srun --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
     --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$IC" --partition "$PART" \
     --steps "$STEPS" --chunk-steps "$CHUNK" --ragged --local-forcing \
     --checkpoint-every 2400 --diagnostics --progress \
+    --daily-out "$OUT/daily" --daily-start-step "${DAILY_START:-175200}" \
     --restart-out "$RESTART" $RIN
 R=$?
 echo "dars3yr job#$CNT exit=$R"

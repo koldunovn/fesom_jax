@@ -31,6 +31,7 @@ T0=$SECONDS
 timeout 1800 srun --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
     --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "${IC:-$MESH}" --partition ${PART:-dist_16} \
     --steps ${STEPS:-60} --chunk-steps ${CHUNK:-30} --ragged --local-forcing --progress --diagnostics \
+    ${DAILY_OUT:+--daily-out "$DAILY_OUT" --daily-start-step ${DAILY_START:-0}} \
     --restart-out "$OUT"
 R=$?
 echo ">>> dars canary $TAG exit=$R elapsed=$((SECONDS-T0))s $([ $R -eq 124 ] && echo 'COMPILE-HANG' || echo 'completed')"
