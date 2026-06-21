@@ -4460,3 +4460,30 @@ Cite the C source (`file:line`) or dump probe that proves it.
   the multi-node compiler path is a different beast; (2) a `timeout`-wrapped compile-canary turns a silent 66-min hang
   into a clean exit-124 you can branch on; (3) the cheap small-mesh bisection (farc) proved "not a code bug" in ~5 min of
   compute instead of hours of dars node-time — measure at the cheapest scale that can still answer the question.**
+
+- **[model-paper / w_split / completed the port] (`WSPLIT_PORTED`) The implicit-advection half of w_split, behind
+  `AleConfig.use_wsplit`.** `compute_wvel_split` already split `w→(w_e,w_i)`; the gap was the IMPLICIT consumers. Added,
+  mirroring FESOM2 Fortran exactly: momentum `impl_vert_visc` gains the `w_i` upwind tridiagonal terms (`oce_ale.F90:2696-2742`,
+  node→element 3-vertex mean, `w>0`=upward); a new `tracer_adv.adv_tra_vert_impl` (the standalone implicit `w_i` solve for the
+  FCT low-order solution, `oce_adv_tra_ver.F90:90-239`); and the FCT antidiffusive flux now uses the FULL `w=w_e+w_i`
+  (`oce_adv_tra_driver.F90:177-203`). Threaded `use_wsplit`/`wsplit_maxcfl` through `step.py` (momentum reads the LAGGED
+  `st.w_i`; tracers the fresh one). **Off-path bit-identity is structural** — `w_i` is threaded only when `use_wsplit` is on, so
+  `w_i=None` skips every new path; suite **714+49 green** (vs 710 baseline = +4 new w_split tests). It is a valid feature for
+  genuinely fine meshes where the VERTICAL CFL is the limiter — but note it did NOT fix dars dt=180 (next lesson).
+
+- **[model-paper / scaling / the dars-dt=180 blowup is the PORT LINEAGE'S intrinsic 2Δx instability, not the JAX]
+  (`DARS_DT180_PORT_LINEAGE_2DX`) dars blows up at dt=180 (finite at dt=60) — and it is NOT the SSH, NOT a halo bug, NOT
+  CFL/w_split. It is a known, UNRESOLVED instability the C/Kokkos/JAX ports all share.** Chased every hypothesis to ground:
+  (1) **SSH verified a LITERAL port** of the C port `fesom_ssh.c` (maxiter 500, soltol 1e-5, warm-start `X=d_eta`,
+  `rtol=soltol·RMS(rhs)`, MITgcm preconditioner, runtime-dt mass term — all identical; pi gates bit-validate). (2) **w_split
+  had ZERO effect** (runs byte-class identical on/off) ⇒ not the vertical-velocity CFL. (3) **Partition-independent**:
+  `dist_16`≡`dist_32` blew up identically. The answer was in the reference ports' OWN docs: the C port `MPI_PORT_REPORT.md`
+  documents the multi-rank partition-boundary `eta`/`w` divergence, but the later Kokkos `DT1800_HANDOFF.md` **refuted the halo
+  hypothesis** (256r vs 864r blow within 0.8% → "INTRINSIC, rank-independent") and pinned it on the port carrying **"~20–35%
+  more grid-scale (2Δx) velocity energy than Fortran"** — a subtle operator-application difference vs Fortran, never resolved;
+  the Kokkos workaround is a smaller dt (CORE2 1800→1200). The **dt ceiling scales with the finest cell**: CORE2 (~100 km) <1800,
+  NG5 (uniform 5 km) =180 OK (user ran Kokkos NG5 for months), dars (1.2 km refined patch) <180. Confirmed end-to-end: the C
+  port ITSELF `MPI_ABORT`s (CG-NaN `FESOM_DIE`) on dars dt=180. **Lessons: (1) before re-deriving a blowup, read the reference
+  port's own bug docs — the answer (incl. the ruled-out halo) was already written down. (2) "the SSH must be a literal port" is
+  checkable in minutes against the C source — verify, don't speculate (the user was right to insist). (3) a refined patch sets
+  the global dt for the whole mesh; the cheap-eddy mesh you want is a UNIFORM one (FORCA20), not a regionally-refined one.**

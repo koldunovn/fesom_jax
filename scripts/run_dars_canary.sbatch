@@ -23,14 +23,14 @@ export XLA_FLAGS="--xla_gpu_enable_command_buffer="
 export JDIST=1 GPUS_PER_NODE=4 PYTHONUNBUFFERED=1
 CONFIG=${CONFIG:-$PWD/configs/dars_kpp_mevp.yaml}
 TAG=${TAG:-canary}
-MESH=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
-POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars
+MESH=${MESH:-/work/ab0995/a270088/fesom_jax_meshes/mesh_dars}
+POOL=${POOL:-/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars}
 OUT=/work/ab0995/a270088/port_jax/runs/dars_canary/$TAG; rm -rf "$OUT"; mkdir -p "$OUT"
 echo "=== $(date) dars canary CONFIG=$CONFIG (30-min compile cap, 60 steps, dist_16) ==="
 T0=$SECONDS
 timeout 1800 srun --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
-    --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$MESH" --partition dist_16 \
-    --steps 60 --chunk-steps 30 --ragged --local-forcing --progress --diagnostics \
+    --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "${IC:-$MESH}" --partition ${PART:-dist_16} \
+    --steps ${STEPS:-60} --chunk-steps ${CHUNK:-30} --ragged --local-forcing --progress --diagnostics \
     --restart-out "$OUT"
 R=$?
 echo ">>> dars canary $TAG exit=$R elapsed=$((SECONDS-T0))s $([ $R -eq 124 ] && echo 'COMPILE-HANG' || echo 'completed')"

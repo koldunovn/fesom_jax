@@ -264,17 +264,22 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_c
 
 
 def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT,
-                   elem_geo=None):
+                   elem_geo=None, w_i=None):
     """Implicit vertical viscosity per element (substep 7). Returns the velocity
     **increment** ``du`` ``[elem2D, nl, 2]`` (the C stores it back into ``uv_rhs``;
     ``update_vel`` later does ``uv += du``).
 
     Mirror of ``fesom_impl_vert_visc`` (``fesom_momentum.c:291``) for Phase-2 pi:
-    no cavity / no partial cells (so ``zbar_n=zbar``, ``Z_n=Z`` globally) and
-    ``w_i=0`` (the advective tridiagonal terms drop). Builds the tridiagonal
-    (a,b,c) from ``Av`` + geometry, adds wind-stress (surface) and quadratic
+    no cavity / no partial cells (so ``zbar_n=zbar``, ``Z_n=Z`` globally). Builds the
+    tridiagonal (a,b,c) from ``Av`` + geometry, adds wind-stress (surface) and quadratic
     bottom-drag (bottom) forcing, converts to the ``du`` system, and solves with
     :func:`ops.tdma` (vectorized over elements).
+
+    ``w_i`` (``[nod2D, nl]`` or ``None``) is the implicit part of the split vertical
+    velocity (``compute_wvel_split``). When given, its upwind advection terms are added to
+    the tridiagonal (``oce_ale.F90:2696-2742``; node→element 3-vertex mean, ``w>0``=upward);
+    the increment-form rhs then carries the implicit advection of the old velocity. ``None``
+    (use_wsplit off) ⇒ the terms drop ⇒ byte-identical to the no-split path.
 
     **zstar (Phase 9a, JZ.6).** ``elem_geo`` is the live per-element ``(zbar_n, Z_n)``
     ``[elem2D, nl]`` from :func:`fesom_jax.ale.live_geometry_elem` (built from the carried
@@ -331,6 +336,22 @@ def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT,
     a = jnp.where(valid, a, 0.0)
     c = jnp.where(valid, c, 0.0)
     b = jnp.where(valid, b, 1.0)
+
+    # w_split: implicit vertical advection of momentum by w_i (oce_ale.F90:2696-2742). Upwind
+    # (w>0 = upward): wu = element 3-vertex mean of w_i at face nz, wd at face nz+1. The terms
+    # add to the SAME (a,b,c) AFTER the viscosity diagonal (b=-a-c+1) is set, exactly as the C.
+    # surface uses the full wu top-face; the bottom row keeps only the top face. w_i=None ⇒ skip
+    # (byte-identical); w_i≡0 ⇒ min/max(0,0)=0 ⇒ all terms vanish.
+    if w_i is not None:
+        wu = ops.gather_nodes_to_elem(w_i, mesh.elem_nodes).sum(axis=1) / 3.0   # (elem2D, nl)
+        wd = _shift_up(wu)                                                       # face nz+1
+        a_wi = jnp.where(surf, 0.0, jnp.minimum(0.0, wu)) * zinv_b
+        b_wi = (jnp.where(surf, wu, jnp.maximum(0.0, wu))          # top face (full at surface)
+                - jnp.where(bot, 0.0, jnp.minimum(0.0, wd))) * zinv_b   # bottom face (none at bottom)
+        c_wi = jnp.where(bot, 0.0, -jnp.maximum(0.0, wd)) * zinv_b
+        a = a + jnp.where(valid, a_wi, 0.0)
+        b = b + jnp.where(valid, b_wi, 0.0)
+        c = c + jnp.where(valid, c_wi, 0.0)
 
     u_old, v_old = uv[:, :, 0], uv[:, :, 1]
     fu, fv = uv_rhs[:, :, 0], uv_rhs[:, :, 1]

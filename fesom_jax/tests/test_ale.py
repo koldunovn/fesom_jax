@@ -27,7 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from fesom_jax import ale, eos, forcing, ic, momentum, pgf, pp, ssh, verify
+from fesom_jax import ale, eos, forcing, ic, momentum, pgf, pp, ssh, tracer_adv, verify
 from fesom_jax.io_dump import find_record
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
 from fesom_jax.state import State
@@ -317,6 +317,44 @@ def test_wvel_split_active_matches_reference(mesh):
     assert np.any((we == np.asarray(w))[imask] & (np.asarray(cfl) <= 1.0)[imask])
     # explicit + implicit recovers the total w where split is active (w_e+w_i == w)
     assert np.allclose((we + wi)[imask], np.asarray(w)[imask], atol=1e-14)
+
+
+def test_impl_vert_visc_wi_zero_is_identity(mesh):
+    """w_split: passing w_i=0 adds EXACTLY zero to the momentum tridiagonal, so enabling the
+    split never perturbs a low-CFL region (w_i=0). impl_vert_visc(w_i=None) == (w_i=0)."""
+    st = ic.initial_state(mesh)
+    Av = jnp.zeros((mesh.elem2D, mesh.nl))
+    uvr = jnp.zeros((mesh.elem2D, mesh.nl, 2))
+    ss = jnp.zeros((mesh.elem2D, 2))
+    du_none = momentum.impl_vert_visc(mesh, st.uv, uvr, Av, ss, dt=DT)
+    du_zero = momentum.impl_vert_visc(mesh, st.uv, uvr, Av, ss, dt=DT,
+                                      w_i=jnp.zeros((mesh.nod2D, mesh.nl)))
+    assert np.array_equal(np.asarray(du_none), np.asarray(du_zero))
+
+
+def test_adv_tra_vert_impl_wi_zero_is_identity(mesh):
+    """w_split tracer implicit solve: w_i=0 ⇒ M = hnode_new·I ⇒ the identity (T_new == T)."""
+    st = ic.initial_state(mesh)
+    T_new = tracer_adv.adv_tra_vert_impl(mesh, jnp.zeros((mesh.nod2D, mesh.nl)),
+                                         st.T, st.hnode, dt=DT)
+    assert np.array_equal(np.asarray(T_new), np.asarray(st.T))
+
+
+def test_adv_tra_vert_impl_active_finite_and_bounded(mesh):
+    """A synthetic w_i: the implicit upwind solve stays FINITE, genuinely moves T, and stays
+    globally bounded (implicit upwind ⇒ no blow-up). The on-path mechanics smoke-test."""
+    st = ic.initial_state(mesh)
+    n = np.arange(mesh.nod2D)[:, None]
+    k = np.arange(mesh.nl)[None, :]
+    imask = np.asarray(mesh.node_iface_mask)
+    w_i = jnp.where(jnp.asarray(imask), jnp.asarray(0.001 * np.cos(0.3 * k + 0.01 * n)), 0.0)
+    T_new = np.asarray(tracer_adv.adv_tra_vert_impl(mesh, w_i, st.T, st.hnode, dt=DT))
+    vmask = np.asarray(mesh.node_layer_mask)
+    Tv = np.asarray(st.T)[vmask]
+    assert np.all(np.isfinite(T_new))
+    assert not np.array_equal(T_new, np.asarray(st.T))                  # genuinely advected
+    assert T_new[vmask].min() >= Tv.min() - 1.0                         # globally bounded
+    assert T_new[vmask].max() <= Tv.max() + 1.0
 
 
 def test_wvel_split_gradient_finite(mesh):

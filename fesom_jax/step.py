@@ -308,11 +308,18 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                                                      visc_cfg=visc_cfg))()
     uv_rhs = _exch(uv_rhs, "elem")
 
+    # w_split config (static; ale_cfg=None ⇒ off ⇒ byte-identical). Used at substeps 7 + 13.
+    _use_wsplit = ale_cfg.use_wsplit if ale_cfg is not None else False
+    _wsplit_maxcfl = ale_cfg.wsplit_maxcfl if ale_cfg is not None else 1.0
+
     # 7 — implicit vertical viscosity → increment du (the C keeps it in uv_rhs). zstar (JZ.6):
     #     the per-element tridiagonal geometry comes from the live st.helem stack (elem_geo_live);
-    #     None ⇒ static column-uniform zbar/Z (byte-identical).
+    #     None ⇒ static column-uniform zbar/Z (byte-identical). w_split: the LAGGED st.w_i adds the
+    #     implicit vertical momentum advection (the C solves momentum before the new w ⇒ w_i lagged,
+    #     like w_e in substep 5). use_wsplit off ⇒ w_i=None ⇒ unchanged.
     du = _ckpt(lambda: momentum.impl_vert_visc(mesh, st.uv, uv_rhs, Av, stress_surf, dt=dt,
-                                               elem_geo=elem_geo_live))()
+                                               elem_geo=elem_geo_live,
+                                               w_i=(st.w_i if _use_wsplit else None)))()
     du = _exch(du, "elem")
 
     # zstar (Phase 9a, JZ.3): the SSH plumbing gains the real-freshwater tail (ssh_rhs +
@@ -363,7 +370,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     w = _exch(w, "nod")
     cfl_z = ale.compute_cfl_z(mesh, w, hnode_new, dt=dt)
     cfl_z = _exch(cfl_z, "nod")
-    w_e, w_i = ale.compute_wvel_split(mesh, w, cfl_z)
+    # w_split (oce_ale.F90:2500): move the vertical-CFL excess to the implicit part (config above).
+    w_e, w_i = ale.compute_wvel_split(mesh, w, cfl_z, use_wsplit=_use_wsplit, maxcfl=_wsplit_maxcfl)
     w_e = _exch(w_e, "nod")
     w_i = _exch(w_i, "nod")
 
@@ -386,14 +394,19 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 15 — FCT tracer advection (T then S) + Redi explicit terms + implicit vert diffusion.
     #      advect_one_fct exchanges fct_LO + fct_plus/minus internally (S.7 splits).
+    # w_split (FRESH w_i from substep 13): the FCT LO flux used the explicit w_e (in w_e_adv),
+    # the implicit w_i advection is applied to the LO solution, and the antidiffusive HO flux uses
+    # the full w_e_adv+w_i. use_wsplit off ⇒ w_i=None ⇒ byte-identical. (w_i is the EULERIAN
+    # implicit part; the GM bolus stays explicit in w_e_adv.)
+    _wi_adv = w_i if _use_wsplit else None
     T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
         mesh, uv_adv, w_e_adv, st.helem, st.hnode,
         hnode_new, st.T, st.T_old, dt=dt, exch=_exch,
-        Z3d=Z3d_live, zbar3=zbar3_live))()
+        Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv))()
     S_adv, S_old = _ckpt(lambda: tracer_adv.advect_one_fct(
         mesh, uv_adv, w_e_adv, st.helem, st.hnode,
         hnode_new, st.S, st.S_old, dt=dt, exch=_exch,
-        Z3d=Z3d_live, zbar3=zbar3_live))()
+        Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv))()
     T_adv = _exch(T_adv, "nod")
     S_adv = _exch(S_adv, "nod")
 

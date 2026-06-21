@@ -1,0 +1,16 @@
+# dars KPP + standard-EVP + zstar with W_SPLIT ON (the new port), GM off, dt=180 flat.
+# The use_wsplit=false version of this config blew up (NON-FINITE) at dt=180 in 60 steps;
+# w_split should move the fine-patch (1.2 km) vertical-CFL excess to implicit ⇒ stable.
+ale: {use_wsplit: true, wsplit_maxcfl: 1.0}
+gm: null
+kpp: {}
+tke: null
+ice: {}
+visc: {}
+tracer: {}
+dt: 180.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars_canary/kpp_evp_wsplit

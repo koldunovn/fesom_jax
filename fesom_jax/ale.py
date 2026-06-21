@@ -62,6 +62,12 @@ class AleConfig(NamedTuple):
     """
 
     zstar: bool = True            # which_ALE = 'zstar' (the only supported non-linfs mode)
+    # Vertical-velocity split (oce_ale.F90:2436-2514; namelist dynamics_general). Off ⇒ w_e=w,
+    # w_i=0 ⇒ the implicit-advection terms vanish ⇒ byte-identical. ON moves the vertical-CFL
+    # excess (cfl_z > wsplit_maxcfl) to an implicit solve ⇒ a refined mesh (e.g. dars's 1.2 km
+    # patch) stays stable at a large dt that would otherwise violate the explicit vertical CFL.
+    use_wsplit: bool = False
+    wsplit_maxcfl: float = 1.0    # CFL threshold above which w is split (MOD_DYN.F90:113)
 
     @property
     def use_virt_salt(self) -> bool:

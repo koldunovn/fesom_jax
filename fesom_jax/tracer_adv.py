@@ -484,8 +484,53 @@ def flux2dtracer_fct(mesh: Mesh, T, LO, adf_h, adf_v, hnode, hnode_new, *,
     return dttf_h + dttf_v
 
 
+def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
+    """Standalone implicit vertical advection of one tracer by the split ``w_i``
+    (``adv_tra_vert_impl``, ``oce_adv_tra_ver.F90:90-239``). Per-**node** tridiagonal =
+    mass (``hnode_new`` diagonal) + upwind ``w_i`` advection (``w>0`` = upward); solves
+    ``M·T_new = hnode_new·T`` and returns ``T_new``. Under w_split + FCT this is applied to
+    the low-order solution (the implicit part the explicit ``w_e`` flux left out). ``w_i≡0``
+    ⇒ ``M = hnode_new·I`` ⇒ the identity (so it's safe to call unconditionally when split is on).
+
+    Coefficients (per node, layer ``nz``), with ``v_top = dt·area[nz]/areasvol[nz]`` and
+    ``v_bot = dt·area[nz+1]/areasvol[nz]``:
+        a[nz]    = min(0, w_i[nz])  ·v_top                       (0 at surface)
+        b_adv    = top + bottom, top = max(0,w_i[nz])·v_top  (FULL w_i[nz]·v_top at surface),
+                   bottom = −min(0,w_i[nz+1])·v_bot              (0 at bottom)
+        c[nz]    = −max(0, w_i[nz+1])·v_bot                      (0 at bottom)
+        b[nz]    = hnode_new[nz] + b_adv
+    Increment form (== the C): ``dT = TDMA(a,b,c, −(a·T[nz-1] + b_adv·T[nz] + c·T[nz+1]))``,
+    ``T_new = T + dT`` (padded rows: ``b=1, rhs=0 ⇒ dT=0``)."""
+    nl = mesh.nl
+    safe_av = jnp.where(mesh.areasvol > 0.0, mesh.areasvol, 1.0)
+    v_top = dt * mesh.area / safe_av                  # (nod2D, nl): dt·area[nz]/areasvol[nz]
+    v_bot = dt * _shift_up(mesh.area) / safe_av        # dt·area[nz+1]/areasvol[nz]
+    wu = w_i                                           # face nz
+    wd = _shift_up(w_i)                                # face nz+1
+
+    k = jnp.arange(nl)[None, :]
+    nzmin = (mesh.ulevels_nod2D - 1)[:, None]
+    nzmax = (mesh.nlevels_nod2D - 1)[:, None]
+    valid = mesh.node_layer_mask
+    surf = k == nzmin
+    bot = k == (nzmax - 1)
+
+    a_adv = jnp.where(surf, 0.0, jnp.minimum(0.0, wu)) * v_top
+    b_top = jnp.where(surf, wu, jnp.maximum(0.0, wu)) * v_top          # full w_i at the surface face
+    b_bot = jnp.where(bot, 0.0, -jnp.minimum(0.0, wd)) * v_bot
+    c_adv = jnp.where(bot, 0.0, -jnp.maximum(0.0, wd)) * v_bot
+    b_adv = b_top + b_bot
+
+    a = jnp.where(valid, a_adv, 0.0)
+    c = jnp.where(valid, c_adv, 0.0)
+    b = jnp.where(valid, hnode_new + b_adv, 1.0)
+    rhs = jnp.where(valid, -(a * _shift_down(T) + b_adv * T + c * _shift_up(T)), 0.0)
+    dT = ops.tdma(a, b, c, rhs)
+    return T + ops.mask_below_bottom(dT, valid)
+
+
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
-                   *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None):
+                   *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None, w_i=None):
     """One tracer's FCT advection + ALE reconstruction
     (``fesom_tracer_advect_one_fct``, ``fesom_tracer_adv.c:1199``). Returns
     ``(T_new, T_old_new)`` with ``T_old_new = T`` (the AB2 ``valuesold`` save).
@@ -505,15 +550,26 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
     # 2 — LO upwind fluxes from values
     flux_h_lo = adv_flux_hor(mesh, uv, helem, T)
     flux_v_lo = adv_flux_ver(mesh, w_e, T)
-    # 3 — low-order ALE solution
+    # 3 — low-order ALE solution (its vertical flux used the EXPLICIT w_e)
     LO = compute_fct_lo(mesh, flux_h_lo, flux_v_lo, T, hnode, hnode_new, dt=dt)
+    # w_split: add back the IMPLICIT w_i vertical advection on the LO solution
+    # (oce_adv_tra_driver.F90:173). w_i=None ⇒ skipped ⇒ byte-identical.
+    if w_i is not None:
+        LO = adv_tra_vert_impl(mesh, w_i, LO, hnode_new, dt=dt)
     LO = _exch(LO, "nod")        # S.7: the limiter clusters LO over surrounding cells
     # 4 — antidiffusive fluxes HO − LO
     tr_xy = tracer_gradient_elements(mesh, T)
     tr_xy = _exch(tr_xy, "elem")  # S.7: eXDim halo elem gradients are read by fill_up_dn_grad
     eud = fill_up_dn_grad(mesh, tr_xy)
     adf_h = adv_flux_hor_ho(mesh, uv, helem, ttfAB, eud) - flux_h_lo
-    adf_v = adv_flux_ver_ho(mesh, w_e, ttfAB, Z3d=Z3d, zbar3=zbar3) - flux_v_lo
+    # w_split: the antidiffusive (HO−LO) vertical flux uses the FULL w (= w_e + w_i) for FCT
+    # (oce_adv_tra_driver.F90:177-203). w_i=None ⇒ w_full=w_e ⇒ reuses flux_v_lo ⇒ byte-identical.
+    if w_i is None:
+        adf_v = adv_flux_ver_ho(mesh, w_e, ttfAB, Z3d=Z3d, zbar3=zbar3) - flux_v_lo
+    else:
+        w_full = w_e + w_i
+        adf_v = (adv_flux_ver_ho(mesh, w_full, ttfAB, Z3d=Z3d, zbar3=zbar3)
+                 - adv_flux_ver(mesh, w_full, T))
     # 5 — Zalesak limit (exchanges fct_plus/fct_minus internally)
     adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, hnode_new, dt=dt, exch=exch)
     # 6-7 — assemble del_ttf  8 — reconstruct (T_new = LO + limited antidiff)
