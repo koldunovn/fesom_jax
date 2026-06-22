@@ -66,13 +66,49 @@ else
 fi
 echo "running $STEPS steps from $CUR (${RIN:-cold})"
 
+LOGFILE=$REPO/scripts/run_dars_3yr.${SLURM_JOB_ID}.out   # this job's own -o file (srun output lands here, live)
+do_resubmit() {   # resubmit the chain from the rolling restart (shared by the hang-heal + normal-completion paths)
+  cd $REPO && sbatch --nodes=$NODES \
+    --export=ALL,CONFIG="$CONFIG",TAG="$TAG",MESH="$MESH",POOL="$POOL",PART="$PART",IC="$IC",NODES="$NODES",PERJOB="$PERJOB",TOTAL="$TOTAL" $SELF
+}
+
+# Run in the BACKGROUND so a compile-hang guard can supervise the first chunk. The observed failure
+# (job#4, 2026-06-22) was an XLA compile-hang: the job reaches "setup done" then sits forever — 5h20m
+# idle on 8 GPUs, no chunk 1, restart never advances. A fresh allocation clears it.
 srun --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
     --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$IC" --partition "$PART" \
     --steps "$STEPS" --chunk-steps "$CHUNK" --ragged --local-forcing \
     --checkpoint-every 2400 --diagnostics --progress \
     --daily-out "$OUT/daily" --daily-start-step "${DAILY_START:-175200}" \
-    --restart-out "$RESTART" $RIN
-R=$?
+    --restart-out "$RESTART" $RIN &
+SRUN_PID=$!
+
+# COMPILE-HANG GUARD: a healthy job prints "chunk 1/" within minutes (setup ~1 min + XLA compile); a
+# hang never does. Watch ONLY the first chunk — once it appears the job is healthy and we stop guarding
+# (steady chunks run for hours). No "chunk 1/" within GUARD_SECS ⇒ kill + self-heal (resubmit from the
+# intact restart) so the chain survives unattended. A consecutive-hang counter STOPS a hang-LOOP (a
+# persistent fault, or a mis-firing guard) after 3 tries rather than burning the whole node budget.
+GUARD_SECS=${GUARD_SECS:-1800}
+t0=$SECONDS; HUNG=0
+while kill -0 $SRUN_PID 2>/dev/null; do
+  grep -q "chunk 1/" "$LOGFILE" 2>/dev/null && break
+  [ $((SECONDS-t0)) -gt $GUARD_SECS ] && { HUNG=1; break; }
+  sleep 30
+done
+
+if [ "$HUNG" -eq 1 ]; then
+  HC=$(( $(cat $OUT/.hangcount 2>/dev/null || echo 0) + 1 )); echo $HC > $OUT/.hangcount
+  echo "GUARD: COMPILE-HANG — no 'chunk 1/' in ${GUARD_SECS}s (consecutive hang #$HC); killing srun"
+  kill $SRUN_PID 2>/dev/null; sleep 5; kill -9 $SRUN_PID 2>/dev/null; wait $SRUN_PID 2>/dev/null
+  if [ "$HC" -ge 3 ]; then
+    echo "DARS_3YR_STOP (3 consecutive compile-hangs — persistent fault; needs a human, chain halted)"; exit 1
+  fi
+  echo "GUARD: self-healing — resubmitting from $CUR/$TOTAL (restart intact, no data lost)"; do_resubmit; exit 0
+fi
+
+# healthy: chunk 1 reached ⇒ reset the consecutive-hang counter, then wait for the run to finish
+echo 0 > $OUT/.hangcount
+wait $SRUN_PID; R=$?
 echo "dars3yr job#$CNT exit=$R"
 if [ "$R" -ne 0 ]; then
   echo "DARS_3YR_STOP (exit=$R — non-finite/crash/kill; inspect $OUT, do NOT auto-continue)"; exit $R
@@ -80,8 +116,7 @@ fi
 
 NEWCUR=$((CUR+STEPS))
 if [ "$NEWCUR" -lt "$TOTAL" ]; then
-  echo "resubmitting from $NEWCUR/$TOTAL"; cd $REPO && sbatch --nodes=$NODES \
-    --export=ALL,CONFIG="$CONFIG",TAG="$TAG",MESH="$MESH",POOL="$POOL",PART="$PART",IC="$IC",NODES="$NODES",PERJOB="$PERJOB",TOTAL="$TOTAL" $SELF
+  echo "resubmitting from $NEWCUR/$TOTAL"; do_resubmit
 else
   echo "DARS_3YR_DONE ($NEWCUR steps = 3 model years)"
 fi
