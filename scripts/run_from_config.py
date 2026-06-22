@@ -85,6 +85,9 @@ def main():
     ap.add_argument("--daily-start-step", type=int, default=0,
                     help="begin daily output only after this absolute step (e.g. the year-1 end "
                          "175200 ⇒ daily output from year 2 onward)")
+    ap.add_argument("--chunk-diagnostics", action="store_true",
+                    help="print gather-free max|uv|/max|eta| health after EACH chunk (a blow-up "
+                         "trajectory probe — pair with a small --chunk-steps; lead process only)")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
@@ -149,7 +152,8 @@ def main():
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
                           use_ragged=args.ragged, progress=(args.progress and _IS_LEAD),
                           local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
-                          daily_out=args.daily_out, daily_start_step=args.daily_start_step)
+                          daily_out=args.daily_out, daily_start_step=args.daily_start_step,
+                          chunk_diagnostics=args.chunk_diagnostics)
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")

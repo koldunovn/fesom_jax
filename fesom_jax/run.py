@@ -174,7 +174,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
                     accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
                     local_forcing=None, checkpoint_every=None,
-                    daily_out=None, daily_start_step=0):
+                    daily_out=None, daily_start_step=0, chunk_diagnostics=False):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -324,6 +324,28 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             print(f"[run.progress] chunk {ci + 1}/{len(chunks)} step{ch.start}->{ch.start+ch.count} "
                   f"host={tc_host - tc0:.1f}s device={now - tc_host:.1f}s "
                   f"(loop elapsed {now - t_loop0:.0f}s)", flush=True)
+        # per-chunk health TRAJECTORY (diagnostic, default off ⇒ no behavior change). Gather-free
+        # scalar reductions on the FOLDED sharded State after each chunk ⇒ with small chunks this is
+        # a max|uv|/max|eta| curve over the run, so a slow blow-up (e.g. the dars dt=180 2Δx velocity
+        # growth) is visible STEP-BY-STEP — what the end-of-run --diagnostics can't show (it only
+        # reports the final state, and a NaN blow-up never reaches it). Each reduction is a blocking
+        # all-reduce; only worth it at small chunk sizes for a stability probe.
+        if chunk_diagnostics:
+            import jax.numpy as jnp
+            from .diagnostics import state_diagnostics
+            d = state_diagnostics(state_p)               # COLLECTIVE (all ranks must call) ...
+            # per-level max|T| (gather-free: reduce the sharded node axis, keep the vertical axis ⇒
+            # a replicated (nl,) vector) ⇒ WHICH level the tracer overshoot lives on (surface k≈0 ⇒
+            # forcing/KPP-BL/advection; deep ⇒ convection or a zstar layer-thickness collapse). Plus
+            # max|cfl_z| (vertical CFL) — a collapsing layer drives it up before T goes non-finite.
+            Tlev = jnp.max(jnp.abs(jnp.nan_to_num(state_p.T, nan=0.0)), axis=0)   # (nl,)
+            klev = int(jnp.argmax(Tlev)); Tk = float(Tlev[klev]); Tsurf = float(Tlev[0])
+            cflz = float(jnp.max(jnp.abs(jnp.nan_to_num(state_p.cfl_z, nan=0.0))))
+            if jax.process_index() == 0:                 # ... but only the lead prints
+                print(f"[chunk-diag] step{step_now} max|uv|={d['max_abs_uv']:.4g} "
+                      f"max|eta|={d['max_abs_eta']:.4g} T[{d['T_min']:.3g},{d['T_max']:.3g}] "
+                      f"|T|max@k={klev}({Tk:.3g}) |T|surf={Tsurf:.3g} max_cfl_z={cflz:.3g} "
+                      f"n_nonfinite={d['n_nonfinite']}", flush=True)
         if accumulate_stats:
             leaves = {k: getattr(state_p, k) for k in stats_fields}   # already folded [P*Lmax]
             stats = (zarr_output.OnlineStats.init(leaves) if stats is None

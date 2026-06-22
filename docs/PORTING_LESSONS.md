@@ -4487,3 +4487,24 @@ Cite the C source (`file:line`) or dump probe that proves it.
   port's own bug docs — the answer (incl. the ruled-out halo) was already written down. (2) "the SSH must be a literal port" is
   checkable in minutes against the C source — verify, don't speculate (the user was right to insist). (3) a refined patch sets
   the global dt for the whole mesh; the cheap-eddy mesh you want is a UNIFORM one (FORCA20), not a regionally-refined one.**
+  ⚠️ **Claim (2) above is CORRECTED by `DARS_DT180_TWO_MODES` (next) — w_split is NOT zero-effect; that read was
+  trajectory-blind. The 2Δx-velocity FINAL-blocker conclusion still STANDS.**
+
+- **[model-paper / w_split / dars dt=180 has TWO instabilities; the earlier "w_split zero effect" was trajectory-blind]
+  (`DARS_DT180_TWO_MODES`) The `DARS_DT180_PORT_LINEAGE_2DX` claim "w_split had ZERO effect (byte-class identical on/off)"
+  is REFUTED for the trajectory — it compared only the (both-NaN) end state. An instrumented probe (the new
+  `--chunk-diagnostics`: gather-free per-level `max|T|` + `max|cfl_z|` after each small chunk; KPP+EVP+zstar = Kokkos's
+  config, dist_16) shows w_split changes the blow-up in KIND and TIMING, even though it does NOT save the run.** w_split
+  OFF (`dars_kpp_evp_dt180.yaml`): blows at step ~17 via a **SUBSURFACE tracer overshoot** — `|T|max` migrates to level
+  20–22 (surface k=0 stays clean at 30.2) with `max_cfl_z≈5` (≫1) ⇒ an EXPLICIT vertical-advection CFL blow-up (the
+  elevated 2Δx velocity → large `w` → `w·dt/dz` over the explicit QR4C vertical tracer at the thin 1.2 km mid-depth
+  layers). w_split ON (`dars_kpp_evp_wsplit.yaml`, `ale:{use_wsplit:true}`): the tracer instability is **GONE** (T bounded
+  [−2.1,30.1] through step 25) but the run now blows at step ~30 via **VELOCITY** (`max|uv|`→2.7e19) — the SAME signature
+  as Kokkos (u=99, step 35) and the C port (CG-NaN). So the step-17 tracer death was a **JAX config gap (w_split off), NOT
+  a port bug**; with w_split (= Kokkos's implicit vertical advection) **JAX tracks the lineage** — same velocity blow-up,
+  similar step. `DARS_DT180_PORT_LINEAGE_2DX` STANDS as the FINAL (2Δx velocity) blocker. **Lessons: (1) instrument the
+  TRAJECTORY (per-step, per-level, per-mechanism), not just the final state — "zero effect" hid two distinct failure modes;
+  a blow-up that ends NaN either way can still be changed in kind+timing by a real fix. (2) `cfl_z` + per-level `max|T|`
+  localize a blow-up to surface-vs-deep and advection-vs-mixing in one cheap gather-free reduction — the single most useful
+  sharded stability probe; build it before guessing. (3) OPEN: w_split + intermediate dt (120/150) may UNBLOCK dars — the
+  vertical CFL is cured, only the velocity 2Δx remains, which a smaller dt may clear.**

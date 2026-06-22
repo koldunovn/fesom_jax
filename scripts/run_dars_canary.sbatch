@@ -28,10 +28,11 @@ POOL=${POOL:-/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars}
 OUT=/work/ab0995/a270088/port_jax/runs/dars_canary/$TAG; rm -rf "$OUT"; mkdir -p "$OUT"
 echo "=== $(date) dars canary CONFIG=$CONFIG (30-min compile cap, 60 steps, dist_16) ==="
 T0=$SECONDS
-timeout 1800 srun --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
+timeout ${TIMEOUT:-1800} srun --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
     --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "${IC:-$MESH}" --partition ${PART:-dist_16} \
     --steps ${STEPS:-60} --chunk-steps ${CHUNK:-30} --ragged --local-forcing --progress --diagnostics \
     ${DAILY_OUT:+--daily-out "$DAILY_OUT" --daily-start-step ${DAILY_START:-0}} \
+    ${CDIAG:+--chunk-diagnostics} \
     --restart-out "$OUT"
 R=$?
 echo ">>> dars canary $TAG exit=$R elapsed=$((SECONDS-T0))s $([ $R -eq 124 ] && echo 'COMPILE-HANG' || echo 'completed')"

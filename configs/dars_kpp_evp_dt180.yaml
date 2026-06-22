@@ -1,0 +1,17 @@
+# dars dt=180 STABILITY PROBE — KPP + standard-EVP + zstar, GM off (matches the Kokkos
+# dars dt=180 scaling config: KPP + whichEVP=0). Used to trace the port-lineage 2Δx velocity
+# blow-up step-by-step (pair with --chunk-steps 5 --chunk-diagnostics) and compare the onset
+# to Kokkos (dist_8 blew at step 35, u=99.4 m/s, CG 58->64). NOT a production run.
+ale: {}
+ice: {}
+gm: null
+kpp: {}
+tke: null
+visc: {}
+tracer: {}
+dt: 180.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars_dt180_probe/restart
