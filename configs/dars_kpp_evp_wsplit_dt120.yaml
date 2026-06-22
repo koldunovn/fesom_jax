@@ -1,0 +1,17 @@
+# dars UNBLOCK ATTEMPT: KPP + standard-EVP + zstar + W_SPLIT ON at dt=120. w_split cured the
+# vertical-CFL tracer mode at dt=180 (which then blew at step ~30 via the 2Δx VELOCITY); dt=120
+# lowers the velocity CFL. If finite + max|uv| stays bounded over ~100 steps ⇒ dars is RUNNABLE
+# (the regionally-refined eddy mesh comes back as a paper comparison alongside FORCA20).
+ale: {use_wsplit: true, wsplit_maxcfl: 1.0}
+gm: null
+kpp: {}
+tke: null
+ice: {}
+visc: {}
+tracer: {}
+dt: 120.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars_canary/kpp_evp_wsplit_dt120
