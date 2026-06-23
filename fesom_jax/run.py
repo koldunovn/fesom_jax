@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import datetime
 import math
+import os
 import time
 from typing import NamedTuple
 
@@ -39,6 +40,12 @@ from .integrate_sharded import run_steps_sharded_forced
 from .run_config import RunConfig
 
 _SECONDS = {"s": 1.0, "h": 3600.0, "d": 86400.0, "mo": 30 * 86400.0, "yr": 365 * 86400.0}
+
+# Reuse the compiled per-chunk executable across chunks (avoid the ~25 s/chunk XLA recompile the perf
+# decomposition exposed: a 96 ms/step all-on CORE2 step ran the hindcast at 520 ms/step). OPT-IN via
+# FESOM_REUSE_EXE so the default working-tree behavior is byte-identical to before (the bit-identity
+# guard); enabled once the GPU bit-identity test (reuse == fresh-compile) is green.
+_REUSE_EXE = bool(os.environ.get("FESOM_REUSE_EXE"))
 
 
 # --------------------------------------------------------------------------
@@ -332,7 +339,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         state_p = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
-            use_ragged=use_ragged, boundary_node_p=boundary_node_p, **cfg.physics_kwargs())
+            use_ragged=use_ragged, boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
+            **cfg.physics_kwargs())
         folded_in = True                                     # the scan output is folded [P*Lmax]
         step_now = ch.start + ch.count
         if progress:

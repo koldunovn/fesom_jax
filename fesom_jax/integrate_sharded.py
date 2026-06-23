@@ -516,13 +516,25 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     return unfold_state(jfn(*args), npes)
 
 
+# Compiled-executable cache for run_steps_sharded_forced(reuse_executable=True) — keyed by the full
+# set of compilation determinants (see the call site). Process-lifetime; clear between independent
+# setups (different meshes/cfgs reusing freed object ids) via clear_forced_jit_cache().
+_FORCED_JIT_CACHE: dict = {}
+
+
+def clear_forced_jit_cache() -> None:
+    """Drop all cached forced-step executables (call between independent run setups / in tests)."""
+    _FORCED_JIT_CACHE.clear()
+
+
 def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                              stress_p, step_forcing_seq, forcing_static, n_steps: int, *,
                              dt: float, npes: int, params=None, gm_cfg=None, kpp_cfg=None,
                              tke_cfg=None, ale_cfg=None, ice_cfg=None, visc_cfg=None,
                              tracer_cfg=None, boundary_node_p=None, use_ragged: bool = False,
                              bootstrap_ab2: bool = True, state_is_folded: bool = False,
-                             return_folded: bool = False, return_executable: bool = False):
+                             return_folded: bool = False, return_executable: bool = False,
+                             reuse_executable: bool = False):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     Like :func:`run_steps_sharded` but the surface forcing **changes every step** — the real
@@ -613,8 +625,29 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
         return st
 
     in_specs = (fm_spec, fs_spec, fop_spec, _P, ha_spec, seq_spec) + extras_spec
-    jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
-                                out_specs=fs_spec, check_vma=False))
+    # EXECUTABLE REUSE across chunks (the A6 driver's multi-chunk contract). `body` is a FRESH
+    # closure every call, so a bare `jax.jit(shard_map(body))` is a NEW jitted object ⇒ XLA RE-
+    # COMPILES on every chunk (~25 s at CORE2 all-on — the ~5× driver overhead the perf decomposition
+    # found: a 96 ms/step model ran the hindcast at 520 ms/step). When `reuse_executable`, cache the
+    # compiled `jfn` keyed by EVERY compilation determinant: the static config (n_steps, dt, the AB2-
+    # bootstrap + folded-input flags, ragged/npes/have_bn) AND the IDENTITY of the structural inputs
+    # (sm/sop/params/the physics cfgs are ONE persistent object per run.py invocation ⇒ id() is a
+    # complete, collision-free key within a process-run; differing objects miss ⇒ safely recompile).
+    # A hit reuses the executable; the args (fresh state + forcing VALUES, identical shapes) are
+    # rebuilt every call and fed to it ⇒ bit-identical to a fresh compile (asserted on GPU).
+    if reuse_executable:
+        key = (id(sm), id(sop), id(params), int(n_steps), float(dt), bool(bootstrap_ab2),
+               bool(state_is_folded), bool(use_ragged), int(npes), bool(have_bn),
+               id(ice_cfg), id(gm_cfg), id(kpp_cfg), id(tke_cfg),
+               id(ale_cfg), id(visc_cfg), id(tracer_cfg))
+        jfn = _FORCED_JIT_CACHE.get(key)
+        if jfn is None:
+            jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
+                                        out_specs=fs_spec, check_vma=False))
+            _FORCED_JIT_CACHE[key] = jfn
+    else:
+        jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
+                                    out_specs=fs_spec, check_vma=False))
     args = (fm, fs, fop, fstress, ha, seq_folded, *extras)
     args = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(args, in_specs))
     if return_executable:

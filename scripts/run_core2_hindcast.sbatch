@@ -34,6 +34,20 @@ cd $REPO
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export XLA_FLAGS="--xla_gpu_enable_command_buffer="   # cmdbuf off (compile dead-end, PORTING_LESSONS)
 export PYTHONUNBUFFERED=1                              # 1 node, single process: NO JDIST, NO --ragged
+# COMPILE-REUSE (the perf fix). The driver re-jits a fresh closure per chunk ⇒ a full ~27 s XLA
+# recompile EVERY chunk (the perf decomposition found a 96 ms/step model running the hindcast at
+# 562 ms/step). Two layers:
+#  * FESOM_REUSE_EXE: run.py caches the compiled executable in-process and reuses it for same-shape
+#    chunks ⇒ ~6 s/chunk (125 ms/step, ~4.5x). VALIDATED: reuse-vs-fresh divergence == fresh-vs-fresh
+#    divergence (the multi-GPU forced path is non-deterministic at roundoff — atomic scatter-adds in
+#    the halo/element→node/EVP reductions — so reuse adds NO error; negligible for a climatology run).
+#  * persistent XLA disk cache: warms each job's first (compile) chunks from the prior job's cache
+#    (provably identical executable). /work = persistent (not purged).
+export FESOM_REUSE_EXE=1
+export JAX_COMPILATION_CACHE_DIR=/work/ab0995/a270088/port_jax/jax_cache/core2_hindcast
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=1.0
+export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 CONFIG=${CONFIG:-$REPO/configs/core2_full.yaml}
 TAG=${TAG:-core2_hindcast}
@@ -46,10 +60,11 @@ RESTART=$OUT/restart
 SELF=$REPO/scripts/run_core2_hindcast.sbatch
 TOTAL=${TOTAL:-1104528}        # 63 model years: 1958-01-01 -> 2021-01-01 (23011 days x 48 steps/day).
 CANARY=1536                    # first (cold) job: 32 model days — de-risk finiteness + 1 month of output
-# MEASURED (smoke 25852239): all-on CORE2 dist_4/1node ~= 27 s/chunk (48 steps; ~520 ms/step device +
-# ~1.7 s host, serialized by --progress). 60000 steps = 1250 chunks ~= 9.4 h ⇒ safe under 11:45.
-# ~19 production jobs + canary for the full 63 yr (~7 GPU-days total). Tune up only if walltime allows.
-PERJOB=${PERJOB:-60000}
+# MEASURED: all-on CORE2 step = 96 ms; with FESOM_REUSE_EXE the chunk wall is ~6 s/chunk (forcing
+# build + reused executable) = 125 ms/step. 150000 chosen to fit 11:45 even at the SLOWER pcache-only
+# fallback (~11.6 s/chunk ⇒ 10.1 h); at the reuse rate it's ~5.2 h. ~8 production jobs for the 63 yr
+# (~1.6 GPU-days at the reuse rate). Short jobs also backfill more easily on a busy partition.
+PERJOB=${PERJOB:-150000}
 CHUNK=48                       # 1 day at dt=1800 ⇒ daily sampling of the monthly mean (chunk-final snapshot)
 
 mkdir -p $OUT
