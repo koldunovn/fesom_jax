@@ -4508,3 +4508,60 @@ Cite the C source (`file:line`) or dump probe that proves it.
   localize a blow-up to surface-vs-deep and advection-vs-mixing in one cheap gather-free reduction — the single most useful
   sharded stability probe; build it before guessing. (3) OPEN: w_split + intermediate dt (120/150) may UNBLOCK dars — the
   vertical CFL is cured, only the velocity 2Δx remains, which a smaller dt may clear.**
+
+- **[model-paper / the CORE2 hindcast's "520 ms/step" was a DRIVER recompile bug, not model cost; and the
+  multi-GPU forced path is non-deterministic] (`PERCHUNK_RECOMPILE_5X` + `MULTIGPU_FORCED_NONDETERMINISM`) The
+  CORE2 1958–2020 hindcast smoke ran at 520–562 ms/step, ~6× an unrelated forward bench. Decomposition
+  (`scripts/core2_perf_decomp.py` — the PRODUCTION kernel with one physics slot toggled off at a time) showed the
+  all-on step is only **96 ms** (bare 58.6 = the 58 ms bench base + ice 18 + GM 10 + zstar 6 + TKE 3 — every
+  component cheap and linear). The 5.4× was **100 % XLA RECOMPILATION**: `run.py`'s chunk loop calls
+  `run_steps_sharded_forced` per chunk, which builds `jax.jit(jax.shard_map(body))` with a FRESH `body` closure
+  each call ⇒ jit cache MISS ⇒ a full ~27 s recompile EVERY chunk. FIX (commit 4778f50):
+  `run_steps_sharded_forced(reuse_executable=True)` caches the compiled `jfn` in a module dict keyed by all
+  compilation determinants (id(sm/sop/cfgs) + n_steps/dt/bootstrap/folded/ragged/npes/have_bn); `run.py` opts in
+  via env `FESOM_REUSE_EXE` (default OFF ⇒ byte-identical) ⇒ ~6 s/chunk = 125 ms/step (4.5×, ~1.6 GPU-days). A
+  persistent XLA disk cache (`JAX_COMPILATION_CACHE_DIR`) warms each chained job's first compile chunks. **The
+  reuse "bit-identity test" FAILED (max|Δ|≈3e3) — but so does FRESH-vs-FRESH by the SAME per-leaf magnitude
+  (ssh_rhs ~3.4k, uv_rhsAB ~2.6k, sigma ~1.8k, T ~0.36): the multi-GPU forced path is NON-DETERMINISTIC at
+  roundoff (atomic scatter-adds in the halo / element→node / EVP reductions), amplified by stiff cold-start
+  dynamics.** So reuse adds NO error beyond the model's own non-reproducibility. Lessons: (1) a chunked driver
+  re-jitting a fresh closure per chunk is a silent 5× tax — the bench harness dodged it via `return_executable`,
+  only the driver had the bug; ALWAYS confirm a chunked driver reuses its compiled executable. (2) On multi-GPU,
+  "bit-identity" is the WRONG correctness test for a forced run — validate a perf change against FRESH-vs-FRESH
+  noise, not zero. (3) The paper's "portable bit-identical restart" claim must soften to "resumes the trajectory"
+  on GPU multi-device (bit-exact only on a deterministic single-device/CPU path, like any parallel ocean model).
+  See [[fesom-jax-perchunk-recompile-and-nondeterminism]].**
+
+- **[model-paper / hiding the per-chunk forcing build doesn't work in-loop; interp is 75 % but netCDF reads are
+  thread-unsafe ⇒ on-device interp is the real (deferred) lever] (`FORCING_INTERP_75PCT_NETCDF_THREAD_WALL`)
+  After the reuse fix the hindcast sits at 125 ms/step = 92 ms GPU + ~30 ms/step host forcing (forcing is
+  interpolated at RUNTIME, FESOM-style, every step). Two in-loop attempts to hide the host part both FAILED:
+  (a) periodic-blocking instead of per-chunk `block_until_ready` — no effect (the forcing is on the device's
+  critical path; the step CONSUMES it); (b) prefetch next chunk's forcing while the device runs — slightly WORSE
+  (the sharded `partition_step_forcing` device_put queues on the compute stream and backpressures). Reverted both.
+  Measurement (`scripts/core2_forcing_measure.py`): `forcing.stack` (JRA bilinear interp, host) = **1091 ms (75 %)**,
+  `partition_step_forcing` (scatter + device_put) = 367 ms (25 %), per 48-step chunk. The multi-CORE plan (split
+  nodes across threads via the `LocalForcing` sub-mesh machinery) hit a WALL: **netCDF4/HDF5 is NOT thread-safe**
+  — concurrent `read_slice` across sub-readers corrupts (IndexError in the HDF5 read) even with independent file
+  handles. Lessons: (1) `--local-forcing` is a multi-NODE optimization (distribute interp across nodes); on a
+  SINGLE node one host owns all nodes so it can't reduce host work — and CORE2 anti-scales, so adding nodes to
+  split the forcing costs more compute than it saves. (2) JAX implicit async does NOT overlap a per-chunk sharded
+  `device_put` with compute — it backpressures on the compute stream. (3) netCDF4/HDF5 is thread-unsafe ⇒ no
+  naive ThreadPool over readers (use processes, or read serially then thread only the numpy interp). (4) The clean
+  throughput win is **on-device interpolation** (device_put the static bilinear weights once + the small raw JRA
+  records, gather+weight on the GPU — eliminates the host interp AND shrinks the transfer ~4×) — a real `jra55`
+  re-architecture, benefits CORE2/FORCA20/NG5, DEFERRED because R1 runs fine in the background at 4.5× and the
+  paper's critical path is figures. (5) CORE2 split = 75 % interp / 25 % device_put (NG5 was 84/16 — smaller mesh
+  ⇒ relatively bigger fixed device_put). See [[fesom-jax-perchunk-recompile-and-nondeterminism]].**
+
+- **[model-paper / `ice: {}` is STANDARD EVP, not mEVP — the hindcast config silently had the wrong ice rheology]
+  (`ICE_WHICHEVP_DEFAULT_STDEVP`) `configs/core2_full.yaml` had `ice: {}` (= `IceConfig()` defaults) with a comment
+  "mEVP sea ice" — but `IceConfig.whichEVP` defaults to **0 = standard EVP**; mEVP is `whichEVP=1`. So R1 would
+  have run standard EVP, contradicting the all-on intent. The VALIDATED JAMES all-on config is explicit
+  (`core2_kpp_climate_run.py:268` = `IceConfig(whichEVP=1)`). Fixed to `ice: {whichEVP: 1}` (commit 0300158);
+  `ice_dt` stays the 500 default as those validated runs used (NOT the ocean dt, despite the IceConfig docstring —
+  the validated runs override neither). Re-smoke GREEN. Lessons: (1) `{}` = "defaults", and the DEFAULT ice
+  rheology is standard EVP, not mEVP — every other paper config sets `ice: {whichEVP: 1}` explicitly with a
+  warning comment; trust the VALIDATED config-construction code, not a hopeful YAML comment. (2) When matching a
+  Fortran run, diff the JAX sub-config DEFAULTS against the namelist (here surfaced `ice_diff`=10 in JAX vs 0 in
+  the FORCA20 namelist — flagged in `docs/CORE2_FORTRAN_SPEC.md`).**
