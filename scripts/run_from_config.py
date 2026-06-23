@@ -85,6 +85,12 @@ def main():
     ap.add_argument("--daily-start-step", type=int, default=0,
                     help="begin daily output only after this absolute step (e.g. the year-1 end "
                          "175200 ⇒ daily output from year 2 onward)")
+    ap.add_argument("--monthly-out", default=None,
+                    help="write monthly-mean ushow zarrs (full temp/salt/u/v + ssh/a_ice/m_ice) to "
+                         "this dir, one <YYYY>_<MM> per calendar month; gather-free (the CORE2 "
+                         "1958-2020 hindcast climatology output)")
+    ap.add_argument("--monthly-start-step", type=int, default=0,
+                    help="begin monthly output only after this absolute step")
     ap.add_argument("--chunk-diagnostics", action="store_true",
                     help="print gather-free max|uv|/max|eta| health after EACH chunk (a blow-up "
                          "trajectory probe — pair with a small --chunk-steps; lead process only)")
@@ -153,6 +159,7 @@ def main():
                           use_ragged=args.ragged, progress=(args.progress and _IS_LEAD),
                           local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
                           daily_out=args.daily_out, daily_start_step=args.daily_start_step,
+                          monthly_out=args.monthly_out, monthly_start_step=args.monthly_start_step,
                           chunk_diagnostics=args.chunk_diagnostics)
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")

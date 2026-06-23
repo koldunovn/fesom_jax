@@ -291,3 +291,41 @@ def test_daily_output(core2_setup, tmp_path):
                     daily_out=str(daily2), daily_start_step=10_000, **common)
     assert not list(daily2.glob("day_*")), "daily_start_step gate must suppress output before it"
     print(f"DAILY_OUTPUT_OK ({len(days)} day zarrs {days}; fields {sorted(keys - {'lon', 'lat'})})")
+
+
+@have_forcing
+def test_monthly_output(core2_setup, tmp_path):
+    """Monthly-mean output (the CORE2 1958-2020 hindcast climatology): one ushow-readable zarr per
+    calendar month with FULL temp/salt/u/v (3-D) + ssh/a_ice/m_ice (2-D), gather-free, gated on
+    ``monthly_start_step``. A 60-step run at DT=1800 stays within January 1958 ⇒ the final-flush
+    writes one month (``1958_01``) with the right fields, finite owned means, and ``n_samples>0``
+    (``init().update()`` folds the first sample — a count=0 month would write all zeros). The
+    month-ROLLOVER write is the daily rollover's twin (exercised by the day-boundary cross in
+    test_daily_output)."""
+    import zarr
+    fx = core2_setup
+    n = 60                                                # 1.25 days at DT=1800 — all within Jan 1958
+    stack = fx["cf"].stack(_chunk_dates(YEAR, DT, 0, n, None))
+    common = dict(forcing=fx["cf"], forcing_stack=stack, mesh=fx["mesh"], part=fx["part"],
+                  sm=fx["sm"], sop=fx["sop"], year=YEAR, chunk_steps=12)
+    monthly = tmp_path / "monthly"
+    run_from_config(RunConfig(n_steps=n, kpp=KppConfig(), dt=DT), state0=fx["state"],
+                    monthly_out=str(monthly), monthly_start_step=0, **common)
+    months = sorted(p.name for p in monthly.glob("[0-9]*_[0-9]*"))
+    assert months == ["1958_01"], f"expected the partial-Jan flush, got {months}"
+    g = zarr.open_group(str(monthly / months[0]), "r")
+    keys = set(g.array_keys())
+    assert {"temp", "salt", "u", "v", "ssh", "a_ice", "m_ice", "lon", "lat"} <= keys, f"fields {keys}"
+    assert g["temp"].ndim == 2 and g["ssh"].ndim == 1, "temp is [nz,nod2] (3-D); ssh is [nod2] (2-D)"
+    assert int(g.attrs["n_samples"]) > 0, "init().update() must fold samples (count>0, not zeros)"
+    lat, temp = np.asarray(g["lat"]), np.asarray(g["temp"])
+    owned = lat > -89.0                                   # non-sentinel (real-owner) lanes
+    assert owned.any() and np.all(np.isfinite(temp[:, owned])), "owned monthly temp means finite"
+
+    # the start-step gate: with monthly_start_step past the run, NOTHING is written
+    monthly2 = tmp_path / "monthly2"
+    run_from_config(RunConfig(n_steps=n, kpp=KppConfig(), dt=DT), state0=fx["state"],
+                    monthly_out=str(monthly2), monthly_start_step=10_000, **common)
+    assert not list(monthly2.glob("[0-9]*_[0-9]*")), "monthly_start_step gate must suppress output"
+    print(f"MONTHLY_OUTPUT_OK ({months}; fields {sorted(keys - {'lon', 'lat'})}, "
+          f"n_samples={int(g.attrs['n_samples'])})")

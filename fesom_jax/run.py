@@ -174,7 +174,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
                     accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
                     local_forcing=None, checkpoint_every=None,
-                    daily_out=None, daily_start_step=0, chunk_diagnostics=False):
+                    daily_out=None, daily_start_step=0,
+                    monthly_out=None, monthly_start_step=0, chunk_diagnostics=False):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -281,6 +282,22 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 attrs={"calendar_date": f"{yr:04d}-doy{doy:03d}", "n_samples": st.nobs(),
                        "depth_100m_level": int(k100)})
 
+    # monthly-mean output (the CORE2 1958-2020 hindcast climatology): FULL 3-D temp/salt/u/v + 2-D
+    # ssh/a_ice/m_ice, accumulated per CALENDAR MONTH into a gather-free OnlineStats (chunk-final
+    # samples; ~1/day at chunk_steps=48,dt=1800 ⇒ ~30/month ⇒ a real monthly mean), written as one
+    # ushow-readable sharded zarr per month at the rollover. Active for steps > monthly_start_step.
+    # Like daily_out, the accumulator does NOT persist across chain-job processes ⇒ a month straddling
+    # a job boundary keeps only its post-boundary samples (~1 month per multi-year segment ⇒ negligible
+    # for a multi-decadal climatology). Parallels the daily_out path (kept separate, not merged: only
+    # one cadence runs per mesh — CORE2 monthly, FORCA20 daily — so duplication beats coupling here).
+    monthly_stats = monthly_key = None
+    if monthly_out is not None:
+        def _write_monthly(key, st):
+            yr, mo = key
+            ushow_output.write_ushow_sharded(
+                f"{monthly_out}/{yr:04d}_{mo:02d}", st.mean_dict(), sm, part, mesh,
+                attrs={"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": st.nobs()})
+
     t_loop0 = time.perf_counter()
     cur_year = int(year)                     # the year the forcing reader was built for
     for ci, ch in enumerate(chunks):
@@ -363,6 +380,21 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                            else daily_stats.update(samp))
             daily_day = day
 
+        if monthly_out is not None and step_now > monthly_start_step:
+            yr, _, _, mo = _chunk_dates(year, cfg.dt, step_now, 1, cfg.dt_ramp)[0]
+            key = (int(yr), int(mo))
+            samp = {"temp": state_p.T, "salt": state_p.S,
+                    "u": state_p.uvnode[:, :, 0], "v": state_p.uvnode[:, :, 1],
+                    "ssh": state_p.eta_n, "a_ice": state_p.a_ice, "m_ice": state_p.m_ice}
+            if monthly_stats is not None and key != monthly_key:
+                _write_monthly(monthly_key, monthly_stats)   # the previous calendar month completed
+                monthly_stats = None
+            # init().update() folds the FIRST sample too (init alone is count=0/zeros) — so a
+            # single-chunk partial month at a job boundary writes its real value, not zeros.
+            monthly_stats = (zarr_output.OnlineStats.init(samp).update(samp) if monthly_stats is None
+                             else monthly_stats.update(samp))
+            monthly_key = key
+
         # rolling intermediate checkpoint: when this chunk crossed a `checkpoint_every` step
         # boundary (and it's not the last chunk — the final restart covers that), overwrite the
         # restart so a crash resumes from here. start_step from the restart metadata.
@@ -393,4 +425,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # flush the final (partial) calendar day so the last day of the run/job is written too
     if daily_out is not None and daily_stats is not None:
         _write_daily(daily_day, daily_stats)
+    # flush the final (partial) calendar month so the last month of the run/job is written too
+    if monthly_out is not None and monthly_stats is not None:
+        _write_monthly(monthly_key, monthly_stats)
     return RunResult(state_p=state_p, stats=stats, step=end_step, dt_stage=float(end_dt))
