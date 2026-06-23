@@ -53,7 +53,7 @@ srun --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
     --restart-out "$RESTART" $RIN &
 SRUN_PID=$!
 
-GUARD_SECS=${GUARD_SECS:-1800}
+GUARD_SECS=${GUARD_SECS:-900}
 t0=$SECONDS; HUNG=0
 while kill -0 $SRUN_PID 2>/dev/null; do
   grep -q "chunk 1/" "$LOGFILE" 2>/dev/null && break
@@ -65,7 +65,7 @@ if [ "$HUNG" -eq 1 ]; then
   HC=$(( $(cat $OUT/.hangcount 2>/dev/null || echo 0) + 1 )); echo $HC > $OUT/.hangcount
   echo "GUARD: COMPILE-HANG — no 'chunk 1/' in ${GUARD_SECS}s (consecutive #$HC); killing srun ($(date))"
   kill $SRUN_PID 2>/dev/null; sleep 5; kill -9 $SRUN_PID 2>/dev/null; wait $SRUN_PID 2>/dev/null
-  if [ "$HC" -ge 3 ]; then echo "DARS_STAB_STOP (3 consecutive compile-hangs — needs a human)"; exit 1; fi
+  if [ "$HC" -ge 6 ]; then echo "DARS_STAB_STOP (6 consecutive compile-hangs — needs a human)"; exit 1; fi
   echo "GUARD: self-healing — resubmitting ($(date))"; cd $REPO && sbatch scripts/run_dars_stability.sbatch; exit 0
 fi
 
