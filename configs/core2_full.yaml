@@ -11,7 +11,9 @@ gm: {}             # GM on (CORE2 ~1° needs the mesoscale-eddy parameterization
                    # TODO: confirm k_gm / Redi_Kmax against the matched-Fortran namelist.oce
 kpp: null          # vertical mixing: the existing JAX CORE2 used TKE — TODO confirm KPP vs TKE
 tke: {}            # classical-TKE prognostic mixing (the JAMES-paper all-on default)
-ice: {}            # mEVP sea ice
+ice: {whichEVP: 1}  # mEVP sea-ice rheology (Bouillon 2013). whichEVP=1 = mEVP; the default 0 is
+                    # STANDARD EVP. Matches the validated JAMES all-on run IceConfig(whichEVP=1)
+                    # (core2_kpp_climate_run.py:268); ice_dt stays the 500 default as those runs used.
 
 visc: {}           # CORE2 default γ's (gamma1 = 0.1)
 

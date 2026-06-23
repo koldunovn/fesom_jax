@@ -25,6 +25,11 @@ cd $REPO
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export XLA_FLAGS="--xla_gpu_enable_command_buffer="   # cmdbuf off (compile dead-end, PORTING_LESSONS)
 export PYTHONUNBUFFERED=1                              # 1 node, single process: NO JDIST
+# match the R1 production path: executable reuse + persistent compile cache (validates both end-to-end)
+export FESOM_REUSE_EXE=1
+export JAX_COMPILATION_CACHE_DIR=/work/ab0995/a270088/port_jax/jax_cache/core2_smoke
+export JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=1.0 JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=0
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
 
 MESH=data/mesh_core2
 IC=data/ic_core2
