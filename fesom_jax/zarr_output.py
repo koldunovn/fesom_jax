@@ -61,7 +61,7 @@ def _folded_gid_owned(part, sm, kind: str):
     return gid, owned
 
 
-def write_state_zarr(out_dir, state_folded, sm, part, *, fields=None, attrs=None):
+def write_state_zarr(out_dir, state_folded, sm, part, *, fields=None, attrs=None, layout="folded"):
     """Write the *folded sharded* ``state_folded`` to a Zarr store at ``out_dir`` — each
     process writes ONLY its addressable shards, in parallel, no gather.
 
@@ -70,7 +70,16 @@ def write_state_zarr(out_dir, state_folded, sm, part, *, fields=None, attrs=None
     ``run_steps_sharded(..., return_executable=True)`` then ``jfn(*args)``). Rank 0 creates
     the array metadata + the per-kind index maps; a multi-host barrier; then every process
     writes its local device shards (``arr.addressable_shards`` → one ``Lmax``-chunk each).
-    Returns the store path."""
+
+    ``layout``: ``"folded"`` (default) = the gather-free ``[P*Lmax]`` sharded write described above
+    (partition-DEPENDENT on-disk shape, carries gid/owned maps to reload onto any device count).
+    ``"global"`` = **partition-INDEPENDENT** canonical global-node order (see
+    :func:`_write_state_global`): byte-identical at any device count, read back by global index
+    directly; works single- AND multi-process (host-gather / all_gather). Returns the store path."""
+    if layout == "global":
+        return _write_state_global(out_dir, state_folded, sm, part, fields=fields, attrs=attrs)
+    if layout != "folded":
+        raise ValueError(f"layout must be 'folded' or 'global', got {layout!r}")
     import zarr
     from jax.experimental import multihost_utils
 
@@ -114,13 +123,101 @@ def write_state_zarr(out_dir, state_folded, sm, part, *, fields=None, attrs=None
     return out_dir
 
 
+# Entity-axis chunk for canonical restarts. P-INDEPENDENT (depends only on n_global) ⇒ a restart is
+# byte-identical at any device/process count; large enough that small meshes are one chunk, small enough
+# that a huge mesh (NG5) splits into a handful of chunks for parallel multi-process disjoint writes.
+_RESTART_CHUNK = 1_000_000
+
+
+def _write_state_global(out_dir, state_folded, sm, part, *, fields=None, attrs=None):
+    """Canonical global-node-order (**partition-independent**) State write — the ``layout='global'``
+    path of :func:`write_state_zarr` (mirrors the FESOM3 ``mod_io_zarr`` layout).
+
+    Each leaf's UNIQUE-owner lanes are scattered by global id into a dense ``[n_global_kind, …]`` array
+    in canonical order, full dtype (float64 state preserved), no folded lane axis / FILL / gid maps. The
+    store is **byte-identical at any device/process count** (a P-independent chunk grid) and reads back
+    by global index directly (:func:`reconstruct_global` short-circuits on the ``layout`` attr).
+
+    Works **single- AND multi-process**, like the output writer's ``all_gather`` method:
+
+    * **single-process** — host-gathers each leaf (``np.asarray``) and writes it (one writer);
+    * **multi-process** — ``all_gather`` gives every process the full folded leaf (no single-node
+      funnel), each scatters to canonical global and writes its DISJOINT chunk range. Handles BOTH
+      ``nod`` and ``elem`` State kinds. Host peak ≈ one global leaf (streamed one leaf at a time)."""
+    import zarr
+
+    from . import halo
+    out_dir = Path(out_dir)
+    fields = tuple(fields) if fields is not None else DEFAULT_FIELDS
+    leaves = {name: getattr(state_folded, name) for name in fields}
+    P = int(sm.P)
+    n_global = {"nod": int(sm.nod2D), "elem": int(sm.elem2D), "edge": int(sm.edge2D)}
+    multiproc = jax.process_count() > 1
+    pid, nproc = jax.process_index(), jax.process_count()
+    maps: dict = {}                                          # gid/owned per kind, computed once
+
+    def _go(kind):
+        if kind not in maps:
+            maps[kind] = _folded_gid_owned(part, sm, kind)
+        return maps[kind]
+
+    # rank 0 creates the store + every dataset (C-chunked, C independent of P → byte-identical bytes).
+    if pid == 0:
+        root = zarr.open_group(str(out_dir), mode="a")
+        for name, arr in leaves.items():
+            kind = _kind_of(arr.shape[0], P, sm.Lmax)
+            ng = n_global[kind]
+            shape = (ng,) + tuple(int(s) for s in arr.shape[1:])
+            chunks = (min(ng, _RESTART_CHUNK),) + shape[1:]
+            z = root.require_dataset(name, shape=shape, chunks=chunks,
+                                     dtype=np.dtype(arr.dtype), overwrite=True)
+            z.attrs["kind"] = kind
+        root.attrs.update(P=P, nod2D=int(sm.nod2D), elem2D=int(sm.elem2D), edge2D=int(sm.edge2D),
+                          nl=int(sm.nl), layout="canonical_global", **(attrs or {}))
+    if multiproc:
+        from jax.experimental import multihost_utils
+        multihost_utils.sync_global_devices("restart_global_meta")
+
+    gather = None
+    if multiproc:
+        from . import canonical_redist as cr
+        jmesh = halo.device_mesh("p", devices=jax.devices()[:P])
+        gather = cr._allgather_callable(jmesh, "p")
+
+    root = zarr.open_group(str(out_dir), mode="a")
+    for name, arr in leaves.items():
+        kind = _kind_of(arr.shape[0], P, sm.Lmax)
+        gid, owned = _go(kind)
+        ng = n_global[kind]
+        folded_host = np.asarray(gather(arr)) if multiproc else np.asarray(arr)   # full folded leaf
+        g = np.zeros((ng,) + folded_host.shape[1:], dtype=folded_host.dtype)
+        g[gid[owned]] = folded_host[owned]                  # canonical [n_global, …]
+        # this process writes its DISJOINT whole-chunk range (single-process ⇒ the whole leaf)
+        C = min(ng, _RESTART_CHUNK)
+        nchunks = (ng + C - 1) // C
+        cpp = (nchunks + nproc - 1) // nproc
+        r0 = pid * cpp * C
+        r1 = min(min((pid + 1) * cpp, nchunks) * C, ng)
+        if r1 > r0:
+            root[name][r0:r1] = g[r0:r1]
+    if multiproc:
+        from jax.experimental import multihost_utils
+        multihost_utils.sync_global_devices("restart_global_data")
+    return out_dir
+
+
 def reconstruct_global(out_dir, field: str):
-    """Read a folded Zarr field back to a dense global ``[n_global, …]`` array (host numpy):
-    scatter the OWNED lanes by their global id. Inverse of :func:`write_state_zarr` for one
-    field — for analysis / validation, not the hot path."""
+    """Read a Zarr restart field back to a dense global ``[n_global, …]`` array (host numpy).
+
+    Auto-detects the on-disk layout: a ``layout='canonical_global'`` store (the partition-independent
+    default) is ALREADY dense global ⇒ returned as-is; a folded store scatters the OWNED lanes by
+    their global id. Inverse of :func:`write_state_zarr` for one field — for analysis / the restart
+    reload, not the hot path."""
     import zarr
     root = zarr.open_group(str(Path(out_dir)), mode="r")
     z = root[field]
+    if root.attrs.get("layout") == "canonical_global":
+        return z[:]                                           # already dense global [n_global, …]
     kind = z.attrs["kind"]
     data = z[:]                                            # [P*Lmax, …]
     gid = root[f"gid_{kind}"][:]
@@ -147,8 +244,14 @@ def _all_state_fields() -> tuple[str, ...]:
 
 
 def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_stage,
-                  fields=None, attrs=None):
+                  fields=None, attrs=None, layout="global"):
     """Write the **FULL** prognostic ``State`` as a device-count-portable restart.
+
+    ``layout`` defaults to ``"global"`` = **partition-independent** canonical node order: the restart
+    is byte-identical regardless of the device count it was written from, and reads back by global
+    index (no folded lane axis / gid maps). Works single- AND multi-process (host-gather / all_gather —
+    see :func:`_write_state_global`). ``"folded"`` is the gather-free sharded write (fastest / huge-mesh
+    OOM escape); :func:`read_restart` auto-detects either on-disk layout and reloads onto any device count.
 
     Unlike :func:`write_state_zarr` (which writes the ``DEFAULT_FIELDS`` snapshot
     subset), this writes **every** ``State`` leaf — all history/carry slots
@@ -169,7 +272,7 @@ def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_st
             "calendar_date": str(calendar_date), "dt_stage": float(dt_stage)}
     if attrs:
         meta.update(attrs)
-    return write_state_zarr(out_dir, state_folded, sm, part, fields=fields, attrs=meta)
+    return write_state_zarr(out_dir, state_folded, sm, part, fields=fields, attrs=meta, layout=layout)
 
 
 def read_restart(out_dir, mesh, new_part, *, devices=None):

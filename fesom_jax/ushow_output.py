@@ -28,22 +28,36 @@ TIME_DIM = "time"      # in ushow's TIME_NAMES
 
 
 def write_ushow_zarr(out_dir, lon, lat, *, fields2d=None, fields3d=None,
-                     units=None, attrs=None):
+                     units=None, attrs=None, chunk_horiz=None, chunk_vert=None):
     """Write an ushow-readable zarr store.
 
     ``lon``/``lat``: ``[N]`` node coordinates **in degrees**. ``fields2d``: ``{name: [N]}`` (surface
     / 2-D). ``fields3d``: ``{name: [N, nlev]}`` (stored transposed to ``[nlev, N]`` = ``[nz, nod2]``).
-    ``units``: optional ``{name: str}``. ``attrs``: optional store-level metadata. Returns the path."""
+    ``units``: optional ``{name: str}``. ``attrs``: optional store-level metadata.
+
+    ``chunk_horiz`` / ``chunk_vert``: optional **user-controlled** chunk sizes along the node
+    (``nod2``) and depth (``nz``) axes (the FESOM3 ``chunk_horiz``/``chunk_vert`` knobs); ``None`` =
+    one chunk per axis (the prior behaviour). Chunking is independent of any partition. Returns the
+    path."""
     import zarr
 
     out_dir = str(out_dir)
     root = zarr.open_group(out_dir, mode="w")
     units = units or {}
 
+    def _chunks(dims, shape):
+        ch = list(shape)
+        for i, d in enumerate(dims):
+            if d == NODE_DIM and chunk_horiz:
+                ch[i] = min(int(chunk_horiz), shape[i])
+            elif d == DEPTH_DIM and chunk_vert:
+                ch[i] = min(int(chunk_vert), shape[i])
+        return tuple(ch)
+
     def _put(name, data, dims):
         data = np.ascontiguousarray(data)
         a = root.create_dataset(name, data=data, shape=data.shape, dtype=data.dtype,
-                                chunks=data.shape, overwrite=True)
+                                chunks=_chunks(dims, data.shape), overwrite=True)
         a.attrs["_ARRAY_DIMENSIONS"] = list(dims)
         if name in units:
             a.attrs["units"] = units[name]
@@ -129,6 +143,70 @@ def write_ushow_sharded(out_dir, fields, sm, part, mesh, *, attrs=None):
                 z[:, lane_slice] = masked.T                  # [nlev, P*Lmax]: transpose [chunk,nlev]→[nlev,chunk]
     _barrier("ushow_data")
     return out_dir
+
+
+def write_global_zarr(out_dir, fields, sm, part, mesh, *, method="auto", chunk_horiz=None,
+                      chunk_vert=None, units=None, attrs=None):
+    """Write **partition-independent, canonical global-node-order** output — the clean alternative to
+    the folded :func:`write_ushow_sharded` (it mirrors the FESOM3 ``mod_io_zarr`` on-disk layout).
+
+    ``fields``: ``{name: folded [P*Lmax_nod, …] array}`` (a sharded ``jax.Array`` or host numpy) — the
+    SAME input as :func:`write_ushow_sharded`. Each node's UNIQUE-owner lane is placed (by global id)
+    into a dense ``[nod2D]`` / ``[nod2D, nz]`` array in **canonical global order**. The store is
+    **partition-independent** (byte-identical at any device count — the FESOM3 ``dist_2 ≡ dist_8``
+    property), **directly node-indexed** (``xr.open_zarr`` → ``[nod2]``, no ``ushow_to_nodes`` unfold;
+    ushow/pyfesom2 read it as-is), and **user-chunkable** (``chunk_horiz``/``chunk_vert``).
+
+    ``method`` selects HOW the canonical array is assembled (all give a byte-identical store):
+
+    * ``"auto"`` (default) — ``"host_gather"`` when single-process, else ``"redistribute"``.
+    * ``"host_gather"`` — SINGLE-process: ``np.asarray`` the folded array to this host + scatter by id
+      (fine while one global field fits host RAM, ≤ FORCA20). Raises if multi-process.
+    * ``"redistribute"`` — MULTI-process, **no single-node gather**: one ``ragged_all_to_all`` ships
+      owned lanes to their chunk-owner device, which writes its chunks (see :mod:`canonical_redist`).
+    * ``"all_gather"`` — MULTI-process baseline: gather the field to every device, each process writes
+      a disjoint chunk range (replicates the field per device; for the throughput comparison)."""
+    if method == "auto":
+        # 1 process → host_gather (simplest). Multi-process → all_gather: the throughput bench found
+        # the ragged_all_to_all 'redistribute' ~6× slower (the primitive itself is ~7.7 s/CORE2-payload
+        # vs all_gather ~1.5 s), and all_gather's per-device replication is fine ≤ FORCA20. Use
+        # 'redistribute' (no replication) explicitly only when all_gather would OOM (huge multi-node mesh).
+        method = "host_gather" if jax.process_count() == 1 else "all_gather"
+    if method == "redistribute":
+        from .canonical_redist import write_redistribute
+        return write_redistribute(out_dir, fields, sm, part, mesh, chunk_horiz=chunk_horiz,
+                                  chunk_vert=chunk_vert, attrs=attrs)
+    if method == "all_gather":
+        from .canonical_redist import write_all_gather
+        return write_all_gather(out_dir, fields, sm, part, mesh, chunk_horiz=chunk_horiz,
+                                chunk_vert=chunk_vert, attrs=attrs)
+    if method != "host_gather":
+        raise ValueError(f"write_global_zarr: unknown method {method!r} (host_gather|redistribute|"
+                         "all_gather|auto)")
+    if jax.process_count() > 1:
+        raise NotImplementedError(
+            "method='host_gather' host-gathers owned lanes onto one node (single-process only); a "
+            "multi-process run must use method='redistribute' (no single-node gather) or 'all_gather'.")
+    gid, owned = _folded_gid_owned_nod(part, sm)              # [P*Lmax_nod] each
+    nod2D = int(sm.nod2D)
+    nowned = int(np.asarray(owned).sum())
+    if nowned != nod2D:
+        raise ValueError(f"owned lanes ({nowned}) != nod2D ({nod2D}); each node must have exactly one "
+                         "owner — mesh/partition mismatch?")
+    g_idx = gid[owned]                                        # global id of each owned lane
+    glon, glat = node_lonlat(mesh)
+    f2d, f3d = {}, {}
+    for name, arr in fields.items():
+        host = arr if isinstance(arr, np.ndarray) else np.asarray(arr)   # folded [P*Lmax, …] on host
+        ow = host[owned]                                                 # owned lanes (drops halo/pad)
+        g = np.zeros((nod2D,) + ow.shape[1:], dtype=host.dtype)
+        g[g_idx] = ow                                                    # canonical [nod2D] / [nod2D, nlev]
+        (f2d if g.ndim == 1 else f3d)[name] = g
+    meta = {"layout": "canonical_global", "nod2D": nod2D, "P": int(sm.P)}
+    if attrs:
+        meta.update(attrs)
+    return write_ushow_zarr(out_dir, glon, glat, fields2d=f2d, fields3d=f3d, units=units,
+                            attrs=meta, chunk_horiz=chunk_horiz, chunk_vert=chunk_vert)
 
 
 def _folded_gid_owned_nod(part, sm):

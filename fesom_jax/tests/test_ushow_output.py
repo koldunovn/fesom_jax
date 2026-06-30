@@ -74,3 +74,49 @@ def test_ushow_sharded_owned_only(tmp_path):
     recon[gid[owned]] = lf[owned]
     assert not np.isnan(recon).any(), "some node was not written by its owner"
     assert np.allclose(recon, glat.astype(np.float32), atol=1e-4)
+
+
+@pytest.mark.skipif(not CORE2_MESH.exists(), reason="CORE2 mesh not present")
+def test_global_zarr_canonical_partition_independent(tmp_path):
+    """The CANONICAL writer (:func:`write_global_zarr`): owned lanes scatter into dense global
+    ``[nod2]`` / ``[nz, nod2]`` order, so the store is node-indexed directly (no unfold), chunk-
+    controlled, and **partition-INDEPENDENT** — a different device count gives a byte-identical store
+    (the FESOM3 ``dist_2 ≡ dist_8`` property)."""
+    import zarr
+
+    from fesom_jax import partit, shard_mesh
+    from fesom_jax.mesh import load_mesh
+    from fesom_jax.ushow_output import node_lonlat, write_global_zarr
+    mesh = load_mesh(CORE2_MESH)
+    nod2D, nz = mesh.nod2D, 3
+
+    def canon(npes, out):
+        part = partit.synth_block_partition(mesh.nod2D, mesh.elem2D, mesh.edge2D, npes)
+        sm = shard_mesh.build_sharded_mesh(mesh, part)
+        from fesom_jax.ushow_output import _folded_gid_owned_nod
+        gid, owned = _folded_gid_owned_nod(part, sm)
+        gsafe = np.clip(gid, 0, None)
+        # folded fields whose owned lanes carry the GLOBAL node id (2-D) and id+level/1000 (3-D)
+        f2 = np.where(owned, gsafe, -1).astype(np.float64)
+        f3 = np.where(owned[:, None],
+                      gsafe[:, None] + np.arange(nz)[None, :] / 1000.0, -1).astype(np.float64)
+        write_global_zarr(out, {"id2d": f2, "id3d": f3}, sm, part, mesh,
+                          chunk_horiz=20000, chunk_vert=2)
+        return zarr.open_group(str(out), mode="r")
+
+    ra = canon(4, tmp_path / "p4.zarr")
+    # (1) canonical order: id2d[node] == node EXACTLY (node ids < 2^24 are exact in float32)
+    np.testing.assert_array_equal(np.asarray(ra["id2d"]), np.arange(nod2D, dtype=np.float32))
+    id3d = np.asarray(ra["id3d"])                                   # [nz, nod2]
+    assert id3d.shape == (nz, nod2D)
+    for k in range(nz):
+        np.testing.assert_array_equal(id3d[k], (np.arange(nod2D) + k / 1000.0).astype(np.float32))
+    # (2) user chunking honoured + node-indexed dims
+    assert ra["id2d"].chunks == (20000,) and ra["id3d"].chunks == (2, 20000)
+    assert list(ra["id3d"].attrs["_ARRAY_DIMENSIONS"]) == ["nz", "nod2"]
+    glon, _ = node_lonlat(mesh)
+    np.testing.assert_allclose(np.asarray(ra["lon"]), glon)
+    # (3) partition-independence: a DIFFERENT npes ⇒ byte-identical store
+    rb = canon(8, tmp_path / "p8.zarr")
+    for v in ("lon", "lat", "id2d", "id3d"):
+        np.testing.assert_array_equal(np.asarray(ra[v]), np.asarray(rb[v]))

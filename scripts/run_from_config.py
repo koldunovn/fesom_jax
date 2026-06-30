@@ -94,7 +94,20 @@ def main():
     ap.add_argument("--chunk-diagnostics", action="store_true",
                     help="print gather-free max|uv|/max|eta| health after EACH chunk (a blow-up "
                          "trajectory probe — pair with a small --chunk-steps; lead process only)")
+    ap.add_argument("--output-layout", choices=["global", "folded"], default=None,
+                    help="output + restart on-disk layout. 'global' = partition-independent canonical "
+                         "node order — xarray/ushow read it directly (no unfold), byte-identical at "
+                         "any device count; 'folded' = the gather-free sharded [P*Lmax] write — "
+                         "multi-process OUTPUT uses all_gather (the restart auto-folds). DEFAULT: "
+                         "'global' everywhere. Pass 'folded' for the gather-free fastest write, or if "
+                         "all_gather output would OOM on a huge multi-node mesh.")
     args = ap.parse_args()
+    # Default to the partition-independent 'global' canonical layout EVERYWHERE: single-process
+    # host-gathers, multi-process output uses all_gather (and the restart auto-folds, since the
+    # canonical restart writer is single-process — see run.py). Set --output-layout folded for the
+    # gather-free fastest write or if all_gather output OOMs on a huge multi-node mesh.
+    if args.output_layout is None:
+        args.output_layout = "global"
 
     cfg = load_yaml(args.config)
     import dataclasses
@@ -160,7 +173,7 @@ def main():
                           local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
                           daily_out=args.daily_out, daily_start_step=args.daily_start_step,
                           monthly_out=args.monthly_out, monthly_start_step=args.monthly_start_step,
-                          chunk_diagnostics=args.chunk_diagnostics)
+                          chunk_diagnostics=args.chunk_diagnostics, output_layout=args.output_layout)
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")

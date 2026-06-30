@@ -177,3 +177,52 @@ def test_restart_portable_ok(tmp_path):
     _roundtrip(tmp_path, mesh, g0, 2, 4)
     _roundtrip(tmp_path, mesh, g0, 4, 1)                   # also P=4 → single-device
     print("RESTART_PORTABLE_OK")
+
+
+# --------------------------------------------------------------------------
+# 5. Partition-INDEPENDENCE of the canonical (default) restart + the folded path
+# --------------------------------------------------------------------------
+@avail
+def test_restart_folded_layout_roundtrip(tmp_path):
+    """The 'folded' layout (the multi-node / output-OOM path) still round-trips the full State and
+    carries the gid/owned maps; `reconstruct_global` auto-detects it."""
+    import zarr
+    mesh = load_mesh(PI_MESH)
+    g0 = _signature_state(mesh)
+    saved, sm, part = _to_folded_sharded(g0, mesh, min(2, NDEV))
+    d = tmp_path / "rt_folded"
+    zo.write_restart(d, saved, sm, part, step=7, calendar_date="1958-01-02", dt_stage=1800.0,
+                     layout="folded")
+    root = zarr.open_group(str(d), mode="r")
+    assert "gid_nod" in root and root.attrs.get("layout") != "canonical_global"
+    for f in dataclasses.fields(State):
+        g = zo.reconstruct_global(d, f.name)
+        assert np.array_equal(g, np.asarray(getattr(g0, f.name))), f"{f.name}: folded roundtrip"
+
+
+@avail
+@need4
+def test_restart_canonical_partition_independent(tmp_path):
+    """The DEFAULT (canonical 'global') restart is partition-INDEPENDENT: the same global State saved
+    from P=4 vs P=2 yields BYTE-identical on-disk arrays (the FESOM3 ``dist_2 ≡ dist_8`` property), it
+    carries NO folded lane axis / gid maps, and it still reloads bit-exactly onto a different P."""
+    import zarr
+    mesh = load_mesh(PI_MESH)
+    g0 = _signature_state(mesh)
+    s4, sm4, p4 = _to_folded_sharded(g0, mesh, 4)
+    s2, sm2, p2 = _to_folded_sharded(g0, mesh, 2)
+    d4, d2 = tmp_path / "ci_p4", tmp_path / "ci_p2"
+    zo.write_restart(d4, s4, sm4, p4, step=1, calendar_date="1958-01-01", dt_stage=1800.0)  # default global
+    zo.write_restart(d2, s2, sm2, p2, step=1, calendar_date="1958-01-01", dt_stage=1800.0)
+    r4 = zarr.open_group(str(d4), mode="r"); r2 = zarr.open_group(str(d2), mode="r")
+    assert r4.attrs["layout"] == "canonical_global" and "gid_nod" not in r4
+    for f in dataclasses.fields(State):
+        assert np.array_equal(np.asarray(r4[f.name]), np.asarray(r2[f.name])), \
+            f"{f.name}: canonical restart differs across source partition (not partition-independent)"
+    # the canonical restart reloads bit-exactly onto a DIFFERENT device count
+    loaded, _ = zo.read_restart(d4, mesh, p2)
+    ref = shard_mesh.partition_state(g0, p2)
+    got = _unfold_host(loaded, 2)
+    for f in dataclasses.fields(State):
+        assert np.array_equal(np.asarray(getattr(ref, f.name)), got[f.name]), f"{f.name}: P4->P2 reload"
+    print("RESTART_PARTITION_INDEPENDENT_OK")

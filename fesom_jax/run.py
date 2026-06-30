@@ -182,7 +182,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
                     local_forcing=None, checkpoint_every=None,
                     daily_out=None, daily_start_step=0,
-                    monthly_out=None, monthly_start_step=0, chunk_diagnostics=False):
+                    monthly_out=None, monthly_start_step=0, chunk_diagnostics=False,
+                    output_layout="global"):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -195,6 +196,24 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     :class:`RunResult`; writes the portable restart to ``out_dir`` / ``cfg.restart_out`` if set."""
     cfg.validate()
     npes = part.npes
+    # Output / restart on-disk layout. 'global' (default) = partition-INDEPENDENT canonical node
+    # order (xarray/ushow read it directly; byte-identical at any device count) — it host-gathers
+    # owned lanes on ONE process. 'folded' = the gather-free sharded [P*Lmax] write. A multi-node
+    # (multi-process) run CANNOT host-gather ⇒ MUST use 'folded'. HINT: if output/restart OOMs or
+    # you scale to NG5 multi-node, set output_layout='folded' (CLI: --output-layout folded).
+    if output_layout not in ("global", "folded"):
+        raise ValueError(f"output_layout must be 'global' or 'folded', got {output_layout!r}")
+    # 'global' = partition-independent canonical OUTPUT *and* RESTART (host_gather single-process,
+    # all_gather multi-process — both byte-identical at any device count); 'folded' = the gather-free
+    # sharded write (fastest; for max throughput / huge-mesh OOM). The restart follows the same layout
+    # (its canonical writer is multi-process now); a 'folded' restart still reloads onto ANY device
+    # count. HINT: set output_layout='folded' if the all_gather replicated field OOMs on a huge mesh.
+    multiproc = jax.process_count() > 1
+    restart_layout = output_layout
+    if jax.process_index() == 0:
+        _om = (("host_gather" if not multiproc else "all_gather")
+               if output_layout == "global" else "folded")
+        print(f"[run] output_layout={output_layout} (output+restart → {_om})", flush=True)
     if sm is None:
         sm = shard_mesh.build_sharded_mesh(mesh, part)
 
@@ -270,7 +289,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     def _write_restart_at(sp, step, dtv):
         yr, doy, _, _ = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
         zarr_output.write_restart(target, sp, sm, part, step=step,
-                                  calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv)
+                                  calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv,
+                                  layout=restart_layout)
 
     # daily-mean output (requested SST/SSS/T@100m/u@100m/v@100m), gather-free, active for absolute
     # steps > daily_start_step (set to the year-1 end so daily output begins in year 2). The chunk-
@@ -278,16 +298,26 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # dt=180, ~7.5 at dt=240); each day's mean is written as one ushow-readable zarr at the rollover.
     # A day straddling a chain-job boundary is the post-boundary samples only (~1% of days) — the
     # daily_stats does not persist across the separate per-job processes.
+    # output writer dispatch (daily/monthly): 'global' (default) = partition-INDEPENDENT canonical
+    # node order (write_global_zarr; xarray/ushow read it directly, byte-identical at any device
+    # count); 'folded' = the gather-free sharded [P*Lmax] write (write_ushow_sharded) — the multi-
+    # node / output-OOM path. Both take the same (path, {name: folded field}, sm, part, mesh).
+    def _emit_ushow(path, fields_dict, attrs):
+        if output_layout == "folded":
+            ushow_output.write_ushow_sharded(path, fields_dict, sm, part, mesh, attrs=attrs)
+        else:
+            ushow_output.write_global_zarr(path, fields_dict, sm, part, mesh, attrs=attrs)
+
     daily_stats = daily_day = k100 = None
     if daily_out is not None:
         k100 = int(np.argmin(np.abs(np.asarray(mesh.Z) - (-100.0))))
 
         def _write_daily(day, st):
             yr, doy = day
-            ushow_output.write_ushow_sharded(
-                f"{daily_out}/day_{yr:04d}_{doy:03d}", st.mean_dict(), sm, part, mesh,
-                attrs={"calendar_date": f"{yr:04d}-doy{doy:03d}", "n_samples": st.nobs(),
-                       "depth_100m_level": int(k100)})
+            _emit_ushow(
+                f"{daily_out}/day_{yr:04d}_{doy:03d}", st.mean_dict(),
+                {"calendar_date": f"{yr:04d}-doy{doy:03d}", "n_samples": st.nobs(),
+                 "depth_100m_level": int(k100)})
 
     # monthly-mean output (the CORE2 1958-2020 hindcast climatology): FULL 3-D temp/salt/u/v + 2-D
     # ssh/a_ice/m_ice, accumulated per CALENDAR MONTH into a gather-free OnlineStats (chunk-final
@@ -301,9 +331,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     if monthly_out is not None:
         def _write_monthly(key, st):
             yr, mo = key
-            ushow_output.write_ushow_sharded(
-                f"{monthly_out}/{yr:04d}_{mo:02d}", st.mean_dict(), sm, part, mesh,
-                attrs={"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": st.nobs()})
+            _emit_ushow(
+                f"{monthly_out}/{yr:04d}_{mo:02d}", st.mean_dict(),
+                {"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": st.nobs()})
 
     t_loop0 = time.perf_counter()
     cur_year = int(year)                     # the year the forcing reader was built for
