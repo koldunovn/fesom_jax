@@ -4565,3 +4565,72 @@ Cite the C source (`file:line`) or dump probe that proves it.
   warning comment; trust the VALIDATED config-construction code, not a hopeful YAML comment. (2) When matching a
   Fortran run, diff the JAX sub-config DEFAULTS against the namelist (here surfaced `ice_diff`=10 in JAX vs 0 in
   the FORCA20 namelist — flagged in `docs/CORE2_FORTRAN_SPEC.md`).**
+
+- **[paper Phase 3 / unfolding the ushow monthly output back to node indexing — the fidelity-figure linchpin]
+  (`USHOW_TO_NODES_OK`) The CORE2 hindcast streams monthly means in the *ushow* point-cloud layout
+  (`write_ushow_sharded`): arrays folded over the sharded lane axis `[P*Lmax=128292]`, NOT the global node index
+  — each ocean node on its OWNER lane (real lon/lat/value), every non-owned lane (halo+pad) the Antarctic sentinel
+  `(0, -89.99)` + `FILL=1e38`; 3-D fields `[nz, lane]`. `paper_jax/scripts/common.py:{ushow_to_nodes,unfold_ushow,
+  ushow_lane_map}` invert it by matching each owned lane's `(lon,lat)` to the mesh node coords. **The one
+  load-bearing gotcha (the handoff's premise was WRONG): EXACT float64 matching recovers only ~3/126858 nodes** —
+  the ushow lon/lat come from the model's `geo_coord_nod2D` (rad→deg) and are NOT bit-identical to
+  `fesom.mesh.diag.nc` lon/lat (a different deg path). **Rounding to 6 decimals gives a clean full collision-free
+  bijection** (verified 126858/126858, 0 collisions; even 4 decimals works ⇒ margin); the helper raises on any
+  collision / unmatched lane / non-bijection so a bad assumption is loud, never silent. **Three facts that shape
+  the API:** (1) lon/lat are byte-identical across every month of a run ⇒ compute the `(owned_lane, node_id)`
+  permutation ONCE via `ushow_lane_map` and reuse it (`lane_map=`) for all 744 months (hoists the O(nod2) match
+  out of the loop). (2) owned mask = `lat > -89.98` (sentinel -89.99 < real CORE2 min -78.5); equals value-based
+  `< 1e37` ⇒ FILL never leaks. (3) **3-D fields carry 0.0 in sub-bottom cells** (`salt` min = 0.0), so 3-D
+  reductions (OHC/drift/sections) MUST weight by `nod_area[nz,nod2]` / `nlevels_nod2D` (both 0 below bottom) — a
+  naive `nanmean` over `[nz,nod2]` would average in the dry zeros. Returns 3-D as `[nz, nod2]` (matches `nod_area`
+  + native storage), surface as `[nod2]`. Validated by 6 pure-numpy unit tests (synthetic fold, no `/work`:
+  recovery, FILL-no-leak, lane-map reuse, + collision/no-match/count-mismatch raises) AND a real-data
+  `validate_ushow.py` (USHOW_TO_NODES_OK: all nodes finite + bounded, global area-weighted SST 18.2 °C, 66% regrid
+  coverage). The standalone-repo constraint forces coordinate matching (can't import the partition layout) — but
+  it's empirically clean, so it's the right call.**
+
+- **[paper/F2-F4-F7] CORE2 1958–2020 hindcast is FAITHFUL: regenerated fidelity figs on the real climatology window.**
+  *Why it matters:* the provisional figs (built on 7 months of 1958, near the cold IC) read worse than the model
+  actually is — the proper 1980–2009 window tells the real story. *How to apply:* F2 SST RMSE vs PHC3.0 dropped
+  **1.23 → 0.60 °C** (SSS 0.40 psu) once reduced over 360 real months (`reduce_meanstate.py --y0 1980 --y1 2009`).
+  F4 drift over all 757 months: full-depth Tbar **3.636 → 3.615 °C** across 63 yr (no JAX runaway), ocean volume
+  1.321e18 m³, OHC does the classic CORE2 cold-start dip-and-recover, 1958-vs-2021 T(z) profiles overlie. F7 sea
+  ice vs **OSI-SAF** (716 mid-month files, EASE2-250 → 6.25e8 m²/cell, `grid_ice_area`): seasonal phase correct
+  both hemispheres, JAX modestly icier (NH-area seasonal RMSD 1.63, SH 0.75 ×10¹² m²) — a clean *statistical*
+  match, never pointwise. Helpers `hemisphere_ice_area/extent`, `monthly_climatology`, `grid_ice_area` are pure +
+  unit-tested (35 tests green total).
+
+- **[paper/obs] OSI-SAF CDR is the located sea-ice obs; per-hemisphere daily EASE2-250 in % — integrate, don't regrid, for area.**
+  *Why it matters:* observed ice AREA is a robust scalar integral immune to grid mismatch; only the Mar/Sep *maps*
+  need regridding. *How to apply:* `ice_conc` (%) NaN over land; area = Σ(conc/100)·625 km², extent = Σ(conc>15%)·
+  625 km² (EASE2 is equal-area → constant cell). Sample the file nearest day-15 per (hem,yr,mo); monthly-mean vs
+  mid-month differs a few %, immaterial for the seasonal-cycle claim. Maps: accumulate native conc, mean, then one
+  `regrid_to_latlon` per hemisphere, overlay NH/SH disjoint bands.
+
+- **[paper/standalone] No Fortran CORE2 oracle (R2) on disk yet, and we keep plots standalone (not nereus) — both are deliberate, reversible choices.**
+  *Why it matters:* the figures currently compare JAX↔obs only; every reduce already carries NaN `*_fortran`
+  columns + `has_fortran=0` so the oracle panels auto-light when `/work/.../fesom2_core2` lands. *How to apply:*
+  R2 = a CORE2 Fortran hindcast matched to the JAX config (zstar/cvmix-TKE/mEVP/opt_visc=7/CORE2-forcing) — must be
+  launched externally (only the FORCA20 Fortran run exists today, different mesh). Plotting stays pure numpy/xarray
+  for GMD reproducibility (no `fesom_jax` import); `nereus` (`~/PYTHON/nereus`, own mamba env, tested) is the natural
+  upgrade for nicer mesh-native maps **if/when** we want it — user's call to defer.
+
+- **[paper/R2] CORE2 Fortran oracle (R2) drafted = clone FORCA20, change 3 things; STAGE RUN ARTIFACTS ON /work NOT /home.**
+  *Why it matters:* the matched-Fortran hindcast is the parity reference; getting the config right = clone the
+  already-validated FORCA20 namelists and touch only what CORE2 changes. *How to apply:* deltas are (1) `namelist.config`
+  dt=1800 (`step_per_day=48`, **constant — no ramp**, unlike FORCA20's dt-ramp) + CORE2 mesh + ranks; (2) `namelist.oce`
+  **GM/Redi ON** (`Fer_GM=Redi=.true.`, coarse 1° needs eddy param; FORCA20 had off); (3) `namelist.ice` `ice_diff=10.0`
+  (match JAX `IceConfig`; FORCA20=0.0). dyn/tra/cvmix/forcing/icepack copy verbatim (re-verified: opt_visc=7, tracer
+  (0,1), JRA55-do-v1.4.0, TKE c_k/c_eps/α, surf_relax_S=1.929e-6). CORE2 mesh + `dist_256` pre-exist in
+  `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2/`. **Clock semantics (verified on FORCA20):** `fesom.clock` line-2
+  year = NEXT start year ⇒ self-chain `run_length=9 y`, stop when next-start≥2021 = 7 chunks × 9 yr = 1958-2020 exactly.
+  Staged complete at `/work/ab0995/a270088/fesom2_core2/` (run dir, NOT `/home` — run configs/outputs live on `/work`).
+
+- **Partition-independent canonical Zarr output (`ushow_output.write_global_zarr`) — the FESOM3 `mod_io_zarr` layout, single-process.**
+  *Lesson:* the monthly/daily output (`write_ushow_sharded`) writes the **folded `[P*Lmax]`** lane layout — partition-DEPENDENT, FILL=1e38 halo/pad lanes, needs an unfold (`paper_jax` `ushow_to_nodes`) to analyse. The clean alternative the user wanted (matching what they built in the FESOM3 Fortran port) = **canonical global-node order + user chunking, partition-independent**. *How to apply:* `write_global_zarr` scatters each node's unique-OWNER lane (the existing `_folded_gid_owned_nod` gid/owned maps) into a dense global `[nod2D]`/`[nod2D,nz]` via `g[gid[owned]] = host[owned]`, then writes through `write_ushow_zarr` (now with `chunk_horiz`/`chunk_vert` knobs). Result: byte-identical at any device count (verified `synth npes 4 ≡ 8`), `xr.open_zarr` gives `[nz,nod2]` directly (no unfold; ushow/pyfesom2 read as-is), reduce scripts can drop the `ushow_to_nodes` linchpin. **Perf (real CORE2 month 1980_01, 7 fields ~100 MB):** host-gather+scatter ~0.3 s, the rest is zarr compression/IO that the folded writer pays anyway ⇒ ~same cost, amortised over ~138 s of compute between monthly writes ⇒ negligible. Cross-checked max|Δ|=0 vs an independent coord-match unfold. **⚠️ SINGLE-PROCESS only** — it host-gathers owned lanes (fine ≤ FORCA20, a 3-D field ≲ 1 GB; raises `NotImplementedError` if `process_count>1`). Multi-node (NG5) needs the **no-single-node-gather** redistribute-to-writers path: one forward `ragged_all_to_all` folded-shard → canonical-chunk across writer ranks (the analogue of FESOM3 `mod_io_decomp`'s `MPI_Alltoallv`; output needs no autodiff ⇒ the ragged-a2a grad-transpose bug doesn't apply).
+
+- **Canonical output + partition-independent restart wired as the DEFAULT (`output_layout='global'`), folded kept as the NG5/OOM option.**
+  *Lesson:* monthly/daily output (`run.py` `_emit_ushow`) and the restart (`zarr_output.write_restart`) now default to the partition-independent canonical layout; the folded gather-free writer is opt-in via `output_layout='folded'` (CLI `--output-layout folded`). *How to apply:* (1) one `output_layout` knob drives all three write sites (daily/monthly/restart); a **fail-fast startup guard** in `run_from_config` raises if `output_layout='global'` AND `jax.process_count()>1` (multi-node can't host-gather) with the hint to use `'folded'` — better than OOMing hours in. (2) Restart canonical = `write_state_zarr(..., layout='global')` → `_write_state_global` scatters each State leaf's owned lanes by gid into dense `[n_global,…]` (full f64 dtype, ALL kinds nod+elem via `_kind_of`, no fold/FILL/gid-maps), `layout='canonical_global'` in attrs. (3) The keystone that kept it low-risk: **`reconstruct_global` auto-detects the layout** (canonical → return `z[:]`; folded → the gid-scatter) ⇒ `read_restart` and every existing restart test work UNCHANGED for both formats, and old folded restarts on disk still resume. (4) Partition-independence is now a *tested property*: same global State saved from P=4 vs P=2 ⇒ byte-identical canonical arrays (`RESTART_PARTITION_INDEPENDENT_OK`), and the restart-seam continuous==chained test passes through the canonical path. Snapshots (`write_snapshot`) left folded (out of scope). 27 + restart-seam tests green.
+
+- **Multi-process canonical output: `all_gather` beats no-gather `redistribute` at every scale (ragged_all_to_all is slow).**
+  *Lesson:* built two multi-process partition-independent writers (`fesom_jax/canonical_redist.py`) so the canonical `write_global_zarr` works multi-node, not just single-process: **`all_gather`** (gather the field to every device, each process writes a disjoint chunk range) and **`redistribute`** (the true no-single-node-gather path — one forward `lax.ragged_all_to_all` ships owned lanes to their chunk-owner device, mirroring FESOM3 `mod_io_decomp`'s `MPI_Alltoallv`). Both are correct + byte-identical canonical (validated value==gid on 4-GPU single-node AND 2-node/8-GPU multi-process). **Throughput (CORE2 monthly payload ~200 MB):** folded ~0.4 s ≫ host_gather ~1.0 s > all_gather ~1.5 s ≫ **redistribute ~9 s** — and the redistribute cost is the `ragged_all_to_all` primitive itself (~7.7 s collective-only; caching the shard_map and a `mode='drop'` scatter did NOT help — XLA:CPU has no ragged_all_to_all at all, and the GPU one is ~6× slower than all_gather even at 2 nodes where its no-replication should win). *How to apply:* `write_global_zarr(method=...)`: `auto` ⇒ host_gather (1 proc) / **all_gather** (multi-proc); `redistribute` is the explicit OOM-only fallback (when all_gather's per-device replicated field is too big, i.e. NG5-scale). Default `output_layout='global'` everywhere now (CLI), single→host_gather, multi→all_gather, logged (no silent fallback). The canonical **restart** is multi-process too (`_write_state_global` all_gathers each leaf, scatters to canonical global, writes its disjoint chunk range; handles BOTH nod+elem State kinds; a P-independent chunk grid ⇒ byte-identical at any device count) — validated 2-node/8-GPU (30 nod + 10 elem leaves bit-exact via reconstruct). So multi-node restarts are canonical/partition-independent too; `restart_layout = output_layout` in run.py. Folded stays the fastest/`--output-layout folded` escape (and the OOM fallback). **gotcha:** an all_gather inside shard_map needs `out_specs=P()` + `check_vma=False` (else it re-tiles the gathered array).
