@@ -86,20 +86,70 @@ step (`n_steps: 1` / `"1step"`) is valid — useful for smoke tests.
 ## 4. Restart — portable across device counts
 
 The restart writes the **FULL** prognostic State (every leaf, incl. the history/carry slots
-`T_old`/`S_old`/`uv_rhsAB`/`sigma*`/`tke`) gid-keyed and gather-free, so it reloads onto **any** device
-count: **save on 64 GPU → resume on 8** (or the reverse). A chained run is bit-identical to a continuous
-one (the restart round-trip is faithful and AB2 continues across the seam). See
-`fesom_jax/zarr_output.py` (`write_restart`/`read_restart`).
+`T_old`/`S_old`/`uv_rhsAB`/`sigma*`/`tke`), so it reloads onto **any** device count: **save on 64 GPU →
+resume on 8** (or the reverse) — regardless of the on-disk layout, which follows `--output-layout`
+(§5.2; `reconstruct_global` auto-detects it, so older `folded` restarts still load too). A chained run
+is bit-identical to a continuous one (the restart round-trip is faithful and AB2 continues across the
+seam). See `fesom_jax/zarr_output.py` (`write_restart`/`read_restart`).
 
 ---
 
-## 5. Output — streaming mean/variance + snapshots
+## 5. Output
 
-Output is gather-free (each device writes its own shard). The streaming accumulator
-(`fesom_jax.zarr_output.OnlineStats`, Welford) gives the **time mean AND variance** — hence the EKE map
-(`eke_from_stats` = ½⟨u'²+v'²⟩) — without storing every step. Periodic instantaneous snapshots
-(`snapshot_every`) capture the visual fields / KE spectra / LKF deformation. Read a field back to a
-dense global array for analysis with `zarr_output.reconstruct_global`.
+Two **independent** choices: *which streams* to write (cadence + fields, §5.1), and the on-disk
+*layout* those shards land in (§5.2). Daily, monthly, **and** the restart all obey the same layout.
+
+### 5.1 Streams — what gets written (all opt-in; mix freely)
+
+| stream | enable with | fields | cadence | use for |
+|--------|-------------|--------|---------|---------|
+| **monthly mean** | `--monthly-out DIR` (+ `--monthly-start-step N`) | full 3-D `temp`/`salt`/`u`/`v` + 2-D `ssh`/`a_ice`/`m_ice` | per calendar month | long-hindcast climatology (the CORE2 1958–2020 run) |
+| **daily mean** | `--daily-out DIR` (+ `--daily-start-step N`) | `sst`, `sss`, `temp@100m`, `u@100m`, `v@100m` | per calendar day | surface variability / eddies (typically year-2+) |
+| **restart** (full state) | `restart_out:` (YAML) | every prognostic leaf incl. AB2 history (§4) | end of run | resume / chain — always written |
+| **rolling checkpoint** | `--checkpoint-every N` | same as restart | every N steps | crash-safety / mid-job recovery on long runs |
+
+- Means are **gather-free streaming `OnlineStats`** (Welford) — no per-step storage; each calendar
+  day/month is flushed at its rollover. `--*-start-step` defers the stream past spin-up (e.g. the
+  year-1 end `175200` ⇒ daily output from year 2 on).
+- A mean that **straddles a chain-job boundary** keeps only the post-boundary samples (~1 % of days):
+  the accumulator lives in one process and does not cross the SLURM-segment seam.
+- *(API path)* `run_from_config(accumulate_stats=True)` additionally returns an in-memory Welford
+  **mean AND variance** over chunk-final states in `RunResult.stats` — hence the EKE map
+  (`eke_from_stats` = ½⟨u'²+v'²⟩). This is the analysis/notebook path; the CLI driver does not write it
+  to disk. Read any field back to a dense global array with `zarr_output.reconstruct_global`.
+
+### 5.2 Layout — how the shards land on disk: `--output-layout {global,folded}`
+
+Default **`global`** everywhere; governs daily + monthly + restart writes alike.
+
+| layout | what it is | read back via | partition-independent? | when to pick it |
+|--------|------------|---------------|------------------------|-----------------|
+| **`global`** *(default)* | canonical global-node order (FESOM3 `mod_io_zarr` style) | `xr.open_zarr` → `[nod2]` **directly**; ushow / pyfesom2 as-is | **yes** — byte-identical at any device count (`dist_2 ≡ dist_8`) | everything normal: CORE2 / farc / dars / FORCA20 |
+| **`folded`** | gather-free sharded `[P*Lmax]` write | needs the `ushow_to_nodes` unfold | no (shaped by partition `P`) | max write throughput, **or** when `global` would OOM on a huge multi-node mesh (NG5) |
+
+`global` is assembled automatically — no extra knob:
+
+- **1 process** → `host_gather` (gather to one host, scatter each node by global id).
+- **multi-process** → `all_gather` (gather to every device; each writes a disjoint chunk range).
+- a no-replication `redistribute` writer (`ragged_all_to_all`, the FESOM3 `mod_io_decomp` analogue)
+  exists for the case where `all_gather`'s per-device replication would OOM — but it is **~6× slower**
+  and reachable only from the API (`ushow_output.write_global_zarr(method="redistribute")`), not the
+  CLI. At CLI level the OOM escape is simply `--output-layout folded`.
+
+**Throughput** (CORE2 ~200 MB monthly payload, measured on 4-GPU single-node *and* 8-GPU 2-node):
+`folded ~0.4 s` ≫ `host_gather ~1.0 s` > `all_gather ~1.5 s` ≫ `redistribute ~9 s`. At monthly/daily
+cadence the gather cost is negligible.
+
+### 5.3 When to use what — the short version
+
+- **Default to `global`.** Output is directly readable (no unfold step), partition-independent, and
+  reproducible byte-for-byte at any device count. This is the right choice for essentially every run.
+- **Switch to `--output-layout folded` only if** you (a) hit an OOM writing output/restart on a huge
+  multi-node mesh (NG5 scale), or (b) genuinely need the fastest possible write for very frequent
+  dumps. The cost is that readers must `ushow_to_nodes`-unfold and the store is partition-shaped.
+
+*(Internals / benchmarks: `docs/PORTING_LESSONS.md`, `fesom_jax/canonical_redist.py`, and
+`scripts/bench_canonical_output.py` / `bench_canonical_mn.py` / `validate_restart_mn.py`.)*
 
 ---
 
