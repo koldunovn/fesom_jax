@@ -159,13 +159,16 @@ def write_global_zarr(out_dir, fields, sm, part, mesh, *, method="auto", chunk_h
 
     ``method`` selects HOW the canonical array is assembled (all give a byte-identical store):
 
-    * ``"auto"`` (default) — ``"host_gather"`` when single-process, else ``"redistribute"``.
+    * ``"auto"`` (default) — ``"host_gather"`` when single-process, else ``"all_gather"`` (the
+      throughput bench found ``"redistribute"`` ~6× slower — see its bullet).
     * ``"host_gather"`` — SINGLE-process: ``np.asarray`` the folded array to this host + scatter by id
       (fine while one global field fits host RAM, ≤ FORCA20). Raises if multi-process.
+    * ``"all_gather"`` — MULTI-process default: gather the field to every device, each process writes a
+      disjoint chunk range (replicates the field per device; fine ≤ FORCA20).
     * ``"redistribute"`` — MULTI-process, **no single-node gather**: one ``ragged_all_to_all`` ships
       owned lanes to their chunk-owner device, which writes its chunks (see :mod:`canonical_redist`).
-    * ``"all_gather"`` — MULTI-process baseline: gather the field to every device, each process writes
-      a disjoint chunk range (replicates the field per device; for the throughput comparison)."""
+      ~6× slower (the ``ragged_all_to_all`` primitive cost) ⇒ use explicitly only when ``"all_gather"``
+      would OOM (huge multi-node mesh)."""
     if method == "auto":
         # 1 process → host_gather (simplest). Multi-process → all_gather: the throughput bench found
         # the ragged_all_to_all 'redistribute' ~6× slower (the primitive itself is ~7.7 s/CORE2-payload
