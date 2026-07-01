@@ -65,7 +65,11 @@ CANARY=1536                    # first (cold) job: 32 model days — de-risk fin
 # fallback (~11.6 s/chunk ⇒ 10.1 h); at the reuse rate it's ~5.2 h. ~8 production jobs for the 63 yr
 # (~1.6 GPU-days at the reuse rate). Short jobs also backfill more easily on a busy partition.
 PERJOB=${PERJOB:-150000}
-CHUNK=48                       # 1 day at dt=1800 ⇒ daily sampling of the monthly mean (chunk-final snapshot)
+CHUNK=48                       # perf knob only: the monthly mean now accumulates EVERY step (run.py
+                               # _MeanStream, split at month boundaries) ⇒ a TRUE time-mean that averages
+                               # the diurnal cycle at any dt. CHUNK no longer sets the sampling cadence
+                               # (the old 1-day value froze a fixed time-of-day ⇒ the wavenumber-1 SST
+                               # artifact); larger CHUNK = fewer chunks = faster, bounded by forcing memory.
 
 mkdir -p $OUT
 # runaway guard (resume phase): cap chain length above the ~20 real jobs expected (19 prod + canary,

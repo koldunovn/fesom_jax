@@ -4687,3 +4687,29 @@ Cite the C source (`file:line`) or dump probe that proves it.
   the generic signature of a slow, near-uniform, volume-driven tracer drift. *The C-port precedent (per the user) was the
   right place to look* — not for the SAME bug (that was runoff double-count, already avoided) but because the C-port has the
   CORRECT bundling, proving the JAX regressed.
+
+- **[paper/R2] The CORE2 JAX−Fortran SST wavenumber-1 zonal pattern = DIURNAL ALIASING in the monthly-mean output (a diagnostic
+  artifact, NOT a model bug) — RESOLVED 2026-07-01.**
+  *Symptom:* JAX−Fortran annual-mean SST (`meanstate.nc:sst_jaxfor`) is a clean global k=1 zonal harmonic (R²=0.88 tropics,
+  peak −79°W / trough +101°E, hemispheres opposite-signed, zero global mean). Looks like a coordinate/rotated-grid or
+  wind-rotation effect. *The mandate + all the "obvious" suspects were RED HERRINGS — verified byte-identical to Fortran:* the
+  wind g2r rotation (`jra55._vector_g2r` + Euler 50/15/−90 matrix == C `fesom_vector_g2r`/`build_rotation_matrix`), the forcing
+  time mid-shift (`NM_NC_TMID=0`, both apply it), the solar-zenith open-water albedo (both `open_water_albedo=0` ⇒ constant
+  `albw`), and the geographic forcing-interp coords (C-exported). *Root cause:* the JAX **monthly-mean output** sampled ONE
+  chunk-final `state_p` snapshot per chunk (`run.py`), and the hindcast used **48-step = exactly 1-day chunks**, so every sample
+  fell at the SAME UTC time (~00:00) ⇒ the mean of ~30 same-time-of-day snapshots ALIASES the diurnal SST cycle into a k=1
+  pattern (warm on the afternoon side / cool on the night side; at 00:00 UTC → warm Americas/West, cool Asia/East — exactly the
+  observed sign). Fortran writes a TRUE every-timestep monthly mean (`namelist.io 'sst',1,'m'`) ⇒ no alias. So the "SST
+  difference" is the JAX output's diurnal alias, not a physics divergence — the model SST is on-par. *The diagnostic that
+  cracked it (do FIRST for any zonal-k=1 "difference"): is the field a snapshot or a true time-mean, and at what cadence?*
+  *Fix (GENERAL, dt-independent):* accumulate the output fields over EVERY step inside the chunk scan (`run_steps_sharded_forced`
+  gains opt-in `sample_fn`; the scan carries a running sum → the driver ÷ by the step count = a true time-mean, matching
+  Fortran) + split chunks at DATE-based period boundaries (`_period_boundaries` day/month, dt-INDEPENDENT via `_step_at_elapsed`)
+  so each chunk's sum belongs to one period, keyed by the chunk's FIRST step (`_MeanStream` — keying by the final step
+  misattributes a boundary-ending chunk one period late). *NOT the config hack (chunk_steps=16 for 3 samples/day) — that only
+  works at dt=1800 (48 steps/day); the every-step mean is correct at any mesh/dt.* Verified: sample_fn=None byte-identical
+  (`test_forcing_sharded` 4 pass); the accumulation is an exact per-step sum AND does not perturb the State at npes=1 AND npes=2
+  (real dist_2). Rerun R1 (with the salinity fix) + regenerate `meanstate.nc` ⇒ the k=1 should vanish. *Lesson:* a
+  time-sampled diagnostic (snapshot at a step-count cadence) can imprint a longitude-organized pattern that mimics a
+  coordinate/physics bug; compare LIKE-for-LIKE (both true time-means) before blaming the model — and make the mean dt-general,
+  not tied to one config's steps-per-day.

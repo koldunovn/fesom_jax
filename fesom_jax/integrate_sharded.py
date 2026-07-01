@@ -534,7 +534,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              tracer_cfg=None, boundary_node_p=None, use_ragged: bool = False,
                              bootstrap_ab2: bool = True, state_is_folded: bool = False,
                              return_folded: bool = False, return_executable: bool = False,
-                             reuse_executable: bool = False):
+                             reuse_executable: bool = False, sample_fn=None):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     Like :func:`run_steps_sharded` but the surface forcing **changes every step** — the real
@@ -618,13 +618,37 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
         # restart-continuation chunk carries the AB2 history forward (is_first_step=False), so a
         # chained run is bit-identical to a continuous one (the A6 restart-seam invariant).
         st = one(s, bootstrap_ab2, sf0)
+        # Optional per-step OUTPUT accumulation (the diurnal-cycle fix): sample_fn(state) extracts the
+        # output-stream fields and we sum them over EVERY step ⇒ a TRUE time-mean (the driver ÷ by the
+        # step count), dt-INDEPENDENT, matching Fortran's every-timestep mean. Without it the monthly
+        # mean was one chunk-final snapshot/chunk; at day-aligned chunks that samples a FIXED time-of-day
+        # and aliases the diurnal cycle into a wavenumber-1 SST pattern. sample_fn=None ⇒ byte-identical.
+        if sample_fn is None:
+            if n_steps > 1:
+                rest = jax.tree.map(lambda x: x[1:], seq)   # [n_steps-1, Lmax] per leaf
+                st, _ = lax.scan(jax.checkpoint(lambda c, sf: (one(c, False, sf), None)),
+                                 st, xs=rest, length=n_steps - 1)
+            return st
+        acc = sample_fn(st)                                 # running sum, seeded by step-1's output
         if n_steps > 1:
-            rest = jax.tree.map(lambda x: x[1:], seq)       # [n_steps-1, Lmax] per leaf
-            st, _ = lax.scan(jax.checkpoint(lambda c, sf: (one(c, False, sf), None)),
-                             st, xs=rest, length=n_steps - 1)
-        return st
+            rest = jax.tree.map(lambda x: x[1:], seq)
+            def _accum(carry, sf):
+                c, a = carry
+                c = one(c, False, sf)
+                a = jax.tree.map(lambda u, v: u + v, a, sample_fn(c))
+                return (c, a), None
+            (st, acc), _ = lax.scan(jax.checkpoint(_accum), (st, acc),
+                                    xs=rest, length=n_steps - 1)
+        return st, acc
 
     in_specs = (fm_spec, fs_spec, fop_spec, _P, ha_spec, seq_spec) + extras_spec
+    # out_specs: the final State (fs_spec) alone; + the per-step accumulation sum (acc_spec) when
+    # sample_fn is given. acc leaves are node-folded [P*Lmax,…] ⇒ the same _P PartitionSpec as State.
+    if sample_fn is None:
+        out_specs = fs_spec
+    else:
+        acc_spec = jax.tree.map(lambda _: _P, jax.eval_shape(sample_fn, fs))
+        out_specs = (fs_spec, acc_spec)
     # EXECUTABLE REUSE across chunks (the A6 driver's multi-chunk contract). `body` is a FRESH
     # closure every call, so a bare `jax.jit(shard_map(body))` is a NEW jitted object ⇒ XLA RE-
     # COMPILES on every chunk (~25 s at CORE2 all-on — the ~5× driver overhead the perf decomposition
@@ -639,18 +663,23 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
         key = (id(sm), id(sop), id(params), int(n_steps), float(dt), bool(bootstrap_ab2),
                bool(state_is_folded), bool(use_ragged), int(npes), bool(have_bn),
                id(ice_cfg), id(gm_cfg), id(kpp_cfg), id(tke_cfg),
-               id(ale_cfg), id(visc_cfg), id(tracer_cfg))
+               id(ale_cfg), id(visc_cfg), id(tracer_cfg), id(sample_fn))
         jfn = _FORCED_JIT_CACHE.get(key)
         if jfn is None:
             jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
-                                        out_specs=fs_spec, check_vma=False))
+                                        out_specs=out_specs, check_vma=False))
             _FORCED_JIT_CACHE[key] = jfn
     else:
         jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
-                                    out_specs=fs_spec, check_vma=False))
+                                    out_specs=out_specs, check_vma=False))
     args = (fm, fs, fop, fstress, ha, seq_folded, *extras)
     args = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(args, in_specs))
     if return_executable:
         return jfn, args, npes
     out = jfn(*args)                                       # folded [P*Lmax] sharded scan output
+    # sample_fn ⇒ out is (final_state, per-step-sum); the driver divides the sum by the step count
+    # for a true time-mean. Otherwise out is just the final State (byte-identical to before).
+    if sample_fn is not None:
+        state_out, acc_out = out
+        return (state_out, acc_out) if return_folded else (unfold_state(state_out, npes), acc_out)
     return out if return_folded else unfold_state(out, npes)

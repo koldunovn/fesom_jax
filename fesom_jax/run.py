@@ -169,6 +169,78 @@ def _year_boundaries(year: int, dt: float, start_step: int, n_steps: int, dt_ram
     return bounds
 
 
+def _period_boundaries(year: int, dt: float, start_step: int, n_steps: int,
+                       *, period: str, dt_ramp=None):
+    """Absolute step indices in ``(start_step, start_step+n_steps)`` where the calendar DAY
+    (``period='day'``) or MONTH (``period='month'``) rolls over. **dt-INDEPENDENT** (date-based via
+    :func:`_step_at_elapsed`) — splitting chunks here keeps each chunk within ONE output period, so the
+    per-step output accumulation yields a TRUE per-period time-mean regardless of steps-per-day (the
+    diurnal-cycle-aliasing fix works at any mesh/dt). Mirrors :func:`_year_boundaries`."""
+    base = datetime.datetime(int(year), 1, 1)
+    end = int(start_step) + int(n_steps)
+    d0 = base + datetime.timedelta(seconds=_elapsed_seconds(int(start_step), dt, dt_ramp))
+    if period == "day":
+        cur = datetime.datetime(d0.year, d0.month, d0.day)
+        nxt = lambda c: c + datetime.timedelta(days=1)                       # noqa: E731
+    elif period == "month":
+        cur = datetime.datetime(d0.year, d0.month, 1)
+        nxt = lambda c: datetime.datetime(c.year + (c.month == 12),          # noqa: E731
+                                          1 if c.month == 12 else c.month + 1, 1)
+    else:
+        raise ValueError(f"period must be 'day' or 'month', got {period!r}")
+    bounds = []
+    while True:
+        cur = nxt(cur)
+        nb = _step_at_elapsed((cur - base).total_seconds(), dt, dt_ramp)
+        if nb >= end:
+            break
+        if nb > int(start_step):
+            bounds.append(nb)
+    return bounds
+
+
+class _MeanStream:
+    """A per-calendar-period TRUE time-mean output stream — the diurnal-safe replacement for the old
+    once-per-chunk snapshot. The chunk scan sums this stream's fields over EVERY step and returns the
+    sum; :meth:`add` accumulates the sum per period key with the step count, and :meth:`flush` writes
+    ``sum/count`` — a real time-mean at any dt (no fixed-time-of-day aliasing of the diurnal cycle).
+    ``keys`` are the accumulated-dict keys this stream owns; ``key_fn(step)`` gives the period key;
+    ``write(key, mean_dict, count)`` emits it. Chunks must not straddle this period's boundary (the
+    driver adds :func:`_period_boundaries` to ``plan_chunks`` ``split_at``), so a whole chunk's sum
+    belongs to one period."""
+
+    def __init__(self, keys, key_fn, write, start_step):
+        self.keys = tuple(keys)
+        self.key_fn = key_fn
+        self.write = write
+        self.start_step = int(start_step)
+        self.sum = None
+        self.count = 0
+        self.pkey = None
+
+    def add(self, gate_step, key_step, acc_sum, n):
+        # gate_step (the chunk-final step) decides activation; key_step (the chunk's FIRST step) picks
+        # the period — a chunk split at a period boundary ends AT the next period's first step, so
+        # keying by the final step would misattribute the whole chunk one period late. The chunk never
+        # straddles a boundary, so key_step's period IS the chunk's period.
+        if gate_step <= self.start_step:
+            return
+        key = self.key_fn(key_step)
+        if self.sum is not None and key != self.pkey:
+            self.flush()
+        sub = {k: acc_sum[k] for k in self.keys}
+        self.sum = sub if self.sum is None else jax.tree.map(lambda a, b: a + b, self.sum, sub)
+        self.count += int(n)
+        self.pkey = key
+
+    def flush(self):
+        if self.sum is not None and self.count > 0:
+            c = float(self.count)
+            self.write(self.pkey, {k: v / c for k, v in self.sum.items()}, self.count)
+        self.sum = None
+        self.count = 0
+
+
 class RunResult(NamedTuple):
     state_p: object     # FOLDED [P*Lmax] final State (device-sharded; restart-ready)
     stats: object       # OnlineStats over chunk-final folded states, or None
@@ -250,8 +322,17 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     else:
         raise ValueError("run_from_config: set cfg.n_steps or cfg.duration")
     cs = int(chunk_steps) if chunk_steps else max(1, n_steps)
+    # split chunks at forcing-year boundaries AND (when a mean-output stream is active) at the output
+    # period boundary — DAY for daily output (finest; months align to days), else MONTH — so no chunk
+    # straddles a period and its every-step sum belongs to exactly one period. dt-independent, so the
+    # true-time-mean output (the diurnal-aliasing fix) works at any mesh/dt. See :class:`_MeanStream`.
+    _out_period = "day" if daily_out is not None else ("month" if monthly_out is not None else None)
+    _split = list(_year_boundaries(year, cfg.dt, start_step, n_steps, cfg.dt_ramp))
+    if _out_period is not None:
+        _split += _period_boundaries(year, cfg.dt, start_step, n_steps,
+                                     period=_out_period, dt_ramp=cfg.dt_ramp)
     chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt,
-                         split_at=_year_boundaries(year, cfg.dt, start_step, n_steps, cfg.dt_ramp))
+                         split_at=sorted(set(_split)))
 
     if forcing is None and forcing_stack is None:
         raise ValueError("run_from_config: provide forcing (CoreForcing) or forcing_stack")
@@ -292,12 +373,11 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                                   calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv,
                                   layout=restart_layout)
 
-    # daily-mean output (requested SST/SSS/T@100m/u@100m/v@100m), gather-free, active for absolute
-    # steps > daily_start_step (set to the year-1 end so daily output begins in year 2). The chunk-
-    # final surface/100m slices are folded into a per-calendar-day OnlineStats (~10 samples/day at
-    # dt=180, ~7.5 at dt=240); each day's mean is written as one ushow-readable zarr at the rollover.
-    # A day straddling a chain-job boundary is the post-boundary samples only (~1% of days) — the
-    # daily_stats does not persist across the separate per-job processes.
+    # daily-/monthly-mean output (gather-free). Each active stream is a TRUE per-calendar-period time-
+    # mean: the chunk scan sums the stream's fields over EVERY step and the driver divides by the step
+    # count (:class:`_MeanStream` below) — dt-INDEPENDENT, and it AVERAGES the diurnal cycle (fixing the
+    # once-per-chunk-snapshot artifact that, at day-aligned chunks, froze a fixed time-of-day and aliased
+    # the diurnal SST cycle into a wavenumber-1 pattern). Matches Fortran's every-timestep mean.
     # output writer dispatch (daily/monthly): 'global' (default) = partition-INDEPENDENT canonical
     # node order (write_global_zarr; xarray/ushow read it directly, byte-identical at any device
     # count); 'folded' = the gather-free sharded [P*Lmax] write (write_ushow_sharded) — the multi-
@@ -308,32 +388,68 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         else:
             ushow_output.write_global_zarr(path, fields_dict, sm, part, mesh, attrs=attrs)
 
-    daily_stats = daily_day = k100 = None
+    # TRUE time-mean output streams (daily / monthly). Each names the fields to average; the chunk scan
+    # sums them over EVERY step (out_sample_fn below) and the mean divides by the step count — a real
+    # time-mean that AVERAGES the diurnal cycle at ANY dt. This replaces the old once-per-chunk snapshot,
+    # which at day-aligned chunks froze a fixed time-of-day and aliased the diurnal cycle into a
+    # wavenumber-1 SST pattern (JAX−Fortran meanstate artifact). Matches Fortran's every-timestep mean.
+    # Chunks are split at the finest active period boundary (below) so a whole chunk's sum is one period.
+    # (Accumulators do NOT persist across chain-job processes ⇒ a period straddling a job boundary keeps
+    # only its post-boundary steps — ~1 period per multi-year segment, negligible for a climatology.)
+    streams = []
+    out_sample_specs = []
+    k100 = None
     if daily_out is not None:
         k100 = int(np.argmin(np.abs(np.asarray(mesh.Z) - (-100.0))))
 
-        def _write_daily(day, st):
-            yr, doy = day
-            _emit_ushow(
-                f"{daily_out}/day_{yr:04d}_{doy:03d}", st.mean_dict(),
-                {"calendar_date": f"{yr:04d}-doy{doy:03d}", "n_samples": st.nobs(),
-                 "depth_100m_level": int(k100)})
+        def _daily_fields(s, _k=k100):
+            return {"sst": s.T[:, 0], "sss": s.S[:, 0], "temp100": s.T[:, _k],
+                    "u100": s.uvnode[:, _k, 0], "v100": s.uvnode[:, _k, 1]}
 
-    # monthly-mean output (the CORE2 1958-2020 hindcast climatology): FULL 3-D temp/salt/u/v + 2-D
-    # ssh/a_ice/m_ice, accumulated per CALENDAR MONTH into a gather-free OnlineStats (chunk-final
-    # samples; ~1/day at chunk_steps=48,dt=1800 ⇒ ~30/month ⇒ a real monthly mean), written as one
-    # ushow-readable sharded zarr per month at the rollover. Active for steps > monthly_start_step.
-    # Like daily_out, the accumulator does NOT persist across chain-job processes ⇒ a month straddling
-    # a job boundary keeps only its post-boundary samples (~1 month per multi-year segment ⇒ negligible
-    # for a multi-decadal climatology). Parallels the daily_out path (kept separate, not merged: only
-    # one cadence runs per mesh — CORE2 monthly, FORCA20 daily — so duplication beats coupling here).
-    monthly_stats = monthly_key = None
+        def _write_daily(day, mean, count, _k=k100):
+            yr, doy = day
+            _emit_ushow(f"{daily_out}/day_{yr:04d}_{doy:03d}", mean,
+                        {"calendar_date": f"{yr:04d}-doy{doy:03d}", "n_samples": int(count),
+                         "depth_100m_level": int(_k)})
+
+        def _daily_key(step):
+            yr, doy, _, _ = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
+            return (int(yr), int(doy))
+
+        streams.append(_MeanStream(("sst", "sss", "temp100", "u100", "v100"),
+                                   _daily_key, _write_daily, daily_start_step))
+        out_sample_specs.append(_daily_fields)
+
     if monthly_out is not None:
-        def _write_monthly(key, st):
+        def _monthly_fields(s):
+            return {"temp": s.T, "salt": s.S, "u": s.uvnode[:, :, 0], "v": s.uvnode[:, :, 1],
+                    "ssh": s.eta_n, "a_ice": s.a_ice, "m_ice": s.m_ice}
+
+        def _write_monthly(key, mean, count):
             yr, mo = key
-            _emit_ushow(
-                f"{monthly_out}/{yr:04d}_{mo:02d}", st.mean_dict(),
-                {"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": st.nobs()})
+            _emit_ushow(f"{monthly_out}/{yr:04d}_{mo:02d}", mean,
+                        {"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": int(count)})
+
+        def _monthly_key(step):
+            yr, _, _, mo = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
+            return (int(yr), int(mo))
+
+        streams.append(_MeanStream(("temp", "salt", "u", "v", "ssh", "a_ice", "m_ice"),
+                                   _monthly_key, _write_monthly, monthly_start_step))
+        out_sample_specs.append(_monthly_fields)
+
+    # The ONE sample_fn threaded into the chunk scan = union of active streams' fields, summed each step.
+    # Built ONCE (stable id ⇒ the reuse-executable cache stays warm). None ⇒ no output ⇒ the scan returns
+    # just the State (byte-identical). Split period = DAY if daily output is active (finest; months align
+    # to day boundaries) else MONTH — dt-independent, so each chunk lands in exactly one output period.
+    if out_sample_specs:
+        def out_sample_fn(s, _specs=tuple(out_sample_specs)):
+            d = {}
+            for f in _specs:
+                d.update(f(s))
+            return d
+    else:
+        out_sample_fn = None
 
     t_loop0 = time.perf_counter()
     cur_year = int(year)                     # the year the forcing reader was built for
@@ -366,11 +482,13 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             seq = forcing.stack(_chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), xp=np)
             seq_p = shard_mesh.partition_step_forcing(seq, part)
         tc_host = time.perf_counter()
-        state_p = run_steps_sharded_forced(
+        _chunk_out = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
             use_ragged=use_ragged, boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
-            **cfg.physics_kwargs())
+            sample_fn=out_sample_fn, **cfg.physics_kwargs())
+        # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else just the final state.
+        state_p, acc_sum = _chunk_out if out_sample_fn is not None else (_chunk_out, None)
         folded_in = True                                     # the scan output is folded [P*Lmax]
         step_now = ch.start + ch.count
         if progress:
@@ -406,32 +524,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             stats = (zarr_output.OnlineStats.init(leaves) if stats is None
                      else stats).update(leaves)
 
-        if daily_out is not None and step_now > daily_start_step:
-            yr, doy, _, _ = _chunk_dates(year, cfg.dt, step_now, 1, cfg.dt_ramp)[0]
-            day = (int(yr), int(doy))
-            samp = {"sst": state_p.T[:, 0], "sss": state_p.S[:, 0], "temp100": state_p.T[:, k100],
-                    "u100": state_p.uvnode[:, k100, 0], "v100": state_p.uvnode[:, k100, 1]}
-            if daily_stats is not None and day != daily_day:
-                _write_daily(daily_day, daily_stats)         # the previous calendar day completed
-                daily_stats = None
-            daily_stats = (zarr_output.OnlineStats.init(samp) if daily_stats is None
-                           else daily_stats.update(samp))
-            daily_day = day
-
-        if monthly_out is not None and step_now > monthly_start_step:
-            yr, _, _, mo = _chunk_dates(year, cfg.dt, step_now, 1, cfg.dt_ramp)[0]
-            key = (int(yr), int(mo))
-            samp = {"temp": state_p.T, "salt": state_p.S,
-                    "u": state_p.uvnode[:, :, 0], "v": state_p.uvnode[:, :, 1],
-                    "ssh": state_p.eta_n, "a_ice": state_p.a_ice, "m_ice": state_p.m_ice}
-            if monthly_stats is not None and key != monthly_key:
-                _write_monthly(monthly_key, monthly_stats)   # the previous calendar month completed
-                monthly_stats = None
-            # init().update() folds the FIRST sample too (init alone is count=0/zeros) — so a
-            # single-chunk partial month at a job boundary writes its real value, not zeros.
-            monthly_stats = (zarr_output.OnlineStats.init(samp).update(samp) if monthly_stats is None
-                             else monthly_stats.update(samp))
-            monthly_key = key
+        # TRUE time-mean accumulation: add this chunk's per-step field SUMS (acc_sum) and step count to
+        # each active output stream, keyed by the chunk's calendar period. Chunks never straddle a period
+        # boundary (plan_chunks split_at includes _period_boundaries), so the whole chunk belongs to one
+        # period; the stream flushes sum/count at the rollover. Replaces the old once-per-chunk snapshot
+        # (the diurnal-aliasing fix — averages the full diurnal cycle at any dt).
+        if acc_sum is not None:
+            for _stream in streams:
+                _stream.add(step_now, ch.start, acc_sum, ch.count)
 
         # rolling intermediate checkpoint: when this chunk crossed a `checkpoint_every` step
         # boundary (and it's not the last chunk — the final restart covers that), overwrite the
@@ -460,10 +560,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if progress:
             print(f"[run.progress] restart written in {time.perf_counter() - tw:.1f}s", flush=True)
 
-    # flush the final (partial) calendar day so the last day of the run/job is written too
-    if daily_out is not None and daily_stats is not None:
-        _write_daily(daily_day, daily_stats)
-    # flush the final (partial) calendar month so the last month of the run/job is written too
-    if monthly_out is not None and monthly_stats is not None:
-        _write_monthly(monthly_key, monthly_stats)
+    # flush the final (partial) calendar period so the last day/month of the run/job is written too
+    for _stream in streams:
+        _stream.flush()
     return RunResult(state_p=state_p, stats=stats, step=end_step, dt_stage=float(end_dt))
