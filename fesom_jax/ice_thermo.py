@@ -137,7 +137,12 @@ class ThermoOut(NamedTuple):
     iflice: jax.Array
     # zstar (Phase 9a) real-salt path — the split + the rsf producer + thdgrsn for the
     # fresh-water balancing (all 0 / virtual-salt-equivalent under use_virt_salt=True).
-    evaporation: jax.Array      # open-water evaporation _evap·(1−A) [m water/s] (= C's _evap)
+    evaporation: jax.Array      # evap_ow·(1−A) + subli·A [m water/s] — the BUNDLED evap the Fortran
+                                # stores as evaporation(i) (therm_ice:651 evap=evap+subli, then
+                                # ice_thermo_oce.F90:324). The zstar FW balance forms evaporation −
+                                # ice_sublimation = evap_ow, so subli CANCELS (sublimation is ice→atmos,
+                                # not ocean FW). Surfacing open-water evap here (pre-2026-07-01 bug) left
+                                # −⟨subli·A⟩ uncancelled ⇒ a global-mean FW-budget leak (SSH/vol drift).
     ice_sublimation: jax.Array  # sublimation over ice _subli·A [m water/s] (= C's _subli)
     rsf: jax.Array              # real_salt_flux = fwice·Sice − iflice·ρice/ρwat·Sice [PSU·m/s]
     thdgrsn: jax.Array          # dhsngrowth = (hsn_new − hsn_post_fall)/ice_dt [m/s]
@@ -252,7 +257,7 @@ def therm_ice_cell(cfg: IceConfig, h, hsn, A, fsh, flo, Ta, qa, rain, snow, runo
 
     return ThermoOut(h=h, hsn=hsn, A=A, t=t, fw=fw, ehf=ehf, thdgr=dhgrowth,
                      evap=evap + subli, dAgrowth=dAgrowth, iflice=iflice,
-                     evaporation=evap, ice_sublimation=subli, rsf=rsf, thdgrsn=dhsngrowth)
+                     evaporation=evap + subli, ice_sublimation=subli, rsf=rsf, thdgrsn=dhsngrowth)
 
 
 # --------------------------------------------------------------------------
@@ -289,7 +294,8 @@ class ThermoState(NamedTuple):
     thdgr: jax.Array
     # zstar real-salt path — fed to the water-flux balancing + the bc_S real_salt_flux term.
     thdgrsn: jax.Array          # dhsngrowth [m/s]
-    evaporation: jax.Array      # open-water evaporation [m water/s]
+    evaporation: jax.Array      # evap_ow + subli, bundled (= Fortran evaporation(i)); FW balance
+                                # subtracts ice_sublimation to recover evap_ow (subli cancels)
     ice_sublimation: jax.Array  # sublimation over ice [m water/s]
     real_salt_flux: jax.Array   # rsf [PSU·m/s] (0 under use_virt_salt=True)
 

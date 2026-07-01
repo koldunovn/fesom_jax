@@ -4634,3 +4634,56 @@ Cite the C source (`file:line`) or dump probe that proves it.
 
 - **Multi-process canonical output: `all_gather` beats no-gather `redistribute` at every scale (ragged_all_to_all is slow).**
   *Lesson:* built two multi-process partition-independent writers (`fesom_jax/canonical_redist.py`) so the canonical `write_global_zarr` works multi-node, not just single-process: **`all_gather`** (gather the field to every device, each process writes a disjoint chunk range) and **`redistribute`** (the true no-single-node-gather path — one forward `lax.ragged_all_to_all` ships owned lanes to their chunk-owner device, mirroring FESOM3 `mod_io_decomp`'s `MPI_Alltoallv`). Both are correct + byte-identical canonical (validated value==gid on 4-GPU single-node AND 2-node/8-GPU multi-process). **Throughput (CORE2 monthly payload ~200 MB):** folded ~0.4 s ≫ host_gather ~1.0 s > all_gather ~1.5 s ≫ **redistribute ~9 s** — and the redistribute cost is the `ragged_all_to_all` primitive itself (~7.7 s collective-only; caching the shard_map and a `mode='drop'` scatter did NOT help — XLA:CPU has no ragged_all_to_all at all, and the GPU one is ~6× slower than all_gather even at 2 nodes where its no-replication should win). *How to apply:* `write_global_zarr(method=...)`: `auto` ⇒ host_gather (1 proc) / **all_gather** (multi-proc); `redistribute` is the explicit OOM-only fallback (when all_gather's per-device replicated field is too big, i.e. NG5-scale). Default `output_layout='global'` everywhere now (CLI), single→host_gather, multi→all_gather, logged (no silent fallback). The canonical **restart** is multi-process too (`_write_state_global` all_gathers each leaf, scatters to canonical global, writes its disjoint chunk range; handles BOTH nod+elem State kinds; a P-independent chunk grid ⇒ byte-identical at any device count) — validated 2-node/8-GPU (30 nod + 10 elem leaves bit-exact via reconstruct). So multi-node restarts are canonical/partition-independent too; `restart_layout = output_layout` in run.py. Folded stays the fastest/`--output-layout folded` escape (and the OOM fallback). **gotcha:** an all_gather inside shard_map needs `out_specs=P()` + `check_vma=False` (else it re-tiles the gathered array).
+
+- **[paper/R2] CORE2 Fortran oracle (R2) COMPLETE + wired into F2/F4/F7 — strong on-par result; one real S-drift caveat.**
+  *Why it matters:* R2 (the matched Fortran CORE2 hindcast, 1958-2020, all 22 streams × 63 yr) is the parity reference;
+  the matched-Fortran comparison both validates the port and surfaces where it differs. *How to apply:* the timeout-resilient
+  self-chaining job (`/work/.../fesom2_core2/run_core2_r2.sbatch`) finished in 3 jobs (clock semantics: line-2 = next-start yr,
+  stop ≥2021). Reductions read Fortran per-year/per-var NetCDF (`{var}.fesom.YYYY.nc`, `[time=12,nz1,nod2]` on the SAME
+  native node order as `fesom.mesh.diag.nc` ⇒ node-for-node comparable to the unfolded JAX ushow; `_FillValue`→NaN under
+  xarray, pad 3-D to 48 levels to match `area3d`; record i = month i+1). Shared readers in `paper_jax/scripts/common.py`:
+  `fortran_iter_months` / `fortran_var_years` / `align_index` (mid-month decimal-year match onto the JAX time axis — JAX has
+  757 months incl. an extra 2021-01, Fortran 756, so align, don't assume equal length). **Results:** SST RMSE vs PHC JAX 0.604
+  / Fortran 0.606 (|JAX−Fortran| 0.058 °C); Tbar JAX 3.636→3.615 / Fortran →3.621 (Δ 0.006 °C); NH ice area Mar JAX 15.89 /
+  Fortran 15.92 — the port reproduces Fortran across mean-state, drift, and ice. **⚠️ one real divergence:** JAX global-mean
+  SALINITY drifts +0.0045 psu/63 yr while Fortran stays flat (T/OHC track) — both from identical PHC IC, same vol-weighted
+  reduction ⇒ a real salt-budget difference (likely a missing global freshwater/virtual-salt normalization in the port); see
+  the 2026-06-30 handoff. Keep `common.py` for diagnostics on BOTH sides (identical reduction ⇒ fair comparison), use nereus
+  only for plotting.
+
+- **[paper] "scatter looks strange" = 1°-bin-average speckle; fix = native-triangulation render via nereus. STANDALONE means no `fesom_jax`, not no deps.**
+  *Why it matters:* the old F2 maps were `np.histogram2d` bin-averages to a 1° grid; the ~1° CORE2 mesh ALIASES against the 1°
+  target ⇒ many empty bins = white speckle dots (looked like a scatter plot). *How to apply:* render node fields on the native
+  Delaunay triangulation with **nereus** (`nr.plot(field, lon, lat, projection="rob"/"np"/"sp", method="linear", ax=, interpolator=)`,
+  env `/work/.../mambaforge/envs/nereus`, v0.4.1) — `method="linear"` is gap-free in the mesh hull (avoid the default
+  `idw`/80 km radius which re-introduces holes on a coarse mesh). The reduces now store **node-level** fields (no regrid) +
+  node lon/lat; the figs do the interpolation at plot time. The user clarified STANDALONE = the paper pipeline must not import
+  the MODEL (`fesom_jax`) — ordinary libraries (nereus, cartopy, cmocean) ARE allowed deps. The nereus env reads the ushow
+  zarr (zarr3) + NetCDF and passes the whole suite ⇒ it now drives the entire pipeline (Makefile `PYTHON`). Helpers added:
+  `common.regular_to_nodes` (gridded obs→nodes, periodic-padded + nearest-fill) and `node_weighted_rms`. Panel diet: F4 6→4,
+  F7 8→4, F2 → a 2×3 bias triplet [JAX−PHC | Fortran−PHC | JAX−Fortran] (last column ≈ white = port reproduces Fortran).
+
+- **[paper/R2] The CORE2 salinity drift = a sublimation term breaking the zstar freshwater-budget closure — RESOLVED 2026-07-01.**
+  *Symptom:* JAX global vol-mean S drifts +0.0044 psu/63 yr while the matched Fortran stays flat; near-uniform +0.031 psu
+  surface offset. *The diagnostic that cracked it (do this FIRST for any "conservation" drift):* **plot global-mean SSH**
+  (area-weighted `hbar`/`ssh`) alongside the drifting field. JAX ⟨SSH⟩ drops **−0.442 m/63 yr**, Fortran flat; the predicted
+  drop if S̄ rose purely by volume loss (`−H·ΔS/S̄`, H=3627 m) is **−0.444 m** — a 0.5% match ⇒ the drift is **volume-driven
+  (freshwater budget non-closure), NOT a salt source**. Salt content is conserved; the ocean loses ~7 mm/yr of freshwater,
+  concentrating S̄=salt/V. This one plot rules out the salinity floor, brine/rsf, restoring, and every salt-source hypothesis
+  at once. *Root cause:* under zstar `oce_fluxes` removes the global-mean freshwater flux via `flux = evaporation −
+  ice_sublimation + prec + runoff − ice/snow-growth`; **sublimation (ice→atmos, not ocean FW) must cancel, which requires
+  `evaporation` to be the BUNDLED `evap_ow + subli`** — Fortran bundles it in `therm_ice` (`ice_thermo_oce.F90:651`
+  `evap=evap+subli`) BEFORE storing `evaporation(i)` (`:324`); the C-port bundles it too (`fesom_ice_thermo.c:407`
+  `*evap=_evap+_subli`). The JAX regressed: `ice_thermo.py` surfaced `evaporation=evap` = **open-water only** (the value at
+  the `evap*(1-A)` line, before the bundle), so the balance computed `evap_ow − subli`, leaving `−⟨subli·A⟩` uncancelled ⇒ a
+  net freshwater deficit injected every step, applied *uniformly* by the global-mean correction (hence the near-uniform
+  surface offset; ⟨subli·A⟩≈2.2e-10 m/s ≈ 3.6 cm/yr over ice = realistic). *Fix:* `ThermoOut.evaporation = evap + subli`
+  (1 line, `ice_thermo.py`); only consumer is `ice_coupling.fresh_water_balance_zstar` (zstar+ice path), linfs untouched.
+  Verified by running the REAL balance fn: buggy ⟨water_flux_bal⟩=+1.0e-9 m/s (=−⟨subli⟩), fixed=−2e-25 (machine zero).
+  *Lesson (grep-before-you-run):* when a port splits a bundled Fortran field into components for a downstream reconstruction
+  (`A − B` to recover `A−B`), verify you took the field at the SAME point in the Fortran control flow the consumer reads it —
+  therm_ice bundles evap+subli at its LAST line, so the stored `evaporation` is the bundled one, NOT the open-water `_evap`
+  named earlier. A one-sided cancellation term (in the removed global mean but not the applied local flux, or vice-versa) is
+  the generic signature of a slow, near-uniform, volume-driven tracer drift. *The C-port precedent (per the user) was the
+  right place to look* — not for the SAME bug (that was runoff double-count, already avoided) but because the C-port has the
+  CORRECT bundling, proving the JAX regressed.
