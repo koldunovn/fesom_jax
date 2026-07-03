@@ -42,7 +42,8 @@ NODES=${NODES:-4}     # GPU nodes (dist_16=4, dist_32=8); the resubmit re-reques
 OUT=/work/ab0995/a270088/port_jax/runs/$TAG
 RESTART=$OUT/restart
 SELF=$REPO/scripts/run_dars_3yr.sbatch
-TOTAL=${TOTAL:-438000}          # 3 model years: 1958@180 (175200) + 1959-60@240 (262800).
+TOTAL=${TOTAL:-438360}          # 3 model years: 1958@180 (175200) + 1959-60@240 (263160 = 731
+                                # days INCL. the 1960 leap day; the old 438000 was a day short).
 CANARY=1440           # first (cold) job: 3 model days — de-risk finiteness cheaply
 PERJOB=${PERJOB:-20000}          # ~9-10 h margin under 11:45; a walltime-kill safely stops the chain
 CHUNK=48
@@ -53,14 +54,25 @@ CNT=$( cat $OUT/.jobcount 2>/dev/null || echo 0 ); CNT=$((CNT+1)); echo $CNT > $
 if [ "$CNT" -gt 35 ]; then echo "ABORT: jobcount $CNT > 35 (runaway guard)"; exit 1; fi
 
 # current step = the rolling restart's step (0 ⇒ cold). Source of truth (survives crashes/kills).
-CUR=$( $PY -c "import json;print(int(json.load(open('$RESTART/.zattrs')).get('step',0)))" 2>/dev/null || echo 0 )
-[ -z "$CUR" ] && CUR=0
+# ⚠️ If the restart EXISTS but its step is unreadable (corrupted .zattrs / transient /work error),
+# STOP the chain — the old silent `|| echo 0` fallback turned any read failure into a cold start
+# (the 2026-07-03 data-loss incident class).
+CUR=0
+if [ -d "$RESTART" ]; then
+  CUR=$( $PY -c "import json;print(int(json.load(open('$RESTART/.zattrs')).get('step',0)))" 2>/dev/null || echo FAIL )
+  case "$CUR" in ''|*[!0-9]*)
+    echo "ABORT: $RESTART exists but its step is unreadable — refusing the silent cold-start fallback; inspect + resubmit manually"; exit 1;;
+  esac
+fi
 echo "=== $(date) dars3yr job#$CNT: CUR=$CUR / TOTAL=$TOTAL ==="
 if [ "$CUR" -ge "$TOTAL" ]; then echo "DARS_3YR_DONE ($CUR steps = 3 model years)"; exit 0; fi
 
 # step budget for THIS job: short canary on the cold start, else the per-job budget (capped at remaining).
 if [ "$CUR" -eq 0 ]; then
-  STEPS=$CANARY; RIN=""; rm -rf $OUT; mkdir -p $OUT; echo $CNT > $OUT/.jobcount
+  # COLD start — NO deletion (the old `rm -rf $OUT` here violated the no-silent-deletion rule
+  # for unattended chains, 2026-07-03 review). A deliberate re-run over an old tag must clean
+  # up MANUALLY first or use a fresh TAG.
+  STEPS=$CANARY; RIN=""
 else
   REM=$((TOTAL-CUR)); STEPS=$PERJOB; [ "$STEPS" -gt "$REM" ] && STEPS=$REM; RIN="--restart-in $RESTART"
 fi

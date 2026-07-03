@@ -1,8 +1,8 @@
 #!/bin/bash
 # Self-chaining CORE2 1958-2020 HINDCAST (JAX) — model-paper R1, the fidelity flagship.
 # All-on physics (zstar + TKE + mEVP + GM, tracer (0,1)) at dt=1800 on dist_4 / 1 node (4 GPUs) —
-# CORE2 ANTI-scales past 4 GPU (halo-bound), so 1 node is OPTIMAL. Each job resumes from the rolling
-# restart, runs a bounded step budget (< 12 h walltime), writes a restart + monthly-mean zarrs, and
+# CORE2 ANTI-scales past 4 GPU (halo-bound), so 1 node is OPTIMAL. Each job resumes from the latest
+# archival restart, runs a bounded step budget (< 12 h walltime), writes a restart + monthly-mean zarrs, and
 # RESUBMITS itself until 63 model years (TOTAL = 1,104,528 steps = 1958-01-01 -> 2021-01-01) are done.
 # The forcing reader rolls calendar years automatically from the absolute step (run.py _year_boundaries
 # + reopen_year); a job's start_step is read from the restart metadata, so resumes land in the right year.
@@ -12,7 +12,13 @@
 #    non-finite ⇒ run_from_config.py exits non-zero (NG5_R0_NONFINITE) and the chain STOPS.
 #  * EVERY job ends with --diagnostics ⇒ a NaN never propagates into the next restart.
 #  * a non-zero srun (non-finite / crash / walltime-kill) STOPS the chain (no resubmit) — inspect.
-#  * a crash mid-job is covered by the rolling --checkpoint-every restart (resume from the last).
+#  * chain continuity + crash recovery is the ARCHIVAL restart (--restart-archive-out, yearly +
+#    unconditionally at the end of every job segment — 2026-07-02, replaces the old plain
+#    --checkpoint-every rolling restart): each firing is an IMMUTABLE, uniquely-named directory,
+#    never overwritten, resolved via restart.latest — so ANY past yearly restart stays resumable
+#    for a branching experiment, not just the newest. A mid-segment CRASH (not a clean resubmit)
+#    falls back to the last calendar-year boundary (bounded: ~44 min of CORE2 wall-clock at the
+#    measured ~0.15 s/step steady rate) — accepted explicitly (user call, 2026-07-02).
 #  * compile-hang guard: kill + self-heal-resubmit if "chunk 1/" never appears (a stuck XLA compile).
 #  * runaway guard: a per-chain jobcount caps the chain length.
 #SBATCH --job-name=core2_hind
@@ -56,15 +62,25 @@ POOL=${POOL:-/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2}
 PART=${PART:-dist_4}
 IC=${IC:-data/ic_core2}
 OUT=/work/ab0995/a270088/port_jax/runs/$TAG
-RESTART=$OUT/restart
+ARCHIVE=$OUT/restart_archive     # the ONLY restart stream now (2026-07-02) — immutable, yearly + end-of-job
 SELF=$REPO/scripts/run_core2_hindcast.sbatch
 TOTAL=${TOTAL:-1104528}        # 63 model years: 1958-01-01 -> 2021-01-01 (23011 days x 48 steps/day).
 CANARY=1536                    # first (cold) job: 32 model days — de-risk finiteness + 1 month of output
-# MEASURED: all-on CORE2 step = 96 ms; with FESOM_REUSE_EXE the chunk wall is ~6 s/chunk (forcing
-# build + reused executable) = 125 ms/step. 150000 chosen to fit 11:45 even at the SLOWER pcache-only
-# fallback (~11.6 s/chunk ⇒ 10.1 h); at the reuse rate it's ~5.2 h. ~8 production jobs for the 63 yr
-# (~1.6 GPU-days at the reuse rate). Short jobs also backfill more easily on a busy partition.
-PERJOB=${PERJOB:-150000}
+# Every job in the chain REQUESTS the same fixed 11:45 walltime (the #SBATCH --time above) regardless
+# of PERJOB — Slurm schedules/backfills on the REQUEST, not on how long the job actually runs, so a
+# smaller PERJOB does NOT queue faster; it just finishes its request early and pays a fresh queue-wait
+# for the next leg. So PERJOB should use as much of the 11:45 request as safely possible, not as little.
+# MEASURED (core2_hindcast_v2 R1 rerun, live log): steady-state chunk wall ~0.15 s/step (host+device+I/O,
+# FESOM_REUSE_EXE hot) confirmed over 2 consecutive production jobs. 240000 steps ~= 42(setup) + 50(compile
+# warmup) + 240000*0.15(compute) + ~14(yearly archival-restart writes, ~10s each) + 10(final archival write)
+# ~= 10.5 h, leaving ~75 min margin under 11:45. ~5 production jobs for the 63 yr (down from ~8 at the old
+# 150000, which was sized for the SLOWER pcache-only fallback ~0.24 s/step ⇒ ~16.6 h at 240000 steps — i.e.
+# this sizing trades the worst-case-fallback safety margin for using the (now twice-validated) fast rate.
+# If reuse ever regresses on some future leg, that job walltime-hard-kills (SIGKILL, no graceful exit) ⇒ the
+# in-script auto-resubmit never fires (it runs only after a clean exit) ⇒ the chain silently STALLS until
+# someone notices and manually resubmits — data loss is bounded to <=1 calendar year (the archival restart
+# cadence, see the header) either way, since the archival stream is independent of PERJOB.
+PERJOB=${PERJOB:-240000}
 CHUNK=48                       # perf knob only: the monthly mean now accumulates EVERY step (run.py
                                # _MeanStream, split at month boundaries) ⇒ a TRUE time-mean that averages
                                # the diurnal cycle at any dt. CHUNK no longer sets the sampling cadence
@@ -77,22 +93,44 @@ mkdir -p $OUT
 CNT=$( cat $OUT/.jobcount 2>/dev/null || echo 0 ); CNT=$((CNT+1)); echo $CNT > $OUT/.jobcount
 if [ "$CNT" -gt 35 ]; then echo "ABORT: jobcount $CNT > 35 (runaway guard)"; exit 1; fi
 
-# current step = the rolling restart's step (0 ⇒ cold). Source of truth (survives crashes/kills).
-CUR=$( $PY -c "import json;print(int(json.load(open('$RESTART/.zattrs')).get('step',0)))" 2>/dev/null || echo 0 )
-[ -z "$CUR" ] && CUR=0
-echo "=== $(date) core2_hindcast job#$CNT: CUR=$CUR / TOTAL=$TOTAL ==="
+# current restart = whatever restart.latest in the archive resolves to (empty ⇒ cold). Source of
+# truth (survives crashes/kills) — a plain pointer-file read (mirrors zarr_output.resolve_latest_restart,
+# reimplemented in pure bash so this doesn't drag in `import jax` just to read one line of text — that
+# noisily fails CUDA init outside srun's GPU-scoped allocation and needlessly slows every resubmit).
+RESTART_DIR=""
+if [ -f "$ARCHIVE/restart.latest" ]; then
+  LTAG=$(cat "$ARCHIVE/restart.latest"); [ -n "$LTAG" ] && RESTART_DIR="$ARCHIVE/$LTAG"
+fi
+CUR=0
+if [ -n "$RESTART_DIR" ]; then
+  # the pointer EXISTS ⇒ an unreadable step must STOP the chain, not silently cold-start —
+  # the old `|| echo 0` fallback here was the mechanism class of the 2026-07-03 data loss
+  # (a cold start overwrites period stores + same-tag archival dirs). Transient /work read
+  # errors land here too: inspect + resubmit manually.
+  CUR=$( $PY -c "import json;print(int(json.load(open('$RESTART_DIR/.zattrs')).get('step',0)))" 2>/dev/null || echo FAIL )
+  case "$CUR" in ''|*[!0-9]*)
+    echo "ABORT: restart pointer -> $RESTART_DIR but its step is unreadable (corrupted .zattrs or transient FS error) — refusing the silent cold-start fallback"; exit 1;;
+  esac
+fi
+echo "=== $(date) core2_hindcast job#$CNT: CUR=$CUR / TOTAL=$TOTAL (restart=${RESTART_DIR:-none}) ==="
 if [ "$CUR" -ge "$TOTAL" ]; then echo "CORE2_HINDCAST_DONE ($CUR steps = 63 model years)"; exit 0; fi
 
 # step budget for THIS job: short canary on the cold start, else the per-job budget (capped at remaining).
 if [ "$CUR" -eq 0 ]; then
-  STEPS=$CANARY; RIN=""; rm -rf $OUT; mkdir -p $OUT; echo $CNT > $OUT/.jobcount
+  # COLD start: refuse when this chain has EVER archived (a cold start would overwrite the
+  # existing period stores under $OUT) — no silent deletion/overwrite in unattended chains.
+  # A deliberate re-run over an old tag needs an explicit FORCE_COLD=1 (or a fresh TAG).
+  if [ -n "$(ls -A "$ARCHIVE" 2>/dev/null)" ] && [ "${FORCE_COLD:-0}" != "1" ]; then
+    echo "ABORT: cold start requested but $ARCHIVE is non-empty — refusing to overwrite an existing chain (FORCE_COLD=1 overrides)"; exit 1
+  fi
+  STEPS=$CANARY; RIN=""; mkdir -p $OUT; echo $CNT > $OUT/.jobcount
 else
-  REM=$((TOTAL-CUR)); STEPS=$PERJOB; [ "$STEPS" -gt "$REM" ] && STEPS=$REM; RIN="--restart-in $RESTART"
+  REM=$((TOTAL-CUR)); STEPS=$PERJOB; [ "$STEPS" -gt "$REM" ] && STEPS=$REM; RIN="--restart-in $RESTART_DIR"
 fi
 echo "running $STEPS steps from $CUR (${RIN:-cold})"
 
 LOGFILE=$REPO/scripts/run_core2_hindcast.${SLURM_JOB_ID}.out   # this job's own -o file (srun output, live)
-do_resubmit() {   # resubmit the chain from the rolling restart (hang-heal + normal-completion paths)
+do_resubmit() {   # resubmit the chain from the latest archival restart (hang-heal + normal-completion paths)
   cd $REPO && sbatch \
     --export=ALL,CONFIG="$CONFIG",TAG="$TAG",MESH="$MESH",POOL="$POOL",PART="$PART",IC="$IC",PERJOB="$PERJOB",TOTAL="$TOTAL" $SELF
 }
@@ -101,9 +139,11 @@ do_resubmit() {   # resubmit the chain from the rolling restart (hang-heal + nor
 srun --ntasks=1 --cpu-bind=none "$PY" scripts/run_from_config.py "$CONFIG" \
     --mesh-dir "$MESH" --dist-dir "$POOL" --ic-dir "$IC" --partition "$PART" \
     --steps "$STEPS" --chunk-steps "$CHUNK" \
-    --checkpoint-every 1440 --diagnostics --progress \
+    --diagnostics --progress \
     --monthly-out "$OUT/monthly" --monthly-start-step 0 \
-    --restart-out "$RESTART" $RIN &
+    --restart-out "$OUT/restart" \
+    --restart-archive-out "$ARCHIVE" --restart-archive-period year --restart-archive-length 1 \
+    $RIN &
 SRUN_PID=$!
 
 # COMPILE-HANG GUARD: a healthy job prints "chunk 1/" within minutes (setup + XLA compile). No
