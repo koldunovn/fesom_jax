@@ -16,8 +16,13 @@ Layout (matches ushow's unstructured test fixture):
   lon[nod2], lat[nod2]                         — degrees, the node coordinates
   <2-D field>[nod2]                            — e.g. sst, sss, aice, speed, ssh
   <3-D field>[nz, nod2]                        — e.g. temp, salt (node-last; ushow keys on dim NAME)
+  time[1]                                      — optional, CF ``units``/``calendar`` (see write_*
+                                                  ``time_days``): the one date a period store represents,
+                                                  so a multi-file ``ushow`` glob can label/order frames.
 """
 from __future__ import annotations
+
+import datetime
 
 import jax
 import numpy as np
@@ -26,14 +31,58 @@ NODE_DIM = "nod2"      # in ushow's NODE_NAMES
 DEPTH_DIM = "nz"       # in ushow's DEPTH_NAMES
 TIME_DIM = "time"      # in ushow's TIME_NAMES
 
+# CF time convention for the optional per-store ``time`` coordinate (a single date: the day a
+# daily mean covers, or the mid-month day of a monthly mean). Epoch is arbitrary (any run year,
+# incl. pre-1970, encodes fine as a signed day offset) — 1970-01-01 is just the common default.
+TIME_EPOCH = datetime.date(1970, 1, 1)
+TIME_UNITS = "days since 1970-01-01 00:00:00"
+TIME_CALENDAR = "proleptic_gregorian"   # matches Python's datetime.date arithmetic (real leap years)
+
+
+def cf_days(d: datetime.date) -> int:
+    """Whole days from :data:`TIME_EPOCH` to date ``d`` — the ``time`` coordinate's raw value."""
+    return (d - TIME_EPOCH).days
+
+
+def _put_time(root, time_days):
+    """Write the optional ``time[1]`` CF coordinate into an already-open zarr ``root`` group.
+    No-op if ``time_days`` is ``None`` (most callers besides the daily/monthly output streams).
+
+    dtype is **int64, not float64** — confirmed against the ushow source
+    (``file_zarr.c:zarr_get_dim_info_fileset``): its CF time-value reader only recognizes
+    ``dtype=='i' && dtype_size==8`` (int64); a float64 array's dtype comes back as ``'f'`` from
+    ``parse_dtype`` (which doesn't distinguish f4/f8 by dtype CHAR, only by size) and matches
+    neither of that function's two branches (`'i'&&size==8` or a literal `'d'` that
+    ``parse_dtype`` never actually produces — dead code), so ``got_values`` silently stays 0 and
+    every frame's date falls back to a plain 0/1/2… index. :func:`cf_days` already returns a
+    whole day-count, so int64 loses nothing. Verified directly: float64 rendered every frame as
+    the 1970-01-01 epoch (index 0 misdecoded as a date); int64 renders the correct date per
+    frame (checked frame 1 AND frame 3 of a 3-file test set via a real pty + keypress)."""
+    if time_days is None:
+        return
+    a = root.create_dataset(TIME_DIM, data=np.asarray([time_days], np.int64), shape=(1,),
+                            dtype=np.int64, chunks=(1,), overwrite=True)
+    a.attrs["_ARRAY_DIMENSIONS"] = [TIME_DIM]
+    a.attrs["units"] = TIME_UNITS
+    a.attrs["calendar"] = TIME_CALENDAR
+    a.attrs["standard_name"] = "time"
+    a.attrs["long_name"] = "time"
+
 
 def write_ushow_zarr(out_dir, lon, lat, *, fields2d=None, fields3d=None,
-                     units=None, attrs=None, chunk_horiz=None, chunk_vert=None):
+                     units=None, attrs=None, chunk_horiz=None, chunk_vert=None, time_days=None):
     """Write an ushow-readable zarr store.
 
     ``lon``/``lat``: ``[N]`` node coordinates **in degrees**. ``fields2d``: ``{name: [N]}`` (surface
     / 2-D). ``fields3d``: ``{name: [N, nlev]}`` (stored transposed to ``[nlev, N]`` = ``[nz, nod2]``).
-    ``units``: optional ``{name: str}``. ``attrs``: optional store-level metadata.
+    ``units``: optional ``{name: str}``. ``attrs``: optional store-level metadata. ``time_days``:
+    optional CF day-offset (:func:`cf_days`) — writes a ``time[1]`` coordinate AND prepends a
+    matching leading ``time`` axis (size 1) to every data field (``[1, N]`` / ``[1, nlev, N]``,
+    ``_ARRAY_DIMENSIONS`` gains a leading ``"time"``) — required for ushow's per-point time-series
+    extraction (``zarr_read_timeseries_fileset``/``file_zarr.c``), which only reads a variable's
+    ``time`` coordinate when the variable's OWN dims name one (a bare store-level ``time[1]``
+    coordinate with no matching data-variable dim is silently ignored by that code path — confirmed
+    against the ushow source, not just its CLI). ``lon``/``lat`` are node-only, never time-varying.
 
     ``chunk_horiz`` / ``chunk_vert``: optional **user-controlled** chunk sizes along the node
     (``nod2``) and depth (``nz``) axes (the FESOM3 ``chunk_horiz``/``chunk_vert`` knobs); ``None`` =
@@ -44,18 +93,24 @@ def write_ushow_zarr(out_dir, lon, lat, *, fields2d=None, fields3d=None,
     out_dir = str(out_dir)
     root = zarr.open_group(out_dir, mode="w")
     units = units or {}
+    has_time = time_days is not None
 
     def _chunks(dims, shape):
         ch = list(shape)
         for i, d in enumerate(dims):
-            if d == NODE_DIM and chunk_horiz:
+            if d == TIME_DIM:
+                ch[i] = 1
+            elif d == NODE_DIM and chunk_horiz:
                 ch[i] = min(int(chunk_horiz), shape[i])
             elif d == DEPTH_DIM and chunk_vert:
                 ch[i] = min(int(chunk_vert), shape[i])
         return tuple(ch)
 
-    def _put(name, data, dims):
+    def _put(name, data, dims, time_varying=False):
         data = np.ascontiguousarray(data)
+        if has_time and time_varying:
+            data = data[np.newaxis]                # [N,...] -> [1, N,...]
+            dims = [TIME_DIM] + list(dims)
         a = root.create_dataset(name, data=data, shape=data.shape, dtype=data.dtype,
                                 chunks=_chunks(dims, data.shape), overwrite=True)
         a.attrs["_ARRAY_DIMENSIONS"] = list(dims)
@@ -66,11 +121,13 @@ def write_ushow_zarr(out_dir, lon, lat, *, fields2d=None, fields3d=None,
     _put("lon", np.asarray(lon, np.float64), [NODE_DIM])
     _put("lat", np.asarray(lat, np.float64), [NODE_DIM])
     for name, data in (fields2d or {}).items():
-        _put(name, np.asarray(data, np.float32), [NODE_DIM])
+        _put(name, np.asarray(data, np.float32), [NODE_DIM], time_varying=True)
     for name, data in (fields3d or {}).items():
-        _put(name, np.asarray(data, np.float32).T, [DEPTH_DIM, NODE_DIM])   # [nlev, N]
+        _put(name, np.asarray(data, np.float32).T, [DEPTH_DIM, NODE_DIM], time_varying=True)   # [nlev, N]
+    _put_time(root, time_days)
     if attrs:
         root.attrs.update(attrs)
+    zarr.consolidate_metadata(out_dir)
     return out_dir
 
 
@@ -88,7 +145,7 @@ def node_lonlat(mesh):
 _SENT_LON, _SENT_LAT, FILL = 0.0, -89.99, 1e38
 
 
-def write_ushow_sharded(out_dir, fields, sm, part, mesh, *, attrs=None):
+def write_ushow_sharded(out_dir, fields, sm, part, mesh, *, attrs=None, time_days=None):
     """Write an ushow-readable zarr **directly from a sharded run, gather-free** (Task B2 output).
 
     ``fields``: ``{name: folded [P*Lmax_nod, …] array}`` — node diagnostic fields (e.g. ``sst``,
@@ -96,6 +153,7 @@ def write_ushow_sharded(out_dir, fields, sm, part, mesh, *, attrs=None):
     (test). Reuses the restart's per-shard write: rank 0 creates the metadata + the single
     ``lon``/``lat`` coordinate arrays (folded ``[P*Lmax_nod]``), then every process writes ONLY its
     addressable shards — **no ``all_gather``, no global on one device** (cost ≈ a restart write).
+    ``time_days``: optional CF day-offset (:func:`cf_days`) — see :func:`write_ushow_zarr`.
 
     **Why it's correct for a point-cloud viewer:** every lane carries its own ``lon``/``lat``. The
     UNIQUE-owner lane of each node writes the real coord + value; **non-owned lanes (halo + pad) are
@@ -113,6 +171,7 @@ def write_ushow_sharded(out_dir, fields, sm, part, mesh, *, attrs=None):
     lon = np.where(owned, glon[safe], _SENT_LON).astype(np.float64)
     lat = np.where(owned, glat[safe], _SENT_LAT).astype(np.float64)
 
+    has_time = time_days is not None
     is0 = (jax.process_index() == 0)
     if is0:
         root = zarr.open_group(out_dir, mode="w")
@@ -125,28 +184,37 @@ def write_ushow_sharded(out_dir, fields, sm, part, mesh, *, attrs=None):
             nlev = shp[1] if len(shp) > 1 else 0
             store_shape = (nlev, PL) if nlev else (PL,)
             store_chunks = (nlev, Lmax) if nlev else (Lmax,)
+            dims = [DEPTH_DIM, NODE_DIM] if nlev else [NODE_DIM]
+            if has_time:                                     # leading time axis (size 1) -- see write_ushow_zarr
+                store_shape = (1,) + store_shape
+                store_chunks = (1,) + store_chunks
+                dims = [TIME_DIM] + dims
             z = root.create_dataset(name, shape=store_shape, chunks=store_chunks,
                                     dtype="f4", fill_value=FILL, overwrite=True)
-            z.attrs["_ARRAY_DIMENSIONS"] = ([DEPTH_DIM, NODE_DIM] if nlev else [NODE_DIM])
+            z.attrs["_ARRAY_DIMENSIONS"] = dims
+        _put_time(root, time_days)
         root.attrs.update(nod2D=int(sm.nod2D), P=int(sm.P), **(attrs or {}))
 
     _barrier("ushow_meta")
     root = zarr.open_group(out_dir, mode="a")
     for name, arr in fields.items():
         z = root[name]
+        t0 = (0,) if has_time else ()                        # leading time index, prepended below
         for lane_slice, data in _addressable_lane_chunks(arr):
             o = owned[lane_slice]                            # [chunk] bool for these lanes
             masked = np.where(o.reshape((-1,) + (1,) * (data.ndim - 1)), data, FILL).astype(np.float32)
             if data.ndim == 1:
-                z[lane_slice] = masked                       # [P*Lmax] node-only field
+                z[t0 + (lane_slice,)] = masked               # [(1,) P*Lmax] node-only field
             else:
-                z[:, lane_slice] = masked.T                  # [nlev, P*Lmax]: transpose [chunk,nlev]→[nlev,chunk]
+                z[t0 + (slice(None), lane_slice)] = masked.T  # [(1,) nlev, P*Lmax]: [chunk,nlev]→[nlev,chunk]
     _barrier("ushow_data")
+    if is0:
+        zarr.consolidate_metadata(out_dir)
     return out_dir
 
 
 def write_global_zarr(out_dir, fields, sm, part, mesh, *, method="auto", chunk_horiz=None,
-                      chunk_vert=None, units=None, attrs=None):
+                      chunk_vert=None, units=None, attrs=None, time_days=None):
     """Write **partition-independent, canonical global-node-order** output — the clean alternative to
     the folded :func:`write_ushow_sharded` (it mirrors the FESOM3 ``mod_io_zarr`` on-disk layout).
 
@@ -156,6 +224,7 @@ def write_global_zarr(out_dir, fields, sm, part, mesh, *, method="auto", chunk_h
     **partition-independent** (byte-identical at any device count — the FESOM3 ``dist_2 ≡ dist_8``
     property), **directly node-indexed** (``xr.open_zarr`` → ``[nod2]``, no ``ushow_to_nodes`` unfold;
     ushow/pyfesom2 read it as-is), and **user-chunkable** (``chunk_horiz``/``chunk_vert``).
+    ``time_days``: optional CF day-offset (:func:`cf_days`) — see :func:`write_ushow_zarr`.
 
     ``method`` selects HOW the canonical array is assembled (all give a byte-identical store):
 
@@ -178,11 +247,11 @@ def write_global_zarr(out_dir, fields, sm, part, mesh, *, method="auto", chunk_h
     if method == "redistribute":
         from .canonical_redist import write_redistribute
         return write_redistribute(out_dir, fields, sm, part, mesh, chunk_horiz=chunk_horiz,
-                                  chunk_vert=chunk_vert, attrs=attrs)
+                                  chunk_vert=chunk_vert, attrs=attrs, time_days=time_days)
     if method == "all_gather":
         from .canonical_redist import write_all_gather
         return write_all_gather(out_dir, fields, sm, part, mesh, chunk_horiz=chunk_horiz,
-                                chunk_vert=chunk_vert, attrs=attrs)
+                                chunk_vert=chunk_vert, attrs=attrs, time_days=time_days)
     if method != "host_gather":
         raise ValueError(f"write_global_zarr: unknown method {method!r} (host_gather|redistribute|"
                          "all_gather|auto)")
@@ -209,7 +278,8 @@ def write_global_zarr(out_dir, fields, sm, part, mesh, *, method="auto", chunk_h
     if attrs:
         meta.update(attrs)
     return write_ushow_zarr(out_dir, glon, glat, fields2d=f2d, fields3d=f3d, units=units,
-                            attrs=meta, chunk_horiz=chunk_horiz, chunk_vert=chunk_vert)
+                            attrs=meta, chunk_horiz=chunk_horiz, chunk_vert=chunk_vert,
+                            time_days=time_days)
 
 
 def _folded_gid_owned_nod(part, sm):

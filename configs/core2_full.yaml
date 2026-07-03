@@ -32,5 +32,5 @@ output_dir: /work/ab0995/a270088/port_jax/runs/core2
 snapshot_every: 48        # steps (~1/day at dt=1800)
 checkpoint_every: 1440    # steps (~1 month)
 restart_in: null
-restart_out: /work/ab0995/a270088/port_jax/runs/core2/restart
+restart_out: /work/ab0995/a270088/port_jax/runs/core2_hindcast_v2/restart   # overridden via --restart-out by run_core2_hindcast.sbatch
 duration: 10yr            # overridden by --steps (the per-job budget) from run_core2_hindcast.sbatch

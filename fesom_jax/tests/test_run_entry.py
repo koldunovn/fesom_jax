@@ -80,6 +80,32 @@ def test_year_boundaries():
     assert _year_boundaries(1958, 180.0, 200000, 200000) == [350400]
 
 
+def test_archive_tag():
+    from fesom_jax.run import _archive_tag
+    assert _archive_tag(1958, 1, 0) == "fesom.1958.001.00000"       # a clean calendar boundary
+    assert _archive_tag(1958, 213, 43200) == "fesom.1958.213.43200"  # a mid-period (crash-fallback-like) stamp
+    # lexical sort == chronological sort (the whole point of the zero-padded FESOM3 convention)
+    tags = sorted([_archive_tag(1958, 1, 0), _archive_tag(1958, 213, 43200), _archive_tag(1959, 1, 0)])
+    assert tags == [_archive_tag(1958, 1, 0), _archive_tag(1958, 213, 43200), _archive_tag(1959, 1, 0)]
+
+
+def test_archive_boundaries_year_and_month_and_length():
+    from fesom_jax.run import _archive_boundaries
+    n = parse_duration("3yr", 180.0)
+    # length=1 (the common case) == exactly the raw year boundaries
+    assert _archive_boundaries(1958, 180.0, 0, n, period="year", length=1) == \
+        _year_boundaries(1958, 180.0, 0, n)
+    # length=2 keeps only every OTHER year boundary (1958 % 2 == 0 is the reference; 1959 is odd,
+    # dropped; 1960 is even, kept) — filtered by the boundary's OWN absolute year, not call-local index
+    assert _archive_boundaries(1958, 180.0, 0, n, period="year", length=2) == \
+        [b for b in _year_boundaries(1958, 180.0, 0, n) if b == 350400]
+    # month period fires 12x more often than year within the same window
+    assert len(_archive_boundaries(1958, 180.0, 0, n, period="month", length=1)) == 35  # 36 months - 1 (start)
+    # an invalid period raises rather than silently doing nothing
+    with pytest.raises(ValueError):
+        _archive_boundaries(1958, 180.0, 0, n, period="fortnight", length=1)
+
+
 def test_plan_chunks_splits_at_year_boundary():
     # a forcing-year boundary forces a chunk boundary (so the reader rolls cleanly) WITHOUT
     # re-bootstrapping AB2 — a year switch is forcing-only; the dynamics are continuous.
@@ -225,6 +251,46 @@ def test_checkpoint_cadence(core2_setup, tmp_path, monkeypatch):
 
 
 @have_forcing
+def test_restart_archive_cadence(core2_setup, tmp_path, monkeypatch):
+    """`restart_archive_out` writes an IMMUTABLE, uniquely-named restart at every calendar
+    boundary crossed, PLUS unconditionally at the end of the run (mirrors FESOM3's "the last
+    step is always checkpointed") — never overwriting a prior one, and updates `restart.latest`
+    to the newest. A SEPARATE stream from the plain rolling `checkpoint_every`/`out_dir` restart,
+    which this test also exercises unchanged (both fire independently, no interference)."""
+    from fesom_jax import zarr_output
+    fx = core2_setup
+    common = dict(mesh=fx["mesh"], part=fx["part"], sm=fx["sm"], sop=fx["sop"], year=YEAR)
+    calls = []
+    orig = zarr_output.write_restart
+    monkeypatch.setattr(zarr_output, "write_restart",
+                        lambda out_dir, *a, **kw: (calls.append((out_dir, int(kw["step"]))),
+                                                    orig(out_dir, *a, **kw))[1])
+    archive = tmp_path / "archive"
+    # 60 steps @ DT=1800 (48 steps/day) crosses ONE day boundary (step 48) — mirrors test_daily_output.
+    # fx["stack"] is only pre-built for fx["n"]=4 steps, so build a correctly-sized one here (same
+    # pattern as test_daily_output).
+    n = 60
+    stack = fx["cf"].stack(_chunk_dates(YEAR, DT, 0, n, None))
+    run_from_config(RunConfig(n_steps=n, kpp=KppConfig(), dt=DT), state0=fx["state"],
+                    forcing=fx["cf"], forcing_stack=stack, chunk_steps=12,
+                    out_dir=str(tmp_path / "r"), checkpoint_every=100,   # never fires in 60 steps
+                    restart_archive_out=str(archive), restart_archive_period="day", **common)
+    archive_calls = sorted(s for d, s in calls if str(d).startswith(str(archive)))
+    assert archive_calls == [48, 60], f"archival steps {archive_calls} != [48, 60] (boundary + final)"
+    rolling_calls = sorted(s for d, s in calls if d == str(tmp_path / "r"))
+    assert rolling_calls == [60], f"unaffected rolling stream: {rolling_calls} != [60]"
+    # both archival directories exist, independently, forever (no overwrite) — and restart.latest
+    # names the chronologically LAST one (step 60), not merely the last call in the calls list.
+    import zarr as _zarr
+    last = zarr_output.resolve_latest_restart(str(archive))
+    assert last is not None and Path(last).is_dir()
+    g_last = _zarr.open_group(last, mode="r")
+    assert int(g_last.attrs["step"]) == 60
+    dirs = sorted(p.name for p in archive.iterdir() if p.is_dir())
+    assert len(dirs) == 2, f"expected 2 immutable archival dirs, got {dirs}"
+
+
+@have_forcing
 def test_inrun_multichunk_equals_singlechunk(core2_setup):
     """In ONE ``run_from_config`` call, splitting into multiple fine forcing-chunks (the A4/A6
     memory contract — NG5 can't pre-stack a whole year) carries the FOLDED state chunk→chunk
@@ -279,9 +345,14 @@ def test_daily_output(core2_setup, tmp_path):
     assert len(days) >= 2, f"expected >=2 daily zarrs (crossed a day boundary), got {days}"
     g = zarr.open_group(str(daily / days[0]), "r")
     keys = set(g.array_keys())
-    assert {"sst", "sss", "temp100", "u100", "v100", "lon", "lat"} <= keys, f"fields {keys}"
-    assert tuple(g["sst"].shape) == tuple(g["lon"].shape), "sst must be node-shaped (2-D field)"
-    lat, sst = np.asarray(g["lat"]), np.asarray(g["sst"])
+    assert {"sst", "sss", "temp100", "u100", "v100", "lon", "lat", "time"} <= keys, f"fields {keys}"
+    # sst carries a LEADING time axis (size 1) so ushow's per-point time-series extraction can find
+    # it (it keys off the DATA variable's own _ARRAY_DIMENSIONS, not just a bare time coordinate) --
+    # lon/lat stay node-only (mesh-invariant, never time-varying).
+    assert tuple(g["sst"].shape) == (1,) + tuple(g["lon"].shape), "sst must be [1, nod2] (leading time)"
+    assert g["sst"].attrs["_ARRAY_DIMENSIONS"][0] == "time", "sst's first dim must be named 'time'"
+    assert tuple(g["time"].shape) == (1,), "the time coordinate itself is a length-1 array"
+    lat, sst = np.asarray(g["lat"]), np.asarray(g["sst"])[0]
     owned = lat > -89.0                                   # non-sentinel (real-owner) lanes
     assert owned.any() and np.all(np.isfinite(sst[owned])), "owned SST daily means must be finite"
 
@@ -315,10 +386,12 @@ def test_monthly_output(core2_setup, tmp_path):
     assert months == ["1958_01"], f"expected the partial-Jan flush, got {months}"
     g = zarr.open_group(str(monthly / months[0]), "r")
     keys = set(g.array_keys())
-    assert {"temp", "salt", "u", "v", "ssh", "a_ice", "m_ice", "lon", "lat"} <= keys, f"fields {keys}"
-    assert g["temp"].ndim == 2 and g["ssh"].ndim == 1, "temp is [nz,nod2] (3-D); ssh is [nod2] (2-D)"
+    assert {"temp", "salt", "u", "v", "ssh", "a_ice", "m_ice", "lon", "lat", "time"} <= keys, f"fields {keys}"
+    # every data field gains a LEADING time axis (size 1) -- see test_daily_output's comment.
+    assert g["temp"].ndim == 3 and g["ssh"].ndim == 2, "temp is [1,nz,nod2]; ssh is [1,nod2]"
+    assert g["temp"].attrs["_ARRAY_DIMENSIONS"][0] == "time", "temp's first dim must be named 'time'"
     assert int(g.attrs["n_samples"]) > 0, "init().update() must fold samples (count>0, not zeros)"
-    lat, temp = np.asarray(g["lat"]), np.asarray(g["temp"])
+    lat, temp = np.asarray(g["lat"]), np.asarray(g["temp"])[0]
     owned = lat > -89.0                                   # non-sentinel (real-owner) lanes
     assert owned.any() and np.all(np.isfinite(temp[:, owned])), "owned monthly temp means finite"
 

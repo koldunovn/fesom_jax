@@ -151,6 +151,33 @@ def test_validate_and_dt_ramp():
 
 
 # --------------------------------------------------------------------------
+# 7b. Archival restart config: validation + YAML round-trip
+# --------------------------------------------------------------------------
+def test_restart_archive_config():
+    RunConfig().validate()                                        # off by default: never raises
+    RunConfig(restart_archive_out="/x", restart_archive_period="year").validate()   # OK
+    RunConfig(restart_archive_out="/x", restart_archive_period="month",
+             restart_archive_length=3).validate()                 # OK, general N
+    with pytest.raises(ValueError):
+        RunConfig(restart_archive_out="/x", restart_archive_period="fortnight").validate()
+    with pytest.raises(ValueError):
+        RunConfig(restart_archive_out="/x", restart_archive_period="year",
+                 restart_archive_length=0).validate()
+    with pytest.raises(ValueError):
+        RunConfig(restart_archive_out="/x", restart_archive_period=None).validate()  # out set, period not
+
+
+def test_restart_archive_yaml_roundtrip(tmp_path):
+    cfg = RunConfig(restart_archive_out="/work/x/archive", restart_archive_period="month",
+                    restart_archive_length=2)
+    p = tmp_path / "rc.yaml"
+    cfg.to_yaml(p)
+    back = load_yaml(p)
+    assert back == cfg
+    assert back.restart_archive_period == "month" and back.restart_archive_length == 2
+
+
+# --------------------------------------------------------------------------
 # 8. Aggregate gate
 # --------------------------------------------------------------------------
 def test_run_config_ok():

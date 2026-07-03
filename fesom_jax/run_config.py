@@ -36,8 +36,18 @@ YAML schema (every key optional; absent ⇒ the bit-identical default)::
     checkpoint_every: 480   # steps; 0 = off
     restart_in: null
     restart_out: /work/.../ng5_out/restart
+    restart_archive_out: /work/.../ng5_out/restart_archive   # null = archive off
+    restart_archive_period: year    # 'year' | 'month' | 'day'
+    restart_archive_length: 1       # fire every Nth `period` boundary (1 = every one)
     n_steps: 1440           # OR a duration string the A6 driver parses
     duration: 2yr
+
+``restart_out``/``checkpoint_every`` are the ROLLING restart (crash recovery + chain hand-off —
+frequent, single directory, always overwritten, mirrors nothing before it existed). By contrast
+``restart_archive_*`` is a SEPARATE, calendar-cadenced stream: each firing writes an immutable,
+uniquely-named directory (mirrors FESOM3's ``fesom.<YYYY>.<DDD>.<SSSSS>`` convention exactly —
+see ``fesom_jax/run.py``'s ``_archive_tag``) that is never overwritten or auto-deleted, so a past
+restart is always resumable (point ``--restart-in`` at it directly) for branching experiments.
 """
 from __future__ import annotations
 
@@ -69,7 +79,10 @@ _SUBCONFIGS = {
 }
 # Non-physics scalar/spec fields that pass through YAML verbatim.
 _SPEC_FIELDS = ("dt", "mesh", "partition", "forcing", "output_dir", "snapshot_every",
-                "checkpoint_every", "restart_in", "restart_out", "n_steps", "duration")
+                "checkpoint_every", "restart_in", "restart_out",
+                "restart_archive_out", "restart_archive_period", "restart_archive_length",
+                "n_steps", "duration")
+_ARCHIVE_PERIODS = ("year", "month", "day")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,6 +107,9 @@ class RunConfig:
     checkpoint_every: int = 0
     restart_in: Optional[str] = None
     restart_out: Optional[str] = None
+    restart_archive_out: Optional[str] = None       # None = archival restarts off
+    restart_archive_period: Optional[str] = None    # 'year' | 'month' | 'day'
+    restart_archive_length: int = 1                 # fire every Nth `period` boundary
     n_steps: Optional[int] = None
     duration: Optional[str] = None
 
@@ -119,6 +135,12 @@ class RunConfig:
             raise ValueError(f"dt must be > 0, got {self.dt}")
         if self.dt_ramp is not None and self.dt_ramp.dt <= 0:
             raise ValueError(f"dt_ramp.dt must be > 0, got {self.dt_ramp.dt}")
+        if (self.restart_archive_out is not None
+                and self.restart_archive_period not in _ARCHIVE_PERIODS):
+            raise ValueError(f"restart_archive_period must be one of {_ARCHIVE_PERIODS}, "
+                             f"got {self.restart_archive_period!r}")
+        if self.restart_archive_length < 1:
+            raise ValueError(f"restart_archive_length must be >= 1, got {self.restart_archive_length}")
 
     # -- the seam to the step kernel ---------------------------------------
     def physics_kwargs(self) -> dict:

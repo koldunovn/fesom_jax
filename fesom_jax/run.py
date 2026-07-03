@@ -199,6 +199,41 @@ def _period_boundaries(year: int, dt: float, start_step: int, n_steps: int,
     return bounds
 
 
+def _archive_tag(yr: int, doy: int, sec: float) -> str:
+    """``fesom.<YYYY>.<DDD>.<SSSSS>`` — mirrors FESOM3's archival-checkpoint folder name
+    (``mod_io_restart.F90``) exactly: year, day-of-year, second-of-day, all zero-padded, so
+    lexical sort == chronological sort. A calendar boundary (year/month start) always has
+    ``sec=0``; only a mid-period "always checkpoint the final step" write can have a nonzero one."""
+    return f"fesom.{int(yr):04d}.{int(doy):03d}.{int(round(sec)):05d}"
+
+
+def _archive_boundaries(year: int, dt: float, start_step: int, n_steps: int,
+                        *, period: str, length: int = 1, dt_ramp=None):
+    """Absolute step indices in ``(start_step, start_step+n_steps)`` where an ARCHIVAL restart
+    should fire: every ``length``-th ``period`` ('year'/'month'/'day') boundary. ``length=1``
+    (the common case) fires at every one. Reuses :func:`_year_boundaries`/:func:`_period_boundaries`
+    for the raw boundary set (so it's exactly consistent with the existing forcing-reopen /
+    output-period splits) and filters by an ABSOLUTE elapsed-period count (year number, or
+    year*12+month) so the cadence is stable across chain-job segments regardless of where a given
+    segment happens to start — not merely "every Nth boundary within this call"."""
+    if period == "year":
+        raw = _year_boundaries(year, dt, start_step, n_steps, dt_ramp)
+    elif period in ("month", "day"):
+        raw = _period_boundaries(year, dt, start_step, n_steps, period=period, dt_ramp=dt_ramp)
+    else:
+        raise ValueError(f"restart_archive_period must be 'year'/'month'/'day', got {period!r}")
+    length = int(length)
+    if length <= 1:
+        return list(raw)
+    out = []
+    for s in raw:
+        yr, _doy, _sec, mo = _chunk_dates(year, dt, s, 1, dt_ramp)[0]
+        idx = yr if period == "year" else (yr * 12 + mo)
+        if idx % length == 0:
+            out.append(s)
+    return out
+
+
 class _MeanStream:
     """A per-calendar-period TRUE time-mean output stream — the diurnal-safe replacement for the old
     once-per-chunk snapshot. The chunk scan sums this stream's fields over EVERY step and returns the
@@ -253,6 +288,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
                     accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
                     local_forcing=None, checkpoint_every=None,
+                    restart_archive_out=None, restart_archive_period=None,
+                    restart_archive_length=1,
                     daily_out=None, daily_start_step=0,
                     monthly_out=None, monthly_start_step=0, chunk_diagnostics=False,
                     output_layout="global"):
@@ -265,7 +302,18 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     (the test path); production builds each chunk's forcing from ``forcing`` (a ``CoreForcing``) via
     the calendar. ``accumulate_stats`` folds each chunk-final State into an
     :class:`~fesom_jax.zarr_output.OnlineStats` (a coarse, gather-free time mean). Returns a
-    :class:`RunResult`; writes the portable restart to ``out_dir`` / ``cfg.restart_out`` if set."""
+    :class:`RunResult`; writes the portable restart to ``out_dir`` / ``cfg.restart_out`` if set.
+
+    ``restart_archive_out`` (if set) additionally writes ARCHIVAL restarts: an immutable,
+    uniquely-named directory (``_archive_tag`` — mirrors FESOM3's ``fesom.<YYYY>.<DDD>.<SSSSS>``)
+    at every ``restart_archive_length``-th ``restart_archive_period`` ('year'/'month'/'day')
+    calendar boundary, PLUS unconditionally at the end of this run (mirrors FESOM3's "the last
+    step is always checkpointed regardless of cadence") — so a clean chain resubmit never loses
+    anything; only a mid-segment crash falls back to the last calendar boundary. Nothing is ever
+    overwritten or auto-deleted (resume any of them directly via ``restart_in``); a
+    ``restart.latest`` pointer (:func:`zarr_output.write_restart_latest`) always names the
+    newest one. This is a SEPARATE, additive stream — the plain rolling ``checkpoint_every``
+    restart (if also set) is unaffected."""
     cfg.validate()
     npes = part.npes
     # Output / restart on-disk layout. 'global' (default) = partition-INDEPENDENT canonical node
@@ -331,6 +379,12 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     if _out_period is not None:
         _split += _period_boundaries(year, cfg.dt, start_step, n_steps,
                                      period=_out_period, dt_ramp=cfg.dt_ramp)
+    _archive_targets = set()
+    if restart_archive_out is not None and restart_archive_period is not None:
+        _archive_targets = set(_archive_boundaries(
+            year, cfg.dt, start_step, n_steps, period=restart_archive_period,
+            length=restart_archive_length, dt_ramp=cfg.dt_ramp))
+        _split += list(_archive_targets)
     chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt,
                          split_at=sorted(set(_split)))
 
@@ -373,6 +427,18 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                                   calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv,
                                   layout=restart_layout)
 
+    # ARCHIVAL restart: a SEPARATE, immutable, never-overwritten directory per firing (calendar
+    # boundary or end-of-run) — see the docstring. `restart_archive_out=None` ⇒ fully inert (no
+    # extra writes, no extra directory created).
+    def _write_archive_restart(sp, step, dtv):
+        yr, doy, sec, _ = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
+        tag = _archive_tag(yr, doy, sec)
+        zarr_output.write_restart(f"{restart_archive_out}/{tag}", sp, sm, part, step=step,
+                                  calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv,
+                                  layout=restart_layout)
+        zarr_output.write_restart_latest(restart_archive_out, tag)
+        return tag
+
     # daily-/monthly-mean output (gather-free). Each active stream is a TRUE per-calendar-period time-
     # mean: the chunk scan sums the stream's fields over EVERY step and the driver divides by the step
     # count (:class:`_MeanStream` below) — dt-INDEPENDENT, and it AVERAGES the diurnal cycle (fixing the
@@ -382,11 +448,13 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # node order (write_global_zarr; xarray/ushow read it directly, byte-identical at any device
     # count); 'folded' = the gather-free sharded [P*Lmax] write (write_ushow_sharded) — the multi-
     # node / output-OOM path. Both take the same (path, {name: folded field}, sm, part, mesh).
-    def _emit_ushow(path, fields_dict, attrs):
+    def _emit_ushow(path, fields_dict, attrs, time_days=None):
         if output_layout == "folded":
-            ushow_output.write_ushow_sharded(path, fields_dict, sm, part, mesh, attrs=attrs)
+            ushow_output.write_ushow_sharded(path, fields_dict, sm, part, mesh, attrs=attrs,
+                                             time_days=time_days)
         else:
-            ushow_output.write_global_zarr(path, fields_dict, sm, part, mesh, attrs=attrs)
+            ushow_output.write_global_zarr(path, fields_dict, sm, part, mesh, attrs=attrs,
+                                           time_days=time_days)
 
     # TRUE time-mean output streams (daily / monthly). Each names the fields to average; the chunk scan
     # sums them over EVERY step (out_sample_fn below) and the mean divides by the step count — a real
@@ -401,22 +469,30 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     k100 = None
     if daily_out is not None:
         k100 = int(np.argmin(np.abs(np.asarray(mesh.Z) - (-100.0))))
+        k500 = int(np.argmin(np.abs(np.asarray(mesh.Z) - (-500.0))))
 
-        def _daily_fields(s, _k=k100):
-            return {"sst": s.T[:, 0], "sss": s.S[:, 0], "temp100": s.T[:, _k],
-                    "u100": s.uvnode[:, _k, 0], "v100": s.uvnode[:, _k, 1]}
+        def _daily_fields(s, _k100=k100, _k500=k500):
+            return {"sst": s.T[:, 0], "sss": s.S[:, 0], "ssh": s.eta_n,
+                    "temp100": s.T[:, _k100],
+                    "usurf": s.uvnode[:, 0, 0], "vsurf": s.uvnode[:, 0, 1],
+                    "u100": s.uvnode[:, _k100, 0], "v100": s.uvnode[:, _k100, 1],
+                    "u500": s.uvnode[:, _k500, 0], "v500": s.uvnode[:, _k500, 1],
+                    "a_ice": s.a_ice, "m_ice": s.m_ice}
 
-        def _write_daily(day, mean, count, _k=k100):
+        def _write_daily(day, mean, count, _k100=k100, _k500=k500):
             yr, doy = day
+            date = datetime.date(yr, 1, 1) + datetime.timedelta(days=doy - 1)
             _emit_ushow(f"{daily_out}/day_{yr:04d}_{doy:03d}", mean,
                         {"calendar_date": f"{yr:04d}-doy{doy:03d}", "n_samples": int(count),
-                         "depth_100m_level": int(_k)})
+                         "depth_100m_level": int(_k100), "depth_500m_level": int(_k500)},
+                        time_days=ushow_output.cf_days(date))
 
         def _daily_key(step):
             yr, doy, _, _ = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
             return (int(yr), int(doy))
 
-        streams.append(_MeanStream(("sst", "sss", "temp100", "u100", "v100"),
+        streams.append(_MeanStream(("sst", "sss", "ssh", "temp100", "usurf", "vsurf",
+                                    "u100", "v100", "u500", "v500", "a_ice", "m_ice"),
                                    _daily_key, _write_daily, daily_start_step))
         out_sample_specs.append(_daily_fields)
 
@@ -427,8 +503,10 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
 
         def _write_monthly(key, mean, count):
             yr, mo = key
+            date = datetime.date(yr, mo, 15)   # mid-month stamp (matches paper_jax's mid-month convention)
             _emit_ushow(f"{monthly_out}/{yr:04d}_{mo:02d}", mean,
-                        {"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": int(count)})
+                        {"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": int(count)},
+                        time_days=ushow_output.cf_days(date))
 
         def _monthly_key(step):
             yr, _, _, mo = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
@@ -546,6 +624,19 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 print(f"[run.progress] checkpoint @ step {step_now} -> {target} "
                       f"({time.perf_counter() - tw:.1f}s)", flush=True)
 
+        # archival restart: fires on every configured calendar boundary crossed by THIS chunk
+        # (never the last chunk — the unconditional end-of-run write below covers that exactly
+        # once, avoiding a redundant double-write at the same step).
+        if (restart_archive_out is not None and ci < len(chunks) - 1
+                and step_now in _archive_targets):
+            if progress:
+                jax.block_until_ready(state_p)
+            tw = time.perf_counter()
+            tag = _write_archive_restart(state_p, step_now, ch.dt)
+            if progress:
+                print(f"[run.progress] archival restart @ step {step_now} -> "
+                      f"{restart_archive_out}/{tag} ({time.perf_counter() - tw:.1f}s)", flush=True)
+
     end_step = start_step + n_steps
     end_dt = chunks[-1].dt if chunks else cfg.dt
 
@@ -559,6 +650,18 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         _write_restart_at(state_p, end_step, end_dt)
         if progress:
             print(f"[run.progress] restart written in {time.perf_counter() - tw:.1f}s", flush=True)
+
+    # unconditional end-of-run archival restart (mirrors FESOM3: "the last step is always
+    # checkpointed regardless of cadence") — so a CLEAN chain resubmit never loses anything; only
+    # an actual mid-segment crash falls back to the last calendar-boundary archival restart.
+    if restart_archive_out is not None:
+        if progress:
+            jax.block_until_ready(state_p)
+        tw = time.perf_counter()
+        tag = _write_archive_restart(state_p, end_step, end_dt)
+        if progress:
+            print(f"[run.progress] final archival restart -> {restart_archive_out}/{tag} "
+                  f"({time.perf_counter() - tw:.1f}s)", flush=True)
 
     # flush the final (partial) calendar period so the last day/month of the run/job is written too
     for _stream in streams:

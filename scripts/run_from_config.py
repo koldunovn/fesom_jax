@@ -79,6 +79,15 @@ def main():
     ap.add_argument("--checkpoint-every", type=int, default=None,
                     help="write a rolling intermediate restart every N steps (crash-safety on a "
                          "multi-hour run + segment-chaining); gather-free, coarse cadence ⇒ <<1%%")
+    ap.add_argument("--restart-archive-out",
+                    help="write ARCHIVAL restarts here: an immutable, uniquely-named directory "
+                         "(fesom.<YYYY>.<DDD>.<SSSSS>, mirrors FESOM3) per firing, never "
+                         "overwritten/deleted — resume any of them via --restart-in directly. "
+                         "A SEPARATE stream from --restart-out/--checkpoint-every.")
+    ap.add_argument("--restart-archive-period", choices=["year", "month", "day"], default="year",
+                    help="archival-restart cadence unit (default: year)")
+    ap.add_argument("--restart-archive-length", type=int, default=1,
+                    help="fire every Nth --restart-archive-period boundary (default 1 = every one)")
     ap.add_argument("--daily-out", default=None,
                     help="write daily-mean ushow zarrs (sst/sss/temp100/u100/v100) to this dir, "
                          "one day_<YYYY>_<DOY> per calendar day; gather-free")
@@ -171,6 +180,9 @@ def main():
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
                           use_ragged=args.ragged, progress=(args.progress and _IS_LEAD),
                           local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
+                          restart_archive_out=args.restart_archive_out,
+                          restart_archive_period=args.restart_archive_period,
+                          restart_archive_length=args.restart_archive_length,
                           daily_out=args.daily_out, daily_start_step=args.daily_start_step,
                           monthly_out=args.monthly_out, monthly_start_step=args.monthly_start_step,
                           chunk_diagnostics=args.chunk_diagnostics, output_layout=args.output_layout)

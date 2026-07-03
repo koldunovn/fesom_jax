@@ -13,4 +13,4 @@ mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20
 partition: dist_32
 forcing: {kind: core2, start_year: 1958}
 restart_in: null
-restart_out: /work/ab0995/a270088/port_jax/runs/forca20_3yr/restart
+restart_out: /work/ab0995/a270088/port_jax/runs/forca20_hindcast_v2/restart   # overridden via --restart-out by run_forca20_hindcast.sbatch

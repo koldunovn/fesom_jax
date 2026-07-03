@@ -275,6 +275,34 @@ def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_st
     return write_state_zarr(out_dir, state_folded, sm, part, fields=fields, attrs=meta, layout=layout)
 
 
+def write_restart_latest(archive_root, tag):
+    """Atomically point ``archive_root/restart.latest`` at ``tag`` (the folder NAME of the newest
+    archival restart) — mirrors FESOM3's ``restart.latest`` pointer (``mod_io_restart.F90``). A
+    reader should ALWAYS follow this pointer via :func:`resolve_latest_restart` rather than
+    sort/glob the directory, so a stray partial/failed write is never mistaken for the latest
+    complete restart. Write-then-rename is atomic on POSIX (``Path.replace``)."""
+    from pathlib import Path
+    root = Path(archive_root)
+    root.mkdir(parents=True, exist_ok=True)
+    if jax.process_index() != 0:
+        return
+    tmp = root / "restart.latest.tmp"
+    tmp.write_text(str(tag))
+    tmp.replace(root / "restart.latest")
+
+
+def resolve_latest_restart(archive_root):
+    """The full path of the newest archival restart per ``archive_root/restart.latest``, or
+    ``None`` if no archival restart has been published yet (fresh/cold archive)."""
+    from pathlib import Path
+    root = Path(archive_root)
+    ptr = root / "restart.latest"
+    if not ptr.exists():
+        return None
+    tag = ptr.read_text().strip()
+    return str(root / tag) if tag else None
+
+
 def read_restart(out_dir, mesh, new_part, *, devices=None):
     """Reload a :func:`write_restart` store onto ``new_part`` (ANY device count).
 

@@ -189,11 +189,17 @@ def redistribute_fields(fields, maps: RedistMaps, jmesh, axis_name: str = "p"):
 # --------------------------------------------------------------------------
 # The two multi-process canonical writers (node fields)
 # --------------------------------------------------------------------------
-def _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, method):
+def _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, method, time_days=None):
     """Rank-0: create the store, write the (host-global) lon/lat coords, define each field dataset in
-    canonical ``[..., n_global]`` shape with the fixed ``C`` chunk grid. Returns nothing."""
+    canonical ``[..., n_global]`` shape with the fixed ``C`` chunk grid. Returns nothing.
+
+    ``time_days`` (see :func:`ushow_output.write_ushow_zarr`): if given, EVERY field dataset also
+    gains a leading ``time`` axis (size 1) -- required for ushow's per-point time-series extraction
+    to find/use the ``time`` coordinate at all (it keys off the DATA variable's own dims, not just a
+    bare store-level ``time`` array)."""
     import zarr
-    from .ushow_output import DEPTH_DIM, NODE_DIM
+    from .ushow_output import DEPTH_DIM, NODE_DIM, TIME_DIM, _put_time
+    has_time = time_days is not None
     root = zarr.open_group(str(out_dir), mode="w")
     zlon = root.create_dataset("lon", shape=(n_global,), chunks=(C,), dtype="f8", overwrite=True)
     zlat = root.create_dataset("lat", shape=(n_global,), chunks=(C,), dtype="f8", overwrite=True)
@@ -205,15 +211,21 @@ def _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, m
         nlev = int(arr.shape[1]) if arr.ndim > 1 else 0
         shape = (nlev, n_global) if nlev else (n_global,)
         chunks = ((chunk_vert or nlev, C) if nlev else (C,))
+        dims = [DEPTH_DIM, NODE_DIM] if nlev else [NODE_DIM]
+        if has_time:
+            shape = (1,) + shape
+            chunks = (1,) + chunks
+            dims = [TIME_DIM] + dims
         z = root.create_dataset(name, shape=shape, chunks=chunks, dtype="f4", overwrite=True)
-        z.attrs["_ARRAY_DIMENSIONS"] = ([DEPTH_DIM, NODE_DIM] if nlev else [NODE_DIM])
+        z.attrs["_ARRAY_DIMENSIONS"] = dims
         z.attrs["long_name"] = name
+    _put_time(root, time_days)
     root.attrs.update(nod2D=int(n_global), layout="canonical_global", write_method=method,
                       **(attrs or {}))
 
 
 def write_redistribute(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk_vert=None,
-                       attrs=None, devices=None):
+                       attrs=None, devices=None, time_days=None):
     """No-single-node-gather canonical writer via ``ragged_all_to_all`` (see module docstring)."""
     import zarr
 
@@ -227,9 +239,12 @@ def write_redistribute(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chu
     jmesh = halo.device_mesh("p", devices=devs)
 
     if jax.process_index() == 0:
-        _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, "redistribute")
+        _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, "redistribute",
+                      time_days=time_days)
     _barrier("canon_redist_meta")
 
+    has_time = time_days is not None
+    t0 = (0,) if has_time else ()                                 # leading time index, see _create_store
     canon = redistribute_fields(fields, maps, jmesh)             # {name: folded [P*BUF, *rest] sharded}
     root = zarr.open_group(out_dir, mode="a")
     for name, c in canon.items():
@@ -242,10 +257,12 @@ def write_redistribute(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chu
             g0 = int(maps.first_gid[w])
             data = np.asarray(shard.data[:nr]).astype(np.float32)
             if data.ndim == 1:
-                z[g0:g0 + nr] = data
+                z[t0 + (slice(g0, g0 + nr),)] = data
             else:
-                z[:, g0:g0 + nr] = data.T                        # [nr, nlev] → [nlev, nr]
+                z[t0 + (slice(None), slice(g0, g0 + nr))] = data.T   # [nr, nlev] → [nlev, nr]
     _barrier("canon_redist_data")
+    if jax.process_index() == 0:
+        zarr.consolidate_metadata(out_dir)
     return out_dir
 
 
@@ -266,7 +283,7 @@ def _cached_maps(sm, part, C: int) -> RedistMaps:
 
 
 def write_all_gather(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk_vert=None,
-                     attrs=None, devices=None):
+                     attrs=None, devices=None, time_days=None):
     """Simpler baseline: ``all_gather`` the full field to every device, then each PROCESS writes its
     disjoint chunk range lock-free. Replicates the field per device (memory-heavy) — for the comparison."""
     import zarr
@@ -290,7 +307,8 @@ def write_all_gather(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk
     r0, r1 = c0 * C, min(c1 * C, n_global)                        # this process's global row range
 
     if pid == 0:
-        _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, "all_gather")
+        _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, "all_gather",
+                      time_days=time_days)
     _barrier("canon_ag_meta")
 
     gather_fn = _allgather_callable(jmesh, "p")
@@ -300,6 +318,8 @@ def write_all_gather(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk
         # once per shape); out_spec replicated (a sharded out_spec would re-tile the gathered array).
         return np.asarray(gather_fn(field_folded))               # [P*Lmax, *rest] host
 
+    has_time = time_days is not None
+    t0 = (0,) if has_time else ()                                 # leading time index, see _create_store
     root = zarr.open_group(out_dir, mode="a")
     for name, arr in fields.items():
         folded_host = _gather(arr)                                # every process has the full folded
@@ -309,10 +329,12 @@ def write_all_gather(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk
             data = g[r0:r1].astype(np.float32)
             z = root[name]
             if data.ndim == 1:
-                z[r0:r1] = data
+                z[t0 + (slice(r0, r1),)] = data
             else:
-                z[:, r0:r1] = data.T
+                z[t0 + (slice(None), slice(r0, r1))] = data.T
     _barrier("canon_ag_data")
+    if pid == 0:
+        zarr.consolidate_metadata(out_dir)
     return out_dir
 
 
