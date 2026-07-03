@@ -60,7 +60,12 @@ def jm_components(T, S):
     """
     t = jnp.asarray(T)
     s = jnp.asarray(S)
-    s_sqrt = jnp.sqrt(s)
+    # sqrt(0) is fine forward but its VJP is 0.5/sqrt(0)=inf ⇒ 0·inf=NaN cotangents on the
+    # exactly-zero below-bottom S lanes (phc_ic zero-fills them and nothing re-fills — the
+    # masked-NaN trap, cf. the zdiff guard below). Guard ONLY s==0 so wet-cell forward bits
+    # are untouched and a (nonphysical) negative S still fails loudly as NaN.
+    s_zero = s == 0.0
+    s_sqrt = jnp.where(s_zero, 0.0, jnp.sqrt(jnp.where(s_zero, 1.0, s)))
 
     bulk_0 = (
         _A0 + t * (_AT + t * (_AT2 + t * (_AT3 + t * _AT4)))

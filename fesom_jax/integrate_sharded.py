@@ -394,6 +394,16 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     ``stress_p`` static); the forced multi-step (per-step forcing as the scan ``xs``, a
     ``[n_steps, P*Lmax]`` ``PartitionSpec(None,'p')`` fold) is the follow-up for the PRIMARY
     KPP+GM+ice few-step gate."""
+    if return_grad_fn and use_ragged:
+        # lax.ragged_all_to_all has a WRONG reverse-mode transpose (over-counts ~axis_size×,
+        # GPU-only; docs/JAX_RAGGED_A2A_BUG.md + the test_halo.py xfail). The forward is
+        # byte-exact but any gradient through it is silently wrong — refuse loudly, at entry,
+        # before any setup work (guard added by the 2026-07-03 review).
+        raise ValueError(
+            "return_grad_fn=True with use_ragged=True would differentiate through "
+            "lax.ragged_all_to_all, whose autodiff transpose is broken (silently wrong "
+            "gradients; see docs/JAX_RAGGED_A2A_BUG.md). Use use_ragged=False (all_gather "
+            "halo) for the gradient path.")
     fm, fm_spec = folded_mesh(sm)
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)

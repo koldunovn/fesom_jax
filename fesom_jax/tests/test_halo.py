@@ -223,3 +223,15 @@ def test_ragged_primitive_grad_known_broken(npes, kind):
     assert np.allclose(g_rag, g_ref, atol=1e-12, rtol=0), \
         f"ragged grad != all_gather grad ({kind}, npes={npes}); " \
         f"max|Δ|={np.max(np.abs(g_rag - g_ref)):.3e}"
+
+
+def test_ragged_grad_path_refused():
+    """GUARD (2026-07-03 review): while the ``ragged_all_to_all`` transpose is broken (the
+    xfail above), the gradient entry point must REFUSE ``use_ragged=True`` loudly rather
+    than return silently wrong gradients. The raise is at function entry, before any
+    argument is touched — hermetic (no devices, no data). Once B.0d lands a correct
+    ``custom_vjp``, delete this test together with the guard in ``run_steps_sharded``."""
+    from fesom_jax import integrate_sharded as ish
+    with pytest.raises(ValueError, match="ragged_all_to_all"):
+        ish.run_steps_sharded(None, None, None, None, 1, dt=1.0, npes=2,
+                              use_ragged=True, return_grad_fn=True)

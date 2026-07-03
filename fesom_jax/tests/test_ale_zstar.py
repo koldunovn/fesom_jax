@@ -345,16 +345,22 @@ def _ice_inputs(n=6):
 
 
 def test_thermo_split_and_rsf_producer():
-    """zstar real-salt path (``use_virt_salt=False``): the bundled ``evap`` splits exactly into
-    ``evaporation+ice_sublimation``; ``rsf = fwice·Sice − iflice·ρice/ρwat·Sice``; the
-    virtual-salt path keeps ``rsf=0`` and ``thdgr``/``evap`` are path-independent."""
+    """zstar real-salt path (``use_virt_salt=False``): ``evaporation`` is the BUNDLED
+    ``evap_ow·(1−A) + subli·A`` (== ``evap``, the C's ``*evap = _evap + _subli`` — the
+    5a61bb0 budget fix; the pre-fix open-water-only ``evaporation`` was the salinity-drift
+    leak) and ``evaporation − ice_sublimation`` recovers the open-water part the balance
+    needs; ``rsf = fwice·Sice − iflice·ρice/ρwat·Sice``; the virtual-salt path keeps
+    ``rsf=0`` and ``thdgr``/``evap`` are path-independent."""
     from fesom_jax import ice_thermo as it
     cfg, args = _ice_inputs()
     ov = jax.vmap(lambda *x: it.therm_ice_cell(cfg, *x, use_virt_salt=True))(*args)
     orl = jax.vmap(lambda *x: it.therm_ice_cell(cfg, *x, use_virt_salt=False))(*args)
-    # the split is exact on both paths
+    # post-5a61bb0 semantics on both paths: evaporation ≡ evap (bundled, bit-identical),
+    # ice_sublimation = subli·A nonzero on these icy sublimating columns (so the
+    # balance's evaporation − ice_sublimation genuinely subtracts something)
     for o in (ov, orl):
-        assert float(jnp.max(jnp.abs(o.evaporation + o.ice_sublimation - o.evap))) == 0.0
+        assert float(jnp.max(jnp.abs(o.evaporation - o.evap))) == 0.0
+        assert float(jnp.min(jnp.abs(o.ice_sublimation))) > 0.0
     # rsf: 0 under virtual; the exact producer formula under real
     assert float(jnp.max(jnp.abs(ov.rsf))) == 0.0
     fwice = -orl.thdgr * cfg.rhoice / cfg.rhowat

@@ -38,7 +38,7 @@ import jax.numpy as jnp
 
 from . import (ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh, tke,
                tracer_adv, tracer_diff)
-from .config import DENSITY_0, DT_DEFAULT
+from .config import DT_DEFAULT
 from .mesh import Mesh
 from .params import Params
 from .ssh import SSHOperator
@@ -246,9 +246,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 3 — pressure-gradient force. zstar ⇒ the shchepetkin density-Jacobian on live geometry
     #     (NO hpressure under zstar — the C uses none); linfs ⇒ the hpressure gradient (byte-identical).
+    #     `density` from compute_pressure_bv is ALREADY ρ−ρ0 (eos.py rho_ref subtraction = the C's
+    #     density_m_rho0) — do NOT subtract DENSITY_0 again (the pre-2026-07-03 double subtraction
+    #     was analytically harmless — the kernel is offset-invariant — but coarsened the stencil-
+    #     difference ulp ~30× and diverged from the pgf.py ρ−ρ0 contract).
     if ale_cfg is not None:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_shchepetkin(
-            mesh, density - DENSITY_0, Z3d_live, st.helem))()
+            mesh, density, Z3d_live, st.helem))()
     else:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_linfs(mesh, hpressure))()
     pgf_x = _exch(pgf_x, "elem")

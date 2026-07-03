@@ -99,6 +99,7 @@ class IceConfig(NamedTuple):
     use_meltponds: int = 0
     use_virt_salt: int = 1        # linfs virtual-salt path
     ref_sss_local: int = 1        # rsss = local S_top (not a global ref_sss)
+    ref_sss: float = 34.7         # global rsss when ref_sss_local=0 (oce_modules.F90:37 default)
     # --- over-ice exchange coeffs (fesom_constants.h:110-113; from config.py) ---
     ch_atm_ice: float = CH_ATM_ICE  # 1.75e-3 sensible-heat over ice
     ce_atm_ice: float = CE_ATM_ICE  # 1.75e-3 evaporation over ice

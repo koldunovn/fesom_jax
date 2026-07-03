@@ -110,6 +110,60 @@ def test_ice_state_advances(assembled):
 
 
 # --------------------------------------------------------------------------
+# zstar freshwater conservation — the assembled-wiring gate (2026-07-03 review)
+# --------------------------------------------------------------------------
+def test_zstar_freshwater_balance_closes_globally(assembled):
+    """CONSERVATION GATE: after ``fresh_water_balance_zstar`` the area-weighted global mean
+    of ``water_flux`` is zero to roundoff. This holds ONLY if the assembled step passes the
+    THERMO-ENTRY (post-advection/cut_off) concentration ``a_co`` as ``a_ice_old`` (the C's
+    ``values_old``, fesom_ice_thermo.c:497-506): then the balance's ``prec_snow·(1−a_old)``
+    cancels thermo's ``snow·(1−A)`` in ``fw`` term-for-term and ``⟨water_flux⟩ ≡ 0``. The
+    pre-2026-07-03 wiring passed ``state.a_ice`` instead, leaking
+    ``⟨prec_snow·(A_entry−A_state)⟩`` into the volume budget every step — the same failure
+    class as the 5a61b0 sublimation leak. Both budget bugs lived exactly here; the per-node
+    z2_cdump gate (test_ale_zstar) cannot see them below its ~1e-8 bulk-ulp floor, so this
+    GLOBAL-MEAN gate is the regression that would have caught both."""
+    import dataclasses
+
+    import jax.numpy as jnp
+    from fesom_jax import ice_step
+    from fesom_jax.ice import IceConfig
+    from fesom_jax.sss_runoff import _area_mean
+
+    mesh, s0, _new, _recs, cf, sf = assembled
+    fs = cf.static
+
+    def gmean(x):
+        return float(_area_mean(jnp.asarray(x), fs.areasvol_surf, fs.ocean_area))
+
+    out = ice_step.ice_surface_step(IceConfig(), mesh, s0, sf, fs, dt=DT,
+                                    use_virt_salt=False)
+    scale = gmean(np.abs(np.asarray(out.water_flux)))
+    assert scale > 1e-12                       # real fluxes present (non-vacuous)
+    rel = abs(gmean(out.water_flux)) / scale
+    assert rel < 1e-8, f"post-balance ⟨water_flux⟩/⟨|water_flux|⟩ = {rel:.3e} (leak!)"
+
+    # Anti-triviality: a state engineered so cut_off changes A by ~0.4 over the icy nodes
+    # (a_ice=1.4 → clamped to 1.0 at thermo entry). The balance must STILL close with the
+    # a_co wiring, while the old state.a_ice wiring would leak ≈⟨snow·0.4·icy⟩ — asserted
+    # below to sit orders of magnitude ABOVE the gate tolerance, so the gate cannot pass
+    # the old wiring by luck of small step-1 advection increments.
+    a_pert = np.asarray(s0.a_ice).copy()
+    icy = a_pert > 0.5
+    assert icy.sum() > 1000                    # the seeded ice cover is substantial
+    a_pert[icy] = 1.4
+    s0b = dataclasses.replace(s0, a_ice=jnp.asarray(a_pert))
+    outb = ice_step.ice_surface_step(IceConfig(), mesh, s0b, sf, fs, dt=DT,
+                                     use_virt_salt=False)
+    scaleb = gmean(np.abs(np.asarray(outb.water_flux)))
+    relb = abs(gmean(outb.water_flux)) / scaleb
+    assert relb < 1e-8, f"perturbed post-balance mean {relb:.3e} (a_ice_old wiring leak!)"
+    # the leak the OLD wiring would have produced: ⟨snow·(min(a,1)−a)⟩ over the clamped nodes
+    leak_old = abs(gmean(np.asarray(sf.prec_snow) * (np.minimum(a_pert, 1.0) - a_pert)))
+    assert leak_old / scaleb > 1e-4, "negative control lost its teeth (no snow over ice?)"
+
+
+# --------------------------------------------------------------------------
 # The pi / no-ice path is untouched
 # --------------------------------------------------------------------------
 def test_no_ice_path_unchanged(assembled):

@@ -136,14 +136,20 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         use_virt_salt=use_virt_salt, real_salt_flux=th.real_salt_flux)
 
     # zstar (Phase 9a): the global freshwater-flux balancing on water_flux (the C's
-    # !use_virt_salt block, fesom_ice_coupling.c:193-216). a_ice_old = the PREVIOUS step's
-    # concentration (state.a_ice, since the ice step runs at the start). Under linfs this is
-    # skipped (dead branch ⇒ byte-identical).
+    # !use_virt_salt block, fesom_ice_coupling.c:193-216). a_ice_old = the THERMO-ENTRY
+    # (post-advection/cut_off) concentration `a_co`: the C saves values_old inside the thermo
+    # loop AFTER fct_solve/cut_off and BEFORE overwriting with thermo's outputs
+    # (fesom_ice_thermo.c:497-506), and that is what the balance consumes
+    # (fesom_ice_coupling.c:197-207). With a_co the balance's prec_snow·(1−a_old) cancels
+    # thermo's snow·(1−A) in fw exactly ⇒ post-balance ⟨water_flux⟩ ≡ 0 (the conservation
+    # gate in test_ice_step.py); passing state.a_ice instead leaks
+    # ⟨prec_snow·(A_entry−A_state)⟩ into the volume budget every step (2026-07-03 review).
+    # Under linfs this is skipped (dead branch ⇒ byte-identical).
     water_flux = icef.water_flux
     if not use_virt_salt:
         water_flux = ice_coupling.fresh_water_balance_zstar(
             water_flux, th.evaporation, th.ice_sublimation, sf.prec_rain, sf.prec_snow,
-            state.a_ice, fs.runoff_node, th.thdgr, th.thdgrsn,
+            a_co, fs.runoff_node, th.thdgr, th.thdgrsn,
             fs.areasvol_surf, fs.ocean_area, cfg,
             owned_mask=owned_mask, axis_name=axis_name)
 
