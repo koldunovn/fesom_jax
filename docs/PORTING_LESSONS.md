@@ -4713,3 +4713,213 @@ Cite the C source (`file:line`) or dump probe that proves it.
   time-sampled diagnostic (snapshot at a step-count cadence) can imprint a longitude-organized pattern that mimics a
   coordinate/physics bug; compare LIKE-for-LIKE (both true time-means) before blaming the model — and make the mean dt-general,
   not tied to one config's steps-per-day.
+
+- **[model-paper] ushow multi-file animation silently fails on a specific variable ("Could not find variable 'm_ice' in zarr
+  file N") when the store has no consolidated Zarr metadata — FIX, CONFIRMED by the user 2026-07-02.**
+  *Symptom:* the user globbed the per-month canonical output (`ushow "monthly/1958_0*"`) expecting an animation across
+  months — ushow loaded the store (variable buttons appeared) but every frame past the first failed to read `m_ice`
+  specifically, with no animation. *First checked, ruled out:* whether fesom_jax's writer was actually missing/inconsistent
+  data — it wasn't: `ls` + `.zattrs`/`.zarray` diffs showed all 9 months had byte-identical schema (`a_ice lat lon m_ice
+  salt ssh temp u v`, same dims/dtype/chunking), and raw (unsorted, `ls -f`) directory order was IDENTICAL across every
+  file too — so this is not a write-side bug, and not a cross-file directory-order inconsistency either. *The tell:* ushow's
+  own startup log prints `Zarr: No consolidated metadata, will read individual .zarray files` — a routine fallback message,
+  but circumstantial evidence it has a less-robust code path when no `.zmetadata` manifest exists, and our writers
+  (`zarr_output.py`/`ushow_output.py`/`canonical_redist.py`) never called `zarr.consolidate_metadata()`. *Fix:* added
+  `zarr.consolidate_metadata(out_dir)` at the end of all four writer paths that produce ushow-viewable output —
+  `write_ushow_zarr` (unconditional, single-process), `write_ushow_sharded` (rank-0-only, after the data barrier),
+  `write_all_gather`/`write_redistribute` in `canonical_redist.py` (same, `pid==0`-guarded post-barrier) — purely additive
+  (a `.zmetadata` manifest aggregating existing `.zarray`/`.zattrs`; never touches chunk data), so it does not change how
+  `common.jax_canonical_months`/`reconstruct_global` read the store (plain `zarr.open_group`, unaffected either way).
+  Verified via `test_ushow_output.py`/`test_canonical_redist.py` (3 passed + the 2 previously `NDEV<4`-skipped multi-process
+  tests re-run with `XLA_FLAGS=--xla_force_host_platform_device_count=4`, both pass) — no regression, and the two
+  multi-process writers used by FORCA20's multi-node output are now genuinely exercised. Backfilled onto all
+  already-written live production output (`core2_hindcast_v2` 341/341 months, `forca20_hindcast_v2` 3/3 months + 121/121
+  days; the single most-recently-modified dir per root was skipped each time as a margin against the still-running writer
+  process). *Confirmed:* the user retested interactively — animation now advances through frames correctly, the fix
+  worked. *Lesson:* when a third-party VIEWER (not this codebase) fails on a SPECIFIC variable/frame while the underlying
+  data is byte-identical across every file, check what optional-but-preferred on-disk convention the viewer itself
+  announces (a log line, a warning, a fallback message) before assuming a data bug — and when you can't drive the
+  viewer's UI yourself, say so plainly and wait for confirmation rather than claiming a fix works.
+
+- **[model-paper] ushow shows no dates during (now-working) multi-file animation, and can't build a time series either —
+  because the writer never wrote an actual `time` COORDINATE, only a date STRING in a metadata attr — FIX 2026-07-02.**
+  *Symptom:* immediate follow-up to the bullet above — once animation worked, frames had no date label, and the user
+  separately noted this also blocks building a time series (both need a real time axis to key off). *Root cause:*
+  `ushow_output.py` stashed the period's date as `attrs["calendar_date"]`/`attrs["calendar_month"]` — a plain STRING on
+  the store's root `.zattrs`, not a `time`-dimensioned array variable. Telling clue: the module already defined
+  `TIME_DIM = "time"  # in ushow's TIME_NAMES` — a `grep TIME_DIM` found exactly that ONE definition and no use anywhere
+  else, i.e. it was designed for but never wired up. *Fix:* added `ushow_output.cf_days(date)` (days since 1970-01-01,
+  `calendar=proleptic_gregorian` — matches plain `datetime.date` arithmetic, negative offsets pre-1970 decode fine) +
+  `_put_time(root, time_days)` (writes a `time[1]` array with `_ARRAY_DIMENSIONS=["time"]` + CF `units`/`calendar`
+  attrs), and a `time_days=` kwarg threaded through all 4 writer entry points down to `_put_time`/`_create_store`.
+  `run.py` computes the value per period: `_write_daily` uses the exact calendar day, `_write_monthly` uses day 15
+  (mid-month — matches the SAME convention `paper_jax/scripts/common.py` already uses for its decimal-year x-axis, so
+  the two pipelines now agree). *Verified:* 7/7 tests green (the same 5 writer/consolidate tests + `test_daily_output`/
+  `test_monthly_output`, both now list `'time'` in the written fields); backfilled onto live output by PARSING each
+  store's EXISTING `calendar_date`/`calendar_month` attr (no need to touch run state) — 354/354 + 3/3 + 129/129 stores,
+  0 errors; spot-checked 3 backfilled stores decode back to the exact expected date via `TIME_EPOCH + timedelta(days=t)`.
+  *Lesson:* an unused "anticipated" constant (a dimension name, a config key, a schema field defined but never actually
+  populated) is a strong signal the feature was planned but the wiring got dropped — `grep` for a suspicious constant's
+  OTHER uses before assuming it's actually implemented just because it's *defined*.
+
+- **[model-paper] ushow's "ultimate test" (per-point time series) STILL failed after the `time[1]` coordinate fix — two
+  more root causes, found only after the user pointed me at ushow's SOURCE (`~/ushow`, a sibling repo) — FIX 2026-07-02.**
+  *Symptom:* animation worked (prior bullet), but clicking a point for a value-vs-time plot produced nothing sensible.
+  *Why binary-strings-only investigation stalled here:* I'd confirmed via `uterm` (ushow's terminal sibling, far easier
+  to introspect than the X11 GUI) that "Total virtual time steps: N across N zarr files" was correct, and the on-canvas
+  HUD showed "time 1/N" — but couldn't tell if that was a real date or a plain index without seeing rendered output, and
+  `strings`-based reverse engineering of the binary was giving plausible-but-unverifiable theories. The user's source
+  pointer turned hours of inference into minutes of `grep`. *Root cause 1:* `zarr_get_dim_info`/`zarr_read_timeseries_fileset`
+  (`file_zarr.c`) only read the `time` coordinate's VALUES when the DATA VARIABLE's own `_ARRAY_DIMENSIONS` names a dim
+  matching `TIME_NAMES` (`var->time_dim_id>=0`) — confirmed against `ushow/tests/test_file_zarr.c`'s own fixtures, which
+  ALWAYS declare `_ARRAY_DIMENSIONS:["time","ncells"]` on the data variable itself, time leading; a bare store-level
+  `time[1]` array with no matching data-variable dim is silently ignored. *Fix:* every data field gains a `[1,...]`
+  leading axis (`_put`/`write_ushow_sharded`/`_create_store` in `canonical_redist.py` — every low-level write-indexing
+  call site needed the new leading time index prepended, e.g. `z[0, r0:r1]` not `z[r0:r1]`); lon/lat stay node-only
+  (never time-varying). *Root cause 2, a genuine USHOW BUG (not a convention mismatch):* even with dim #1 fixed, the
+  HUD showed the WRONG date (1970-01-01, the epoch) on every frame. Traced to `file_zarr.c`'s
+  `zarr_get_dim_info_fileset` (~line 1475): its value-reader only has branches for `dtype=='i'&&size==8` (int64) or a
+  literal `dtype=='d'` — but `parse_dtype` (same file) maps EVERY float width (4-byte or 8-byte) to `'f'`, NEVER `'d'`
+  (dead branch) — so a float64 `time` array matches neither branch, `got_values` stays 0, and it silently falls back to
+  a plain `0,1,2,...` index (which happens to format as the epoch date when passed through the otherwise-correct
+  `format_time_from_units`). Ran ushow's OWN test suite (`cd ~/ushow/tests && make WITH_ZARR=1 test_file_zarr &&
+  ./test_file_zarr` — needs DKRZ's spack c-blosc/lz4 paths) — 34/34 pass, but `zarr_get_dim_info_fileset_basic` only
+  asserts the dimension SIZE, never checks the VALUES are correct — a real gap in ushow's own coverage. *Fix:* write
+  `time` as int64, not float64 (`cf_days()` already returns a whole day-count, so nothing is lost). *The verification
+  technique that cracked it:* `timeout cmd 2>&1` shows NOTHING on success for either `ushow`/`uterm` — both fully-buffer
+  stdout unless attached to a real terminal (not just any redirect) — use `script -qc "cmd" out.txt` (or Python's `pty`
+  module, which additionally lets you INJECT keypresses, e.g. `os.write(master, b"j")` to step frames) to see real
+  output. This is how I got `uterm` to print `Found zarr variable: sst [time=1, nod2=126858]` and
+  `time 1/3 1958-01-15` — a direct, unambiguous pass/fail signal for a GUI feature I could otherwise never observe
+  headlessly. *Verified end-to-end through the ACTUAL production `write_ushow_zarr` function* (not a manual data patch):
+  built a 3-file synthetic set, confirmed frame 1 → `1958-01-15` and frame 3 → `1958-03-15` via a real injected
+  keypress. *Migration of the already-written ~20GB of production output* (reshape every field + fix the time dtype)
+  was written and tested 100% byte-identical on scratch copies (2D+3D fields, two mesh sizes) before touching live
+  data — deliberately gated on the user's explicit go-ahead, since unlike the two previous fixes (purely additive
+  metadata sidecars) this rewrites actual array shapes in place. *Lesson:* (1) when a closed/hard-to-introspect tool
+  misbehaves and binary-strings guessing stalls, ask if source is available before continuing to infer — a sibling
+  repo can turn hours into minutes; (2) a tool's OWN test suite passing does not mean the specific behavior you depend
+  on is covered — read the actual assertions, not just the pass/fail count; (3) `timeout` alone is not a reliable
+  headless-testing tool for interactive terminal/GUI programs — get a real pty.
+
+- **[model-paper] the time-schema migration itself had a bug, caught by a spot-check on an ARBITRARY (not the newest)
+  store after "0 errors" — FIX 2026-07-02.** *Symptom:* first migration pass reported 639/639 migrated, 0 script
+  errors; a follow-up check of `core2_hindcast_v2/monthly/1990_03` (picked arbitrarily) raised `KeyError: 'time'`.
+  *Root cause:* the migration script assumed every store either already had a `time` coordinate (float64, needing a
+  dtype fix) or would gain one via the reshape step — but it silently reshaped ANY data field lacking a leading
+  `"time"` dim regardless of whether a backing `time` coordinate array actually existed. 164 stores (written by the
+  STILL-RUNNING `core2_hindcast_v2`/`forca20_hindcast_v2` chain jobs, which only re-import Python on their NEXT
+  `sbatch` resubmit — never mid-job — so they kept writing with STALE pre-fix code for hours after the fix landed on
+  disk) had never gotten a `time` coordinate from any earlier backfill, and came out of the migration WORSE than
+  before: a dangling `_ARRAY_DIMENSIONS=["time",...]` reference with no backing array. *Fix:* extended the migration
+  to also SYNTHESIZE a missing `time` coordinate (from the store's own `calendar_date`/`calendar_month` attr, same
+  formula the original backfill used) when `"time" not in g`, not just dtype-convert an existing one. Verified on a
+  copy, reran live (idempotent — 2:50 vs the first pass's 18:32, since most stores were already-correct no-ops), then
+  ran a FULL verification sweep (every store, not a sample) — 647/650 pass, the 3 "failures" exactly match the 3
+  dirs each run intentionally skips as the live-writer safety margin (confirmed against the migration log's own
+  "skipped most-recent X" line) — expected, not a defect. *Lesson:* a migration/backfill script's "0 errors" summary
+  only means its OWN error handling didn't trip — it says nothing about whether its ASSUMPTIONS about prior state
+  were correct. When a resource is fed by a still-running process that can't have picked up an intervening code fix,
+  don't trust "I ran the backfill once, therefore it's covered" — re-verify against live current state, and spot-check
+  an ARBITRARY item (not just the newest or most suspicious one) — this bug was invisible from the newest end.
+
+- **[model-paper] restarts get an ARCHIVAL stream — immutable, one folder per firing, user-controlled cadence,
+  REPLACING the old rolling `--checkpoint-every` restart entirely — mirrors FESOM3, 2026-07-02.** *The ask:* the
+  user was unhappy the restart was one directory, always overwritten, no history, no controllable frequency —
+  "restarts should have separate folder for each of the restarts, like in ../fesom3 and I should be able to
+  continue from any restart in the past... restarts should have frequency, that I can control." *Investigated the
+  actual reference instead of guessing:* `/home/a/a270088/fesom3/src/io/mod_io_restart.F90` writes an IMMUTABLE
+  `fesom.<YYYY>.<DDD>.<SSSSS>` folder (year/doy/sec-of-day, zero-padded ⇒ lexical sort == chronological) per
+  checkpoint, NEVER overwritten, kept forever by default (`restart_keep=0`); cadence is a `restart_length`/
+  `restart_length_unit` pair (y/m/d/h/s/off); resume ALWAYS follows a `restart.latest` POINTER FILE (one line, a
+  folder name) — never sorts/globs the directory (a stray crashed `.tmp` or a later-but-unpointed folder can't be
+  mistaken for current); the last step of a run is ALWAYS checkpointed regardless of cadence. *Design fork the user
+  resolved directly:* I initially proposed keeping the frequent rolling checkpoint SEPARATE from a new coarser
+  archival stream (crash-safety vs branching, two concerns). User: "we are fine losing longer computations...
+  it's for the user to decide - if they want they can do more frequent restarts" — ONE unified, user-configurable-
+  frequency mechanism, exactly matching FESOM3 (which doesn't have two restart concepts either). So the archival
+  stream REPLACED `--checkpoint-every`/`restart_out` in both production sbatch scripts (CORE2=yearly,
+  FORCA20=monthly); the library-level rolling-checkpoint code in `run.py` is untouched/still available, just unused
+  by these two chains now. *Implementation:* `RunConfig.restart_archive_out/_period/_length` (general N, not just
+  "every one"); `run.py`'s `_archive_tag`/`_archive_boundaries` mirror FESOM3's naming/cadence exactly, added to
+  the existing chunk-split machinery (same mechanism as the daily/monthly output period splits, so a chunk never
+  straddles a firing); the chunk loop fires on every boundary crossed PLUS unconditionally at the run's end
+  (mirrors "last step always checkpointed" — a CLEAN chain resubmit never loses anything, only an actual crash
+  falls back to the last calendar boundary); `zarr_output.write_restart_latest`/`resolve_latest_restart` mirror the
+  pointer file (atomic write-then-rename). *A sbatch-script gotcha caught before shipping:* the natural resume
+  snippet (`from fesom_jax import zarr_output; ...resolve_latest_restart(...)`) works but silently drags in
+  `import jax`, which noisily fails CUDA init (a `cuInit(0) failed` traceback) in the sbatch BATCH-script context
+  (outside `srun`'s GPU-scoped allocation) just to read one line of text — reimplemented the pointer read in PURE
+  BASH (`cat "$ARCHIVE/restart.latest"`) instead. Caught by testing the exact snippet in isolation BEFORE trusting
+  it in production — a lesson on its own: always test sbatch-level shell logic standalone, not just the underlying
+  Python function it wraps. *Verified 3 ways before touching the live chains:* 22 pytest tests (unit boundary/tag
+  math incl. general-N filtering; an integration test spying on `write_restart` to lock the exact firing steps);
+  the isolated bash-snippet test that caught the CUDA-import bug; a full CLI-level end-to-end smoke test running
+  the ACTUAL `run_from_config.py` through a real 2-job resume cycle (cold→step60 with a day-boundary + final write,
+  then a genuine `restart.latest`-resolved resume to step72) — 3 immutable dirs, none overwritten, exactly as
+  designed. *Cost transparency surfaced BEFORE wiring in:* FORCA20 monthly × 36 months ≈ 972 GB total (27 GB/
+  restart, kept forever) — a real number, explicitly given to the user and accepted, not silently defaulted.
+  *Lesson:* when a user references another model/tool as the target convention ("like in X"), go read X's actual
+  source if it's available rather than inventing a plausible-sounding design — it resolved naming, cadence-unit,
+  and resume-semantics questions I would otherwise have had to guess or re-ask about, and confirmed the "last step
+  always checkpointed" behavior I'd have designed anyway but couldn't have been sure was the RIGHT convention to
+  match without checking.
+
+- **2026-07-03 — orphaned rolling `restart_out` (stale YAML default, no CLI override) crashed FORCA20's cold-start
+  canary 25 min in, right after a clean 30-day run.** When the archival-restart mechanism replaced the old rolling
+  `--checkpoint-every`/`restart_out` stream in the production sbatch scripts (previous lesson above), I removed the
+  CHAIN's dependence on `restart_out` but never checked whether the underlying library code (`run.py`) still
+  unconditionally WRITES to `cfg.restart_out` at the end of every job — it does (`target = out_dir if out_dir is not
+  None else cfg.restart_out`, then an unconditional final `_write_restart_at` regardless of `checkpoint_every`).
+  Neither `run_core2_hindcast.sbatch` nor `run_forca20_hindcast.sbatch` ever passed `--restart-out` on the CLI
+  (despite `core2_full.yaml`'s own comment claiming "the hindcast sbatch overrides mesh/partition/steps/restart via
+  CLI" — an intent that was never actually implemented), so both fell through to each YAML's literal default:
+  `forca20_tke_mevp_prod.yaml` pointed at `runs/forca20_3yr/restart` — the OLD, stalled, explicitly-superseded chain's
+  directory (see its own header: "do NOT resume it"). That old directory's zarr arrays were shaped for `dist_32`
+  (the YAML's own default partition); the sbatch script overrides `PART=dist_16` via `--partition`, so the new run's
+  local shard shape didn't match the pre-existing array on disk — `root.require_dataset` raised `TypeError: shape
+  do not match existing array`, one rank crashed mid-write, and the other 3 ranks hung on the JAX distributed
+  shutdown barrier until DEADLINE_EXCEEDED killed the whole job. CORE2's `core2_full.yaml` had the identical latent
+  bug (`restart_out: runs/core2/restart`, a directory distinct from the actual `runs/core2_hindcast_v2` in use) but
+  it hadn't crashed yet only because CORE2's partition (`dist_4`) never changes across jobs, so the shape happened
+  to keep matching — it was silently overwriting a stray directory every checkpoint, not equivalent-safe, just
+  not-yet-triggered. *Caught by:* actually reading the crash traceback instead of just noting the exit code — the
+  literal path in `"writing restart -> …"` immediately named a directory that had no business being touched by this
+  run. *Fix:* both sbatch scripts now pass `--restart-out "$OUT/restart"` explicitly (mirrors how they already pin
+  down `--restart-archive-out "$ARCHIVE"` — the CLI override, not the YAML default, should be the actual source of
+  truth for any per-TAG path in a shared config template); updated both YAML defaults too so they're not misleading
+  bystanders. *Lesson:* when a new mechanism (the restart archive) supersedes an old one (rolling `restart_out`) in
+  the automation layer, check whether the OLD mechanism's write path is still LIVE at the library level even though
+  the chain no longer reads it back — "unused for resume" is not the same as "inert." A stale default that's merely
+  unread is latent; the moment ANY run parameter it was silently coupled to (here: partition/device-count) changes,
+  it can crash the job or silently clobber an unrelated directory. Grep for every place a YAML default could still
+  be reached un-overridden whenever a chain's CLI-argument surface changes.
+
+- **2026-07-03 — review fix set: the zstar `a_ice_old` freshwater leak (the SECOND budget bug in the same
+  10 lines), the PGF ρ−2ρ0 double subtraction, and WHY the dump gates couldn't see either.** The full-codebase
+  review (`docs/CODE_REVIEW-20260703.md`) found `ice_step.py` passing start-of-step `state.a_ice` as the balance's
+  `a_ice_old` where the C uses the THERMO-ENTRY (post-FCT/cut_off) concentration: the C's `values_old` backup runs
+  inside the thermo loop AFTER advection and BEFORE overwriting (`fesom_ice_thermo.c:497-506`) — the JAX comment
+  ("the PREVIOUS step's concentration") had misread the C's loop structure. With the right `a_co`, the balance's
+  `prec_snow·(1−a_old)` cancels thermo's `snow·(1−A)` term-for-term and post-balance `⟨water_flux⟩ ≡ 0` exactly;
+  with `state.a_ice`, `⟨prec_snow·(A_entry−A_state)⟩` (~1e-13 m/s at step 1) leaks into the volume budget every
+  step — the same class as the 5a61b0 sublimation leak, in the same block. Also fixed: `step.py` fed the
+  Shchepetkin PGF `density − DENSITY_0` although `eos.compute_pressure_bv` already returns ρ−ρ0 (the C's
+  `density_m_rho0`) — analytically a no-op (the kernel is offset-invariant, which is why the JZ.7 gate passed at
+  1e-14) but ~30× coarser stencil ulp and a trap for any future non-invariant consumer; fixing it perturbs zstar
+  trajectories at the rounding floor (relaunch-only change). Plus three guards: `eos.jm_components` sqrt(S)
+  double-where (S≡0 below bottom ⇒ NaN cotangents in d/dS adjoints), an entry raise in
+  `run_steps_sharded(return_grad_fn=True, use_ragged=True)` (the broken ragged transpose was silently reachable),
+  and the missing `IceConfig.ref_sss` field (34.7, `oce_modules.F90:37`) that made `ref_sss_local=0` a trace-time
+  AttributeError. *Caught by:* a systematic review re-reading the C loop structure — NOT by the test suite,
+  and that is the lesson. *Why the gates were blind:* the z2_cdump forcing gate compares water_flux PER NODE at a
+  ~1e-8 bulk-ulp floor; a ~1e-13 near-uniform budget leak is invisible there, and the unit test for the balance
+  re-derived the implementation's own formula (self-consistent by construction). Both budget bugs (sublimation +
+  a_ice_old) lived exactly in the gap between per-kernel dump gates and global invariants. *Fix for the gap:* a
+  new CONSERVATION gate (`test_ice_step.py::test_zstar_freshwater_balance_closes_globally`) asserts the assembled
+  step's post-balance `⟨water_flux⟩/⟨|water_flux|⟩ < 1e-8` on the real CORE2 state PLUS a clamp-perturbed state
+  (a_ice=1.4 → cut_off 1.0) with a computed negative control proving the old wiring would fail it by ≥4 orders.
+  *Lesson:* per-node dump oracles validate KERNELS; they cannot see GLOBAL-budget wiring bugs whose per-node
+  signature is a near-uniform offset below the reduction-class floor. Every conservation statement the model
+  makes ("the balance zeroes the global mean", "the tracer sum is preserved") deserves its own assembled-step
+  invariant gate, asserted against the mathematical property — not against the implementation's own re-derivation.

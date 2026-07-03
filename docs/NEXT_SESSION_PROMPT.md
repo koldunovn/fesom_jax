@@ -1,3 +1,12 @@
+# >>> NOTE: a SECOND, separate effort is underway — the GMD **model-description paper**
+# >>> ("a JAX FESOM2 exists / on-par with Fortran FESOM / scales").
+# >>> ►►► START-OF-SESSION BRIEF = `docs/HANDOFF-20260623-model-paper.md` ◄◄◄ (read it FIRST).
+# >>> Plan = `docs/plans/20260619-fesom-jax-model-paper.md`. (20260619/20/21 handoffs = older briefs.)
+# >>> STATUS 2026-06-23: MODEL DONE. Part A (usability) COMPLETE; B0 + NG5 R0 + dars-unblocked + scaling
+# >>> analysis all GREEN. FORCA20 3-yr JAX headline run IN FLIGHT (~18.5%); Fortran FORCA20 reference DONE.
+# >>> The FIGURE LAYER is entirely UNBUILT (every scripts/fig_*.py missing). NEXT SESSION (per user) =
+# >>> MAKE THE PAPER PLAN + WRITE THE MANUSCRIPT. Two open decisions: NG5 scope/budget + CORE2 matched config.
+# >>> Everything BELOW in this file is the OTHER (JAMES *capabilities*) paper — don't conflate them.
 # ============================================================================
 # STATUS — session 2026-06-18 (F1/F2 paper wrap-up: verification + docs DONE; 2 open forks)
 # ============================================================================
