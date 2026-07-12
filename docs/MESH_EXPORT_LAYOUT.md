@@ -1,5 +1,9 @@
 # Mesh export layout (Task 0.3)
 
+> **Using your own FESOM2 mesh?** The practical recipe — the two preparation steps, the
+> sanity gates, picking `dt` — is [`NEW_MESH.md`](NEW_MESH.md). This document is the *format
+> contract* that a prepared bundle must satisfy.
+
 The C port (`fesom2_port`, branch `jax-mesh-export`) writes its **static
 mesh/geometry** arrays so the JAX port consumes *exactly* what the C kernels
 compute (gradients, areas, Coriolis, edge geometry) rather than re-deriving them.

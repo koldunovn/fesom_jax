@@ -339,9 +339,10 @@ anywhere else you export `FESOM_JRA_DIR`, `FESOM_PHC_PATH`, `FESOM_SSS_PATH`, `F
 > all `fesom-jax` results were produced with. They differ at 2 nodes / 4 elements in the Ross Sea; both
 > are structurally valid. Details in [`docs/DATA.md`](docs/DATA.md).
 
-Meshes are dense `.npy` bundles. Build one from a raw FESOM mesh with
-`scripts/prepare_mesh.py <raw_dir> <out_dir>` (`docs/MESH_EXPORT_LAYOUT.md`); cache a mesh's PHC IC
-once with `scripts/cache_phc_ic.py --mesh-dir <M> --out-dir <M>` (slow at NG5 scale).
+**Bringing your own mesh.** fesom-jax loads a dense `.npy` bundle, not raw FESOM ASCII, so a FESOM2
+mesh needs two one-off preparation steps — `scripts/prepare_mesh.py` (ASCII → bundle, pure numpy,
+~20 s at CORE2 size) and `scripts/cache_phc_ic.py` (an initial state on your nodes). Full recipe,
+including the sanity gates and how to pick `dt`, in **[`docs/NEW_MESH.md`](docs/NEW_MESH.md)**.
 
 ⚠️ The C IC is **partition-dependent** (the `extrap_nod3D` Gauss-Seidel land fill is
 order-dependent and runs per-rank), so an IC meant to match a C dump oracle bit-for-bit must be
@@ -510,6 +511,7 @@ above; these are the constraints on the *gradient* modes):
 | [`examples/01_pi_quickstart.ipynb`](examples/01_pi_quickstart.ipynb) | **start here** — run + differentiate the model in 2 min, no data |
 | [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic.ipynb) | the realistic 1° global ocean with real weather + sea ice |
 | [`docs/DATA.md`](docs/DATA.md) | the input datasets: what they are, how to get them, how to point at them |
+| [`docs/NEW_MESH.md`](docs/NEW_MESH.md) | **running on your own FESOM2 mesh** — the two one-off preparation steps |
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | driving runs from a single YAML: restarts, chaining, multi-GPU |
 | [`docs/ENV.md`](docs/ENV.md) | exact environment + GPU verification |
 | [`docs/JAX_RAGGED_A2A_BUG.md`](docs/JAX_RAGGED_A2A_BUG.md) | the ragged AD bug: record, repro, workaround |

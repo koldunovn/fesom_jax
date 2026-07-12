@@ -4,6 +4,9 @@
 > `pip install fesom-jax` is enough to run the model and take gradients — that is
 > [`examples/01_pi_quickstart.ipynb`](../examples/01_pi_quickstart.ipynb). Read on only if you
 > want the **realistic** setup ([`examples/02_core2_realistic.ipynb`](../examples/02_core2_realistic.ipynb)).
+>
+> Bringing your **own** FESOM2 mesh rather than a shipped one? That needs two one-off preparation
+> steps — see [`NEW_MESH.md`](NEW_MESH.md).
 
 ## Quick start: get one year of CORE2
 
