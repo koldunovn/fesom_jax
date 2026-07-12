@@ -76,8 +76,8 @@ SANDBOX = "sandbox.zenodo.org"
 # Zenodo's edge rejects requests with no User-Agent (HTML 403, before the API ever sees them).
 USER_AGENT = "fesom-jax-zenodo-uploader/1.0 (+https://github.com/koldunovn/fesom_jax)"
 
-# The two archives, in upload order (small first, so a metadata mistake surfaces before the 10 GB).
-ARCHIVES = ("core2_mesh_ic.zip", "core2_forcing_1958.zip")
+# The archives, in upload order (small first, so a metadata mistake surfaces before the 10 GB).
+ARCHIVES = ("core2_mesh_ic.zip", "core2_partitions.zip", "core2_forcing_1958.zip")
 
 GITHUB = "https://github.com/koldunovn/fesom_jax"
 
@@ -86,12 +86,16 @@ DESCRIPTION = """\
 ocean model on the <strong>CORE2</strong> mesh (global, ~1&deg;, 126,858 nodes, 48 levels) for one
 year. fesom-jax is a differentiable port of the FESOM2 ocean circulation model to JAX.</p>
 
-<p>Two archives:</p>
+<p>Three archives:</p>
 <ul>
   <li><strong>core2_mesh_ic.zip</strong> (~370 MB) &mdash; the mesh (as a dense <code>.npy</code>
       bundle and in standard FESOM2 text format), the cached PHC 3.0 initial temperature/salinity,
       the PHC source file, the sea-surface-salinity restoring field, river runoff, and the
       chlorophyll climatology.</li>
+  <li><strong>core2_partitions.zip</strong> (~180 MB) &mdash; the <code>dist_N</code> domain
+      decompositions (dist_2 &hellip; dist_864). <strong>You need these to run on more than one
+      device.</strong> Pick the one matching your device count; a single-device run needs none of
+      them.</li>
   <li><strong>core2_forcing_1958.zip</strong> (~10.4 GB) &mdash; the eight JRA55-do v1.4.0 surface
       fields for 1958 (<code>uas, vas, tas, huss, rsds, rlds, prra, prsn</code>), 3-hourly, on the
       native JRA55 grid.</li>
@@ -129,7 +133,7 @@ METADATA = {
     ],
     "access_right": "open",
     "license": "cc-by-4.0",
-    "version": "1.0",
+    "version": "1.1",
     "keywords": ["ocean model", "FESOM", "FESOM2", "fesom-jax", "JAX", "CORE2",
                  "differentiable model", "JRA55-do", "ocean forcing", "climate"],
     "related_identifiers": [
@@ -291,6 +295,12 @@ def main() -> int:
     ap.add_argument("--deposition", type=int,
                     help="add to / update an EXISTING draft deposition instead of creating one. "
                          "THIS IS HOW YOU RESUME: parts already on the draft are skipped")
+    ap.add_argument("--new-version-of", type=int, metavar="RECORD",
+                    help="publish a NEW VERSION of an already-published record (files on a "
+                         "published record are immutable). Zenodo COPIES the existing files into "
+                         "the new draft, so only genuinely new archives are uploaded -- adding a "
+                         "180 MB file to an 11 GB record costs 180 MB, not 11 GB. The concept DOI "
+                         "keeps resolving to the newest version.")
     ap.add_argument("--split-mb", type=int, default=0,
                     help="upload files larger than this as N-MB parts (0 = off, the default: upload "
                          "each archive as ONE file, which is the nicer artifact). Zenodo has no "
@@ -341,7 +351,27 @@ def main() -> int:
         return 1
 
     # 1. deposition ---------------------------------------------------------
-    if args.deposition:
+    if args.new_version_of:
+        # Published files are immutable, so adding an archive means a NEW VERSION. Zenodo copies the
+        # previous version's files into the draft for us -- which is the whole point: the 10.4 GB
+        # forcing is NOT re-uploaded, only the genuinely new archive is.
+        code, dep = _api(host, "POST",
+                         f"/api/deposit/depositions/{args.new_version_of}/actions/newversion", token)
+        if code not in (201, 202):
+            print(f"error: could not open a new version of {args.new_version_of} "
+                  f"(HTTP {code}): {json.dumps(dep)[:400]}", file=sys.stderr)
+            return 1
+        # the action returns the OLD deposition with a link to the new draft; follow it
+        latest = (dep.get("links", {}) or {}).get("latest_draft", "")
+        new_id = int(latest.rstrip("/").split("/")[-1]) if latest else dep["id"]
+        code, dep = _api(host, "GET", f"/api/deposit/depositions/{new_id}", token)
+        if code != 200:
+            print(f"error: cannot open the new draft {new_id}: {dep}", file=sys.stderr)
+            return 1
+        carried = [f.get("filename") for f in dep.get("files", [])]
+        print(f"\nnew version of record {args.new_version_of} -> draft {dep['id']}")
+        print(f"  {len(carried)} file(s) carried over (NOT re-uploaded): {carried}")
+    elif args.deposition:
         code, dep = _api(host, "GET", f"/api/deposit/depositions/{args.deposition}", token)
         if code != 200:
             print(f"error: cannot open draft {args.deposition}: {dep}", file=sys.stderr)
@@ -388,7 +418,9 @@ def main() -> int:
     todo = [("MANIFEST.json", man_path, 0, man_path.stat().st_size)]
     for f in files:
         todo += [(p["name"], f, p["offset"], p["length"]) for p in plans[f]]
-    pending = [t for t in todo if t[0] not in already]
+    # MANIFEST.json is always re-uploaded: on a --new-version-of run Zenodo carries the OLD one
+    # over, and it does not know about any archive we are adding now. The bucket PUT overwrites.
+    pending = [t for t in todo if t[0] not in already or t[0] == "MANIFEST.json"]
     print(f"\nuploading {len(pending)} of {len(todo)} files "
           f"({sum(t[3] for t in pending) / 2**30:.2f} GB to go)")
 

@@ -40,6 +40,7 @@ ZENODO_API = "https://zenodo.org/api/records/{record}"
 UA = {"User-Agent": "fesom-jax-fetch/1.0 (+https://github.com/koldunovn/fesom_jax)"}
 
 MESH_ZIP = "core2_mesh_ic.zip"
+PART_ZIP = "core2_partitions.zip"       # dist_<N>: needed only for multi-device runs
 FORCING_ZIP = "core2_forcing_1958.zip"
 
 
@@ -183,6 +184,9 @@ def print_env(dest: Path) -> None:
     print(f"export FESOM_PHC_PATH={m / 'phc3.0_winter.nc'}")
     print(f"export FESOM_IC_DIR={m / 'ic_core2'}")
     print(f"export FESOM_MESH_DIR={m / 'mesh_core2'}      # for the notebooks")
+    # The domain decompositions. Only needed to run on MORE THAN ONE device -- pass this as
+    # --dist-dir, together with --partition dist_<N> for your device count. See docs/PARTITIONS.md.
+    print(f"export FESOM_DIST_DIR={dest / 'core2_partitions'}   # multi-device: --dist-dir")
 
 
 def main() -> int:
@@ -207,7 +211,7 @@ def main() -> int:
              "       (The record id is the number at the end of the Zenodo URL.)")
 
     files = record_files(args.record)
-    want = [MESH_ZIP] if args.mesh_only else [MESH_ZIP, FORCING_ZIP]
+    want = [MESH_ZIP, PART_ZIP] if args.mesh_only else [MESH_ZIP, PART_ZIP, FORCING_ZIP]
     dest.mkdir(parents=True, exist_ok=True)
 
     # The record may carry each archive either whole, or split into .partNNN files with a

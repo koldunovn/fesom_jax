@@ -16,6 +16,7 @@ Everything needed to run the CORE2 (~1°) global ocean for one year is published
 | Archive | Size | Contents |
 |---|---|---|
 | `core2_mesh_ic.zip` | ~370 MB | the mesh (dense `.npy` + raw FESOM text), the cached PHC initial state, the PHC source file, SSS restoring, river runoff, chlorophyll |
+| `core2_partitions.zip` | ~180 MB | the `dist_N` domain decompositions (dist_2 … dist_864) — **needed to run on more than one device**; see [`PARTITIONS.md`](PARTITIONS.md) |
 | `core2_forcing_1958.zip` | ~10.4 GB | the eight JRA55-do fields for 1958 |
 
 ```bash

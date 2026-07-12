@@ -40,10 +40,15 @@ viz = ["matplotlib>=3.7"]   # scaling/SYPD plots (scripts/plot_sypd.py)
 include = ["fesom_jax*"]
 
 [tool.setuptools.package-data]
-# The pi mesh (5 MB) and a PHC initial state for it (2.3 MB) ship with the wheel, so
-# `pip install fesom-jax` is enough to run a REALISTIC global ocean — observed T/S, not a toy.
-# Only the atmospheric forcing then needs downloading (docs/DATA.md).
-fesom_jax = ["data/mesh_pi/*.npy", "data/mesh_pi/meta.txt", "data/ic_pi/*.npy"]
+# What ships in the wheel, so `pip install fesom-jax` can run a REALISTIC global ocean with no
+# download at all: the pi mesh (5 MB), a PHC initial state for it (2.3 MB), and its dist_<N>
+# domain decompositions (1.1 MB) so multi-device runs work out of the box too. Only the
+# atmospheric forcing needs fetching (docs/DATA.md).
+fesom_jax = [
+    "data/mesh_pi/*.npy", "data/mesh_pi/meta.txt",
+    "data/mesh_pi/dist_*/*.out",
+    "data/ic_pi/*.npy",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["fesom_jax/tests"]

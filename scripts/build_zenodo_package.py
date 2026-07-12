@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 """Build the Zenodo data package: everything needed to run CORE2 for one year.
 
-Two archives (see docs/DATA.md):
+Three archives (see docs/DATA.md):
 
   core2_mesh_ic.zip       ~370 MB  mesh (raw + dense), cached PHC initial state,
                                    SSS restoring, river runoff, chlorophyll
+  core2_partitions.zip    ~180 MB  the dist_<N> domain decompositions -- what you need to
+                                   run on MORE THAN ONE device (dist_2 ... dist_864)
   core2_forcing_1958.zip  ~10.4 GB the 8 JRA55-do fields for 1958
 
 MESH PROVENANCE — the load-bearing detail. The CORE2 level files on /pool
@@ -42,6 +44,13 @@ YEAR = 1958
 # Topology / geometry files that the 2026-07-03 level fix did NOT touch.
 RAW_VERBATIM = ("nod2d.out", "elem2d.out", "aux3d.out",
                 "edges.out", "edge_tri.out", "edgenum.out")
+
+# The domain decompositions, one per device count you might want to run on. Without these you can
+# only run on a single device. They are derived from the 2D mesh topology (nod2d/elem2d), which has
+# not changed since 2021, so they are valid for the level version we ship (see the mesh note below).
+# ~200 MB for all of them, which is nothing next to the forcing -- so ship the lot and let people
+# pick. dist_1 is not needed (a single device synthesises its own trivial partition) but is tiny.
+PARTITIONS = (2, 4, 8, 12, 16, 32, 64, 72, 128, 144, 256, 288, 432, 512, 864)
 
 
 def sha256(path: Path, buf: int = 1 << 20) -> str:
@@ -98,6 +107,27 @@ def build_mesh_ic(stage: Path) -> None:
         print(f"    {src.name}")
 
     (d / "README.md").write_text(MESH_README)
+    write_checksums(d)
+
+
+def build_partitions(stage: Path) -> None:
+    """The dist_<N> domain decompositions -- what you need to run on more than one device."""
+    d = stage / "core2_partitions"
+    d.mkdir(parents=True, exist_ok=True)
+    got = []
+    for n in PARTITIONS:
+        src = POOL_MESH / f"dist_{n}"
+        if not src.is_dir():
+            print(f"    dist_{n}: not on /pool, skipping")
+            continue
+        dst = d / f"dist_{n}"
+        if not dst.is_dir():
+            shutil.copytree(src, dst)
+        mb = sum(f.stat().st_size for f in dst.rglob("*") if f.is_file()) / 2**20
+        print(f"    dist_{n:<4d} {mb:6.1f} MB")
+        got.append(n)
+    (d / "README.md").write_text(PARTITIONS_README.format(
+        counts=", ".join(f"dist_{n}" for n in got)))
     write_checksums(d)
 
 
@@ -169,6 +199,48 @@ https://doi.org/10.5194/gmd-7-663-2014, 2014.
 Verify the download with `sha256sum -c CHECKSUMS.sha256`.
 """
 
+PARTITIONS_README = """\
+# fesom-jax — CORE2 domain decompositions (dist_N)
+
+What you need to run CORE2 on **more than one device**. Without these you can still run on a single
+GPU or CPU; you cannot shard across several.
+
+Included: {counts}
+
+## What these are
+
+FESOM2 splits the mesh into `N` sub-domains, one per process/device, and writes the node/element
+ownership and the halo-exchange lists into a `dist_<N>/` directory. fesom-jax reads exactly those
+files, so a decomposition made for FESOM works here unchanged.
+
+**Pick the one that matches your device count.** `dist_8` means 8 devices, no more, no less. On a
+single device you need none of this — the model synthesises a trivial partition (`--partition serial`).
+
+## Using them
+
+```bash
+# a 4-GPU run: --dist-dir points at the directory HOLDING the dist_<N> folders
+python scripts/run_from_config.py configs/core2_full.yaml \\
+    --mesh-dir <mesh_core2> --ic-dir <ic_core2> \\
+    --dist-dir <this directory> --partition dist_4 \\
+    --steps 480 --restart-out runs/core2/seg0
+```
+
+Restarts are **portable across device counts**: write one on 64 devices, resume it on 8.
+
+⚠️ **Gradients run on ONE device.** The forward model shards correctly, but a bug in JAX's multi-GPU
+halo exchange makes the sharded *backward* pass wrong. See `docs/PARTITIONS.md` and
+`docs/JAX_RAGGED_A2A_BUG.md` in the repository.
+
+## Mesh version
+
+These decompositions come from the 2D mesh topology (`nod2d.out`/`elem2d.out`), which has not changed
+since 2021, so they are valid for the mesh in `core2_mesh_ic.zip` — including its pre-2026-07-03
+vertical levels. Verified: every `dist_N` here loads against that mesh.
+
+Verify the download with `sha256sum -c CHECKSUMS.sha256`.
+"""
+
 FORCING_README = """\
 # fesom-jax — JRA55-do atmospheric forcing, 1958 (2 of 2)
 
@@ -214,18 +286,23 @@ def main() -> int:
     stage = Path(args.out)
     stage.mkdir(parents=True, exist_ok=True)
 
-    print("[1/2] mesh + initial state")
+    print("[1/3] mesh + initial state")
     build_mesh_ic(stage)
     if not args.no_zip:
         zip_dir(stage, "core2_mesh_ic")
 
+    print("[2/3] domain decompositions (dist_N) -- needed for multi-device runs")
+    build_partitions(stage)
+    if not args.no_zip:
+        zip_dir(stage, "core2_partitions")
+
     if not args.skip_forcing:
-        print("[2/2] JRA55-do forcing 1958 (~10.4 GB, slow)")
+        print("[3/3] JRA55-do forcing 1958 (~10.4 GB, slow)")
         build_forcing(stage)
         if not args.no_zip:
             zip_dir(stage, "core2_forcing_1958")
     else:
-        print("[2/2] skipped (--skip-forcing)")
+        print("[3/3] skipped (--skip-forcing)")
 
     print(f"\ndone -> {stage}")
     return 0

@@ -98,9 +98,11 @@ fesom_jax/
   zarr_output.py               # sharded, gather-free model output to Zarr
   longwindow.py                # ensemble-averaged (climate-timescale) adjoint seam: seed-spread + streaming mean+SE
   paths.py                     # where the input data lives (explicit arg > env var > Levante default)
-  data/mesh_pi/                # the pi mesh — SHIPS WITH THE PACKAGE (5 MB; no download needed)
+  data/                        # SHIPS WITH THE PACKAGE — no download needed:
+  #   mesh_pi/         the pi mesh (5 MB) + its dist_{2,4,8,16} partitions (1 MB) ⇒ multi-device works too
+  #   ic_pi/           a PHC initial state for pi (2 MB) ⇒ a REALISTIC ocean, not just a toy
   tests/                       # ~55 verification + gradient + sharding gates
-examples/                      # 01_pi_quickstart (no data) + 02_core2_realistic (real ocean)
+examples/                      # 01_pi_quickstart · 02_core2_realistic · 03_how_the_model_works
 configs/                       # run YAMLs — pi_demo.yaml runs anywhere; core2_full.yaml is the flagship
 scripts/                       # fetch_data.py + benchmarks + SLURM sbatch + capability drivers
 docs/                          # DATA (input datasets), USER_GUIDE, ENV, porting lessons, the ragged-bug record
@@ -550,6 +552,7 @@ above; these are the constraints on the *gradient* modes):
 | [`examples/03_how_the_model_works.ipynb`](examples/03_how_the_model_works.ipynb) | how the model is put together: `step` vs `integrate`, and how to run without sea ice / eddies / … |
 | [`docs/DATA.md`](docs/DATA.md) | the input datasets: what they are, how to get them, how to point at them |
 | [`docs/NEW_MESH.md`](docs/NEW_MESH.md) | **running on your own FESOM2 mesh** — the two one-off preparation steps |
+| [`docs/PARTITIONS.md`](docs/PARTITIONS.md) | **running on more than one device** — `dist_N`, halos, and why the sharded gradient is wrong |
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | driving runs from a single YAML: restarts, chaining, multi-GPU |
 | [`docs/ENV.md`](docs/ENV.md) | exact environment + GPU verification |
 | [`docs/JAX_RAGGED_A2A_BUG.md`](docs/JAX_RAGGED_A2A_BUG.md) | the ragged AD bug: record, repro, workaround |
