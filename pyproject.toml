@@ -4,10 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fesom-jax"
-version = "0.0.0"
+version = "0.1.0"
 description = "Differentiable FESOM2 ocean model in JAX (for hybrid ML parameterizations)"
 readme = "README.md"
 requires-python = ">=3.11"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [{ name = "Nikolay Koldunov", email = "koldunovn@gmail.com" }]
+keywords = ["ocean", "climate", "FESOM", "JAX", "differentiable", "machine-learning"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Atmospheric Science",
+    "Programming Language :: Python :: 3",
+]
 dependencies = [
     "jax>=0.4.34",
     "numpy>=1.24",
@@ -26,6 +36,10 @@ viz = ["matplotlib>=3.7"]   # scaling/SYPD plots (scripts/plot_sypd.py)
 
 [tool.setuptools.packages.find]
 include = ["fesom_jax*"]
+
+[tool.setuptools.package-data]
+# The pi mesh ships with the wheel: `pip install fesom-jax` is enough to run the model.
+fesom_jax = ["data/mesh_pi/*.npy", "data/mesh_pi/meta.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["fesom_jax/tests"]

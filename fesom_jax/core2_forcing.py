@@ -242,12 +242,17 @@ class CoreForcing:
 
 
 def build_core_forcing(mesh: Mesh, year: int, *, sst_ic=None,
-                       jra_dir: str = jra55.DEFAULT_JRA_DIR,
-                       sss_path: str = sss_runoff.DEFAULT_SSS_PATH,
-                       runoff_path: str = sss_runoff.DEFAULT_RUNOFF_PATH,
-                       chl_path: str = sss_runoff.DEFAULT_CHL_PATH,
+                       jra_dir: str | None = None,
+                       sss_path: str | None = None,
+                       runoff_path: str | None = None,
+                       chl_path: str | None = None,
                        chl_const: float | None = None) -> CoreForcing:
     """Build the CORE2 forcing driver for a JRA ``year`` (host setup, ~seconds).
+
+    The four input-path kwargs default to ``None`` ⇒ each reader resolves its own path
+    through :mod:`fesom_jax.paths` (``$FESOM_JRA_DIR`` / ``$FESOM_SSS_PATH`` /
+    ``$FESOM_RUNOFF_PATH`` / ``$FESOM_CHL_PATH``, else the Levante default). Pass a string
+    (e.g. from the run YAML's ``forcing:`` block) to override.
 
     ``sst_ic`` (``[nod2D]``, the PHC IC surface temperature) builds the static ``a_ice``
     mask (:func:`ice_ic_aice`); pass ``state.T[:, 0]`` from

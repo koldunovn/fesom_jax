@@ -45,8 +45,13 @@ from jax import tree_util
 
 from .config import CYCLIC_LENGTH_RAD
 
-# Repo-relative default: <repo>/data/mesh_pi  (this file is <repo>/fesom_jax/mesh.py)
-DEFAULT_PI_MESH_DIR = Path(__file__).resolve().parents[1] / "data" / "mesh_pi"
+# The pi mesh (3140 nodes, 5 MB) SHIPS INSIDE the package, so a pip-installed fesom-jax
+# can run the model with no external data. The repo-root <repo>/data/mesh_pi (the /work
+# export) is honoured as a fallback for older checkouts.
+_PACKAGED_PI_MESH_DIR = Path(__file__).resolve().parent / "data" / "mesh_pi"
+_REPO_PI_MESH_DIR = Path(__file__).resolve().parents[1] / "data" / "mesh_pi"
+DEFAULT_PI_MESH_DIR = (_PACKAGED_PI_MESH_DIR if _PACKAGED_PI_MESH_DIR.is_dir()
+                       else _REPO_PI_MESH_DIR)
 
 
 def _meta(static: bool = False) -> dataclasses.Field:

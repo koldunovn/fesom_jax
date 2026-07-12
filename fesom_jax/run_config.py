@@ -31,6 +31,11 @@ YAML schema (every key optional; absent ⇒ the bit-identical default)::
     mesh: /work/.../ng5
     partition: dist_64
     forcing: {kind: core2, start_year: 1958}
+    # …plus OPTIONAL input-path overrides inside `forcing:` (absent ⇒ $FESOM_JRA_DIR /
+    # $FESOM_SSS_PATH / $FESOM_RUNOFF_PATH / $FESOM_CHL_PATH, else the Levante default —
+    # see fesom_jax/paths.py + docs/DATA.md):
+    #   forcing: {kind: core2, start_year: 1958, jra_dir: /data/JRA55-do-v1.4.0,
+    #             sss_path: …, runoff_path: …, chl_path: …}
     output_dir: /work/.../ng5_out
     snapshot_every: 240     # steps; 0 = off
     checkpoint_every: 480   # steps; 0 = off
@@ -83,6 +88,12 @@ _SPEC_FIELDS = ("dt", "mesh", "partition", "forcing", "output_dir", "snapshot_ev
                 "restart_archive_out", "restart_archive_period", "restart_archive_length",
                 "n_steps", "duration")
 _ARCHIVE_PERIODS = ("year", "month", "day")
+# The `forcing:` mapping — WHAT the forcing is (`kind`/`start_year`) plus WHERE its input
+# files live. The four path keys are optional overrides of the env var / Levante default
+# (:mod:`fesom_jax.paths`); absent ⇒ the reader resolves them itself. Strict-keyed like every
+# other block: an unknown key raises rather than being silently ignored.
+_FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path")
+_FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,8 +131,20 @@ class RunConfig:
         this is **bit-identical** to a bare :func:`fesom_jax.step.step` (the regression guard)."""
         return cls()
 
+    def forcing_paths(self) -> dict:
+        """The input-path overrides from the ``forcing:`` block, as kwargs for
+        :func:`fesom_jax.core2_forcing.build_core_forcing` (absent key ⇒ ``None`` ⇒ the
+        reader resolves it via ``$FESOM_*`` / the Levante default, :mod:`fesom_jax.paths`)."""
+        f = self.forcing or {}
+        return {k: f.get(k) for k in _FORCING_PATH_KEYS}
+
     def validate(self) -> None:
         """Cross-field validity (mirrors the in-kernel guards, fail-fast at config load)."""
+        if self.forcing is not None:
+            if not isinstance(self.forcing, dict):
+                raise TypeError(f"forcing must be a mapping or null, "
+                                f"got {type(self.forcing).__name__}")
+            _check_keys(self.forcing, _FORCING_KEYS, "forcing")
         if self.kpp is not None and self.tke is not None:
             raise ValueError(
                 "kpp and tke are both set — the model runs exactly one vertical-mixing scheme "
@@ -198,6 +221,11 @@ class RunConfig:
         for f in _SPEC_FIELDS:
             if f in d:
                 kw[f] = d[f]
+        fc = kw.get("forcing")
+        if fc is not None:                      # strict keys inside `forcing:` too (no silent typos)
+            if not isinstance(fc, dict):
+                raise TypeError(f"forcing must be a mapping or null, got {type(fc).__name__}")
+            _check_keys(fc, _FORCING_KEYS, "forcing")
         return cls(**kw)
 
     def to_yaml(self, path=None) -> str:

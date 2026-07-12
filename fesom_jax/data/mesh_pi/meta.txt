@@ -1,0 +1,8 @@
+nod2D 3140
+elem2D 5839
+edge2D 8986
+nl 48
+edge2D_in 8531
+myDim_edge2D 8986
+npes 1
+ocean_area 339720478579587.94

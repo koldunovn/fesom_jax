@@ -1,0 +1,44 @@
+cff-version: 1.2.0
+title: "fesom-jax: a differentiable FESOM2 ocean model in JAX"
+message: "If you use this software, please cite it, together with the FESOM2 model it ports."
+type: software
+authors:
+  - family-names: Koldunov
+    given-names: Nikolay
+    email: koldunovn@gmail.com
+    affiliation: Alfred Wegener Institute, Helmholtz Centre for Polar and Marine Research
+repository-code: "https://github.com/koldunovn/fesom_jax"
+abstract: >-
+  A port of the FESOM2 unstructured-grid, finite-volume ocean model to JAX: a fully
+  differentiable, multi-GPU/multi-node forward ocean model. It runs the complete model
+  (ALE thickness, equation of state, pressure-gradient force, FCT tracer advection, the
+  sea-surface-height solve, KPP/TKE vertical mixing, GM/Redi eddy fluxes, and prognostic
+  sea ice) in float64, forced by JRA55-do atmosphere and PHC initial conditions, and is
+  differentiable end to end. Its purpose is hybrid machine learning: embedding trainable
+  neural-network parameterizations and training them through the ocean dynamics.
+keywords:
+  - ocean model
+  - climate
+  - FESOM
+  - JAX
+  - automatic differentiation
+  - hybrid machine learning
+license: Apache-2.0
+references:
+  - type: article
+    title: "The Finite-volumE Sea ice-Ocean Model (FESOM2)"
+    authors:
+      - family-names: Danilov
+        given-names: Sergey
+      - family-names: Sidorenko
+        given-names: Dmitry
+      - family-names: Wang
+        given-names: Qiang
+      - family-names: Jung
+        given-names: Thomas
+    journal: Geoscientific Model Development
+    volume: 10
+    start: 765
+    end: 789
+    year: 2017
+    doi: 10.5194/gmd-10-765-2017

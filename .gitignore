@@ -36,6 +36,9 @@ jax_cache/
 *.nc
 *.npy
 !fesom_jax/tests/fixtures/**
+# The pi mesh (5 MB) ships WITH the package — it is what makes `pip install fesom-jax`
+# runnable with no external data (examples/01_pi_quickstart.ipynb).
+!fesom_jax/data/**
 
 # --- C-exported mesh + other regenerated reference data ---
 # Large artifacts live on /work (gitignored); `data` is a symlink to

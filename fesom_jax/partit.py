@@ -5,8 +5,11 @@ Numpy port of the C MPI port's ASCII ``dist_<NP>`` partition reader
 ``read_my_list`` / ``read_com_info``). It loads the **bit-identical** FESOM
 domain decomposition so an N-rank JAX run can be diffed per-substep against the
 C N-rank dump (Phase-8 design, Locked decision 2). Nothing here is generated:
-the canonical CORE2 partitions ship under
-``/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2/dist_{2,4,8,…}``.
+the canonical CORE2 partitions ship under ``<mesh_root>/core2/dist_{2,4,8,…}``, where
+``<mesh_root>`` is :func:`fesom_jax.paths.resolve`'s ``mesh_root`` — ``$FESOM_MESH_ROOT``
+if set, else the Levante default ``/pool/data/AWICM/FESOM2/MESHES_FESOM2.1``. The reader
+itself takes an explicit ``mesh_dir`` (the run YAML's ``mesh:`` key / ``--mesh-dir``), so no
+path is hardcoded here; use :func:`default_mesh_dir` to compose one from the root.
 
 The C reads ONE rank's files (the running ``mype``); the single-process
 ``shard_map`` model (Locked decision 3) instead needs **every** rank's data in
@@ -56,6 +59,19 @@ from pathlib import Path
 
 import numpy as np
 from jax import tree_util
+
+from . import paths
+
+
+def default_mesh_dir(mesh_name: str, mesh_root: str | Path | None = None) -> Path:
+    """``<mesh_root>/<mesh_name>`` — the conventional mesh directory (which holds the
+    ``dist_<NP>`` partitions :func:`read_partition` reads).
+
+    ``mesh_root`` ``None`` ⇒ ``$FESOM_MESH_ROOT``, else the Levante default
+    ``/pool/data/AWICM/FESOM2/MESHES_FESOM2.1`` (:mod:`fesom_jax.paths`). Callers that
+    already have a full mesh path (the run YAML's ``mesh:`` key, ``--mesh-dir``) pass it
+    straight to :func:`read_partition` and never need this."""
+    return Path(paths.resolve("mesh_root", mesh_root)) / str(mesh_name)
 
 
 def _meta(static: bool = False) -> dataclasses.Field:

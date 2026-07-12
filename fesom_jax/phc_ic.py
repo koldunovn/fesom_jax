@@ -39,13 +39,18 @@ from pathlib import Path
 import numpy as np
 import netCDF4
 
+from . import paths
 from .config import RAD
 
-DEFAULT_IC_DIR = Path(__file__).resolve().parents[1] / "data" / "ic_core2"
+# The cached-IC directory (``T_ic.npy``/``S_ic.npy``): repo-relative ``data/ic_core2`` by
+# default — NOT a /pool path — overridable with $FESOM_IC_DIR (e.g. a scratch cache).
+DEFAULT_IC_DIR = Path(paths.resolve("ic_dir"))
 
 PHC_DUMMY = 1.0e10
 _DUMMY_HI = 0.99 * PHC_DUMMY
-DEFAULT_PHC_PATH = "/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc"
+# Import-time snapshot of the resolved PHC file ($FESOM_PHC_PATH → the Levante default);
+# the loaders below re-resolve at CALL time via :mod:`fesom_jax.paths`.
+DEFAULT_PHC_PATH = paths.resolve("phc_path")
 
 
 # --------------------------------------------------------------------------
@@ -311,16 +316,20 @@ class PHCResult:
     S_pre_surf: np.ndarray
 
 
-def load_phc_ic(mesh, path: str = DEFAULT_PHC_PATH, t_insitu: bool = True,
+def load_phc_ic(mesh, path: str | None = None, t_insitu: bool = True,
                 rank_nodes=None) -> PHCResult:
     """Build the PHC initial condition on ``mesh``. Returns :class:`PHCResult`
     with the final potential-T / S ``[N, nl]`` and the pre-extrap surface + bracket
     indices (for verifying against the C ``phc_dump_*`` surface dumps).
 
+    ``path=None`` ⇒ resolved from ``$FESOM_PHC_PATH``, else the Levante default
+    (:mod:`fesom_jax.paths`).
+
     ``rank_nodes`` (list of per-rank 0-based node-index arrays in C local order)
     selects the partition-faithful MPI extrapolation — the GS land fill is
     order-dependent, so matching a C oracle run bit-for-bit requires its partition
     (e.g. dist_16 for the 16-rank ``z2_cdump``). ``None`` = serial (npes=1) order."""
+    path = paths.require("phc_path", path)
     nl = int(mesh.nl)
     Z = np.asarray(mesh.Z, dtype=np.float64)
     geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64)
@@ -412,20 +421,23 @@ def load_phc_ic(mesh, path: str = DEFAULT_PHC_PATH, t_insitu: bool = True,
                      T_pre_surf=T_pre_surf, S_pre_surf=S_pre_surf)
 
 
-def build_and_cache_ic(mesh, path: str = DEFAULT_PHC_PATH,
-                       out_dir: str | Path = DEFAULT_IC_DIR,
+def build_and_cache_ic(mesh, path: str | None = None,
+                       out_dir: str | Path | None = None,
                        rank_nodes=None) -> PHCResult:
     """Build the PHC IC on ``mesh`` and cache ``T_ic.npy``/``S_ic.npy`` to ``out_dir``
-    (one-time; ``out_dir`` is gitignored under ``data/``)."""
+    (one-time; the default ``out_dir`` is gitignored under ``data/``).
+
+    ``path``/``out_dir`` ``None`` ⇒ ``$FESOM_PHC_PATH`` / ``$FESOM_IC_DIR``, else the
+    defaults (:mod:`fesom_jax.paths`)."""
     res = load_phc_ic(mesh, path, rank_nodes=rank_nodes)
-    out_dir = Path(out_dir)
+    out_dir = Path(paths.resolve("ic_dir", out_dir))          # may not exist yet ⇒ resolve
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "T_ic.npy", res.T)
     np.save(out_dir / "S_ic.npy", res.S)
     return res
 
 
-def core2_initial_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR,
+def core2_initial_state(mesh, ic_dir: str | Path | None = None,
                         base_T: float = 10.0, base_S: float = 35.0, *, xp=None):
     """Build a CORE2 :class:`~fesom_jax.state.State` from the cached PHC IC: a rest
     state (uv=0, eta=0, ``hnode`` from ``zbar_3d_n``) with ``T``/``S`` set to the PHC
@@ -449,7 +461,7 @@ def core2_initial_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR,
     from .state import State
     if xp is None:
         xp = jnp
-    ic_dir = Path(ic_dir)
+    ic_dir = Path(paths.require("ic_dir", ic_dir))    # None ⇒ $FESOM_IC_DIR → data/ic_core2
     T = xp.asarray(np.load(ic_dir / "T_ic.npy"))
     S = xp.asarray(np.load(ic_dir / "S_ic.npy"))
     mask = np.asarray(mesh.node_layer_mask) if xp is np else mesh.node_layer_mask
@@ -459,7 +471,7 @@ def core2_initial_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR,
     return dataclasses.replace(st, T=T, S=S, T_old=T_old, S_old=S_old)
 
 
-def cold_start_state(mesh, ic_dir: str | Path = DEFAULT_IC_DIR, base_T: float = 10.0,
+def cold_start_state(mesh, ic_dir: str | Path | None = None, base_T: float = 10.0,
                      base_S: float = 35.0, *, xp=None, seed_sea_ice: bool = True):
     """THE canonical cold-start :class:`~fesom_jax.state.State` — **use this for any cold start.**
 

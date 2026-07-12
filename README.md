@@ -37,17 +37,27 @@ sea-ice EVP scan).
 
 ## Installation
 
-The model needs JAX with float64 enabled. On **Levante** there is a ready env; elsewhere create one.
+The model needs JAX with float64 enabled.
 
 ```bash
 # new conda/mamba env (Python 3.12)
 mamba create -y -n fesom-jax python=3.12 pip
 mamba activate fesom-jax
 
-cd /home/a/a270088/port_jax           # the repo
+git clone https://github.com/koldunovn/fesom_jax.git
+cd fesom_jax
 pip install -e ".[cuda,dev,viz]"      # GPU JAX (CUDA12 wheels) + pytest + matplotlib
 # CPU-only (no GPU wheels):  pip install -e ".[dev,viz]"
 ```
+
+**That is enough to run the model.** The small `pi` mesh (3,140 nodes — a coarse global ocean) ships
+*inside* the package, so a fresh install runs a forward model **and** takes gradients on a laptop CPU
+with no data download. Start here:
+
+| Notebook | What | Needs |
+|---|---|---|
+| [`examples/01_pi_quickstart.ipynb`](examples/01_pi_quickstart.ipynb) | run the ocean, plot it, differentiate it — **~2 min on a CPU** | nothing |
+| [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic.ipynb) | the real 1° global ocean: observed initial state, real weather, sea ice | [input data](#data) |
 
 This pulls `jax[cuda12]`, numpy, scipy, netCDF4, **zarr** (sharded output), and (viz) matplotlib.
 No system CUDA module is needed — CUDA 12 + cuDNN ship as pip wheels. **Recorded working set:**
@@ -86,10 +96,13 @@ fesom_jax/
   shard_mesh.py integrate_sharded.py          # per-device sharded mesh/state; shard_map runners
   zarr_output.py               # sharded, gather-free model output to Zarr
   longwindow.py                # ensemble-averaged (climate-timescale) adjoint seam: seed-spread + streaming mean+SE
+  paths.py                     # where the input data lives (explicit arg > env var > Levante default)
+  data/mesh_pi/                # the pi mesh — SHIPS WITH THE PACKAGE (5 MB; no download needed)
   tests/                       # ~55 verification + gradient + sharding gates
-scripts/                       # benchmarks + SLURM sbatch + differentiable-capability drivers (core2_paper_*, core2_lw_*)
-docs/                          # ENV, plans, porting lessons, scaling, the ragged-bug record
-data/  mesh_core2/ ic_core2/   # CORE2 dense mesh + cached PHC IC (small, in-repo)
+examples/                      # 01_pi_quickstart (no data) + 02_core2_realistic (real ocean)
+configs/                       # run YAMLs — pi_demo.yaml runs anywhere; core2_full.yaml is the flagship
+scripts/                       # fetch_data.py + benchmarks + SLURM sbatch + capability drivers
+docs/                          # DATA (input datasets), USER_GUIDE, ENV, porting lessons, the ragged-bug record
 ```
 
 ---
@@ -291,21 +304,43 @@ $PY scripts/fig_avgadj.py --maps scripts/lw_avgadj_mld_ck_adjoint_map.npz   # re
 
 ---
 
-## Data & paths on Levante
+## Data
 
-| What | Path |
+**The `pi` mesh needs no data** — it ships in the package. Everything below is only for the realistic
+CORE2-and-larger setups.
+
+Everything needed to run **CORE2 for one year** is published on Zenodo as two archives — the mesh +
+initial state (~370 MB) and one year of JRA55-do forcing (~10.4 GB):
+
+```bash
+python scripts/fetch_data.py --dest ~/fesom-data --record <ZENODO_RECORD_ID>
+eval "$(python scripts/fetch_data.py --dest ~/fesom-data --print-env)"
+```
+
+Longer runs need more years of JRA55-do; **[`docs/DATA.md`](docs/DATA.md)** explains where to get them
+and what layout the reader expects.
+
+Every external input resolves as *explicit arg / run-YAML `forcing:` key* → *`$FESOM_*` env var* →
+*Levante default*, through `fesom_jax/paths.py`. So on Levante the defaults below just work, and
+anywhere else you export `FESOM_JRA_DIR`, `FESOM_PHC_PATH`, `FESOM_SSS_PATH`, `FESOM_RUNOFF_PATH`,
+`FESOM_CHL_PATH`, `FESOM_MESH_ROOT`.
+
+| What | Levante default |
 |------|------|
-| Env interpreter | `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python` |
 | GPU partition / account | `-p gpu -A ab0995_gpu` (A100-80GB ×4/node) |
-| CORE2 dense mesh + IC | `data/mesh_core2/`, `data/ic_core2/{T,S}_ic.npy` (in repo) |
-| farc/dars/NG5 mesh bundles | `/work/ab0995/a270088/fesom_jax_meshes/mesh_{farc,dars,ng5}/` |
-| farc/dars/NG5 cached PHC IC | `/work/.../mesh_{dars,ng5}/{T,S}_ic.npy` |
 | dist_`<NP>` partitions | `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/{core2,farc,dars,ng5}/dist_<NP>` |
 | PHC winter IC (source nc) | `/pool/data/AWICM/FESOM2/INITIAL/phc3.0/phc3.0_winter.nc` |
 | JRA55-do forcing | `/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0` |
+| farc/dars/NG5 mesh bundles | `/work/ab0995/a270088/fesom_jax_meshes/mesh_{farc,dars,ng5}/` |
 
-Meshes are dense `.npy` bundles exported from the C port (`docs/MESH_EXPORT_LAYOUT.md`). Cache a
-mesh's PHC IC once with `scripts/cache_phc_ic.py --mesh-dir <M> --out-dir <M>` (slow at NG5 scale).
+> ⚠️ **CORE2 mesh version.** The upstream CORE2 level files (`nlvls.out`/`elvls.out`) were regenerated
+> on 2026-07-03. Everything here — and the Zenodo package — uses the **earlier** version, which is what
+> all `fesom-jax` results were produced with. They differ at 2 nodes / 4 elements in the Ross Sea; both
+> are structurally valid. Details in [`docs/DATA.md`](docs/DATA.md).
+
+Meshes are dense `.npy` bundles. Build one from a raw FESOM mesh with
+`scripts/prepare_mesh.py <raw_dir> <out_dir>` (`docs/MESH_EXPORT_LAYOUT.md`); cache a mesh's PHC IC
+once with `scripts/cache_phc_ic.py --mesh-dir <M> --out-dir <M>` (slow at NG5 scale).
 
 ⚠️ The C IC is **partition-dependent** (the `extrap_nod3D` Gauss-Seidel land fill is
 order-dependent and runs per-rank), so an IC meant to match a C dump oracle bit-for-bit must be
@@ -471,12 +506,16 @@ above; these are the constraints on the *gradient* modes):
 
 | Doc | What |
 |-----|------|
-| [`docs/plans/20260605-fesom-jax-port.md`](docs/plans/20260605-fesom-jax-port.md) | roadmap + locked design decisions (source of truth) |
-| [`docs/plans/20260608-fesom-jax-phase8b-scaling.md`](docs/plans/20260608-fesom-jax-phase8b-scaling.md) | multi-GPU/multi-node scaling phase (the scaling work above) |
-| [`docs/PORTING_LESSONS.md`](docs/PORTING_LESSONS.md) | per-task gotchas & hard-won facts (AD seams, sharding, fidelity) |
+| [`examples/01_pi_quickstart.ipynb`](examples/01_pi_quickstart.ipynb) | **start here** — run + differentiate the model in 2 min, no data |
+| [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic.ipynb) | the realistic 1° global ocean with real weather + sea ice |
+| [`docs/DATA.md`](docs/DATA.md) | the input datasets: what they are, how to get them, how to point at them |
+| [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | driving runs from a single YAML: restarts, chaining, multi-GPU |
 | [`docs/ENV.md`](docs/ENV.md) | exact environment + GPU verification |
 | [`docs/JAX_RAGGED_A2A_BUG.md`](docs/JAX_RAGGED_A2A_BUG.md) | the ragged AD bug: record, repro, workaround |
 | [`docs/MESH_EXPORT_LAYOUT.md`](docs/MESH_EXPORT_LAYOUT.md) | the dense mesh `.npy` bundle format |
+| [`docs/PORTING_LESSONS.md`](docs/PORTING_LESSONS.md) | per-task gotchas & hard-won facts (AD seams, sharding, fidelity) |
+| [`docs/plans/20260605-fesom-jax-port.md`](docs/plans/20260605-fesom-jax-port.md) | roadmap + locked design decisions (source of truth) |
+| [`docs/plans/20260608-fesom-jax-phase8b-scaling.md`](docs/plans/20260608-fesom-jax-phase8b-scaling.md) | multi-GPU/multi-node scaling phase (the scaling work above) |
 
 ### Reference ports (algorithmic / numerical sources of truth)
 | What | Where |
@@ -493,3 +532,22 @@ above; these are the constraints on the *gradient* modes):
   instead of Python control flow on traced values; gradient checks re-run at every gate.
 - **Fidelity target:** climate-close, not bit-identical (FP reassociation in scatters/reductions);
   ~1e-15 for map/gather kernels, ~1e-12 for scatter/reduction kernels — which does not hurt AD.
+
+---
+
+## License
+
+[Apache-2.0](LICENSE).
+
+The model is a port of [FESOM2](https://github.com/FESOM/fesom2). If you use it, please cite the
+underlying model and the datasets you ran it on:
+
+- **FESOM2** — Danilov, S., Sidorenko, D., Wang, Q., and Jung, T.: The Finite-volumE Sea ice–Ocean
+  Model (FESOM2), *Geosci. Model Dev.*, 10, 765–789, 2017.
+  [doi:10.5194/gmd-10-765-2017](https://doi.org/10.5194/gmd-10-765-2017)
+- **CORE2 mesh** — Wang, Q., et al.: The Finite Element Sea Ice-Ocean Model (FESOM) v.1.4,
+  *Geosci. Model Dev.*, 7, 663–693, 2014.
+  [doi:10.5194/gmd-7-663-2014](https://doi.org/10.5194/gmd-7-663-2014)
+- **JRA55-do forcing** — Tsujino, H., et al.: JRA-55 based surface dataset for driving ocean–sea-ice
+  models, *Ocean Modelling*, 130, 79–139, 2018.
+  [doi:10.1016/j.ocemod.2018.07.002](https://doi.org/10.1016/j.ocemod.2018.07.002)

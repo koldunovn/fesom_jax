@@ -42,10 +42,15 @@ from pathlib import Path
 import numpy as np
 import netCDF4
 
+from . import paths
 from .config import (RAD, ALPHA_EULER_DEG, BETA_EULER_DEG, GAMMA_EULER_DEG,
                      FORCE_ROTATION)
 
-DEFAULT_JRA_DIR = "/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0"
+# Import-time snapshot of the resolved forcing dir ($FESOM_JRA_DIR → the Levante default);
+# kept for the callers that import the name (data-availability test gates, scripts). The
+# reader itself re-resolves at CALL time via :mod:`fesom_jax.paths` — prefer
+# ``paths.resolve("jra_dir")`` / ``paths.require("jra_dir")`` for late binding.
+DEFAULT_JRA_DIR = paths.resolve("jra_dir")
 
 # Field order — fesom_jra55.h:50-59 (FESOM_JRA_XWIND=0 … FESOM_JRA_SNOW=7).
 JRA_VARS = ("uas", "vas", "huss", "rsds", "rlds", "tas", "prra", "prsn")
@@ -296,10 +301,13 @@ class JRA55Reader:
     :meth:`step` per model date. Output is a :class:`JRAFields` of ``[nod2D]`` numpy
     arrays (convert to ``jnp`` at the device boundary in the step driver)."""
 
-    def __init__(self, mesh, year: int, jra_dir: str | Path = DEFAULT_JRA_DIR):
+    def __init__(self, mesh, year: int, jra_dir: str | Path | None = None):
+        """``jra_dir=None`` ⇒ resolved from ``$FESOM_JRA_DIR``, else the Levante default
+        (:func:`fesom_jax.paths.require`, which raises an actionable ``FileNotFoundError``
+        if the directory is absent)."""
         self.year = int(year)
         self.N = int(mesh.nod2D)
-        self.jra_dir = Path(jra_dir)
+        self.jra_dir = Path(paths.require("jra_dir", jra_dir))
 
         # geographic node coords (deg), with only the <0 wrap (C :306-308).
         geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64) / RAD

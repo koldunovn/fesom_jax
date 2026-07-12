@@ -4923,3 +4923,128 @@ Cite the C source (`file:line`) or dump probe that proves it.
   signature is a near-uniform offset below the reduction-class floor. Every conservation statement the model
   makes ("the balance zeroes the global mean", "the tracer sum is preserved") deserves its own assembled-step
   invariant gate, asserted against the mathematical property — not against the implementation's own re-derivation.
+
+- **[bench/paper§5] Single-device + CPU baselines measured (jobs 26037292/26037293); npes==1 needs
+  `synth_serial`, not `read_partition`.** `read_partition` refuses npes==1 by design — `bench_forward_scaling.py`
+  now builds the identity partition for `--npes 1` (zero halo, exchange=identity). *Results (CORE2 FULL
+  ice+kpp+gm+JRA1958, warm-executable protocol):* **1×A100 = 243.2 ms/step (20.3 SYPD, peak 8.41 GiB)** ⇒
+  4-GPU parallel efficiency 70% vs the 86.7 ms ragged number; **1 CPU node (128 cores, JAX_PLATFORMS=cpu,
+  single process, XLA threads) = 5755 ms/step (0.86 SYPD)** — ~29× slower than Kokkos-CPU's 128-rank MPI on
+  the SAME node (200 ms/step) ⇒ JAX-CPU is a functionality/accessibility mode, never a performance mode; and
+  it cannot scale out (XLA collectives are not production-grade on the CPU backend — no multi-node CPU
+  shard_map). New sbatch: `bench_core2_cpu.sbatch`, `bench_core2_1gpu.sbatch`; `paper_jax` reduce_scaling now
+  labels `plat=cpu` rows "JAX (CPU)" so the GPU figure/table ignore them.
+
+- **[bench/HPC] Levante's `gpu` partition MIXES A100-40GB (cell09) and A100-80GB (cell13) — ALWAYS pin
+  `#SBATCH --constraint=a100_80` for anything memory- or bandwidth-sensitive.** Job 26037293 (the 1-GPU
+  CORE2 baseline) silently landed on a 40GB card (l40366) — different HBM bandwidth (1.6 vs 2.0 TB/s), so
+  its 243 ms/step is NOT comparable with the a100_80 multi-GPU rows (re-measured as job 26038900); and the
+  gradient bench (26038321/26038491) OOM'd unexplainably until `nvidia-smi` in the log exposed the 40GB
+  card — the adjoint's per-step checkpoint carry stack (~2 GiB × N steps for the full CORE2 State) simply
+  cannot fit there. Audit trick: `sacct -j <id> -o NodeList` + `sinfo -n <node> -o "%f"` reveals the card
+  after the fact — all historical paper-scaling rows checked and confirmed a100_80. Second lesson from the
+  same saga: `XLA_PYTHON_CLIENT_MEM_FRACTION≥0.9` starves the CUDA module loader ("Failed to load
+  in-memory CUBIN ... CUDA_ERROR_OUT_OF_MEMORY") for programs this large — 0.85 with default preallocation
+  is the working setting; PREALLOCATE=false fragments and kills the multi-ten-GiB carry-stack alloc.
+
+- **[bench/AD] Gradient cost MEASURED (job 26046417, attempt 5): reverse-mode = 4.7× forward,
+  0.83 GiB/step of window; the fix for the CUBIN-load OOM was DISABLING XLA COMMAND BUFFERS.**
+  CORE2 full (ice+kpp+gm), 1×A100-80GB, per-step ckpt + remat_blocks: fwd 196 ms/step (== the
+  bench-harness 194 ms — dense integrate() path cross-checks), value_and_grad 909-923 ms/step
+  (ratio 4.63/4.70 at n=12/24, n-independent), peaks 29.1→39.1 GiB (slope 0.83 GiB/step + ~19 GiB
+  base) ⇒ day-scale windows fit one 80GB card. The grad executable only LOADS with
+  `XLA_FLAGS="--xla_gpu_enable_command_buffer="` (CUDA-graph instantiation of the huge backward
+  program eats device memory at load — same mitigation run_perf.sbatch uses) + MEM_FRACTION=0.80.
+  Still failing: seg=-1 (O(√N) two-level) executable does not load even so — the nested-scan
+  backward program is bigger still; workaround unknown, single data point, don't over-generalize.
+  Grad-bench forward compile via integrate() is ~280-340 s (vs 25 s for run_steps_sharded) — the
+  dense path compiles much slower; budget accordingly.
+
+- **[bench/paper§5] dars timing-validity A/B (job 26046701, dars_ab.26046701.log): the historical
+  dt=180 bench state IS non-finite by step 25 (117.8M NaN in T — the DARS_INSTABILITY_FINDING
+  suspicion, now measured), but it does NOT invalidate the timings: dt=60 verified-finite re-time =
+  504.9 ms/step vs 521.2 on the blown-up state (3%), and the production-like zstar+wsplit+mEVP(+KPP)
+  at dt=120 = 522.5 ms/step (4%, peak 26.9 vs 22.1 GiB).** So per-step cost is insensitive to state
+  health at this scale and the paper's dars rows stand; SYPD however must use dt_prod=120 (w_split),
+  not 240 — fixed in paper_jax reduce_scaling/make_numbers (dars 1.28→0.64 SYPD, 300→600 GPU-h/yr).
+  Bonus finding from the same batch: forca20/dist_32 with KPP compiles+runs fine (326 ms/step, finite)
+  ⇒ the production forca20 dist_32 compile-hang is TKE-multinode-specific, not partition-specific;
+  and NG5 anti-scales at 128 GPU (763.7 vs 583.8 ms at 64) — the JAX communication wall, while
+  Kokkos-CUDA still improves there. All new benches now print a [bench-finite] gate line.
+
+- **[bench/paper§5] dars confirms the 128-GPU communication wall (jobs 26047719/26047720, dt=60
+  verified-finite): 283.3 ms/step at 64 GPUs (32→64 doubling keeps only 56% efficiency) but
+  423.3 ms at 128 — anti-scaling, exactly like NG5 (583.8→763.7 ms), while Kokkos-CUDA still
+  improves on both meshes at 128 (dars 236.5→210.7 ms, NG5 491.6→373.8 ms).** Two meshes of very
+  different size (3.16M vs 7.4M nodes) now turn over at the same GPU count, i.e. the wall tracks
+  the per-GPU workload (~25–58k surface nodes/GPU) — the same halo-exchange wall CORE2 hits at
+  8 GPUs. Paper updated (fig10 + §5 strong-scaling + §7); dars SYPD peaks at 64 GPUs (1.16).
+
+- **[fidelity/paper§4] CORE2 v3 hindcast COMPLETE (2026-07-05, 63/63 yr) and the zstar freshwater
+  fix is confirmed at full length: vol-mean S drift = +5×10⁻⁵ psu over 62 compared years (Fortran
+  reference: +2×10⁻⁵ — same order; pre-fix JAX was +4×10⁻³, i.e. 100× down), end-state vol-mean T
+  gap 0.0001 °C, OHC gap 0.5 ZJ.** Mean state 1980–2009: SST RMSE vs PHC 0.605 (JAX) / 0.606
+  (Fortran) with |JAX−Fortran| RMS 0.004 °C; SSS 0.380/0.380/0.002 psu — the port-vs-original
+  difference is two orders below the shared model-vs-obs bias. NOTE the analysis cap: the user
+  distrusts the final (2020) JRA55-do forcing year, so ALL comparisons end at 2019
+  (paper_jax paths.LAST_COMPARE_YEAR; the paper says 1958–2019/62-year/744 months). Formatting
+  gotcha: post-fix drifts are ~1e-5, so any `%.4f` annotation renders "0.0000" — the fig04/macros
+  now use scientific notation, and the salinity panel uses a fixed ±0.01 psu window instead of
+  matplotlib's offset-notation autoscale (unreadable per user feedback).
+
+- **[fidelity/paper§4] Fortran reference runs write what their namelist says and nothing more:
+  the 3-yr FORCA20 reference (fesom2_forca20) has YEARLY MEANS ONLY, so a "show me a snapshot"
+  figure required re-integrating January 1959 in a copy dir (fesom2_forca20_snap) from the
+  end-of-1958 restart with daily sst/ssh/unod/vnod.** Recipe that worked: copy namelists, cut
+  io_list to the needed fields at 1,'d', run_length=1,'m', hand-write fesom.clock
+  ("86160 365 1958 / 0.0 1 1959"), and SYMLINK the 253 GB fesom.1958.{oce,ice}.restart dirs
+  (read-only use — verified "restart from record 12 of 12" through the symlink; never copy, never
+  point ResultPath at the original). Cost: ~8 min init + ~1.5 min/simulated day on the original
+  32-node/4096-rank layout, ~half of it the daily 3-D netCDF writes. When planning reference runs,
+  decide the snapshot-output question BEFORE the run, not after.
+
+- **[usability] External input-data paths are now resolved in ONE place (`fesom_jax/paths.py`),
+  never hardcoded in the reader that opens them: explicit arg / run-YAML `forcing:` key → env var
+  → Levante default.** The six inputs (JRA55-do forcing, PHC IC, SSS restoring, runoff, chl, mesh/
+  partition root — plus the repo-relative cached-IC dir) each have an env var (`FESOM_JRA_DIR`,
+  `FESOM_PHC_PATH`, `FESOM_SSS_PATH`, `FESOM_RUNOFF_PATH`, `FESOM_CHL_PATH`, `FESOM_MESH_ROOT`,
+  `FESOM_IC_DIR`) and the four forcing files also a YAML key inside `forcing:` (strict-keyed like
+  every other config block). Two rules that made this a no-risk refactor: (1) the env is read at
+  CALL time (`paths.resolve`), not at import, so exporting a var in a job script after
+  `import fesom_jax` still works; (2) all four `build_core_forcing` path kwargs became `None`
+  ("resolve yourself") instead of an import-time default, so the default path on Levante is
+  byte-identical while a caller can override any single one. Keep the legacy `DEFAULT_*` module
+  names alive as import-time snapshots — test gates (`Path(jra55.DEFAULT_JRA_DIR).is_dir()`) and
+  scripts import them. `paths.require()` fails with the env var, the YAML key, and `docs/DATA.md`
+  named in the message: an actionable error is the difference between "unusable off Levante" and
+  "usable off Levante" far more than the plumbing itself.
+
+- **[usability][mesh] The CORE2 mesh on `/pool` is NOT immutable — its level files were silently
+  regenerated under us.** `nlvls.out`/`elvls.out` (the per-node/per-element level counts) were
+  rewritten upstream on **2026-07-03**, a month after this project's C mesh export (2026-06-06).
+  They differ at exactly **2 nodes and 4 elements**, all in the Ross Sea (~154 °W, 77 °S), where the
+  newer files are shallower (580 m → 280 m at the worst point). Everything fesom-jax has ever
+  produced — the 63-yr hindcast, every paper figure — used the OLD levels, and because `/pool`
+  overwrote them, **our dense `.npy` export is now the only surviving copy**. Three consequences,
+  each of which cost real time to work out:
+  (1) `test_prepare_mesh.py` had been failing since 2026-07-03 and looked like a code regression —
+  it was not: it derives a mesh from today's `/pool` and diffs it against an export built from the
+  old one. Fixed by *pinning* the level files it feeds `prepare_mesh` to the ones the export
+  encodes, plus a new explicit tripwire (`test_upstream_levels_delta_is_as_documented`) that
+  asserts the divergence is exactly the known 2/4 points — so the next upstream edit fails loudly
+  instead of silently changing the bathymetry.
+  (2) The Zenodo data package must ship the OLD levels (reconstructed from the `.npy` export, not
+  copied from `/pool`), or the published package would not reproduce the published results.
+  (3) Both versions are structurally valid — the FESOM invariant (no element deeper than its
+  shallowest node) holds for each — so nothing "detects" the swap for you. **Lesson: a mesh under
+  `/pool` is a dependency with no version number. Check `ls -l` mtimes on the raw `.out` files
+  before trusting that a reference run and a fresh export share a bathymetry.**
+
+- **[usability] The pi mesh (5 MB) now ships INSIDE the package** (`fesom_jax/data/mesh_pi`,
+  `DEFAULT_PI_MESH_DIR`, `package-data` in `pyproject.toml`). Before this, `data/` was a gitignored
+  symlink to `/work`, so a fresh `git clone` had **zero** meshes and the README's quick-start failed
+  on its first line for everyone except the author — while the README claimed the CORE2 mesh was
+  "small, in-repo" (it is 204 MB, on `/work`). 5 MB of committed mesh is the difference between a
+  repo that only its author can run and one that `pip install` + a laptop CPU can run in 2 minutes
+  (forward model *and* gradient — `examples/01_pi_quickstart.ipynb`). If a model's data does not
+  ship, its documentation is fiction; test the quick-start as a stranger would, from a clean clone.

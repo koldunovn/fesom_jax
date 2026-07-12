@@ -1,0 +1,33 @@
+# pi — the demo config. Runs anywhere, on a laptop CPU, with NO external data:
+# the pi mesh (3140 nodes, 48 levels) ships inside the fesom_jax package.
+#
+#   python scripts/run_from_config.py configs/pi_demo.yaml --steps 300 --restart-out runs/pi/seg0
+#
+# This is the config-file counterpart of examples/01_pi_quickstart.ipynb. For the realistic
+# global setup (real mesh, real weather, sea ice) see configs/core2_full.yaml + docs/DATA.md.
+
+# --- physics ---------------------------------------------------------------
+# Kept deliberately minimal so the run is fast and needs no forcing files. Each key:
+#   null = that physics OFF   |   {} = ON with defaults   |   mapping = ON with overrides
+ale:  null        # linear free surface (zstar would be `{}`)
+gm:   null        # eddy parameterization off — pi is too coarse for it to mean much
+kpp:  null        # simple PP vertical mixing (KPP would be `{}`)
+tke:  null        # (kpp XOR tke — at most one)
+ice:  null        # no sea ice: the pi demo has no atmospheric forcing to drive it
+
+visc:   {}        # default horizontal viscosity
+tracer: {}        # the implemented MFCT/QR4C/FCT scheme
+
+dt: 100.0         # pi timestep [s]
+
+# --- run orchestration -----------------------------------------------------
+mesh: null        # null => the packaged pi mesh (fesom_jax/data/mesh_pi)
+partition: null   # single device
+forcing: null     # no external forcing: the idealized warm-blob initial state drives the flow
+
+output_dir: runs/pi          # relative to where you launch — no /work, no scratch needed
+snapshot_every: 50           # steps
+checkpoint_every: 0
+restart_in: null
+restart_out: null            # set with --restart-out on the command line
+duration: 300step            # ~8 hours of ocean; override with --steps

@@ -95,12 +95,15 @@ class LocalForcing:
 
 
 def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None,
-                        jra_dir=jra55.DEFAULT_JRA_DIR,
-                        sss_path=sss_runoff.DEFAULT_SSS_PATH,
-                        runoff_path=sss_runoff.DEFAULT_RUNOFF_PATH,
-                        chl_path=sss_runoff.DEFAULT_CHL_PATH,
+                        jra_dir=None,
+                        sss_path=None,
+                        runoff_path=None,
+                        chl_path=None,
                         chl_const=None, static=None) -> LocalForcing:
     """Build a :class:`LocalForcing` for this process's local partitions.
+
+    The four input-path kwargs default to ``None`` ⇒ resolved by the readers through
+    :mod:`fesom_jax.paths` (env var, else the Levante default); pass a string to override.
 
     ``local_parts`` overrides the :func:`local_partitions` device-derived set (the test path —
     so a single process can exercise the multi-partition scatter without N real devices).

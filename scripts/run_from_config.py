@@ -160,7 +160,12 @@ def main():
         # xp=np keeps the global State on the host (the big-mesh setup-OOM fix).
         state0 = cold_start_state(mesh, args.ic_dir, xp=np); _lap("cold_start_state")
     sst0 = None if state0 is None else np.asarray(state0.T[:, 0])
-    forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0); _lap("forcing_setup")
+    # Input-data paths: the run YAML's optional `forcing: {jra_dir,sss_path,runoff_path,chl_path}`
+    # keys win; absent (all None) ⇒ each reader resolves $FESOM_* → the Levante default
+    # (fesom_jax/paths.py, docs/DATA.md) — the historical behaviour.
+    fpaths = cfg.forcing_paths()
+    forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0,
+                                               **fpaths); _lap("forcing_setup")
 
     # The NG5 host-forcing fix: build a LOCAL-node forcing (interp only this process's owned
     # partitions, ~npes× less). forcing.static is reused for the (cheap, once) static path.
@@ -168,7 +173,7 @@ def main():
     if args.local_forcing:
         from fesom_jax.forcing_local import build_local_forcing
         local_forcing = build_local_forcing(mesh, args.year, part, part.npes,
-                                             static=forcing.static, sst_ic=sst0)
+                                             static=forcing.static, sst_ic=sst0, **fpaths)
         _lap("local_forcing_setup")
 
     if _IS_LEAD:

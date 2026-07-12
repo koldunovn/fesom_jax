@@ -14,6 +14,7 @@ CORE2 is the oracle (a real physical mesh; pi's idealized quirks aren't worth ch
 from __future__ import annotations
 
 import importlib.util
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,15 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 CORE2_RAW = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2")
 CORE2_EXPORT = ROOT / "data" / "mesh_core2"
+
+# Upstream regenerated the CORE2 vertical level files on 2026-07-03, AFTER this project's C
+# export. We ship (and publish on Zenodo) the EARLIER version, because every fesom-jax result was
+# produced with it; the two differ at 2 nodes / 4 elements in the Ross Sea. See docs/DATA.md.
+# So the derivation gates below must feed prepare_mesh the levels our export was built from —
+# otherwise they compare a mesh derived from today's /pool against an export from the old one.
+# `test_upstream_levels_delta_is_as_documented` is the tripwire that watches that divergence.
+LEVEL_FILES = ("nlvls.out", "elvls.out")
+KNOWN_NODE_DELTA, KNOWN_ELEM_DELTA = 2, 4
 
 needs_data = pytest.mark.skipif(
     not (CORE2_RAW / "nod2d.out").exists() or not (CORE2_EXPORT / "coord_nod2D.npy").exists(),
@@ -35,10 +45,37 @@ def _load_prepare_mesh():
     return mod
 
 
+@pytest.fixture(scope="module")
+def pinned_raw(tmp_path_factory):
+    """The raw CORE2 mesh, with the level files pinned to the version the C export encodes."""
+    d = tmp_path_factory.mktemp("core2_raw_pinned")
+    for p in CORE2_RAW.glob("*.out"):
+        if p.name not in LEVEL_FILES:
+            shutil.copy2(p, d / p.name)
+    for name, npy in ((("nlvls.out"), "nlevels_nod2D.npy"), (("elvls.out"), "nlevels.npy")):
+        np.savetxt(d / name, np.load(CORE2_EXPORT / npy).ravel().astype(int), fmt="%12d")
+    return d
+
+
 @needs_data
-def test_prepare_mesh_matches_c_export(tmp_path):
+def test_upstream_levels_delta_is_as_documented():
+    """Tripwire on the upstream mesh. We ship the pre-2026-07-03 CORE2 levels; /pool now has the
+    newer ones. Assert the divergence is EXACTLY the known Ross Sea change — so that any further
+    upstream edit fails here loudly instead of silently changing the model's bathymetry."""
+    ours_n = np.load(CORE2_EXPORT / "nlevels_nod2D.npy").ravel()
+    ours_e = np.load(CORE2_EXPORT / "nlevels.npy").ravel()
+    pool_n = np.loadtxt(CORE2_RAW / "nlvls.out", dtype=int).ravel()
+    pool_e = np.loadtxt(CORE2_RAW / "elvls.out", dtype=int).ravel()
+    assert int((ours_n != pool_n).sum()) == KNOWN_NODE_DELTA, (
+        "the upstream CORE2 node levels changed again — re-check docs/DATA.md and the Zenodo package")
+    assert int((ours_e != pool_e).sum()) == KNOWN_ELEM_DELTA, (
+        "the upstream CORE2 element levels changed again — re-check docs/DATA.md and the Zenodo package")
+
+
+@needs_data
+def test_prepare_mesh_matches_c_export(pinned_raw):
     pm = _load_prepare_mesh()
-    raw = pm.read_fesom_ascii(CORE2_RAW)
+    raw = pm.read_fesom_ascii(pinned_raw)
     out = pm.derive(raw)
     diffs = pm.verify_against(out, CORE2_EXPORT)
 
@@ -59,13 +96,13 @@ def test_prepare_mesh_matches_c_export(tmp_path):
 
 
 @needs_data
-def test_prepared_mesh_is_loadable(tmp_path):
+def test_prepared_mesh_is_loadable(tmp_path, pinned_raw):
     """The prepared mesh round-trips through the port's own `load_mesh` (which asserts CW
     orientation) and matches the C export's loaded Mesh on the step-read fields."""
     import dataclasses
     from fesom_jax.mesh import load_mesh
     pm = _load_prepare_mesh()
-    out = pm.derive(pm.read_fesom_ascii(CORE2_RAW))
+    out = pm.derive(pm.read_fesom_ascii(pinned_raw))
     pm.write_mesh(out, tmp_path / "prepared")
 
     prepared = load_mesh(tmp_path / "prepared")          # runs check_cw_orientation internally

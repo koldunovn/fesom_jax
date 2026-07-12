@@ -49,11 +49,15 @@ from scipy.ndimage import uniform_filter
 
 import jax.numpy as jnp
 
+from . import paths
 from .config import RAD
 
-DEFAULT_SSS_PATH = "/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/PHC2_salx.nc"
-DEFAULT_RUNOFF_PATH = "/pool/data/AWICM/FESOM2/FORCING/JRA55-do-v1.4.0/CORE2_runoff.nc"
-DEFAULT_CHL_PATH = "/pool/data/AWICM/FESOM2/FORCING/Sweeney/Sweeney_2005.nc"
+# Import-time snapshots of the resolved defaults ($FESOM_SSS_PATH / $FESOM_RUNOFF_PATH /
+# $FESOM_CHL_PATH → the Levante defaults), kept importable for the callers that use the
+# names. The readers below re-resolve at CALL time via :mod:`fesom_jax.paths`.
+DEFAULT_SSS_PATH = paths.resolve("sss_path")
+DEFAULT_RUNOFF_PATH = paths.resolve("runoff_path")
+DEFAULT_CHL_PATH = paths.resolve("chl_path")
 
 # surf_relax_S = 10 / (60·3600·24) = 1.929e-6 s⁻¹ (fesom_sss_runoff_init:305).
 SURF_RELAX_S = 10.0 / (60.0 * 3600.0 * 24.0)
@@ -188,11 +192,16 @@ class SSSRunoffReader:
         return self.Ssurf_clim[m - 1]
 
 
-def build_reader(mesh, sss_path: str = DEFAULT_SSS_PATH,
-                 runoff_path: str = DEFAULT_RUNOFF_PATH) -> SSSRunoffReader:
+def build_reader(mesh, sss_path: str | None = None,
+                 runoff_path: str | None = None) -> SSSRunoffReader:
     """Read the SSS climatology (12 months) + CORE2 runoff and interpolate to ``mesh``
     nodes (npes=1). Mirrors ``fesom_sss_runoff_init`` (runoff once, ``/1000``) + the
-    per-month ``SALT`` reads in ``fesom_sss_runoff_step``."""
+    per-month ``SALT`` reads in ``fesom_sss_runoff_step``.
+
+    ``sss_path``/``runoff_path`` ``None`` ⇒ resolved from ``$FESOM_SSS_PATH`` /
+    ``$FESOM_RUNOFF_PATH``, else the Levante defaults (:mod:`fesom_jax.paths`)."""
+    sss_path = paths.require("sss_path", sss_path)
+    runoff_path = paths.require("runoff_path", runoff_path)
     geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64) / RAD
     lon_mod = np.where(geo[:, 0] < 0.0, geo[:, 0] + 360.0, geo[:, 0])   # <0 wrap (:250)
     lat_mod = geo[:, 1].copy()
@@ -207,7 +216,7 @@ def build_reader(mesh, sss_path: str = DEFAULT_SSS_PATH,
     return SSSRunoffReader(Ssurf_clim=Ssurf_clim, runoff_node=runoff_node)
 
 
-def build_chl_clim(mesh, chl_path: str = DEFAULT_CHL_PATH) -> np.ndarray:
+def build_chl_clim(mesh, chl_path: str | None = None) -> np.ndarray:
     """Chlorophyll monthly climatology interpolated to mesh nodes — host numpy port of
     the ``chl`` read in ``fesom_main.c:1111`` (``fesom_read_other_NetCDF(chl_file, "chl",
     mi, …, /*check_dummy=*/1, /*do_onvert=*/1)``). The CORE2 default source is
@@ -217,7 +226,11 @@ def build_chl_clim(mesh, chl_path: str = DEFAULT_CHL_PATH) -> np.ndarray:
     Returns ``chl_clim[12, nod2D]`` (mg/m³); index by ``m-1`` for 1-based month ``m``.
     For the constant-chl alternative (``FESOM_CHL_SOURCE=None`` ⇒ ``FESOM_PHASE1_CHL_CONST
     = 0.1``) just pass ``jnp.full(nod2D, 0.1)`` to :func:`fesom_jax.forcing.cal_shortwave_rad`
-    instead of this climatology — the seam is the ``chl`` argument."""
+    instead of this climatology — the seam is the ``chl`` argument.
+
+    ``chl_path=None`` ⇒ resolved from ``$FESOM_CHL_PATH``, else the Levante default
+    (:mod:`fesom_jax.paths`)."""
+    chl_path = paths.require("chl_path", chl_path)
     geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64) / RAD
     lon_mod = np.where(geo[:, 0] < 0.0, geo[:, 0] + 360.0, geo[:, 0])
     lat_mod = geo[:, 1].copy()
