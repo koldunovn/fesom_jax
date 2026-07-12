@@ -25,6 +25,7 @@ import hashlib
 import json
 import os
 import sys
+import ssl
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -38,6 +39,22 @@ ZENODO_API = "https://zenodo.org/api/records/{record}"
 # Zenodo's edge returns an HTML 403 to any request with no User-Agent. urllib sets one by default,
 # but say it explicitly -- this exact trap cost a day on the upload side.
 UA = {"User-Agent": "fesom-jax-fetch/1.0 (+https://github.com/koldunovn/fesom_jax)"}
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """Works even where the interpreter's CA store is broken (conda BASE envs often are: every
+    HTTPS request dies with CERTIFICATE_VERIFY_FAILED though the network is fine). certifi ships a
+    working bundle; use it rather than making the user work out which python to run."""
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:                      # noqa: BLE001 - no certifi: keep the default store
+        pass
+    return ctx
+
+
+SSL_CTX = _ssl_context()
 
 MESH_ZIP = "core2_mesh_ic.zip"
 PART_ZIP = "core2_partitions.zip"       # dist_<N>: needed only for multi-device runs
@@ -53,7 +70,8 @@ def record_files(record: str) -> dict:
     """{filename: {'url':…, 'size':…, 'md5':…}} for a Zenodo record."""
     url = ZENODO_API.format(record=record)
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA),
+                                   timeout=60, context=SSL_CTX) as r:
             meta = json.load(r)
     except Exception as e:  # noqa: BLE001
         _die(f"could not reach Zenodo record {record}: {e}")
@@ -78,7 +96,7 @@ def download(url: str, dest: Path, size: int = 0) -> None:
     # so off a tty report sparsely (every 10%) instead.
     tty = sys.stdout.isatty()
     req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+    with urllib.request.urlopen(req, timeout=120, context=SSL_CTX) as r, open(dest, "wb") as f:
         done, next_mark = 0, 10
         while chunk := r.read(1 << 20):
             f.write(chunk)

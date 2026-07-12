@@ -76,6 +76,27 @@ SANDBOX = "sandbox.zenodo.org"
 # Zenodo's edge rejects requests with no User-Agent (HTML 403, before the API ever sees them).
 USER_AGENT = "fesom-jax-zenodo-uploader/1.0 (+https://github.com/koldunovn/fesom_jax)"
 
+
+def _ssl_context() -> ssl.SSLContext:
+    """An SSL context that works even where the interpreter's CA store is broken.
+
+    conda/mambaforge BASE environments frequently ship a broken CA path, so every HTTPS request
+    dies with ``CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate`` even though the
+    network is perfectly fine. (The same breakage makes ``curl`` fail with "error setting certificate
+    file".) It looks like Zenodo is down; it is not. certifi ships a working bundle and is almost
+    always installed, so load it rather than making the caller work out which python to run.
+    """
+    ctx = ssl.create_default_context()
+    try:
+        import certifi
+        ctx.load_verify_locations(cafile=certifi.where())
+    except Exception:                              # noqa: BLE001 - no certifi: keep the default store
+        pass
+    return ctx
+
+
+SSL_CTX = _ssl_context()
+
 # The archives, in upload order (small first, so a metadata mistake surfaces before the 10 GB).
 ARCHIVES = ("core2_mesh_ic.zip", "core2_partitions.zip", "core2_forcing_1958.zip")
 
@@ -157,7 +178,7 @@ def _api(host: str, method: str, path: str, token: str, payload=None) -> tuple[i
                                  headers={"Content-Type": "application/json",
                                           "User-Agent": USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r:
+        with urllib.request.urlopen(req, timeout=60, context=SSL_CTX) as r:
             body = r.read()
             return r.status, (json.loads(body) if body else {})
     except urllib.error.HTTPError as e:
@@ -209,7 +230,7 @@ def put_slice(bucket_url: str, path: Path, name: str, offset: int, length: int,
         conn = None
         try:
             conn = http.client.HTTPSConnection(parts.netloc, timeout=180,
-                                               context=ssl.create_default_context())
+                                               context=SSL_CTX)
             conn.putrequest("PUT", target)
             conn.putheader("Content-Length", str(length))
             conn.putheader("Content-Type", "application/octet-stream")
