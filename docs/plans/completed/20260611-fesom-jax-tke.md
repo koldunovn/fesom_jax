@@ -194,7 +194,7 @@ interface spacings `dz_trr` **as derived-from-(hnode, Z-source) inputs** compute
 - **STANDING RULE:** append one lesson per task to `docs/PORTING_LESSONS.md` as you go.
 - `[x]` immediately; ➕ discovered tasks; ⚠️ blockers; keep this plan in sync; move to `completed/`
   at GATE 9b.
-- Compute: suite via `scripts/run_suite.sbatch` (CPU); stability/gradients on A100 (`-A ab0995_gpu`);
+- Compute: suite via `scripts/runs/run_suite.sbatch` (CPU); stability/gradients on A100 (`-A ab0995_gpu`);
   C dump regeneration jobs `-p compute --time=30:00`. Env python as in the parent plan.
 
 ## Implementation Steps

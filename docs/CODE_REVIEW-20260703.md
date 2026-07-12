@@ -625,7 +625,7 @@ tautological asserts found.
 
 **Hermeticity:** `data/` is a symlink to /work, so most of the suite is Levante-bound by
 design. A real hermetic subset exists and runs in CI (`.github/workflows/ci.yml`, 5
-data-free files per push), and the full suite runs via `scripts/run_suite.sbatch` (3
+data-free files per push), and the full suite runs via `scripts/runs/run_suite.sbatch` (3
 groups, 1:45 wall). Weakness: both are **hand-listed filenames, no pytest markers
 registered at all** — a new hermetic test file is silently excluded from CI until someone
 edits ci.yml.

@@ -28,7 +28,7 @@ only its OWN nodes (local ``myList_nod2D`` order) with halo values frozen betwee
 ``exchange_nod`` calls, so a 1-rank and a 16-rank C run differ at GS-filled nodes by up to
 ~25 PSU (Baltic/Kara basins seeded from different fill fronts). To match a C dump oracle
 bit-for-bit, build the IC with that run's partition (``rank_nodes`` →
-:func:`_extrap_nod3D_mpi`; ``scripts/rebuild_ic_dist16.py`` for the dist_16 z2_cdump).
+:func:`_extrap_nod3D_mpi`; ``scripts/tools/rebuild_ic_dist16.py`` for the dist_16 z2_cdump).
 """
 
 from __future__ import annotations
@@ -489,7 +489,7 @@ def cold_start_state(mesh, ic_dir: str | Path | None = None, base_T: float = 10.
     (``np`` ⇒ the big-mesh HOST build, mirrors :func:`core2_initial_state`). ``seed_sea_ice=False``
     returns the bare PHC IC (ice State at 0) for the rare ocean-only case that wants no ice IC.
 
-    (Note: ``scripts/bench_forward_scaling.py`` keeps its own ``phc_state`` — a host build with a
+    (Note: ``scripts/bench/bench_forward_scaling.py`` keeps its own ``phc_state`` — a host build with a
     live-PHC-interp FALLBACK when no cached ``T_ic.npy`` exists — which this helper does not cover.)"""
     import jax.numpy as jnp
     if xp is None:

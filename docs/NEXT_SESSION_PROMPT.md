@@ -84,10 +84,10 @@ misalignment). Committed `1966e7e` (code + lesson only; plan + this prompt + .cl
   papers that stop at the short-window number hide the online failure).
 - **Suite GREEN** (ocean **656** + ice **47**, job 25717958; sharding = the pre-existing timeout). E2 is
   scripts-only ⇒ zero library surface (the `params=None`/NN-off bit-identical invariant holds).
-- **Fig 4** (`scripts/fig_hybridml.py` → `fig_hybridml.png`): (A) E1 twin recovery; (B) per-season held-out
+- **Fig 4** (`scripts/paper/fig_hybridml.py` → `fig_hybridml.png`): (A) E1 twin recovery; (B) per-season held-out
   MLD reduction (train≈held-out); (C) stable deploy (drift ≈ default); (D) the offline/online gap.
 - Code: `scripts/core2_paper_nn_obs.{py,sbatch}` (`--reg`/`--m-max`/`--const-mult`/keep-best/`--mode
-  train|validate`), `scripts/core2_paper_nn_obs_diag.sbatch`, `scripts/fig_hybridml.py`. Memory:
+  train|validate`), `scripts/paper/core2_paper_nn_obs_diag.sbatch`, `scripts/paper/fig_hybridml.py`. Memory:
   `e2-nn-obs-offline-online`. PORTING_LESSONS entry added.
 
 ## Commit (code only — plan + this prompt + .claude deliberately uncommitted, NOT pushed)
@@ -167,7 +167,7 @@ D2b (job 25603998) was already recorded — recommended-step #1 needed nothing f
     **1.2%**, all ∈ [0.05, 0.30] ⇒ the VALUE is well-determined regardless of the split.
   - **SST** ΔRMSE **+0.0022…+0.0037 °C — at/UNDER the C↔Fortran 0.0049 °C floor** ⇒ honestly, SST is NOT
     meaningfully improved over the fast window; **MLD is the constrained channel**.
-- **Fig 3** (`scripts/fig_calibration.py` → `scripts/fig_calibration.png`): (A) D1 twin bowl + 800→1499
+- **Fig 3** (`scripts/paper/fig_calibration.py` → `scripts/fig_calibration.png`): (A) D1 twin bowl + 800→1499
   recovery; (B) train-vs-held-out MLD% per fold (the random≈train / lon-asymmetry contrast); (C) `c_k`
   across every split in the plausibility band. Emits `D2C_HELDOUT_OK`.
 - **Two design choices worth keeping** (now a `PORTING_LESSONS` entry): (1) random vs blocked CV answer
@@ -226,7 +226,7 @@ Basin-mean **upper-ocean/thermocline T/S profiles**: model T/S → `obs_compare.
 → `obs_compare.basin_mean_profiles` over **5 lat-band basins × 8 WOA levels (0–1500 m) × {T,S}** = an 80-vec.
 The SAME fixed reduction (fixed basin weights + a fixed common-validity mask = model-valid ∧ WOA-valid) hits
 model AND obs ⇒ a clean *linear* observable; members differ only through the physics. WOA target =
-`scripts/make_woa_ts_targets.py` → `woa_ts_targets.npz` (annual; physically textbook basin profiles verified).
+`scripts/tools/make_woa_ts_targets.py` → `woa_ts_targets.npz` (annual; physically textbook basin profiles verified).
 
 ## Two findings (now in `docs/PORTING_LESSONS.md`)
 1. **The GM→T/S signal over a short window is TINY (~3e-4 °C at 2 d) but CLEAN** ⇒ the twin needs
@@ -293,11 +293,11 @@ targets → **EKI** (forward-only, immune).
 ## What I built (D1 + D2a twins + D2a obs)
 | File | Role |
 |---|---|
-| `scripts/core2_paper_calib_twin.py` (+`.sbatch`) | D1 all-on `k_gm` twin: bowl scan + cosine-Adam recovery; `--config all3/tkegm/gm`; `--grad-check` |
-| `scripts/core2_paper_calib_tke.py` (+`.sbatch`) | D2a all-on `tke_c_k`→MLD twin (frozen-ice adjoint) — `TKE_TWIN_OK` |
-| `scripts/core2_paper_calib_tke_obs.py` (+`.sbatch`) | D2a obs calib: spin-up split + WOA MLD+SST via `obs_compare` + frozen-ice adjoint — `TKE_CALIB_OK` |
-| `scripts/make_woa_targets.py` | WOA MLD (per-month→avg, fixes Jensen bias) + SST obs target → `woa_targets.npz` |
-| `scripts/core2_paper_calib_twin_diag.sbatch` | adjoint grad-check diagnostic (config×N) |
+| `scripts/paper/core2_paper_calib_twin.py` (+`.sbatch`) | D1 all-on `k_gm` twin: bowl scan + cosine-Adam recovery; `--config all3/tkegm/gm`; `--grad-check` |
+| `scripts/paper/core2_paper_calib_tke.py` (+`.sbatch`) | D2a all-on `tke_c_k`→MLD twin (frozen-ice adjoint) — `TKE_TWIN_OK` |
+| `scripts/paper/core2_paper_calib_tke_obs.py` (+`.sbatch`) | D2a obs calib: spin-up split + WOA MLD+SST via `obs_compare` + frozen-ice adjoint — `TKE_CALIB_OK` |
+| `scripts/tools/make_woa_targets.py` | WOA MLD (per-month→avg, fixes Jensen bias) + SST obs target → `woa_targets.npz` |
+| `scripts/paper/core2_paper_calib_twin_diag.sbatch` | adjoint grad-check diagnostic (config×N) |
 | `fesom_jax/ice.py`, `fesom_jax/step.py` | `IceConfig.adjoint_mode` + frozen-ice backward (`stop_gradient`) |
 | `fesom_jax/tests/test_calib_twin.py` | CPU pi recipe guard — `TWIN_RECIPE_OK` (4/4) |
 
@@ -346,8 +346,8 @@ uncommitted per instruction; results (`.npz`/`.png`/`.jsonl`) gitignored.
 
 | File | Role |
 |---|---|
-| `scripts/core2_paper_sensitivity.py` (+`.sbatch`) | field-leaf backward → `[nod2D]` map; adjoint==FD proof; h-sweep FD spot-check; adjoint↔EKI cross-check |
-| `scripts/fig_sensitivity.py` | Fig 2 — two maps + adjoint↔EKI inset → `scripts/fig_sensitivity.png` |
+| `scripts/paper/core2_paper_sensitivity.py` (+`.sbatch`) | field-leaf backward → `[nod2D]` map; adjoint==FD proof; h-sweep FD spot-check; adjoint↔EKI cross-check |
+| `scripts/paper/fig_sensitivity.py` | Fig 2 — two maps + adjoint↔EKI inset → `scripts/fig_sensitivity.png` |
 | `fesom_jax/tests/test_sensitivity.py` | CPU seam unit test (6/6, `SENSITIVITY_SEAM_OK`) |
 
 ## GPU results (job 25589761, A100-80GB, single-GPU)
@@ -403,7 +403,7 @@ leaf seam differentiates cleanly; **field N_max=12** (TKE+MLD; the FIELD backwar
 scalar — scalar is cheaper, use it for scalar calibration). Adjoint↔EKI agree on `k_gm` (C1).
 
 **Build order (cheapest first):**
-1. **D1 — perfect-model `k_gm` twin** (`scripts/core2_paper_calib_twin.py`+`.sbatch`; model on
+1. **D1 — perfect-model `k_gm` twin** (`scripts/paper/core2_paper_calib_twin.py`+`.sbatch`; model on
    `core2_gm_grad_gate.py`). Inject truth = run with `k_gm=1500`; **grid-scan the misfit bowl FIRST**
    (forward-only) to confirm argmin sits at 1500; then recover `k_gm` 800→1500 via `calibrate.optimize`
    (Adam + cosine decay) over a short window. **`TWIN_RECOVER_OK`** (within ~2% of 1500, misfit ≪ initial).
@@ -424,7 +424,7 @@ scalar — scalar is cheaper, use it for scalar calibration). Adjoint↔EKI agre
 = `-A ab0995_gpu -p gpu --gres=gpu:a100_80:1`, `XLA_PYTHON_CLIENT_PREALLOCATE=false`, `MEM_FRACTION=0.95`,
 and **`XLA_FLAGS=--xla_gpu_enable_command_buffer=`** + reuse one jitted forward (the C1 OOM lesson). Cheap
 CPU jobs `-p compute --time=30:00`; large files on `/work`. IC per-oracle (`data/ic_core2`). Suite:
-`sbatch scripts/run_suite.sbatch` (the sharding-group timeout is pre-existing, not a regression).
+`sbatch scripts/runs/run_suite.sbatch` (the sharding-group timeout is pre-existing, not a regression).
 
 **DO NOT ATTEMPT:** §0 B1 (needs the parallel-session all-on climate run); D3's actual Fortran run (external);
 changing a locked decision. **Open question deferred from C1 (for the writeup, non-blocking):** keep Fig 2's
@@ -478,7 +478,7 @@ replay values — **passed**). The sharded path calls the *same* `mixing_tke`, s
 
 ## A7 adjoint-window sweep — DONE ✅ `WINDOW_DERISK_OK`, **N_max = 20 (~0.42 d / ~10 h)**
 
-`scripts/core2_adjoint_window_sweep.{py,sbatch}` + `scripts/fig_window_snr.py` → `scripts/fig_window_snr.png`.
+`scripts/core2_adjoint_window_sweep.{py,sbatch}` + `scripts/paper/fig_window_snr.py` → `scripts/fig_window_snr.png`.
 Measured `d(mean MLD)/d(tke_c_k)` (zstar+TKE, GM/ice off) on a full 80.8 GB A100 (final run, job 25583047):
 
 | N | window | peak GB | d(MLD)/d(c_k) | FD↔AD plateau | verdict |
@@ -497,7 +497,7 @@ window sizing); slow GM→T/S (multi-year) ⇒ **EKI** (`fesom_jax.eki`). Reconc
 37.8 GB-at-N=20 GM figure (TKE+zstar+MLD is heavier: 52 GB at N=20). Two infra fixes en route: the
 40 GB-node OOM (`--gres=gpu:a100_80:1`) and the prealloc/mem-fraction interaction (in the committed sbatch).
 
-## A1 obs staging — `scripts/stage_obs.sh` + `docs/OBS_DATASETS.md`
+## A1 obs staging — `scripts/tools/stage_obs.sh` + `docs/OBS_DATASETS.md`
 
 Login node HAS internet (the conda `CURL_CA_BUNDLE` points at a missing cert → set it to
 `/etc/ssl/certs/ca-bundle.crt`; baked into `stage_obs.sh`). Staged to `/work/ab0995/a270088/port_jax/obs`:
@@ -599,14 +599,14 @@ NOT needed for the machinery or its tests.
 
 ### Then — medium autonomy (GPU queue or internet):
 
-7. **A1 obs staging** (`scripts/stage_obs.sh`, `docs/OBS_DATASETS.md`) — downloads need login-node internet.
+7. **A1 obs staging** (`scripts/tools/stage_obs.sh`, `docs/OBS_DATASETS.md`) — downloads need login-node internet.
    Attempt WOA18/23, EN4.2.x, de Boyer Montégut 2023; locate NSIDC/OSI-SAF on Levante. **If no internet /
    it fails, document and SKIP** — the machinery above doesn't need it.
-8. **A7 adjoint-window de-risking** (`scripts/core2_adjoint_window_sweep.py` + `.sbatch`) — the single most
+8. **A7 adjoint-window de-risking** (`scripts/archive/core2_adjoint_window_sweep.py` + `.sbatch`) — the single most
    scientifically valuable autonomous result: a single-GPU N-sweep (N=4,20,50,100,200,…) measuring CORE2
    backward **peak memory** + **gradient SNR/FD-agreement** of `d(MLD-misfit)/d(c_k)`, to find **N_max** and
    the adjoint↔EKI boundary (this de-risks the WHOLE plan and reconciles the inherited 37.8 GB-at-N=20
-   figure). Model it on `scripts/core2_tke_grad_gate.py` + `scripts/core2_gm_grad_gate.py`. **Submit the
+   figure). Model it on `scripts/archive/core2_tke_grad_gate.py` + `scripts/archive/core2_gm_grad_gate.py`. **Submit the
    sbatch and poll**; if the GPU queue is slow, keep building CPU machinery. Token `WINDOW_DERISK_OK` +
    the gradient-SNR-vs-N supplementary figure.
 
@@ -624,7 +624,7 @@ NOT needed for the machinery or its tests.
   forward-only safe). See `docs/JAX_RAGGED_A2A_BUG.md`.
 - **AD masked-NaN rule:** masked lanes must compute a **finite** value (a forward `where` does NOT stop a
   backward `0·inf`). Applies to `obs_compare`, the MLD diagnostic, and `tke_nn`.
-- **Keep the suite green** after every task: `sbatch scripts/run_suite.sbatch` (CPU; runs in two chunks —
+- **Keep the suite green** after every task: `sbatch scripts/runs/run_suite.sbatch` (CPU; runs in two chunks —
   the full set in one process exceeds login-node RAM). The `params=None`/cfg-off **bit-identical** invariant
   is the regression guard.
 - **House style:** mirror the existing `fesom_jax/tests/test_*.py` and `docs/plans/*.md`; append a

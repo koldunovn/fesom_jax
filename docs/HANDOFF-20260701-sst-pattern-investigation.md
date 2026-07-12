@@ -75,7 +75,7 @@ peak ≈79°W, trough ≈101°E). Longitude profile (20° bins, all lat): monoto
 eastern-boundary-upwelling / western-boundary-current signals, but the **global k=1** (R²=0.88) says
 the organizing variable is **longitude/coordinate**, and the upwelling zones just sit near the crest.
 
-Reproduce: `port_jax/scripts/diag_sst_pattern.py` (regional/equatorial breakdown) and
+Reproduce: `port_jax/scripts/debug/diag_sst_pattern.py` (regional/equatorial breakdown) and
 `diag_sst_rotation.py` (the harmonic fit + hemisphere means) on `paper_jax/data/meanstate.nc`.
 
 ---
@@ -164,8 +164,8 @@ if the k=1 SST/current pattern vanishes or flips phase, the g2r rotation is conf
 - **SST-diff field:** `paper_jax/data/meanstate.nc` — `sst_jaxfor` `[nod2]` (+ `sss_jaxfor`, `lon`, `lat`).
   Attrs `rms_sst_jaxfor=0.0580`. (Regenerate from the salinity-fixed run via
   `paper_jax/scripts/reduce/reduce_meanstate.py`.)
-- **Diagnostics (this session, in-repo):** `port_jax/scripts/diag_sst_pattern.py` (basin/equatorial/
-  upwelling breakdown), `port_jax/scripts/diag_sst_rotation.py` (k=1 harmonic fit, hemisphere means,
+- **Diagnostics (this session, in-repo):** `port_jax/scripts/debug/diag_sst_pattern.py` (basin/equatorial/
+  upwelling breakdown), `port_jax/scripts/debug/diag_sst_rotation.py` (k=1 harmonic fit, hemisphere means,
   longitude profile). Run with the nereus env `/work/ab0995/a270088/mambaforge/envs/nereus/bin/python`.
 - **Raw runs (both output surface u,v for §4.1):**
   - JAX CORE2 hindcast monthly: `/work/ab0995/a270088/port_jax/runs/core2_hindcast/monthly/<YYYY>_<MM>`

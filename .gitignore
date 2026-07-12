@@ -57,3 +57,16 @@ scripts/*.png
 
 # SLURM job stdout — swept out of scripts/ so the folder shows code, not job noise
 scripts/logs/
+
+# --- Local working notes: kept on disk, deliberately NOT published ---
+# Session handoffs, unpublished paper plans/memos and draft figures. These were pushed once by a
+# careless `git add docs/` (a directory add sweeps in UNTRACKED files too) and had to be purged.
+# Never blanket-add a directory; stage files explicitly.
+/docs/memo/
+/docs/previews-*/
+/docs/CORE2_FORTRAN_SPEC.md
+/docs/HANDOFF-*.md
+/docs/plans/20260614-fesom-jax-paper-experiments.md
+/docs/plans/20260618-fesom-jax-longwindow-experiments.md
+/docs/plans/20260619-fesom-jax-model-paper.md
+/docs/plans/20260623-fesom-jax-model-paper-build.md

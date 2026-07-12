@@ -6,7 +6,7 @@ reads the JRA slices off disk and bilinear-interps to the mesh nodes + time-inte
 SSS-restoring / runoff / Sweeney-chl readers work the same way. **Nothing is pre-interpolated to
 disk.** So "staging" a mesh's forcing means only: (1) the SOURCE files resolve (they are
 mesh-independent, native-grid), and (2) the runtime interpolation *setup* initializes for that mesh
-(no pole / dateline / coast out-of-bounds at scale). Verify with `scripts/check_forcing.py MESH_DIR`.
+(no pole / dateline / coast out-of-bounds at scale). Verify with `scripts/debug/check_forcing.py MESH_DIR`.
 
 ## Source files (mesh-independent, native grid — all resolve on Levante)
 
@@ -23,7 +23,7 @@ These are the same inputs that drove the CORE2 5-yr spin-up + 10-yr reference; n
 
 | mesh | raw FESOM mesh (Levante) | JAX-exported? | forcing-init smoke |
 |---|---|---|---|
-| CORE2 | `/pool/.../MESHES_FESOM2.1/core2` | yes (`data/mesh_core2`) | ✅ `NG5_FORCING_OK` (all 10 fields finite; `scripts/check_forcing.py data/mesh_core2`) |
+| CORE2 | `/pool/.../MESHES_FESOM2.1/core2` | yes (`data/mesh_core2`) | ✅ `NG5_FORCING_OK` (all 10 fields finite; `scripts/debug/check_forcing.py data/mesh_core2`) |
 | farc | `/pool/.../MESHES_FESOM2.1/farc` | ⏳ needs export (B0) | run `check_forcing.py` after export |
 | dars | `/pool/.../MESHES_FESOM2.1/dars` | ⏳ needs export (B0) | run `check_forcing.py` after export |
 | NG5 | `/pool/.../MESHES_FESOM2.1/ng5` | ⏳ needs export (B0) | run `check_forcing.py` after export |
@@ -37,7 +37,7 @@ mesh-agnostic — `check_forcing.py` confirms the bilinear-weight setup + a fini
 
 ## What was verified (CORE2)
 
-`scripts/check_forcing.py data/mesh_core2` (126 858 nodes): all 10 `StepForcing` fields finite with
+`scripts/debug/check_forcing.py data/mesh_core2` (126 858 nodes): all 10 `StepForcing` fields finite with
 physical ranges — Tair −42…+31 °C, shortwave 0…1122 W/m², shum 2e-5…0.023, SSS 3.8…39.3, chl
 6.4e-5…14.5 — ⇒ `NG5_FORCING_OK`. The runtime interpolation + the bulk inputs are sound; farc/dars/NG5
 re-run the same one-line check after the mesh export.

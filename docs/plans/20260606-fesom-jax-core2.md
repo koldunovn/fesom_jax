@@ -376,7 +376,7 @@ SLURM dump job. Create `tests/test_step_core2.py`; `docs/REFERENCE_RUNS.md` (COR
 > pressure ~5e5 match ~1e-11 *relative*); element fields gated at the dump's incident-element
 > gids; `test_evolution_steps23` extended with uv/d_eta (steps 2-3 ~1e-6, the discrete CG
 > iter-count + FCT amplifying the step-1 ~1e-15). **(2) Stability run**
-> (`scripts/core2_stability_run.py` + `core2_stability_gpu.sh`, A100, jitted ~0.06 s/step):
+> (`scripts/archive/core2_stability_run.py` + `core2_stability_gpu.sh`, A100, jitted ~0.06 s/step):
 > **numerically stable days 1–7** (no NaN; max|vel| ≤ 1.9 < 3; |SSH| ≤ 2.8 < 5; Aleutian
 > 94122 calm). **(3) C arbiter** (`jobs/jax_core2_stability.sh`, matched config + per-step
 > monitor): the C is stable + JAX **tracks it to 3 sig figs** on SST_min/max|uv|/max|eta|
@@ -409,7 +409,7 @@ SLURM dump job. Create `tests/test_step_core2.py`; `docs/REFERENCE_RUNS.md` (COR
 ### Task 5.8: GATE 5 — gradient check on a CORE2 slice
 
 **Files:** Create `fesom_jax/tests/test_gradient_core2.py`; extend `tests/test_forcing.py`
-(bulk-feedback AD↔FD); create `scripts/core2_grad_gate.py` + `.sbatch` (GPU).
+(bulk-feedback AD↔FD); create `scripts/archive/core2_grad_gate.py` + `.sbatch` (GPU).
 
 > **✅ DONE 2026-06-06 — GATE 5 met; Phase 5 COMPLETE.** Suite **376** (371 + bulk-feedback
 > ×2 + `test_gradient_core2` ×3). **KEY FINDING (reframed the gate):** the multi-step
@@ -442,7 +442,7 @@ SLURM dump job. Create `tests/test_step_core2.py`; `docs/REFERENCE_RUNS.md` (COR
   the ζ_u≈0 / u10=33 / Δu=0 kinks.
 - [x] **Memory:** the checkpointed N=20 CORE2 backward peaks **37.8 GB** on the A100 (59% of the
   80 GB card; the A100-40 needs a shorter window or O(√N) nesting). GPU sbatch
-  `scripts/core2_grad_gate.sbatch`.
+  `scripts/archive/core2_grad_gate.sbatch`.
 - [x] run — full suite green (**376**: pi 313 + CORE2 additions). **Lesson:** appended (4:
   the non-smooth-forced-trajectory finding, the `d_eta⊥a_ver` / residual-CG-check, the
   bulk-seam smooth-subset FD, the N=20 backward memory).
@@ -641,7 +641,7 @@ seam).**
   pressure ~5e5 match ~1e-11 relative); element fields compared at the dump's incident-element
   gids (`_emaxabs`); `test_evolution_steps23` extended with uv/d_eta (steps 2-3 ~1e-6 — the
   discrete CG iter-count + FCT amplify the step-1 ~1e-15). Suite **371** (was 370). **(B) CORE2
-  stability run** (`scripts/core2_stability_run.py` + `core2_stability_gpu.sh`, A100 jitted
+  stability run** (`scripts/archive/core2_stability_run.py` + `core2_stability_gpu.sh`, A100 jitted
   ~0.06 s/step; eager ~32, CPU ~3): **numerically stable days 1–7** (no NaN; max|vel| ≤ 1.9
   < 3; |SSH| ≤ 2.8 < 5; Aleutian 94122 calm/warm). **(C) Matched C arbiter**
   (`jobs/jax_core2_stability.sh`, same config + `FESOM_PRINT_EVERY` monitor): stable, and JAX
@@ -656,7 +656,7 @@ seam).**
   `main`. Next: **Task 5.8 (GATE 5 — gradient on a CORE2 slice)**.
 - **2026-06-06 — Task 5.8 DONE (GATE 5 — gradient on a CORE2 slice). PHASE 5 COMPLETE.**
   Suite **376** (371 + bulk-feedback AD↔FD ×2 in `test_forcing.py` + `test_gradient_core2.py`
-  ×3). New `scripts/core2_grad_gate.py` + `.sbatch` (GPU GATE-5 confirmation, job 25394380 =
+  ×3). New `scripts/archive/core2_grad_gate.py` + `.sbatch` (GPU GATE-5 confirmation, job 25394380 =
   `GRAD_GATE_OK`). **KEY FINDING that reframed the gate:** the multi-step *forced* CORE2
   trajectory is genuinely NON-smooth in the physics params (the FCT Zalesak limiter + the
   convective adjustment are **active** under real forcing — pi's smooth blob keeps them

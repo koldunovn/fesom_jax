@@ -112,7 +112,7 @@ watch node 94122**) + their 7 incident-element gids `{307,747,25954,61526,99096,
 **(2) Stability arbiter run** (no dump — the per-step monitor only), regen via
 `port2/fesom2_port/jobs/jax_core2_stability.sh` (same config + `FESOM_PRINT_EVERY=36`; give it
 a non-debug QOS — single-rank C is ~4.6 s/step). The C prints per-step max|uv|/max|eta|/T-range/
-fluxes. **Used to cross-validate the JAX multi-day trajectory:** `scripts/core2_stability_run.py`
+fluxes. **Used to cross-validate the JAX multi-day trajectory:** `scripts/archive/core2_stability_run.py`
 (JITTED, A100 ~0.06 s/step; `core2_stability_gpu.sh`) runs the assembled JAX model with the same
 forcing and JAX **tracks the C to ~3 sig figs** on SST_min / max|uv| / max|eta| (step 216:
 −6.60=−6.60, 1.389≈1.39, 2.715≈2.71) — robust global reductions track even though per-element

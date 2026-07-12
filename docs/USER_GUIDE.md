@@ -149,7 +149,7 @@ cadence the gather cost is negligible.
   dumps. The cost is that readers must `ushow_to_nodes`-unfold and the store is partition-shaped.
 
 *(Internals / benchmarks: `docs/PORTING_LESSONS.md`, `fesom_jax/canonical_redist.py`, and
-`scripts/bench_canonical_output.py` / `bench_canonical_mn.py` / `validate_restart_mn.py`.)*
+`scripts/bench/bench_canonical_output.py` / `bench_canonical_mn.py` / `validate_restart_mn.py`.)*
 
 ---
 
@@ -197,7 +197,7 @@ so a multi-year run never pre-stacks its forcing.
 pytest fesom_jax/tests/test_release.py fesom_jax/tests/test_run_config.py \
        fesom_jax/tests/test_stream_output.py fesom_jax/tests/test_run_entry.py
 # full regression on Levante (needs the data symlink; ~1:45):
-sbatch scripts/run_suite.sbatch
+sbatch scripts/runs/run_suite.sbatch
 ```
 
 The standing invariant: `RunConfig.defaults()` / config-off / `params=None` ⇒ **bit-identical** to the

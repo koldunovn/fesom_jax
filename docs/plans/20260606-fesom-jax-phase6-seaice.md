@@ -461,7 +461,7 @@ modify `fesom_jax/sss_runoff.py` (the ice-on flux variant), `fesom_jax/core2_for
 
 ### Task 6.7: GATE 6 — multi-day CORE2 ice-ON stability + gradient re-check
 
-**Files:** Create `scripts/core2_ice_stability_run.py` + `.sh`, `scripts/core2_ice_grad_gate.py`
+**Files:** Create `scripts/archive/core2_ice_stability_run.py` + `.sh`, `scripts/archive/core2_ice_grad_gate.py`
 + `.sbatch` (new, not modifying the Phase-5 ones).
 
 > **✅ DONE 2026-06-06 — GATE 6 MET.** **(1) Multi-day stability** (`core2_ice_stability_run.py`

@@ -542,7 +542,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   couldn't get it below 28 GiB and tried to alloc 48.7 GiB → `RESOURCE_EXHAUSTED`. With
   per-step `jax.checkpoint` it is O(N · `State` carry) ≈ 4.23 GB (13% of the A100-40), compile
   +run 26 s. For *much* longer windows switch to nested/policy checkpointing (O(√N)); per-step
-  remat suffices to N≥200. (`scripts/phase3_grad_memory.py`, GPU job 25378918, Task 3.1.)
+  remat suffices to N≥200. (`scripts/debug/phase3_grad_memory.py`, GPU job 25378918, Task 3.1.)
 
 - **[xla] The host-assembled static scatters (mesh indices baked as constants) trigger XLA
   constant-folding warnings (`scatter-add … taking > 2s`) at compile — benign, ~5 s each.**
@@ -1085,7 +1085,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   **not** trigger — ice stays Phase 6, and a physically realistic SST simply needs
   the ice cap. *Lesson: distinguish numerical stability (bounded vel/SSH/CG, no NaN) from
   thermodynamic realism (SST in range); a no-ice ocean is the former for ~a week and never the
-  latter at high latitudes.* (`scripts/core2_stability_run.py`, Task 5.7.)
+  latter at high latitudes.* (`scripts/archive/core2_stability_run.py`, Task 5.7.)
 
 - **[stability/method] The matched C arbiter run is the decisive truth-teller: JAX tracks the C
   to 3 sig figs on the bulk min/max diagnostics, even though individual elements diverge
@@ -1134,7 +1134,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   max|vel| / max|eta| / Aleutian node) is cheap enough to monitor every step and pinpoint the
   exact destabilization step. The single-rank C reference is much slower (~4.6 s/step) — it is
   an MPI code run on 1 rank — so for the C arbiter cap the run or give it a non-debug QOS.
-  (`scripts/core2_stability_gpu.sh`, Task 5.7.)
+  (`scripts/archive/core2_stability_gpu.sh`, Task 5.7.)
 
 ## Phase 5 — CORE2-slice gradient gate (Task 5.8, GATE 5)
 
@@ -1157,7 +1157,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   adjustment) that a synthetic smooth IC hides — match the FD regime to what is smooth, and
   lean on the (sub)gradient + masked-NaN finiteness for the non-smooth full model. This is the
   long-anticipated "model is mildly chaotic ⇒ test_gradient stays short/smooth" lesson, now
-  shown to be STRONG (not mild) under real forcing.* (`scripts/core2_grad_gate.py` [1]/[4],
+  shown to be STRONG (not mild) under real forcing.* (`scripts/archive/core2_grad_gate.py` [1]/[4],
   job 25394380, Task 5.8.)
 
 - **[ad/observable] ⚠️ To FD-probe a sub-path's gradient the observable must actually DEPEND
@@ -1195,7 +1195,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   *assembled CORE2 model* (the new bulk seams + the eos/tracer_diff/FCT masked-divide guards in
   one backward). ⚠️ A login/CPU node could **not** hold even the N=4 T₀ backward (the process
   was killed) → this is a GPU-only gate; the CPU suite runs the N=1 masked-NaN probe.
-  (`scripts/core2_grad_gate.py` [3], job 25394380, Task 5.8.)
+  (`scripts/archive/core2_grad_gate.py` [3], job 25394380, Task 5.8.)
 
 # Phase 6 — Sea Ice (sub-plan `docs/plans/20260606-fesom-jax-phase6-seaice.md`)
 
@@ -1435,7 +1435,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   findings (supercooling, inert runoff) are now RESOLVED. *Lesson: the no-ice supercooling was
   exactly the PHYSICAL gap the C-port-matched model predicted; porting the ice thermo (not any
   numerical band-aid) is what fixes it — vindicating the "match the C, the limitation is real"
-  call.* (`scripts/core2_ice_stability_run.py`, job 25396309, Task 6.7.)
+  call.* (`scripts/archive/core2_ice_stability_run.py`, job 25396309, Task 6.7.)
 
 - **[ad] The assembled-ice backward is AD-SAFE (masked-NaN clean) but the EVP IC-gradient is
   STIFF (~1e16, finite) via `1/delta_min` — this is fine for the ML use case.** `d(SST)/d(T0)`
@@ -1451,7 +1451,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   needs ice-dynamics gradients, raise `delta_min` for the gradient or `stop_gradient` the EVP.
   *Lesson: a finite-but-huge gradient through a plastic/iterative solver is the solver's
   conditioning, not a NaN bug — gate on finiteness, and confirm the ACTUAL trainable path (the
-  mixing seam) is well-conditioned separately.* (`scripts/core2_ice_grad_gate.py` [1]/[3],
+  mixing seam) is well-conditioned separately.* (`scripts/archive/core2_ice_grad_gate.py` [1]/[3],
   job 25396293, Task 6.7.)
 
 - **[memory] Two CORE2-ice GPU memory traps on the A100-40: (a) stacking the per-step forcing,
@@ -1648,7 +1648,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   finite everywhere / 0 on dry / nonzero wet (the backward flows through the GM slopes safe-sqrt,
   the streamfunction TDMA, the Redi scatters). Backward memory at N=4 CORE2 GM-ON = **37 GB / 64 GB**
   (the per-step GM TDMA + Redi scatters add to the backward; the A100-80 is comfortable, the -40
-  would be tight at N=4). (`scripts/core2_gm_grad_gate.py`, job 25402381, G.7.)
+  would be tight at N=4). (`scripts/archive/core2_gm_grad_gate.py`, job 25402381, G.7.)
 
 - **[gm/physics] ✅ GM does PHYSICAL WORK — it smooths fronts: 10-day front |∇T| 7.42e-6 (GM-ON) vs
   7.89e-6 (GM-OFF), a ~6% reduction that GROWS monotonically (d1 6.72/6.82 → d10 7.42/7.89).** The
@@ -1659,7 +1659,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   purely on T/S. GPU steady-state is ~0.09 s/step (the 8-9 s I saw at s1/s2 was compile + the first
   device_get sync), so the full 1728-step (10-day) run finishes in ~4 min. *Lesson: verify a
   parameterization is doing work with a matched ON/OFF run on a physical diagnostic (front
-  sharpness), not just "it ran stably".* (`scripts/core2_gm_stability_run.py`, jobs 25402379/80, G.7.)
+  sharpness), not just "it ran stably".* (`scripts/archive/core2_gm_stability_run.py`, jobs 25402379/80, G.7.)
 
 ## Phase 6C — KPP (planning + research; the pivot to finish the full model)
 
@@ -2277,7 +2277,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   robustly device-deterministic, and `d_eta` matches to MACHINE PRECISION.** The `ssh.py` docstring's
   "≈3 iters, cond≈800" is **pi**; the real CORE2 operator (dt=1800, nod2D=126858) is far stiffer and the
   loose `soltol=1e-5` stop lands deep in the trajectory. Captured the residual-vs-threshold margin on the
-  REAL KPP+GM+ice rhs (`scripts/capture_core2_ssh_rhs.py`): consecutive residuals near the stop cross the
+  REAL KPP+GM+ice rhs (`scripts/debug/capture_core2_ssh_rhs.py`): consecutive residuals near the stop cross the
   threshold by only a factor **~1.09** (tightest margin: the last *above* iterate sits 0.93 % above `rtol`)
   — but that is **~10 orders of magnitude** above the ~1e-15 `psum` reassociation, so the count CANNOT
   drift. Verified N==1 iteration count (127/130 on 2 and 4 devices) AND owned `d_eta` agreeing to
@@ -2630,7 +2630,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   decorrelates chaotically (Decision 4), so this gates the scan-backward MECHANISM, not a tight dense match.
 
 - **[🎯S.9 — the model runs CORRECTLY on real A100s; byte-identity is a CPU property, and the EVP stress is
-  a VP-kink diagnostic not a prognostic] The first real-GPU run (`scripts/phase8_s9_gpu.sbatch`, 4×A100)
+  a VP-kink diagnostic not a prognostic] The first real-GPU run (`scripts/debug/phase8_s9_gpu.sbatch`, 4×A100)
   validated the sharded model: every PROGNOSTIC field matched single-device — ocean dynamics at the clean
   floor (uv 1.1e-9, d_eta 2.6e-11, w 2.3e-13, Kv/Av 4e-14…2e-14), FCT tracers T/S climate-close (9.7e-3/
   6.0e-3), prognostic ice u_ice/v_ice/m_ice/a_ice/m_snow 1e-7…6e-9 — and the OCEAN gradient (`jax.grad`-thru-
@@ -2676,7 +2676,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
 
 - **[Phase 8b B.0c — JAX 0.10.1 `lax.ragged_all_to_all` FORWARD is correct but its reverse-mode AUTODIFF
   TRANSPOSE is WRONG (cotangent scales with device count) — wrap in `custom_vjp`]** The B.0 GPU gate
-  (`scripts/phase8b_b0_gpu.sbatch`, 4×A100, job 25438454) found: the halo-only `ragged_all_to_all` exchange
+  (`scripts/debug/phase8b_b0_gpu.sbatch`, 4×A100, job 25438454) found: the halo-only `ragged_all_to_all` exchange
   matches the `all_gather` exchange **byte-identically on the forward** (all 3 kinds, npes 2 & 4 — the maps,
   the `output_offsets = recv_offsets.T` argument semantics, and the NCCL movement are all correct), **but its
   gradient is wrong by an order-unity amount that scales ~linearly with `npes`**: nod/elem/edge grad max|Δ|
@@ -3118,7 +3118,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
 - **[verify/zstar] ⚠️ A pgf `p99.9` tail on the "config-clean" subset was a DEEP IC mismatch, NOT a
   pgf bug — the surface-`relax` proxy is blind to deep T/S.** The `pgf` was bit-faithful on the bulk
   (p50=2e-18, p99=1e-16) but had a ~0.1 % tail (max ~3e-5) at IC-matched (surface-`relax`=floor) shelf-break
-  elements. The full debug ladder (`scripts/jz7_pgf_debug.py`): (1) the cumsum→recurrence geometry change
+  elements. The full debug ladder (`scripts/debug/jz7_pgf_debug.py`): (1) the cumsum→recurrence geometry change
   left it **byte-identical** ⇒ not geometry; (2) **k≤14 are bit-faithful (1e-18), divergence starts at
   exactly k=15** (the deep-PHC grid-coarsening, `helem` 30→40 m) ⇒ not the kernel (same kernel all levels);
   (3) `dz_dx=0` (column-uniform geometry at step 1) ⇒ `∂ₓρ` is purely the IC density's horizontal gradient,
@@ -3148,7 +3148,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `[[zstar-forcing-dump-config-gap]]` (488 brackish surface nodes + deep k≥15 shelf-break T/S) were this
   one mechanism. **Moral:** an order-dependent fill makes the OUTPUT depend on the domain decomposition;
   "which partition produced the oracle?" is part of the config. (`phc_ic.py`,
-  `scripts/rebuild_ic_dist16.py`, `test_phc_ic.py::test_dist16_*`.)
+  `scripts/tools/rebuild_ic_dist16.py`, `test_phc_ic.py::test_dist16_*`.)
 
 - **[phc_ic] The other half of bit-identity was ~1-ulp FP association in the bilinear interp: C groups
   `((v·wx)·wy)` (`fesom_phc.c:215-218`); the numpy port grouped `v·(wx·wy)` — ~27k surface nodes off by
@@ -3178,7 +3178,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
 - **[verify/zstar] ⚠️ CORRECTED (the controlled-replay): the chained 3-step gate's `d_eta`/`hbar`
   diverge to ~mm at step ≥2, but the SSH SOLVE IS BYTE-IDENTICAL on CPU — the divergence is the
   UPSTREAM velocity/ssh_rhs reassociation amplified, NOT a solve/early-stop property.** A controlled
-  replay (`test_jz7_ssh_solve_controlled_replay`, `scripts/jz7_ssh_replay_check.py`) feeds the C's
+  replay (`test_jz7_ssh_solve_controlled_replay`, `scripts/debug/jz7_ssh_replay_check.py`) feeds the C's
   OWN dumped `ssh_rhs`+warm-start+`hbar` (instead of the JAX chained state) into `solve_ssh`:
   step 1 (`x0=0`,`hbar=0`) → max|Δ|=**7.2e-16**, step 2 (`x0=C_d_eta1`,`hbar=C_hbar1`, the **D2
   increment LIVE**) → **9.7e-16** — both at the map/gather floor. So with IDENTICAL inputs the
@@ -3222,7 +3222,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   upwind-flip FCT floor (9.7e-3), ssh_rhs at the cancellation floor — the documented N-vs-1
   non-determinism, NOT a missing exchange. npes=1 collapses to dense byte-identically. **Moral:** to
   N-vs-1-test a config-gated feature whose effect is a step-1 no-op (cold start), seed the state PAST
-  the degeneracy first. (`test_zstar_{serial,assembled}_sharded_*`, `scripts/jz7_shard_zstar.sbatch`,
+  the degeneracy first. (`test_zstar_{serial,assembled}_sharded_*`, `scripts/debug/jz7_shard_zstar.sbatch`,
   Task JZ.7.)
 
 ## Phase 9a — zstar (Task JZ.8 — climate: the IC-partition provenance bites a SECOND oracle)
@@ -3233,7 +3233,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   match the **16-rank** `z2_cdump` (the step gate). But the climate oracle `c_zstar_2yr` was run on
   **864 ranks** (the C plan's Z9, job 25495449) — and the C `extrap_nod3D` GS land fill is
   order-dependent per-rank, so the dist_16 and dist_864 ICs differ by **up to 25.7 PSU at the Baltic
-  fill nodes** (`scripts/rebuild_ic_dist864.py` confirmed: 12258 surface nodes differ, 512 in the
+  fill nodes** (`scripts/tools/rebuild_ic_dist864.py` confirmed: 12258 surface nodes differ, 512 in the
   Baltic). The smoking-gun signature that it's the IC and not the physics: the divergence is (a)
   **largest at month 1, decaying** (a spin-up transient from a different start), (b) **localized to
   the GS-fill nodes** (global p50 SSS = 1.7e-3 = the ref level), (c) **global salt budget conserved**
@@ -3244,7 +3244,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   partition produced THIS oracle?" must be answered PER ORACLE — the dump oracle (z2_cdump=16r) and
   the climate oracle (c_zstar_2yr=864r) were different decompositions, and an order-dependent IC fill
   makes each demand its own matched IC.** (`scripts/rebuild_ic_dist864.{py,sbatch}`,
-  `scripts/core2_zstar_climate_compare.py`, Task JZ.8.)
+  `scripts/archive/core2_zstar_climate_compare.py`, Task JZ.8.)
 
 ## Phase 9b — classical-TKE vertical mixing (Task JT.0 — scaffolding, NO behavior change)
 
@@ -3717,7 +3717,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   noisy gradient. Label the map HONESTLY as the **fast/instantaneous** (single ~10-h window) sensitivity,
   NOT the equilibrium; the **adjoint↔EKI cross-check** (`cov(θ,J)/var(θ)` == adjoint scalar grad for the
   locally-linear `k_gm`) validates both tools and motivates EKI for the slow equilibrium the adjoint
-  can't reach. (`scripts/core2_paper_sensitivity.py`+`.sbatch`, `scripts/fig_sensitivity.py`,
+  can't reach. (`scripts/paper/core2_paper_sensitivity.py`+`.sbatch`, `scripts/paper/fig_sensitivity.py`,
   `fesom_jax/tests/test_sensitivity.py`; **SENSITIVITY_SEAM_OK** (CPU) + **SENSITIVITY_MAP_OK** (GPU).)
 
 - **[sensitivity/C1 GPU memory] The FIELD-leaf backward is heavier than the SCALAR backward → its N_max
@@ -3747,7 +3747,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   Lesson: a per-cell FD check needs the same h-plateau rigor as the scalar gate — never trust one h. Also
   reconfirmed: the GM short-window adjoint signal is **tiny** (6.5e-10 vs MLD/c_k's 2e-2) ⇒ the slow GM→T/S
   equilibrium is beyond the adjoint window — exactly why §2 GM calib uses EKI (the adjoint↔EKI rel-6.6%
-  cross-check ties them). (`scripts/core2_paper_sensitivity.py`; **SENSITIVITY_MAP_OK**.)
+  cross-check ties them). (`scripts/paper/core2_paper_sensitivity.py`; **SENSITIVITY_MAP_OK**.)
 
 - **[AD / sea ice] The all-on (zstar+TKE+mEVP+GM) FORWARD is fine but the naive ADJOINT explodes
   through the mEVP sea-ice rheology — fix with a frozen-ice adjoint (full forward, `stop_gradient`
@@ -3764,7 +3764,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   substitute a stable adjoint for one block — `stop_gradient` (skip) or `custom_vjp` (the planned
   free-drift adjoint = drop ∇·σ, keep wind/ocean/Coriolis/tilt). An approximate adjoint ⇒ FD≠AD by
   construction; validate by descent + EKI cross-check, not a gradient check. (`fesom_jax/ice.py`,
-  `fesom_jax/step.py`, `scripts/core2_paper_calib_twin.py`; **TWIN_RECOVER_OK**.)
+  `fesom_jax/step.py`, `scripts/paper/core2_paper_calib_twin.py`; **TWIN_RECOVER_OK**.)
 
 - **[optimizer] A tiny-signal misfit needs the loss normalized by its initial value, or Adam's `eps`
   swamps the gradient.** The GM short-window misfit is ~1e-6 (the GM→T signal is ~1e-9; C1), so the raw
@@ -3773,7 +3773,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   optimize `loss/J0` (J0 = the misfit at the start; an O(1) loss ⇒ O(1) gradient) on a scale-free leaf
   `u=θ/θ_ref`. A pi convergence probe then sets `lr`/`iters` (lr=0.05/80→2.2%, *missed* the 2% bar;
   lr=0.1/100→<0.1%) — probe the cheap mesh first, the normalized-bowl dynamics are mesh-independent.
-  (`scripts/core2_paper_calib_twin.py`, `fesom_jax/tests/test_calib_twin.py`; **TWIN_RECIPE_OK**.)
+  (`scripts/paper/core2_paper_calib_twin.py`, `fesom_jax/tests/test_calib_twin.py`; **TWIN_RECIPE_OK**.)
 
 - **[calibration / §2] MLD is a strong FAST adjoint target — the TKE→MLD twin recovers in the FULL
   all-on model via the frozen-ice adjoint, far faster than the GM→T twin.** D2a injects `tke_c_k=0.15`,
@@ -3785,7 +3785,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   signal is optimizer-grade, and (b) the frozen-ice adjoint generalizes to a 2nd parameter/target. MLD is
   the right OMIP metric for TKE calibration (fast ⇒ adjoint, not EKI). No CPU twin: TKE raises on the pi
   `integrate` path (`mixing_tke` is the faithful site) — the recipe is guarded by the D1 `test_calib_twin`.
-  (`scripts/core2_paper_calib_tke.py`; **TKE_TWIN_OK**.)
+  (`scripts/paper/core2_paper_calib_tke.py`; **TKE_TWIN_OK**.)
 
 - **[obs] A density-threshold MLD must be computed PER MONTH then averaged — never from the
   annual-mean WOA profile (Jensen's inequality).** dBM is IFREMER-blocked, so we derive the MLD
@@ -3796,7 +3796,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   cycle, max 319 m. (Still under-represents sporadic deep convection vs dBM's individual profiles —
   ice-masked out anyway.) Also: WOA SST is NaN on land ⇒ the obs misfit needs `where(isfinite & ok, x,
   0)` or `0·NaN=NaN` poisons the weighted sum even at weight 0 (the masked-NaN rule, obs side).
-  (`scripts/make_woa_targets.py`.)
+  (`scripts/tools/make_woa_targets.py`.)
 
 - **[AD / JAX] A `RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN` OOM at iteration 2 of an optimizer
   loop is a WEAK-TYPE RECOMPILE, not a memory limit.** D2a-obs (TKE→WOA MLD+SST) died at it=2 with this
@@ -3811,12 +3811,12 @@ Cite the C source (`file:line`) or dump probe that proves it.
   counter. Then the obs calib runs all-on (job 25601631, 32 it, 52.6 GB; MLD misfit −8.3%, SST −4.8%).
   ⚠️ The 2-param `{c_k,c_eps}` fit overfits — `c_eps`→0 (unphysical) — the structural-bias compensation
   the recovered-value plausibility report catches; use `--params ck` or bound `c_eps`.
-  (`scripts/core2_paper_calib_tke_obs.py`.)
+  (`scripts/paper/core2_paper_calib_tke_obs.py`.)
 
 - **[Calibration / EKI] The slow-target GM→T/S calibration uses gradient-free EKI on the FULL all-on
   model with LIVE mEVP ice — forward-only ⇒ immune to the A8 sea-ice-rheology adjoint instability** (no
   frozen-ice approximation the adjoint twins D1/D2a needed; the whole point of the adjoint↔EKI split). D2b's
-  perfect-model EKI twin (`scripts/core2_paper_calib_gm_eki.py --mode twin`) recovered a planted `k_gm=1500`
+  perfect-model EKI twin (`scripts/paper/core2_paper_calib_gm_eki.py --mode twin`) recovered a planted `k_gm=1500`
   to **0.034 %** (1500.51; ensemble 1500.5±0.5) in **5 EKI iters** at a **5-day** window (10 members; the 2-day/
   6-member de-risk gave 0.065 %), misfit 1.4e-5→4.2e-11, peak **24 GB** (forward-only is light — no tape).
   Observable = basin-mean upper-ocean/thermocline T/S
@@ -3835,7 +3835,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   equilibrium GM→stratification calibration needs the multi-year production ensemble — short-window adjoint OR
   short-window EKI both under-constrain it). The recovered-value-with-uncertainty report (±347) is the rigor catch,
   the D2a `c_eps`→0 analogue: report VALUES + plausibility, never just "misfit reduced".
-  (`scripts/core2_paper_calib_gm_eki.py`, `fesom_jax/obs_compare.basin_mean_profiles`, `fesom_jax/eki.py`.)
+  (`scripts/paper/core2_paper_calib_gm_eki.py`, `fesom_jax/obs_compare.basin_mean_profiles`, `fesom_jax/eki.py`.)
 
 - **[AD / JAX / perf] A jit that closes over the pre-stacked CORE2 forcing makes XLA constant-fold the
   `to_obs` node→cell scatter over the mesh constants — a slow ONE-TIME compile** (D2b: a single
@@ -3849,7 +3849,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   **~4.3 steps/s on an A100-80** (forward-only, mEVP live, peak 18 GB) ⇒ a few-year × 16-member × 8-iter
   production EKI is hundreds of GPU-h — a production run, NOT overnight; the overnight EKI is a scoped
   demonstration + the GPU-h projection (`--mode budget`, the EKI analogue of A7's adjoint-window de-risking).
-  (`scripts/core2_paper_calib_gm_eki.py`.)
+  (`scripts/paper/core2_paper_calib_gm_eki.py`.)
 
 - **[calibration / rigor] Held-out CV answers TWO different questions for a global scalar — pick the split to
   match the question.** Validating the TKE `c_k`→WOA-MLD calibration on independent cells: a **random** 50/50
@@ -3867,7 +3867,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   path. **(2)** A short-window calibration only moves what the window constrains: MLD ΔRMSE is real but **SST
   ΔRMSE (~0.003 °C) sits UNDER the C↔Fortran 0.0049 °C floor** — honestly, MLD is the constrained channel, not
   SST (and the EN4 interannual-spread bar needs the multi-year series, not the staged seasonal climatology).
-  (`scripts/core2_paper_calib_tke_obs.py` `--holdout`/`build_holdout`, `scripts/fig_calibration.py`.)
+  (`scripts/paper/core2_paper_calib_tke_obs.py` `--holdout`/`build_holdout`, `scripts/paper/fig_calibration.py`.)
 
 - **[§3 hybrid-ML / AD memory] The CORE2 NN-of-TKE backward is RUNTIME-peak-bound, not compile-temp-bound
   — `memory_analysis()` underpredicts by ~2.4×, and a SECOND large jitted program is what actually OOMs.**
@@ -3896,7 +3896,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   Build a compile-only `memory_analysis()` probe to size forward-vs-backward and validate a remat fix BEFORE a
   full GPU run — but trust RUNTIME OOM (the BFC `bfc_allocator.cc` "ran out trying to allocate" line + the
   region-growth attempts) for the true ceiling, not the compile-temp. (`fesom_jax/step.py` `remat_blocks`/`_ckpt`,
-  `fesom_jax/integrate.py`, `scripts/core2_paper_nn_twin.py`, `scripts/core2_nn_twin_memprobe.py`.)
+  `fesom_jax/integrate.py`, `scripts/paper/core2_paper_nn_twin.py`, `scripts/archive/core2_nn_twin_memprobe.py`.)
 
 - **[§3 hybrid-ML / identifiability] The per-column NN mixing FIELD is NOT recoverable from short-window
   T/S evolution — equifinality — and batching DIVERSE short windows does NOT fix it; only a CONTINUOUS
@@ -3973,11 +3973,11 @@ Cite the C source (`file:line`) or dump probe that proves it.
   multiplier field, tol 0.8) + `corr_pw` (perturbation-weighted) reported; `corr_active` kept as a DIAGNOSTIC,
   not gated. Canonical §3 sharded twin = amp=2.0 N=4 ⇒ evolution recovered + bulk field recovered (corr_all
   ~0.88) = `NN_TWIN_SHARDED_OK`. (`fesom_jax/cvmix_tke.py`, `fesom_jax/integrate_sharded.py`,
-  `scripts/core2_paper_nn_twin_sharded.py`, `scripts/verify_sharded_tke_grad.py`,
-  `scripts/repro_sharded_grad_nan.py`.)
+  `scripts/paper/core2_paper_nn_twin_sharded.py`, `scripts/debug/verify_sharded_tke_grad.py`,
+  `scripts/debug/repro_sharded_grad_nan.py`.)
 - **[§3 hybrid-ML / obs training / offline-online gap] An NN mixing closure trains end-to-end through the
   global adjoint to reduce REAL held-out obs misfit — but the short-window optimum does NOT deploy, and the
-  fix for the *instability* does not fix the *misalignment*.** E2 (`scripts/core2_paper_nn_obs.py`, all3
+  fix for the *instability* does not fix the *misalignment*.** E2 (`scripts/paper/core2_paper_nn_obs.py`, all3
   frozen-ice adjoint) trains `tke_nn` over the 12 monthly snapshots (batched SEASONAL short windows, N=12,
   gradient accumulated) to reduce MLD/SST-vs-WOA through the D2a obs operator. It WORKS as an obs reducer:
   held-out MLD **−2.1%** = train −2.1% (the D2c clean no-overfit bar), bounded multiplier ⇒ PD diffusivities,
@@ -4003,7 +4003,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   necessary but NOT sufficient for a deployable closure; reporting it alone (as offline ML-closure papers
   do) hides the online failure. The structure-preserving bounded multiplier + trust-region reg are what buy
   *stability*; *persisted benefit* needs the slow-target tool. (`scripts/core2_paper_nn_obs.{py,sbatch}`,
-  `scripts/core2_paper_nn_obs_diag.sbatch`, `scripts/fig_hybridml.py`.)
+  `scripts/paper/core2_paper_nn_obs_diag.sbatch`, `scripts/paper/fig_hybridml.py`.)
 
 ## Long-window experiments (PART A) — `docs/plans/20260618-fesom-jax-longwindow-experiments.md`
 
@@ -4074,7 +4074,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   [[multigpu-sharded-adjoint-horizon]]) — **freezing the mEVP rheology adjoint is what buys the usable window**.
   The §3 "wrong sign" ([[e2-nn-obs-offline-online]]) was the deployed-NN-over-90-d problem, NOT this window-
   mean adjoint sensitivity (correctly signed even at 6 h). (`scripts/core2_lw_signflip.{py,sbatch}`,
-  `scripts/fig_signflip.py`.)
+  `scripts/paper/fig_signflip.py`.)
 
 - **Task A2 — 5-yr spin-up: a "blow-up" that was a PHYSICAL current vs a too-tight cap (`SPINUP_5YR_OK`).**
   The 5-yr all-on spin-up tripped the run's `max|vel|≥3.0` stability abort at year ~4.6. **Lesson: localize
@@ -4087,7 +4087,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   **peaks ~3 and SUBSIDES** (worst |vel|=2.96 over the next 175 d, did NOT climb to 5.0) ⇒ physical, base
   recoverable. The completed base equilibrated: upper-ocean 0-700 m T drift yr3→4 0.018 °C yr⁻¹ (falling).
   Also added `--start-month/--start-day` to the driver for mid-year `--load-state` restarts (the probe needed
-  the July forcing; ±1-day forcing offset is negligible for a developed base). (`scripts/core2_lw_spinup_finish.sbatch`.)
+  the July forcing; ±1-day forcing offset is negligible for a developed base). (`scripts/paper/core2_lw_spinup_finish.sbatch`.)
 
 - **Task D1 — probing-design findings (multi-target + window choice + robust ensemble).** The 10-yr reference
   is target-agnostic: `core2_lw_avgadj.py --target {mld_ck, t100_kgm}` gives d(any climate diagnostic)/d(any
@@ -4116,7 +4116,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   target ambiguous. **Sizing gotcha:** the frozen-ice adjoint burst is ~60 s steady-state at N=48 (1 d) after a
   ~200 s first-burst JIT compile (~32 s at N=24) ⇒ K=200 ≈ 3.4 h **per target**. The two-target `for`-loop in
   one 3.5-h sbatch would time-cut the second target — **split into independent single-target jobs** (matches the
-  "parallelism = many INDEPENDENT burst jobs" design) with a 5-h wall each. (`scripts/core2_lw_ref_check.py`.)
+  "parallelism = many INDEPENDENT burst jobs" design) with a 5-h wall each. (`scripts/paper/core2_lw_ref_check.py`.)
 
 - **Task D1 — the adjoint↔TLM `--mode` switch (forward-mode mirror) + a free transpose validation.** The
   ensemble-averaged-sensitivity harness is **direction-agnostic**: both modes seed the SAME reference snapshots,
@@ -4136,7 +4136,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   sliver of the GLOBAL-mean sensitivity) — large local TLM values with a moderate +1.5 global mean is correct,
   not a blow-up. The chaotic `N_blow` horizon + the need for ensemble-averaging apply to BOTH (TLM and adjoint
   share the linearization's singular values) — forward vs reverse changes only WHICH dimension is cheap.
-  (`scripts/core2_lw_avgadj.py --mode`, validation smoke job 25762879.)
+  (`scripts/paper/core2_lw_avgadj.py --mode`, validation smoke job 25762879.)
 
 - **Task D1 — the production climate-sensitivity RESULTS + the K=200 transpose nuance (per-burst exact,
   ensemble-mean noisy).** The Part-D payoff on the 10-yr reference (K=200, N=48, ~18-d cadence, MAD-filtered;
@@ -4154,7 +4154,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   mode (sharp, tail-dominated) one, validate the transpose on MATCHED SEEDS per-burst and compare ensemble
   MEDIANS — don't expect the heavy-tailed mean to land on the smooth one. The TLM filter still dropped 56/200
   (same June/Dec amplifiers) and kept-mean≈median, so it IS well-behaved — just intrinsically noisier per the
-  physics, not a bug. **Plotting (`scripts/fig_avgadj.py`):** one script renders any `lw_avgadj_*_map.npz`
+  physics, not a bug. **Plotting (`scripts/paper/fig_avgadj.py`):** one script renders any `lw_avgadj_*_map.npz`
   (map panel + across-burst convergence panel); the heavy-tailed TLM map needs a **signed-log (`SymLogNorm`)**
   colour (`--symlog auto` ⇒ on for tlm, off for adjoint) or the few extreme nodes wash out the broad
   fingerprint — adjoint maps stay linear (99th-pct symmetric clip). Figures: `fig_avgadj_climate.png` (both
@@ -4244,7 +4244,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   bilinear weights ONCE at setup (`sbc_ini`), then `.step()` reads disk + bilinear-interp + time-interp every
   step; SSS/runoff/chl readers too. **Nothing is pre-interpolated/pre-staged.** So A5 is NOT data prep — it is
   verifying the runtime setup initializes for a mesh (the only mesh-dependent step) + that the SOURCE files
-  resolve (all do: JRA55 + PHC2_salx + CORE2_runoff + Sweeney chl on `/pool`). `scripts/check_forcing.py MESH_DIR`
+  resolve (all do: JRA55 + PHC2_salx + CORE2_runoff + Sweeney chl on `/pool`). `scripts/debug/check_forcing.py MESH_DIR`
   builds the readers + does a 1-step finite-flux smoke; CORE2 (126 858 nodes) → all 10 fields finite, physical
   ranges. **The one per-mesh step is the JAX mesh EXPORT** (`load_mesh` needs the exported layout, not the raw
   FESOM `nod2d.out`); farc/dars/NG5 raw meshes are on `/pool/.../MESHES_FESOM2.1` but need the export (B0) before
@@ -4326,7 +4326,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   function works on a dense single-device State (the unit test) and a multi-process folded one. **Padding/dry
   lanes are 0 ⇒ finite ⇒ never a false NaN, and 0 never inflates a max**, so the blow-up detectors are mask-free;
   the masked min-layer-thickness>0 check (zstar stability, needs the layer mask) lives in the OFFLINE
-  `scripts/ng5_ladder_check.py`, which streams a saved restart one global field at a time. **A second lesson
+  `scripts/debug/ng5_ladder_check.py`, which streams a saved restart one global field at a time. **A second lesson
   from the in-job multichunk test**: splitting a run into fine forcing-chunks (the A4/A6 NG5-memory contract)
   is NOT bit-identical to one big scan — the chunk-BOUNDARY step is a direct bootstrap-`one()` call instead of a
   scan iteration, so XLA reassociates it at the **same ~5.7e-8 float64 floor as the restart seam** (the seam's
@@ -4348,7 +4348,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   progress=)`: per-setup-phase laps + per-chunk `host=`/`device=` split via a `block_until_ready`, gated off by
   default ⇒ suite/bit-identity untouched). **(c) The measured bottleneck.** With flushing: setup 3.5 min (cheap,
   NOT the suspect), steady per 48-step chunk **host 110 s + device 102 s, serial** ⇒ R0 ~112 min (the 90-min
-  timeout). A **CPU compute-node profiler** (`scripts/prof_ng5_forcing.py`, pure numpy ⇒ no GPUs) split the host:
+  timeout). A **CPU compute-node profiler** (`scripts/bench/prof_ng5_forcing.py`, pure numpy ⇒ no GPUs) split the host:
   **84 % is `cf.stack` = the JRA interp at 4 s/step over all 7.4 M nodes, run REDUNDANTLY on every one of the 16
   nodes** (each owns ~472 k). **The fix (`fesom_jax/forcing_local.py`):** interpolate ONLY this process's local-
   partition nodes (a fresh reader on a `_SubMesh` of those nodes — independent state, dodging the JRA `_Field`
@@ -4512,7 +4512,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
 - **[model-paper / the CORE2 hindcast's "520 ms/step" was a DRIVER recompile bug, not model cost; and the
   multi-GPU forced path is non-deterministic] (`PERCHUNK_RECOMPILE_5X` + `MULTIGPU_FORCED_NONDETERMINISM`) The
   CORE2 1958–2020 hindcast smoke ran at 520–562 ms/step, ~6× an unrelated forward bench. Decomposition
-  (`scripts/core2_perf_decomp.py` — the PRODUCTION kernel with one physics slot toggled off at a time) showed the
+  (`scripts/bench/core2_perf_decomp.py` — the PRODUCTION kernel with one physics slot toggled off at a time) showed the
   all-on step is only **96 ms** (bare 58.6 = the 58 ms bench base + ice 18 + GM 10 + zstar 6 + TKE 3 — every
   component cheap and linear). The 5.4× was **100 % XLA RECOMPILATION**: `run.py`'s chunk loop calls
   `run_steps_sharded_forced` per chunk, which builds `jax.jit(jax.shard_map(body))` with a FRESH `body` closure
@@ -4539,7 +4539,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (a) periodic-blocking instead of per-chunk `block_until_ready` — no effect (the forcing is on the device's
   critical path; the step CONSUMES it); (b) prefetch next chunk's forcing while the device runs — slightly WORSE
   (the sharded `partition_step_forcing` device_put queues on the compute stream and backpressures). Reverted both.
-  Measurement (`scripts/core2_forcing_measure.py`): `forcing.stack` (JRA bilinear interp, host) = **1091 ms (75 %)**,
+  Measurement (`scripts/bench/core2_forcing_measure.py`): `forcing.stack` (JRA bilinear interp, host) = **1091 ms (75 %)**,
   `partition_step_forcing` (scatter + device_put) = 367 ms (25 %), per 48-step chunk. The multi-CORE plan (split
   nodes across threads via the `LocalForcing` sub-mesh machinery) hit a WALL: **netCDF4/HDF5 is NOT thread-safe**
   — concurrent `read_slice` across sub-readers corrupts (IndexError in the HDF5 read) even with independent file

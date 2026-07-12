@@ -191,7 +191,7 @@ Hazard inventory from the C digest, each with its JAX treatment:
 ## Development Approach (standing rules)
 
 - Oracle-first house style: every task lands its dump-gate **tests with the kernel**; the full suite
-  (`scripts/run_suite.sbatch`, CPU; ~483 tests + new) must be green before the next task. `ale_cfg=None`
+  (`scripts/runs/run_suite.sbatch`, CPU; ~483 tests + new) must be green before the next task. `ale_cfg=None`
   bit-identity is asserted by the existing suite at every task boundary.
 - **STANDING RULE:** append one entry per task to `docs/PORTING_LESSONS.md` as you go, citing the C
   `file:line` or dump probe that proves it.
@@ -376,7 +376,7 @@ the new — the C dual-geometry, no rename needed).
 new exchange row needs asserting). Create: `scripts/` gate job if needed.
 
 - [~] assembled eager zstar run vs the dump tags. **STEP-1 DONE (2026-06-12, job 25535718,
-      `test_jz7_assembled_zstar_step1` + `scripts/jz7_assembled_gate.sbatch`):** the FULL 4-config
+      `test_jz7_assembled_zstar_step1` + `scripts/debug/jz7_assembled_gate.sbatch`):** the FULL 4-config
       model — **KPP + GM/Redi + EVP ice + zstar, the z2_cdump config — assembles and runs FINITE the
       first time all four knobs run together** (the key integration milestone).
       **IC MISMATCH ROOT-CAUSED & FIXED (2026-06-12, job 25537808): FULL-MESH BIT-IDENTITY.** The former
@@ -384,7 +384,7 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       `extrap_nod3D` GS land fill is order-dependent and runs PER-RANK (local order, halo frozen between
       exchanges, surface-only outer-loop continuation) ⇒ **the C IC is partition-dependent** (C 1r vs 16r
       dumps differ by up to 25.8 PSU at fill nodes). Fix: `phc_ic._extrap_nod3D_mpi` (dist_16-faithful,
-      rank lists from the dump gid columns; `scripts/rebuild_ic_dist16.py`) + the bilinear association fix
+      rank lists from the dump gid columns; `scripts/tools/rebuild_ic_dist16.py`) + the bilinear association fix
       (`((v·wx)·wy)` like C — was ~1 ulp off at ~27k nodes). Rebuilt-IC surface = C 16r postload dump
       **EXACTLY (0 diffs, all 126858 nodes)**; standalone density→pgf max|Δ|=**2.7e-20**. Step-1 gates
       now FULL-mesh: config-clean = 126858/126858; `pgf_x/y` max=**4.4e-16/5.6e-16** (gate p99<1e-15,
@@ -398,7 +398,7 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       1-rank runs — one IC can't serve both partitions): `data/ic_core2` = serial (legacy gates),
       `data/ic_core2_dist16` = dist_16 (all z2_cdump-gated zstar tests point here).
       **MULTI-STEP DONE (steps 1-3, 2026-06-12, job 25550843, `test_jz7_assembled_zstar_steps123` +
-      `scripts/jz7_multistep_gate.sbatch`):** the assembled model chained 3 steps vs the z2_cdump
+      `scripts/debug/jz7_multistep_gate.sbatch`):** the assembled model chained 3 steps vs the z2_cdump
       3-step set — the REAL validation of the JZ.6 live-geometry re-points (live≠static at steps ≥2).
       **pgf stays bit-faithful on genuinely-live geometry** (s2/s3 p50≈4e-9, p99≈3.7e-7, max≈4.5e-6 vs
       step-1 4e-16) — since pgf reads BOTH density (T/S) AND live `Z_3d_n`, this certifies the geometry
@@ -416,7 +416,7 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       the eager 3-step chain runs clean (both is_first_step branches compile).
 - [x] sharded N-vs-1 (CPU fake devices) with `ale_cfg` ON — **DONE (2026-06-12, job 25551060,
       `test_zstar_serial_sharded_step_matches_dense` (npes=1 byte-id) + `test_zstar_assembled_
-      sharded_owned_matches` (npes=2 owned) + `scripts/jz7_shard_zstar.sbatch`).** A WARM hbar seed
+      sharded_owned_matches` (npes=2 owned) + `scripts/debug/jz7_shard_zstar.sbatch`).** A WARM hbar seed
       (`_warm_zstar_state`, ~0.5 m bump ⇒ stretched hnode) makes the live geometry genuinely active
       (cold-start would be a no-op). npes=1: the full 4-config (KPP+GM+ice+zstar) collapses to dense
       BYTE-identically. npes=2 owned-match: every new zstar State field at the CLEAN reassociation
@@ -451,10 +451,10 @@ new exchange row needs asserting). Create: `scripts/` gate job if needed.
       0.12 — a 41× SSS reduction), i.e. AT the C↔Fortran port-fidelity (C₀ = 3.74e-3/1.52e-3; SST even
       slightly closer). **B/A = 5.7× SST, 7.4× SSS — inside the C's measured 3–9× coordinate
       contrast** ⇒ the JAX reproduces the C zstar climate, not a linfs-ward drift. Methodology sound
-      (C₀ reproduces the plan-§0 ref 0.0038/0.0014 exactly). (`scripts/core2_zstar_climate_compare.py`,
-      `scripts/rebuild_ic_dist864.*`, `scripts/core2_zstar_climate_dist864.sbatch`.)
+      (C₀ reproduces the plan-§0 ref 0.0038/0.0014 exactly). (`scripts/archive/core2_zstar_climate_compare.py`,
+      `scripts/rebuild_ic_dist864.*`, `scripts/archive/core2_zstar_climate_dist864.sbatch`.)
 - [x] gradient gates per §4 — **DONE (2026-06-12, job 25551862, `test_jz8_grad_*_zstar` (3) +
-      `scripts/jz8_grad_gate.sbatch`).** All N=1 backward through the assembled zstar step on a
+      `scripts/debug/jz8_grad_gate.sbatch`).** All N=1 backward through the assembled zstar step on a
       compute node (no ice scan ⇒ CPU-feasible): **masked-NaN** `d(SST)/d(T₀)` through KPP+GM+zstar
       finite EVERYWHERE + nonzero on wet + EXACTLY 0 on masked lanes (the live-geometry ÷thickness
       guards + shchepetkin safe denominators + vert_vel/D2/forcing-flip paths are AD-safe);

@@ -187,7 +187,7 @@ Notional test command (provided by the harness): `pytest fesom_jax/tests/ -k ver
 - [x] confirm/create a Python env with JAX + a GPU backend available on Levante; record exact versions in `docs/ENV.md` — mamba env `fesom-jax`, Python 3.12.13, jax/jaxlib 0.10.1, jax-cuda12 0.10.1 (CUDA 12.9 pip wheels)
 - [x] verify `jax.config.update("jax_enable_x64", True)` works and `jnp.ones(1).dtype == float64` — confirmed CPU + GPU
 - [x] verify GPU is visible (`jax.devices()`); record device memory; note CPU fallback for CI — A100-40 `[CudaDevice(id=0)]`, ~31.8 GB usable (job 25374974); login node falls back to CPU (benign cuInit warning)
-- [x] minimal smoke: jit a float64 function on GPU, confirm it runs — `scripts/gpu_smoke.py` float64 matmul on CudaDevice, rc=0
+- [x] minimal smoke: jit a float64 function on GPU, confirm it runs — `scripts/debug/gpu_smoke.py` float64 matmul on CudaDevice, rc=0
 - [x] write `fesom_jax/config.py` (global float64 enable, constants from FRESH_START §17: PI, RAD, DENSITY_0=1030, G=9.81, R_EARTH=6367500, OMEGA, VCPW=4.2e6) — mirrors `fesom_constants.h` incl. truncated π + Phase-1 namelist defaults
 - [x] verification: a tiny `tests/test_config.py` asserting x64 + constants match FRESH_START §17 — 4 passed
 
@@ -219,7 +219,7 @@ Notional test command (provided by the harness): `pytest fesom_jax/tests/ -k ver
 
 - [x] write `docs/MESH_EXPORT_LAYOUT.md`: for EVERY array, fix shape, dtype, units, 0-vs-1-based, and packing order — cross-referenced to the C macros. Critical packings: `gradient_sca` is `[6*elem]` with the [1..3]=dNi/dx, [4..6]=dNi/dy split (`fesom_ssh.c:140`); `edge_cross_dxdy` is `[4*ed]` packed (dx1,dy1,dx2,dy2) in **meters** (`fesom_ssh.c:290-306`); `nod_in_elem2D` as CSR (offsets+flat); `edge_tri` uses −1 for boundary — done; **`elem_edges` dropped** (unused in the C port, verified by grep)
 - [x] add `fesom_mesh_export` to the C port: after mesh init, write coords, `elem_nodes`, `edges`, `edge_tri`, `nod_in_elem2D` CSR, `nlevels*`, `ulevels*`, `zbar`, `Z`, `elem_area`, `area`, `areasvol`, `gradient_sca`, `edge_dxdy`, `edge_cross_dxdy`, `coriolis*`, `metric_factor`, `elem_cos` to one file matching the spec — `src/fesom_mesh_export.c` on branch `jax-mesh-export`; writes 31 `.npy` + `meta.txt`, env-gated `FESOM_MESH_EXPORT`, npes==1
-- [x] verification: load the exported file in Python, assert counts (pi: nod2D=3140, elem2D=5839, **nl=48** — NOT ~23; "~23" is the per-node count, global nl=len(zbar)=48), index ranges (`elem_nodes ∈ [0,nod2D)`, `edge_tri` ≤ 2 nonneg), and value ranges (areas, gradients) per FRESH_START §20 — `scripts/verify_mesh_export.py` → PASS
+- [x] verification: load the exported file in Python, assert counts (pi: nod2D=3140, elem2D=5839, **nl=48** — NOT ~23; "~23" is the per-node count, global nl=len(zbar)=48), index ranges (`elem_nodes ∈ [0,nod2D)`, `edge_tri` ≤ 2 nonneg), and value ranges (areas, gradients) per FRESH_START §20 — `scripts/debug/verify_mesh_export.py` → PASS
 - [x] run — must pass before Phase 1 — export cached at `port_jax/data/mesh_pi/` (job 25375272, 6 s)
 
 #### Task 0.4: Reference-dump enablement + element-dump extension
@@ -434,7 +434,7 @@ constant); step 1 reproduces **every** per-kernel substep dump gate through the 
 
 - [x] wrap `step` in `jax.lax.scan` over N steps; apply `jax.checkpoint` (rematerialization) to the step fn — `fesom_jax/integrate.py` (`integrate`/`integrate_jit`). **Step 1 runs eagerly (`is_first_step=True`) OUTSIDE the scan; steps 2..N scan with `is_first_step=False` baked in** (uniform body, no traced bool). Loop-invariant `mesh`/`op`/`stress_surf`/`params` closed over (carry = just `State`).
 - [x] confirm forward result of the scan == the Phase-2 manual loop (climate-close) — **BIT-IDENTICAL** (`integrate`==`run`: uv ~4e-19, all else 0.0); checkpoint on==off forward exactly 0.0
-- [x] memory sanity: N=200 pi steps backward pass fits in device memory with checkpointing — `scripts/phase3_grad_memory.py` + `.sbatch` (GPU job 25378918, A100-40). **Checkpointed: grad finite, peak 4.23 GB / 31.8 GB (13%), 26 s. Un-checkpointed: OOM at 48.7 GB** (XLA couldn't remat below 28 GiB) ⇒ **checkpointing is load-bearing** for the backward pass.
+- [x] memory sanity: N=200 pi steps backward pass fits in device memory with checkpointing — `scripts/debug/phase3_grad_memory.py` + `.sbatch` (GPU job 25378918, A100-40). **Checkpointed: grad finite, peak 4.23 GB / 31.8 GB (13%), 26 s. Un-checkpointed: OOM at 48.7 GB** (XLA couldn't remat below 28 GiB) ⇒ **checkpointing is load-bearing** for the backward pass.
 - [x] write `tests/test_integrate.py` (forward-equivalence) — scan==run (N=1,2,5,12); checkpoint forward-transparent; small-N backward finite + checkpoint-invariant
 - [x] run — must pass before next task — **test_integrate.py + test_gradient.py 12 passed (CPU)**
 
@@ -1136,7 +1136,7 @@ rewrite (all gates single-device or CPU-fake-device sharded) — the two tracks 
   `gm_diagnostics` driver `fer_uv` end-to-end 2.2e-16; the Redi terms — G7a 1.78e-15, **G7b's
   5-branch edge loop 1.07e-14** (the 5→3-case collapse), K33 ("augment Kv"). New modules
   `gm.py`/`gm_redi.py` + `eos.compute_sw_alpha_beta` + the `params.py` 2nd-ML-hook seam
-  (`k_gm`/`redi_kmax`). Compute-node test runner `scripts/run_suite.sbatch` adopted (the CORE2
+  (`k_gm`/`redi_kmax`). Compute-node test runner `scripts/runs/run_suite.sbatch` adopted (the CORE2
   backprop tests hang on the login node). **Only Task G.7 remains** (assemble into `step.py` behind
   `gm_cfg=None` + multi-day GPU stability + gradient re-check with `d/d(k_gm)` = GATE 6B). Handoff
   in `docs/NEXT_SESSION_PROMPT.md`.
@@ -1149,8 +1149,8 @@ rewrite (all gates single-device or CPU-fake-device sharded) — the two tracks 
   (front|∇T| 7.42e-6 ON vs 7.89e-6 OFF, growing). **Gradient `GM_GRAD_GATE_OK`:** the 2nd ML-hook
   `d/d(k_gm)` plateau **3.5e-6 (well-conditioned — not stiff)**, `d/d(k_ver)` 5.8e-10, masked-NaN
   `d/d(T0)` clean; backward 37 GB/64 GB @ N=4 CORE2. ⚠️ Redi reads the **pre-step `st.T`/`st.S`**
-  (the returned `T_old`), not `st.T_old`. New: `test_gm_step.py`, `scripts/core2_gm_stability_run.py`
-  +`_gpu.sh`, `scripts/core2_gm_grad_gate.py`+`.sbatch`; 4 lessons. **Both ML hooks now training-ready.**
+  (the returned `T_old`), not `st.T_old`. New: `test_gm_step.py`, `scripts/archive/core2_gm_stability_run.py`
+  +`_gpu.sh`, `scripts/archive/core2_gm_grad_gate.py`+`.sbatch`; 4 lessons. **Both ML hooks now training-ready.**
 - **2026-06-07 — Phase 7a (Differentiable Parameter Tuning) added to the plan (user-requested).**
   Use the diff. port to calibrate physics params (GM/ice/mixing) against a target and push the
   optimum back to the Fortran `namelist.oce` (scalar = zero Fortran code) — the SAME `params.py`

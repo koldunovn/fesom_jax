@@ -31,7 +31,7 @@ needed for the format.** (Old R1 used folded because it predates the `'global'` 
 
 ## 2. How to launch (cold start, self-chaining)
 
-The driver `scripts/run_core2_hindcast.sbatch` self-chains: each job resumes the rolling restart, runs a
+The driver `scripts/runs/run_core2_hindcast.sbatch` self-chains: each job resumes the rolling restart, runs a
 step budget < 12 h walltime, writes a restart + monthly canonical zarrs, and resubmits until 63 yr
 (`TOTAL=1,104,528` steps = 1958-01-01 → 2021-01-01). 1 node / 4 GPU (dist_4; CORE2 anti-scales past 4).
 ~8 production jobs, ~1.6 GPU-days at the reuse rate.
@@ -41,7 +41,7 @@ the PHC IC — both fixes need a fresh trajectory):
 
 ```bash
 cd /home/a/a270088/port_jax
-TAG=core2_hindcast_v2 sbatch --export=ALL,TAG=core2_hindcast_v2 scripts/run_core2_hindcast.sbatch
+TAG=core2_hindcast_v2 sbatch --export=ALL,TAG=core2_hindcast_v2 scripts/runs/run_core2_hindcast.sbatch
 ```
 
 - Cold job = a **1-month CANARY** (`CANARY=1536` steps) — the all-on finiteness gate; non-finite ⇒ chain
@@ -105,7 +105,7 @@ area-weighted `ssh` from the canonical monthly zarr + Fortran `ssh.fesom.YYYY.nc
 scratch; the SSH-drift recipe is in `HANDOFF-20260701-salinity-drift-investigation.md` §RESOLVED.)
 
 **4.2 SST k=1 fix — the wavenumber-1 harmonic must VANISH.** Regenerate `paper_jax/data/meanstate.nc`
-(the canonical-reader `reduce_meanstate.py`) and re-run `scripts/diag_sst_rotation.py` /
+(the canonical-reader `reduce_meanstate.py`) and re-run `scripts/debug/diag_sst_rotation.py` /
 `diag_sst_pattern.py`: the pre-fix R²(k=1)=0.88 / amplitude 0.10 °C should drop to noise (Fig 2's
 JAX−Fortran column goes ~white). If a residual k=1 remains, it's a REAL (small) SST difference to
 investigate — but the diurnal alias should be gone.
@@ -142,7 +142,7 @@ JAX↔Fortran now agree on SST **and** salinity.
 
 ## 6. Inventory
 
-- **Driver:** `scripts/run_core2_hindcast.sbatch` (self-chaining; TAG/PART/PERJOB/TOTAL env-tunable).
+- **Driver:** `scripts/runs/run_core2_hindcast.sbatch` (self-chaining; TAG/PART/PERJOB/TOTAL env-tunable).
 - **Config:** `configs/core2_full.yaml` (all-on: zstar+TKE+mEVP+GM, dt=1800, dist_4).
 - **Mesh/IC/partition:** `data/mesh_core2`, `data/ic_core2` (PHC cold start),
   `/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2/dist_4`.

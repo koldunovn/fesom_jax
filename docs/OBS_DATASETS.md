@@ -1,6 +1,6 @@
 # Observational datasets — paper obs-application targets (Task A1)
 
-Staging for the obs-based half of the three capability pillars. **Staged by** `scripts/stage_obs.sh`
+Staging for the obs-based half of the three capability pillars. **Staged by** `scripts/tools/stage_obs.sh`
 **into** `/work/ab0995/a270088/port_jax/obs/` (large files live on `/work`, not `/home`).
 
 ## Why obs-based, NOT reanalyses (the methodology rule — Locked Decision #2)

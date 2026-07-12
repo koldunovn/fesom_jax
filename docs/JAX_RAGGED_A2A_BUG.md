@@ -101,7 +101,7 @@ the composition, which depends on the field/weights — not a clean O(npes) law.
 
 ## Self-contained, filing-ready repro (VERIFIED on 2×A100, job 25456662)
 
-`scripts/ragged_a2a_transpose_bug.py` — **jax + numpy only**, built on JAX's OWN `ragged_all_to_all`
+`scripts/debug/ragged_a2a_transpose_bug.py` — **jax + numpy only**, built on JAX's OWN `ragged_all_to_all`
 docstring example (axis size 2). Output:
 
 ```
@@ -122,7 +122,7 @@ adds spurious cross-terms, not a pure scalar factor — i.e. the fix is in the r
 > **Title:** `lax.ragged_all_to_all`: reverse-mode autodiff transpose is incorrect (gradient over-counts by
 > ~axis_size); forward is correct
 >
-> **Repro:** `scripts/ragged_a2a_transpose_bug.py` (≈60 lines, jax+numpy only) — JAX's own `ragged_all_to_all`
+> **Repro:** `scripts/debug/ragged_a2a_transpose_bug.py` (≈60 lines, jax+numpy only) — JAX's own `ragged_all_to_all`
 > docstring example (axis size 2) wrapped in `shard_map`. Checks: (1) forward == documented result; (2) the
 > transpose of an all-ones cotangent vs the hand-derived gradient; (3) the adjoint identity `⟨f(x),y⟩ ==
 > ⟨x, fᵀ(y)⟩`. **GPU/TPU required** (`ragged_all_to_all` is unimplemented on XLA:CPU).

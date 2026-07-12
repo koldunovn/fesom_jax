@@ -94,7 +94,7 @@ cycle). Audit, most-likely first:
    antidiffusive flux + the limiter, and the boundary handling.
 
 **Diagnostic strategy (step-1 gates can't see this — need multi-step / regional):**
-- **Spatial maps** (already have the tooling): `scripts/kpp_bias_map.py` writes `bias_map_<yr>.nc`
+- **Spatial maps** (already have the tooling): `scripts/debug/kpp_bias_map.py` writes `bias_map_<yr>.nc`
   (ushow-able). Map `a_ice_diff`/`m_ice_diff`/`temp_diff` + look at WHERE in the growth/melt cycle.
 - **A later-step ice dump-gate:** the C KPP dump has 2 steps; step 2 has nonzero shear/velocity — a
   step-2 (or a fresh multi-step) C ice dump would test the velocity-dependent ice paths the step-1
@@ -106,13 +106,13 @@ cycle). Audit, most-likely first:
 
 ## 3. TOOLS + HOW TO REPRODUCE (all committed)
 
-- **Run:** `scripts/core2_kpp_climate_run.py` (monthly means, C-port format) +
-  `scripts/core2_kpp_climate_gpu.sh` (A100, ~1 h for 2 yr). Output → `data/kpp_climate_2yr/
+- **Run:** `scripts/archive/core2_kpp_climate_run.py` (monthly means, C-port format) +
+  `scripts/archive/core2_kpp_climate_gpu.sh` (A100, ~1 h for 2 yr). Output → `data/kpp_climate_2yr/
   <var>.fesom.<yr>.monthly.nc` (sst/sss/ssh/a_ice/m_ice 2-D + temp/salt 3-D, 12 rec/yr; ushow-able).
 - **Compare:** `port_kokkos/scripts/m32_climate_compare.py <dir> --label JAX --years 1958 1959`
   (defaults: `--fref /scratch/a/a270088/fortran_kpp_5yr_fix --cref /work/ab0995/a270088/port/kpp_5yr_fix`).
   Annual-mean surface corr/bias/RMS + drift. Inter-ref budget: run with `--label C-port` on the cref dir.
-- **Bias map:** `scripts/kpp_bias_map.py --year 1958` → `data/kpp_climate_2yr/bias_map_<yr>.nc` +
+- **Bias map:** `scripts/debug/kpp_bias_map.py --year 1958` → `data/kpp_climate_2yr/bias_map_<yr>.nc` +
   lat-band + hotspot + depth printout.
 - **ushow a live/finished file:** `HDF5_USE_FILE_LOCKING=FALSE ushow <file.nc>` (HDF5 lock; `--yac-3d`
   for 3-D; `--polar north`). See `[[hpc-job-file-conventions]]`.

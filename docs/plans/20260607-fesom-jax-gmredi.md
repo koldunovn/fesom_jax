@@ -353,7 +353,7 @@ augmentation in `impl_vert_diff`). `tests/test_gm_redi.py`. C: G.1 dump (full GM
 ### Task G.7: GATE 6B — assemble GM/Redi into the CORE2 step + stability + gradient
 
 **Files:** modify `fesom_jax/step.py`, `fesom_jax/integrate.py` (the `gm_cfg` static arg + the
-full wiring); create `scripts/core2_gm_stability_run.py` (+ `_gpu.sh`), `scripts/core2_gm_grad_gate.py`
+full wiring); create `scripts/archive/core2_gm_stability_run.py` (+ `_gpu.sh`), `scripts/archive/core2_gm_grad_gate.py`
 (+ `.sbatch`). `tests/test_gm_step.py`.
 
 > **✅ DONE 2026-06-07 (GATE 6B MET).** `gm_cfg=None` static arg wired into `step.py`/`integrate.py`

@@ -264,7 +264,7 @@ per [[model-paper-test-on-small-meshes]] the budget residual should show on any 
   for zk, d in zip(ds["z"].values, dS): print(f"{zk:7.1f} m : {d:+.5f}")
   print("vol-mean S drift:", float(ds["sbar_jax"][-1]-ds["sbar_jax"][0]))
   ```
-  (full script at `port_jax/scripts/diag_salinity_drift.py`; also verifies
+  (full script at `port_jax/scripts/debug/diag_salinity_drift.py`; also verifies
   `OHC ≡ ρ₀c_p·V·T̄` exactly — the OHC "difference" is **not** a salt signal, it's the 0.006 °C T̄
   gap rescaled; don't chase it.)
 - **Raw runs:**

@@ -192,7 +192,7 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 **Files:**
 - Create: `fesom_jax/shard_mesh.py`
 - Modify: `fesom_jax/mesh.py` (optional halo/partition fields on `Mesh`, or a parallel `ShardedMesh`)
-- Create: `scripts/export_dist_mesh.py`
+- Create: `scripts/tools/export_dist_mesh.py`
 - Create: `fesom_jax/tests/test_shard_mesh.py`
 
 - [x] `build_sharded_mesh(mesh, partition)` → per-device local arrays: gather each global `Mesh` field
@@ -210,7 +210,7 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 - [x] build the **exchange index maps** for the JAX collective: `(src_dev, src_lane)` `[P,Lmax]` per kind
       (the `all_gather` form — interior identity, halo←owner's interior). The `slist`/`rlist`/segment form
       stays in the `Partition` `ComStruct` for the `ragged_all_to_all` perf follow-up.
-- [x] `scripts/export_dist_mesh.py` → write the padded local arrays + masks + exchange maps as `.npy` +
+- [x] `scripts/tools/export_dist_mesh.py` → write the padded local arrays + masks + exchange maps as `.npy` +
       `meta.txt`; default output on `/work`. `load_sharded_mesh` reloads it.
 - [x] write tests: every local `elem_nodes` index `< Lmax_nod` or `==-1`; halo lane gids equal their
       owner's; `export→reload` round-trips; the **serial `NP=1`** sharded mesh is array-equal to the dense
@@ -310,8 +310,8 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 - Modify: `fesom_jax/ssh.py` (`ssh_matvec`, `ssh_precond`, `_pcg`, `solve_ssh` + `SSHHalo`,
   `ShardedSSHOperator`, `partition_ssh_operator`, `local_ssh_operator`)
 - Create: `fesom_jax/tests/test_ssh_sharded.py`
-- Create: `scripts/capture_core2_ssh_rhs.py` + `.sbatch` (the realistic-rhs fixture + margin report)
-- Create: `scripts/phase8_ssh_sharded_gpu.sbatch` (early real-4×A100 confirmation)
+- Create: `scripts/debug/capture_core2_ssh_rhs.py` + `.sbatch` (the realistic-rhs fixture + margin report)
+- Create: `scripts/debug/phase8_ssh_sharded_gpu.sbatch` (early real-4×A100 confirmation)
 
 - [x] partition the **static operator**: `partition_ssh_operator` filters the global operator to each
       device's (row-local ∧ col-local) entries, remaps to local node lanes, pads `nnz`. 🎯 **The SSH
@@ -393,7 +393,7 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 
 **Files:**
 - Create: `fesom_jax/tests/test_gradient_sharded.py` ✅
-- Create: `scripts/test_grad_ocean.sbatch` + `scripts/test_grad_forced.sbatch` ✅ (the focused-gate
+- Create: `scripts/debug/test_grad_ocean.sbatch` + `scripts/debug/test_grad_forced.sbatch` ✅ (the focused-gate
   sbatch convention from S.7p3, in place of a single `phase8_grad_gate.py`)
 
 - [x] `jax.grad` of a scalar loss (owned-masked mean SST) of the sharded run wrt `params` (`k_ver`/`a_ver`/
@@ -425,7 +425,7 @@ startup exchanges: `elem_area`(elem2D+full), `elem_cos`,`metric_factor`,`corioli
 - Create: `scripts/phase8_cn_dump_diff.py` (JAX-N-rank ↔ C-N-rank per-substep compare)
 
 - [x] **(a) per-substep N==1** on real devices: full assembled CORE2 step (KPP+GM+ice) on 2×A100
-      (`scripts/phase8_s9_gpu.sbatch`, job 25430592) == single-device on every PROGNOSTIC field (ocean
+      (`scripts/debug/phase8_s9_gpu.sbatch`, job 25430592) == single-device on every PROGNOSTIC field (ocean
       dynamics clean 1e-9…1e-18; FCT tracers + prognostic ice climate-close 1e-2…1e-9). GPU findings:
       byte-id is a CPU property (serial-collapse worst 7.66e-9 → platform-aware `_BYTE_ID_ATOL`); EVP stress
       σ rides the VP yield kink (O(0.5) on a non-prognostic diagnostic, driven u_ice/v_ice correct to 1e-7)
@@ -508,7 +508,7 @@ the sharding analog of `v1.0-single-gpu`). Final Phase-8 lessons in `PORTING_LES
 S.7/S.8 oracles, before any farc→dars→NG5 scaling numbers mean anything.
 
 ### #14 — S.9 COMPLETE: the model runs CORRECTLY on real A100s (2026-06-08)
-First time the sharded model touched real GPUs (NCCL, not CPU fake-devices). `scripts/phase8_s9_gpu.sbatch`
+First time the sharded model touched real GPUs (NCCL, not CPU fake-devices). `scripts/debug/phase8_s9_gpu.sbatch`
 on a **4×A100 node** (job 25430592), each gate in its own fresh process (the S.8 OOM lesson). **Verdict:
 the model is validated correct on real A100s.** 🎯 The assembled CORE2 step (KPP + GM/Redi + prognostic ice
 + bulk forcing) sharded across 2 A100s == single-device on every PROGNOSTIC field: ocean dynamics at the
@@ -646,7 +646,7 @@ CORE2 N-vs-1 gate (ocean → +KPP → +GM → +ice).
 ### #8 — S.6 distributed CG solve DONE (2026-06-07)
 Built the distributed SSH CG in `ssh.py` (`partition_ssh_operator` + `SSHHalo` + `ShardedSSHOperator`;
 folded `halo_exchange` into `ssh_matvec`/`ssh_precond`; gated `_pcg`/`solve_ssh` on an optional `halo`) +
-`tests/test_ssh_sharded.py` (**9 passed**, 4 CPU fake-devices, ~54 s) + `scripts/capture_core2_ssh_rhs.py`
+`tests/test_ssh_sharded.py` (**9 passed**, 4 CPU fake-devices, ~54 s) + `scripts/debug/capture_core2_ssh_rhs.py`
 (the realistic-rhs fixture + margin report). **Two load-bearing discoveries.** (1) 🎯 **The SSH operator
 stencil EXCEEDS the node halo** — owned rows have columns outside the local node list (11664 on dist_2,
 20466 on dist_4) — **but every such entry is EXACTLY zero** (the operator keeps the topological pattern
@@ -662,7 +662,7 @@ row's local `segment_sum` is the same nonzero terms in the same order; the contr
 reassociation). `all_gather`+`psum` inside the `while_loop` inside `custom_linear_solve` inside `shard_map`
 **lowers and runs** (review #4 resolved); the `psum`'d residual makes the trip count device-identical (no
 deadlock). `halo=None` traces the **exact `v1.0` graph** (43 single-device ssh tests green). Submitted an
-early real-4×A100 confirmation (`scripts/phase8_ssh_sharded_gpu.sbatch`; the formal multi-GPU gate is S.9).
+early real-4×A100 confirmation (`scripts/debug/phase8_ssh_sharded_gpu.sbatch`; the formal multi-GPU gate is S.9).
 NEXT: S.7 (wire `shard_map` around `step`/`integrate` — split the 5 fused kernels, interleave the
 `halo_points` post-exchanges, gate behind a static arg; PRIMARY per-substep CORE2 N==1 gate).
 
@@ -720,7 +720,7 @@ foundation (S.1→S.2→S.2b) is complete and the single-device path is intact. 
 
 ### #3 — S.2 sharded-mesh build + export DONE (2026-06-07)
 Built `fesom_jax/shard_mesh.py` (`ShardedMesh` + `build_sharded_mesh` + `export`/`load`) +
-`scripts/export_dist_mesh.py` + `tests/test_shard_mesh.py` (**11 passed**, ~4 s CPU). Per-device gather
+`scripts/tools/export_dist_mesh.py` + `tests/test_shard_mesh.py` (**11 passed**, ~4 s CPU). Per-device gather
 by `myList`, connectivity remap (`elem_nodes`/`edges`/`edge_tri`/`edge_up_dn_tri`) global→local with
 `-1` sentinels, pad-to-`Lmax` + `owned`/`valid` masks. **Serial `npes==1` sharded mesh is array-equal
 to the dense `Mesh`** (no-op invariant — every non-static field; `mesh.py` untouched so the

@@ -105,7 +105,7 @@ The load-bearing rewrite. Everything downstream is meaningless until this lands 
       HLO opcode 'ragged-all-to-all' is not supported by XLA:CPU ThunkEmitter`, confirmed job 25438390 — the
       existing all_gather S.3 tests stayed green, only the 6 new ragged tests hit the CPU gap). So B.0 can
       ONLY be gated on real GPUs (NCCL). The ragged tests now **SKIP on CPU** (platform guard) so the
-      single-device/CPU suite stays clean. GPU gate (`scripts/phase8b_b0_gpu.sbatch`, job 25438454):
+      single-device/CPU suite stays clean. GPU gate (`scripts/debug/phase8b_b0_gpu.sbatch`, job 25438454):
       (1) **isolated primitive** `test_halo.py::test_ragged_primitive_matches_allgather` — ragged ==
       all_gather forward (byte-id on valid lanes) + grad (transpose), npes 2 & 4, all three kinds;
       (2) **step-level wiring** `test_step_sharded.py::test_ragged_step_matches_allgather` —
@@ -224,7 +224,7 @@ nod/GPU fits 40 GB). **Verify in order:** dars-4 single-node full → dars-8 mul
 - `fesom_jax/integrate_sharded.py` — `_fold` + `folded_state`/`folded_mesh`/`folded_operator` +
   `_halo_arrays` → `np`; make the `device_put`-to-sharding ALWAYS run (single-process too, to a local
   mesh sharding) so the global is never on one GPU.
-- `scripts/bench_forward_scaling.py` — `phc_state`/`perturbed_state` → numpy.
+- `scripts/bench/bench_forward_scaling.py` — `phc_state`/`perturbed_state` → numpy.
 - GATE: the single-device suite + `test_step_sharded.py`/`test_gradient_sharded.py` must stay green
   (the host-build + device_put must be numerically identical — it only changes WHERE arrays live).
 
