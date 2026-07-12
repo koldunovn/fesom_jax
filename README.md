@@ -145,7 +145,7 @@ print(state_N.T[:, 0].mean())                        # surface temperature after
 `step()` takes one step's forcing; for a forced *multi*-step run use `run_steps_sharded` (per-step
 forcing) or `integrate(step_forcings=...)` (a pre-stacked stack — simplest, but it holds all forcing
 in memory and so caps at **~weeks**). For **multi-year** forwards use the per-year-chunked driver
-`scripts/core2_kpp_climate_run.py` (`--load-state` restart, `is_first_step=False`) — the tool that
+`scripts/archive/core2_kpp_climate_run.py` (`--load-state` restart, `is_first_step=False`) — the tool that
 produced the 5-yr spin-up + 10-yr climate reference:
 
 ```python
@@ -200,7 +200,7 @@ mld_field, dmld_dck = jax.jvp(                         # forward-mode: d(MLD fie
 one number: reverse; one knob → a whole map: forward). They are two views of the same underlying
 calculation, so on a matched run they give the same answer (checked to **~1 %** per burst) and run
 into the same short-window limit (see Limitations). The long-window driver exposes both via
-`--mode {adjoint,tlm}` (`scripts/core2_lw_avgadj.py`).
+`--mode {adjoint,tlm}` (`scripts/paper/core2_lw_avgadj.py`).
 
 ### 3. Multi-GPU / multi-node forward
 
@@ -227,7 +227,7 @@ The benchmark driver handles all of this:
 ```bash
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 # single node, CORE2 full model, ragged, timed:
-$PY scripts/bench_forward_scaling.py --mesh-dir data/mesh_core2 \
+$PY scripts/bench/bench_forward_scaling.py --mesh-dir data/mesh_core2 \
     --dist-dir /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2 --npes 4 --steps 25 \
     --dt 1800 --full 1 --ic-dir data/ic_core2 --ragged 1 --out-zarr /work/.../core2_out.zarr
 # multi-node: submit the prebuilt sbatch (sets JDIST, srun, paths) — see below.
@@ -272,7 +272,7 @@ headline figures: `scripts/fig_{sensitivity,calibration,hybridml}.png`.
   but not sufficient for a deployable closure, so the long-forward drift+persisted-benefit gate is
   essential.
 
-- **Climate-timescale sensitivity — the ensemble-averaged adjoint** (`scripts/core2_lw_avgadj.py`,
+- **Climate-timescale sensitivity — the ensemble-averaged adjoint** (`scripts/paper/core2_lw_avgadj.py`,
   `fig_avgadj.py`). A single burst's gradient is clean only for hours→days (chaos, below); to reach
   the **10-yr-mean** response, *don't* backprop a long window — **average many short frozen-ice
   adjoint bursts** seeded along a 10-yr reference trajectory (Lea/Allen/Haine): the chaotic part
@@ -289,13 +289,13 @@ its knobs. Heavy state goes to `/work`; results are small `scripts/*.jsonl` + `*
 
 ```bash
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
-$PY scripts/core2_paper_sensitivity.py  --help     # Fig 2 — instantaneous adjoint sensitivity maps
-$PY scripts/core2_paper_calib_twin.py    --help     # perfect-model calibration (k_gm / c_k recovery)
-$PY scripts/core2_paper_nn_twin.py       --help     # learned-TKE hybrid-ML twin
+$PY scripts/paper/core2_paper_sensitivity.py  --help     # Fig 2 — instantaneous adjoint sensitivity maps
+$PY scripts/paper/core2_paper_calib_twin.py    --help     # perfect-model calibration (k_gm / c_k recovery)
+$PY scripts/paper/core2_paper_nn_twin.py       --help     # learned-TKE hybrid-ML twin
 # climate-timescale sensitivity (needs a 10-yr reference of state snapshots), reverse- OR forward-mode:
-$PY scripts/core2_lw_avgadj.py --mode adjoint --target mld_ck \
+$PY scripts/paper/core2_lw_avgadj.py --mode adjoint --target mld_ck \
     --snap-dir /work/ab0995/a270088/port_jax/longwindow/ref10_snaps --K 200 --n 48
-$PY scripts/fig_avgadj.py --maps scripts/lw_avgadj_mld_ck_adjoint_map.npz   # render the climate map
+$PY scripts/paper/fig_avgadj.py --maps scripts/lw_avgadj_mld_ck_adjoint_map.npz   # render the climate map
 ```
 
 > These are research capabilities on the CORE2 (127 k-node) configuration, not a turnkey DA
@@ -309,11 +309,12 @@ $PY scripts/fig_avgadj.py --maps scripts/lw_avgadj_mld_ck_adjoint_map.npz   # re
 **The `pi` mesh needs no data** — it ships in the package. Everything below is only for the realistic
 CORE2-and-larger setups.
 
-Everything needed to run **CORE2 for one year** is published on Zenodo as two archives — the mesh +
+Everything needed to run **CORE2 for one year** is published on Zenodo
+([doi:10.5281/zenodo.21324319](https://doi.org/10.5281/zenodo.21324319)) as two archives — the mesh +
 initial state (~370 MB) and one year of JRA55-do forcing (~10.4 GB):
 
 ```bash
-python scripts/fetch_data.py --dest ~/fesom-data --record <ZENODO_RECORD_ID>
+python scripts/fetch_data.py --dest ~/fesom-data          # ~11 GB; --mesh-only for just the 370 MB
 eval "$(python scripts/fetch_data.py --dest ~/fesom-data --print-env)"
 ```
 
@@ -346,7 +347,7 @@ once with `scripts/cache_phc_ic.py --mesh-dir <M> --out-dir <M>` (slow at NG5 sc
 order-dependent and runs per-rank), so an IC meant to match a C dump oracle bit-for-bit must be
 built with that run's partition. Two CORE2 caches coexist: `data/ic_core2` = the **serial**
 (1-rank) order (`cache_phc_ic.py`; the legacy core2/kpp/gm/ice oracles were 1-rank runs) and
-`data/ic_core2_dist16` = the **dist_16** order (`scripts/rebuild_ic_dist16.py`; matches the
+`data/ic_core2_dist16` = the **dist_16** order (`scripts/tools/rebuild_ic_dist16.py`; matches the
 16-rank `z2_cdump` zstar oracle).
 
 **Mesh ladder + per-mesh timestep** (CFL — `dt` is mesh-specific):
@@ -365,10 +366,10 @@ built with that run's partition. Two CORE2 caches coexist: `data/ic_core2` = the
 Prebuilt SLURM scripts in `scripts/` (each loops the relevant `--npes` / halo / mesh):
 
 ```bash
-sbatch scripts/bench_core2_2node.sbatch     # CORE2 2 nodes (ragged + allgather)
-sbatch scripts/bench_dars_dist16.sbatch     # dars 4 nodes
-sbatch scripts/bench_ng5_dist32.sbatch      # NG5 8 nodes (+ sharded zarr output)
-sbatch scripts/bench_ng5_dist64.sbatch      # NG5 16 nodes
+sbatch scripts/bench/bench_core2_2node.sbatch     # CORE2 2 nodes (ragged + allgather)
+sbatch scripts/bench/bench_dars_dist16.sbatch     # dars 4 nodes
+sbatch scripts/bench/bench_ng5_dist32.sbatch      # NG5 8 nodes (+ sharded zarr output)
+sbatch scripts/bench/bench_ng5_dist64.sbatch      # NG5 16 nodes
 ```
 
 Conventions: GPU jobs use `-p gpu -A ab0995_gpu`; **keep `--time` ≤ 30 min** so short jobs backfill
@@ -418,7 +419,7 @@ $PY -m pytest fesom_jax/tests/ -k "verify"                      # per-substep vs
 $PY -m pytest fesom_jax/tests/ -k "gradient"                    # AD checks
 # sharding (CPU fake-devices, compute node):
 XLA_FLAGS=--xla_force_host_platform_device_count=4 $PY -m pytest fesom_jax/tests/test_step_sharded.py
-sbatch scripts/run_suite.sbatch                                 # full suite on a compute node
+sbatch scripts/runs/run_suite.sbatch                                 # full suite on a compute node
 ```
 
 ---
@@ -432,7 +433,7 @@ the next table):
 |---|---|---|
 | Single-device, ocean-only **or full** model (KPP+GM/Redi+ice+JRA55), float64 | ✅ | the normal way to run it on one GPU — see Quick start |
 | Forced multi-step, **pre-stacked** (`integrate(step_forcings=…)`) | ✅ but **≤ ~weeks** | the simple path loads every timestep's atmospheric forcing into memory up front, so it runs out of room after a few weeks of simulated time |
-| **Multi-year** forced forward | ✅ | a separate driver (`scripts/core2_kpp_climate_run.py`) feeds the forcing one year at a time and saves/reloads the model state, so it can run for years — this is how we made the 5-yr spin-up and the 10-yr reference |
+| **Multi-year** forced forward | ✅ | a separate driver (`scripts/archive/core2_kpp_climate_run.py`) feeds the forcing one year at a time and saves/reloads the model state, so it can run for years — this is how we made the 5-yr spin-up and the 10-yr reference |
 | Multi-GPU / multi-node, **ragged** halo | ✅ **GPU only** | the fast, lean way the GPUs swap their shared edges only exists on GPUs, not CPUs (#4) |
 | Multi-GPU, **all_gather** halo | ✅ CPU **and** GPU | works anywhere (CPU too), but every GPU has to hold a copy of all the others' edge data, so the biggest meshes run out of memory (#1) |
 | Big mesh on too few nodes | ❌ out of memory | the model needs more memory per node than the original C/Fortran, so the largest meshes only fit if spread over enough nodes: dars needs **≥ 2 nodes**, NG5 **≥ 8** (#3) |
@@ -551,3 +552,6 @@ underlying model and the datasets you ran it on:
 - **JRA55-do forcing** — Tsujino, H., et al.: JRA-55 based surface dataset for driving ocean–sea-ice
   models, *Ocean Modelling*, 130, 79–139, 2018.
   [doi:10.1016/j.ocemod.2018.07.002](https://doi.org/10.1016/j.ocemod.2018.07.002)
+- **The CORE2 one-year data package** (if you use it) — Koldunov, N.: *fesom-jax CORE2 one-year
+  setup: mesh, initial state, and JRA55-do forcing (1958)*, Zenodo, 2026.
+  [doi:10.5281/zenodo.21324319](https://doi.org/10.5281/zenodo.21324319)

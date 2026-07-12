@@ -29,9 +29,15 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-# The Zenodo record holding the package. Override with $FESOM_ZENODO_RECORD or --record.
-ZENODO_RECORD = os.environ.get("FESOM_ZENODO_RECORD", "")
+# The Zenodo record holding the package: https://doi.org/10.5281/zenodo.21324319
+# (concept DOI 10.5281/zenodo.21324318 always resolves to the newest version).
+# Override with $FESOM_ZENODO_RECORD or --record.
+ZENODO_RECORD = os.environ.get("FESOM_ZENODO_RECORD", "21324319")
 ZENODO_API = "https://zenodo.org/api/records/{record}"
+
+# Zenodo's edge returns an HTML 403 to any request with no User-Agent. urllib sets one by default,
+# but say it explicitly -- this exact trap cost a day on the upload side.
+UA = {"User-Agent": "fesom-jax-fetch/1.0 (+https://github.com/koldunovn/fesom_jax)"}
 
 MESH_ZIP = "core2_mesh_ic.zip"
 FORCING_ZIP = "core2_forcing_1958.zip"
@@ -46,7 +52,7 @@ def record_files(record: str) -> dict:
     """{filename: {'url':…, 'size':…, 'md5':…}} for a Zenodo record."""
     url = ZENODO_API.format(record=record)
     try:
-        with urllib.request.urlopen(url, timeout=60) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
             meta = json.load(r)
     except Exception as e:  # noqa: BLE001
         _die(f"could not reach Zenodo record {record}: {e}")
@@ -67,16 +73,25 @@ def download(url: str, dest: Path, size: int = 0) -> None:
         return
     print(f"  {dest.name}: downloading ({size / 2**30:.2f} GB)..." if size
           else f"  {dest.name}: downloading...", flush=True)
-    with urllib.request.urlopen(url, timeout=120) as r, open(dest, "wb") as f:
-        done = 0
+    # A \r progress bar is fine on a terminal but turns a redirected log into thousands of lines,
+    # so off a tty report sparsely (every 10%) instead.
+    tty = sys.stdout.isatty()
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=120) as r, open(dest, "wb") as f:
+        done, next_mark = 0, 10
         while chunk := r.read(1 << 20):
             f.write(chunk)
             done += len(chunk)
-            if size:
-                pct = 100 * done / size
+            if not size:
+                continue
+            pct = 100 * done / size
+            if tty:
                 print(f"\r    {pct:5.1f}%  {done / 2**30:.2f}/{size / 2**30:.2f} GB",
                       end="", flush=True)
-        if size:
+            elif pct >= next_mark:
+                print(f"    {next_mark:3d}%  {done / 2**30:.2f}/{size / 2**30:.2f} GB", flush=True)
+                next_mark += 10
+        if size and tty:
             print()
 
 

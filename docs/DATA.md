@@ -7,8 +7,8 @@
 
 ## Quick start: get one year of CORE2
 
-Everything needed to run the CORE2 (~1°) global ocean for one year is published as a single Zenodo
-record, in two archives:
+Everything needed to run the CORE2 (~1°) global ocean for one year is published on Zenodo —
+**[doi:10.5281/zenodo.21324319](https://doi.org/10.5281/zenodo.21324319)** — in two archives:
 
 | Archive | Size | Contents |
 |---|---|---|
@@ -16,7 +16,7 @@ record, in two archives:
 | `core2_forcing_1958.zip` | ~10.4 GB | the eight JRA55-do fields for 1958 |
 
 ```bash
-python scripts/fetch_data.py --dest ~/fesom-data --record <ZENODO_RECORD_ID>
+python scripts/fetch_data.py --dest ~/fesom-data                  # record id is already the default
 eval "$(python scripts/fetch_data.py --dest ~/fesom-data --print-env)"   # set the env vars
 ```
 
