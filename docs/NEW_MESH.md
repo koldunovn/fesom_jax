@@ -116,12 +116,12 @@ see [`FORCING_MESHES.md`](FORCING_MESHES.md).)
 import jax.numpy as jnp
 from fesom_jax.mesh import load_mesh
 from fesom_jax.ssh import build_ssh_operator
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.integrate import integrate
 from fesom_jax.diagnostics import state_diagnostics, format_diagnostics
 
 mesh   = load_mesh("MESH_JAX")
-state0 = core2_initial_state(mesh, "IC_MYMESH")      # mesh-agnostic despite the name
+state0 = phc_initial_state(mesh, "IC_MYMESH")      # the PHC state you just cached
 op     = build_ssh_operator(mesh, dt=DT)
 stress = jnp.zeros((mesh.elem2D, 2))
 

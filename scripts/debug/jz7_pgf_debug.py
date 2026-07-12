@@ -6,7 +6,7 @@ import numpy as np
 from pathlib import Path
 from fesom_jax.mesh import load_mesh
 from fesom_jax import ale, eos, ice, io_dump, pgf
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.config import DENSITY_0, G
 
 CORE2_MESH = Path("data/mesh_core2"); CORE2_IC = Path("data/ic_core2_dist16")
@@ -15,7 +15,7 @@ NOD, ELEM, NL = 126858, 244659, 48
 E = 240789
 
 mesh = load_mesh(CORE2_MESH)
-state = core2_initial_state(mesh, CORE2_IC)
+state = phc_initial_state(mesh, CORE2_IC)
 sst = np.asarray(state.T[:, 0])
 st = ice.seed_ice(state, mesh, sst)
 zbar3, Z3d = ale.live_geometry(mesh, st.hnode)

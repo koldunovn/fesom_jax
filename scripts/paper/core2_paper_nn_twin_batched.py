@@ -126,7 +126,7 @@ def main():
             import pickle
             import re
             from fesom_jax import surface_forcing
-            from fesom_jax.phc_ic import core2_initial_state
+            from fesom_jax.phc_ic import phc_initial_state
             files = sorted(glob.glob(str(args.snapshots_dir / "snap_step*.pkl")))
             pairs = [(int(re.search(r"snap_step(\d+)", f).group(1)), f) for f in files
                      if re.search(r"snap_step(\d+)", f)]
@@ -137,7 +137,7 @@ def main():
                 idx = sorted(set(np.linspace(0, len(pairs) - 1, K).round().astype(int).tolist()))
                 pairs = [pairs[i] for i in idx]
             K = len(pairs)
-            base = core2_initial_state(mesh, twin.IC_DIR)
+            base = phc_initial_state(mesh, twin.IC_DIR)
             cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=np.asarray(base.T[:, 0]))
             for s, f in pairs:
                 with open(f, "rb") as fp:

@@ -39,7 +39,7 @@ def perturbed_state(mesh):
 
 def phc_state(mesh, ic_dir=None):
     """REAL PHC3.0 winter IC (the Kokkos IC) as a rest State, with base T_old/S_old (the C
-    step-1 AB2 history, per core2_initial_state). Loads a cached T_ic/S_ic.npy from ``ic_dir``
+    step-1 AB2 history, per phc_initial_state). Loads a cached T_ic/S_ic.npy from ``ic_dir``
     if present, else interpolates the global PHC nc onto the mesh live (slow for big meshes —
     pre-cache with build_and_cache_ic → /work). **Built entirely on the HOST (numpy)** (Phase
     8b B.3) so the global 3-D IC never lands on GPU 0 before sharding (the dars/NG5 setup-OOM)."""

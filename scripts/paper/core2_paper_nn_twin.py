@@ -46,7 +46,7 @@ from fesom_jax.ice import IceConfig
 from fesom_jax.integrate import integrate
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.tke import DENSITY_0, TkeConfig, _layer_center_Z, _safe_sqrt, _shift_down
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -85,7 +85,7 @@ def is_oom(e: Exception) -> bool:
 def build(year, n, config):
     """Mesh + (ice-seeded) state + forcing + the live-config dict (mirrors the D2a TKE twin)."""
     mesh = load_mesh(MESH_DIR)
-    base = core2_initial_state(mesh, IC_DIR)
+    base = phc_initial_state(mesh, IC_DIR)
     if config == "all3":
         state = ice.seed_ice(base, mesh, np.asarray(base.T[:, 0]))
         cfgs = dict(gm_cfg=GMConfig(), tke_cfg=TkeConfig(),

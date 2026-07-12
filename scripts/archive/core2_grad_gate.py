@@ -53,7 +53,7 @@ from fesom_jax.config import A_VER
 from fesom_jax.integrate import integrate
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.ssh import solve_ssh, ssh_matvec
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -66,7 +66,7 @@ H_SWEEP = (1e-2, 1e-3, 1e-4, 1e-5, 1e-6)
 
 def build(year, n):
     mesh = load_mesh(MESH_DIR)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(state.T[:, 0]))
     sfs = cf.stack(surface_forcing.dates_for_steps(year, DT, n))

@@ -39,7 +39,7 @@ from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
 from fesom_jax.kpp import KppConfig
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 
 ROOT = Path(__file__).resolve().parents[2]
 MESH_DIR = ROOT / "data" / "mesh_core2"
@@ -55,8 +55,8 @@ MICE_MAX = 20.0
 
 def build(year, steps):
     mesh = load_mesh(MESH_DIR)
-    sst = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])
-    state = ice.seed_ice(core2_initial_state(mesh, IC_DIR), mesh, sst)
+    sst = np.asarray(phc_initial_state(mesh, IC_DIR).T[:, 0])
+    state = ice.seed_ice(phc_initial_state(mesh, IC_DIR), mesh, sst)
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=sst)
     dates = surface_forcing.dates_for_steps(year, DT, steps)

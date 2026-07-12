@@ -63,7 +63,7 @@ from fesom_jax.ice import IceConfig
 from fesom_jax.integrate import _run_steps
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.step import step
 from fesom_jax.tke import TkeConfig
 
@@ -222,7 +222,7 @@ def main():
     t0 = time.time()
     mesh = load_mesh(MESH_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    sst0 = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])
+    sst0 = np.asarray(phc_initial_state(mesh, IC_DIR).T[:, 0])
     geo = np.degrees(np.asarray(mesh.geo_coord_nod2D))
     segments = max(2, int(round(math.sqrt(max(1, n)))))
 

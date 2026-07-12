@@ -31,7 +31,7 @@ import pytest
 from fesom_jax import surface_forcing, kpp, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.tke import TkeConfig
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -53,7 +53,7 @@ def run1():
     """Build the CORE2 model + JRA55 1958 forcing (dt=1800), run one eager TKE step, and a
     KPP step from the same IC (for the scheme-engaged check). Eager ~40 s — built once."""
     mesh = load_mesh(MESH_DIR)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
     fs = cf.static

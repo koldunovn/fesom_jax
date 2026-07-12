@@ -142,9 +142,9 @@ def test_calendar_ramp_aware_dt_change():
 # ==========================================================================
 @pytest.fixture(scope="module")
 def core2_setup():
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(CORE2_MESH)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
     part = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
     sm = shard_mesh.build_sharded_mesh(mesh, part)

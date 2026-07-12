@@ -158,17 +158,21 @@ eval "$(python scripts/fetch_data.py --dest ~/fesom-data --print-env)"
 import os, jax.numpy as jnp
 from fesom_jax.mesh import load_mesh
 from fesom_jax.ssh import build_ssh_operator
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import cold_start_state
 from fesom_jax.step import step
-from fesom_jax import surface_forcing, ice
+from fesom_jax import surface_forcing
 from fesom_jax.kpp import KppConfig; from fesom_jax.gm import GMConfig; from fesom_jax.ice import IceConfig
 
 mesh   = load_mesh(os.environ["FESOM_MESH_DIR"])            # the CORE2 mesh you fetched
 op     = build_ssh_operator(mesh, dt=1800.0)
-state0 = core2_initial_state(mesh, os.environ["FESOM_IC_DIR"])   # observed PHC T/S
 stress = jnp.zeros((mesh.elem2D, 2))
+
+# cold_start_state does BOTH cold-start steps in ONE call: the observed PHC temperature and
+# salinity, AND sea ice seeded where the water is already at freezing point. Don't assemble a
+# cold start by hand — a driver here once did the first step and dropped the second, and the
+# model ran ice-free for months before anyone noticed.
+state0 = cold_start_state(mesh, os.environ["FESOM_IC_DIR"])
 sst0   = state0.T[:, 0]
-state0 = ice.seed_ice(state0, mesh, sst0)                   # cold-start sea ice
 
 # Where does the forcing come from? Each input path resolves as
 #     explicit argument  >  $FESOM_* environment variable  >  DKRZ/Levante default

@@ -63,7 +63,7 @@ from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
 from fesom_jax.integrate import integrate
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.tke import TkeConfig
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -103,7 +103,7 @@ def is_oom(e: Exception) -> bool:
 def build(year, n, config):
     """Mesh + (ice-seeded) state + forcing + the live-config dict for the chosen model."""
     mesh = load_mesh(MESH_DIR)
-    base = core2_initial_state(mesh, IC_DIR)
+    base = phc_initial_state(mesh, IC_DIR)
     if config == "all3":
         sst = np.asarray(base.T[:, 0])
         state = ice.seed_ice(base, mesh, sst)                       # mEVP needs an ice IC

@@ -515,8 +515,8 @@ def main():
     t0 = time.time()
     # build the all3 model (n only sizes the throwaway initial stack; chunks re-stack their own forcing)
     mesh, _, op, fs, _, _, cfgs = twin.build(args.year, args.n, args.config)
-    from fesom_jax.phc_ic import core2_initial_state
-    base = core2_initial_state(mesh, twin.IC_DIR)
+    from fesom_jax.phc_ic import phc_initial_state
+    base = phc_initial_state(mesh, twin.IC_DIR)
     cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=np.asarray(base.T[:, 0]))
     node_mask = jnp.asarray(mesh.node_layer_mask)
     w3d = jnp.asarray(mesh.area[:, 0])[:, None] * node_mask

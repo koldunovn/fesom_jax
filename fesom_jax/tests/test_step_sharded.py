@@ -296,10 +296,10 @@ def test_ragged_step_matches_allgather(npes):
 def test_gm_serial_sharded_step_matches_dense():
     """The GM/Redi-ON ocean step under ``shard_map`` on ONE device == the dense GM step,
     byte-identically (the ``exch=None``/identity GM path is a structural no-op)."""
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(CORE2_MESH)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     gm_cfg = GMConfig()
     st_dense = stepmod.step(state, mesh, op, jnp.zeros((mesh.elem2D, 2)), dt=DT,
                             is_first_step=True, gm_cfg=gm_cfg)
@@ -338,10 +338,10 @@ def test_gm_diagnostics_sharded_owned_matches(npes):
         pytest.skip(f"needs {npes} devices, have {NDEV}")
     from fesom_jax import ale, eos, gm
     from fesom_jax.params import Params
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     from fesom_jax.shard_mesh import _shard_along_axis, local_sizes
     mesh = load_mesh(CORE2_MESH)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     gm_cfg, params = GMConfig(), Params.defaults()
 
     # dense GM diagnostics (the reference) + its inputs.
@@ -385,10 +385,10 @@ def test_gm_sharded_step_owned_matches(npes):
     than the part-2 sharp-bump (~1e-3): measured T≈8.6e-3, S≈3.9e-3 (T sharper gradients)."""
     if NDEV < npes:
         pytest.skip(f"needs {npes} devices, have {NDEV}")
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(CORE2_MESH)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     gm_cfg = GMConfig()
     st_dense = stepmod.step(state, mesh, op, jnp.zeros((mesh.elem2D, 2)), dt=DT,
                             is_first_step=True, gm_cfg=gm_cfg)
@@ -416,9 +416,9 @@ def test_gm_sharded_step_owned_matches(npes):
 def core2_forced():
     """CORE2 model + 1-step JRA forcing for the forced-path sharded gates (built once)."""
     from fesom_jax import surface_forcing
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(CORE2_MESH)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     sst0 = np.asarray(state.T[:, 0])
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)

@@ -181,7 +181,7 @@ def ice_initial_state(mesh: Mesh, sst, *, xp=jnp):
     m_snow=0.5``. Else open water (all 0). ``u_ice=v_ice=0`` (caller seeds via State).
 
     ``sst`` is the IC surface temperature [°C] (``[nod2D]``, e.g. ``state.T[:, 0]`` from
-    :func:`fesom_jax.phc_ic.core2_initial_state`). ``xp`` selects the backend (mirrors
+    :func:`fesom_jax.phc_ic.phc_initial_state`). ``xp`` selects the backend (mirrors
     :meth:`State.zeros`): default ``jnp`` (device, byte-identical to before); ``xp=np`` keeps
     the result on the HOST — needed for the big-mesh (dars/NG5) host-build path so the 2-D ice
     fields are not staged on GPU 0. Returns ``(a_ice, m_ice, m_snow)`` ``[nod2D]`` float64."""

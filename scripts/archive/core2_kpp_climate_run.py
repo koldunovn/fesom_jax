@@ -43,7 +43,7 @@ from fesom_jax.ice import IceConfig
 from fesom_jax.kpp import KppConfig
 from fesom_jax.tke import TkeConfig
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import cold_start_state, core2_initial_state
+from fesom_jax.phc_ic import cold_start_state, phc_initial_state
 
 ROOT = Path(__file__).resolve().parents[2]
 MESH_DIR = ROOT / "data" / "mesh_core2"
@@ -245,7 +245,7 @@ def main():
     mesh = load_mesh(MESH_DIR)
     # IC SST is ALWAYS computed (it builds the forcing's static a_ice mask, held fixed) — even
     # on restart, so the continued run uses the SAME forcing as the trajectory it continues.
-    sst0 = np.asarray(core2_initial_state(mesh, ic_dir).T[:, 0])
+    sst0 = np.asarray(phc_initial_state(mesh, ic_dir).T[:, 0])
     if args.load_state:
         import pickle
         with open(args.load_state, "rb") as fpk:

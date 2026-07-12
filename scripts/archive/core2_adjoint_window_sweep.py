@@ -40,7 +40,7 @@ from fesom_jax.ale import AleConfig
 from fesom_jax.integrate import integrate
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.tke import TkeConfig
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -68,7 +68,7 @@ def gpu_limit_gb():
 
 def build(year, n_max):
     mesh = load_mesh(MESH_DIR)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(state.T[:, 0]))
     sfs = cf.stack(surface_forcing.dates_for_steps(year, DT, n_max))

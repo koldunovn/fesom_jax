@@ -61,7 +61,7 @@ from fesom_jax.ice import IceConfig
 from fesom_jax.integrate import integrate
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.tke import TkeConfig
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -107,7 +107,7 @@ def build(year):
     """Mesh + ice-seeded all-on state + forcing + the FULL all-on config dict (forward-only ⇒
     the mEVP ice is fully live; no frozen-ice adjoint needed — that is the whole point of EKI)."""
     mesh = load_mesh(MESH_DIR)
-    base = core2_initial_state(mesh, IC_DIR)
+    base = phc_initial_state(mesh, IC_DIR)
     state = ice.seed_ice(base, mesh, np.asarray(base.T[:, 0]))
     cfgs = dict(gm_cfg=GMConfig(), tke_cfg=TkeConfig(),
                 ice_cfg=IceConfig(whichEVP=1), ale_cfg=AleConfig())   # exact ice (forward-only)

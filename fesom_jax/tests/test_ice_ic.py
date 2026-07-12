@@ -19,7 +19,7 @@ import pytest
 
 from fesom_jax import surface_forcing, ice
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.state import State
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,7 +35,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def core2():
     mesh = load_mesh(MESH_DIR)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     sst = np.asarray(state.T[:, 0])
     a, m, ms = ice.ice_initial_state(mesh, sst)
     return mesh, state, sst, np.asarray(a), np.asarray(m), np.asarray(ms)
@@ -112,7 +112,7 @@ def test_ic_host_build_matches_device(core2):
 
 
 def test_cold_start_state_equals_manual_seed(core2):
-    """``cold_start_state`` == ``ice.seed_ice(core2_initial_state(...))`` **byte-for-byte** — the ONE
+    """``cold_start_state`` == ``ice.seed_ice(phc_initial_state(...))`` **byte-for-byte** — the ONE
     canonical cold-start builder that ``run_from_config`` + the run scripts now share, so the IC +
     ice-seed sequence can't drift (the bug that left run_from_config's prognostic ice at 0).
     ``seed_sea_ice=False`` returns the bare PHC IC (ice State at 0)."""
@@ -121,7 +121,7 @@ def test_cold_start_state_equals_manual_seed(core2):
     from fesom_jax import ice
     from fesom_jax.phc_ic import cold_start_state
     mesh = core2[0]
-    base = core2_initial_state(mesh, IC_DIR)
+    base = phc_initial_state(mesh, IC_DIR)
     manual = ice.seed_ice(base, mesh, base.T[:, 0])          # the pattern every run script uses
     helper = cold_start_state(mesh, IC_DIR)
     for f in dataclasses.fields(type(helper)):

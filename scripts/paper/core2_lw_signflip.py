@@ -56,7 +56,7 @@ from fesom_jax.ice import IceConfig
 from fesom_jax.integrate import _run_steps
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.step import step
 from fesom_jax.tke import TkeConfig
 
@@ -125,7 +125,7 @@ def main():
     with open(args.snap, "rb") as f:
         st0 = jax.device_put(pickle.load(f))
     yr, mo, dy = seed_date(args.snap, args.run_start_year, args.seed_month or None, args.seed_day or None)
-    sst0 = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])          # forcing a_ice mask (fixed)
+    sst0 = np.asarray(phc_initial_state(mesh, IC_DIR).T[:, 0])          # forcing a_ice mask (fixed)
     cf = surface_forcing.build_surface_forcing(mesh, yr, sst_ic=sst0)
     dates = surface_forcing.dates_for_steps(yr, DT, n, start_month=mo, start_day=dy)
     sfs = cf.stack(dates)

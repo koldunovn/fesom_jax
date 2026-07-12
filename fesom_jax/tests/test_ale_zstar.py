@@ -462,9 +462,9 @@ def test_forcing_flip_linfs_vs_zstar(capsys):
     is :func:`test_forcing_dump_gate_zstar_diagnostic` (config-matching is a follow-on)."""
     from fesom_jax import surface_forcing, ice, ice_step
     from fesom_jax.ice import IceConfig
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(CORE2_MESH)
-    state = core2_initial_state(mesh, CORE2_IC)
+    state = phc_initial_state(mesh, CORE2_IC)
     sst = np.asarray(state.T[:, 0])
     state0 = ice.seed_ice(state, mesh, sst)
     cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
@@ -497,9 +497,9 @@ def test_forcing_dump_gate_zstar_diagnostic(capsys):
     max=1.6e-10, ``water_flux`` max=1.4e-9 (bulk-formula ulp accumulation)."""
     from fesom_jax import surface_forcing, ice, ice_step
     from fesom_jax.ice import IceConfig
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(CORE2_MESH)
-    state = core2_initial_state(mesh, CORE2_IC)
+    state = phc_initial_state(mesh, CORE2_IC)
     sst = np.asarray(state.T[:, 0])
     state0 = ice.seed_ice(state, mesh, sst)
     cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
@@ -927,9 +927,9 @@ def test_jz7_assembled_zstar_step1(capsys):
     from fesom_jax.gm import GMConfig
     from fesom_jax.kpp import KppConfig
     from fesom_jax.ice import IceConfig
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(CORE2_MESH)
-    state = core2_initial_state(mesh, CORE2_IC)
+    state = phc_initial_state(mesh, CORE2_IC)
     sst = np.asarray(state.T[:, 0])
     state0 = ice.seed_ice(state, mesh, sst)
     op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
@@ -1089,9 +1089,9 @@ def test_jz7_assembled_zstar_steps123(capsys):
     from fesom_jax.gm import GMConfig
     from fesom_jax.kpp import KppConfig
     from fesom_jax.ice import IceConfig
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(CORE2_MESH)
-    state = core2_initial_state(mesh, CORE2_IC)
+    state = phc_initial_state(mesh, CORE2_IC)
     sst = np.asarray(state.T[:, 0])
     state0 = ice.seed_ice(state, mesh, sst)
     op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
@@ -1211,8 +1211,8 @@ def _mean_sst_z(state, mesh):
 def _jz8_grad_setup(mesh):
     """CORE2 warm-zstar state (stretched hnode via the zstar init) + 1-step forcing + op."""
     from fesom_jax import surface_forcing
-    from fesom_jax.phc_ic import core2_initial_state
-    state = core2_initial_state(mesh, CORE2_IC)
+    from fesom_jax.phc_ic import phc_initial_state
+    state = phc_initial_state(mesh, CORE2_IC)
     sst = np.asarray(state.T[:, 0])
     lat = np.asarray(mesh.geo_coord_nod2D)[:, 1]
     hbar = jnp.asarray(0.5 * np.cos(2.0 * lat))           # ~0.5 m bump ⇒ stretched column

@@ -34,7 +34,7 @@ from fesom_jax import surface_forcing, io_dump, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.gm import GMConfig
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.verify import compare_column
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -59,7 +59,7 @@ def run_gm():
     """Build the CORE2 model + forcing and run ``NSTEPS`` eager GM-ON steps (eager
     ~32 s/step on CPU — run once for the module)."""
     mesh = load_mesh(MESH_DIR)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
     fs = cf.static

@@ -130,7 +130,7 @@ touches it.
    `mixing_tke(..., exch=)`; without it the design passes eager/1-device and fails the sharded
    N-vs-1 gate on boundary-element Av. The final Kv/Av reuse the existing post-exchanges
    (`step.py:191-193`).
-8. ICs: `phc_ic.core2_initial_state` / `ic.initial_state` inherit the rest default (0)
+8. ICs: `phc_ic.phc_initial_state` / `ic.initial_state` inherit the rest default (0)
 9. Tests: `test_state.py:30-44` `_expected_shapes` is the deliberate tripwire — add
    `"tke": (nod2D, nl)` (the `:51` comparison trips on it; the leaf-count check is self-adjusting);
    `test_partition_state.py` + the seven `test_step_sharded.py` field loops cover `tke` automatically

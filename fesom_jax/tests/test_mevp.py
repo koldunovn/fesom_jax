@@ -432,9 +432,9 @@ def ice_harness(mesh):
     mEVP dispatch test."""
     import jax.numpy as jnp                                  # noqa: F401
     from fesom_jax import surface_forcing, ice
-    from fesom_jax.phc_ic import core2_initial_state
-    sst = np.asarray(core2_initial_state(mesh, IC_CORE2).T[:, 0])
-    state0 = ice.seed_ice(core2_initial_state(mesh, IC_CORE2), mesh, sst)
+    from fesom_jax.phc_ic import phc_initial_state
+    sst = np.asarray(phc_initial_state(mesh, IC_CORE2).T[:, 0])
+    state0 = ice.seed_ice(phc_initial_state(mesh, IC_CORE2), mesh, sst)
     cf = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=sst)
     sf = cf.step_forcing(1958, 1, 0.0, 1)                    # 1958-01-01 00:00, January
     return state0, cf, sf

@@ -437,11 +437,15 @@ def build_and_cache_ic(mesh, path: str | None = None,
     return res
 
 
-def core2_initial_state(mesh, ic_dir: str | Path | None = None,
-                        base_T: float = 10.0, base_S: float = 35.0, *, xp=None):
-    """Build a CORE2 :class:`~fesom_jax.state.State` from the cached PHC IC: a rest
-    state (uv=0, eta=0, ``hnode`` from ``zbar_3d_n``) with ``T``/``S`` set to the PHC
-    fields.
+def phc_initial_state(mesh, ic_dir: str | Path | None = None,
+                      base_T: float = 10.0, base_S: float = 35.0, *, xp=None):
+    """Build a :class:`~fesom_jax.state.State` from the **cached PHC IC** (the
+    ``T_ic.npy``/``S_ic.npy`` written by :func:`build_and_cache_ic`): a rest state
+    (uv=0, eta=0, ``hnode`` from ``zbar_3d_n``) with ``T``/``S`` set to the PHC fields.
+
+    Mesh-agnostic — it reads whatever cached IC ``ic_dir`` points at, so it serves ANY mesh
+    (pi/farc/dars/CORE2/NG5). ``ic_dir=None`` ⇒ ``$FESOM_IC_DIR``, else the repo default
+    ``data/ic_core2`` — a *default*, not a constraint.
 
     ``xp`` selects the array backend: the default ``jnp`` is byte-identical to before (builds
     on the default device). ``xp=np`` builds the WHOLE State on the HOST — required for big
@@ -454,7 +458,7 @@ def core2_initial_state(mesh, ic_dir: str | Path | None = None,
     ``values = constant 10/35`` (``fesom_main.c:413``), runs the rest-sanity
     ``advect_one`` which saves ``valuesold = values = 10/35`` (``:724-756``), and only
     THEN loads PHC into ``values`` (``:778``) — leaving ``valuesold`` at the base. So at
-    step 1 ``ttfAB = −(0.5+ε)·base + (1.5+ε)·PHC``, not ``PHC``. This is the CORE2 analog
+    step 1 ``ttfAB = −(0.5+ε)·base + (1.5+ε)·PHC``, not ``PHC``. This is the PHC-IC analog
     of the pi ``T_old``-is-the-pre-blob-base lesson; using ``T_old=PHC`` corrupts the
     step-1 FCT advection (~2e-3 in surface T)."""
     import jax.numpy as jnp
@@ -471,22 +475,31 @@ def core2_initial_state(mesh, ic_dir: str | Path | None = None,
     return dataclasses.replace(st, T=T, S=S, T_old=T_old, S_old=S_old)
 
 
+# DEPRECATED alias, kept so existing scripts and the long-running SLURM chains that import the
+# old name keep working. It is bound to the SAME function object (not a wrapper), so the two
+# names cannot possibly differ numerically. The old name was misleading: it named a *mesh*
+# (CORE2) although the function is mesh-agnostic — it just loads whatever cached PHC IC
+# ``ic_dir`` holds (the ``data/ic_core2`` default is a default, not a constraint). New code
+# should call :func:`phc_initial_state`.
+core2_initial_state = phc_initial_state
+
+
 def cold_start_state(mesh, ic_dir: str | Path | None = None, base_T: float = 10.0,
                      base_S: float = 35.0, *, xp=None, seed_sea_ice: bool = True):
     """THE canonical cold-start :class:`~fesom_jax.state.State` — **use this for any cold start.**
 
     Composes the two steps every run needs, which must NOT be re-implemented piecemeal:
-      1. :func:`core2_initial_state` — the PHC IC (``T``/``S`` + the AB2 ``T_old``/``S_old`` base +
+      1. :func:`phc_initial_state` — the PHC IC (``T``/``S`` + the AB2 ``T_old``/``S_old`` base +
          the rest layer thickness).
       2. :func:`fesom_jax.ice.seed_ice` — the sea-ice IC (``fesom_ice_initial_state``,
          ``fesom_ice.c:246-277``: ``a_ice=0.9`` where SST<0; NH ``m_ice=1``/``m_snow=0.1``, SH
          ``m_ice=2``/``m_snow=0.5``).
 
-    Every validated entry point does ``ice.seed_ice(core2_initial_state(...), mesh, sst)``; the
+    Every validated entry point does ``ice.seed_ice(phc_initial_state(...), mesh, sst)``; the
     model-paper ``run_from_config`` driver originally re-typed step 1 only and DROPPED step 2,
     cold-starting the prognostic ice at 0 (no polar ice until it spins up over months). Routing
     callers through this one helper makes that drift impossible. ``xp`` selects the backend
-    (``np`` ⇒ the big-mesh HOST build, mirrors :func:`core2_initial_state`). ``seed_sea_ice=False``
+    (``np`` ⇒ the big-mesh HOST build, mirrors :func:`phc_initial_state`). ``seed_sea_ice=False``
     returns the bare PHC IC (ice State at 0) for the rare ocean-only case that wants no ice IC.
 
     (Note: ``scripts/bench/bench_forward_scaling.py`` keeps its own ``phc_state`` — a host build with a
@@ -494,7 +507,7 @@ def cold_start_state(mesh, ic_dir: str | Path | None = None, base_T: float = 10.
     import jax.numpy as jnp
     if xp is None:
         xp = jnp
-    state = core2_initial_state(mesh, ic_dir, base_T=base_T, base_S=base_S, xp=xp)
+    state = phc_initial_state(mesh, ic_dir, base_T=base_T, base_S=base_S, xp=xp)
     if seed_sea_ice:
         from . import ice
         state = ice.seed_ice(state, mesh, state.T[:, 0], xp=xp)

@@ -57,10 +57,10 @@ def main():
     from fesom_jax.integrate import integrate
     from fesom_jax.kpp import KppConfig
     from fesom_jax.mesh import load_mesh
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
 
     mesh = load_mesh(args.mesh_dir)
-    st0 = core2_initial_state(mesh, args.ic_dir)
+    st0 = phc_initial_state(mesh, args.ic_dir)
     sst0 = np.asarray(st0.T[:, 0])
     if args.ice:
         st0 = ice.seed_ice(st0, mesh, sst0)

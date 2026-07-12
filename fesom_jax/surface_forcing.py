@@ -273,7 +273,7 @@ def build_surface_forcing(mesh: Mesh, year: int, *, sst_ic=None,
 
     ``sst_ic`` (``[nod2D]``, the PHC IC surface temperature) builds the static ``a_ice``
     mask (:func:`ice_ic_aice`); pass ``state.T[:, 0]`` from
-    :func:`fesom_jax.phc_ic.core2_initial_state`. ``None`` ⇒ ``a_ice≡0`` (truly ice-free;
+    :func:`fesom_jax.phc_ic.phc_initial_state`. ``None`` ⇒ ``a_ice≡0`` (truly ice-free;
     e.g. constant-T sanity runs).
 
     ``chl_const`` (default ``None``) selects the chl source: ``None`` ⇒ the Sweeney

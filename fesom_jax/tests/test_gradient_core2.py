@@ -46,10 +46,10 @@ def core2():
 
     from fesom_jax import surface_forcing, ssh
     from fesom_jax.mesh import load_mesh
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
 
     mesh = load_mesh(MESH_DIR)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=_np.asarray(state.T[:, 0]))
     sfs = cf.stack(surface_forcing.dates_for_steps(YEAR, DT, 1))   # leading axis [1]

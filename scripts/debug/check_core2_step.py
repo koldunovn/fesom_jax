@@ -7,7 +7,7 @@ from pathlib import Path
 
 from fesom_jax import io_dump, surface_forcing, step as stepmod, ssh
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.verify import compare_column
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,7 +19,7 @@ YEAR = 1958
 
 print("load mesh + IC + op ...")
 mesh = load_mesh(MESH)
-state = core2_initial_state(mesh)
+state = phc_initial_state(mesh)
 op = ssh.build_ssh_operator(mesh, dt=DT)
 
 print("build forcing (year %d) ..." % YEAR)

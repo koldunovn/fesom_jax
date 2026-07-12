@@ -44,7 +44,7 @@ from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
 from fesom_jax.ice_evp import boundary_node_mask
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.shard_mesh import _shard_along_axis, local_sizes
 from fesom_jax.tke import TkeConfig
 from fesom_jax.ale import AleConfig
@@ -110,7 +110,7 @@ def main():
 
     # ---------- build dense, then shard over P devices ----------
     mesh = load_mesh(MESH_DIR)
-    base = core2_initial_state(mesh, IC_DIR)
+    base = phc_initial_state(mesh, IC_DIR)
     if args.from_s0 is not None:
         import pickle
         with open(args.from_s0, "rb") as fpk:

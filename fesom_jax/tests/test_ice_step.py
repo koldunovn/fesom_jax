@@ -43,11 +43,11 @@ def assembled():
     from fesom_jax import step as stepmod
     from fesom_jax.ice import IceConfig
     from fesom_jax.mesh import load_mesh
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
 
     mesh = load_mesh(MESH_DIR)
-    sst = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])
-    state0 = ice.seed_ice(core2_initial_state(mesh, IC_DIR), mesh, sst)
+    sst = np.asarray(phc_initial_state(mesh, IC_DIR).T[:, 0])
+    state0 = ice.seed_ice(phc_initial_state(mesh, IC_DIR), mesh, sst)
     op = ssh.build_ssh_operator(mesh, dt=DT)
     cf = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=sst)
     sf = cf.step_forcing(1958, 1, 0.0, 1)               # step 1: 1958-01-01 00:00, January
@@ -173,7 +173,7 @@ def test_no_ice_path_unchanged(assembled):
     from fesom_jax import surface_forcing, ice, ssh
     from fesom_jax import step as stepmod
     from fesom_jax.mesh import load_mesh
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh, s0, _new, _recs, cf, sf = assembled
     op = ssh.build_ssh_operator(mesh, dt=DT)
     stress0 = jnp.zeros((int(mesh.elem2D), 2))

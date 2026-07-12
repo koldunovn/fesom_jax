@@ -143,7 +143,7 @@ verification needs it (cheap).
 
 > **✅ DONE 2026-06-06.** `fesom_jax/phc_ic.py` (faithful numpy port of `fesom_phc.c`:
 > bilinear interp + **sequential GS** `extrap_nod3D` + vertical fill + `ptheta`) +
-> `build_and_cache_ic` + `core2_initial_state`. Verified vs the C dump (job 25386555,
+> `build_and_cache_ic` + `phc_initial_state`. Verified vs the C dump (job 25386555,
 > `data/phc_dump_core2/`): **bracket indices EXACT**, pre-extrap surface **~1e-14**,
 > **post-load surface ~1e-14** (the order-dependent GS replicated exactly), 0 nodes off
 > by >1e-12. Cache `data/ic_core2/{T,S}_ic.npy` (T∈[−2.06,30.05]°C, S∈[5.63,41.12] wet).
@@ -565,7 +565,7 @@ seam).**
   (PHC initial conditions)**.
 - **2026-06-06 — Task 5.2 DONE (PHC initial conditions).** `fesom_jax/phc_ic.py` — faithful
   numpy port of `fesom_phc.c` (bilinear interp + sequential-GS `extrap_nod3D` + vertical
-  fill + Bryden-1973 `ptheta`); `build_and_cache_ic` + `core2_initial_state`. Verified vs the
+  fill + Bryden-1973 `ptheta`); `build_and_cache_ic` + `phc_initial_state`. Verified vs the
   C surface dumps (job 25386555): bracket indices EXACT, pre/post-load surface **~1e-14**
   (GS replicated exactly — the #1 risk cleared). Cache `data/ic_core2/`; `test_phc_ic.py`
   5 passed. **Env: netCDF4 installed** (user-approved; numpy 2.4.6 / jax 0.10.1 unchanged;

@@ -765,7 +765,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   literally — bracket indices match the C **exactly**), bilinear-horizontal + linear-vertical
   interp onto `mesh.Z`, then `extrap_nod3D` + vertical fill + `ptheta`. The IC is
   **non-differentiable setup** (host numpy, not JAX), cached to `data/ic_core2/{T,S}_ic.npy`;
-  `core2_initial_state` injects it via `dataclasses.replace`. (Task 5.2.)
+  `phc_initial_state` injects it via `dataclasses.replace`. (Task 5.2.)
 
 - **[phc/extrap] ⚠️ The land-extrapolation is SEQUENTIAL Gauss-Seidel (order-dependent) and
   must be replicated as such — a Jacobi pass gives different values.** Each dummy ocean node
@@ -998,12 +998,12 @@ Cite the C source (`file:line`) or dump probe that proves it.
   (`fesom_main.c`): set `values = const 10/35` (`:413`) → run the rest-sanity `advect_one`
   which saves `valuesold = values = 10/35` (`:724-756`, via `init_tracers_AB_one`) → **then**
   `fesom_phc_load_ic` overwrites `values = PHC` but leaves `valuesold` (`:778`). So at step 1
-  `ttfAB = −(0.5+ε)·base + (1.5+ε)·PHC`, not `PHC`. `core2_initial_state` had `T_old=T=PHC` →
+  `ttfAB = −(0.5+ε)·base + (1.5+ε)·PHC`, not `PHC`. `phc_initial_state` had `T_old=T=PHC` →
   corrupted the step-1 FCT advection: post-step `T` was off **2.4e-3** (a *large fraction of the
   one-step tendency*, surface-concentrated with an opposite-sign dipole at level 1). Fix:
   `T_old = masked base 10`, `S_old = masked base 35`. *Lesson (3rd time, pi+CORE2): at step 1
   `T_old ≠ T`; the IC's `valuesold` is whatever the last pre-IC-overwrite `advect_one` saved.*
-  (`phc_ic.core2_initial_state`, Task 5.6.)
+  (`phc_ic.phc_initial_state`, Task 5.6.)
 
 - **[bulk/fixed-iters] ⚠️ `FESOM_BULK_FIXED_ITERS=1` was honored ONLY by `fesom_bulk_dump`,
   NOT by the time-loop `fesom_bulk_compute` (hardcoded `fixed_iters=0` = early-break).** So the
@@ -2437,7 +2437,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   state — the latter degenerates (N²≈0 ⇒ the ODM95 slope taper collapses, the slopes blow up).** GM is purely
   diagnostic (no surface forcing, no reductions), so it gates WITHOUT the forced path — but it needs genuine
   vertical stratification or `compute_neutral_slope`'s `denom=max(bv0+bv1, eps²)` floors to `eps²` and the
-  `sigma_xy·(2g/ρ₀/eps²)` slopes explode. The cached `core2_initial_state` (PHC IC) is the right state; it
+  `sigma_xy·(2g/ρ₀/eps²)` slopes explode. The cached `phc_initial_state` (PHC IC) is the right state; it
   isolates the GM exchanges from the forcing/reduction wiring (which KPP/ice need).
 
 ## Phase 8 — sharding (Task S.7 part 3 — reductions routing + the forced-path forcing fold)
@@ -4030,7 +4030,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   continuation must run **`is_first_step=False` throughout** (`is_first_step=(i==0) and not loaded`) — re-
   cold-starting the AB2 first step would corrupt it. With that, a restart is **BYTE-IDENTICAL** to never
   having stopped (pi-mesh save→pickle-roundtrip→continue test, k=1 and k=3). **Second subtlety:** even on
-  restart `sst0` is STILL computed from the IC (`core2_initial_state`), because it builds the forcing's
+  restart `sst0` is STILL computed from the IC (`phc_initial_state`), because it builds the forcing's
   static `a_ice` mask — deriving it from the restart state would change the mask and break continuity with
   the trajectory being continued. No-flags ⇒ `params=None` passed (not `Params.defaults()`) ⇒ the byte-
   identical default path is untouched. Plus a `/work`-discipline guard: `--save-state`/`--snapshot-dir` must
@@ -4284,7 +4284,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   The config-driven `run.py` driver works **single-node** at farc (638 k / 4 GPU) first try, but the dars
   (3.16 M, multi-node `jax.distributed`) B0 surfaced FIVE distinct scale/multi-process issues — each invisible
   single-node, each a genuine blocker for ANY multi-node run (incl. NG5), and the ladder caught them all cheaply
-  on dars instead of the NG5 flagship. In peel order: **(1) GPU-0 setup OOM** — `core2_initial_state` built the
+  on dars instead of the NG5 flagship. In peel order: **(1) GPU-0 setup OOM** — `phc_initial_state` built the
   global State on GPU 0 (~50-80 GB at 3.16 M); fix = host-build (`xp=np`, the Phase-8b B.3 pattern; value-
   identical). **(2) `np.asarray` on a cross-process global** — `write_restart`/resume pulled a multi-process
   sharded array to host (`spans non-addressable devices`); fix = fold on-device + let `_to_global_sharded` pass
@@ -4370,7 +4370,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   point has. **(1) `ice.seed_ice` missing** — it cold-started the prognostic ice at `a_ice=0` instead of the C
   `fesom_ice_initial_state` (`a_ice=0.9` where SST<0, NH `m_ice=1`/SH `m_ice=2`). So in a 3-day Jan run there was
   no Antarctic (summer-hemisphere) ice; the Arctic grew from 0. EVERY validated run (`core2_kpp_climate_run`, all
-  `core2_*_stability_run`, `bench_forward_scaling`, all ice tests) does `ice.seed_ice(core2_initial_state(...),
+  `core2_*_stability_run`, `bench_forward_scaling`, all ice tests) does `ice.seed_ice(phc_initial_state(...),
   mesh, sst)` — so the ladder was sound; only the new driver missed it. **(2) `boundary_node_p` missing** — the
   sharded mEVP fell back to `boundary_node_mask(LOCAL mesh)`, which marks PARTITION CUTS as coasts (the EVP zeros
   `u_ice`/`v_ice` at "boundary" nodes, `fesom_ice_evp.c:430-437`) ⇒ artificial ice-velocity walls on interior
@@ -5072,3 +5072,24 @@ Cite the C source (`file:line`) or dump probe that proves it.
   every file must round-trip to a byte-identical original, or the diff is not the pure rename you
   claimed.** (Ironically `CORE2_runoff.nc` — a real file on disk, inside the JRA55-do directory —
   keeps its name; not every "core2" in the forcing path is a mistake.)
+
+- **[usability] A misleading name can hide in a DEFAULT ARGUMENT** (`phc_ic.phc_initial_state`, the
+  sibling of the `surface_forcing` rename above; the old name is kept as a module-level alias and,
+  as there, is deliberately not spelled out here so that grepping the tree for it stays a clean
+  "are we done?" gate). Same disease as the forcing driver — the function was named after a **mesh**
+  (CORE2) though it is entirely mesh-agnostic: it is called with pi, farc, dars and NG5, and all it
+  does is load the cached PHC initial condition (`T_ic.npy`/`S_ic.npy`) into a rest `State`. What
+  made this one easy to overlook is *where* the only real "core2" lived: not in the body, but in the
+  **default** `ic_dir=data/ic_core2`. A default is not a constraint — every non-CORE2 caller already
+  passed its own IC directory — yet the name had quietly promoted that default into an apparent
+  precondition, which is precisely the fact a new user reads off a signature. **Lesson: when you
+  audit names, read the defaults as if a user will mistake them for requirements, because they will.**
+  Two smaller notes worth keeping. (1) *Match the shim to the shape of the rename*: the forcing rename
+  moved a whole MODULE and needed a deprecation shim module with a PEP-562 `__getattr__`; this one
+  renames a single function *inside* a module that keeps its name, so one line — the old name bound to
+  the **same function object**, not a wrapper — is the whole compatibility story, and binding rather
+  than wrapping is what makes "numerics cannot have changed" a fact about the code instead of a claim
+  about the diff. (2) A rename **invalidates the comments that apologised for the old name**: the
+  new-mesh guide's `# mesh-agnostic despite the name` was true only while the name was wrong, and a
+  `sed` will happily leave that fossil behind, still passing every test — so grep the prose for the
+  hedges the bad name forced you to write, and delete them with it.

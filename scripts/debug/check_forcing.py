@@ -37,8 +37,8 @@ def main():
     sst0 = None
     ic = Path(args.ic_dir) / "T_ic.npy"
     if ic.exists() and np.load(ic, mmap_mode="r").shape[0] == mesh.nod2D:
-        from fesom_jax.phc_ic import core2_initial_state
-        sst0 = np.asarray(core2_initial_state(mesh, args.ic_dir).T[:, 0])
+        from fesom_jax.phc_ic import phc_initial_state
+        sst0 = np.asarray(phc_initial_state(mesh, args.ic_dir).T[:, 0])
     elif ic.exists():
         print(f"[forcing] IC {ic} ({np.load(ic, mmap_mode='r').shape[0]} nodes) != mesh "
               f"({mesh.nod2D}) — ice-free smoke (a_ice≡0)")

@@ -40,10 +40,10 @@ def coupling():
     import jax.numpy as jnp
     from fesom_jax import ice_coupling, io_dump, sss_runoff
     from fesom_jax.mesh import load_mesh
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
 
     mesh = load_mesh(MESH_DIR)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
 
     # all-node C flx_fw/flx_h from the thermo dump (row i = node i; gid = i+1)
     with open(THERMO) as f:
@@ -218,9 +218,9 @@ def test_coupling_ad(coupling):
     import jax.numpy as jnp
     from fesom_jax import ice_coupling, sss_runoff
     from fesom_jax.mesh import load_mesh
-    from fesom_jax.phc_ic import core2_initial_state
+    from fesom_jax.phc_ic import phc_initial_state
     mesh = load_mesh(MESH_DIR)
-    state = core2_initial_state(mesh, IC_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
     reader = sss_runoff.build_reader(mesh)
     Ssurf = jnp.asarray(reader.month(1)); runoff = jnp.asarray(reader.runoff_node)
     areasvol = jnp.asarray(np.asarray(mesh.areasvol)[:, 0])

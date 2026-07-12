@@ -33,7 +33,7 @@ from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
 from fesom_jax.ice_evp import boundary_node_mask
 from fesom_jax.mesh import load_mesh
-from fesom_jax.phc_ic import core2_initial_state
+from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.shard_mesh import _shard_along_axis, local_sizes
 from fesom_jax.tke import TkeConfig
 from pathlib import Path
@@ -85,7 +85,7 @@ def main():
     assert ndev >= NPES, f"need {NPES} devices; XLA_FLAGS=--xla_force_host_platform_device_count={NPES}"
 
     mesh = load_mesh(MESH_DIR)
-    base = core2_initial_state(mesh, IC_DIR)
+    base = phc_initial_state(mesh, IC_DIR)
     sst0 = np.asarray(base.T[:, 0])
     state = ice.seed_ice(base, mesh, sst0)
     op = ssh.build_ssh_operator(mesh, dt=DT)
