@@ -116,6 +116,20 @@ def reassemble(archive: dict, files: dict, dest: Path) -> Path:
         print(f"  {name}: already assembled")
         return out
 
+    # Not split at all: the archive's only "part" IS the archive. Just download it (concatenating
+    # would mean reading and writing the same path).
+    if parts == [name]:
+        if name not in files:
+            _die(f"record is missing {name}")
+        download(files[name]["url"], out, files[name]["size"])
+        print(f"  {name}: verifying sha256...", flush=True)
+        got = sha256sum(out)
+        if got != archive["sha256"]:
+            _die(f"{name}: sha256 mismatch (got {got}, expected {archive['sha256']}) — "
+                 "delete it and re-run")
+        print(f"  {name}: verified")
+        return out
+
     print(f"  {name}: {len(parts)} part(s), {archive['size'] / 2**30:.2f} GB")
     part_paths = []
     for i, p in enumerate(parts, 1):

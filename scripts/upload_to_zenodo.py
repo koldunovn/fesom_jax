@@ -19,23 +19,33 @@ Stdlib only (no requests/click), so it runs in the fesom-jax env as-is.
     python scripts/upload_to_zenodo.py --stage /work/ab0995/a270088/zenodo_core2 --sandbox
     python scripts/upload_to_zenodo.py --stage /work/ab0995/a270088/zenodo_core2
 
-WHY THE ARCHIVES ARE SPLIT INTO PARTS
--------------------------------------
-Zenodo has **no resumable upload** (multipart is only on the InvenioRDM roadmap), and multi-GB PUTs
-to it are known to die mid-transfer at a random point (zenodo/zenodo#2328: "randomly stopped anywhere
-between 10-99%"). Observed here: the connection is dropped after ~20-30 s regardless of how many
-bytes have gone -- so a single 10.4 GB PUT can never finish, and even a 369 MB one failed 3/3.
+THE USER-AGENT TRAP (read this before you "fix" a mysterious upload failure)
+---------------------------------------------------------------------------
+**Zenodo's edge rejects any request with no User-Agent header** -- with an HTML `403 Forbidden`,
+before the API ever sees it. `urllib` sets a UA automatically; **`http.client` does not**, so the
+JSON API calls here worked while every file PUT died, which is a maddening way for it to present.
 
-So we never PUT a whole archive. Each is sliced into `--split-mb` parts (default 128 MB, ~13 s each),
-streamed straight from the original file (a seek + bounded read -- no extra disk), and every part is
-retried on its own. `MANIFEST.json` on the record records the parts and each archive's sha256;
-`scripts/fetch_data.py` reassembles and verifies them, so the split is invisible to whoever downloads
-it. Zenodo allows 100 files / 50 GB per record, which bounds how small the parts can be.
+Worse, it does not look like a 403 at all. nginx answers immediately, then *lingering-closes*: it
+keeps reading and discarding the request body for ~30 s before killing the socket. So a big upload
+dies with `BrokenPipeError` after ~20-30 s at a random byte offset, and looks exactly like a
+mid-transfer network drop. It is not. It is a 403 you never read.
+
+Two lessons, both encoded below: always send a User-Agent, and when a socket dies mid-body, still
+call `getresponse()` -- the server's real answer is usually sitting there.
+
+LARGE FILES
+-----------
+Zenodo has **no resumable upload** (multipart is only on the InvenioRDM roadmap), so a PUT that dies
+at 99% starts over, and multi-GB uploads are reported to abort at random (zenodo/zenodo#2328). By
+default each archive is uploaded as ONE file -- the nicer artifact. If a multi-GB PUT does prove
+flaky, `--split-mb 1024` slices it into parts, streamed straight from the original file (seek +
+bounded read, no extra disk), each retried on its own. `MANIFEST.json` records the parts and each
+archive's sha256, and `scripts/fetch_data.py` rejoins and verifies them, so a split is invisible to
+whoever downloads it. Zenodo allows 100 files / 50 GB per record, which bounds the part size.
 
 RESUMING
 --------
-Every part is a separate file on the draft, and files already present are skipped -- so if the
-upload dies, just re-run it against the same draft and it picks up where it stopped:
+Files already on the draft are skipped, so a failed upload resumes rather than restarting:
 
     python scripts/upload_to_zenodo.py --stage <STAGE> --deposition <DRAFT_ID>
 
@@ -62,6 +72,9 @@ from pathlib import Path
 
 PROD = "zenodo.org"
 SANDBOX = "sandbox.zenodo.org"
+
+# Zenodo's edge rejects requests with no User-Agent (HTML 403, before the API ever sees them).
+USER_AGENT = "fesom-jax-zenodo-uploader/1.0 (+https://github.com/koldunovn/fesom_jax)"
 
 # The two archives, in upload order (small first, so a metadata mistake surfaces before the 10 GB).
 ARCHIVES = ("core2_mesh_ic.zip", "core2_forcing_1958.zip")
@@ -137,7 +150,8 @@ def _api(host: str, method: str, path: str, token: str, payload=None) -> tuple[i
     url = f"{url}{sep}access_token={urllib.parse.quote(token)}"
     data = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(url, data=data, method=method,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json",
+                                          "User-Agent": USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             body = r.read()
@@ -195,6 +209,13 @@ def put_slice(bucket_url: str, path: Path, name: str, offset: int, length: int,
             conn.putrequest("PUT", target)
             conn.putheader("Content-Length", str(length))
             conn.putheader("Content-Type", "application/octet-stream")
+            # A User-Agent is MANDATORY. http.client sends none by default (urllib does, which is
+            # why the JSON API calls worked and only the file PUTs failed). Zenodo's edge answers a
+            # UA-less request with an HTML 403 -- and then nginx lingering-close keeps reading and
+            # discarding the body for ~30 s before killing the socket, which is what made this look
+            # like a mid-transfer network drop instead of an instant rejection. Verified: identical
+            # PUT, no UA -> HTML 403; with UA -> JSON from the API.
+            conn.putheader("User-Agent", USER_AGENT)
             conn.endheaders()
 
             sent, t0, last = 0, time.time(), 0.0
@@ -270,9 +291,12 @@ def main() -> int:
     ap.add_argument("--deposition", type=int,
                     help="add to / update an EXISTING draft deposition instead of creating one. "
                          "THIS IS HOW YOU RESUME: parts already on the draft are skipped")
-    ap.add_argument("--split-mb", type=int, default=128,
-                    help="upload files larger than this as N-MB parts (default 128). Zenodo has no "
-                         "resumable upload and drops long PUTs, so big files MUST be sliced. 0 = off")
+    ap.add_argument("--split-mb", type=int, default=0,
+                    help="upload files larger than this as N-MB parts (0 = off, the default: upload "
+                         "each archive as ONE file, which is the nicer artifact). Zenodo has no "
+                         "resumable upload, so if a multi-GB PUT proves flaky, set e.g. --split-mb "
+                         "1024: each part is retried and re-runs skip parts already uploaded, so "
+                         "the upload resumes instead of restarting")
     args = ap.parse_args()
 
     host = SANDBOX if args.sandbox else PROD
