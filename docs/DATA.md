@@ -142,8 +142,8 @@ The `forcing:` block is strict-keyed: only `kind`, `start_year`, `jra_dir`, `sss
 Python (explicit argument; wins over everything):
 
 ```python
-from fesom_jax import core2_forcing
-forcing = core2_forcing.build_core_forcing(mesh, 1958, sst_ic=sst0,
+from fesom_jax import surface_forcing
+forcing = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=sst0,
                                            jra_dir="/data/JRA55-do-v1.4.0")
 ```
 

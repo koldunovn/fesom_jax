@@ -30,7 +30,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from fesom_jax import core2_forcing, ice, ssh
+from fesom_jax import surface_forcing, ice, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
@@ -108,8 +108,8 @@ def main():
     sst0 = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])
     state = ice.seed_ice(core2_initial_state(mesh, IC_DIR), mesh, sst0)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=sst0)
-    dates = core2_forcing.dates_for_steps(YEAR, DT, 2)
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
+    dates = surface_forcing.dates_for_steps(YEAR, DT, 2)
     ice_cfg, gm_cfg, kpp_cfg = IceConfig(), GMConfig(), KppConfig()
     print(f"[setup] built in {time.time()-t0:.1f}s; assembled KPP+GM+ice, dt={DT:.0f}", flush=True)
 

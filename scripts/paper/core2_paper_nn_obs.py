@@ -53,7 +53,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from fesom_jax import ale, calibrate, core2_forcing, obs_compare, tke_nn
+from fesom_jax import ale, calibrate, surface_forcing, obs_compare, tke_nn
 from fesom_jax.integrate import integrate
 
 import core2_paper_nn_twin as twin          # build/reconstruct_features/peak_gb/gpu_limit_gb/is_oom/DT
@@ -147,7 +147,7 @@ def run_train(args, mesh, op, fs, cfgs, cf, node_mask, w3d, Hmap, cell_lat, cell
     for s, f in pairs:
         with open(f, "rb") as fp:
             starts_host.append(pickle.load(fp))                # host State (device_get'd at save)
-        dts = core2_forcing.dates_for_steps(args.year, DT, s + args.n)
+        dts = surface_forcing.dates_for_steps(args.year, DT, s + args.n)
         frc.append(cf.stack(dts[s:s + args.n]))
         m = dts[s][3]                                          # (year, doy, sec, month) → month
         months.append(m)
@@ -393,7 +393,7 @@ def run_validate(args, mesh, op, fs, cfgs, cf, node_mask, w3d, Hmap, cell_lat, c
         t1 = time.time()
         for seg in range(n_seg):
             off = start_step + seg * args.long_seg
-            dts = core2_forcing.dates_for_steps(args.year, DT, off + args.long_seg)
+            dts = surface_forcing.dates_for_steps(args.year, DT, off + args.long_seg)
             frc_seg = cf.stack(dts[off:off + args.long_seg])
             state = fwd_seg(nn, state, frc_seg)
             state.T.block_until_ready()
@@ -517,7 +517,7 @@ def main():
     mesh, _, op, fs, _, _, cfgs = twin.build(args.year, args.n, args.config)
     from fesom_jax.phc_ic import core2_initial_state
     base = core2_initial_state(mesh, twin.IC_DIR)
-    cf = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=np.asarray(base.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=np.asarray(base.T[:, 0]))
     node_mask = jnp.asarray(mesh.node_layer_mask)
     w3d = jnp.asarray(mesh.area[:, 0])[:, None] * node_mask
     Hmap, _, (cell_lat, cell_lon) = cobs.load_woa(mesh, 1)        # Hmap is month-independent

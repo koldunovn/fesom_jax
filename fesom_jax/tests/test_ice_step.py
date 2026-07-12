@@ -39,7 +39,7 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def assembled():
     import jax.numpy as jnp
-    from fesom_jax import core2_forcing, ice, io_dump, ssh
+    from fesom_jax import surface_forcing, ice, io_dump, ssh
     from fesom_jax import step as stepmod
     from fesom_jax.ice import IceConfig
     from fesom_jax.mesh import load_mesh
@@ -49,7 +49,7 @@ def assembled():
     sst = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])
     state0 = ice.seed_ice(core2_initial_state(mesh, IC_DIR), mesh, sst)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, 1958, sst_ic=sst)
+    cf = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=sst)
     sf = cf.step_forcing(1958, 1, 0.0, 1)               # step 1: 1958-01-01 00:00, January
     cfg = IceConfig()
     stress0 = jnp.zeros((int(mesh.elem2D), 2))
@@ -170,7 +170,7 @@ def test_no_ice_path_unchanged(assembled):
     """``ice_cfg=None`` ⇒ the Phase-5 static-ice surface-flux path (the prognostic ice fields
     stay at their seeded values — the ice step did not run)."""
     import jax.numpy as jnp
-    from fesom_jax import core2_forcing, ice, ssh
+    from fesom_jax import surface_forcing, ice, ssh
     from fesom_jax import step as stepmod
     from fesom_jax.mesh import load_mesh
     from fesom_jax.phc_ic import core2_initial_state

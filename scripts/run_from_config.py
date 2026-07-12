@@ -33,7 +33,7 @@ if os.environ.get("JDIST"):
         local_device_ids=list(range(int(os.environ.get("GPUS_PER_NODE", "4")))))
 _IS_LEAD = (not os.environ.get("JDIST")) or jax.process_index() == 0
 
-from fesom_jax import core2_forcing, partit, shard_mesh, ssh
+from fesom_jax import surface_forcing, partit, shard_mesh, ssh
 from fesom_jax.mesh import load_mesh
 from fesom_jax.run import run_from_config
 from fesom_jax.run_config import load_yaml
@@ -164,7 +164,7 @@ def main():
     # keys win; absent (all None) ⇒ each reader resolves $FESOM_* → the Levante default
     # (fesom_jax/paths.py, docs/DATA.md) — the historical behaviour.
     fpaths = cfg.forcing_paths()
-    forcing = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0,
+    forcing = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0,
                                                **fpaths); _lap("forcing_setup")
 
     # The NG5 host-forcing fix: build a LOCAL-node forcing (interp only this process's owned

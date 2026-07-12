@@ -44,7 +44,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from fesom_jax import core2_forcing, eos, kpp, pp, ssh
+from fesom_jax import surface_forcing, eos, kpp, pp, ssh
 from fesom_jax.integrate import integrate
 from fesom_jax.kpp import KppConfig
 from fesom_jax.mesh import load_mesh
@@ -62,8 +62,8 @@ def build(year, n):
     mesh = load_mesh(MESH_DIR)
     state = core2_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, year, sst_ic=np.asarray(state.T[:, 0]))
-    sfs = cf.stack(core2_forcing.dates_for_steps(year, DT, n))
+    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(state.T[:, 0]))
+    sfs = cf.stack(surface_forcing.dates_for_steps(year, DT, n))
     return mesh, state, op, cf.static, sfs
 
 
@@ -114,7 +114,7 @@ def main():
     # so trace K_bg through the replicated mixing chain with the wscale tables prebuilt from
     # the static cfg (build_wscale_tables lru_cache needs a hashable cfg). The k_bg-independent
     # prestep/bldepth (forcing + dbsfc + tables) are computed once outside the loss.
-    cf_step = core2_forcing.compute_surface_fluxes(
+    cf_step = surface_forcing.compute_surface_fluxes(
         mesh, st0, jax.tree.map(lambda x: x[0], sfs), fs, dt=DT)
     bvfreq = eos.compute_pressure_bv(mesh, st0.T, st0.S, st0.hnode)[2]
     sw_alpha, sw_beta = eos.compute_sw_alpha_beta(mesh, st0.T, st0.S)

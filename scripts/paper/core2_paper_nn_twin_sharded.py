@@ -38,7 +38,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from fesom_jax import calibrate, core2_forcing, ice, partit, shard_mesh, ssh, tke_nn
+from fesom_jax import calibrate, surface_forcing, ice, partit, shard_mesh, ssh, tke_nn
 from fesom_jax import integrate_sharded as ish
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
@@ -119,8 +119,8 @@ def main():
         dense = ice.seed_ice(base, mesh, np.asarray(base.T[:, 0])) if args.config == "all3" else base
     sst0 = np.asarray(base.T[:, 0])
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=sst0)
-    sf = cf.step_forcing(*core2_forcing.dates_for_steps(YEAR, DT, 1)[0])
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
+    sf = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
     fs = cf.static
     if args.config == "all3":
         cfg = dict(tke_cfg=TkeConfig(), gm_cfg=GMConfig(),

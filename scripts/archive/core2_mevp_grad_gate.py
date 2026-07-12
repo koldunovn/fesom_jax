@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from fesom_jax import core2_forcing, ice, ssh
+from fesom_jax import surface_forcing, ice, ssh
 from fesom_jax.config import A_VER
 from fesom_jax.ice import IceConfig
 from fesom_jax.integrate import integrate
@@ -50,8 +50,8 @@ def build(year, n):
     sst = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])
     state = ice.seed_ice(core2_initial_state(mesh, IC_DIR), mesh, sst)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, year, sst_ic=sst)
-    sfs = cf.stack(core2_forcing.dates_for_steps(year, DT, n))
+    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=sst)
+    sfs = cf.stack(surface_forcing.dates_for_steps(year, DT, n))
     return mesh, state, op, cf.static, sfs
 
 

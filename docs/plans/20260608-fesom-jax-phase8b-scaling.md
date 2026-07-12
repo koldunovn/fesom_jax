@@ -315,7 +315,7 @@ timing from the 2-compile subtraction to compile-once + warm-call). NG5 IC cachi
 
 ### #5 — FULL model (real JRA+PHC+ice): JAX is COMPARABLE to Kokkos-CUDA; the "10×" was a compile bug (2026-06-09)
 Two corrections (both user-flagged): (a) the bench must use the **REAL Kokkos setup** — PHC winter IC
-(`phc_ic.load_phc_ic`, mesh-agnostic) + JRA55 1958 (`build_core_forcing`, mesh-agnostic) + prognostic ice
+(`phc_ic.load_phc_ic`, mesh-agnostic) + JRA55 1958 (`build_surface_forcing`, mesh-agnostic) + prognostic ice
 (real a_ice cover ⇒ the EVP does real work) — NOT synthetic constant forcing; (b) the timed window must
 **exclude XLA compile**. The original bench warmed up at n=2 but timed n=N (different scan length ⇒ different
 executable) and `run_steps_sharded` re-jits a fresh shard_map each call ⇒ the timed wall-time was

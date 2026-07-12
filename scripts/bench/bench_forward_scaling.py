@@ -133,7 +133,7 @@ def main():
 
     full_kw = {}
     if args.full:
-        from fesom_jax import ice, ice_evp, core2_forcing
+        from fesom_jax import ice, ice_evp, surface_forcing
         from fesom_jax.ice import IceConfig
         from fesom_jax.kpp import KppConfig
         from fesom_jax.gm import GMConfig
@@ -142,8 +142,8 @@ def main():
         state = phc_state(mesh, args.ic_dir)
         sst0 = np.asarray(state.T[:, 0])
         state = ice.seed_ice(state, mesh, sst0)                        # seed BEFORE partition
-        cf = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0)
-        y, d, s, mo = core2_forcing.dates_for_steps(args.year, DT, 1)[0]
+        cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0)
+        y, d, s, mo = surface_forcing.dates_for_steps(args.year, DT, 1)[0]
         sf, fs = cf.step_forcing(y, d, s, mo), cf.static               # real JRA, run start date
         bn = np.asarray(ice_evp.boundary_node_mask(mesh))
         _, Lmax = local_sizes(part)

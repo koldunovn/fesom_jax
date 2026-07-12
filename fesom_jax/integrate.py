@@ -104,7 +104,7 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
     memory comparison). ``params=None`` ⇒ the config-constant baseline.
 
     **CORE2 forcing.** Pass ``step_forcings`` (a
-    :class:`~fesom_jax.core2_forcing.StepForcing` stacked with leading axis
+    :class:`~fesom_jax.surface_forcing.StepForcing` stacked with leading axis
     ``[n_steps]``) + ``forcing_static`` to drive the bulk/SSS/shortwave surface BCs:
     step 1 consumes ``step_forcings[0]`` (eager), the scan carries
     ``step_forcings[1:]`` as ``xs``. ``None`` ⇒ the pi analytical path (unchanged).
@@ -122,6 +122,16 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
         _seg = max(2, int(round(math.sqrt(max(1, n_steps - 1)))))
 
     if step_forcings is None:
+        # The unforced path does not run the sea-ice step at all -- ice grows and melts in response
+        # to the atmosphere, so with no forcing there is nothing to drive it. Passing ice_cfg here
+        # used to be a SILENT no-op: you asked for sea ice and got none, with no error. Say so.
+        if ice_cfg is not None:
+            raise ValueError(
+                "ice_cfg was given but there is no forcing (step_forcings=None), so the sea-ice "
+                "step would be silently skipped -- ice cannot grow or melt without an atmosphere. "
+                "Either pass step_forcings=... (build them with "
+                "fesom_jax.surface_forcing.build_surface_forcing), or drop ice_cfg.")
+
         # pi path (unchanged): static stress_surf, no per-step forcing, xs=None.
         state = step(state, mesh, op, stress_surf, params, dt=dt, is_first_step=True,
                      gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,

@@ -5,7 +5,7 @@ Run:  JAX_PLATFORMS=cpu <env python> scripts/debug/check_core2_step.py
 import numpy as np
 from pathlib import Path
 
-from fesom_jax import io_dump, core2_forcing, step as stepmod, ssh
+from fesom_jax import io_dump, surface_forcing, step as stepmod, ssh
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import core2_initial_state
 from fesom_jax.verify import compare_column
@@ -23,7 +23,7 @@ state = core2_initial_state(mesh)
 op = ssh.build_ssh_operator(mesh, dt=DT)
 
 print("build forcing (year %d) ..." % YEAR)
-cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
 sf0 = cf.step_forcing(YEAR, 1, 0.0, 1)            # (year, day, sec, month)
 fs = cf.static
 print("a_ice>0 nodes:", int((np.asarray(fs.a_ice) > 0).sum()), "/", mesh.nod2D)
@@ -33,7 +33,7 @@ recs = io_dump.load_records(DUMP)
 print("\n=== uvnode at IC (should be 0):", float(np.max(np.abs(np.asarray(state.uvnode)))))
 
 # --- forcing gate (start-of-step state) ---
-sfx = core2_forcing.compute_surface_fluxes(mesh, state, sf0, fs, dt=DT)
+sfx = surface_forcing.compute_surface_fluxes(mesh, state, sf0, fs, dt=DT)
 scal = {"heat_flux": sfx.heat_flux, "water_flux": sfx.water_flux,
         "virtual_salt": sfx.virtual_salt, "relax_salt": sfx.relax_salt}
 print("\n=== STEP-1 SURFACE FORCING (sub 0) ===")

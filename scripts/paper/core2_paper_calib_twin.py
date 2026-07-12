@@ -57,7 +57,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from fesom_jax import calibrate, core2_forcing, ice, ssh
+from fesom_jax import calibrate, surface_forcing, ice, ssh
 from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
@@ -120,8 +120,8 @@ def build(year, n, config):
     else:
         raise ValueError(f"unknown --config {config!r}")
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
-    sfs = cf.stack(core2_forcing.dates_for_steps(year, DT, n))
+    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
+    sfs = cf.stack(surface_forcing.dates_for_steps(year, DT, n))
     return mesh, state, op, cf.static, sfs, cfgs
 
 

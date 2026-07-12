@@ -323,13 +323,13 @@ driver) + `tests/test_jra55.py`. C: probe-dump the 8 jra fields at a fixed (year
 
 **Files:** Modify `fesom_jax/tracer_diff.py`, `fesom_jax/step.py`, `fesom_jax/integrate.py`,
 `fesom_jax/forcing.py`, `fesom_jax/sss_runoff.py`, `fesom_jax/phc_ic.py`; create
-`fesom_jax/core2_forcing.py`, `tests/test_surface_bc.py`, `tests/test_core2_step.py`.
+`fesom_jax/surface_forcing.py`, `tests/test_surface_bc.py`, `tests/test_core2_step.py`.
 C (`port2`): `fesom_dump.c` (env probes), `fesom_step.c` (surf dump), `fesom_bulk.c`
 (`FESOM_BULK_FIXED_ITERS` in `fesom_bulk_compute`); `jobs/jax_step_dump_core2.sh`.
 
 > **✅ DONE 2026-06-06.** Surface BCs wired (`bc_T=−dt·heat_flux/vcpw`,
 > `bc_S=dt·(virtual_salt+relax_salt)`, shortwave penetration `sw_3d` divergence into T) +
-> the bulk/SSS/runoff/shortwave forcing assembled per step (`core2_forcing.py`:
+> the bulk/SSS/runoff/shortwave forcing assembled per step (`surface_forcing.py`:
 > bulk → sss_runoff → **ice stress blend** → cal_shortwave_rad). Verified vs a new CORE2
 > per-substep C dump (job 25391647, `data/step_dump_core2/`, 7 re-pinned probes incl.
 > Aleutian 94122, `FESOM_BULK_FIXED_ITERS=1`): **step-1 post-step T 7.1e-15 / S 2.1e-14**
@@ -351,10 +351,10 @@ C (`port2`): `fesom_dump.c` (env probes), `fesom_step.c` (surf dump), `fesom_bul
   298-308`). `cal_shortwave_rad` added to `forcing.py` (AD-safe, cumulative-OR break).
   Bulk `stress_surf` (with the ice blend) replaces the analytical wind. Defaults `None` ⇒
   the pi path bit-identical.
-- [x] **Thread forcing through `step`/`integrate`:** `core2_forcing.compute_surface_fluxes`
+- [x] **Thread forcing through `step`/`integrate`:** `surface_forcing.compute_surface_fluxes`
   taps `T[:,0]`/`uvnode[:,0]`; the per-step jra atmosphere + month SSS/chl are the scanned
   `xs` (`StepForcing`), the runoff/areasvol/ocean_area/`a_ice` closed over (`ForcingStatic`).
-  `step(..., step_forcing, forcing_static)` (lazy-imports `core2_forcing`); `params=None`
+  `step(..., step_forcing, forcing_static)` (lazy-imports `surface_forcing`); `params=None`
   transparency intact.
 - [x] ✅ **Static ice mask (user decision: match the C).** `ice_ic_aice` replicates
   `fesom_ice_initial_state` (`a_ice=0.9` where IC SST<0); gates shortwave penetration +
@@ -393,7 +393,7 @@ SLURM dump job. Create `tests/test_step_core2.py`; `docs/REFERENCE_RUNS.md` (COR
   incl. Aleutian 94122, `FESOM_BULK_FIXED_ITERS=1`). 5.7 added the per-substep **dynamics**
   gates on it (5.6 had only the comprehensive T/S + density/bvfreq/Kv).
 - [x] **Assemble + run CORE2:** jitted `step_jit` loop with stacked `step_forcings`
-  (`CoreForcing.stack(dates_for_steps(1958, 500, N))`) + `forcing_static`, monitored per
+  (`SurfaceForcing.stack(dates_for_steps(1958, 500, N))`) + `forcing_static`, monitored per
   step. CORE2 1-day (172 steps) + 10-day (1728) on an A100. Numerically stable through
   day 7; the Aleutian Trench stayed calm.
 - [x] ⚠️ **Stability risk resolved empirically:** the matched C arbiter is **stable and
@@ -504,7 +504,7 @@ salty coastal/Arctic bias vs. a complete run.)
 
 **What is ALREADY done (needs no change for Phase 6):**
 - The runoff **reader** — `sss_runoff.runoff_node` (bit-exact, Task 5.5), carried in
-  `core2_forcing.ForcingStatic.runoff_node`.
+  `surface_forcing.ForcingStatic.runoff_node`.
 - The **salt/water balance** — `sss_runoff.sss_runoff_fluxes(water_flux, …, runoff_node, …)`
   is **pure in `water_flux`** (Task 5.5, dump-verified). The global-mean balance already
   consumes `runoff_node`.
@@ -514,7 +514,7 @@ salty coastal/Arctic bias vs. a complete run.)
    (`prec = rain + runo + …`) — this is part of "port sea ice" anyway.
 2. Port `fesom_ice_oce_fluxes` so it sets `water_flux = −flx_fw` (incl. runoff) + the
    heat-flux ice blend — also part of porting sea ice.
-3. **The JAX seam is already clean:** in `core2_forcing.compute_surface_fluxes`, the ice-on
+3. **The JAX seam is already clean:** in `surface_forcing.compute_surface_fluxes`, the ice-on
    branch computes `flx_fw` and passes `water_flux = −flx_fw` into the EXISTING
    `sss_runoff_fluxes` (instead of the bulk's `evap−prec`). No restructuring of the reader or
    the balance — just feed a different `water_flux`. `runoff_node` is already plumbed.
@@ -617,7 +617,7 @@ seam).**
   `jobs/jax_sss_dump_core2.sh`. `ref_sss_local=1`, `surf_relax_S=1.929e-6`; no legacy month
   +1. Next: **Task 5.6 (wire surface BCs into the step + assemble CORE2 forcing)**.
 - **2026-06-06 — Task 5.6 DONE (wire surface BCs + assemble CORE2 forcing).** New
-  `fesom_jax/core2_forcing.py` (the per-step driver: bulk → sss_runoff → ice stress blend →
+  `fesom_jax/surface_forcing.py` (the per-step driver: bulk → sss_runoff → ice stress blend →
   cal_shortwave_rad → bc_T/bc_S/sw_3d/stress_surf; host readers + device AD-safe math).
   `tracer_diff` gained `bc_T`/`bc_S`/`sw_3d`; `forcing` gained `cal_shortwave_rad`;
   `sss_runoff` gained `build_chl_clim`; `step`/`integrate` thread `step_forcing`/

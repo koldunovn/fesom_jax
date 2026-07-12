@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 
 from fesom_jax import partit, shard_mesh
-from fesom_jax.core2_forcing import ForcingStatic, StepForcing
+from fesom_jax.surface_forcing import ForcingStatic, StepForcing
 from fesom_jax.mesh import Mesh, load_mesh
 from fesom_jax.state import State
 

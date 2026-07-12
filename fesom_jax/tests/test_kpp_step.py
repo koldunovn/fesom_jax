@@ -36,7 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from fesom_jax import core2_forcing, eos, io_dump, kpp, ssh
+from fesom_jax import surface_forcing, eos, io_dump, kpp, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import core2_initial_state
@@ -69,11 +69,11 @@ def run1():
     mesh = load_mesh(MESH_DIR)
     state = core2_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
     fs = cf.static
     cfg = kpp.KppConfig()
-    sf0 = cf.step_forcing(*core2_forcing.dates_for_steps(YEAR, DT, 1)[0])
-    sfx = core2_forcing.compute_surface_fluxes(mesh, state, sf0, fs, dt=DT)
+    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
+    sfx = surface_forcing.compute_surface_fluxes(mesh, state, sf0, fs, dt=DT)
 
     # one assembled KPP step (post-mo_convect Kv/Av — the substep-4 dump fields)
     st1 = stepmod.step(state, mesh, op, None, dt=DT, is_first_step=True,
@@ -194,7 +194,7 @@ def test_kpp_requires_forcing(run1):
     """KPP on the pi path (no ``step_forcing``) raises — it needs surface forcing for
     ``ustar``/``Bo`` (locked decision 7: the pi path keeps PP)."""
     mesh, state, op, cfg = (run1[k] for k in ("mesh", "state", "op", "cfg"))
-    with pytest.raises(ValueError, match="KPP .* requires CORE2 surface forcing"):
+    with pytest.raises(ValueError, match="KPP .* requires surface forcing"):
         stepmod.step(state, mesh, op, None, dt=DT, is_first_step=True, kpp_cfg=cfg)
 
 

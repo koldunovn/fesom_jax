@@ -433,10 +433,10 @@ def partition_state(state, partition: Partition):
 
 
 def partition_forcing_static(fs, partition: Partition):
-    """Gather a :class:`~fesom_jax.core2_forcing.ForcingStatic` to per-device padded
+    """Gather a :class:`~fesom_jax.surface_forcing.ForcingStatic` to per-device padded
     form. Node fields → ``[P, Lmax_nod]``; the scalar ``ocean_area`` is replicated
     (kept as-is — it becomes a ``psum`` over owned nodes in S.5)."""
-    from .core2_forcing import ForcingStatic
+    from .surface_forcing import ForcingStatic
 
     _, Lmax = local_sizes(partition)
     out = {}
@@ -453,11 +453,11 @@ def partition_forcing_static(fs, partition: Partition):
 
 
 def partition_step_forcing(sf, partition: Partition):
-    """Gather a :class:`~fesom_jax.core2_forcing.StepForcing` to per-device padded
+    """Gather a :class:`~fesom_jax.surface_forcing.StepForcing` to per-device padded
     form, handling both a single step (``[nod2D]`` fields → ``[P, Lmax_nod]``) and a
     scanned stack (``[n_steps, nod2D]`` → ``[P, n_steps, Lmax_nod]``): the node axis
     is detected by size and sharded, the ``n_steps`` axis is preserved."""
-    from .core2_forcing import StepForcing
+    from .surface_forcing import StepForcing
 
     _, Lmax = local_sizes(partition)
     out = {}

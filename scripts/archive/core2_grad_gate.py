@@ -48,7 +48,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from fesom_jax import core2_forcing, ssh
+from fesom_jax import surface_forcing, ssh
 from fesom_jax.config import A_VER
 from fesom_jax.integrate import integrate
 from fesom_jax.mesh import load_mesh
@@ -68,8 +68,8 @@ def build(year, n):
     mesh = load_mesh(MESH_DIR)
     state = core2_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, year, sst_ic=np.asarray(state.T[:, 0]))
-    sfs = cf.stack(core2_forcing.dates_for_steps(year, DT, n))
+    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(state.T[:, 0]))
+    sfs = cf.stack(surface_forcing.dates_for_steps(year, DT, n))
     return mesh, state, op, cf.static, sfs
 
 

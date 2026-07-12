@@ -30,7 +30,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fesom_jax import core2_forcing, io_dump, ssh
+from fesom_jax import surface_forcing, io_dump, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.gm import GMConfig
 from fesom_jax.mesh import load_mesh
@@ -61,9 +61,9 @@ def run_gm():
     mesh = load_mesh(MESH_DIR)
     state = core2_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
     fs = cf.static
-    dates = core2_forcing.dates_for_steps(YEAR, DT, NSTEPS)
+    dates = surface_forcing.dates_for_steps(YEAR, DT, NSTEPS)
     recs = io_dump.load_records(DUMP)
     gm_cfg = GMConfig()
 

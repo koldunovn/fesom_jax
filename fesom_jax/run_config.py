@@ -133,7 +133,7 @@ class RunConfig:
 
     def forcing_paths(self) -> dict:
         """The input-path overrides from the ``forcing:`` block, as kwargs for
-        :func:`fesom_jax.core2_forcing.build_core_forcing` (absent key ⇒ ``None`` ⇒ the
+        :func:`fesom_jax.surface_forcing.build_surface_forcing` (absent key ⇒ ``None`` ⇒ the
         reader resolves it via ``$FESOM_*`` / the Levante default, :mod:`fesom_jax.paths`)."""
         f = self.forcing or {}
         return {k: f.get(k) for k in _FORCING_PATH_KEYS}

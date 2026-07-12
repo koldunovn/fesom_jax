@@ -18,7 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from fesom_jax import core2_forcing, partit, shard_mesh, ssh
+from fesom_jax import surface_forcing, partit, shard_mesh, ssh
 from fesom_jax.mesh import load_mesh
 from fesom_jax.run import (Chunk, _chunk_dates, _elapsed_seconds, _step_at_elapsed,
                            _year_boundaries, parse_duration, plan_chunks, run_from_config)
@@ -145,7 +145,7 @@ def core2_setup():
     from fesom_jax.phc_ic import core2_initial_state
     mesh = load_mesh(CORE2_MESH)
     state = core2_initial_state(mesh, IC_DIR)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
     part = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
     sm = shard_mesh.build_sharded_mesh(mesh, part)
     sop = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=DT), part)

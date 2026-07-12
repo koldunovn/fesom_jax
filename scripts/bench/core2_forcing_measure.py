@@ -15,7 +15,7 @@ import numpy as np
 import jax
 jax.config.update("jax_enable_x64", True)
 
-from fesom_jax import core2_forcing, partit, shard_mesh, jra55, sss_runoff
+from fesom_jax import surface_forcing, partit, shard_mesh, jra55, sss_runoff
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import cold_start_state
 from fesom_jax.run_config import load_yaml
@@ -38,7 +38,7 @@ mesh = load_mesh("data/mesh_core2")
 part = partit.read_partition(Path(POOL), 4)
 state0 = cold_start_state(mesh, "data/ic_core2", xp=np)
 sst0 = np.asarray(state0.T[:, 0])
-forcing = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=sst0)
+forcing = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
 dates = _chunk_dates(YEAR, cfg.dt, 0, NS, cfg.dt_ramp)
 print(f"[meas] nod2D={mesh.nod2D} npes=4 NS={NS}", flush=True)
 
@@ -76,7 +76,7 @@ for M in (4, 8):
     for s in subsets:
         sub = _SubMesh(mesh, s)
         chl = sss_runoff.build_chl_clim(sub, sss_runoff.DEFAULT_CHL_PATH)
-        cf = core2_forcing.CoreForcing(
+        cf = surface_forcing.SurfaceForcing(
             jra=jra55.JRA55Reader(sub, YEAR, jra55.DEFAULT_JRA_DIR),
             sss=sss_runoff.build_reader(sub, sss_runoff.DEFAULT_SSS_PATH, sss_runoff.DEFAULT_RUNOFF_PATH),
             chl_clim=chl, static=forcing.static)

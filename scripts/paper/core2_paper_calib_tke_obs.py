@@ -54,7 +54,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from fesom_jax import ale, calibrate, core2_forcing, ice, obs_compare, ssh
+from fesom_jax import ale, calibrate, surface_forcing, ice, obs_compare, ssh
 from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
@@ -102,7 +102,7 @@ def build(year, config):
     else:
         raise ValueError(f"unknown --config {config!r}")
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
     return mesh, state, op, cf, cfgs        # return cf so spin/window forcing stack separately
 
 
@@ -200,7 +200,7 @@ def main():
     mesh, st0, op, cf, cfgs = build(args.year, args.config)
     fs = cf.static
     node_mask = jnp.asarray(mesh.node_layer_mask)
-    all_dates = core2_forcing.dates_for_steps(args.year, DT, args.n_spin + args.n)
+    all_dates = surface_forcing.dates_for_steps(args.year, DT, args.n_spin + args.n)
     Hmap, (woa_mld, woa_mld_ok, woa_sst, woa_sst_ok), (cell_lat, cell_lon) = load_woa(mesh, args.month)
     rec = {"target": "tke_obs", "config": "zstar+TKE+mEVP+GM(frozen-ice)", "N": args.n,
            "n_spin": args.n_spin, "month": args.month, "params": args.params,

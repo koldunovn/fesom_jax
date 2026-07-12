@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fesom_jax import core2_forcing, partit, shard_mesh
+from fesom_jax import surface_forcing, partit, shard_mesh
 from fesom_jax.mesh import load_mesh
 
 MESH = "/work/ab0995/a270088/fesom_jax_meshes/mesh_ng5"
@@ -29,9 +29,9 @@ print(f"=== NG5 forcing host-build profile (npes={NPES}, chunk={CHUNK}) ===", fl
 t = time.perf_counter()
 mesh = load_mesh(MESH); t = lap("load_mesh", t)
 part = partit.read_partition(Path(POOL), NPES); t = lap(f"read_partition dist_{NPES}", t)
-cf = core2_forcing.build_core_forcing(mesh, 1958, sst_ic=None); t = lap("build_core_forcing", t)
+cf = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=None); t = lap("build_surface_forcing", t)
 
-dates = core2_forcing.dates_for_steps(1958, 180.0, CHUNK)
+dates = surface_forcing.dates_for_steps(1958, 180.0, CHUNK)
 
 # single step (the JRA interp + np.asarray for ~10 fields over 7.4 M nodes)
 t = time.perf_counter()

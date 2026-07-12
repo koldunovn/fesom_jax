@@ -52,7 +52,7 @@ thicknesses become state. Seven concrete changes vs linfs (C digest verified):
    becomes a live producer in ice thermo. ⚠️ The JAX port (like C v1.0) has **no rsf producer**:
    `ice_thermo.py` computes none (its `evap` at `ice_thermo.py:135` bundles evaporation+sublimation —
    must be SPLIT for the balancing), and the ice-path `bc_S` omits rsf (`ice_step.py:137`;
-   `core2_forcing.py:155` is the secondary no-ice consumer) — this plan adds the producer
+   `surface_forcing.py:155` is the secondary no-ice consumer) — this plan adds the producer
    (C plan-review BLOCKER #1).
 4. **`water_flux` composition:** gains ice-growth volume terms + a **global net balancing** increment
    (`fesom_ice_coupling.c:178-216`, gated `!use_virt_salt`); needs new `evaporation`/`ice_sublimation`
@@ -137,7 +137,7 @@ Under linfs each re-point is bitwise-neutral (live == static by construction) �
 **Forcing flip integration:** `ice_thermo.py` gains the rsf producer (+ the `evap` split into
 `evaporation`/`ice_sublimation`) surfaced through `IceStepOut`; `ice_coupling.py` gains the
 fw-balancing block (global sums → `reductions.global_sum` so the sharded path is psum-correct);
-`core2_forcing.py:24-28,97,153` + `ice_step.py:137` (the ice-path `bc_S` — the operative consumer) +
+`surface_forcing.py:24-28,97,153` + `ice_step.py:137` (the ice-path `bc_S` — the operative consumer) +
 `sss_runoff.py:262` + `ice.py:96` flip on `use_virt_salt/is_nonlinfs`. Under `ale_cfg=None` all new
 code is dead-branch ⇒ bit-identical.
 
@@ -238,7 +238,7 @@ Hazard inventory from the C digest, each with its JAX treatment:
 ### JZ.2 — Forcing flip: rsf producer, water-flux composition, balancing, BCs
 
 **Files:** Modify: `fesom_jax/ice_thermo.py`, `fesom_jax/ice_step.py`, `fesom_jax/ice_coupling.py`,
-`fesom_jax/core2_forcing.py`, `fesom_jax/sss_runoff.py`. Create: tests in `test_ale_zstar.py`.
+`fesom_jax/surface_forcing.py`, `fesom_jax/sss_runoff.py`. Create: tests in `test_ale_zstar.py`.
 
 - [x] rsf producer in ice thermo (`fesom_ice_thermo.c:359-408`); SPLIT `evap` into
       `evaporation`/`ice_sublimation` (the C already computes both halves — free), surfaced via

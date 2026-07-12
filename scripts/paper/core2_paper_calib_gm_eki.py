@@ -54,7 +54,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from fesom_jax import ale, calibrate, core2_forcing, eki, ice, obs_compare, ssh
+from fesom_jax import ale, calibrate, surface_forcing, eki, ice, obs_compare, ssh
 from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
@@ -112,7 +112,7 @@ def build(year):
     cfgs = dict(gm_cfg=GMConfig(), tke_cfg=TkeConfig(),
                 ice_cfg=IceConfig(whichEVP=1), ale_cfg=AleConfig())   # exact ice (forward-only)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
     return mesh, state, op, cf, cfgs
 
 
@@ -215,7 +215,7 @@ def main():
     fs = cf.static
     gpu_gb = gpu_limit_gb()
     Hmap, basin_w, (lat, lon, depth, n_lat, n_lon) = obs_grid_and_basins(mesh)
-    all_dates = core2_forcing.dates_for_steps(args.year, DT, args.n_spin + args.n)
+    all_dates = surface_forcing.dates_for_steps(args.year, DT, args.n_spin + args.n)
     rec = {"target": "gm_eki", "mode": args.mode, "config": "zstar+TKE+mEVP+GM (forward-only)",
            "N": args.n, "n_spin": args.n_spin, "members": args.members, "iters": args.iters,
            "k0": args.k0, "depth": depth.astype(int).tolist(), "gpu_gb": gpu_gb}

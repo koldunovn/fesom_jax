@@ -26,10 +26,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from fesom_jax import core2_forcing, partit, shard_mesh, ssh
+from fesom_jax import surface_forcing, partit, shard_mesh, ssh
 from fesom_jax import integrate as integ
 from fesom_jax import integrate_sharded as ish
-from fesom_jax.core2_forcing import StepForcing
+from fesom_jax.surface_forcing import StepForcing
 from fesom_jax.kpp import KppConfig
 from fesom_jax.mesh import load_mesh
 from fesom_jax.state import State
@@ -98,7 +98,7 @@ def core2_forced_seq():
     state = core2_initial_state(mesh, IC_DIR)
     sst0 = np.asarray(state.T[:, 0])
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=sst0)
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
     # Hand-pick WELL-SEPARATED dates (Jan / Jul / Oct) so the forcing genuinely VARIES per step —
     # JRA55 is piecewise-constant over its 3-hourly interval, so consecutive 30-min steps would
     # share one record (Tair constant) and the per-step gate couldn't tell a per-step wiring from a

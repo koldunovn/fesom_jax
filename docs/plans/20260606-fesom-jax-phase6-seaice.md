@@ -136,7 +136,7 @@ Everything in Phase-5 §3 (PP/linfs/FCT/opt_visc7, dt=500, PHC IC, JRA55+SSS+run
 ### Task 6.1: Ice state + cold-start IC + config + ice-ON C reference dumps
 
 **Files:** Create `fesom_jax/ice.py` (state fields helper + `IceConfig` + cold-start IC);
-modify `fesom_jax/state.py` (add ice fields), `fesom_jax/core2_forcing.py` (generalize
+modify `fesom_jax/state.py` (add ice fields), `fesom_jax/surface_forcing.py` (generalize
 `ice_ic_aice`). C (`port2`, branch `jax-mesh-export`): re-pin `PROBE_GIDS`
 (`fesom_dump.c:15-17`) for ice coverage; new SLURM dump jobs (3 configs A/B/C). Create
 `tests/test_ice_ic.py`.
@@ -145,7 +145,7 @@ modify `fesom_jax/state.py` (add ice fields), `fesom_jax/core2_forcing.py` (gene
 > (`a_ice/m_ice/m_snow/u_ice/v_ice/t_skin` [nod] + `sigma11/12/22` [elem]; σ carried as EVP
 > elastic memory — see the lesson). `fesom_jax/ice.py`: `IceConfig` (the §3 constants +
 > derived `cc/cl/Tevp_inv/dte/vale`) and `ice_initial_state`/`seed_ice` (the cold-start IC,
-> generalizing the Phase-5 `core2_forcing.ice_ic_aice` a_ice-only mask). The ocean (pi +
+> generalizing the Phase-5 `surface_forcing.ice_ic_aice` a_ice-only mask). The ocean (pi +
 > Phase-5 no-ice) path is **bit-identical** (ice fields inert-zero). `test_ice_ic.py` (8
 > tests) green; the IC is C-verified **transitively** (a pure threshold of the ~1e-14 PHC
 > SST; **0** FP-fragile nodes) + an independent per-node loop ref — no SLURM C dump spent.
@@ -167,7 +167,7 @@ modify `fesom_jax/state.py` (add ice fields), `fesom_jax/core2_forcing.py` (gene
   step). Keep it separate from `params.py` (ice is not on the trainable path yet).
 - [x] **Cold-start IC:** port `fesom_ice_initial_state` (`fesom_ice.c:246-277`) — the
   hemisphere-split a/m/msnow from PHC SST<0. This **generalizes** the Phase-5
-  `core2_forcing.ice_ic_aice` (which produced only the static `a_ice=0.9` mask); now it
+  `surface_forcing.ice_ic_aice` (which produced only the static `a_ice=0.9` mask); now it
   produces full `(a_ice, m_ice, m_snow)` and seeds `State`. Pure numpy host setup.
 - [~] **Generate ice-ON C reference dumps (Path A, 3 configs):** DEFERRED to consuming tasks
   (config-A → 6.2, config-B → 6.4, config-C → 6.5/6.6) — see the DONE note. Recipe: clone the Phase-5 step-dump
@@ -252,7 +252,7 @@ gated `FESOM_ICE_THERMO_DUMP_DIR`) + `jobs/jax_ice_thermo_dump_core2.sh` (config
 ### Task 6.3: Ice-ocean coupling + the runoff handoff — `ice_coupling.py`
 
 **Files:** Create `fesom_jax/ice_coupling.py` (ocean2ice + oce_fluxes + oce_fluxes_mom);
-modify `fesom_jax/sss_runoff.py` (the ice-on flux variant), `fesom_jax/core2_forcing.py`
+modify `fesom_jax/sss_runoff.py` (the ice-on flux variant), `fesom_jax/surface_forcing.py`
 (thread the ice fluxes). `tests/test_ice_coupling.py`. C: dump in config-A.
 
 > After this task the **thermo-only ice** path (6.2+6.3, EVP/FCT off) runs end-to-end and
@@ -267,7 +267,7 @@ modify `fesom_jax/sss_runoff.py` (the ice-on flux variant), `fesom_jax/core2_for
 > (MAP/reduction class). **Runoff handoff PROVEN end-to-end** — composing thermo∘coupling,
 > `d(water_flux)/d(runoff) = -1` exactly (freshwater in; `virtual_salt = S_top·water_flux`,
 > S_top>0 ⇒ freshening). AD seams (`d/d(flx_fw)`, `d/d(S_top)`) finite. `test_ice_coupling.py`
-> = **9 passed**. ⚠️ The `core2_forcing` threading + the **multi-day** supercooling-cap
+> = **9 passed**. ⚠️ The `surface_forcing` threading + the **multi-day** supercooling-cap
 > manifestation move to 6.6/6.7 (need the assembled step); the *mechanism* (`heat_flux=-flx_h`
 > carries the ice-growth heat to `bc_T`) is verified here. `sss_runoff.py` default unchanged ⇒
 > the Phase-5 path stays bit-identical.
@@ -275,7 +275,7 @@ modify `fesom_jax/sss_runoff.py` (the ice-on flux variant), `fesom_jax/core2_for
 - [x] **`ocean2ice`** (`fesom_ice_coupling.c:47-115`): nearly free in JAX — `srfoce_temp =
   T[:,0]`, `srfoce_salt = S[:,0]`, `srfoce_ssh = hbar`, `srfoce_u/v = uvnode[:,0]` (the C
   comment `:44-45` confirms `u_w` uses the same area-weighted recipe as `uvnode`, which
-  `core2_forcing` already taps). Cavity skip. `ice_update=1` (no time-averaging branch).
+  `surface_forcing` already taps). Cavity skip. `ice_update=1` (no time-averaging branch).
 - [x] **`oce_fluxes` — the runoff handoff** (`fesom_ice_coupling.c:125-179`):
   `water_flux = -flx_fw` (flx_fw from thermo, **includes runoff**), `heat_flux = -flx_h`;
   `virtual_salt = rsss·water_flux` (rsss=S_top, balanced minus the area-weighted global
@@ -290,7 +290,7 @@ modify `fesom_jax/sss_runoff.py` (the ice-on flux variant), `fesom_jax/core2_for
   **prognostic** `u_ice` (Phase 5 used static `u_ice=0`): per node `a>0.001` ⇒
   `stress_iceoce = ρ·cd_oce_ice·|u_ice-u_w|·(u_ice-u_w)`; `stress_node_surf =
   stress_iceoce·a + atm·(1-a)`; element `stress_surf = mean-of-3`. This **upgrades** the
-  existing `core2_forcing` blend (lines 127-142) from static to prognostic `a`/`u_ice`.
+  existing `surface_forcing` blend (lines 127-142) from static to prognostic `a`/`u_ice`.
 - [x] **Gate:** dump `water_flux/virtual_salt/relax_salt/heat_flux/stress_surf` vs the
   config-A/B C dump; **river-mouth `bc_S` freshening** (the runoff signal); the stress blend
   reproduces with prognostic u_ice (config-B). ~1e-12 (reductions) / ~1e-15 (maps).
@@ -448,7 +448,7 @@ modify `fesom_jax/sss_runoff.py` (the ice-on flux variant), `fesom_jax/core2_for
   `lax.scan` carry (alongside the ocean State). The jra atmosphere + month SSS/chl stay the
   scanned `xs`; `IceConfig`/runoff/areas closed over.
 - [x] **Prognostic a_ice/u_ice in the surface fluxes:** replace the static `fs.a_ice` /
-  `u_ice=0` in `core2_forcing.compute_surface_fluxes` (lines 127-148) with the **prognostic**
+  `u_ice=0` in `surface_forcing.compute_surface_fluxes` (lines 127-148) with the **prognostic**
   ice State — the two couplings (shortwave-penetration gate `pene_open = … & (a≤0)`; the
   momentum stress blend) now read the live `a_ice`/`u_ice` (via `oce_fluxes_mom`). `params=
   None` / pi path still bit-identical (ice off ⇒ a_ice≡0).
@@ -571,7 +571,7 @@ scalar maps to the Fortran `namelist.ice` with zero Fortran code.
   + ice_oce_fluxes + ice_oce_fluxes_mom) + a backward-compatible `balance_water_flux` flag on
   `sss_runoff.sss_runoff_fluxes`. water_flux/virtual_salt/relax_salt **match the config-A C dump**
   at the 7 probes; **runoff handoff proven** (`d(water_flux)/d(runoff)=-1` through thermo∘coupling).
-  `test_ice_coupling.py` 9 green. 3 lessons. The core2_forcing threading + multi-day
+  `test_ice_coupling.py` 9 green. 3 lessons. The surface_forcing threading + multi-day
   supercooling-cap manifestation are at 6.6/6.7. Next: Task 6.4 (EVP dynamics — the 120-subcycle
   `lax.scan`).
 - **2026-06-06 — Task 6.4 DONE** (EVP dynamics). `fesom_jax/ice_evp.py` (evp_setup,

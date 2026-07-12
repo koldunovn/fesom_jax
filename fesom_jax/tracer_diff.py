@@ -20,7 +20,7 @@ and, for the temperature tracer, a shortwave-penetration flux divergence per lay
 
 * ``bc_surf`` — a per-node ``[nod2D]`` increment added to the surface layer's RHS.
   For linfs: ``bc_T = −dt·heat_flux/vcpw`` (T) and ``bc_S = dt·(virtual_salt +
-  relax_salt)`` (S); built by :mod:`fesom_jax.core2_forcing`. ``None`` ⇒ 0 (the pi
+  relax_salt)`` (S); built by :mod:`fesom_jax.surface_forcing`. ``None`` ⇒ 0 (the pi
   analytical path: zero heat/water/virtual-salt/relax-salt flux).
 * ``sw_3d`` — the per-node, per-layer shortwave flux ``[nod2D, nl]``
   (:func:`fesom_jax.forcing.cal_shortwave_rad`), consumed by the **T** tracer only as

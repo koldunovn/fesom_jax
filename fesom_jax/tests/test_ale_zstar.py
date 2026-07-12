@@ -460,16 +460,16 @@ def test_forcing_flip_linfs_vs_zstar(capsys):
     Combined with the existing linfs forcing dump gates (which validate the linfs forcing vs the
     C at dt=500), this transitively validates the zstar forcing. The DIRECT z2_cdump comparison
     is :func:`test_forcing_dump_gate_zstar_diagnostic` (config-matching is a follow-on)."""
-    from fesom_jax import core2_forcing, ice, ice_step
+    from fesom_jax import surface_forcing, ice, ice_step
     from fesom_jax.ice import IceConfig
     from fesom_jax.phc_ic import core2_initial_state
     mesh = load_mesh(CORE2_MESH)
     state = core2_initial_state(mesh, CORE2_IC)
     sst = np.asarray(state.T[:, 0])
     state0 = ice.seed_ice(state, mesh, sst)
-    cf = core2_forcing.build_core_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
+    cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
     fs = cf.static
-    sf0 = cf.step_forcing(*core2_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
+    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
     lin = ice_step.ice_surface_step(IceConfig(), mesh, state0, sf0, fs, dt=DT_ZSTAR,
                                     use_virt_salt=True)
     zst = ice_step.ice_surface_step(IceConfig(), mesh, state0, sf0, fs, dt=DT_ZSTAR,
@@ -495,15 +495,15 @@ def test_forcing_dump_gate_zstar_diagnostic(capsys):
     partition-dependent IC all along (SST/S_top feed evap, ice growth, and relax):
     ``virtual_salt≡0`` exact, ``relax_salt`` max=3.4e-18 (bit class), ``real_salt_flux``
     max=1.6e-10, ``water_flux`` max=1.4e-9 (bulk-formula ulp accumulation)."""
-    from fesom_jax import core2_forcing, ice, ice_step
+    from fesom_jax import surface_forcing, ice, ice_step
     from fesom_jax.ice import IceConfig
     from fesom_jax.phc_ic import core2_initial_state
     mesh = load_mesh(CORE2_MESH)
     state = core2_initial_state(mesh, CORE2_IC)
     sst = np.asarray(state.T[:, 0])
     state0 = ice.seed_ice(state, mesh, sst)
-    cf = core2_forcing.build_core_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
-    sf0 = cf.step_forcing(*core2_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
+    cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
+    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
     out = ice_step.ice_surface_step(IceConfig(), mesh, state0, sf0, cf.static,
                                     dt=DT_ZSTAR, use_virt_salt=False)
     f, _ = io_dump.load_ale_dump(ZSTAR_ORACLE, ["forcing"], step=1, n_nod=NG5_NOD2D)
@@ -923,7 +923,7 @@ def test_jz7_assembled_zstar_step1(capsys):
     early-stop tolerance. At step 1 the geometry re-points are no-ops (live==static cold
     start), so this validates JZ.2-5 + the assembled order/threading end-to-end. Multi-step
     (steps 2-3) gates need JZ.6 complete (the live geometry re-points), deferred."""
-    from fesom_jax import core2_forcing, ice
+    from fesom_jax import surface_forcing, ice
     from fesom_jax.gm import GMConfig
     from fesom_jax.kpp import KppConfig
     from fesom_jax.ice import IceConfig
@@ -933,8 +933,8 @@ def test_jz7_assembled_zstar_step1(capsys):
     sst = np.asarray(state.T[:, 0])
     state0 = ice.seed_ice(state, mesh, sst)
     op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
-    cf = core2_forcing.build_core_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
-    sf0 = cf.step_forcing(*core2_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
+    cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
+    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
     st1 = stepmod.step(state0, mesh, op, None, dt=DT_ZSTAR, is_first_step=True,
                        step_forcing=sf0, forcing_static=cf.static,
                        kpp_cfg=KppConfig(), gm_cfg=GMConfig(), ice_cfg=IceConfig(),
@@ -1085,7 +1085,7 @@ def test_jz7_assembled_zstar_steps123(capsys):
 
     Bounds calibrated from the per-step prints (house style); finiteness is the hard gate at
     every step (no NaN through 3 assembled zstar steps = the integration milestone)."""
-    from fesom_jax import core2_forcing, ice
+    from fesom_jax import surface_forcing, ice
     from fesom_jax.gm import GMConfig
     from fesom_jax.kpp import KppConfig
     from fesom_jax.ice import IceConfig
@@ -1095,8 +1095,8 @@ def test_jz7_assembled_zstar_steps123(capsys):
     sst = np.asarray(state.T[:, 0])
     state0 = ice.seed_ice(state, mesh, sst)
     op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
-    cf = core2_forcing.build_core_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
-    dates = core2_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 3)
+    cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
+    dates = surface_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 3)
     sfs = [cf.step_forcing(*d) for d in dates]
 
     clean_node = _config_clean_node_mask(mesh)
@@ -1210,7 +1210,7 @@ def _mean_sst_z(state, mesh):
 
 def _jz8_grad_setup(mesh):
     """CORE2 warm-zstar state (stretched hnode via the zstar init) + 1-step forcing + op."""
-    from fesom_jax import core2_forcing
+    from fesom_jax import surface_forcing
     from fesom_jax.phc_ic import core2_initial_state
     state = core2_initial_state(mesh, CORE2_IC)
     sst = np.asarray(state.T[:, 0])
@@ -1220,8 +1220,8 @@ def _jz8_grad_setup(mesh):
     state = dataclasses.replace(state, hbar=hbar, hbar_old=jnp.zeros_like(hbar), hnode=hnode,
                                 helem=helem, eta_n=eta_n, ssh_rhs_old=sro)
     op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
-    cf = core2_forcing.build_core_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
-    sf = cf.step_forcing(*core2_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
+    cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
+    sf = cf.step_forcing(*surface_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
     return state, op, cf.static, sf
 
 

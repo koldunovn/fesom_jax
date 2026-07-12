@@ -17,7 +17,7 @@ swamp the ~1.4e-2 °C climate signal) are accumulated on-device and flushed at e
 calendar-month boundary. Variables: ``sst``/``sss``/``ssh``/``a_ice``/``m_ice`` 2-D
 ``(time, nod2)`` + ``temp``/``salt`` 3-D ``(time, nz_1, nod2)`` (below-bottom masked NaN).
 
-Multi-year forcing: the JRA55 reader is single-year, so the CoreForcing is rebuilt at
+Multi-year forcing: the JRA55 reader is single-year, so the SurfaceForcing is rebuilt at
 each year boundary (the static a_ice IC mask is held fixed). Stability is monitored; the
 run aborts on blow-up. Forcing is streamed per step (no OOM).
 
@@ -35,7 +35,7 @@ import jax.numpy as jnp
 import numpy as np
 from netCDF4 import Dataset
 
-from fesom_jax import core2_forcing, ice, ssh
+from fesom_jax import surface_forcing, ice, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
@@ -259,10 +259,10 @@ def main():
     if run_params is not None:
         print(f"[params] injecting ck={args.ck} nn_pkl={args.nn_pkl or '-'}", flush=True)
     op = ssh.build_ssh_operator(mesh, dt=dt)
-    dates = core2_forcing.dates_for_steps(args.start_year, dt, n_steps,
+    dates = surface_forcing.dates_for_steps(args.start_year, dt, n_steps,
                                           start_month=args.start_month, start_day=args.start_day)
     cf_year = args.start_year
-    cf = core2_forcing.build_core_forcing(mesh, cf_year, sst_ic=sst0)
+    cf = surface_forcing.build_surface_forcing(mesh, cf_year, sst_ic=sst0)
     # --mevp on ⇒ the Bouillon-2013 modified-EVP rheology (whichEVP=1, the c_mevp_2yr config);
     # off ⇒ standard EVP (the c_evp_2yr control).
     ice_cfg = IceConfig(whichEVP=1) if args.mevp == "on" else IceConfig()
@@ -303,7 +303,7 @@ def main():
     for i in range(n_steps):
         y, doy, sec, month = dates[i]
         if y != cf_year:
-            cf = core2_forcing.build_core_forcing(mesh, y, sst_ic=sst0); cf_year = y
+            cf = surface_forcing.build_surface_forcing(mesh, y, sst_ic=sst0); cf_year = y
             print(f"  [forcing] rebuilt for year {y}", flush=True)
         sf = cf.step_forcing(y, doy, sec, month)
         ts = time.time()

@@ -65,8 +65,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     Phase-2 path). Pass a ``Params`` with traced leaves to take ``d(loss)/d(param)``.
 
     **CORE2 forcing (Phase 5).** Pass ``step_forcing`` (a
-    :class:`fesom_jax.core2_forcing.StepForcing`, this step's atmosphere + SSS/chl) and
-    ``forcing_static`` (the :class:`~fesom_jax.core2_forcing.ForcingStatic` constants) to
+    :class:`fesom_jax.surface_forcing.StepForcing`, this step's atmosphere + SSS/chl) and
+    ``forcing_static`` (the :class:`~fesom_jax.surface_forcing.ForcingStatic` constants) to
     drive the **bulk + SSS/runoff + shortwave-penetration** surface BCs: the bulk
     ``stress_surf`` replaces the passed ``stress_surf`` (momentum), and the per-node
     ``bc_T``/``bc_S`` + ``sw_3d`` feed the tracer diffusion. The bulk taps the
@@ -211,8 +211,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             heat_flux, water_flux = ice_out.heat_flux, ice_out.water_flux
             stress_node_surf = ice_out.stress_node_surf
         else:
-            from . import core2_forcing            # lazy: keep netCDF deps off the pi path
-            sfx = core2_forcing.compute_surface_fluxes(
+            from . import surface_forcing            # lazy: keep netCDF deps off the pi path
+            sfx = surface_forcing.compute_surface_fluxes(
                 mesh, st, step_forcing, forcing_static, dt=dt,
                 owned_mask=_red_mask, axis_name=_red_axis, use_virt_salt=use_virt_salt,
                 zbar3=zbar3_live)
@@ -274,18 +274,21 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         tke_cfg.validate()                       # the C fesom_tke_alloc:247-253 abort parity
         if stress_node_surf is None:
             raise ValueError(
-                "TKE (tke_cfg) requires CORE2 surface forcing (step_forcing): the surface "
-                "flux cd·|stress_node_surf|^{3/2} needs the ice-blended nodal wind stress. "
-                "The pi analytical path has no surface forcing — keep tke_cfg=None there.")
+                "TKE (tke_cfg) requires surface forcing (step_forcing): the surface flux "
+                "cd·|stress_node_surf|^{3/2} needs the ice-blended nodal wind stress. Build it "
+                "with fesom_jax.surface_forcing.build_surface_forcing, or keep tke_cfg=None "
+                "for an unforced run.")
         Kv, Av, uvnode, tke_new = _ckpt(lambda: tke.mixing_tke(
             mesh, st.uv, bvfreq, st.tke, stress_node_surf, st.hnode, tke_cfg, params,
             dt=dt, exch=_exch, Z3d=Z3d_live))()
     elif kpp_cfg is not None:
         if heat_flux is None:
             raise ValueError(
-                "KPP (kpp_cfg) requires CORE2 surface forcing (step_forcing): it needs "
-                "heat_flux/water_flux/stress_node_surf/sw_3d for ustar/Bo/bfsfc. The pi "
-                "analytical path has no surface forcing — keep kpp_cfg=None there.")
+                "KPP (kpp_cfg) requires surface forcing (step_forcing): it needs "
+                "heat_flux/water_flux/stress_node_surf/sw_3d for ustar/Bo/bfsfc — a "
+                "boundary-layer scheme needs the boundary. Build the forcing with "
+                "fesom_jax.surface_forcing.build_surface_forcing, or keep kpp_cfg=None "
+                "for an unforced run.")
         sw_alpha, sw_beta = eos.compute_sw_alpha_beta(mesh, st.T, st.S, Z3d=Z3d_live)
         dbsfc = eos.compute_dbsfc(mesh, st.T, st.S, Z3d=Z3d_live)
         Kv, Av, uvnode = _ckpt(lambda: kpp.mixing_kpp(
@@ -500,7 +503,7 @@ def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
     for the differentiable path). ``is_first_step`` is set on the first iteration
     only (the AB2 first-step branch).
 
-    For CORE2, pass ``step_forcings`` (a :class:`~fesom_jax.core2_forcing.StepForcing`
+    For CORE2, pass ``step_forcings`` (a :class:`~fesom_jax.surface_forcing.StepForcing`
     with leading axis ``[n_steps]``) + ``forcing_static``; step ``i`` consumes
     ``step_forcings[i]``. ``None`` ⇒ the pi analytical path."""
     for i in range(n_steps):

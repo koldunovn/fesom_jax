@@ -991,7 +991,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   found it: JAX (assuming `a_ice=0`) mismatched the C heat_flux by **122 W/m²** at an Antarctic
   node (the visible band `0.486·shortwave` it wrongly added under ice). *Lesson: "ice off" in a
   coupled model rarely means `a_ice≡0` — grep every `a_ice` reader before assuming ice-free.*
-  (`core2_forcing.ice_ic_aice`/`compute_surface_fluxes`, Task 5.6.)
+  (`surface_forcing.ice_ic_aice`/`compute_surface_fluxes`, Task 5.6.)
 
 - **[tracers/T_old] ⚠️ The CORE2 step-1 `T_old`/`S_old` (AB2 `valuesold`) is the CONSTANT
   BASE 10/35, NOT the PHC field — the exact analog of the pi blob `T_old` trap.** The C order
@@ -1048,7 +1048,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   revisiting: `sss_runoff.runoff_node` (reader, bit-exact) + `sss_runoff_fluxes(water_flux, …,
   runoff_node, …)` (the balance, **pure in `water_flux`**) are already in place. Phase 6 only
   adds (a) `fesom_ice_thermodynamics` folding runoff into `flx_fw`, (b) `fesom_ice_oce_fluxes`
-  setting `water_flux=−flx_fw`; then `core2_forcing.compute_surface_fluxes`'s ice-on branch
+  setting `water_flux=−flx_fw`; then `surface_forcing.compute_surface_fluxes`'s ice-on branch
   feeds `−flx_fw` (incl. runoff) into the EXISTING `sss_runoff_fluxes` instead of the bulk's
   `evap−prec`. Verify ice-on with the dump recipe at river-mouth nodes; no double-count if the
   C3b design is followed (runoff in `flx_fw`, sbc local-term stays removed). Full spec:
@@ -1324,7 +1324,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
 - **[verify] `ocean2ice` is free: `srfoce_u/v == uvnode[:,0]`.** The C `ocean2ice`
   (`fesom_ice_coupling.c:84-110`) computes `u_w` as the area-weighted mean of the surrounding
   elements' surface UV — which is **exactly** the recipe that already produced `State.uvnode`
-  (the C comment `:44-45` says so), and Phase-5 `core2_forcing` already taps `uvnode[:,0]` for
+  (the C comment `:44-45` says so), and Phase-5 `surface_forcing` already taps `uvnode[:,0]` for
   the bulk current. So `ocean2ice` is five taps (`T/S[:,0]`, `hbar`, `uvnode[:,0]`), no new
   scatter. *Lesson: before porting a "compute X at nodes" coupling routine, check whether the
   ocean step already computed X under another name — FESOM reuses `uvnode` for the surface
@@ -1901,7 +1901,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   already computed this blend (`sns_b`) for the element `stress_surf` but only exported the element
   mean — K.8 exports the node `sns_b` as `SurfaceFluxes.stress_node_surf` (and `ice_oce_fluxes_mom`
   now returns `(stress_surf, sns)`, threaded through `IceStepOut`). Verified vs the C `iceforce` dump
-  (cols 8–9 = the final blended `stress_node_surf`) at 4.4e-16. (`core2_forcing.py`, `ice_step.py`,
+  (cols 8–9 = the final blended `stress_node_surf`) at 4.4e-16. (`surface_forcing.py`, `ice_step.py`,
   `ice_coupling.py`, K.8.)
 
 - **[kpp] `mixing_kpp` mirrors `pp.mixing_pp`'s contract — `(Kv,Av,uvnode)` post-mo_convect — so KPP is
@@ -2708,7 +2708,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   time a reused 2nd call; and use the **subtraction method** `per_step = (t_N − t_W)/(N − W)` over two warm
   runs (N and W steps) — the JAX analog of "omit the first W steps" (Kokkos' warmup exclusion), which cancels
   compile + per-call dispatch overhead + the AB2 first-step transient. ⚠️ ALSO benchmark the REAL workload:
-  use the real PHC IC + JRA55 forcing + prognostic ice (`phc_ic.load_phc_ic` + `core2_forcing.build_core_forcing`
+  use the real PHC IC + JRA55 forcing + prognostic ice (`phc_ic.load_phc_ic` + `surface_forcing.build_surface_forcing`
   are BOTH mesh-agnostic — they interpolate the global `/pool` datasets onto any mesh), NOT synthetic constant
   forcing — the SSH-CG iteration count (the dominant comm) is state/forcing-dependent, so a degenerate state
   understates it. (Per-step cost IS forcing-value-independent, so holding the real forcing constant across the
@@ -2926,7 +2926,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   balancing args) are keyword-only with `None`/0 defaults — a dead branch under linfs. (Task JZ.2.)
 
 - **[verify/zstar] ⚠️ The `forcing` ale_dump gate vs `z2_cdump` is a CONFIG-MATCHING problem, not a
-  code gate — the JAX `build_core_forcing` harness (tuned to the dt=500 dumps) does NOT reproduce the
+  code gate — the JAX `build_surface_forcing` harness (tuned to the dt=500 dumps) does NOT reproduce the
   z2_cdump's exact step-1 inputs.** First run: `virtual_salt` matches the C **exactly** (Δ=0, the zstar
   flip), but `water_flux`/`relax_salt`/`real_salt_flux` differ by ~1e-5. The DIAGNOSTIC: `relax_salt` is
   **path-independent** (identical math in linfs/zstar) yet among the worst-matched ⇒ the gap is the
@@ -3357,7 +3357,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   plan assumed the K.8 precedent ("the JAX forcing is a validated 1:1 port ⇒ no JAX↔C transient"), but
   that held for KPP because the KPP step dump was generated SPECIFICALLY to match the JAX (same dt=500,
   same date convention). The TKE cdump was generated by the C's own TKE validation at **dt=1800**, and
-  the JAX `build_core_forcing` step-1 wind stress there differs by **~7e-4 (≈60% of the 1.2e-3 scale)**
+  the JAX `build_surface_forcing` step-1 wind stress there differs by **~7e-4 (≈60% of the 1.2e-3 scale)**
   — and CRUCIALLY it is **IC-independent** (identical to the digit under `ic_core2` vs the 16-rank
   `ic_core2_dist16`), which RULES OUT the land-fill-IC hypothesis (`[[zstar-forcing-dump-config-gap]]`)
   and points squarely at a step-1 forcing **time/convention** mismatch (the wind at a different model
@@ -3414,7 +3414,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
 - **[verify/tke] ⚠️ DON'T pre-judge a climate from a step-1 forcing snapshot — RUN it. The 7e-4
   step-1 stress diff vs the cdump WASHES OUT: the 1-yr climate matches the C oracle at SST/SSS RMS
   4.68e-3/2.74e-3 ≈ the C↔Fortran floor (0.0049/0.0028).** I characterized a step-1 forcing
-  difference (the JAX `build_core_forcing` stress ~5× smaller than the cdump at ~10% low-wind
+  difference (the JAX `build_surface_forcing` stress ~5× smaller than the cdump at ~10% low-wind
   open-water nodes) and OVER-REACHED to "a bulk difference that blocks the climate" — then deferred
   the climate behind that assumption. A reviewer's objection ("the KPP/zstar climates ran fine, why
   a forcing gap now?") forced the right test: run the JAX-TKE 1-yr climate (`ic_core2_dist864` to
@@ -3451,7 +3451,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   node 56098: both 1.566710e-04) while `|JAX−TKE-cdump| = |KPP−TKE-cdump| = 7.185e-4`. So
   **`JAX == KPP-oracle ≠ TKE-cdump`** — the JAX matches the trusted KPP forcing oracle everywhere, and
   the TKE cdump (a separate old C job) disagrees with BOTH. The JAX forcing is the same validated
-  `build_core_forcing` code KPP/zstar use; the cdump just has different forcing inputs (likely a
+  `build_surface_forcing` code KPP/zstar use; the cdump just has different forcing inputs (likely a
   different JRA55 snapshot). My whole chase (gustiness → min-wind → transient → "undiagnosed") was
   WASTED EFFORT born of one error: I anchored on the cdump as ground truth and never cross-checked it
   against the KPP oracle (which I already had, `data/kpp_dump_core2`). **Moral: when ONE oracle
@@ -4207,7 +4207,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   + TODO. pyyaml added to the env (A7 pins it in `pyproject.toml`).
 
 - **Task A4 — per-step time-varying forcing on the SHARDED multi-step path (`SHARDED_FORCING_OK`).** The
-  forcing itself was always built (`core2_forcing.py`, JRA55+L&Y bulk — it drove the CORE2 5+10 yr); the gap
+  forcing itself was always built (`surface_forcing.py`, JRA55+L&Y bulk — it drove the CORE2 5+10 yr); the gap
   was that `run_steps_sharded` holds forcing CONSTANT across its `lax.scan` (the multi-node path only ever ran
   TIMING benchmarks, where the per-step cost is forcing-value-independent). NG5 is the first run that is BOTH
   multi-node AND needs a seasonal cycle ⇒ `run_steps_sharded_forced` folds the partitioned forcing
@@ -4337,7 +4337,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
 
 - **Task B2 — the NG5 forcing perf journey: MEASURE, don't guess (OOM fix → instrument → profile → local build,
   `RESTART`-grade discipline).** Three NG5-only failures the smaller meshes hid, each caught + fixed by data, not
-  hypothesis. **(a) Forcing GPU-0 OOM.** The first R0 canary OOM'd in `jit_stack`: `CoreForcing.stack` built the
+  hypothesis. **(a) Forcing GPU-0 OOM.** The first R0 canary OOM'd in `jit_stack`: `SurfaceForcing.stack` built the
   per-chunk forcing `[n_steps, nod2D]` on GPU 0 (`jnp`) — ~2.65 GB/field at 7.4 M × 48 steps, plus the intermediate
   list of 48 per-date forcings co-resident — before `partition_step_forcing` could shard it. dars (chunk=8, 3.16 M)
   hid it. Fix = the **host-build pattern** (`step_forcing`/`stack` gain `xp=jnp` default vs `xp=np`; the driver uses
@@ -4389,7 +4389,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   Multi-year forcing rollover WAS implemented and CORE-tested — but in the OLD per-step climate driver, not the new
   `run_from_config`.** The user asked "can we start a dars 3-yr run?" and I first claimed multi-year forcing wasn't
   implemented — WRONG (the user pushed: "I thought it was tested on CORE?"). It was: `core2_kpp_climate_run.py:303-308`
-  rebuilds the forcing when the model year changes (`if y != cf_year: cf = build_core_forcing(mesh, y)`), and the
+  rebuilds the forcing when the model year changes (`if y != cf_year: cf = build_surface_forcing(mesh, y)`), and the
   `kpp_climate_2yr` run logged `[forcing] rebuilt for year 1959` → a full 1959 of monthly means. The REAL gap: that
   rollover lives in the old per-step loop; the new consolidated **sharded/chunked `run_from_config`** builds the
   forcing ONCE for `cfg.forcing.start_year` and its chunk loop never rolled it — `_chunk_dates` correctly advances the
@@ -4401,9 +4401,9 @@ Cite the C source (`file:line`) or dump probe that proves it.
   knowledge is lost?").** The expensive part of "build forcing" — the per-node bilinear gather stencil (`idx4`/`dx4`/
   `dy4`/`denom`, built over every node) and the wind rotation — depends ONLY on (mesh, JRA grid), which is IDENTICAL
   every year. So DON'T rebuild it: `JRA55Reader.reopen_year(y)` (`jra55.py`) swaps only the 8 per-year `_Field` handles +
-  1-D time axes and KEEPS the stencil/rotation (a full `build_core_forcing(mesh, y)` rebuild — what the old loop did —
+  1-D time axes and KEEPS the stencil/rotation (a full `build_surface_forcing(mesh, y)` rebuild — what the old loop did —
   would re-pay the per-node setup ~seconds–tens-of-seconds at NG5 scale every Jan 1 and discard the per-device interp
-  knowledge; negligible vs ~55 h/yr compute, but wasteful and trivially avoidable). `CoreForcing.reopen_year` /
+  knowledge; negligible vs ~55 h/yr compute, but wasteful and trivially avoidable). `SurfaceForcing.reopen_year` /
   `LocalForcing.reopen_year` delegate (SSS-restoring + chl are year-independent monthly climatologies; only JRA rolls).
   Wiring in `run_from_config`: `_year_boundaries(year, dt, start_step, n_steps)` (the absolute steps where the calendar
   year flips, exact incl. leap via `datetime`) → `plan_chunks(split_at=…)` so no chunk straddles a year; the loop reopens
@@ -5011,7 +5011,7 @@ Cite the C source (`file:line`) or dump probe that proves it.
   `FESOM_IC_DIR`) and the four forcing files also a YAML key inside `forcing:` (strict-keyed like
   every other config block). Two rules that made this a no-risk refactor: (1) the env is read at
   CALL time (`paths.resolve`), not at import, so exporting a var in a job script after
-  `import fesom_jax` still works; (2) all four `build_core_forcing` path kwargs became `None`
+  `import fesom_jax` still works; (2) all four `build_surface_forcing` path kwargs became `None`
   ("resolve yourself") instead of an import-time default, so the default path on Levante is
   byte-identical while a caller can override any single one. Keep the legacy `DEFAULT_*` module
   names alive as import-time snapshots — test gates (`Path(jra55.DEFAULT_JRA_DIR).is_dir()`) and
@@ -5048,3 +5048,27 @@ Cite the C source (`file:line`) or dump probe that proves it.
   repo that only its author can run and one that `pip install` + a laptop CPU can run in 2 minutes
   (forward model *and* gradient — `examples/01_pi_quickstart.ipynb`). If a model's data does not
   ship, its documentation is fiction; test the quick-start as a stranger would, from a clean clone.
+
+- **[usability] A module named after the wrong thing is a bug in the documentation layer**
+  (`core2_forcing.py` → `surface_forcing.py`; the builder and the dataclass shed their `Core…`
+  names for `build_surface_forcing` / `SurfaceForcing` — spelled out in the shim's docstring, and
+  deliberately not repeated here so that grepping the tree for the old symbols stays a clean
+  "are we done?" gate). The old name was wrong twice: it named a **mesh** (CORE2)
+  although the module is entirely mesh-agnostic (pi/farc/dars/CORE2/NG5), and "CORE2 forcing" is a
+  real but *different* dataset (CORE-II, Large & Yeager) while this driver reads **JRA55-do**. To an
+  ocean modeller that is not a cosmetic wart — it asserts a false fact about the science. Renamed to
+  say what it is: the *driver* that assembles per-step surface forcing from the input datasets, as
+  distinct from `forcing.py`, which holds the differentiable *kernels* (L&Y09 bulk, wind stress) it
+  calls. Two things made the rename safe to do on a live tree: (1) a **deprecation shim** at the old
+  path re-exporting the new module — old names bound to the *same* objects, plus a PEP-562
+  `__getattr__` fallback — so the long-running SLURM chains keep importing `core2_forcing` unchanged
+  while emitting a `DeprecationWarning`; (2) `\bcore2_forcing\b` as the migration regex, since `_` is
+  a word character, so the word boundary **automatically** spared the three lookalikes that must NOT
+  move: the published Zenodo archive `core2_forcing_1958.zip` (renaming it breaks `fetch_data.py`
+  against already-uploaded files), the `core2_forcing_measure.py` benchmark filename, and the
+  `core2_forcing_missing` pytest gate (which really is about CORE2 *fixture data*). **Lesson: when a
+  rename is mostly `sed`, the risk is not the code — it is the identifiers that merely look like the
+  one you are renaming. Prove it: invert the substitution across the tree and diff against `HEAD`;
+  every file must round-trip to a byte-identical original, or the diff is not the pure rename you
+  claimed.** (Ironically `CORE2_runoff.nc` — a real file on disk, inside the JRA55-do directory —
+  keeps its name; not every "core2" in the forcing path is a mistake.)

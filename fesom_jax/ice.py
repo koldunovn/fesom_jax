@@ -10,7 +10,7 @@ Two host-side pieces, both faithful ports of the C ice setup
 * :func:`ice_initial_state` / :func:`seed_ice` — the cold-start ice IC
   (``fesom_ice_initial_state``, ``fesom_ice.c:246-277``): where (non-cavity & IC SST < 0),
   ``a_ice=0.9`` with hemisphere-split ``m_ice``/``m_snow`` (NH 1.0/0.1, SH 2.0/0.5); else
-  open water. This **generalizes** the Phase-5 static-mask :func:`core2_forcing.ice_ic_aice`
+  open water. This **generalizes** the Phase-5 static-mask :func:`surface_forcing.ice_ic_aice`
   (which produced only the ``a_ice`` mask) to the full prognostic ``(a_ice, m_ice, m_snow)``.
 
 ⚠️ Scope (``fesom_ice_types.h:6-18``): single ice class, **standard EVP only**

@@ -130,9 +130,9 @@ KPP sets `Kv/Av`; GM's K33 still augments `Kv` afterward (same as PP+GM today, `
 | `sw_alpha`, `sw_beta` | `Bo`, `bfsfc`, `dbsfc` | `eos.compute_sw_alpha_beta` (`eos.py:211`) | ✅ exists (GM added it) |
 | `uvnode` | dVsq, ri_iwmix shear | `pp.compute_vel_nodes` (`step.py:129`) | ✅ reuse |
 | `S` surface | `Bo` haline term | `st.S[:,0]` | ✅ |
-| `heat_flux`, `water_flux` | `Bo` (surface buoyancy flux) | `StepForcing` (`core2_forcing.py:95-96`) | ⚠️ thread to seam |
-| `stress_node_surf` | `ustar = sqrt(sqrt(\|τ\|/ρ₀))` | `bulk.stress_node_surf` (`core2_forcing.py:137`) | ⚠️ thread to seam |
-| `sw_3d` | `bfsfc` shortwave penetration | forcing `cal_shortwave_rad` (`core2_forcing.py:147`) | ⚠️ thread to seam |
+| `heat_flux`, `water_flux` | `Bo` (surface buoyancy flux) | `StepForcing` (`surface_forcing.py:95-96`) | ⚠️ thread to seam |
+| `stress_node_surf` | `ustar = sqrt(sqrt(\|τ\|/ρ₀))` | `bulk.stress_node_surf` (`surface_forcing.py:137`) | ⚠️ thread to seam |
+| `sw_3d` | `bfsfc` shortwave penetration | forcing `cal_shortwave_rad` (`surface_forcing.py:147`) | ⚠️ thread to seam |
 | **`dbsfc`** | `Ritop = zk·dbsfc(nz)` (bldepth) | **not computed under PP** (`eos.py:7`) | ❌ **ADD** (K.5) |
 
 So K.8 threads `heat_flux`/`water_flux`/`stress_node_surf`/`sw_3d` (already produced by the CORE2
@@ -302,7 +302,7 @@ is the template; `port2/.../docs/plans/completed/20260524-kpp-vertical-mixing.md
   threaded `heat_flux/water_flux/stress_node_surf/sw_3d` from the forcing block + `sw_alpha/sw_beta/
   dbsfc` from EOS + `uvnode/hnode`; `Kv→tracer diff (+GM K33)`, `Av→momentum`. Added the **node-blended
   `stress_node_surf`** (the C `forcing->stress_node_surf` at KPP time = `fesom_main.c:1073-1075`
-  `oce_fluxes_mom` writeback) to `core2_forcing.SurfaceFluxes` + `ice_step.IceStepOut`
+  `oce_fluxes_mom` writeback) to `surface_forcing.SurfaceFluxes` + `ice_step.IceStepOut`
   (`ice_oce_fluxes_mom` now returns `(stress_surf, sns)`). KPP **raises on the pi path** (needs
   forcing — locked decision 7). **Gate (7 tests, `test_kpp_step.py`):** because the JAX forcing is a
   validated 1:1 port of the C forcing (Phase 5), there is **no JAX↔C step-1 forcing transient** (the

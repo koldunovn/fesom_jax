@@ -291,11 +291,11 @@ Next: **JT.1 — the column core `cvmix_tke.py`, controlled-replay-gated (13 cor
       **both-cfgs-set raise** through the forced step; **jit-twice** bit-identical (static cfg). pi-path
       raise is in `test_tke_replay.py` (JT.0).
 - [~] ⚠️ the cdump-matching FORWARD gate (step-1 `tke`/`forc_tke_surf` vs cdump) is **xfail** — the
-      JAX `build_core_forcing` dt=1800 step-1 wind stress differs from the cdump's C-run by ~7e-4
+      JAX `build_surface_forcing` dt=1800 step-1 wind stress differs from the cdump's C-run by ~7e-4
       (≈60% of scale), **IC-independent** (identical under ic_core2 vs dist_16) ⇒ a forcing step-1
       **time/convention** mismatch, NOT FP and NOT the TKE port (which is bit-exact via the JT.1/JT.2
       replay gates; the KPP forcing gate matched <1e-12 at dt=500 with its own forcing-matched dump).
-      A `core2_forcing` dt=1800 alignment (or a forcing-matched TKE step re-dump) unblocks it — handle
+      A `surface_forcing` dt=1800 alignment (or a forcing-matched TKE step re-dump) unblocks it — handle
       in JT.5/follow-up. (lesson JT.3)
 - [ ] full suite green (regression) — submitting
 

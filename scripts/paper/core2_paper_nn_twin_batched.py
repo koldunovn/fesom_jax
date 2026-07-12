@@ -125,7 +125,7 @@ def main():
             import glob
             import pickle
             import re
-            from fesom_jax import core2_forcing
+            from fesom_jax import surface_forcing
             from fesom_jax.phc_ic import core2_initial_state
             files = sorted(glob.glob(str(args.snapshots_dir / "snap_step*.pkl")))
             pairs = [(int(re.search(r"snap_step(\d+)", f).group(1)), f) for f in files
@@ -138,11 +138,11 @@ def main():
                 pairs = [pairs[i] for i in idx]
             K = len(pairs)
             base = core2_initial_state(mesh, twin.IC_DIR)
-            cf = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=np.asarray(base.T[:, 0]))
+            cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=np.asarray(base.T[:, 0]))
             for s, f in pairs:
                 with open(f, "rb") as fp:
                     starts_host.append(pickle.load(fp))  # host State (saved via device_get)
-                dts = core2_forcing.dates_for_steps(args.year, DT, s + N)[s:s + N]
+                dts = surface_forcing.dates_for_steps(args.year, DT, s + N)[s:s + N]
                 frc.append(cf.stack(dts))
             days = [round(s * DT / 86400) for s, _ in pairs]
             print(f"[setup] SEASONAL: {K} snapshots at days {days} (steps {[s for s,_ in pairs]})",

@@ -39,7 +39,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from fesom_jax import ale, calibrate, core2_forcing, eos, ice, pp, ssh, tke_nn
+from fesom_jax import ale, calibrate, surface_forcing, eos, ice, pp, ssh, tke_nn
 from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
@@ -96,8 +96,8 @@ def build(year, n, config):
     else:
         raise ValueError(f"unknown --config {config!r} (use all3 / tkegm)")
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
-    dates = core2_forcing.dates_for_steps(year, DT, n)
+    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
+    dates = surface_forcing.dates_for_steps(year, DT, n)
     sfs = cf.stack(dates)
     sf_last = jax.tree.map(lambda x: x[n - 1], sfs)              # last step's forcing (for diagnostics)
     return mesh, state, op, cf.static, sfs, sf_last, cfgs
@@ -134,7 +134,7 @@ def reconstruct_features(mesh, st, sf_last, fs):
     du = _shift_down(uvnode[..., 0]) - uvnode[..., 0]
     dv = _shift_down(uvnode[..., 1]) - uvnode[..., 1]
     vshear2 = jnp.where(is_interior, (du * du + dv * dv) / (dZ_safe * dZ_safe), 0.0)
-    sfx = core2_forcing.compute_surface_fluxes(mesh, st, sf_last, fs, dt=DT)
+    sfx = surface_forcing.compute_surface_fluxes(mesh, st, sf_last, fs, dt=DT)
     sx, sy = sfx.stress_node_surf[:, 0], sfx.stress_node_surf[:, 1]
     forc = _safe_sqrt(sx * sx + sy * sy) / DENSITY_0
     return tke_nn.column_features(forc, mesh.coriolis_node, mesh.depth, bvfreq2, vshear2,

@@ -62,8 +62,8 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
                      dt: float, boundary_node=None, use_virt_salt: bool = True,
                      owned_mask=None, axis_name=None, exch=None, zbar3=None) -> IceStepOut:
     """One assembled ice step → the surface fluxes + the new ice state. ``sf`` is this step's
-    :class:`core2_forcing.StepForcing` (atmosphere + month SSS/chl); ``fs`` the
-    :class:`core2_forcing.ForcingStatic` (runoff/areas/open_water). ``boundary_node`` (the
+    :class:`surface_forcing.StepForcing` (atmosphere + month SSS/chl); ``fs`` the
+    :class:`surface_forcing.ForcingStatic` (runoff/areas/open_water). ``boundary_node`` (the
     coastal mask) is precomputed once if given, else derived from ``mesh``.
 
     ``use_virt_salt`` (static; ``True`` for linfs, ``False`` for zstar = ``ale_cfg`` present):

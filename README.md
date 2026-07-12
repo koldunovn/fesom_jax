@@ -58,6 +58,7 @@ with no data download. Start here:
 |---|---|---|
 | [`examples/01_pi_quickstart.ipynb`](examples/01_pi_quickstart.ipynb) | run the ocean, plot it, differentiate it — **~2 min on a CPU** | nothing |
 | [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic.ipynb) | the real 1° global ocean: observed initial state, real weather, sea ice | [input data](#data) |
+| [`examples/03_how_the_model_works.ipynb`](examples/03_how_the_model_works.ipynb) | **`step` vs `integrate`; switching physics on/off**; building up to a realistic ocean | nothing (last section: forcing) |
 
 This pulls `jax[cuda12]`, numpy, scipy, netCDF4, **zarr** (sharded output), and (viz) matplotlib.
 No system CUDA module is needed — CUDA 12 + cuDNN ship as pip wheels. **Recorded working set:**
@@ -91,7 +92,7 @@ fesom_jax/
   ice*.py                      # prognostic sea ice: EVP + mEVP (ice_mevp.py) dynamics, FCT, thermo
   # Phase-9 differentiable options, each config-gated (None/0 ⇒ byte-identical):
   #   zstar moving coordinate (ale_cfg), classical-TKE mixing (tke_cfg), mEVP rheology (whichEVP=1)
-  forcing.py core2_forcing.py jra55.py phc_ic.py sss_runoff.py   # bulk fluxes; JRA55; PHC IC; SSS
+  forcing.py surface_forcing.py jra55.py phc_ic.py sss_runoff.py   # bulk fluxes; JRA55; PHC IC; SSS
   halo.py halo_points.py reductions.py        # halo exchange (all_gather + ragged); psum reductions
   shard_mesh.py integrate_sharded.py          # per-device sharded mesh/state; shard_map runners
   zarr_output.py               # sharded, gather-free model output to Zarr
@@ -159,7 +160,7 @@ from fesom_jax.mesh import load_mesh
 from fesom_jax.ssh import build_ssh_operator
 from fesom_jax.phc_ic import core2_initial_state
 from fesom_jax.step import step
-from fesom_jax import core2_forcing, ice
+from fesom_jax import surface_forcing, ice
 from fesom_jax.kpp import KppConfig; from fesom_jax.gm import GMConfig; from fesom_jax.ice import IceConfig
 
 mesh   = load_mesh(os.environ["FESOM_MESH_DIR"])            # the CORE2 mesh you fetched
@@ -172,12 +173,12 @@ state0 = ice.seed_ice(state0, mesh, sst0)                   # cold-start sea ice
 # Where does the forcing come from? Each input path resolves as
 #     explicit argument  >  $FESOM_* environment variable  >  DKRZ/Levante default
 # so with $FESOM_JRA_DIR exported (above) this reads YOUR copy of JRA55-do. To be explicit:
-#     build_core_forcing(mesh, 1958, sst_ic=sst0, jra_dir="/path/to/JRA55-do-v1.4.0")
+#     build_surface_forcing(mesh, 1958, sst_ic=sst0, jra_dir="/path/to/JRA55-do-v1.4.0")
 # Same for sss_path / runoff_path / chl_path. If a file is missing you get an error naming the
 # variable to set — nothing is silently skipped. See docs/DATA.md.
-cf     = core2_forcing.build_core_forcing(mesh, 1958, sst_ic=sst0)
+cf     = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=sst0)
 
-sf, fs = cf.step_forcing(*core2_forcing.dates_for_steps(1958, 1800.0, 1)[0]), cf.static
+sf, fs = cf.step_forcing(*surface_forcing.dates_for_steps(1958, 1800.0, 1)[0]), cf.static
 state_1 = step(state0, mesh, op, stress, dt=1800.0, is_first_step=True,
                step_forcing=sf, forcing_static=fs,
                kpp_cfg=KppConfig(), gm_cfg=GMConfig(), ice_cfg=IceConfig())
@@ -189,7 +190,7 @@ state_1 = step(state0, mesh, op, stress, dt=1800.0, is_first_step=True,
 time and runs for years ([`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)). A worked version of all of this,
 with plots, is [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic.ipynb).
 
-### 2. Backward — gradients (the whole point)
+### 2. Backward — gradients
 
 Continuing from **§1** (the packaged `pi` mesh — so this needs **no data**; it is identical at CORE2
 scale, just with that mesh and `dt`):
@@ -542,6 +543,7 @@ above; these are the constraints on the *gradient* modes):
 |-----|------|
 | [`examples/01_pi_quickstart.ipynb`](examples/01_pi_quickstart.ipynb) | **start here** — run + differentiate the model in 2 min, no data |
 | [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic.ipynb) | the realistic 1° global ocean with real weather + sea ice |
+| [`examples/03_how_the_model_works.ipynb`](examples/03_how_the_model_works.ipynb) | how the model is put together: `step` vs `integrate`, and how to run without sea ice / eddies / … |
 | [`docs/DATA.md`](docs/DATA.md) | the input datasets: what they are, how to get them, how to point at them |
 | [`docs/NEW_MESH.md`](docs/NEW_MESH.md) | **running on your own FESOM2 mesh** — the two one-off preparation steps |
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | driving runs from a single YAML: restarts, chaining, multi-GPU |

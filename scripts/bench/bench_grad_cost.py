@@ -51,7 +51,7 @@ def main():
     ap.add_argument("--gm", type=int, default=1)
     args = ap.parse_args()
 
-    from fesom_jax import core2_forcing, ice, ssh
+    from fesom_jax import surface_forcing, ice, ssh
     from fesom_jax.gm import GMConfig
     from fesom_jax.ice import IceConfig
     from fesom_jax.integrate import integrate
@@ -65,8 +65,8 @@ def main():
     if args.ice:
         st0 = ice.seed_ice(st0, mesh, sst0)
     op = ssh.build_ssh_operator(mesh, dt=args.dt)
-    cf = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0)
-    sfs = cf.stack(core2_forcing.dates_for_steps(args.year, args.dt, args.n))
+    cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0)
+    sfs = cf.stack(surface_forcing.dates_for_steps(args.year, args.dt, args.n))
     fs = cf.static
     cfgs = dict(ice_cfg=IceConfig() if args.ice else None,
                 kpp_cfg=KppConfig() if args.kpp else None,

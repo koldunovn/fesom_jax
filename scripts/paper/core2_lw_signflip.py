@@ -48,7 +48,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from fesom_jax import ale, core2_forcing, obs_compare, ssh
+from fesom_jax import ale, surface_forcing, obs_compare, ssh
 from fesom_jax.ale import AleConfig
 from fesom_jax.calibrate import build_params
 from fesom_jax.gm import GMConfig
@@ -126,8 +126,8 @@ def main():
         st0 = jax.device_put(pickle.load(f))
     yr, mo, dy = seed_date(args.snap, args.run_start_year, args.seed_month or None, args.seed_day or None)
     sst0 = np.asarray(core2_initial_state(mesh, IC_DIR).T[:, 0])          # forcing a_ice mask (fixed)
-    cf = core2_forcing.build_core_forcing(mesh, yr, sst_ic=sst0)
-    dates = core2_forcing.dates_for_steps(yr, DT, n, start_month=mo, start_day=dy)
+    cf = surface_forcing.build_surface_forcing(mesh, yr, sst_ic=sst0)
+    dates = surface_forcing.dates_for_steps(yr, DT, n, start_month=mo, start_day=dy)
     sfs = cf.stack(dates)
     fs = cf.static
     segments = max(2, int(round(math.sqrt(max(1, n)))))                   # O(√N) checkpointing

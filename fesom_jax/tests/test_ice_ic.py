@@ -17,7 +17,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fesom_jax import core2_forcing, ice
+from fesom_jax import surface_forcing, ice
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import core2_initial_state
 from fesom_jax.state import State
@@ -134,9 +134,9 @@ def test_cold_start_state_equals_manual_seed(core2):
 
 
 def test_ic_consistent_with_phase5_mask(core2):
-    """The a_ice component equals the Phase-5 static mask (core2_forcing.ice_ic_aice)."""
+    """The a_ice component equals the Phase-5 static mask (surface_forcing.ice_ic_aice)."""
     mesh, _state, sst, a, _m, _ms = core2
-    a5 = np.asarray(core2_forcing.ice_ic_aice(mesh, sst))
+    a5 = np.asarray(surface_forcing.ice_ic_aice(mesh, sst))
     assert np.array_equal(a, a5)
 
 

@@ -22,7 +22,7 @@ import fesom_jax  # noqa: F401  (x64)
 import jax
 import jax.numpy as jnp
 
-from fesom_jax import core2_forcing, ice, partit, shard_mesh, ssh, tke_nn
+from fesom_jax import surface_forcing, ice, partit, shard_mesh, ssh, tke_nn
 from fesom_jax import integrate_sharded as ish
 from fesom_jax import step as stepmod
 from fesom_jax.gm import GMConfig
@@ -55,8 +55,8 @@ def main():
     sst0 = np.asarray(base.T[:, 0])
     state = ice.seed_ice(base, mesh, sst0)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=sst0)
-    sf = cf.step_forcing(*core2_forcing.dates_for_steps(YEAR, DT, 1)[0])
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
+    sf = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
     fs = cf.static
     cfg = dict(tke_cfg=TkeConfig(), gm_cfg=GMConfig(), ice_cfg=IceConfig())
     print("[setup] built mesh+IC+forcing+ice; cfg=TKE+GM+ice", flush=True)

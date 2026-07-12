@@ -132,7 +132,7 @@ def _step_at_elapsed(T: float, dt0: float, dt_ramp=None) -> int:
 def _chunk_dates(year: int, dt: float, start_step: int, count: int, dt_ramp=None):
     """Model ``(year, doy, sec, month)`` tuples for the ``count`` steps starting at absolute
     ``start_step`` — the chunk-local slice of
-    :func:`fesom_jax.core2_forcing.dates_for_steps`, computed without materializing the whole
+    :func:`fesom_jax.surface_forcing.dates_for_steps`, computed without materializing the whole
     multi-year date list (NG5 has ~175 k steps/yr). ``dt`` is the BASE timestep; ``dt_ramp`` (if
     set) makes the elapsed-time clock PIECEWISE (:func:`_elapsed_seconds`) so the calendar is exact
     across a mid-run dt change. ``dt_ramp=None`` ⇒ the plain ``n·dt`` map (bit-identical to before)."""
@@ -299,7 +299,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     ``state0`` (a GLOBAL host :class:`~fesom_jax.state.State`) seeds a cold start; else
     ``cfg.restart_in`` is read (device-count-portable) and ``start_step`` taken from its metadata.
     ``forcing_stack`` (a ``StepForcing`` stacked over the FULL run) overrides the calendar forcing
-    (the test path); production builds each chunk's forcing from ``forcing`` (a ``CoreForcing``) via
+    (the test path); production builds each chunk's forcing from ``forcing`` (a ``SurfaceForcing``) via
     the calendar. ``accumulate_stats`` folds each chunk-final State into an
     :class:`~fesom_jax.zarr_output.OnlineStats` (a coarse, gather-free time mean). Returns a
     :class:`RunResult`; writes the portable restart to ``out_dir`` / ``cfg.restart_out`` if set.
@@ -389,7 +389,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                          split_at=sorted(set(_split)))
 
     if forcing is None and forcing_stack is None:
-        raise ValueError("run_from_config: provide forcing (CoreForcing) or forcing_stack")
+        raise ValueError("run_from_config: provide forcing (SurfaceForcing) or forcing_stack")
     fstatic = forcing.static
     fs_p = shard_mesh.partition_forcing_static(fstatic, part)
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)

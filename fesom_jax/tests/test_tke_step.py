@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from fesom_jax import core2_forcing, kpp, ssh
+from fesom_jax import surface_forcing, kpp, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import core2_initial_state
@@ -55,10 +55,10 @@ def run1():
     mesh = load_mesh(MESH_DIR)
     state = core2_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
     fs = cf.static
-    sf0 = cf.step_forcing(*core2_forcing.dates_for_steps(YEAR, DT, 1)[0])
-    sfx = core2_forcing.compute_surface_fluxes(mesh, state, sf0, fs, dt=DT)
+    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
+    sfx = surface_forcing.compute_surface_fluxes(mesh, state, sf0, fs, dt=DT)
 
     st_tke = stepmod.step(state, mesh, op, None, dt=DT, is_first_step=True,
                           step_forcing=sf0, forcing_static=fs, tke_cfg=TkeConfig())

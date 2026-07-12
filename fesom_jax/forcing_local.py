@@ -13,7 +13,7 @@ sharded array via `make_array_from_callback`, whose per-shard callback reads ONL
 partitions' slices of the host array (the non-local rows are never touched). The win is the
 ``npes / len(local_parts)`` (= 16×) reduction in interpolation work.
 
-The local reader is a fresh :class:`~fesom_jax.core2_forcing.CoreForcing` built on a **sub-mesh** of
+The local reader is a fresh :class:`~fesom_jax.surface_forcing.SurfaceForcing` built on a **sub-mesh** of
 the local nodes (the JRA/SSS/chl readers need only node lon/lat), so it has fully independent state
 (the JRA `_Field` carries mutable per-field coefficients — a shared reader would corrupt them).
 """
@@ -22,7 +22,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import jra55, sss_runoff
-from .core2_forcing import CoreForcing, StepForcing
+from .surface_forcing import SurfaceForcing, StepForcing
 from .shard_mesh import _default_pad, local_sizes
 
 
@@ -51,13 +51,13 @@ def local_partitions(npes: int):
 
 
 class LocalForcing:
-    """A local-node :class:`CoreForcing` + the scatter map into ``[P, n_steps, Lmax]``.
+    """A local-node :class:`SurfaceForcing` + the scatter map into ``[P, n_steps, Lmax]``.
 
     Build once (per process) via :func:`build_local_forcing`; call :meth:`stack_partitioned` per
     chunk. The output is consumed exactly like :func:`shard_mesh.partition_step_forcing`'s — a
     ``StepForcing`` of ``[P, n_steps, Lmax]`` leaves — but only ``local_parts`` are filled."""
 
-    def __init__(self, cf: CoreForcing, part, npes: int, local_parts, local_nodes):
+    def __init__(self, cf: SurfaceForcing, part, npes: int, local_parts, local_nodes):
         self.cf = cf
         self.part = part
         self.npes = int(npes)
@@ -88,7 +88,7 @@ class LocalForcing:
         return StepForcing(**out)
 
     def reopen_year(self, year: int):
-        """Roll the local forcing to ``year`` (delegates to the wrapped CoreForcing/JRA reader; the
+        """Roll the local forcing to ``year`` (delegates to the wrapped SurfaceForcing/JRA reader; the
         local sub-mesh stencil is year-independent and kept). Returns ``self``."""
         self.cf.reopen_year(year)
         return self
@@ -107,7 +107,7 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
 
     ``local_parts`` overrides the :func:`local_partitions` device-derived set (the test path —
     so a single process can exercise the multi-partition scatter without N real devices).
-    ``static`` is the global :class:`~fesom_jax.core2_forcing.ForcingStatic` (reused as-is; the
+    ``static`` is the global :class:`~fesom_jax.surface_forcing.ForcingStatic` (reused as-is; the
     per-step path never touches it). ``sst_ic`` is accepted for signature parity (the static, not
     the per-step forcing, uses it) and ignored here."""
     if local_parts is None:
@@ -118,7 +118,7 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
     sub = _SubMesh(mesh, local_nodes)
     chl = (np.full((12, int(len(local_nodes))), float(chl_const), dtype=np.float64)
            if chl_const is not None else sss_runoff.build_chl_clim(sub, chl_path))
-    cf = CoreForcing(jra=jra55.JRA55Reader(sub, int(year), jra_dir),
+    cf = SurfaceForcing(jra=jra55.JRA55Reader(sub, int(year), jra_dir),
                      sss=sss_runoff.build_reader(sub, sss_path, runoff_path),
                      chl_clim=chl, static=static)
     return LocalForcing(cf, part, npes, local_parts, local_nodes)

@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from fesom_jax import core2_forcing, ice, ssh
+from fesom_jax import surface_forcing, ice, ssh
 from fesom_jax import step as stepmod
 from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
@@ -48,8 +48,8 @@ def main():
     state = cold_start_state(mesh, IC_DIR)                 # PHC IC + seeded sea-ice IC (canonical)
     sst = np.asarray(state.T[:, 0])
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst)
-    dates = core2_forcing.dates_for_steps(args.year, DT, args.steps)
+    cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst)
+    dates = surface_forcing.dates_for_steps(args.year, DT, args.steps)
     cfgs = dict(gm_cfg=GMConfig(), tke_cfg=TkeConfig(), ice_cfg=IceConfig(whichEVP=1),
                 ale_cfg=AleConfig())     # zstar + TKE + mEVP + GM, all live
     surf = jnp.asarray(np.asarray(mesh.node_layer_mask)[:, 0])

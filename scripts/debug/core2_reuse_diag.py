@@ -26,7 +26,7 @@ if MODE == "pcache":
     jax.config.update("jax_persistent_cache_min_entry_size_bytes", 0)
     print(f"[diag] persistent compile cache ON -> {CACHE_DIR}", flush=True)
 
-from fesom_jax import core2_forcing, partit, shard_mesh, ssh, ice_evp
+from fesom_jax import surface_forcing, partit, shard_mesh, ssh, ice_evp
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import cold_start_state
 from fesom_jax.run_config import load_yaml
@@ -44,7 +44,7 @@ sm = shard_mesh.build_sharded_mesh(mesh, part)
 sop = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=cfg.dt), part)
 state0 = cold_start_state(mesh, IC, xp=np)
 sst0 = np.asarray(state0.T[:, 0])
-forcing = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=sst0)
+forcing = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
 fs_p = shard_mesh.partition_forcing_static(forcing.static, part)
 stress_p = np.zeros((NPES, sm.Lmax["elem"], 2))
 bn = np.asarray(ice_evp.boundary_node_mask(mesh))

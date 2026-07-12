@@ -18,7 +18,7 @@ import numpy as np
 
 jax.config.update("jax_enable_x64", True)
 
-from fesom_jax import core2_forcing, partit, shard_mesh, ssh, ice_evp
+from fesom_jax import surface_forcing, partit, shard_mesh, ssh, ice_evp
 from fesom_jax.mesh import load_mesh
 from fesom_jax.phc_ic import cold_start_state
 from fesom_jax.run_config import load_yaml
@@ -44,7 +44,7 @@ sop = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=cfg.dt), part)
 state0 = cold_start_state(mesh, IC, xp=np)
 sst0 = np.asarray(state0.T[:, 0])
 state_p = shard_mesh.partition_state(state0, part)
-forcing = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=sst0)
+forcing = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
 seq = forcing.stack(_chunk_dates(YEAR, cfg.dt, 0, NSTEPS, cfg.dt_ramp), xp=np)
 seq_p = shard_mesh.partition_step_forcing(seq, part)
 fs_p = shard_mesh.partition_forcing_static(forcing.static, part)

@@ -333,14 +333,14 @@ def test_grad_multistep_scan_backward(npes, capsys):
 # --------------------------------------------------------------------------
 @pytest.fixture(scope="module")
 def core2_forced():
-    from fesom_jax import core2_forcing
+    from fesom_jax import surface_forcing
     from fesom_jax.phc_ic import core2_initial_state
     mesh = load_mesh(CORE2_MESH)
     state = core2_initial_state(mesh, IC_DIR)
     sst0 = np.asarray(state.T[:, 0])
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = core2_forcing.build_core_forcing(mesh, YEAR, sst_ic=sst0)
-    sf = cf.step_forcing(*core2_forcing.dates_for_steps(YEAR, DT, 1)[0])
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
+    sf = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
     return dict(mesh=mesh, state=state, op=op, sf=sf, fs=cf.static)
 
 

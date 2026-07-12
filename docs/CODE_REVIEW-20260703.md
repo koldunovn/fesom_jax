@@ -338,7 +338,7 @@ non-default dt propagates into EVP `dte`/thermo rates.
 
 ---
 
-## 6. Forcing, initial conditions, observations (`forcing*.py`, `jra55.py`, `core2_forcing.py`, `sss_runoff.py`, `ic.py`, `phc_ic.py`, `obs_*.py`)
+## 6. Forcing, initial conditions, observations (`forcing*.py`, `jra55.py`, `surface_forcing.py`, `sss_runoff.py`, `ic.py`, `phc_ic.py`, `obs_*.py`)
 
 ### Assessment
 
@@ -375,7 +375,7 @@ cleared.
   needed host memory at NG5 scale).
 - **[nit] [confirmed] `jra55.py:466-467`** — the only out-of-bounds guard on bilinear
   corner indices is a bare `assert` (stripped under `python -O`).
-- **[nit] [confirmed] `run.py:144` vs `core2_forcing.py:289`** — the two date generators
+- **[nit] [confirmed] `run.py:144` vs `surface_forcing.py:289`** — the two date generators
   disagree on sub-second handling; moot for integer dt.
 - **[nit] [confirmed] `jra55.py:330-334,504`** — files checked for a shared grid but not
   a shared `calendar` attribute.

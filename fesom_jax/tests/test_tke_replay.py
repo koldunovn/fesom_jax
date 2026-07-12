@@ -135,7 +135,7 @@ def test_dispatch_pi_path_raises(pi_step):
     """TKE on the pi path (no CORE2 forcing ⇒ stress_node_surf is None) raises — TKE is
     a forced-path feature (it needs the surface |stress|), the KPP precedent."""
     mesh, op, stress, st = pi_step
-    with pytest.raises(ValueError, match="requires CORE2 surface forcing"):
+    with pytest.raises(ValueError, match="requires surface forcing"):
         stepmod.step(st, mesh, op, stress, dt=DT, is_first_step=True, tke_cfg=TkeConfig())
 
 

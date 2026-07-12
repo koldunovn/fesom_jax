@@ -18,7 +18,7 @@ from pathlib import Path
 
 import numpy as np
 
-from fesom_jax import core2_forcing
+from fesom_jax import surface_forcing
 from fesom_jax.mesh import load_mesh
 
 
@@ -44,11 +44,11 @@ def main():
               f"({mesh.nod2D}) — ice-free smoke (a_ice≡0)")
 
     # SETUP — builds the bilinear interpolation weights ONCE (the only mesh-dependent step)
-    cf = core2_forcing.build_core_forcing(mesh, args.year, sst_ic=sst0)
+    cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0)
     print(f"[forcing] JRA55Reader + SSS/runoff/chl readers built for {mesh.nod2D} nodes")
 
     # 1-step RUNTIME interpolation — read disk + bilinear-interp to nodes + time-interp
-    sf = cf.step_forcing(*core2_forcing.dates_for_steps(args.year, 1800.0, 1)[0])
+    sf = cf.step_forcing(*surface_forcing.dates_for_steps(args.year, 1800.0, 1)[0])
     ok = True
     for name in sf._fields:
         a = np.asarray(getattr(sf, name))
