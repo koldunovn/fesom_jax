@@ -23,6 +23,24 @@ eval "$(python scripts/fetch_data.py --dest ~/fesom-data --print-env)"   # set t
 Add `--mesh-only` to skip the 10.4 GB forcing (enough to load the mesh and plot the initial state,
 not enough to run). The script verifies checksums and can resume.
 
+<details>
+<summary>Maintainer: how the record is built and published</summary>
+
+```bash
+python scripts/build_zenodo_package.py --out /work/.../zenodo_core2      # build the two archives
+export ZENODO_TOKEN=...                                                  # personal token
+python scripts/upload_to_zenodo.py --stage /work/.../zenodo_core2 --sandbox --dry-run
+python scripts/upload_to_zenodo.py --stage /work/.../zenodo_core2 --sandbox   # rehearse
+python scripts/upload_to_zenodo.py --stage /work/.../zenodo_core2             # real; leaves a DRAFT
+```
+
+The uploader is adapted from [FESOM_examples](https://github.com/FESOM/FESOM_examples)
+(`upload_to_zenodo/`), with the FESOM-meshes *community* removed — this is a personal record, since
+it is a model setup rather than a mesh distribution — an explicit file list rather than a folder
+walk, and real metadata. Stdlib only; it runs in the `fesom-jax` env. Rehearse on `--sandbox` first:
+publishing is irreversible.
+</details>
+
 ### Running more than one year
 
 The Zenodo archive carries **1958 only**, to keep the download reasonable. For a longer run, get the
