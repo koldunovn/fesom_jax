@@ -88,10 +88,60 @@ def md5sum(path: Path) -> str:
     return h.hexdigest()
 
 
+def sha256sum(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def unzip(path: Path, dest: Path) -> None:
     print(f"  {path.name}: unpacking...", flush=True)
     with zipfile.ZipFile(path) as z:
         z.extractall(dest)
+
+
+def reassemble(archive: dict, files: dict, dest: Path) -> Path:
+    """Download an archive's .partNNN files and cat them back into one file.
+
+    The archives are split on Zenodo because Zenodo has no resumable upload and drops long PUTs
+    (see scripts/upload_to_zenodo.py). That is an upload-side workaround; nobody downloading should
+    have to care, so we hide it here -- download the parts, concatenate, verify the whole-file
+    sha256 from MANIFEST.json.
+    """
+    name, parts = archive["name"], archive["parts"]
+    out = dest / name
+    if out.exists() and out.stat().st_size == archive["size"]:
+        print(f"  {name}: already assembled")
+        return out
+
+    print(f"  {name}: {len(parts)} part(s), {archive['size'] / 2**30:.2f} GB")
+    part_paths = []
+    for i, p in enumerate(parts, 1):
+        if p not in files:
+            _die(f"record is missing part {p} of {name}")
+        pp = dest / p
+        print(f"    part {i}/{len(parts)}", end=" ", flush=True)
+        download(files[p]["url"], pp, files[p]["size"])
+        part_paths.append(pp)
+
+    print(f"  {name}: joining {len(part_paths)} parts...", flush=True)
+    with open(out, "wb") as w:
+        for pp in part_paths:
+            with open(pp, "rb") as r:
+                while chunk := r.read(8 << 20):
+                    w.write(chunk)
+    for pp in part_paths:
+        pp.unlink()
+
+    print(f"  {name}: verifying sha256...", flush=True)
+    got = sha256sum(out)
+    if got != archive["sha256"]:
+        _die(f"{name}: sha256 mismatch after reassembly (got {got}, "
+             f"expected {archive['sha256']}) -- delete it and re-run")
+    print(f"  {name}: verified")
+    return out
 
 
 def print_env(dest: Path) -> None:
@@ -129,21 +179,34 @@ def main() -> int:
 
     files = record_files(args.record)
     want = [MESH_ZIP] if args.mesh_only else [MESH_ZIP, FORCING_ZIP]
-    missing = [w for w in want if w not in files]
-    if missing:
-        _die(f"record {args.record} does not contain {missing}. It has: {sorted(files)}")
-
     dest.mkdir(parents=True, exist_ok=True)
+
+    # The record may carry each archive either whole, or split into .partNNN files with a
+    # MANIFEST.json saying how to rejoin them (Zenodo drops long uploads, so big archives are
+    # uploaded in pieces). Handle both; the split is invisible from here.
+    manifest = None
+    if "MANIFEST.json" in files:
+        mpath = dest / "MANIFEST.json"
+        download(files["MANIFEST.json"]["url"], mpath, files["MANIFEST.json"]["size"])
+        manifest = json.loads(mpath.read_text())
+
     for name in want:
-        info = files[name]
-        zpath = dest / name
-        download(info["url"], zpath, info["size"])
-        if info["md5"]:
-            print(f"  {name}: verifying...", flush=True)
-            got = md5sum(zpath)
-            if got != info["md5"]:
-                _die(f"{name} checksum mismatch (got {got}, expected {info['md5']}) — "
-                     "delete it and re-run")
+        if manifest and any(a["name"] == name for a in manifest["archives"]):
+            archive = next(a for a in manifest["archives"] if a["name"] == name)
+            zpath = reassemble(archive, files, dest)
+        elif name in files:
+            info = files[name]
+            zpath = dest / name
+            download(info["url"], zpath, info["size"])
+            if info["md5"]:
+                print(f"  {name}: verifying...", flush=True)
+                got = md5sum(zpath)
+                if got != info["md5"]:
+                    _die(f"{name} checksum mismatch (got {got}, expected {info['md5']}) — "
+                         "delete it and re-run")
+        else:
+            _die(f"record {args.record} has neither {name} nor its parts. It has: {sorted(files)}")
+
         unzip(zpath, dest)
         if not args.keep_zips:
             zpath.unlink()
