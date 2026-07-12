@@ -11,7 +11,7 @@ This suite test is deliberately **N=1** (one assembled step, no scan): it is the
 cheapest backward through the full CORE2 step yet still traverses every masked-divide
 lane, so it fits a CPU node and is a fast regression. The *quantitative* AD↔FD plateau
 through the CG and the multi-step checkpointed-backward **memory** confirmation run at
-a larger CORE2 slice on a GPU — ``scripts/core2_grad_gate.py`` (Task 5.8 GATE-5
+a larger CORE2 slice on a GPU — ``scripts/archive/core2_grad_gate.py`` (Task 5.8 GATE-5
 deliverable), not in the CPU suite.
 
 SKIPS cleanly if the CORE2 mesh / PHC IC cache / JRA55 NetCDF are absent.
@@ -97,7 +97,7 @@ def test_grad_kver_finite_core2(core2):
     columns, so this is a smooth, finite gradient. (k_ver does NOT reach the CG at N=1 —
     the CG is upstream of the diffusion and depends on ``uv``/``du`` i.e. ``a_ver``; the
     CG path is the next test. The quantitative AD↔FD plateaus are the GPU gate
-    ``scripts/core2_grad_gate.py``.)"""
+    ``scripts/archive/core2_grad_gate.py``.)"""
     import jax
     import jax.numpy as jnp
 

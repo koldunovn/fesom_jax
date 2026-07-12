@@ -1,7 +1,7 @@
 """E1 gate (CPU): the NN-of-TKE perfect-model twin recipe — recover a KNOWN ``tke_nn`` instance
 through the global adjoint (:func:`fesom_jax.calibrate.optimize` over the NN-weight pytree).
 
-These pi-mesh unit tests guard the recovery *mechanics* that ``scripts/core2_paper_nn_twin.py`` runs
+These pi-mesh unit tests guard the recovery *mechanics* that ``scripts/paper/core2_paper_nn_twin.py`` runs
 on CORE2 (the §3 hybrid-ML proof) — cheaply, through the **faithful TKE consumption site**
 ``tke.mixing_tke`` (TKE raises on the pi ``integrate`` path, so — exactly like the C1 sensitivity
 seam test — the recipe is exercised at ``mixing_tke``; the full end-to-end ``integrate`` adjoint is
@@ -14,7 +14,7 @@ the GPU gate NN_TWIN_OK):
   * **induced-mixing field recovered** — the recovered NN's c_k multiplier moves to the truth's where
     Kv constrains it (closer than the NN→0 start).
 
-Token: NN_TWIN_RECIPE_OK. The CORE2 GPU gate is NN_TWIN_OK (``scripts/core2_paper_nn_twin.py``).
+Token: NN_TWIN_RECIPE_OK. The CORE2 GPU gate is NN_TWIN_OK (``scripts/paper/core2_paper_nn_twin.py``).
 """
 
 from __future__ import annotations

@@ -1,7 +1,7 @@
 """D1 gate (CPU): the perfect-model ``k_gm`` twin recipe — grid-scan the misfit bowl, then
 recover an injected truth with the global adjoint (:func:`fesom_jax.calibrate.optimize`).
 
-These pi-mesh unit tests guard exactly what ``scripts/core2_paper_calib_twin.py`` does on CORE2
+These pi-mesh unit tests guard exactly what ``scripts/paper/core2_paper_calib_twin.py`` does on CORE2
 (the §2 adjoint-as-optimizer proof), cheaply and config-agnostically on the differentiable
 zstar+GM path (the GPU gate runs the FULL zstar+TKE+mEVP+GM model; the recovery *mechanics* are
 the same):
@@ -14,7 +14,7 @@ the same):
 
 A perfect-model twin is well-posed at any window (J=0 at the truth), so a tiny N=4 pi window
 suffices. Token: TWIN_RECIPE_OK. The CORE2 GPU gate is TWIN_RECOVER_OK
-(``scripts/core2_paper_calib_twin.py``).
+(``scripts/paper/core2_paper_calib_twin.py``).
 """
 
 from __future__ import annotations

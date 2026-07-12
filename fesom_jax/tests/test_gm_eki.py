@@ -1,7 +1,7 @@
 """D2b seam: GM→T/S stratification calibration via EKI (the slow-target pillar).
 
 CPU unit tests guarding the two pieces of machinery the GPU driver
-(``scripts/core2_paper_calib_gm_eki.py``) wires together — with NO full model (forward-only,
+(``scripts/paper/core2_paper_calib_gm_eki.py``) wires together — with NO full model (forward-only,
 analytic surrogate):
 
   1. :func:`fesom_jax.obs_compare.basin_mean_profiles` — the area-weighted basin-mean profile

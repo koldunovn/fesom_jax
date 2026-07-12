@@ -37,7 +37,9 @@ from fesom_jax.mesh import load_mesh
 from fesom_jax.state import State
 
 ROOT = Path(__file__).resolve().parents[2]
-PI_MESH = ROOT / "data" / "mesh_pi"
+# the pi mesh SHIPS inside the package, so this gate runs anywhere (incl. CI) —
+# it used to point at the repo-root data/ symlink, which only exists on Levante.
+from fesom_jax.mesh import DEFAULT_PI_MESH_DIR as PI_MESH
 NDEV = len(jax.devices())
 
 avail = pytest.mark.skipif(not PI_MESH.is_dir(), reason="pi mesh missing")

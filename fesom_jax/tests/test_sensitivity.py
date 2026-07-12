@@ -1,7 +1,7 @@
 """C1 gate: the field-leaf sensitivity seam — promote a scalar :class:`~fesom_jax.params.Params`
 leaf to a ``[nod2D]`` field and take ONE backward pass (the §1 sensitivity-map machinery).
 
-These CPU unit tests (pi mesh) guard exactly what ``scripts/core2_paper_sensitivity.py`` does on
+These CPU unit tests (pi mesh) guard exactly what ``scripts/paper/core2_paper_sensitivity.py`` does on
 CORE2: ``calibrate.build_params`` widens a tunable to an array leaf, the model differentiates it,
 and the gradient is a finite ``[nod2D]`` sensitivity map. Per the plan's Testing Strategy — *field-
 leaf misfit + backward on a tiny state, masked-NaN clean*:
@@ -15,7 +15,7 @@ leaf misfit + backward on a tiny state, masked-NaN clean*:
   * **build_params** preserves field-leaf shapes and leaves the untouched leaves at scalar defaults.
 
 Token: SENSITIVITY_SEAM_OK. The CORE2 maps + the adjoint↔EKI cross-check are the GPU gate
-(SENSITIVITY_MAP_OK, ``scripts/core2_paper_sensitivity.py`` / ``scripts/fig_sensitivity.py``).
+(SENSITIVITY_MAP_OK, ``scripts/paper/core2_paper_sensitivity.py`` / ``scripts/paper/fig_sensitivity.py``).
 """
 
 from __future__ import annotations

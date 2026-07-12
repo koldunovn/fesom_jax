@@ -211,7 +211,10 @@ def test_run_boundary_node_is_global_coastal_mask():
     run.py builds reconstructs to `ice_evp.boundary_node_mask(mesh)` exactly (host-only)."""
     from fesom_jax import ice_evp, partit, shard_mesh
     from fesom_jax.zarr_output import _folded_gid_owned
-    mesh = load_mesh(CORE2_MESH)
+    # the PACKAGED pi mesh: the property under test (global coastal mask vs the per-device
+    # fallback) is mesh-agnostic, and pi ships with the package, so this gate runs everywhere
+    # rather than silently needing the Levante-only CORE2 mesh. pi has 455 coastal nodes.
+    mesh = load_mesh()
     part = partit.synth_block_partition(mesh.nod2D, mesh.elem2D, mesh.edge2D, 4)
     sm = shard_mesh.build_sharded_mesh(mesh, part)
     bn = np.asarray(ice_evp.boundary_node_mask(mesh)).astype(bool)         # GLOBAL [nod2D]

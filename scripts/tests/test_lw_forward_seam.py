@@ -25,7 +25,7 @@ import jax
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # scripts/ on the path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "archive"))   # scripts/archive/ on the path
 import core2_kpp_climate_run as climr   # noqa: E402
 
 from fesom_jax import calibrate, forcing, ic, ssh, tke_nn   # noqa: E402

@@ -434,7 +434,7 @@ def test_bc_S_zstar_drops_virtual_salt_keeps_rsf():
 CORE2_MESH = Path(__file__).resolve().parents[2] / "data" / "mesh_core2"
 # dist_16 IC: the z2_cdump oracle ran on 16 ranks and the C IC is PARTITION-DEPENDENT
 # (order-dependent GS land fill) — the serial cache (data/ic_core2, for the 1-rank legacy
-# oracles) differs at GS-filled nodes. Built by scripts/rebuild_ic_dist16.py.
+# oracles) differs at GS-filled nodes. Built by scripts/tools/rebuild_ic_dist16.py.
 CORE2_IC = Path(__file__).resolve().parents[2] / "data" / "ic_core2_dist16"
 DT_ZSTAR = 1800.0
 ZSTAR_YEAR = 1958
@@ -909,7 +909,7 @@ def _relax_mismatch(mesh):
 def _config_clean_node_mask(mesh, thresh=1e-8):
     """Config-clean node mask: ``|Δrelax| ≤ thresh`` ⇒ the IC matches the C (at/near the
     reduction floor). With the dist_16 IC this is ALL-TRUE (asserted in the JZ.7 gate);
-    a node dropping out means the IC cache went stale (rerun scripts/rebuild_ic_dist16.py)."""
+    a node dropping out means the IC cache went stale (rerun scripts/tools/rebuild_ic_dist16.py)."""
     return _relax_mismatch(mesh) <= thresh
 
 
@@ -950,7 +950,7 @@ def test_jz7_assembled_zstar_step1(capsys):
     # gate every tag on its tolerance class over the whole domain.
     clean_node = _config_clean_node_mask(mesh)
     assert clean_node.all(), (f"{int((~clean_node).sum())} nodes above the relax reduction floor "
-                              "— stale IC cache? rerun scripts/rebuild_ic_dist16.py")
+                              "— stale IC cache? rerun scripts/tools/rebuild_ic_dist16.py")
     en = np.asarray(mesh.elem_nodes)
     clean_elem = clean_node[en[:, 0]] & clean_node[en[:, 1]] & clean_node[en[:, 2]]
     nim = np.asarray(mesh.node_iface_mask)
@@ -966,7 +966,7 @@ def test_jz7_assembled_zstar_step1(capsys):
         return d
 
     # pgf (element layer) — bit-identical class, FULL mesh. The former ~3e-5 deep-IC tail was the
-    # serial-vs-dist_16 GS fill-order difference in phc_ic (root-caused via scripts/jz7_pgf_debug.py,
+    # serial-vs-dist_16 GS fill-order difference in phc_ic (root-caused via scripts/debug/jz7_pgf_debug.py,
     # fixed 2026-06-12 by the partition-faithful extrap + bilinear association fix): observed
     # max=5.6e-16 (ulp class; the standalone density→pgf path is 2.7e-20 — the assembled step adds
     # the AB2 tracer-blend reassociation).
@@ -1022,7 +1022,7 @@ def test_jz7_ssh_solve_controlled_replay(capsys):
     step-1 gate shows, which is the JAX's OWN ssh_rhs differing from the C's). So with identical
     inputs the iterated near-null-space CG + the D2 closure reproduce the C bit-for-bit; the chained
     divergence is purely the input difference (the Phase-2 ssh/rhs `dx·helem~1e7` cancellation floor
-    propagated). (`scripts/jz7_ssh_replay_check.py`.)"""
+    propagated). (`scripts/debug/jz7_ssh_replay_check.py`.)"""
     mesh = load_mesh(CORE2_MESH)
     op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
     nlm0 = np.asarray(mesh.node_layer_mask)[:, 0]
@@ -1101,7 +1101,7 @@ def test_jz7_assembled_zstar_steps123(capsys):
 
     clean_node = _config_clean_node_mask(mesh)
     assert clean_node.all(), (f"{int((~clean_node).sum())} nodes above the relax reduction floor "
-                              "— stale IC cache? rerun scripts/rebuild_ic_dist16.py")
+                              "— stale IC cache? rerun scripts/tools/rebuild_ic_dist16.py")
     en = np.asarray(mesh.elem_nodes)
     clean_elem = clean_node[en[:, 0]] & clean_node[en[:, 1]] & clean_node[en[:, 2]]
     nim = np.asarray(mesh.node_iface_mask)

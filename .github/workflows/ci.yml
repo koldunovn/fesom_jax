@@ -1,35 +1,82 @@
 name: ci
 
-# Fast, data-free regression on every push / PR (no GPU, no Levante data). Runs the CPU unit gates
-# that need NO external mesh/forcing: the RunConfig bit-identity invariant + YAML round-trip, the
-# streaming-output (OnlineStats) correctness, the run-driver chunk-planning / duration logic, the
-# sharded per-step-forcing FOLD wiring, and the release gate (the shipped configs parse + validate).
+# CI runs the **pi-mesh** gates ONLY.
 #
-# The data-heavy gates (the few-step BIT-IDENTITY step on the pi/CORE2 mesh, the CORE2 forced sharded
-# runs, the gradient/adjoint suite) need the Levante data symlink and run there via
-# scripts/run_suite.sbatch — they SKIP cleanly here (their skipif sees the data absent).
+# The pi mesh (3140 nodes) ships inside the package, so a bare checkout can run real physics — the
+# step, the tracers, the SSH solve, the gradients — with no data download. That is what this
+# workflow covers, and that is the point: a green tick here means someone who clones the repo can
+# actually run the model.
+#
+# CORE2 and larger are DELIBERATELY NOT RUN HERE. A GitHub runner is 2 cores; a 127k-node global
+# ocean would consume the whole allocation. Those gates (the Fortran-dump verification oracles, the
+# CORE2 forced/sharded runs, the multi-GPU adjoint) need the Levante data anyway, so they SKIP
+# cleanly here. Run the complete suite on a COMPUTE NODE instead — never on a login node:
+#
+#     sbatch scripts/runs/run_suite.sbatch          # complete suite
+#     sbatch scripts/runs/run_suite_shard.sbatch    # the sharded gates
 
 on:
   push:
   pull_request:
 
 jobs:
-  cpu-units:
+  pi-gates:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
       - name: Install (CPU)
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-      - name: Data-free unit gates
+
+      - name: The pi mesh must ship with the package
+        # If this fails, a fresh `pip install` cannot run the model and the quick-start is fiction.
         run: |
-          python -m pytest -q -p no:cacheprovider \
-            fesom_jax/tests/test_release.py \
-            fesom_jax/tests/test_run_config.py \
-            fesom_jax/tests/test_stream_output.py \
-            fesom_jax/tests/test_run_entry.py \
-            fesom_jax/tests/test_forcing_sharded.py
+          python - <<'PY'
+          from fesom_jax.mesh import load_mesh, DEFAULT_PI_MESH_DIR
+          m = load_mesh()                      # no argument => the packaged pi mesh
+          assert m.nod2D == 3140, m.nod2D
+          print(f"pi mesh ships: {DEFAULT_PI_MESH_DIR} ({m.nod2D} nodes, {m.nl} levels)")
+          PY
+
+      - name: Quick-start must work from a bare checkout
+        # Exactly the promise README + examples/01_pi_quickstart make: run the ocean, differentiate it.
+        run: |
+          python - <<'PY'
+          import jax, jax.numpy as jnp
+          from fesom_jax.mesh import load_mesh
+          from fesom_jax.ssh import build_ssh_operator
+          from fesom_jax.integrate import integrate
+          from fesom_jax.params import Params
+          from fesom_jax import ic
+
+          mesh   = load_mesh()
+          op     = build_ssh_operator(mesh, dt=100.0)
+          state0 = ic.initial_state(mesh)
+          stress = jnp.zeros((mesh.elem2D, 2))
+
+          s = integrate(state0, mesh, op, stress, n_steps=10, dt=100.0)
+          assert jnp.isfinite(s.T).all(), "forward produced non-finite temperature"
+
+          g = jax.grad(lambda p: jnp.mean(
+              integrate(state0, mesh, op, stress, n_steps=2, params=p, dt=100.0).T[:, 0]
+          ))(Params.defaults())
+          assert jnp.isfinite(g.k_ver), "gradient is not finite"
+          print(f"forward + gradient OK   d(meanT)/d(k_ver) = {float(g.k_ver):+.3e}")
+          PY
+
+      - name: pi-mesh + data-free gates
+        # Everything that runs without external data; the CORE2-gated tests skip themselves.
+        # The three sharded suites are excluded: slow on a 2-core runner, and their substance
+        # (multi-device halo, sharded adjoint) needs real devices — see run_suite_shard.sbatch.
+        run: |
+          python -m pytest -q -p no:cacheprovider --durations=10 \
+            fesom_jax/tests/ \
+            --ignore=fesom_jax/tests/test_gradient_sharded.py \
+            --ignore=fesom_jax/tests/test_step_sharded.py \
+            --ignore=fesom_jax/tests/test_forcing_sharded.py

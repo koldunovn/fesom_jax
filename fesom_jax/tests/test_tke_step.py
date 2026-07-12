@@ -75,7 +75,7 @@ def run1():
 # showed the cdump's step-1 normstress is an OUTLIER (JAX == KPP-oracle != TKE-cdump, ~7e-4 at
 # low-wind nodes) — a quirk of that old C job's forcing inputs, not a JAX bug. The JAX live
 # forcing is validated against the KPP oracle <1e-12 (test_kpp_step.py) and end-to-end by the
-# 1-yr climate matching c_tke_2yr at the C<->Fortran floor (scripts/core2_tke_climate_compare.py).
+# 1-yr climate matching c_tke_2yr at the C<->Fortran floor (scripts/archive/core2_tke_climate_compare.py).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------

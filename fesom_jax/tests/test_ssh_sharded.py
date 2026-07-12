@@ -5,7 +5,7 @@ at the loose ``soltol=1e-5``, so a **single**-iteration drift moves ``d_eta`` by
 ``~1e-5·‖b‖`` — seven orders above the 1e-12 per-substep budget. The sharded residual
 is a ``psum`` (device-identical) so the trip count CAN drift only if a residual lands
 within the ~1e-12 reassociation margin of the threshold. We gate on the **real CORE2
-KPP+GM+ice** ``ssh_rhs`` (captured by ``scripts/capture_core2_ssh_rhs.py``, NOT pi):
+KPP+GM+ice** ``ssh_rhs`` (captured by ``scripts/debug/capture_core2_ssh_rhs.py``, NOT pi):
 
 * 2/4-device sharded ``solve_ssh`` (under ``shard_map``, ``custom_linear_solve`` +
   ``all_gather``-in-``while_loop``) == single-device ``d_eta`` on **owned** nodes,
@@ -37,13 +37,13 @@ CORE2_MESH = Path(__file__).resolve().parents[2] / "data" / "mesh_core2"
 CORE2_DIST = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2")
 SSH_RHS_DIR = Path(__file__).resolve().parents[2] / "data" / "ssh_rhs_core2"
 NDEV = len(jax.devices())
-DT = 1800.0          # MUST match scripts/capture_core2_ssh_rhs.py (the operator dt)
+DT = 1800.0          # MUST match scripts/debug/capture_core2_ssh_rhs.py (the operator dt)
 
 avail = pytest.mark.skipif(
     not CORE2_MESH.is_dir() or not (CORE2_DIST / "dist_2").is_dir()
     or not (SSH_RHS_DIR / "ssh_rhs_step1.npy").is_file(),
     reason="CORE2 mesh / dist partitions / captured ssh_rhs missing "
-           "(run scripts/capture_core2_ssh_rhs.sbatch)",
+           "(run scripts/debug/capture_core2_ssh_rhs.sbatch)",
 )
 
 

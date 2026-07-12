@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))   # scripts/ on the path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "paper"))   # scripts/paper/ on the path
 import core2_lw_foundation_check as fc   # noqa: E402
 
 
