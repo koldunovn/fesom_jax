@@ -123,52 +123,83 @@ python scripts/run_from_config.py configs/core2_full.yaml --steps 480 --restart-
 scripts/chain_submit.sh configs/dars.yaml 6 4800 /work/.../runs/dars
 ```
 
-### 1. Forward — single device (CORE2, ocean-only)
+### 1. Forward — single device, no data needed (the `pi` mesh)
+
+The `pi` mesh ships inside the package, so this runs on a laptop CPU straight after `pip install`:
 
 ```python
-import jax, jax.numpy as jnp
+import jax.numpy as jnp
+from fesom_jax.mesh import load_mesh
+from fesom_jax.ssh import build_ssh_operator
+from fesom_jax.integrate import integrate
+from fesom_jax import ic
+
+mesh   = load_mesh()                                # no argument ⇒ the PACKAGED pi mesh
+op     = build_ssh_operator(mesh, dt=100.0)         # static SSH stiffness (built once)
+state0 = ic.initial_state(mesh)                     # idealized T/S + a warm blob
+stress = jnp.zeros((mesh.elem2D, 2))                # element wind stress
+
+state_N = integrate(state0, mesh, op, stress, n_steps=10, dt=100.0)
+print(state_N.T[:, 0].mean())                       # surface temperature after 10 steps
+```
+
+### 1b. Forward — the realistic CORE2 model (KPP + GM/Redi + ice + real JRA55)
+
+This one needs **input data**. Fetch it once ([`docs/DATA.md`](docs/DATA.md)) — the env vars below are
+exactly what `--print-env` sets:
+
+```bash
+python scripts/fetch_data.py --dest ~/fesom-data          # ~11 GB from Zenodo
+eval "$(python scripts/fetch_data.py --dest ~/fesom-data --print-env)"
+```
+
+```python
+import os, jax.numpy as jnp
 from fesom_jax.mesh import load_mesh
 from fesom_jax.ssh import build_ssh_operator
 from fesom_jax.phc_ic import core2_initial_state
-from fesom_jax.integrate import integrate
-
-mesh   = load_mesh("data/mesh_core2")               # dense Mesh pytree (float64)
-op     = build_ssh_operator(mesh, dt=1800.0)        # static SSH stiffness (built once)
-state0 = core2_initial_state(mesh, "data/ic_core2") # PHC winter IC (cached)
-stress = jnp.zeros((mesh.elem2D, 2))                # element wind stress
-
-state_N = integrate(state0, mesh, op, stress, n_steps=10, dt=1800.0)
-print(state_N.T[:, 0].mean())                        # surface temperature after 10 steps
-```
-
-**Full model** (KPP + GM/Redi + prognostic ice + real JRA55) — add the configs + forcing.
-`step()` takes one step's forcing; for a forced *multi*-step run use `run_steps_sharded` (per-step
-forcing) or `integrate(step_forcings=...)` (a pre-stacked stack — simplest, but it holds all forcing
-in memory and so caps at **~weeks**). For **multi-year** forwards use the per-year-chunked driver
-`scripts/archive/core2_kpp_climate_run.py` (`--load-state` restart, `is_first_step=False`) — the tool that
-produced the 5-yr spin-up + 10-yr climate reference:
-
-```python
 from fesom_jax.step import step
 from fesom_jax import core2_forcing, ice
 from fesom_jax.kpp import KppConfig; from fesom_jax.gm import GMConfig; from fesom_jax.ice import IceConfig
+
+mesh   = load_mesh(os.environ["FESOM_MESH_DIR"])            # the CORE2 mesh you fetched
+op     = build_ssh_operator(mesh, dt=1800.0)
+state0 = core2_initial_state(mesh, os.environ["FESOM_IC_DIR"])   # observed PHC T/S
+stress = jnp.zeros((mesh.elem2D, 2))
 sst0   = state0.T[:, 0]
-state0 = ice.seed_ice(state0, mesh, sst0)            # cold-start ice
-cf     = core2_forcing.build_core_forcing(mesh, 1958, sst_ic=sst0)             # JRA55 1958
+state0 = ice.seed_ice(state0, mesh, sst0)                   # cold-start sea ice
+
+# Where does the forcing come from? Each input path resolves as
+#     explicit argument  >  $FESOM_* environment variable  >  DKRZ/Levante default
+# so with $FESOM_JRA_DIR exported (above) this reads YOUR copy of JRA55-do. To be explicit:
+#     build_core_forcing(mesh, 1958, sst_ic=sst0, jra_dir="/path/to/JRA55-do-v1.4.0")
+# Same for sss_path / runoff_path / chl_path. If a file is missing you get an error naming the
+# variable to set — nothing is silently skipped. See docs/DATA.md.
+cf     = core2_forcing.build_core_forcing(mesh, 1958, sst_ic=sst0)
+
 sf, fs = cf.step_forcing(*core2_forcing.dates_for_steps(1958, 1800.0, 1)[0]), cf.static
 state_1 = step(state0, mesh, op, stress, dt=1800.0, is_first_step=True,
                step_forcing=sf, forcing_static=fs,
                kpp_cfg=KppConfig(), gm_cfg=GMConfig(), ice_cfg=IceConfig())
 ```
 
+`step()` takes **one** step's forcing. For a forced *multi*-step run use `integrate(step_forcings=…)`
+(a pre-stacked stack — simplest, but it holds every step's forcing in memory and so caps at
+**~weeks**), or drive it from a YAML with `scripts/run_from_config.py`, which chunks the forcing in
+time and runs for years ([`docs/USER_GUIDE.md`](docs/USER_GUIDE.md)). A worked version of all of this,
+with plots, is [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic.ipynb).
+
 ### 2. Backward — gradients (the whole point)
+
+Continuing from **§1** (the packaged `pi` mesh — so this needs **no data**; it is identical at CORE2
+scale, just with that mesh and `dt`):
 
 ```python
 import jax
 from fesom_jax.params import Params
 
 def loss(params):                                    # any scalar functional of the state
-    sN = integrate(state0, mesh, op, stress, n_steps=1, params=params, dt=1800.0)
+    sN = integrate(state0, mesh, op, stress, n_steps=1, params=params, dt=100.0)
     wet = mesh.node_layer_mask[:, 0]
     return jnp.sum(jnp.where(wet, sN.T[:, 0], 0.0)) / jnp.sum(wet)   # mean SST
 
@@ -225,11 +256,12 @@ the runner places each process's shards via `make_array_from_callback` (no globa
 The benchmark driver handles all of this:
 
 ```bash
-PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
-# single node, CORE2 full model, ragged, timed:
-$PY scripts/bench/bench_forward_scaling.py --mesh-dir data/mesh_core2 \
-    --dist-dir /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2 --npes 4 --steps 25 \
-    --dt 1800 --full 1 --ic-dir data/ic_core2 --ragged 1 --out-zarr /work/.../core2_out.zarr
+# single node, CORE2 full model, ragged, timed. $FESOM_MESH_DIR / $FESOM_IC_DIR come from
+# `scripts/fetch_data.py --print-env`; --dist-dir is the FESOM mesh dir holding dist_<N>/.
+python scripts/bench/bench_forward_scaling.py \
+    --mesh-dir $FESOM_MESH_DIR --ic-dir $FESOM_IC_DIR \
+    --dist-dir /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2 \
+    --npes 4 --steps 25 --dt 1800 --full 1 --ragged 1 --out-zarr /scratch/core2_out.zarr
 # multi-node: submit the prebuilt sbatch (sets JDIST, srun, paths) — see below.
 ```
 
