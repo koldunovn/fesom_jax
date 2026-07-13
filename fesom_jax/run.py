@@ -19,7 +19,9 @@ Three pieces, each independently testable:
 formed at the OLD dt, so the first step after the ramp re-bootstraps AB2 (``is_first_step=True`` ⇒
 ``bootstrap_ab2``); ``dt_stage`` is persisted so a resumed job knows the current dt.
 
-**Forward-only at scale** (single-GPU for adjoints — the sharded ragged-halo AD bug). The chunked
+**Forward-only at scale** (single-GPU for adjoints — the sharded ragged-halo AD bug; the Phase 8c
+``use_padded`` transport lifts this for :func:`integrate_sharded.run_steps_sharded`'s grad path,
+this chunk driver stays forward). The chunked
 host round-trip of the State between chunks is fine at CORE2/farc/dars scale; for NG5 the on-device
 state chaining (``return_executable`` + keep the folded shards resident) is the B2 optimization —
 noted, not yet wired (de-risk on the smaller meshes first per the run plan).
@@ -286,6 +288,7 @@ class RunResult(NamedTuple):
 def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=None,
                     state0=None, forcing_stack=None, start_step=0, year=1958,
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
+                    use_padded=False,
                     accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
                     local_forcing=None, checkpoint_every=None,
                     restart_archive_out=None, restart_archive_period=None,
@@ -563,7 +566,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         _chunk_out = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
-            use_ragged=use_ragged, boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
+            use_ragged=use_ragged, use_padded=use_padded,
+            boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
             sample_fn=out_sample_fn, **cfg.physics_kwargs())
         # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else just the final state.
         state_p, acc_sum = _chunk_out if out_sample_fn is not None else (_chunk_out, None)

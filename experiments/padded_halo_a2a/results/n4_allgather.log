@@ -1,0 +1,21 @@
+[bench] core2 npes=4: host setup done  peak_gpu_after_setup=-1.00 GiB
+[bench-finite] core2 npes=4 steps=20 nonfinite_T=0 nonfinite_uv=0 max_uv=1.135 m/s
+[bench] mesh=core2  nod2D=126858 nl=48 npes=4 halo=allgather model=FULL(ice+kpp+gm+JRA1958) steps=20  per_step= 2376.86 ms  throughput=     2.6 Mnodlev/s  compile=  54.9s  plat=cpu  peak_gpu=-1.00 GiB
+      153.65 real      1612.26 user        38.75 sys
+         25217368064  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             3503278  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+             2822686  involuntary context switches
+       6329060628415  instructions retired
+       5212245189553  cycles elapsed
+         22535001640  peak memory footprint

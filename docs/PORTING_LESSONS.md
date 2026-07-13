@@ -5093,3 +5093,22 @@ Cite the C source (`file:line`) or dump probe that proves it.
   new-mesh guide's `# mesh-agnostic despite the name` was true only while the name was wrong, and a
   `sed` will happily leave that fossil behind, still passing every test — so grep the prose for the
   hedges the bad name forced you to write, and delete them with it.
+
+- **[parallelism] When a primitive is missing or broken, reshape the data until a trusted one fits**
+  (`use_padded`, Phase 8c: `experiments/padded_halo_a2a` → `fesom_jax/halo.py`). The point-to-point
+  halo needed `ragged_all_to_all` — unimplemented on XLA:CPU, transpose broken everywhere. Rather
+  than a `custom_vjp` patch over a broken primitive, pad each per-neighbour chunk to the max
+  pair-chunk and use ONE dense `all_to_all`: it exists on every backend and transposes to another
+  `all_to_all`, so the gradient is correct **by construction** — the gate (fwd AND `jax.grad` vs the
+  all_gather oracle, CORE2 dist_2..32) confirms bit-exact/≤2 ulp. The price is knowable in advance
+  (padding factor 1.8×@P4…12×@P32, still 50–140× under all_gather) — measure it before assuming it
+  matters: at these volumes the exchange is latency-bound and the factor is invisible ≤32 devices.
+  Three transferable sub-lessons from the same day's CPU campaign (`docs/PARALLELISM.md`): (1) on
+  CPU, **launch topology beats kernel flags** — real processes + gloo collectives ran 1.7× faster
+  than in-process fake devices at identical npes, while fast-math/scheduler XLA flags moved nothing
+  (the kernels are gather-bound, not FLOP-bound); (2) *cores busy ≠ work done* — in-process user-CPU
+  time doubled (22k→42k s) with zero wall-time gain, all spin-wait at collective sync points; read
+  `/usr/bin/time -v` before profiling anything fancier; (3) when a collective crashes, suspect the
+  runtime before your maps — the all_gather halo dies DETERMINISTICALLY at ≥32 in-process CPU
+  devices inside XLA's own rendezvous (`id < num_threads` check), with valid inputs; the padded
+  all_to_all sails through 128. Verify on a second topology before debugging your own code.

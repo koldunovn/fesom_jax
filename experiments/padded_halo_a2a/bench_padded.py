@@ -1,4 +1,9 @@
-"""Phase 8b forward-scaling benchmark — time ``run_steps_sharded`` FORWARD (no grad) for
+"""PADDED-A2A EXPERIMENT COPY of scripts/bench/bench_forward_scaling.py (repo file untouched).
+Deltas: (1) sys.path bootstrap; (2) no "SKIP ragged on CPU" guard; (3) --ragged 1 installs
+the padded dense-all_to_all adapter (padded_halo.install), reported as halo=padded_a2a.
+
+Original docstring:
+Phase 8b forward-scaling benchmark — time ``run_steps_sharded`` FORWARD (no grad) for
 the halo-only ``ragged_all_to_all`` vs the ``all_gather`` exchange, on any exported mesh.
 
 Reports ms/step + throughput (M node-levels / s). ``ragged_all_to_all`` is GPU-only. One
@@ -12,8 +17,13 @@ work (representative CG iteration count) without needing a per-mesh physical IC.
 from __future__ import annotations
 
 import argparse
+import pathlib
+import sys
 import time
 from pathlib import Path
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))   # repo root
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))       # this folder
 
 import dataclasses
 import jax
@@ -39,7 +49,7 @@ def perturbed_state(mesh):
 
 def phc_state(mesh, ic_dir=None):
     """REAL PHC3.0 winter IC (the Kokkos IC) as a rest State, with base T_old/S_old (the C
-    step-1 AB2 history, per phc_initial_state). Loads a cached T_ic/S_ic.npy from ``ic_dir``
+    step-1 AB2 history, per core2_initial_state). Loads a cached T_ic/S_ic.npy from ``ic_dir``
     if present, else interpolates the global PHC nc onto the mesh live (slow for big meshes —
     pre-cache with build_and_cache_ic → /work). **Built entirely on the HOST (numpy)** (Phase
     8b B.3) so the global 3-D IC never lands on GPU 0 before sharding (the dars/NG5 setup-OOM)."""
@@ -78,11 +88,6 @@ def main():
     ap.add_argument("--warmup", type=int, default=5,
                     help="steps excluded via the subtraction method (Kokkos omitted 5).")
     ap.add_argument("--ragged", type=int, default=0)
-    ap.add_argument("--halo", choices=["allgather", "ragged", "padded"], default=None,
-                    help="halo transport (overrides --ragged): allgather (oracle, any backend), "
-                         "ragged (GPU-only, forward-only), padded (Phase 8c slot-padded dense "
-                         "all_to_all — any backend, AD-correct; the CPU choice). Default: "
-                         "ragged if --ragged 1, else allgather.")
     ap.add_argument("--dt", type=float, default=1800.0,
                     help="timestep (s). Kokkos: CORE2 1800, farc 900, dars/NG5 180 (cold-start CFL).")
     ap.add_argument("--full", type=int, default=0,
@@ -109,14 +114,7 @@ def main():
     DT = args.dt
     import os
     jax.config.update("jax_enable_x64", True)
-    if os.environ.get("JDIST_CPU"):           # multi-PROCESS CPU: 1 device/process, gloo
-        # collectives (the topology that beats in-process fake devices ~1.7x AND is the
-        # only way past the XLA:CPU all_gather rendezvous crash at >=32 in-process
-        # devices — docs/PARALLELISM.md). Launch: srun -n <npes> with
-        # XLA_FLAGS=--xla_force_host_platform_device_count=1 per process.
-        jax.config.update("jax_cpu_collectives_implementation", "gloo")
-        jax.distributed.initialize()          # SLURM auto-detect (srun sets the env)
-    elif os.environ.get("JDIST"):             # multi-node: 1 process/node, all local GPUs
+    if os.environ.get("JDIST"):               # multi-node: 1 process/node, all local GPUs
         jax.distributed.initialize(
             local_device_ids=list(range(int(os.environ.get("GPUS_PER_NODE", "4")))))
 
@@ -127,14 +125,11 @@ def main():
     proc0 = jax.process_index() == 0
     plat = jax.devices()[0].platform
     ndev = len(jax.devices())
-    halo_mode = args.halo or ("ragged" if args.ragged else "allgather")
-    use_ragged = halo_mode == "ragged"
-    use_padded = halo_mode == "padded"
+    use_ragged = bool(args.ragged)
     if ndev < args.npes:
         print(f"[bench] SKIP {args.name} npes={args.npes}: only {ndev} devices"); return
-    if use_ragged and plat == "cpu":
-        print(f"[bench] SKIP ragged on CPU (ragged_all_to_all unimplemented; "
-              f"use --halo padded)"); return
+    # EXPERIMENT DELTA: the original skips ragged on CPU (ragged_all_to_all unimplemented);
+    # here --ragged 1 means the padded dense-all_to_all adapter, which runs everywhere.
 
     mesh = load_mesh(args.mesh_dir)
     op = ssh.build_ssh_operator(mesh, dt=DT)
@@ -145,6 +140,12 @@ def main():
     else:
         part = partit.read_partition(Path(args.dist_dir), args.npes)
     sm = shard_mesh.build_sharded_mesh(mesh, part)
+
+    if use_ragged:                       # EXPERIMENT DELTA: swap in the padded exchange
+        import padded_halo
+        reg = padded_halo.install(sm)
+        if proc0:
+            print(f"[bench] padded-a2a adapter installed; slots={reg}", flush=True)
 
     full_kw = {}
     if args.full:
@@ -192,7 +193,6 @@ def main():
     def warm_time(n):
         jfn, jargs, _ = ish.run_steps_sharded(sm, state_p, sop, stress_p, n, dt=DT,
                                               npes=args.npes, use_ragged=use_ragged,
-                                              use_padded=use_padded,
                                               return_executable=True, **full_kw)
         tc = time.perf_counter()
         jax.block_until_ready(jfn(*jargs))        # 1st call: trace + compile + run (excluded)
@@ -234,7 +234,7 @@ def main():
             print(f"[bench] wrote sharded Zarr output → {args.out_zarr}  "
                   f"(peak_gpu={_gpu_peak_gb():.2f} GiB)", flush=True)
     tput = mesh.nod2D * mesh.nl / per_step / 1e6   # M node-levels / s
-    tag = halo_mode
+    tag = "padded_a2a" if use_ragged else "allgather"
     if args.full:
         comp = "+".join(c for c, on in [
             ("mevp" if args.mevp else "ice", args.ice),

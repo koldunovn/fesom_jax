@@ -229,9 +229,66 @@ def test_ragged_grad_path_refused():
     """GUARD (2026-07-03 review): while the ``ragged_all_to_all`` transpose is broken (the
     xfail above), the gradient entry point must REFUSE ``use_ragged=True`` loudly rather
     than return silently wrong gradients. The raise is at function entry, before any
-    argument is touched — hermetic (no devices, no data). Once B.0d lands a correct
-    ``custom_vjp``, delete this test together with the guard in ``run_steps_sharded``."""
+    argument is touched — hermetic (no devices, no data). The sanctioned point-to-point
+    gradient path is ``use_padded=True`` (Phase 8c; grad-gated below)."""
     from fesom_jax import integrate_sharded as ish
     with pytest.raises(ValueError, match="ragged_all_to_all"):
         ish.run_steps_sharded(None, None, None, None, 1, dt=1.0, npes=2,
                               use_ragged=True, return_grad_fn=True)
+
+
+# --------------------------------------------------------------------------
+# Phase 8c — the slot-padded dense all_to_all == all_gather (fwd + TRANSPOSE),
+# on EVERY backend (the CPU-capable, AD-correct ragged substitute; merged from
+# experiments/padded_halo_a2a after the Levante dist_2..32 gates, 2026-07-13)
+# --------------------------------------------------------------------------
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_padded_forward_matches_allgather(npes, kind):
+    """The padded dense-a2a exchange == the all_gather exchange on every VALID lane,
+    BYTE-IDENTICALLY — same owner values, one tiled ``lax.all_to_all`` of slot-padded
+    chunks instead of the broadcast. Unlike the ragged primitive this runs on CPU."""
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, _ = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    rmap = sm.exchange_ragged[kind]
+    ref = np.asarray(halo.run_halo_exchange(field, src_dev, src_lane, jmesh))
+    got = np.asarray(halo.run_halo_exchange_padded(field, rmap, jmesh))
+    vm = valid[:, :, None]
+    assert np.array_equal(np.where(vm, got, 0.0), np.where(vm, ref, 0.0)), \
+        f"padded != all_gather forward on valid {kind} lanes (npes={npes})"
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_padded_grad_matches_allgather(npes, kind):
+    """THE Phase 8c point: the padded exchange's gradient matches the all_gather
+    oracle's (the transpose is another ``all_to_all`` — a trusted JAX rule — plus the
+    ``pad_valid`` where that kills the duplicated pad-gather cotangents). This is the
+    real test the ragged primitive xfails; the weights are zeroed off the valid lanes
+    (pad-lane cotangents legitimately differ between the transports)."""
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, rng = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    rmap = sm.exchange_ragged[kind]
+    w = jnp.asarray(rng.standard_normal((npes, Lmax, sm.nl)) * valid[:, :, None])
+    g_ref = np.asarray(jax.grad(lambda f: jnp.sum(
+        w * halo.run_halo_exchange(f, src_dev, src_lane, jmesh)))(field))
+    g_pad = np.asarray(jax.grad(lambda f: jnp.sum(
+        w * halo.run_halo_exchange_padded(f, rmap, jmesh)))(field))
+    vm = valid[:, :, None]
+    dif = np.abs(np.where(vm, g_pad - g_ref, 0.0)).max()
+    scale = max(np.abs(g_ref).max(), 1e-300)
+    assert dif / scale < 1e-12, \
+        f"padded grad != all_gather grad ({kind}, npes={npes}); rel max|Δ|={dif/scale:.3e}"
+
+
+def test_halo_modes_mutually_exclusive():
+    """``use_ragged`` and ``use_padded`` name two transports for the SAME exchange —
+    both at once is a caller bug; refused at entry (hermetic, like the guard above)."""
+    from fesom_jax import integrate_sharded as ish
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ish.run_steps_sharded(None, None, None, None, 1, dt=1.0, npes=2,
+                              use_ragged=True, use_padded=True)

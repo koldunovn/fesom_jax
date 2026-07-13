@@ -60,14 +60,21 @@ class HaloCtx:
     owned_mask: dict     # {kind: [Lmax] bool}
     # --- Phase 8b B.0: the halo-only ragged_all_to_all path (None ⇒ all_gather) ---
     exch_ragged: dict = None    # {kind: {send_idx, send_sizes, send_off, out_off,
-    #                                     recv_sizes, recv_gather, halo_mask}} per-device arrays
-    recv_max: dict = None       # {kind: int} static recv-buffer leading dim
-    use_ragged: bool = False    # pick ragged_all_to_all over all_gather
+    #                                     recv_sizes, recv_gather, halo_mask}} per-device arrays;
+    #                             under use_padded the SAME slot carries the padded maps
+    #                             ({pad_src, pad_valid, pad_slotpos, halo_mask}) instead
+    recv_max: dict = None       # {kind: int} static recv-buffer leading dim (ragged only)
+    use_ragged: bool = False    # pick ragged_all_to_all over all_gather (GPU, forward-only)
+    use_padded: bool = False    # pick the slot-padded dense all_to_all (Phase 8c) —
+    #                             every backend, AD-correct; mutually exclusive with use_ragged
 
     def exchange(self, field, kind: str):
         """Broadcast-refresh ``field``'s halo lanes from their owners (a no-op on
-        interior + pad lanes), for the given entity ``kind``. Uses the halo-only
-        ``ragged_all_to_all`` path when ``use_ragged`` (Phase 8b), else ``all_gather``."""
+        interior + pad lanes), for the given entity ``kind``. Transport: the padded
+        dense ``all_to_all`` when ``use_padded`` (Phase 8c), the halo-only
+        ``ragged_all_to_all`` when ``use_ragged`` (Phase 8b), else ``all_gather``."""
+        if self.use_padded and self.exch_ragged is not None:
+            return halo_exchange_padded(field, self.exch_ragged[kind], self.axis_name)
         if self.use_ragged and self.exch_ragged is not None:
             return halo_exchange_ragged(
                 field, self.exch_ragged[kind], self.recv_max[kind], self.axis_name)
@@ -112,6 +119,35 @@ def halo_exchange_ragged(field, r: dict, recv_max: int, axis_name: str = DEFAULT
         r["out_off"], r["recv_sizes"],         # output_offsets (= recv_offsets.T row), recv_sizes
         axis_name=axis_name)                                         # [recv_max, *rest]
     gathered = recv[r["recv_gather"]]                                # [Lmax, *rest]
+    mask = r["halo_mask"].reshape(r["halo_mask"].shape + (1,) * len(rest))
+    return jnp.where(mask, gathered, field)
+
+
+def halo_exchange_padded(field, r: dict, axis_name: str = DEFAULT_AXIS):
+    """One broadcast halo exchange via the **slot-padded dense** ``lax.all_to_all``
+    (Phase 8c, merged from ``experiments/padded_halo_a2a``) — the CPU-capable,
+    AD-correct substitute for :func:`halo_exchange_ragged`: ``ragged_all_to_all`` is
+    unimplemented on XLA:CPU and its reverse-mode transpose is broken everywhere
+    (``docs/JAX_RAGGED_A2A_BUG.md``), while ``all_to_all`` exists on every backend and
+    transposes to another ``all_to_all`` (one of JAX's oldest rules) ⇒ the gradient is
+    correct by construction (gated bit-exact vs the all_gather oracle, CORE2
+    dist_2..32, forward AND ``jax.grad``).
+
+    Called inside ``shard_map``; ``field`` is this device's ``[Lmax, *rest]`` local
+    array, ``r`` its per-device padded maps (:class:`~fesom_jax.shard_mesh.RaggedExchange`
+    ``pad_*`` fields + ``halo_mask``, folded to this shard). The send buffer is P slots
+    of ``pad_slot`` lanes (slot e = my chunk for device e, zero-padded — the ``where``
+    on ``pad_valid`` is load-bearing for the transpose: it kills the cotangents of the
+    duplicated pad gathers); after ONE tiled ``all_to_all``, received slot d holds what
+    device d sent me and ``pad_slotpos`` reads each halo lane straight out of it.
+    Returns the refreshed ``[Lmax, *rest]`` (halo lanes overwritten by their owner's
+    value; interior + pad lanes untouched — the same contract as the other two)."""
+    rest = field.shape[1:]
+    buf = field[r["pad_src"]]                                        # [P*slot, *rest]
+    vmask = r["pad_valid"].reshape(r["pad_valid"].shape + (1,) * len(rest))
+    buf = jnp.where(vmask, buf, jnp.zeros_like(buf))
+    recv = lax.all_to_all(buf, axis_name, split_axis=0, concat_axis=0, tiled=True)
+    gathered = recv[r["pad_slotpos"]]                                # [Lmax, *rest]
     mask = r["halo_mask"].reshape(r["halo_mask"].shape + (1,) * len(rest))
     return jnp.where(mask, gathered, field)
 
@@ -181,4 +217,28 @@ def run_halo_exchange_ragged(field_PL, rmap, jmesh: Mesh,
 
     fn = jax.shard_map(f, mesh=jmesh, in_specs=(spec,) * 8, out_specs=spec)
     out = fn(field, si, ss, so, oo, rs, rg, hm)
+    return _unfold(out, P, Lmax)
+
+
+def run_halo_exchange_padded(field_PL, rmap, jmesh: Mesh,
+                             axis_name: str = DEFAULT_AXIS):
+    """Standalone :func:`halo_exchange_padded` (the Phase 8c gate + standalone use): run
+    the slot-padded dense-``all_to_all`` exchange on a stacked ``[P, Lmax, *rest]`` field
+    via ``shard_map``. ``rmap`` is the kind's :class:`~fesom_jax.shard_mesh.RaggedExchange`
+    (global ``[P, …]`` arrays; only its ``pad_*``/``halo_mask`` fields are consumed);
+    ``jmesh`` must have ``P`` devices on ``axis_name``. Any backend."""
+    field, P, Lmax = _fold(field_PL)
+    fold0 = lambda a: _fold(np.asarray(a))[0]
+    ps = fold0(rmap.pad_src).astype(jnp.int32)
+    pv = fold0(rmap.pad_valid)
+    pp = fold0(rmap.pad_slotpos).astype(jnp.int32)
+    hm = fold0(rmap.halo_mask)
+    spec = PartitionSpec(axis_name)
+
+    def f(fld, ps, pv, pp, hm):
+        r = {"pad_src": ps, "pad_valid": pv, "pad_slotpos": pp, "halo_mask": hm}
+        return halo_exchange_padded(fld, r, axis_name)
+
+    fn = jax.shard_map(f, mesh=jmesh, in_specs=(spec,) * 5, out_specs=spec)
+    out = fn(field, ps, pv, pp, hm)
     return _unfold(out, P, Lmax)
