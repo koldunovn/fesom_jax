@@ -15,8 +15,8 @@ values in all three cases — only the transport differs:
 | transport | flag | backends | gradient (reverse-mode AD) | per-device volume | when |
 |---|---|---|---|---|---|
 | **all_gather** | (default) | CPU + GPU | ✅ correct (the AD **oracle**) | ~the whole global field (47 MB/3-D field at CORE2, 2.65 GB at NG5) | small npes; correctness gates; the reference every other mode is tested against |
-| **ragged** (`lax.ragged_all_to_all`) | `use_ragged=True` / `--ragged 1` | **GPU only** | ❌ **broken** — JAX's transpose is wrong, O(1) error ([JAX_RAGGED_A2A_BUG.md](JAX_RAGGED_A2A_BUG.md)) | minimal (only the actual halo: 0.1–0.3 MB at CORE2) | forward-only production at scale (dars/NG5 multi-GPU, where all_gather OOMs) |
-| **padded** (slot-padded dense `lax.all_to_all`) | `use_padded=True` / `--halo padded` | **CPU + GPU** | ✅ **correct by construction** — the transpose of `all_to_all` is another `all_to_all` | ragged × padding factor: 1.8×@P4, 3.4×@P8, 6.3×@P16, 11.6×@P32 (measured, CORE2) — still 50–140× under all_gather | **any CPU sharded run**; **any sharded gradient** past all_gather's memory/speed limit |
+| **ragged** (`lax.ragged_all_to_all`) | `use_ragged=True` / `--ragged 1` | **GPU only** | ❌ **broken** — JAX's transpose is wrong, O(1) error ([JAX_RAGGED_A2A_BUG.md](JAX_RAGGED_A2A_BUG.md)) | minimal (only the actual halo: 0.1–0.3 MB at CORE2) | forward-only production at ≥32-GPU scale (NG5-class, where all_gather OOMs and padded is untested); at ≤16 GPUs padded ties or beats it (table below) |
+| **padded** (slot-padded dense `lax.all_to_all`) | `use_padded=True` / `--halo padded` | **CPU + GPU** | ✅ **correct by construction** — the transpose of `all_to_all` is another `all_to_all` | ragged × padding factor: 1.8×@P4, 3.4×@P8, 6.3×@P16, 11.6×@P32 (measured, CORE2) — still 50–140× under all_gather | **any CPU sharded run**; **any sharded gradient** past all_gather's memory/speed limit; **GPU forward at ≤16 GPUs** — fastest measured transport there (table below) |
 
 The padded transport (Phase 8c, merged from `experiments/padded_halo_a2a/`) pads every
 per-neighbour chunk to the max pair-chunk (`pad_slot`) and does ONE tiled `all_to_all` of
@@ -47,6 +47,31 @@ the wall limit; 16 procs/node × 2 nodes *runs* but at 12.9 s/step (6× slower t
 npes on one node — gloo-over-TCP latency); 4 nodes aborts. JAX-CPU is effectively
 **single-node**. The untested escape hatch is `jax_cpu_collectives_implementation='mpi'`
 (accepted by this jaxlib; needs an MPIwrapper shim built against the system MPI).
+
+## Measured: GPU three-transport comparison (2026-07-13, same day / same nodes)
+
+Full model (ice+KPP+GM, JRA-1958, PHC IC), compile excluded, A100s. Jobs 26227814 (CORE2 4 GPU),
+26227815 (CORE2 8 GPU = 2 nodes), 26227983 (dars dist_16 = 4 nodes). Logs:
+`scripts/logs/bench_{core2_halo3,dars_halo16}.*.log`.
+
+| mesh | GPUs | all_gather | ragged | padded |
+|---|---|---|---|---|
+| CORE2 (127k) | 4 (1 node) | 90.1 ms | 86.1 ms | **80.1 ms** |
+| CORE2 (127k) | 8 (2 nodes) | 185.5 ms | 116.1 ms | **78.1 ms** |
+| dars (3.16M) | 16 (4 nodes) | — (OOMs/hangs at this scale) | **512.9 ms** | 525.0 ms (+2.4 %) |
+| dars (3.16M) | 32 (8 nodes, job 26228413) | — | **319.6 ms** | 349.1 ms (+9.2 %) |
+
+**On GPU the padded transport is the fastest CORE2 exchange — it crosses the node boundary flat
+(80→78 ms) where ragged loses a third (86→116) — and ties ragged at dars-16** (equal peak memory,
+22.0 vs 22.1 GiB). So the CPU campaign's conclusion holds on GPU at both ends of the mesh range:
+the AD-correct transport costs nothing over the forward-only optimum (here it often *wins*: at
+latency-bound halo sizes one dense tiled `all_to_all` beats per-neighbour ragged bookkeeping).
+Same-day ragged/all_gather controls agree with the older two-transport rows (86.7/93 @4, 122.7/187.5
+@8, 513 @dars-16) within a few percent. **The crossover is at 16–32 GPUs on big meshes**: at
+dars-32 ragged pulls ahead by 9 % (the pad factor grows with P — 11.6×@P32 measured at CORE2), so
+ragged remains the forward default at ≥32 GPUs; below that, prefer padded everywhere. NG5-64
+padded-vs-ragged pending (job 26228433) — expected to widen ragged's lead, guidance unchanged
+either way; a gradient at that scale still uses padded (the only correct choice there).
 
 ## Measured: CORE2 full model, one Levante node (128-core Milan, dt=1800, 25 steps)
 
@@ -114,6 +139,8 @@ srun -n 8 -c 16 python scripts/bench/bench_forward_scaling.py --npes 8 --halo pa
 JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=4 \
     python -m pytest fesom_jax/tests/test_halo.py
 
-# GPU forward at scale (unchanged): --ragged 1 (or --halo ragged), JDIST=1 for multi-node.
+# GPU forward, <=16 GPUs (either mesh class): --halo padded — fastest measured (see the
+#   three-transport table above). >=32 GPUs on huge meshes: --ragged 1 (padded untested there);
+#   JDIST=1 for multi-node either way.
 # GPU sharded GRADIENTS: use_padded=True in run_steps_sharded(..., return_grad_fn=True).
 ```

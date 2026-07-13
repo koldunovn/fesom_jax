@@ -5112,3 +5112,17 @@ Cite the C source (`file:line`) or dump probe that proves it.
   runtime before your maps — the all_gather halo dies DETERMINISTICALLY at ≥32 in-process CPU
   devices inside XLA's own rendezvous (`id < num_threads` check), with valid inputs; the padded
   all_to_all sails through 128. Verify on a second topology before debugging your own code.
+
+- **[parallelism] The "safe" transport can also be the fast one — benchmark before pricing a
+  correctness tax** (Phase 8c GPU follow-up, jobs 26227814/5 + 26227983, logs
+  `scripts/logs/bench_{core2_halo3,dars_halo16}.*.log`, table in `docs/PARALLELISM.md`). The padded
+  dense `all_to_all` — adopted for AD correctness and CPU coverage, expected to cost its padding
+  factor — is FASTER than the ragged point-to-point on GPU at CORE2 (80 vs 86 ms @4 GPUs, 78 vs
+  116 ms @8: flat across the node boundary where ragged loses a third) and within 2.4 % at dars-16,
+  at equal peak memory. "Minimal bytes = fastest exchange" fails at latency-bound halo sizes: one
+  dense tiled collective beats P per-neighbour ragged transfers. Consequence: the AD-correct
+  transport is now also the forward-performance choice at ≤16 GPUs (README table updated); ragged's
+  remaining niche is ≥32-GPU huge-mesh forward runs — measured, not presumed: at dars-32 ragged is
+  9 % ahead (319.6 vs 349.1 ms, job 26228413), so the crossover sits at 16–32 GPUs, right where the
+  growing pad factor said it would. The paper's §5 halo paragraph was rewritten from these numbers
+  the same day.

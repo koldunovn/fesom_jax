@@ -1,3 +1,9 @@
+# ============================================================================
+# >>> 2026-07-13: ►►► CURRENT BRIEF = `docs/HANDOFF-20260713-paper-review-halo-bench.md` ◄◄◄
+# >>> (GMD-paper review pass DONE + three-transport halo benchmarks; paper_jax is now a LOCAL
+# >>> git repo, commits c070ace→af78607; FIRST ACTION next session = read the NG5-64 result,
+# >>> job 26228433, `scripts/logs/bench_ng5_halo64.26228433.out`.) Everything below is OLDER.
+# ============================================================================
 # >>> NOTE: a SECOND, separate effort is underway — the GMD **model-description paper**
 # >>> ("a JAX FESOM2 exists / on-par with Fortran FESOM / scales").
 # >>> ►►► START-OF-SESSION BRIEF = `docs/HANDOFF-20260623-model-paper.md` ◄◄◄ (read it FIRST).

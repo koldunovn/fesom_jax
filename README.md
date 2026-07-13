@@ -283,8 +283,8 @@ in **[docs/PARALLELISM.md](docs/PARALLELISM.md)**:
 | you want | use | why |
 |---|---|---|
 | **Forward only, low-res (pi, CORE2), 1 GPU** | single device, no sharding | the default; nothing to configure |
-| **Forward only, CORE2-class, several GPUs** | `all_gather` (default) or `use_padded` | at this size all_gather still fits; padded is never wrong |
-| **Forward only, high-res (dars, NG5), multi-GPU / multi-node** | `use_ragged` + `JDIST=1` | leanest exchange; all_gather OOMs at this scale. GPU-only, **forward-only** |
+| **Forward only, CORE2-class, several GPUs** | **`use_padded`** | fastest measured: beats ragged AND all_gather at 4 and 8 GPUs, flat across the node boundary (PARALLELISM.md three-transport table) |
+| **Forward only, high-res (dars, NG5), multi-GPU / multi-node** | `use_padded` up to 16 GPUs; `use_ragged` + `JDIST=1` at ≥32 | padded ties ragged at dars-16 (+2.4 %); at dars-32 ragged is 9 % ahead (measured — the pad factor grows with P), so ragged stays the forward default at ≥32 GPUs. Ragged is GPU-only, **forward-only** |
 | **Forward + adjoint, single GPU** | dense single-device (no sharding) | the standard gradient path; nothing sharded to worry about |
 | **Forward + adjoint, sharded (several GPUs / big mesh)** | **`use_padded`** | the only point-to-point transport with a **correct gradient** (ragged's is broken; all_gather's is correct but ~50–140× the traffic and OOMs at scale) |
 | **Any sharded run on CPU** (no GPU, laptop, CI, gates) | **`use_padded`**, ≤16 in-process devices — or the multi-process gloo launch (`JDIST_CPU=1`, best: 8 procs × 16 cores/node) | ragged doesn't exist on XLA:CPU, and all_gather **crashes** at ≥32 in-process CPU devices; padded runs everywhere |
