@@ -1,0 +1,22 @@
+[bench] padded-a2a adapter installed; slots={(274, 16131): 117, (589, 31735): 254, (269, 47305): 117}
+[bench] core2 npes=8: host setup done  peak_gpu_after_setup=-1.00 GiB
+[bench-finite] core2 npes=8 steps=20 nonfinite_T=0 nonfinite_uv=0 max_uv=1.135 m/s
+[bench] mesh=core2  nod2D=126858 nl=48 npes=8 halo=padded_a2a model=FULL(ice+kpp+gm+JRA1958) steps=20  per_step= 2180.38 ms  throughput=     2.8 Mnodlev/s  compile=  52.5s  plat=cpu  peak_gpu=-1.00 GiB
+      143.10 real      1602.71 user        37.33 sys
+         24255512576  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             3177198  page reclaims
+                   0  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  36  voluntary context switches
+             3207425  involuntary context switches
+       7141577651661  instructions retired
+       5383778316547  cycles elapsed
+         20473860520  peak memory footprint
