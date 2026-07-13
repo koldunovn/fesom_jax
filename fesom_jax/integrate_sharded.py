@@ -210,26 +210,33 @@ def unfold_state(folded: State, P: int) -> State:
 _RKINDS = ("nod", "elem", "edge")
 
 
-def _halo_arrays(sm: ShardedMesh, ragged: bool = False) -> tuple[dict, dict]:
+def _halo_arrays(sm: ShardedMesh, ragged: bool = False,
+                 padded: bool = False) -> tuple[dict, dict]:
     """Fold the per-kind exchange maps + the node owned-mask to ``[P*Lmax_kind]``
     ``shard_map`` inputs + their all-``'p'`` spec dict. With ``ragged=True`` (Phase 8b)
     ALSO fold the :class:`~fesom_jax.shard_mesh.RaggedExchange` maps for the halo-only
-    ``ragged_all_to_all`` path (left out when ``ragged=False`` ⇒ the all_gather traces
-    are byte-unchanged)."""
+    ``ragged_all_to_all`` path; with ``padded=True`` (Phase 8c) instead fold its
+    ``pad_*`` maps for the slot-padded dense ``all_to_all`` (left out otherwise ⇒ the
+    all_gather traces are byte-unchanged)."""
     ha: dict = {}
     for k in _RKINDS:
         src_dev, src_lane = sm.exchange[k]
         ha[f"sd_{k}"] = _fold(src_dev).astype(np.int32)       # mesh constants → host numpy
         ha[f"sl_{k}"] = _fold(src_lane).astype(np.int32)
-        if ragged:
+        if ragged or padded:
             r = sm.exchange_ragged[k]
+            ha[f"rhm_{k}"] = _fold(r.halo_mask)
+        if ragged:
             ha[f"rsi_{k}"] = _fold(r.send_idx).astype(np.int32)
             ha[f"rss_{k}"] = _fold(r.send_sizes).astype(np.int32)
             ha[f"rso_{k}"] = _fold(r.send_offsets).astype(np.int32)
             ha[f"roo_{k}"] = _fold(r.out_offsets).astype(np.int32)
             ha[f"rrs_{k}"] = _fold(r.recv_sizes).astype(np.int32)
             ha[f"rrg_{k}"] = _fold(r.recv_gather).astype(np.int32)
-            ha[f"rhm_{k}"] = _fold(r.halo_mask)
+        if padded:
+            ha[f"pps_{k}"] = _fold(r.pad_src).astype(np.int32)
+            ha[f"ppv_{k}"] = _fold(r.pad_valid)
+            ha[f"ppp_{k}"] = _fold(r.pad_slotpos).astype(np.int32)
     ha["owned_nod"] = _fold(sm.owned_mask["nod"])
     return ha, {k: _P for k in ha}
 
@@ -243,9 +250,43 @@ def _ragged_ctx(h: dict) -> dict:
                 "halo_mask": h[f"rhm_{k}"]} for k in _RKINDS}
 
 
+def _padded_ctx(h: dict) -> dict:
+    """The Phase 8c analogue of :func:`_ragged_ctx`: the per-device padded dense-a2a
+    maps, ``{kind: {pad_src, pad_valid, pad_slotpos, halo_mask}}``."""
+    return {k: {"pad_src": h[f"pps_{k}"], "pad_valid": h[f"ppv_{k}"],
+                "pad_slotpos": h[f"ppp_{k}"], "halo_mask": h[f"rhm_{k}"]}
+            for k in _RKINDS}
+
+
 def _recv_max(sm: ShardedMesh) -> dict:
     """Per-kind static recv-buffer extent for ``ragged_all_to_all`` (closed into the body)."""
     return {k: sm.exchange_ragged[k].recv_max for k in _RKINDS}
+
+
+def _make_halo_ctx(h: dict, n_global: int, use_ragged: bool, use_padded: bool,
+                   recv_max) -> HaloCtx:
+    """Build the per-device :class:`HaloCtx` (with its :class:`SSHHalo`) inside
+    ``shard_map`` from the folded halo-arrays ``h`` — the one construction every
+    sharded body shares, routed by the transport flags (padded / ragged / all_gather)."""
+    exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in _RKINDS}
+    rmaps = (_ragged_ctx(h) if use_ragged
+             else _padded_ctx(h) if use_padded else None)
+    ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
+                       owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
+                       ragged=rmaps["nod"] if rmaps is not None else None,
+                       recv_max=recv_max["nod"] if use_ragged else 0,
+                       use_ragged=use_ragged, use_padded=use_padded)
+    return HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
+                   owned_mask={"nod": h["owned_nod"]},
+                   exch_ragged=rmaps, recv_max=recv_max,
+                   use_ragged=use_ragged, use_padded=use_padded)
+
+
+def _check_halo_mode(use_ragged: bool, use_padded: bool):
+    """The two point-to-point transports are mutually exclusive — refuse at entry."""
+    if use_ragged and use_padded:
+        raise ValueError("use_ragged and use_padded are mutually exclusive halo "
+                         "transports (padded IS the ragged substitute; pick one)")
 
 
 def run_gm_diag_sharded(sm: ShardedMesh, T_p, S_p, bvfreq_p, hnode_new_p, helem_p,
@@ -288,7 +329,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      forcing_static=None, ice_cfg=None, gm_cfg=None,
                      kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None,
                      tracer_cfg=None, boundary_node_p=None,
-                     use_ragged: bool = False) -> State:
+                     use_ragged: bool = False, use_padded: bool = False) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
     return the ``[P, Lmax, …]`` next State.
 
@@ -351,20 +392,12 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                             out_specs=fs_spec, check_vma=False)(fm, fs, fop, fstress, *extras)
         return unfold_state(out, npes)
 
-    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged)
+    _check_halo_mode(use_ragged, use_padded)
+    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded)
     recv_max = _recv_max(sm) if use_ragged else None
 
     def body(m, s, o, stress, h, *ex):
-        exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
-        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
-                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
-                           ragged=_ragged_ctx(h)["nod"] if use_ragged else None,
-                           recv_max=recv_max["nod"] if use_ragged else 0,
-                           use_ragged=use_ragged)
-        ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
-                      owned_mask={"nod": h["owned_nod"]},
-                      exch_ragged=_ragged_ctx(h) if use_ragged else None,
-                      recv_max=recv_max, use_ragged=use_ragged)
+        ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max)
         return _run(m, s, o, stress, ctx, ex)
 
     out = jax.shard_map(body, mesh=jmesh,
@@ -377,7 +410,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       stress_p, n_steps: int, *, dt: float, npes: int, params=None,
                       gm_cfg=None, kpp_cfg=None, tke_cfg=None, ale_cfg=None,
                       visc_cfg=None, tracer_cfg=None,
-                      use_ragged: bool = False,
+                      use_ragged: bool = False, use_padded: bool = False,
                       ice_cfg=None, step_forcing=None, forcing_static=None,
                       boundary_node_p=None, return_executable: bool = False,
                       return_grad_fn: bool = False):
@@ -394,23 +427,27 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     ``stress_p`` static); the forced multi-step (per-step forcing as the scan ``xs``, a
     ``[n_steps, P*Lmax]`` ``PartitionSpec(None,'p')`` fold) is the follow-up for the PRIMARY
     KPP+GM+ice few-step gate."""
+    _check_halo_mode(use_ragged, use_padded)
     if return_grad_fn and use_ragged:
         # lax.ragged_all_to_all has a WRONG reverse-mode transpose (over-counts ~axis_size×,
         # GPU-only; docs/JAX_RAGGED_A2A_BUG.md + the test_halo.py xfail). The forward is
         # byte-exact but any gradient through it is silently wrong — refuse loudly, at entry,
-        # before any setup work (guard added by the 2026-07-03 review).
+        # before any setup work (guard added by the 2026-07-03 review). use_padded (Phase 8c)
+        # is the sanctioned point-to-point GRADIENT path: its transpose is a plain
+        # all_to_all, gated bit-exact vs the all_gather oracle.
         raise ValueError(
             "return_grad_fn=True with use_ragged=True would differentiate through "
             "lax.ragged_all_to_all, whose autodiff transpose is broken (silently wrong "
-            "gradients; see docs/JAX_RAGGED_A2A_BUG.md). Use use_ragged=False (all_gather "
-            "halo) for the gradient path.")
+            "gradients; see docs/JAX_RAGGED_A2A_BUG.md). Use use_padded=True (slot-padded "
+            "dense all_to_all, AD-correct) or use_ragged=False (all_gather halo) for the "
+            "gradient path.")
     fm, fm_spec = folded_mesh(sm)
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
     fstress = _fold(stress_p)
     jmesh = halo.device_mesh(devices=jax.devices()[:npes])
     n_global = sm.nod2D
-    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged)
+    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded)
     recv_max = _recv_max(sm) if use_ragged else None
 
     # Full forced+ice step (constant forcing across the scan — correct for TIMING / scaling, the
@@ -429,16 +466,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     extras, extras_spec = tuple(extras), tuple(extras_spec)
 
     def body(m, s, o, stress, h, *ex):
-        exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
-        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
-                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
-                           ragged=_ragged_ctx(h)["nod"] if use_ragged else None,
-                           recv_max=recv_max["nod"] if use_ragged else 0,
-                           use_ragged=use_ragged)
-        ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
-                      owned_mask={"nod": h["owned_nod"]},
-                      exch_ragged=_ragged_ctx(h) if use_ragged else None,
-                      recv_max=recv_max, use_ragged=use_ragged)
+        ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max)
         sf_, fs_ = (ex[0], ex[1]) if have_forcing else (None, None)
         bn_ = ex[2 if have_forcing else 0] if have_bn else None
 
@@ -463,15 +491,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     # jax.checkpoint'd scan backward needs it). `params`/`p` REPLACES the closed-over `params`.
     if return_grad_fn:
         def bodyg(p, m, s, o, stress, h, *ex):
-            exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
-            ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
-                               owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
-                               ragged=_ragged_ctx(h)["nod"] if use_ragged else None,
-                               recv_max=recv_max["nod"] if use_ragged else 0, use_ragged=use_ragged)
-            ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
-                          owned_mask={"nod": h["owned_nod"]},
-                          exch_ragged=_ragged_ctx(h) if use_ragged else None,
-                          recv_max=recv_max, use_ragged=use_ragged)
+            ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max)
             sf_, fs_ = (ex[0], ex[1]) if have_forcing else (None, None)
             bn_ = ex[2 if have_forcing else 0] if have_bn else None
 
@@ -542,6 +562,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              dt: float, npes: int, params=None, gm_cfg=None, kpp_cfg=None,
                              tke_cfg=None, ale_cfg=None, ice_cfg=None, visc_cfg=None,
                              tracer_cfg=None, boundary_node_p=None, use_ragged: bool = False,
+                             use_padded: bool = False,
                              bootstrap_ab2: bool = True, state_is_folded: bool = False,
                              return_folded: bool = False, return_executable: bool = False,
                              reuse_executable: bool = False, sample_fn=None):
@@ -565,7 +586,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     across chunks of equal length (a fresh forcing stack each call ⇒ same shapes ⇒ cache hit).
 
     Forward-only (no ``return_grad_fn``): the model paper is forward at scale; the differentiable
-    path stays single-GPU dense (the sharded ragged-halo AD bug).
+    path stays single-GPU dense (the sharded ragged-halo AD bug — lifted for ``use_padded``,
+    the Phase 8c AD-correct transport, in :func:`run_steps_sharded`).
 
     **Folded I/O (multi-node, the A6 chunk/restart chaining).** ``state_is_folded`` ⇒ ``state_p`` is
     ALREADY a folded ``[P*Lmax]`` device-sharded State (a prior chunk's output / ``read_restart``);
@@ -583,7 +605,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     fstress = _fold(stress_p)
     jmesh = halo.device_mesh(devices=jax.devices()[:npes])
     n_global = sm.nod2D
-    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged)
+    _check_halo_mode(use_ragged, use_padded)
+    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded)
     recv_max = _recv_max(sm) if use_ragged else None
 
     if forcing_static is None:
@@ -603,16 +626,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     extras, extras_spec = tuple(extras), tuple(extras_spec)
 
     def body(m, s, o, stress, h, seq, *ex):
-        exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
-        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
-                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
-                           ragged=_ragged_ctx(h)["nod"] if use_ragged else None,
-                           recv_max=recv_max["nod"] if use_ragged else 0,
-                           use_ragged=use_ragged)
-        ctx = HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
-                      owned_mask={"nod": h["owned_nod"]},
-                      exch_ragged=_ragged_ctx(h) if use_ragged else None,
-                      recv_max=recv_max, use_ragged=use_ragged)
+        ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max)
         fs_ = ex[0]
         bn_ = ex[1] if have_bn else None
 
@@ -671,7 +685,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     # rebuilt every call and fed to it ⇒ bit-identical to a fresh compile (asserted on GPU).
     if reuse_executable:
         key = (id(sm), id(sop), id(params), int(n_steps), float(dt), bool(bootstrap_ab2),
-               bool(state_is_folded), bool(use_ragged), int(npes), bool(have_bn),
+               bool(state_is_folded), bool(use_ragged), bool(use_padded), int(npes), bool(have_bn),
                id(ice_cfg), id(gm_cfg), id(kpp_cfg), id(tke_cfg),
                id(ale_cfg), id(visc_cfg), id(tracer_cfg), id(sample_fn))
         jfn = _FORCED_JIT_CACHE.get(key)

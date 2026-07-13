@@ -3,6 +3,13 @@
 **Overnight prototype, 2026-07-13.** No repo file is modified: everything lives in this
 folder; the model is adapted at runtime.
 
+> **PRODUCTIZED same day** as the `use_padded` mode (`fesom_jax/halo.py::halo_exchange_padded`,
+> host-built maps in `shard_mesh.py`, plumbed through `integrate_sharded`/`run_from_config`;
+> gates in `fesom_jax/tests/test_halo.py`). Levante verification extended the gates to
+> dist_16/32 and added the full-model CPU benchmark campaign — results + transport-choice
+> guidance: **[`docs/PARALLELISM.md`](../../docs/PARALLELISM.md)**. This folder stays as the
+> prototype record; new code should use `use_padded`, not `install()`.
+
 ## Why
 
 Two documented blockers (see `docs/JAX_RAGGED_A2A_BUG.md`):

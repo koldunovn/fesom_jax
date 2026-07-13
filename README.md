@@ -27,7 +27,8 @@ sea-ice EVP scan).
   real-obs parameter calibration, and a learned (NN) TKE closure — see
   [Differentiable capabilities](#differentiable-capabilities).
 - **Scales**: `shard_map` over a 1-D device mesh, **halo-only point-to-point exchange**
-  (`ragged_all_to_all`), `jax.distributed` across nodes. Per-step communication is GPU↔GPU
+  (`ragged_all_to_all` on GPU; a slot-padded dense `all_to_all` on any backend — with correct
+  gradients), `jax.distributed` across nodes. Per-step communication is GPU↔GPU
   halo + reductions only; the host↔GPU transfer is one-time.
 - **Competitive**: within a few-to-~16 % of Kokkos-CUDA in SYPD across the mesh ladder
   (see `docs/figures/jax_vs_kokkos_sypd.png`).
@@ -93,7 +94,7 @@ fesom_jax/
   # Phase-9 differentiable options, each config-gated (None/0 ⇒ byte-identical):
   #   zstar moving coordinate (ale_cfg), classical-TKE mixing (tke_cfg), mEVP rheology (whichEVP=1)
   forcing.py surface_forcing.py jra55.py phc_ic.py sss_runoff.py   # bulk fluxes; JRA55; PHC IC; SSS
-  halo.py halo_points.py reductions.py        # halo exchange (all_gather + ragged); psum reductions
+  halo.py halo_points.py reductions.py        # halo exchange (all_gather/ragged/padded); psum reductions
   shard_mesh.py integrate_sharded.py          # per-device sharded mesh/state; shard_map runners
   zarr_output.py               # sharded, gather-free model output to Zarr
   longwindow.py                # ensemble-averaged (climate-timescale) adjoint seam: seed-spread + streaming mean+SE
@@ -249,7 +250,8 @@ state_p = shard_mesh.partition_state(state0, part)
 sop     = ssh.partition_ssh_operator(op, part)
 stress_p = np.zeros((8, sm.Lmax["elem"], 2))
 final = ish.run_steps_sharded(sm, state_p, sop, stress_p, n_steps=25, dt=180.0,
-                              npes=8, use_ragged=True)   # ragged halo (forward); see limitations
+                              npes=8, use_ragged=True)   # ragged halo (forward-only, GPU);
+                              # use_padded=True = any backend + correct gradients (see below)
 ```
 
 Multi-node uses `jax.distributed` (1 process/node × 4 GPU) — set `JDIST=1` and launch with `srun`;
@@ -265,6 +267,23 @@ python scripts/bench/bench_forward_scaling.py \
     --npes 4 --steps 25 --dt 1800 --full 1 --ragged 1 --out-zarr /scratch/core2_out.zarr
 # multi-node: submit the prebuilt sbatch (sets JDIST, srun, paths) — see below.
 ```
+
+### Which parallelisation option to use when
+
+Three halo transports (`all_gather` default / `use_ragged` / `use_padded`) × three launch
+topologies. The decision, by what you want to do — details, measurements, and launch recipes
+in **[docs/PARALLELISM.md](docs/PARALLELISM.md)**:
+
+| you want | use | why |
+|---|---|---|
+| **Forward only, low-res (pi, CORE2), 1 GPU** | single device, no sharding | the default; nothing to configure |
+| **Forward only, CORE2-class, several GPUs** | `all_gather` (default) or `use_padded` | at this size all_gather still fits; padded is never wrong |
+| **Forward only, high-res (dars, NG5), multi-GPU / multi-node** | `use_ragged` + `JDIST=1` | leanest exchange; all_gather OOMs at this scale. GPU-only, **forward-only** |
+| **Forward + adjoint, single GPU** | dense single-device (no sharding) | the standard gradient path; nothing sharded to worry about |
+| **Forward + adjoint, sharded (several GPUs / big mesh)** | **`use_padded`** | the only point-to-point transport with a **correct gradient** (ragged's is broken; all_gather's is correct but ~50–140× the traffic and OOMs at scale) |
+| **Any sharded run on CPU** (no GPU, laptop, CI, gates) | **`use_padded`**, ≤16 in-process devices — or the multi-process gloo launch (`JDIST_CPU=1`, best: 8 procs × 16 cores/node) | ragged doesn't exist on XLA:CPU, and all_gather **crashes** at ≥32 in-process CPU devices; padded runs everywhere |
+| **CPU across nodes** | ❌ don't (jaxlib 0.10.1) | every variant crashes, hangs, or runs 6× slower than one node — see PARALLELISM.md |
+| **CPU production throughput** | ❌ wrong tool | best JAX-CPU ≈ 3.3 SYPD/node at CORE2 vs Fortran's ~22 — use GPUs (JAX ≈ Kokkos there) or Fortran |
 
 ---
 
@@ -444,7 +463,8 @@ dars-8 / NG5 the `all_gather` halo OOMs while ragged fits.
 
 Sharding tests need CPU "fake devices" (`--xla_force_host_platform_device_count=N`) and a compute
 node (not the login node). `ragged_all_to_all` is **GPU-only** (see limitations), so ragged gates
-run only on real GPUs.
+run only on real GPUs; the **padded**-halo gates (forward *and* gradient vs the all_gather oracle)
+run on CPU fake devices like everything else.
 
 ```bash
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
@@ -468,8 +488,10 @@ the next table):
 | Single-device, ocean-only **or full** model (KPP+GM/Redi+ice+JRA55), float64 | ✅ | the normal way to run it on one GPU — see Quick start |
 | Forced multi-step, **pre-stacked** (`integrate(step_forcings=…)`) | ✅ but **≤ ~weeks** | the simple path loads every timestep's atmospheric forcing into memory up front, so it runs out of room after a few weeks of simulated time |
 | **Multi-year** forced forward | ✅ | a separate driver (`scripts/archive/core2_kpp_climate_run.py`) feeds the forcing one year at a time and saves/reloads the model state, so it can run for years — this is how we made the 5-yr spin-up and the 10-yr reference |
-| Multi-GPU / multi-node, **ragged** halo | ✅ **GPU only** | the fast, lean way the GPUs swap their shared edges only exists on GPUs, not CPUs (#4) |
-| Multi-GPU, **all_gather** halo | ✅ CPU **and** GPU | works anywhere (CPU too), but every GPU has to hold a copy of all the others' edge data, so the biggest meshes run out of memory (#1) |
+| Multi-GPU / multi-node, **ragged** halo | ✅ **GPU only** | the leanest way the GPUs swap their shared edges only exists on GPUs, not CPUs (#4) |
+| Multi-GPU, **all_gather** halo | ✅ CPU **and** GPU | works anywhere, but every device has to hold a copy of all the others' edge data, so the biggest meshes run out of memory — and on CPU it crashes past 32 in-process devices (#1) |
+| Multi-device, **padded** halo (`use_padded`) | ✅ CPU **and** GPU | the middle option: point-to-point like ragged (a few × its traffic), runs on every backend, and — unlike ragged — its gradient is correct. The CPU choice, and the sharded-gradient choice ([docs/PARALLELISM.md](docs/PARALLELISM.md)) |
+| Multi-**node** on **CPU** | ❌ (jaxlib 0.10.1) | every tested variant crashes, hangs, or runs slower than one node; CPU runs are single-node for now |
 | Big mesh on too few nodes | ❌ out of memory | the model needs more memory per node than the original C/Fortran, so the largest meshes only fit if spread over enough nodes: dars needs **≥ 2 nodes**, NG5 **≥ 8** (#3) |
 | Long **bit-for-bit repeatable** run | ❌ | the ocean is chaotic and tiny rounding differences (from adding numbers in a different order across GPUs) grow over time, so two runs never end up identical — exactly like the original models (#5, #7) |
 
@@ -479,7 +501,7 @@ above; these are the constraints on the *gradient* modes):
 | mode | status | what it means in plain terms |
 |---|---|---|
 | Reverse-mode **adjoint**, single-GPU | ✅ used everywhere | the gradient is only trustworthy over short windows because the ocean is chaotic (#2); the sea-ice part of the gradient blows up soonest, so we switch it off in the gradient beyond ~1 day (#9) |
-| Reverse-mode adjoint, **sharded** (multi-GPU) | ❌ wrong gradient | a bug in JAX's multi-GPU data exchange makes the multi-GPU gradient wrong (the forward is fine), so every gradient runs on **one** GPU — we get scale by launching many separate jobs instead (#1) |
+| Reverse-mode adjoint, **sharded** (multi-GPU) | ✅ with `use_padded` | the *ragged* exchange's gradient is broken in JAX (#1), but the padded exchange's gradient is exact (gated vs the all_gather oracle), so sharded adjoints now have a lean transport; the all_gather halo also gives correct gradients where it fits |
 | Forward-mode **TLM** (`jax.jvp`), single-GPU | ✅ | the same calculation run forwards instead of backwards; handy when you turn **one** knob and want the whole map of its effects. It hits the same short-window limit as the adjoint (it's the same gradient, the other way round) |
 | **Ensemble-averaged** climate adjoint | ✅ research | a single long gradient would blow up, so we average many short ones taken along a long run (the chaos cancels out); we freeze sea ice in the gradient and throw out the few short runs that still blew up early |
 | **EKI** (gradient-free) | ✅ | for slow effects a short gradient can't see, an ensemble method that needs no gradient at all — more expensive, and it gives a single number rather than a full map (#10) |
@@ -494,9 +516,11 @@ above; these are the constraints on the *gradient* modes):
 ### Can't (yet) / caveats
 1. **Ragged-halo gradients are broken** — JAX's `lax.ragged_all_to_all` has an incorrect
    reverse-mode *transpose* (forward is byte-exact; the adjoint over-counts ~`axis_size`×). So
-   `use_ragged=True` is **forward-only**. For gradients use `use_ragged=False` (the `all_gather`
-   halo — correct AD, but O(P·N_local) communication). Full record + minimal repro + the planned
-   `custom_vjp` fix: **[`docs/JAX_RAGGED_A2A_BUG.md`](docs/JAX_RAGGED_A2A_BUG.md)**.
+   `use_ragged=True` is **forward-only**. For sharded gradients use `use_padded=True` (the
+   slot-padded dense `all_to_all` — transposes to another `all_to_all`, gradient gated bit-exact
+   vs the oracle at CORE2 dist_2..32) or, where memory allows, the `all_gather` halo. Full
+   record + minimal repro: **[`docs/JAX_RAGGED_A2A_BUG.md`](docs/JAX_RAGGED_A2A_BUG.md)**;
+   transport choice: **[`docs/PARALLELISM.md`](docs/PARALLELISM.md)**.
 2. **Gradient time horizon ≈ predictability window (both adjoint AND tangent-linear).** The model is
    chaotic: a single burst's gradient is clean over **hours→days** (forcing→fast-variable
    sensitivities — ice, SST, mixed layer) but **explodes exponentially** past the Lyapunov time (for

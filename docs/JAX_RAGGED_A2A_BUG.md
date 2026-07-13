@@ -26,6 +26,14 @@ workaround we use. **Created 2026-06-09** (Phase 8b B.0c findings + a fresh upst
    `all_gather` VJP (Phase 8b **B.0d**). Forward scaling (all dars/NG5 numbers) does NOT use the backward, and
    training at smaller scale can use the all_gather halo (correct AD) — so this blocks only **training-at-scale
    with the ragged halo**, not anything shipped.
+6. **RESOLUTION (2026-07-13, Phase 8c):** the **slot-padded dense `all_to_all`** halo (`use_padded=True`,
+   `fesom_jax/halo.py::halo_exchange_padded`, from `experiments/padded_halo_a2a/`) sidesteps BOTH
+   limitations at once: `lax.all_to_all` exists on every backend and transposes to another `all_to_all`
+   (trusted), so the gradient is correct by construction — gated bit-exact vs the all_gather oracle,
+   forward AND `jax.grad`, CORE2 dist_2..32 on Levante CPU. Costs the padding factor in volume
+   (1.8×@P4 … 12×@P32 vs true ragged; 50–140× under all_gather). Which transport to pick when:
+   **`docs/PARALLELISM.md`**. The ragged forward path and this record stay for the day upstream fixes
+   the transpose.
 
 ---
 

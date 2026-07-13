@@ -66,6 +66,12 @@ def main():
     ap.add_argument("--ragged", action="store_true",
                     help="ragged-halo path (no global all_gather) — needed at dars/NG5 scale; "
                          "GPU-only, forward-only (the sharded ragged AD bug doesn't apply here)")
+    ap.add_argument("--padded", action="store_true",
+                    help="slot-padded dense-all_to_all halo (Phase 8c) — the point-to-point "
+                         "exchange that runs on EVERY backend (the only one usable on CPU past "
+                         "16 in-process devices) and has a correct autodiff transpose; ships "
+                         "~2-12x the ragged volume (P<=32) but 50-140x less than all_gather. "
+                         "See docs/PARALLELISM.md for which halo to pick when.")
     ap.add_argument("--diagnostics", action="store_true",
                     help="after the run, reduce the final State to gather-free scalar health "
                          "numbers (NaN/Inf scan + magnitude bounds) and print a finite/non-finite "
@@ -183,7 +189,8 @@ def main():
     res = run_from_config(cfg, mesh=mesh, part=part, sm=sm, sop=sop, forcing=forcing,
                           state0=state0, start_step=0, year=args.year,
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
-                          use_ragged=args.ragged, progress=(args.progress and _IS_LEAD),
+                          use_ragged=args.ragged, use_padded=args.padded,
+                          progress=(args.progress and _IS_LEAD),
                           local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
                           restart_archive_out=args.restart_archive_out,
                           restart_archive_period=args.restart_archive_period,

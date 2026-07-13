@@ -43,7 +43,7 @@ import scipy.sparse as sp
 from jax import lax, tree_util
 
 from .config import DT_DEFAULT, G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
-from .halo import halo_exchange, halo_exchange_ragged
+from .halo import halo_exchange, halo_exchange_padded, halo_exchange_ragged
 from .mesh import Mesh
 from .reductions import global_dot
 
@@ -99,18 +99,32 @@ class SSHHalo:
     n_global: int = dataclasses.field(metadata={"static": True})
     axis_name: str = dataclasses.field(default="p", metadata={"static": True})
     # --- Phase 8b: the halo-only ragged_all_to_all node exchange for the CG (the
-    # DOMINANT per-step comm — ~2 exchanges × ~127 CG iters). None ⇒ all_gather. ---
+    # DOMINANT per-step comm — ~2 exchanges × ~127 CG iters). None ⇒ all_gather.
+    # Under ``use_padded`` (Phase 8c) the SAME slot carries the padded dense-a2a maps
+    # ({pad_src, pad_valid, pad_slotpos, halo_mask}) instead. ---
     ragged: dict = dataclasses.field(default=None)          # {send_idx, send_sizes, send_off,
     #                                       out_off, recv_sizes, recv_gather, halo_mask} or None
     recv_max: int = dataclasses.field(default=0, metadata={"static": True})
     use_ragged: bool = dataclasses.field(default=False, metadata={"static": True})
+    use_padded: bool = dataclasses.field(default=False, metadata={"static": True})
 
 
 tree_util.register_dataclass(
     SSHHalo,
     data_fields=["src_dev", "src_lane", "owned_mask", "ragged"],
-    meta_fields=["n_global", "axis_name", "recv_max", "use_ragged"],
+    meta_fields=["n_global", "axis_name", "recv_max", "use_ragged", "use_padded"],
 )
+
+
+def _halo_refresh(x, halo: "SSHHalo"):
+    """The CG's node halo refresh, routed by the SSHHalo's transport flags: padded
+    dense a2a (Phase 8c, every backend + AD-correct) > ragged (Phase 8b, GPU
+    forward-only) > all_gather (the oracle). Shared by matvec / precond / zstar."""
+    if halo.use_padded:
+        return halo_exchange_padded(x, halo.ragged, halo.axis_name)
+    if halo.use_ragged:
+        return halo_exchange_ragged(x, halo.ragged, halo.recv_max, halo.axis_name)
+    return halo_exchange(x, halo.src_dev, halo.src_lane, halo.axis_name)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -314,9 +328,7 @@ def ssh_matvec(op: SSHOperator, x, halo: "SSHHalo | None" = None):
     is the dense single-device path — byte-identical to ``v1.0``.
     """
     if halo is not None:
-        x = (halo_exchange_ragged(x, halo.ragged, halo.recv_max, halo.axis_name)
-             if halo.use_ragged
-             else halo_exchange(x, halo.src_dev, halo.src_lane, halo.axis_name))
+        x = _halo_refresh(x, halo)
     return jax.ops.segment_sum(
         op.stiff_vals * x[op.cols], op.rows, num_segments=op.n_nodes
     )
@@ -329,9 +341,7 @@ def ssh_precond(op: SSHOperator, r, halo: "SSHHalo | None" = None):
     update", which is exactly before this preconditioner SpMV), then the local
     ``segment_sum``. ``halo=None`` ⇒ dense (byte-identical)."""
     if halo is not None:
-        r = (halo_exchange_ragged(r, halo.ragged, halo.recv_max, halo.axis_name)
-             if halo.use_ragged
-             else halo_exchange(r, halo.src_dev, halo.src_lane, halo.axis_name))
+        r = _halo_refresh(r, halo)
     return jax.ops.segment_sum(
         op.precond_vals * r[op.cols], op.rows, num_segments=op.n_nodes
     )
@@ -480,9 +490,7 @@ def stiff_increment_matvec(mesh: Mesh, hbar, x, *, dt: float = DT_DEFAULT,
     element gradients + edge scatter then run on the local mesh. ``halo=None`` is the
     dense single-device path (validated at JZ.3; the sharded zstar solve is JZ.7)."""
     if halo is not None:
-        x = (halo_exchange_ragged(x, halo.ragged, halo.recv_max, halo.axis_name)
-             if halo.use_ragged
-             else halo_exchange(x, halo.src_dev, halo.src_lane, halo.axis_name))
+        x = _halo_refresh(x, halo)
     en = mesh.elem_nodes
     g = mesh.gradient_sca                                  # (elem2D,6): ∂N/∂x(0:3),∂N/∂y(3:6)
     xe = x[en]                                             # (elem2D,3)

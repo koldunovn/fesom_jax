@@ -247,6 +247,22 @@ class RaggedExchange:
     #                           overwrites these with the gathered owner value, leaves interior+pad as-is
     send_max: int
     recv_max: int
+    # --- the slot-PADDED dense-all_to_all maps (Phase 8c, merged from
+    # experiments/padded_halo_a2a): the SAME point-to-point exchange rendered as ONE
+    # dense ``lax.all_to_all`` over P slots of ``pad_slot`` lanes each (pair-chunks
+    # zero-padded to the max chunk). Runs on every backend (``ragged_all_to_all`` is
+    # unimplemented on XLA:CPU) and its transpose is another ``all_to_all`` (trusted)
+    # ⇒ gradients are correct by construction, unlike the ragged primitive
+    # (docs/JAX_RAGGED_A2A_BUG.md). Overhead vs ragged = the padding zeros:
+    # 1.8×@P4 … 12×@P32 lanes shipped, still 50–140× under all_gather (CORE2). ---
+    pad_src: np.ndarray       # [P, P*pad_slot] int32 — send buffer: slot e = the d→e chunk's
+    #                           local interior lanes (send_idx order), 0 on pad positions
+    pad_valid: np.ndarray     # [P, P*pad_slot] bool — True on real chunk lanes (pad → zeroed;
+    #                           load-bearing for the TRANSPOSE: kills cotangents of the
+    #                           duplicated pad gathers)
+    pad_slotpos: np.ndarray   # [P, Lmax] int32 — per halo lane, its position in the received
+    #                           slotted buffer (= owner*pad_slot + within-chunk); 0 off-halo
+    pad_slot: int             # static slot width = max (d,e) pair-chunk size (≥1)
 
 
 def _ragged_exchange_map(mylists, mydim, Lmax: int, owner, owner_local) -> RaggedExchange:
@@ -298,9 +314,31 @@ def _ragged_exchange_map(mylists, mydim, Lmax: int, owner, owner_local) -> Ragge
         md = int(mydim[e])
         halo_mask[e, md:mylists[e].size] = True         # halo lanes [md, n_local)
     out_offsets = recv_offsets.T.copy()                 # ragged_all_to_all `output_offsets`
+
+    # Padded dense-a2a maps (Phase 8c): lay each d→e chunk into slot e of d's send
+    # buffer; on the receiver (after the tiled all_to_all, slot d = what d sent me)
+    # each halo lane reads owner_slot*pad_slot + its within-chunk position. Both
+    # sides inherit the canonical per-(e,d) chunk ordering above, so this is the
+    # ragged exchange bit-for-bit — only the transport differs.
+    pad_slot = max(int(recv_sizes.max()), 1) if P else 1
+    pad_src = np.zeros((P, P * pad_slot), dtype=np.int32)
+    pad_valid = np.zeros((P, P * pad_slot), dtype=bool)
+    for d in range(P):
+        for e in range(P):
+            n, off = int(send_sizes[d, e]), int(send_offsets[d, e])
+            pad_src[d, e * pad_slot: e * pad_slot + n] = send_idx[d, off: off + n]
+            pad_valid[d, e * pad_slot: e * pad_slot + n] = True
+    pad_slotpos = np.zeros((P, Lmax), dtype=np.int32)
+    for e in range(P):
+        for d in range(P):
+            n, off = int(recv_sizes[e, d]), int(recv_offsets[e, d])
+            pad_slotpos[e, recv_idx[e, off: off + n]] = (
+                d * pad_slot + np.arange(n, dtype=np.int32))
+
     return RaggedExchange(send_idx, send_sizes, send_offsets,
                           recv_idx, recv_sizes, recv_offsets,
-                          out_offsets, recv_gather, halo_mask, send_max, recv_max)
+                          out_offsets, recv_gather, halo_mask, send_max, recv_max,
+                          pad_src, pad_valid, pad_slotpos, pad_slot)
 
 
 # --------------------------------------------------------------------------
