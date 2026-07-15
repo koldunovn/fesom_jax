@@ -97,3 +97,30 @@ worktree leg look green (rc=0, "1 skipped"); `data/` is now symlinked into both 
 - Driver smoke (26276087): both legs ran the full run_from_config path cleanly (the wiring
   works; host= 0.1–0.5 s/chunk both legs — CPU-side the host build is not the bottleneck);
   restart profile = the FMA-seed picture above.
+
+## 6. GPU A/B RESULT (26278428) — the lever pays −12 % on the production loop
+
+CORE2 all-on (zstar+TKE+mEVP+GM, dt=1800) at dist_4/1 node, 240 steps, 48-step chunks,
+interleaved ×2, warm chunks (3–5; chunks 1–2 carry the two compiles):
+
+| leg | host/chunk | device/chunk | per step |
+|---|--:|--:|--:|
+| off (host stack) | 1.2 s | 4.2–4.3 s | **112.5 ms** |
+| on (tables) | 0.6 s | 4.1–4.2 s | **99 ms** |
+
+**⇒ −12 % total step time** (host build halved, device down slightly from the smaller H2D),
+reproduced across both reps. All gates green; CPU gates: `test_jra55` 10/10,
+`test_forcing_sharded` 7/7 (per-field relative slow-field budgets — an ABSOLUTE budget across
+State fields is meaningless, ssh_rhs is O(1e6); job 26278992), driver smoke PASS (26278427).
+
+**Identity on GPU:** the naive off-vs-on compare at 240 steps FAILS 1e-4 budgets — but the
+off₁↔off₂ CONTROL (plain rerun, same flag) decorrelates just as much (T rel 5.5e-3, uv 8.6e-3
+vs off↔on T 1.2e-2, uv 8.5e-3): the known multi-GPU forced-path run-to-run nondeterminism
+([[fesom-jax-perchunk-recompile-and-nondeterminism]]) masks any flag effect at this window.
+The A/B's identity gate is now FLOOR-CONTROLLED (flag effect ≤10× the rerun floor per slow
+field) — **PASS** on the 26278428 restarts. Whether XLA:GPU FMA-contracts the combine is
+unobservable through this noise; short-window correctness lives in the CPU gates.
+
+**Open next:** flip-default decision for `forcing.on_device` (user call — value-equivalent,
+not bit-identical, to the host path); NG5 local-forcing increment; CGPOLY/EVPWIDE (ladder #2);
+the re-measure envelope (§4 of the handoff) once dars-32 fusion A/B (26274791) lands.

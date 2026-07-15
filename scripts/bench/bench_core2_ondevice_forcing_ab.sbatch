@@ -52,36 +52,38 @@ for REP in 1 2; do
   run_leg "on_$REP" --forcing-on-device
 done
 
-# Identity gate, two-tier: bit-identical is the BEST outcome (would mean XLA:GPU does not
-# FMA-contract the in-scan combine — XLA:CPU does, seeding ~1e-9 rel into the forcing and
-# growing through the physics; see PORTING_LESSONS `ONDEVICE_FORCING_XLA_CPU_DIVIDE`).
-# Otherwise: VALUE-equivalent verdict — slow ocean fields ≤1e-4 rel over 240 steps is the
-# wrong-bracket tripwire; the per-field profile is printed for the ledger either way.
-echo "=== GPU identity gate: restart_off_1 vs restart_on_1 ==="
-"$PY" - "$OUT/restart_off_1" "$OUT/restart_on_1" << 'PYEOF'
+# Identity gate WITH the nondeterminism control (learned from job 26278428): the multi-GPU
+# forced path is non-deterministic at roundoff run-to-run, so at 240 steps a plain OFF
+# rerun decorrelates as much as switching the flag (off1↔off2: T rel 5.5e-3, uv 8.6e-3 —
+# same order as off1↔on1). The honest gate: the flag's effect must not exceed ~10× the
+# measured off1↔off2 floor per field. Bit-identity is unobservable here; short-window
+# correctness is pinned by the CPU gates (test_jra55 + test_forcing_sharded).
+echo "=== GPU identity gate (floor-controlled): off_1 vs on_1, floor = off_1 vs off_2 ==="
+"$PY" - "$OUT/restart_off_1" "$OUT/restart_off_2" "$OUT/restart_on_1" << 'PYEOF'
 import sys
 import numpy as np
 import zarr
-a = zarr.open_group(sys.argv[1], mode="r")
-b = zarr.open_group(sys.argv[2], mode="r")
+o1 = zarr.open_group(sys.argv[1], mode="r")
+o2 = zarr.open_group(sys.argv[2], mode="r")
+n1 = zarr.open_group(sys.argv[3], mode="r")
 GATED = {"T", "S", "uv", "uvnode", "eta_n", "hnode", "w"}
-nbit, bad = 0, 0
-for n in sorted(set(a.array_keys()) | set(b.array_keys())):
-    xa, xb = np.asarray(a[n]), np.asarray(b[n])
-    if np.array_equal(xa, xb):
-        continue
-    nbit += 1
-    scale = float(np.max(np.abs(xa))) or 1.0
-    rel = float(np.max(np.abs(xa - xb))) / scale
+bad, allbit = 0, True
+for n in sorted(set(o1.array_keys()) & set(n1.array_keys())):
+    a, b, c = (np.asarray(g[n]) for g in (o1, o2, n1))
+    scale = float(np.max(np.abs(a))) or 1.0
+    floor = float(np.max(np.abs(a - b))) / scale
+    delta = float(np.max(np.abs(a - c))) / scale
+    if delta > 0:
+        allbit = False
     mark = ""
-    if n in GATED and rel > 1e-4:
-        bad += 1; mark = "  <-- OVER BUDGET"
-    print(f"  {n:14s} rel={rel:9.3e}{mark}")
-if nbit == 0:
-    print("IDENTITY_GATE: PASS-BIT (bit-identical — XLA:GPU did not contract the combine)")
+    if n in GATED and delta > max(10 * floor, 1e-12):
+        bad += 1; mark = "  <-- ABOVE 10x NOISE FLOOR"
+    print(f"  {n:14s} floor={floor:9.3e}  on-off={delta:9.3e}{mark}")
+if allbit:
+    print("IDENTITY_GATE: PASS-BIT (bit-identical)")
     sys.exit(0)
-print("IDENTITY_GATE:", "PASS-VALUE (FMA-seed only)" if bad == 0
-      else f"FAIL ({bad} slow fields over 1e-4 rel)")
+print("IDENTITY_GATE:", "PASS (flag effect within the GPU nondeterminism floor)"
+      if bad == 0 else f"FAIL ({bad} slow fields above 10x the rerun floor)")
 sys.exit(1 if bad else 0)
 PYEOF
 echo "=== done $(date) rc=$? ==="
