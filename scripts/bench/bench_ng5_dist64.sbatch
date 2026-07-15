@@ -6,6 +6,7 @@
 #SBATCH --job-name=bench_ng5_d64
 #SBATCH -A ab0995_gpu
 #SBATCH -p gpu
+#SBATCH --constraint=a100_80   # gpu partition mixes a100_40/a100_80 (~25 % HBM apart); one slow node paces the whole job — pin for comparable numbers
 #SBATCH --nodes=16
 #SBATCH --gres=gpu:4
 #SBATCH --ntasks-per-node=1
