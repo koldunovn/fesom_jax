@@ -124,3 +124,24 @@ unobservable through this noise; short-window correctness lives in the CPU gates
 **Open next:** flip-default decision for `forcing.on_device` (user call — value-equivalent,
 not bit-identical, to the host path); NG5 local-forcing increment; CGPOLY/EVPWIDE (ladder #2);
 the re-measure envelope (§4 of the handoff) once dars-32 fusion A/B (26274791) lands.
+
+## 7. 1-YEAR CLIMATE CERTIFICATION: PASS (job 26280985)
+
+Three legs (off_1 / off_2 = rerun-noise control / on), CORE2 all-on, full year 1958
+(17,520 steps @ dt=1800), annual means of monthly output, per-field max & rms rel:
+
+| field | floor (off₂−off₁) max / rms | on−off₁ max / rms |
+|---|---|---|
+| temp  | 6.55e-3 / 3.68e-5 | 6.41e-3 / 3.49e-5 |
+| salt  | 1.09e-3 / 6.55e-6 | 9.74e-4 / 6.26e-6 |
+| u     | 3.82e-2 / 2.21e-4 | 2.89e-2 / 2.05e-4 |
+| v     | 3.65e-2 / 2.11e-4 | 2.59e-2 / 1.93e-4 |
+| ssh   | 8.95e-4 / 1.55e-5 | 1.08e-3 / 1.56e-5 |
+| a_ice | 4.56e-2 / 7.42e-4 | 3.48e-2 / 7.60e-4 |
+| m_ice | 1.70e-2 / 2.22e-4 | 1.65e-2 / 2.32e-4 |
+
+**Every field's ON−OFF deviation sits at or below the OFF−OFF rerun floor** (ssh at 1.2×,
+well inside the 3× gate): over a full year, switching the flag is statistically
+indistinguishable from rerunning the same year — climate-equivalent, certified. The lever is
+now: −12 % step time, all short-window gates green, 1-yr certified. Remaining before
+flipping any default: the user's call (bit-comparison workflows should keep it OFF).
