@@ -40,6 +40,7 @@ from jax import lax
 from . import ops
 from .config import DENSITY_0
 from .forcing import _safe_speed
+from .halo import exchange_pair
 from .ice import IceConfig
 from .ice_evp import _safe_sqrt, bc_index_nod2D, boundary_node_mask, strain_rates, stress_div_scatter
 from .mesh import Mesh
@@ -203,15 +204,13 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
         boundary_node = boundary_node_mask(mesh)
     st = mevp_setup(cfg, mesh, a_ice, m_ice, m_snow, elevation, boundary_node)
     rdt = cfg.ice_dt                                          # T1: the FULL ice step
-    _exch = (lambda f, k: f) if exch is None else exch        # noqa: E731
 
     def body(carry, _):
         u_i, v_i, s11, s12, s22 = carry
         u_i, v_i, s11, s12, s22 = mevp_iterate(
             cfg, mesh, u_i, v_i, s11, s12, s22, st,
             u_ice, v_ice, srfoce_u, srfoce_v, stress_ax, stress_ay, rdt)   # anchor = frozen entry
-        u_i = _exch(u_i, "nod")                              # refresh halo for next strain read
-        v_i = _exch(v_i, "nod")
+        u_i, v_i = exchange_pair(exch, u_i, v_i, "nod")      # fused halo refresh for next strain read
         return (u_i, v_i, s11, s12, s22), None
 
     init = (u_ice, v_ice, sigma11, sigma12, sigma22)          # T11: σ carried, NOT zeroed

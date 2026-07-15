@@ -34,6 +34,7 @@ from jax import lax
 from . import ops
 from .config import DENSITY_0
 from .forcing import _safe_speed
+from .halo import exchange_pair
 from .ice import IceConfig
 from .mesh import Mesh
 
@@ -254,7 +255,6 @@ def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
     if boundary_node is None:
         boundary_node = boundary_node_mask(mesh)
     st = evp_setup(cfg, mesh, a_ice, m_ice, m_snow, elevation)
-    _exch = (lambda f, k: f) if exch is None else exch        # noqa: E731
 
     def body(carry, _):
         u_i, v_i, s11, s12, s22 = carry
@@ -263,8 +263,8 @@ def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
                                   st.inv_areamass, st.tilt_u, st.tilt_v)
         u_i, v_i = velocity_update(cfg, mesh, u_i, v_i, u_rhs, v_rhs, srfoce_u, srfoce_v,
                                    stress_ax, stress_ay, st.inv_mass, a_ice, boundary_node)
-        u_i = _exch(u_i, "nod")                              # refresh halo for next subcycle's
-        v_i = _exch(v_i, "nod")                              # stress_tensor (reads at vertices)
+        u_i, v_i = exchange_pair(exch, u_i, v_i, "nod")      # fused refresh for next subcycle's
+        #                                                      stress_tensor (reads at vertices)
         return (u_i, v_i, s11, s12, s22), None
 
     init = (u_ice, v_ice, sigma11, sigma12, sigma22)

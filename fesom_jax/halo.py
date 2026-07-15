@@ -92,6 +92,22 @@ class HaloCtx:
         return halo_exchange(field, src_dev, src_lane, self.axis_name)
 
 
+def exchange_pair(exch, a, b, kind: str):
+    """Refresh two same-shape fields' halos in ONE exchange: stack them on a new
+    trailing axis (every transport indexes only the leading lane axis — trailing
+    axes ride along), exchange once, unstack. The exchanged VALUES are identical
+    to two single-field calls; the collective count halves — which is the point
+    for per-iteration callers (the EVP/mEVP subcycle fires 120 × 2 node exchanges
+    per ice step, and under the coloured transport each exchange is K = Δ
+    ``ppermute`` rounds). ``exch=None`` (the dense single-device path) returns the
+    pair untouched, keeping that path's graph byte-identical, not merely
+    value-identical."""
+    if exch is None:
+        return a, b
+    ab = exch(jnp.stack([a, b], axis=-1), kind)
+    return ab[..., 0], ab[..., 1]
+
+
 def halo_exchange(field, src_dev, src_lane, axis_name: str = DEFAULT_AXIS):
     """One broadcast halo exchange, **called inside** ``shard_map``.
 

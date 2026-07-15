@@ -164,6 +164,47 @@ def test_linear_and_grad():
 
 
 # --------------------------------------------------------------------------
+# exchange_pair — the fused two-field exchange (the EVP/mEVP u,v refresh)
+# --------------------------------------------------------------------------
+@avail
+def test_exchange_pair_matches_two_singles():
+    """``halo.exchange_pair`` (two fields stacked on a trailing axis, ONE exchange)
+    must reproduce two single-field exchanges bit-for-bit — it exists purely to
+    halve the EVP/mEVP subcycle's collective count. ``exch=None`` (the dense path)
+    must return the pair untouched (same objects, graph byte-identity)."""
+    _need(2)
+    part = partit.read_partition(CORE2_DIST, 2)
+    sm = shard_mesh.build_sharded_mesh(load_mesh(CORE2_MESH), part)
+    Lmax = sm.Lmax["nod"]
+    src_dev, src_lane = sm.exchange["nod"]
+    owned = np.asarray(sm.owned_mask["nod"])
+    jmesh = halo.device_mesh(devices=jax.devices()[:2])
+    rng = np.random.default_rng(3)
+    u = np.where(owned, rng.standard_normal((part.npes, Lmax)), -1.0)
+    v = np.where(owned, rng.standard_normal((part.npes, Lmax)), -2.0)
+
+    # oracle: two single-field exchanges
+    u1 = np.asarray(halo.run_halo_exchange(u, src_dev, src_lane, jmesh))
+    v1 = np.asarray(halo.run_halo_exchange(v, src_dev, src_lane, jmesh))
+
+    # fused: exchange_pair around the same primitive, inside shard_map
+    spec = halo.PartitionSpec("p")
+    fold = lambda a: halo._fold(np.asarray(a))[0]     # noqa: E731
+    fn = jax.shard_map(
+        lambda uu, vv, sd, sl: halo.exchange_pair(
+            lambda f, kind: halo.halo_exchange(f, sd, sl), uu, vv, "nod"),
+        mesh=jmesh, in_specs=(spec,) * 4, out_specs=(spec, spec))
+    u2, v2 = fn(fold(u), fold(v),
+                fold(src_dev).astype(jnp.int32), fold(src_lane).astype(jnp.int32))
+    np.testing.assert_array_equal(np.asarray(halo._unfold(u2, 2, Lmax)), u1)
+    np.testing.assert_array_equal(np.asarray(halo._unfold(v2, 2, Lmax)), v1)
+
+    # dense path: exch=None returns the pair untouched
+    a, b = halo.exchange_pair(None, u, v, "nod")
+    assert a is u and b is v
+
+
+# --------------------------------------------------------------------------
 # Phase 8b B.0b/c — the ragged_all_to_all primitive == all_gather (fwd + transpose)
 # --------------------------------------------------------------------------
 def _ragged_setup(npes, kind):
