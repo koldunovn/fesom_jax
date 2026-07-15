@@ -1,5 +1,13 @@
 # ============================================================================
-# >>> 2026-07-13: ►►► CURRENT BRIEF = `docs/HANDOFF-20260713-paper-review-halo-bench.md` ◄◄◄
+# >>> 2026-07-15: ►►► CURRENT BRIEF = `docs/HANDOFF-20260715-m7-levers-speed.md` ◄◄◄
+# >>> (Branch `perf/kokkos-m7-levers`: 4 speed levers from the port_kokkos M7 campaign landed +
+# >>> the inherited getcoeffld clamp bug FIXED & MEASURED, −59/−84 % host forcing, bit-identical.
+# >>> NEXT SESSION = more speed (ladder in §3: on-device forcing first), then RE-MEASURE (§4);
+# >>> the paper's Kokkos comparison numbers are the LONG POLE — submit those jobs FIRST (§5).
+# >>> FIRST ACTION = check gate-tail job 26273635, `scripts/logs/m7levers_gates2.*.log`;
+# >>> green ⇒ merge the branch.) Everything below is OLDER.
+# ============================================================================
+# >>> 2026-07-13: ►►► PREVIOUS BRIEF = `docs/HANDOFF-20260713-paper-review-halo-bench.md` ◄◄◄
 # >>> (GMD-paper review pass DONE + three-transport halo benchmarks; paper_jax is now a LOCAL
 # >>> git repo, commits c070ace→af78607; FIRST ACTION next session = read the NG5-64 result,
 # >>> job 26228433, `scripts/logs/bench_ng5_halo64.26228433.out`.) Everything below is OLDER.
