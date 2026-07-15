@@ -5204,3 +5204,46 @@ Cite the C source (`file:line`) or dump probe that proves it.
      built a guidance rule (and a paper sentence) on top of, from a single sample.
   4. A 40-minute wall-clock kill is not evidence of a hang: padded at NG5-64 completes fine (741.9 ms,
      compile 51.6 s) — the earlier timeout (26228433) was a transient. Stage prints, not inference.
+
+- **[perf / four levers transferred from the port_kokkos M7 campaign — and the ones deliberately NOT
+  transferred] (`KOKKOS_M7_LEVER_TRANSFER`)
+  Reviewed `../port_kokkos`'s GPU-speed campaign (`docs/GPU_SPEED_M7.md` there; ratio 3.6×→7.04× at
+  NG5@4N) for what transfers to JAX (branch `perf/kokkos-m7-levers`). Most of their gain — dead
+  host-twin code (SWSKIP, −26 %), host↔device PCIe "rails" (packages D/H), Kokkos thread-mapping —
+  does NOT exist here: XLA DCEs dead code and everything already lives on device inside jit. What DID
+  transfer:
+  1. **A real inherited bug: the `getcoeffld` clamp never releases** (`jra55.py`). Once clamped
+     (`t_indx == t_indx_p1`), `lo == hi`, so every step with `rdate` outside that single instant
+     re-ran `_getcoeffld` — a netCDF `read_slice` + full `_gather` — per field per step: ALL 8 fields
+     for the first 1.5 h of every run (mid-interval-shifted first record), prra/prsn for the first
+     12 h, and again for the LAST 1.5 h/12 h of EVERY year (future clamp). Kokkos found it because it
+     contaminated every 35-step benchmark of their campaign (their fix `7f64be1`); our standard
+     protocol is 25 steps + 5 warmup from Jan 1 00:00 — entirely inside the window. Fix: a clamped
+     bracket is valid on its whole open side (coef_a = 0, coef = d1 for ANY rdate there) ⇒ extend
+     lo/hi to ∓inf; values identical, proven by the existing `test_fields_match_c[d1]` C-dump compare
+     which runs INSIDE the window. Lesson: **a faithful port inherits the original's performance bugs
+     too — when the reference code publishes a perf fix, grep the port for the same pattern.**
+  2. **Rotation trig is a mesh constant** (their ROTCACHE, −2 %): `_vector_g2r` recomputed 8 sin/cos
+     node arrays per step from FIXED coords; now precomputed once in `__init__` and passed as `trig`
+     (same inputs, same libm ⇒ bit-identical). Matters most for the single-process production chains
+     (full-mesh reader).
+  3. **Collective-count fusion at the two hot spots** (their package-E direction: comm is the only
+     pool that GROWS with scale, and host/comm levers hold value at scale while kernel levers decay):
+     `halo.exchange_pair` stacks the EVP/mEVP `u,v` pair on a trailing axis — every transport carries
+     trailing axes — halving the ice step's 120 × 2 per-subcycle exchanges (under coloured each is
+     K = Δ ppermute rounds); `reductions.global_dot_pair` fuses the CG's same-point `(r·z, r·r)` into
+     ONE length-2 psum (3 → 2 psums/iter × ~127 iters). Both keep local arithmetic byte-identical and
+     the dense (`exch=None`/`reduce=None`) graphs untouched.
+  4. **Benchmark hygiene (their L94 + protocol retraction):** Levante's `gpu` partition mixes
+     a100_40/a100_80 (~25 % HBM bandwidth apart) and ONE slow node paces a whole job (+3.4 % measured
+     there) — 29 bench sbatch scripts + `run_from_config.sbatch` now pin `--constraint=a100_80`.
+     Their 35-step protocol was retracted as contaminated (forcing clamp + CG-iteration spin-up that
+     settles ~step 30); ours is 25+5 — absolute anchors that become paper numbers should re-run at
+     150–300 steps (or start past the clamp window) after the clamp fix.
+  NOT transferred, on their measured evidence: **FCT T+S batching** — they measured the
+  tracer-invariant traffic fraction f = 0.242 ⇒ honest ceiling ~1.5–2.2 % and parked it; our two
+  separate `advect_one_fct` calls stay. Also noted: Kokkos-GPU is now ~2× faster than JAX-GPU at
+  NG5-64 (0.2688 vs 0.5433 s/step) — the "JAX ≈ Kokkos on GPU" line predates their M7 and needs
+  re-scoping before the GMD submission. The big deferred lever stays on-device forcing interpolation
+  (`FORCING_INTERP_75PCT_NETCDF_THREAD_WALL` above): their L84/A/B evidence says host levers HOLD
+  their value in the comm-bound regime, upgrading its priority.**
