@@ -160,20 +160,28 @@ def _rotation_matrix() -> np.ndarray:
     ], dtype=np.float64)
 
 
-def _vector_g2r(u, v, glon, glat, rlon, rlat, M):
+def _g2r_trig(glon, glat, rlon, rlat):
+    """The 8 per-node sin/cos factors ``_vector_g2r`` needs. They depend only on the
+    (fixed) node coordinates, so a per-step caller precomputes them ONCE and passes
+    them as ``trig`` — same inputs, same libm ⇒ the cached values are bit-identical
+    to recomputing (the port_kokkos ROTCACHE lever, D.0)."""
+    return (np.sin(glat), np.cos(glat), np.sin(glon), np.cos(glon),
+            np.sin(rlat), np.cos(rlat), np.sin(rlon), np.cos(rlon))
+
+
+def _vector_g2r(u, v, glon, glat, rlon, rlat, M, trig=None):
     """``fesom_vector_g2r`` (``fesom_mesh.c:169``), vectorized over nodes. Rotate a
     geographic (east,north) vector into the model-rotated frame; magnitude-preserving.
-    Returns ``(u_rot, v_rot)``."""
-    sgl, cgl = np.sin(glat), np.cos(glat)
-    sgo, cgo = np.sin(glon), np.cos(glon)
+    Returns ``(u_rot, v_rot)``. ``trig`` is an optional precomputed :func:`_g2r_trig`."""
+    if trig is None:
+        trig = _g2r_trig(glon, glat, rlon, rlat)
+    sgl, cgl, sgo, cgo, srl, crl, sro, cro = trig
     txg = -v * sgl * cgo - u * sgo
     tyg = -v * sgl * sgo + u * cgo
     tzg = v * cgl
     txr = M[0] * txg + M[1] * tyg + M[2] * tzg
     tyr = M[3] * txg + M[4] * tyg + M[5] * tzg
     tzr = M[6] * txg + M[7] * tyg + M[8] * tzg
-    srl, crl = np.sin(rlat), np.cos(rlat)
-    sro, cro = np.sin(rlon), np.cos(rlon)
     v_rot = -srl * cro * txr - srl * sro * tyr + crl * tzr
     u_rot = -sro * txr + cro * tyr
     return u_rot, v_rot
@@ -319,6 +327,8 @@ class JRA55Reader:
         self.rlon = np.asarray(mesh.coord_nod2D, dtype=np.float64)[:, 0]
         self.rlat = np.asarray(mesh.coord_nod2D, dtype=np.float64)[:, 1]
         self.M = _rotation_matrix()
+        # per-node rotation trig — a mesh constant; precomputed once, reused every step
+        self._trig = _g2r_trig(self.glon, self.glat, self.rlon, self.rlat)
 
         # Open the 8 per-year fields; build the gather stencil ONCE from their shared (lon,lat)
         # grid. That grid is FIXED across years, so a multi-year run rolls the year via
@@ -518,6 +528,18 @@ class JRA55Reader:
             if not need:
                 lo = f.nc_time[f.t_indx - 1]
                 hi = f.nc_time[f.t_indx_p1 - 1]
+                # A clamped bracket (t_indx == t_indx_p1 ⇒ coef_a = 0, coef = d1) is
+                # valid on its whole open side, so extend it to ±inf. The C's test
+                # (lo == hi) never released the clamp, re-running _getcoeffld — a
+                # netCDF read + gather per field — EVERY step while rdate sat before
+                # the first record (first 1.5 h of a run, 12 h for prra/prsn) or past
+                # the last one (same windows at every year end). Same values either
+                # way; port_kokkos fixed it identically (7f64be1).
+                if f.t_indx_p1 == f.t_indx:
+                    if f.t_indx == 1:
+                        lo = -math.inf
+                    if f.t_indx == f.Ntime:
+                        hi = math.inf
                 need = (rdate < lo or rdate > hi)
             if need:
                 self._getcoeffld(f, rdate)
@@ -526,7 +548,8 @@ class JRA55Reader:
         u = vals[I_XWIND]
         v = vals[I_YWIND]
         if FORCE_ROTATION:
-            u, v = _vector_g2r(u, v, self.glon, self.glat, self.rlon, self.rlat, self.M)
+            u, v = _vector_g2r(u, v, self.glon, self.glat, self.rlon, self.rlat, self.M,
+                               trig=self._trig)
         return JRAFields(
             u_wind=u,
             v_wind=v,

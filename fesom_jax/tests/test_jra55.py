@@ -116,6 +116,68 @@ def test_fields_match_c(jra, tag):
     assert not bad, f"[{tag}] fields exceeding atol={ATOL}: {bad}\n all: {worst}"
 
 
+def test_clamp_holds_and_releases(jra):
+    """The clamped bracket (before a field's first record) must HOLD — one
+    ``_getcoeffld`` per field on entry, NOT one per step (the C's clamp never
+    released: ``lo == hi`` re-read + re-gathered a slice per field per step for the
+    first 1.5 h of every run, 12 h for prra/prsn, and again at every year end —
+    port_kokkos fix ``7f64be1``). And it must RELEASE: crossing a field's first
+    record refreshes exactly that field, exactly once. Values in the window are the
+    constant first-slice extrapolation (also pinned vs C by
+    ``test_fields_match_c[d1]``, which runs at day 1 sec 0 — inside the window)."""
+    import collections
+    from fesom_jax import jra55
+    r = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+    calls = collections.Counter()
+    orig = r._getcoeffld
+    r._getcoeffld = lambda f, rdate: (calls.update([f.var]), orig(f, rdate))[1]
+
+    # every field's time axis is mid-interval-shifted ⇒ its first record sits
+    # strictly after Jan 1 00:00 — the whole point of the clamp
+    first = {f.var: float(f.nc_time[0]) for f in r.fields}
+    rdate0 = float(jra55._julday(YEAR, 1, 1, r.fields[0].calendar))
+    assert all(t0 > rdate0 for t0 in first.values())
+
+    # three dt=1800 steps inside EVERY field's pre-first-record window
+    secs = (0.0, 1800.0, 3600.0)
+    assert all(rdate0 + s / 86400.0 < min(first.values()) for s in secs)
+    outs = [r.step(YEAR, 1, s) for s in secs]
+    assert calls == {v: 1 for v in jra55.JRA_VARS}, \
+        f"clamp re-built per step: {calls}"
+    for o in outs[1:]:                       # constant extrapolation, bit-identical
+        for name in FIELDS:
+            np.testing.assert_array_equal(np.asarray(getattr(o, name)),
+                                          np.asarray(getattr(outs[0], name)))
+
+    # release: step past the earliest first record → exactly the crossed fields
+    # refresh once; the still-clamped ones (e.g. daily prra/prsn) stay quiet
+    sec_in = (min(first.values()) - rdate0) * 86400.0 + 1800.0
+    rdate_in = rdate0 + sec_in / 86400.0     # the reader's own rdate expression
+    calls.clear()
+    r.step(YEAR, 1, sec_in)
+    expected = {v: 1 for v, t0 in first.items() if rdate_in > t0}
+    assert expected and calls == expected, (dict(calls), expected)
+    r.close()
+
+
+def test_g2r_trig_cache_is_bit_identical(jra):
+    """``_vector_g2r`` fed the precomputed ``_g2r_trig`` table (the reader's per-step
+    path) must reproduce the on-the-fly trig path bit-for-bit."""
+    from fesom_jax import jra55
+    geo = np.asarray(jra["mesh"].geo_coord_nod2D)
+    rot = np.asarray(jra["mesh"].coord_nod2D)
+    glon, glat, rlon, rlat = geo[:, 0], geo[:, 1], rot[:, 0], rot[:, 1]
+    M = jra55._rotation_matrix()
+    rng = np.random.default_rng(1)
+    u0 = rng.normal(size=glon.shape[0])
+    v0 = rng.normal(size=glon.shape[0])
+    a = jra55._vector_g2r(u0, v0, glon, glat, rlon, rlat, M)
+    b = jra55._vector_g2r(u0, v0, glon, glat, rlon, rlat, M,
+                          trig=jra55._g2r_trig(glon, glat, rlon, rlat))
+    np.testing.assert_array_equal(a[0], b[0])
+    np.testing.assert_array_equal(a[1], b[1])
+
+
 def test_wind_rotation_is_active(jra):
     """The integrated wind matching the (rotated) C dump in ``test_fields_match_c``
     already proves the rotation fired correctly. Here pin the two properties it must
