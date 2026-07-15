@@ -288,7 +288,7 @@ class RunResult(NamedTuple):
 def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=None,
                     state0=None, forcing_stack=None, start_step=0, year=1958,
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
-                    use_padded=False,
+                    use_padded=False, use_coloured=False,
                     accumulate_stats=False, stats_fields=("T", "S", "uv"), progress=False,
                     local_forcing=None, checkpoint_every=None,
                     restart_archive_out=None, restart_archive_period=None,
@@ -566,7 +566,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         _chunk_out = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
-            use_ragged=use_ragged, use_padded=use_padded,
+            use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
             boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
             sample_fn=out_sample_fn, **cfg.physics_kwargs())
         # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else just the final state.

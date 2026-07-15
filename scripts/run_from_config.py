@@ -72,6 +72,12 @@ def main():
                          "16 in-process devices) and has a correct autodiff transpose; ships "
                          "~2-12x the ragged volume (P<=32) but 50-140x less than all_gather. "
                          "See docs/PARALLELISM.md for which halo to pick when.")
+    ap.add_argument("--coloured", "--colored", action="store_true", dest="coloured",
+                    help="coloured-ppermute halo (Phase 8d) — every backend and AD-correct like "
+                         "--padded, but WITHOUT its P-growing pad factor: the neighbour graph is "
+                         "bipartite-edge-coloured into K=Delta partial permutations, one "
+                         "lax.ppermute each, so the wire volume stays 1.0-1.4x the true halo at "
+                         "any P (padded ships 41x at 128 GPUs). Costs K collectives instead of 1.")
     ap.add_argument("--diagnostics", action="store_true",
                     help="after the run, reduce the final State to gather-free scalar health "
                          "numbers (NaN/Inf scan + magnitude bounds) and print a finite/non-finite "
@@ -190,6 +196,7 @@ def main():
                           state0=state0, start_step=0, year=args.year,
                           chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
                           use_ragged=args.ragged, use_padded=args.padded,
+                          use_coloured=args.coloured,
                           progress=(args.progress and _IS_LEAD),
                           local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
                           restart_archive_out=args.restart_archive_out,

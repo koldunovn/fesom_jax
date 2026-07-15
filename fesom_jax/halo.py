@@ -62,17 +62,27 @@ class HaloCtx:
     exch_ragged: dict = None    # {kind: {send_idx, send_sizes, send_off, out_off,
     #                                     recv_sizes, recv_gather, halo_mask}} per-device arrays;
     #                             under use_padded the SAME slot carries the padded maps
-    #                             ({pad_src, pad_valid, pad_slotpos, halo_mask}) instead
+    #                             ({pad_src, pad_valid, pad_slotpos, halo_mask}), and under
+    #                             use_coloured the coloured maps ({send_idx, send_valid,
+    #                             colpos, halo_mask}) — one slot, three shapes
     recv_max: dict = None       # {kind: int} static recv-buffer leading dim (ragged only)
     use_ragged: bool = False    # pick ragged_all_to_all over all_gather (GPU, forward-only)
     use_padded: bool = False    # pick the slot-padded dense all_to_all (Phase 8c) —
     #                             every backend, AD-correct; mutually exclusive with use_ragged
+    use_coloured: bool = False  # pick the coloured-ppermute rounds (Phase 8d) — every backend,
+    #                             AD-correct, and without padded's P-growing pad factor
+    col_meta: dict = None       # {kind: (perms, slots, offs)} — STATIC (lax.ppermute needs a
+    #                             Python perm); never a pytree leaf
 
     def exchange(self, field, kind: str):
         """Broadcast-refresh ``field``'s halo lanes from their owners (a no-op on
-        interior + pad lanes), for the given entity ``kind``. Transport: the padded
-        dense ``all_to_all`` when ``use_padded`` (Phase 8c), the halo-only
-        ``ragged_all_to_all`` when ``use_ragged`` (Phase 8b), else ``all_gather``."""
+        interior + pad lanes), for the given entity ``kind``. Transport: the coloured
+        ``ppermute`` rounds when ``use_coloured`` (Phase 8d), the padded dense
+        ``all_to_all`` when ``use_padded`` (Phase 8c), the halo-only ``ragged_all_to_all``
+        when ``use_ragged`` (Phase 8b), else ``all_gather``."""
+        if self.use_coloured and self.exch_ragged is not None:
+            return halo_exchange_coloured(
+                field, self.exch_ragged[kind], self.col_meta[kind], self.axis_name)
         if self.use_padded and self.exch_ragged is not None:
             return halo_exchange_padded(field, self.exch_ragged[kind], self.axis_name)
         if self.use_ragged and self.exch_ragged is not None:
@@ -149,6 +159,46 @@ def halo_exchange_padded(field, r: dict, axis_name: str = DEFAULT_AXIS):
     recv = lax.all_to_all(buf, axis_name, split_axis=0, concat_axis=0, tiled=True)
     gathered = recv[r["pad_slotpos"]]                                # [Lmax, *rest]
     mask = r["halo_mask"].reshape(r["halo_mask"].shape + (1,) * len(rest))
+    return jnp.where(mask, gathered, field)
+
+
+def halo_exchange_coloured(field, c: dict, meta, axis_name: str = DEFAULT_AXIS):
+    """One broadcast halo exchange via **coloured ``lax.ppermute`` rounds** (Phase 8d) — the
+    AD-correct transport *without* the padded exchange's P-growing padding tax.
+
+    :func:`halo_exchange_padded` must give every rank a slot (``all_to_all`` sends one message
+    per rank by definition), so at large ``P`` it ships ~98 % zeros. Here the neighbour graph is
+    bipartite-edge-coloured (:func:`~fesom_jax.shard_mesh._coloured_exchange_map`): each colour
+    class is a partial permutation — every device sends to ≤1 and receives from ≤1 peer — i.e.
+    one legal ``ppermute``. An exchange is ``K = Δ`` such rounds (Δ = max #neighbours ≈ 3–14),
+    each carrying only its own class's max chunk. Wire volume: 1.0–1.4× the true halo at every
+    scale, against padded's 1.8×…41× (``scripts/bench/probe_pad_factor.py``).
+
+    Called inside ``shard_map``; ``field`` is this device's ``[Lmax, *rest]`` local array, ``c``
+    its per-device coloured maps (``send_idx``/``send_valid``/``colpos``/``halo_mask``), ``meta``
+    the STATIC ``(perms, slots, offs)``. The K rounds are packed into one buffer — round *r* lives
+    at ``[offs[r], offs[r]+slots[r])`` — so the send side is a single gather; the received rounds
+    are re-concatenated and ``colpos`` reads each halo lane straight out of the result. Returns the
+    refreshed ``[Lmax, *rest]`` (halo lanes overwritten by their owner's value; interior + pad lanes
+    untouched — the same contract as the other three).
+
+    **Why the gradient is right:** every step is linear with a registered transpose — gather,
+    ``where`` (the ``send_valid`` mask is load-bearing: it kills the cotangents of the pad lanes'
+    duplicated gathers), static slice, ``ppermute`` (transposes to the inverse ``ppermute``),
+    concatenate, gather-back, ``where``. Verified against the ``all_gather`` oracle, forward AND
+    ``jax.grad``, in ``fesom_jax/tests/test_halo.py::test_coloured_*``."""
+    perms, slots, offs = meta
+    if not perms:                       # no halo at all (npes==1) — the exchange is the identity
+        return field
+    rest = field.shape[1:]
+    buf = field[c["send_idx"]]                                       # [total, *rest]
+    vmask = c["send_valid"].reshape(c["send_valid"].shape + (1,) * len(rest))
+    buf = jnp.where(vmask, buf, jnp.zeros_like(buf))
+    rounds = [lax.ppermute(buf[o: o + s], axis_name, perm=list(p))   # static o/s ⇒ static slice
+              for p, s, o in zip(perms, slots, offs)]
+    recv = jnp.concatenate(rounds, axis=0) if len(rounds) > 1 else rounds[0]   # [total, *rest]
+    gathered = recv[c["colpos"]]                                     # [Lmax, *rest]
+    mask = c["halo_mask"].reshape(c["halo_mask"].shape + (1,) * len(rest))
     return jnp.where(mask, gathered, field)
 
 
@@ -241,4 +291,29 @@ def run_halo_exchange_padded(field_PL, rmap, jmesh: Mesh,
 
     fn = jax.shard_map(f, mesh=jmesh, in_specs=(spec,) * 5, out_specs=spec)
     out = fn(field, ps, pv, pp, hm)
+    return _unfold(out, P, Lmax)
+
+
+def run_halo_exchange_coloured(field_PL, cmap, hmask, jmesh: Mesh,
+                               axis_name: str = DEFAULT_AXIS):
+    """Standalone :func:`halo_exchange_coloured` (the Phase 8d gate + standalone use): run the
+    coloured-``ppermute`` exchange on a stacked ``[P, Lmax, *rest]`` field via ``shard_map``.
+    ``cmap`` is the kind's :class:`~fesom_jax.shard_mesh.ColouredExchange`, ``hmask`` its
+    ``RaggedExchange.halo_mask`` (``[P, Lmax]``); ``jmesh`` must have ``P`` devices on
+    ``axis_name``. Any backend."""
+    field, P, Lmax = _fold(field_PL)
+    fold0 = lambda a: _fold(np.asarray(a))[0]
+    si = fold0(cmap.send_idx).astype(jnp.int32)
+    sv = fold0(cmap.send_valid)
+    cp = fold0(cmap.colpos).astype(jnp.int32)
+    hm = fold0(hmask)
+    meta = (cmap.perms, cmap.slots, cmap.offs)          # static
+    spec = PartitionSpec(axis_name)
+
+    def f(fld, si, sv, cp, hm):
+        c = {"send_idx": si, "send_valid": sv, "colpos": cp, "halo_mask": hm}
+        return halo_exchange_coloured(fld, c, meta, axis_name)
+
+    fn = jax.shard_map(f, mesh=jmesh, in_specs=(spec,) * 5, out_specs=spec)
+    out = fn(field, si, sv, cp, hm)
     return _unfold(out, P, Lmax)

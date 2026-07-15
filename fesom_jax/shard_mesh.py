@@ -117,6 +117,7 @@ class ShardedMesh:
     myDim_edge2D_global: int = 0
     ocean_area: float = 0.0
     exchange_ragged: dict = None  # {kind: RaggedExchange} — Phase 8b B.0 (None ⇒ not built)
+    exchange_coloured: dict = None  # {kind: ColouredExchange} — Phase 8d (None ⇒ not built)
 
 
 # --------------------------------------------------------------------------
@@ -341,6 +342,96 @@ def _ragged_exchange_map(mylists, mydim, Lmax: int, owner, owner_local) -> Ragge
                           pad_src, pad_valid, pad_slotpos, pad_slot)
 
 
+@dataclasses.dataclass(frozen=True)
+class ColouredExchange:
+    """The **coloured-``ppermute``** exchange maps (Phase 8d) — the transport that keeps
+    the padded exchange's AD-correctness without its padding tax.
+
+    ``all_to_all`` sends one message per rank *by definition*, so the padded transport must
+    give every rank a slot even though a spatial partition has only ~6–7 real neighbours at
+    any ``P``; at NG5-128 that is 98.4 % zeros on the wire (``scripts/bench/probe_pad_factor.py``).
+    Here the neighbour graph is instead **bipartite-edge-coloured** (left = senders, right =
+    receivers ⇒ König: Δ colours suffice, not Vizing's Δ+1). Each colour class is a *partial
+    permutation* — every device sends to ≤1 and receives from ≤1 peer — i.e. exactly one legal
+    :func:`jax.lax.ppermute`. So one exchange = ``K = Δ`` ppermute rounds, each with its **own**
+    slot width (the max chunk *in that class*, not the global max — which kills the chunk-size
+    variance tax as well as the zero-slot tax).
+
+    Wire volume lands at 1.0–1.4× the true halo at every scale (vs padded's 1.8×…41×).
+    ``ppermute`` is CPU-capable and its transpose is another ``ppermute`` ⇒ the gradient is
+    correct by construction, exactly as for :func:`~fesom_jax.halo.halo_exchange_padded`.
+
+    The K rounds are **packed into one buffer** (round r occupies ``[offs[r], offs[r]+slots[r])``)
+    so the transport needs only one send-index array per kind rather than K shard_map inputs;
+    ``offs``/``slots``/``perms`` are static (``ppermute`` needs a Python perm), so they travel as
+    metadata, never as pytree leaves."""
+
+    send_idx: np.ndarray      # [P, total] int32 — packed send buffer: round r at [offs[r], +slots[r])
+    send_valid: np.ndarray    # [P, total] bool  — True on real chunk lanes (pad → zeroed; the
+    #                           `where` is load-bearing for the transpose, as in the padded path)
+    colpos: np.ndarray        # [P, Lmax] int32 — per halo lane, its position in the CONCATENATED
+    #                           received buffer (= offs[r] + within-chunk); 0 off-halo (masked)
+    perms: tuple              # K tuples of (src, dst) pairs — one lax.ppermute round each (STATIC)
+    slots: tuple              # K ints — per-round slot width (max chunk in that colour class)
+    offs: tuple               # K ints — exclusive cumsum of slots
+    total: int                # = sum(slots) — the packed/concatenated buffer extent
+
+
+def _colour_edges(send_sizes: np.ndarray, P: int) -> list:
+    """Greedy bipartite edge-colouring of the neighbour graph (left = senders, right =
+    receivers). Returns the colour classes as lists of ``(d, e, n)`` edges; each class is a
+    partial permutation, i.e. one legal ``lax.ppermute`` round.
+
+    Greedy (smallest colour free at both endpoints) rather than the König/augmenting-path
+    construction: it may use a colour or two beyond Δ, which costs only an extra round, and
+    the neighbour graphs here are tiny (≤ P·~7 edges). Big chunks first so the wide rounds
+    pack together and the tail rounds stay narrow (per-round slots = max chunk in the class)."""
+    edges = [(d, e, int(send_sizes[d, e]))
+             for d in range(P) for e in range(P) if send_sizes[d, e] > 0]
+    edges.sort(key=lambda t: -t[2])
+    used_send = [set() for _ in range(P)]
+    used_recv = [set() for _ in range(P)]
+    classes: dict[int, list] = {}
+    for d, e, n in edges:
+        c = 0
+        while c in used_send[d] or c in used_recv[e]:
+            c += 1
+        used_send[d].add(c)
+        used_recv[e].add(c)
+        classes.setdefault(c, []).append((d, e, n))
+    return [classes[c] for c in sorted(classes)]
+
+
+def _coloured_exchange_map(rex: RaggedExchange, P: int, Lmax: int) -> ColouredExchange:
+    """Build the :class:`ColouredExchange` from the already-computed :class:`RaggedExchange`
+    (pure index bookkeeping — no rebuild of the expensive owner/halo-lane walk).
+
+    Both sides inherit the ragged map's canonical per-(e,d) chunk ordering, so position *i*
+    of a chunk means the same lane on the sender and the receiver: this is the ragged exchange
+    bit-for-bit, only the transport differs (the same contract the padded path satisfies)."""
+    classes = _colour_edges(rex.send_sizes, P)
+    slots = tuple(max(n for _, _, n in cls) for cls in classes)
+    offs, acc = [], 0
+    for s in slots:
+        offs.append(acc)
+        acc += s
+    offs, total = tuple(offs), int(acc)
+    perms = tuple(tuple((d, e) for d, e, _ in cls) for cls in classes)
+
+    send_idx = np.zeros((P, max(total, 1)), dtype=np.int32)
+    send_valid = np.zeros((P, max(total, 1)), dtype=bool)
+    colpos = np.zeros((P, Lmax), dtype=np.int32)
+    for r, cls in enumerate(classes):
+        base = offs[r]
+        for d, e, n in cls:
+            so = int(rex.send_offsets[d, e])           # d's chunk for e (ordered by dest)
+            send_idx[d, base: base + n] = rex.send_idx[d, so: so + n]
+            send_valid[d, base: base + n] = True
+            ro = int(rex.recv_offsets[e, d])           # e's chunk from d (ordered by source)
+            colpos[e, rex.recv_idx[e, ro: ro + n]] = base + np.arange(n, dtype=np.int32)
+    return ColouredExchange(send_idx, send_valid, colpos, perms, slots, offs, total)
+
+
 # --------------------------------------------------------------------------
 # Build
 # --------------------------------------------------------------------------
@@ -385,6 +476,7 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
         fields[name] = np.asarray(getattr(mesh, name))         # global, replicated
 
     owned_mask, valid_mask, exchange, exchange_ragged = {}, {}, {}, {}
+    exchange_coloured = {}
     lane = {k: np.arange(Lmax[k])[None, :] for k in _KINDS}      # [1, Lmax]
     for k in _KINDS:
         md = mydim[k][:, None]                                  # [P, 1]
@@ -395,6 +487,7 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
         exchange[k] = _exchange_map(mylist[k], mydim[k], Lmax[k], owner, owner_local)
         exchange_ragged[k] = _ragged_exchange_map(
             mylist[k], mydim[k], Lmax[k], owner, owner_local)
+        exchange_coloured[k] = _coloured_exchange_map(exchange_ragged[k], P, Lmax[k])
 
     counts = {
         "myDim_nod": partition.myDim_nod2D, "eDim_nod": partition.eDim_nod2D,
@@ -408,7 +501,7 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
     return ShardedMesh(
         P=P, Lmax=Lmax, nl=mesh.nl, fields=fields,
         owned_mask=owned_mask, valid_mask=valid_mask, exchange=exchange,
-        exchange_ragged=exchange_ragged, counts=counts,
+        exchange_ragged=exchange_ragged, exchange_coloured=exchange_coloured, counts=counts,
         nod2D=mesh.nod2D, elem2D=mesh.elem2D, edge2D=mesh.edge2D,
         edge2D_in=mesh.edge2D_in, myDim_edge2D_global=mesh.myDim_edge2D,
         ocean_area=mesh.ocean_area,

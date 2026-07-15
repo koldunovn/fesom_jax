@@ -78,10 +78,12 @@ def main():
     ap.add_argument("--warmup", type=int, default=5,
                     help="steps excluded via the subtraction method (Kokkos omitted 5).")
     ap.add_argument("--ragged", type=int, default=0)
-    ap.add_argument("--halo", choices=["allgather", "ragged", "padded"], default=None,
+    ap.add_argument("--halo", choices=["allgather", "ragged", "padded", "coloured"],
+                    default=None,
                     help="halo transport (overrides --ragged): allgather (oracle, any backend), "
                          "ragged (GPU-only, forward-only), padded (Phase 8c slot-padded dense "
-                         "all_to_all — any backend, AD-correct; the CPU choice). Default: "
+                         "all_to_all — any backend, AD-correct), coloured (Phase 8d ppermute "
+                         "rounds — any backend, AD-correct, no pad factor). Default: "
                          "ragged if --ragged 1, else allgather.")
     ap.add_argument("--dt", type=float, default=1800.0,
                     help="timestep (s). Kokkos: CORE2 1800, farc 900, dars/NG5 180 (cold-start CFL).")
@@ -130,6 +132,7 @@ def main():
     halo_mode = args.halo or ("ragged" if args.ragged else "allgather")
     use_ragged = halo_mode == "ragged"
     use_padded = halo_mode == "padded"
+    use_coloured = halo_mode == "coloured"
     if ndev < args.npes:
         print(f"[bench] SKIP {args.name} npes={args.npes}: only {ndev} devices"); return
     if use_ragged and plat == "cpu":
@@ -190,13 +193,25 @@ def main():
     # cancels compile, the fixed per-call dispatch overhead, AND the first-W-step transient
     # (the AB2 is_first_step branch + early spin-up).
     def warm_time(n):
+        # The stage prints are load-bearing at scale: a wall-clock kill between "host setup
+        # done" and the final row used to be indistinguishable between a slow trace, a slow
+        # compile and a hung collective (the padded halo at 64 GPUs, job 26228433). They are
+        # flushed, proc0-only, and outside every timed region.
+        tb = time.perf_counter()
         jfn, jargs, _ = ish.run_steps_sharded(sm, state_p, sop, stress_p, n, dt=DT,
                                               npes=args.npes, use_ragged=use_ragged,
                                               use_padded=use_padded,
+                                              use_coloured=use_coloured,
                                               return_executable=True, **full_kw)
+        if proc0:
+            print(f"[bench] graph built (trace+lower) in {time.perf_counter() - tb:6.1f}s "
+                  f"— entering compile+1st run", flush=True)
         tc = time.perf_counter()
         jax.block_until_ready(jfn(*jargs))        # 1st call: trace + compile + run (excluded)
         comp = time.perf_counter() - tc
+        if proc0:
+            print(f"[bench] compile+1st run done in {comp:6.1f}s — entering timed run",
+                  flush=True)
         t0 = time.perf_counter()
         jax.block_until_ready(jfn(*jargs))        # 2nd call: reuse executable → pure run
         return time.perf_counter() - t0, comp, jfn, jargs

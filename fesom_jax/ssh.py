@@ -43,7 +43,8 @@ import scipy.sparse as sp
 from jax import lax, tree_util
 
 from .config import DT_DEFAULT, G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
-from .halo import halo_exchange, halo_exchange_padded, halo_exchange_ragged
+from .halo import (halo_exchange, halo_exchange_coloured, halo_exchange_padded,
+                   halo_exchange_ragged)
 from .mesh import Mesh
 from .reductions import global_dot
 
@@ -107,19 +108,31 @@ class SSHHalo:
     recv_max: int = dataclasses.field(default=0, metadata={"static": True})
     use_ragged: bool = dataclasses.field(default=False, metadata={"static": True})
     use_padded: bool = dataclasses.field(default=False, metadata={"static": True})
+    # --- Phase 8d: the coloured-ppermute rounds. `ragged` above carries the coloured maps
+    # ({send_idx, send_valid, colpos, halo_mask}); `col_meta` is the node kind's STATIC
+    # (perms, slots, offs) — lax.ppermute needs a Python perm, so it must be a meta field
+    # (a pytree leaf would be traced into an array and the perm would be unusable). ---
+    use_coloured: bool = dataclasses.field(default=False, metadata={"static": True})
+    col_meta: tuple = dataclasses.field(default=None, metadata={"static": True})
 
 
 tree_util.register_dataclass(
     SSHHalo,
     data_fields=["src_dev", "src_lane", "owned_mask", "ragged"],
-    meta_fields=["n_global", "axis_name", "recv_max", "use_ragged", "use_padded"],
+    meta_fields=["n_global", "axis_name", "recv_max", "use_ragged", "use_padded",
+                 "use_coloured", "col_meta"],
 )
 
 
 def _halo_refresh(x, halo: "SSHHalo"):
-    """The CG's node halo refresh, routed by the SSHHalo's transport flags: padded
-    dense a2a (Phase 8c, every backend + AD-correct) > ragged (Phase 8b, GPU
-    forward-only) > all_gather (the oracle). Shared by matvec / precond / zstar."""
+    """The CG's node halo refresh, routed by the SSHHalo's transport flags: coloured
+    ppermute (Phase 8d, every backend + AD-correct + no pad factor) > padded dense a2a
+    (Phase 8c, every backend + AD-correct) > ragged (Phase 8b, GPU forward-only) >
+    all_gather (the oracle). Shared by matvec / precond / zstar. This is the DOMINANT
+    per-step comm (~2 exchanges × ~127 CG iterations), so the transport choice is felt
+    here first."""
+    if halo.use_coloured:
+        return halo_exchange_coloured(x, halo.ragged, halo.col_meta, halo.axis_name)
     if halo.use_padded:
         return halo_exchange_padded(x, halo.ragged, halo.axis_name)
     if halo.use_ragged:

@@ -292,3 +292,98 @@ def test_halo_modes_mutually_exclusive():
     with pytest.raises(ValueError, match="mutually exclusive"):
         ish.run_steps_sharded(None, None, None, None, 1, dt=1.0, npes=2,
                               use_ragged=True, use_padded=True)
+
+
+@pytest.mark.parametrize("pair", [("use_ragged", "use_coloured"),
+                                  ("use_padded", "use_coloured")])
+def test_coloured_excludes_the_other_transports(pair):
+    """Phase 8d: coloured is a THIRD substitute for the same exchange — refuse any pairing."""
+    from fesom_jax import integrate_sharded as ish
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        ish.run_steps_sharded(None, None, None, None, 1, dt=1.0, npes=2,
+                              **{pair[0]: True, pair[1]: True})
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4, 8])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_coloured_classes_are_partial_permutations(npes, kind):
+    """The property ``lax.ppermute`` REQUIRES, checked on the real partitions: within one
+    colour class every device sends to at most one peer and receives from at most one peer
+    (a partial permutation). If the colouring ever violated this the perm would be illegal
+    — and the exchange would silently drop or overwrite a chunk."""
+    _need(npes)
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(load_mesh(CORE2_MESH), part)
+    c = sm.exchange_coloured[kind]
+    seen = set()
+    for perm in c.perms:
+        srcs = [d for d, _ in perm]
+        dsts = [e for _, e in perm]
+        assert len(srcs) == len(set(srcs)), f"{kind}/{npes}: a device sends twice in one round"
+        assert len(dsts) == len(set(dsts)), f"{kind}/{npes}: a device receives twice in one round"
+        assert all(d != e for d, e in perm), "self-edge in the neighbour graph"
+        seen |= set(perm)
+    # every real neighbour edge is carried by exactly one round (none dropped, none doubled)
+    edges = {(d, e) for d in range(npes) for e in range(npes)
+             if sm.exchange_ragged[kind].send_sizes[d, e] > 0}
+    assert seen == edges, f"{kind}/{npes}: colouring lost or duplicated edges"
+    assert len(c.slots) == len(c.perms) and c.total == sum(c.slots)
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4, 8])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_coloured_forward_matches_allgather(npes, kind):
+    """The coloured-ppermute exchange == the all_gather exchange on every VALID lane,
+    BYTE-IDENTICALLY — same owner values, K point-to-point ppermute rounds instead of the
+    broadcast. Any backend (ppermute, like all_to_all, exists on XLA:CPU)."""
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, _ = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    cmap, hmask = sm.exchange_coloured[kind], sm.exchange_ragged[kind].halo_mask
+    ref = np.asarray(halo.run_halo_exchange(field, src_dev, src_lane, jmesh))
+    got = np.asarray(halo.run_halo_exchange_coloured(field, cmap, hmask, jmesh))
+    vm = valid[:, :, None]
+    assert np.array_equal(np.where(vm, got, 0.0), np.where(vm, ref, 0.0)), \
+        f"coloured != all_gather forward on valid {kind} lanes (npes={npes})"
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_coloured_grad_matches_allgather(npes, kind):
+    """THE Phase 8d point: the coloured exchange's gradient matches the all_gather oracle's.
+    ``ppermute`` transposes to the inverse ``ppermute`` (a trusted JAX rule), and the
+    ``send_valid`` where kills the pad lanes' duplicated-gather cotangents — so the AD
+    correctness of the padded transport survives dropping its padding. This is the test the
+    ragged primitive xfails."""
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, rng = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    cmap, hmask = sm.exchange_coloured[kind], sm.exchange_ragged[kind].halo_mask
+    w = jnp.asarray(rng.standard_normal((npes, Lmax, sm.nl)) * valid[:, :, None])
+    g_ref = np.asarray(jax.grad(lambda f: jnp.sum(
+        w * halo.run_halo_exchange(f, src_dev, src_lane, jmesh)))(field))
+    g_col = np.asarray(jax.grad(lambda f: jnp.sum(
+        w * halo.run_halo_exchange_coloured(f, cmap, hmask, jmesh)))(field))
+    vm = valid[:, :, None]
+    dif = np.abs(np.where(vm, g_col - g_ref, 0.0)).max()
+    scale = max(np.abs(g_ref).max(), 1e-300)
+    assert dif / scale < 1e-12, \
+        f"coloured grad != all_gather grad ({kind}, npes={npes}); rel max|Δ|={dif/scale:.3e}"
+
+
+@avail
+@pytest.mark.parametrize("npes", [4])
+def test_coloured_ships_less_than_padded(npes):
+    """The whole point of Phase 8d, asserted as an invariant rather than a benchmark: the
+    coloured transport's wire volume (Σ per-round slots) is strictly below the padded one's
+    (P × global-max-slot), and the gap widens with P (see scripts/bench/probe_pad_factor.py)."""
+    _need(npes)
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(load_mesh(CORE2_MESH), part)
+    for kind in ("nod", "elem", "edge"):
+        col = sm.exchange_coloured[kind].total
+        pad = npes * sm.exchange_ragged[kind].pad_slot
+        assert col < pad, f"{kind}: coloured {col} lanes !< padded {pad}"

@@ -13,8 +13,11 @@
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=0
 #SBATCH --time=00:40:00
-#SBATCH -o /home/a/a270088/port_jax/scripts/logs/bench_dars_halo16.%j.out
-#SBATCH -e /home/a/a270088/port_jax/scripts/logs/bench_dars_halo16.%j.out
+# .log, NOT .out: the paper reducer globs scripts/logs/bench_*.out and would pull these
+# A/B re-runs into scaling.csv (figure takes best-per-ngpu, macros take first-in-glob-order
+# => they silently disagree). Keep transport A/Bs out of the paper's bench_*.out glob.
+#SBATCH -o /home/a/a270088/port_jax/scripts/logs/bench_dars_halo16.%j.log
+#SBATCH -e /home/a/a270088/port_jax/scripts/logs/bench_dars_halo16.%j.log
 source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax

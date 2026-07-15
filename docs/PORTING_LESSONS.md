@@ -5126,3 +5126,81 @@ Cite the C source (`file:line`) or dump probe that proves it.
   9 % ahead (319.6 vs 349.1 ms, job 26228413), so the crossover sits at 16–32 GPUs, right where the
   growing pad factor said it would. The paper's §5 halo paragraph was rewritten from these numbers
   the same day.
+
+- **[parallelism] The scaling crossover was in the partition files all along — a 22×-cheaper
+  answer than the 16-node job that timed out looking for it** (Phase 8c GPU follow-up 2,
+  `scripts/bench/probe_pad_factor.py`, table in `docs/PARALLELISM.md`). The NG5-64 padded-vs-ragged
+  A/B (job 26228433, 16 nodes) died on a 40-min wall having printed nothing but "host setup done",
+  so it cost ~11 node-hours and produced *neither* number. The question it was asking — where does
+  padded stop winning? — turned out to need no GPU at all: padded ships `P · pad_slot` lanes to
+  every peer while ragged ships only the real chunks, so `pad factor = P · pad_slot / send_max` is a
+  pure function of the partition, computable in **seconds on a login node**. It predicts every
+  measured point: 1.8×/3.4× at CORE2-4/8 (padded wins by 7 %/33 %), 5.4× at dars-16 (ties), 15.3× at
+  dars-32 (ragged +9 %). The winner flips exactly where the pad factor crosses ~5–15.
+  Three lessons, in increasing order of how much they would have saved:
+  1. **The waste has a one-line cause: `all_to_all` demands a uniform message size (that is what
+     buys the static shape and the correct transpose), so padded sends a `pad_slot`-sized message to
+     EVERY rank — zeros to the ~`P−7` non-neighbours. A spatial partition has ~6–7 real neighbours
+     at any `P`; padded allocates a slot for all `P`.** Occupancy collapses as `~7/P`: 45 % at P=4,
+     3.2 % at P=64, 1.6 % at P=128. Stated in bytes (per device, per exchange, one `[Lmax,nl]` f64
+     node field at NG5), the scissors are unmistakable — padded's buffer *grows* as `P·pad_slot`
+     while the local field it refreshes *shrinks* as `~N/P`:
+
+     | | ragged | padded | local field | all_gather |
+     |---|---|---|---|---|
+     | 64 GPUs | 1.08 MB | 23.7 MB | 66.1 MB | 4,146 MB |
+     | 128 GPUs | 0.87 MB | **35.4 MB** | **33.4 MB** | 4,146 MB |
+
+     At P=128 the exchange moves more bytes than the local array it is refreshing, for a job ragged
+     does in 0.87 MB. (Per *device*: both stay ~100× under all_gather's global 4.1 GB — padded is
+     not worse than gathering everything, it is paying an unbounded padding tax.) That killed the
+     planned NG5-128 A/B (~64 GPU-h) on arithmetic. It also names the fix — cap the slots at the
+     real neighbours, not `P`, and the pad factor (with it ragged's only remaining niche) disappears.
+  2. **When a benchmark can only fail by timing out, it cannot tell you anything.** Between "host
+     setup done" and the final row, `bench_forward_scaling.py` was silent across trace, compile and
+     run — so a wall-clock kill was indistinguishable between a slow trace, a slow compile and a
+     hung collective. Two flushed stage prints (now permanent) turn a dead job into a diagnosis.
+     Re-runs of anything expensive also put the *control* first and cap the suspect with `timeout`:
+     bank the number you already understand before the one you don't can eat the wall clock.
+  3. **Cost-asymmetry is a design input, not an afterthought.** A cheap host-side model of the thing
+     you are about to measure is worth writing *before* queueing 16 nodes — not because the
+     measurement is wrong, but because the model tells you which measurements are worth taking.
+
+- **[parallelism] The AD-correct transport turned out to be the FASTEST one at scale — and a
+  single-scale micro-benchmark had me confidently concluding the opposite** (Phase 8d,
+  `use_coloured`, jobs 26232647/8 + 26232224 + 26232225 + 26232853). The coloured-`ppermute`
+  transport (bipartite edge-colour the neighbour graph into K = Δ partial permutations, one
+  `lax.ppermute` each) was built to remove the padded exchange's P-growing pad factor. Full-model
+  GPU A/B, four transports, same day / same nodes:
+
+  | | K | all_gather | ragged | padded | coloured |
+  |---|---|---|---|---|---|
+  | CORE2-4 | 3 | 89.9 | 86.5 | **80.4** | 92.5 |
+  | CORE2-8 | 3 | 185.7 | 116.1 | **78.5** | 84.5 |
+  | dars-32 | 12 | — | **346.9** | 348.7 | 385.4 |
+  | **NG5-64** | 10 | — | 592.1 | 741.9 | **543.3** |
+
+  **At NG5-64 coloured is the fastest transport — 9 % under ragged and 37 % under padded — so at the
+  largest scale the AD-correct halo is now CHEAPER than the forward-only one.** The mechanism is a
+  cost-structure difference, not a constant factor: `ragged_all_to_all` is semantically a **P-way**
+  all-to-all (cost grows with device count) and padded's volume is `P·pad_slot` (also grows), while
+  **coloured's cost is bounded by K = Δ ≈ 3–14 rounds regardless of P** — a spatial partition has
+  ~6–7 neighbours at any scale. It is the only transport whose cost does not grow with P, so it must
+  win eventually; the question was only where. Four lessons:
+  1. **I generalised a micro-benchmark across scales and got it exactly backwards.** The per-exchange
+     micro-benchmark at dars-16 showed ragged doing coloured's volume in ONE collective and beating it
+     1.9×, from which I concluded — in writing, in the docs — "`ragged_all_to_all` IS the coloured
+     transport done natively, so coloured can never beat it." NG5-64 disproved it two runs later. A
+     micro-benchmark measures the cost *structure* (coloured loses tiny 2-D exchanges to latency, wins
+     big 3-D ones on bytes — both true and both durable); it does NOT license a ranking at a scale you
+     did not run. Rankings that depend on P must be measured at the P you care about.
+  2. **Count the exchanges before you count the bytes** — the half of the lesson that survived. The CG
+     fires ~2 × ~127 = ~254 *2-D* ssh exchanges per step against a few dozen 3-D ones, so on small
+     meshes collective COUNT (coloured's K) dominates and the volume win is worthless. Coloured wins
+     only once the 3-D fields are big enough to pay for K.
+  3. **Re-run before quoting a margin.** The tabulated "ragged +9.2 % at dars-32" did not reproduce: a
+     second same-node run gave ragged 346.9 vs padded 348.7 — a 0.5 % tie. Padded reproduced to 0.1 %
+     across allocations; **ragged swung 8.6 %** (319.6 → 346.9). The noisy transport was the one we had
+     built a guidance rule (and a paper sentence) on top of, from a single sample.
+  4. A 40-minute wall-clock kill is not evidence of a hang: padded at NG5-64 completes fine (741.9 ms,
+     compile 51.6 s) — the earlier timeout (26228433) was a transient. Stage prints, not inference.
