@@ -42,3 +42,19 @@ def global_dot(a, b, owned_mask, axis_name: str | None = None):
     """``Σ (a·b)`` over owned lanes + ``psum`` — the distributed CG dot-product
     (``pp·App``, ``rr·zz``, ``rr·rr``). ``a``/``b`` are ``[Lmax, *rest]``."""
     return global_sum(jnp.asarray(a) * jnp.asarray(b), owned_mask, axis_name)
+
+
+def global_dot_pair(a, b, c, d, owned_mask, axis_name: str | None = None):
+    """``(Σ a·b, Σ c·d)`` with ONE collective instead of two — the CG's per-iteration
+    ``(r·z, r·r)`` pair, which lives at the same point of the loop body and costs a
+    separate ``psum`` latency each (~127 iterations × ~2 D exchanges already dominate
+    the step's collective count at scale). The two OWNED-LANE partial dots are computed
+    exactly as two :func:`global_dot` locals — same expressions, same reduction order —
+    and only the cross-device reduction is fused into a single length-2 ``psum``
+    (element-wise, same per-element device summation as two scalar ``psum``s)."""
+    la = global_sum(jnp.asarray(a) * jnp.asarray(b), owned_mask, None)
+    lb = global_sum(jnp.asarray(c) * jnp.asarray(d), owned_mask, None)
+    if axis_name is None:
+        return la, lb
+    s = jax.lax.psum(jnp.stack([la, lb]), axis_name)
+    return s[0], s[1]

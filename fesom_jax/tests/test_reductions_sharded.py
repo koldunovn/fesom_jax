@@ -206,3 +206,43 @@ def test_global_dot_matches_single_device(npes):
     fn = jax.shard_map(lambda x, y, m: reductions.global_dot(x, y, m, "p"),
                        mesh=jmesh, in_specs=(spec, spec, spec), out_specs=PartitionSpec())
     assert float(fn(av, bv, mv)) == pytest.approx(ref, rel=1e-12, abs=1e-9)
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+def test_global_dot_pair_matches_two_dots(npes):
+    """``global_dot_pair`` (the CG's fused ``(r·z, r·r)`` — one length-2 ``psum``
+    instead of two scalar ones) must reproduce two ``global_dot`` calls BIT-for-bit:
+    the owned-lane locals are the same expressions, and the fused ``psum`` reduces
+    each element over the same device order."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    Ln = sm.Lmax["nod"]
+    rng = np.random.default_rng(6)
+    rPL = rng.standard_normal((npes, Ln))
+    zPL = rng.standard_normal((npes, Ln))
+
+    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    spec = PartitionSpec("p")
+    rv = jnp.asarray(rPL).reshape(npes * Ln)
+    zv = jnp.asarray(zPL).reshape(npes * Ln)
+    mv = jnp.asarray(sm.owned_mask["nod"]).reshape(npes * Ln)
+    two = jax.shard_map(
+        lambda r, z, m: (reductions.global_dot(r, z, m, "p"),
+                         reductions.global_dot(r, r, m, "p")),
+        mesh=jmesh, in_specs=(spec,) * 3, out_specs=(PartitionSpec(), PartitionSpec()))
+    one = jax.shard_map(
+        lambda r, z, m: reductions.global_dot_pair(r, z, r, r, m, "p"),
+        mesh=jmesh, in_specs=(spec,) * 3, out_specs=(PartitionSpec(), PartitionSpec()))
+    rz2, rr2 = two(rv, zv, mv)
+    rz1, rr1 = one(rv, zv, mv)
+    assert float(rz1) == float(rz2) and float(rr1) == float(rr2)
+
+    # axis_name=None (dense / single-device): plain pair of masked sums
+    m1 = np.ones(Ln, dtype=bool)
+    la, lb = reductions.global_dot_pair(rPL[0], zPL[0], rPL[0], rPL[0], m1, None)
+    assert float(la) == float(reductions.global_dot(rPL[0], zPL[0], m1, None))
+    assert float(lb) == float(reductions.global_dot(rPL[0], rPL[0], m1, None))

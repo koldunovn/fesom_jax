@@ -46,7 +46,7 @@ from .config import DT_DEFAULT, G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
 from .halo import (halo_exchange, halo_exchange_coloured, halo_exchange_padded,
                    halo_exchange_ragged)
 from .mesh import Mesh
-from .reductions import global_dot
+from .reductions import global_dot, global_dot_pair
 
 # Tolerance for the *gradient* (transpose) solve — tight so the implicit-diff
 # cotangent ``S⁻¹·x̄`` is accurate, independent of the loose forward ``soltol``.
@@ -416,7 +416,7 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
 # Substep 9 — preconditioned CG solve
 # ==========================================================================
 def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
-         reduce=None, n_global=None, return_iters=False):
+         reduce=None, reduce_pair=None, n_global=None, return_iters=False):
     """Preconditioned CG, a literal port of ``fesom_ssh_solve_cg``
     (``fesom_ssh.c:384``). Stops at ``‖r‖/√N < soltol·‖b‖/√N`` (relative residual
     ``soltol``). ``x0`` is the initial guess; returns the (possibly early-stopped)
@@ -436,17 +436,24 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
     deadlock) and — load-bearing — matches the single-device count (review #1/#4).
     ``reduce=None``/``n_global=None`` ⇒ the dense path (plain ``jnp.sum``,
     ``n=b.shape[0]``), byte-identical to ``v1.0``. ``return_iters`` (diagnostic /
-    tests) also returns the iteration count; it leaves the default graph untouched."""
+    tests) also returns the iteration count; it leaves the default graph untouched.
+
+    ``reduce_pair`` (``(r, z) → (Σ r·z, Σ r·r)``) fuses the loop body's two
+    same-point reductions into ONE collective (``reductions.global_dot_pair``) —
+    2 of the 3 per-iteration ``psum``s become 1. ``None`` ⇒ two ``dot`` calls,
+    keeping the dense graph (and any caller not passing it) untouched."""
     n = b.shape[0] if n_global is None else n_global
     dot = (lambda u, v: jnp.sum(u * v)) if reduce is None else reduce
+    dot_rz_rr = ((lambda r, z: (dot(r, z), dot(r, r)))
+                 if reduce_pair is None else reduce_pair)
     s0 = dot(b, b)
     rtol = (soltol * jnp.sqrt(s0 / n)) if rtol_abs is None else rtol_abs
 
     def run(_):
         r0 = b - matvec(x0)
         z0 = precond(r0)
-        resid0 = jnp.sqrt(dot(r0, r0) / n)
-        sold0 = dot(r0, z0)
+        sold0, rr0 = dot_rz_rr(r0, z0)
+        resid0 = jnp.sqrt(rr0 / n)
 
         def cond(c):
             _x, _r, _z, _p, _s, resid, it = c
@@ -459,8 +466,7 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
             x = x + al * p
             r = r - al * Ap
             z = precond(r)
-            sp0 = dot(r, z)
-            sp1 = dot(r, r)
+            sp0, sp1 = dot_rz_rr(r, z)
             resid = jnp.sqrt(sp1 / n)
             be = sp0 / s_old
             p = z + be * p
@@ -593,19 +599,23 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = Non
     if halo is None:
         nrhs = ssh_rhs.shape[0]
         rtol_fwd = forward_tol * jnp.sqrt(jnp.sum(ssh_rhs * ssh_rhs) / nrhs)
-        reduce_fn, n_global = None, None
+        reduce_fn, reduce_pair_fn, n_global = None, None, None
     else:
         reduce_fn = lambda u, v: global_dot(u, v, halo.owned_mask, halo.axis_name)
+        # the (r·z, r·r) pair in ONE psum — same locals, half the loop's collectives
+        reduce_pair_fn = lambda r, z: global_dot_pair(
+            r, z, r, r, halo.owned_mask, halo.axis_name)
         n_global = halo.n_global
         rtol_fwd = forward_tol * jnp.sqrt(reduce_fn(ssh_rhs, ssh_rhs) / n_global)
 
     def solve(mv, b):           # forward: early-stopped (dump-matching)
         return _pcg(mv, precond, b, jnp.zeros_like(b), forward_tol, maxiter,
-                    rtol_abs=rtol_fwd, reduce=reduce_fn, n_global=n_global)
+                    rtol_abs=rtol_fwd, reduce=reduce_fn, reduce_pair=reduce_pair_fn,
+                    n_global=n_global)
 
     def transpose_solve(mv, b):  # reverse cotangent: tight (accurate gradient)
         return _pcg(mv, precond, b, jnp.zeros_like(b), grad_tol, maxiter,
-                    reduce=reduce_fn, n_global=n_global)
+                    reduce=reduce_fn, reduce_pair=reduce_pair_fn, n_global=n_global)
 
     delta = jax.lax.custom_linear_solve(
         matvec, b_eff, solve, transpose_solve, symmetric=True
