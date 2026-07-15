@@ -5247,3 +5247,40 @@ Cite the C source (`file:line`) or dump probe that proves it.
   re-scoping before the GMD submission. The big deferred lever stays on-device forcing interpolation
   (`FORCING_INTERP_75PCT_NETCDF_THREAD_WALL` above): their L84/A/B evidence says host levers HOLD
   their value in the comm-bound regime, upgrading its priority.**
+
+- **[forcing / on-device JRA interpolation + the XLA-CPU divide trap]
+  (`ONDEVICE_FORCING_XLA_CPU_DIVIDE`)
+  Implemented the M7-ladder #1 lever (plan `docs/plans/20260715-fesom-jax-ondevice-forcing.md`):
+  `JRA55Reader.bracket_schedule` hands the device the few bracket coefficient fields a chunk
+  touches (`getcoeffld` fires per ROLL, ~once per 3 h per field, not per step), and
+  `surface_forcing.combine_step_forcing` evaluates `rdate·coef_a + coef_b` + the g2r wind
+  rotation + unit conversions IN-SCAN (`forcing: {on_device: true}`, default OFF ⇒ byte-identical;
+  `--forcing-on-device` on `run_from_config.py`). H2D volume shrinks ~n_steps/n_brackets-fold.
+  Lessons:
+  1. **XLA CPU's f64 divide is NOT correctly rounded** — 1 ULP off vs numpy on ~13 % of operands
+     (measured; `--xla_cpu_enable_fast_math=false` does not help, and a runtime divisor operand
+     doesn't either — it's the backend's vectorized divide itself). CUDA's `div.rn.f64` IS IEEE.
+     Consequence: any jnp-vs-NUMPY bit-fidelity contract involving a division (here prra/prsn
+     `/1000.0`) holds on GPU but is ≤1 ULP on CPU. Everything else in the combine (mul-add at
+     catastrophic-cancellation magnitudes, subtract, the whole rotation) IS bit-exact on CPU.
+     Keep divisors as RUNTIME operands anyway (`ForcingDeviceConst.prec_div`) so no backend can
+     constant-fold `x/1000` into `x·0.001` (which XLA does even on GPU-independent HLO).
+  2. **Gate structure under a platform-dependent op:** demand bitwise where the backend can
+     deliver (probe the platform divide in-test); byte-compare the scan/partition/fold WIRING
+     against a seq built FROM the device combine itself (platform-independent byte-identity);
+     bound the tables-vs-host-production path at ≤1e-9 on CPU.
+  3. The clamp-era `getcoeffld` bookkeeping invariant worth testing is "same `_getcoeffld` call
+     count as a `step()` walk", not an absolute count — prra/prsn brackets in JRA55-do v1.4.0
+     behave 3-hourly-ish over a 30 h window (10 rolls), not daily as the 12 h clamp window
+     suggested.
+  4. **XLA FMA-contracts `a*x + y` INSIDE jit** (single rounding, "excess precision") — and at the
+     time-interp's catastrophic-cancellation magnitudes (rdate ~7e5 · coef_a against coef_b) that
+     is ~1e-9 RELATIVE in the result, on 100 % of elements. Eager execution does NOT contract (so
+     an eager bit-gate passes while the in-scan values differ);
+     `--xla_allow_excess_precision=false`, `lax.optimization_barrier`, and bitcast round-trips all
+     failed to prevent it (context-dependent, unstable). Consequence: an on-device twin of host
+     numpy arithmetic can be bit-identical eagerly yet only VALUE-equivalent in-jit; a 1e-9
+     forcing seed grows to ~1e-7 rel in T over 7 KPP steps and ~3e-2 rel in mEVP stress over 12
+     all-on steps (the stiff amplifier). Gate structure: eager bit-gates for VALUES, tight
+     tolerance (+ wrong-bracket tripwire: slow ocean fields ≤1e-4 rel) for in-scan trajectories,
+     and the flag defaults OFF so the production path stays byte-identical.**

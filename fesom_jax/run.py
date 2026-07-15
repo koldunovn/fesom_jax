@@ -532,6 +532,23 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     else:
         out_sample_fn = None
 
+    # ON-DEVICE forcing interpolation (docs/plans/20260715-fesom-jax-ondevice-forcing.md),
+    # opt-in via the YAML `forcing: {on_device: true}` (default OFF ⇒ byte-identical path).
+    # Host per chunk: getcoeffld only at bracket rolls (tables) instead of per step; the
+    # rdate·coef_a+coef_b combine + wind rotation + unit conversions run in-scan on device.
+    forcing_on_device = bool((cfg.forcing or {}).get("on_device", False))
+    fdc_p = None
+    if forcing_on_device:
+        if forcing_stack is not None:
+            raise ValueError("forcing.on_device is incompatible with an injected forcing_stack")
+        if local_forcing is not None:
+            raise ValueError("forcing.on_device does not support local_forcing yet "
+                             "(the NG5 local-build path still uses the per-step stack)")
+        if forcing is None:
+            raise ValueError("forcing.on_device needs a SurfaceForcing (calendar forcing)")
+        from .surface_forcing import forcing_device_const
+        fdc_p = shard_mesh.partition_forcing_const(forcing_device_const(forcing), part)
+
     t_loop0 = time.perf_counter()
     cur_year = int(year)                     # the year the forcing reader was built for
     for ci, ch in enumerate(chunks):
@@ -556,6 +573,15 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             # identical to the global build's local shards (the non-local rows are never read).
             seq_p = local_forcing.stack_partitioned(
                 _chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), xp=np)
+        elif forcing_on_device:
+            # ON-DEVICE combine: host builds only this chunk's bracket coefficient TABLES
+            # (getcoeffld at rolls — ~n_steps× less host work + H2D than the per-step stack).
+            # nb is a (chunk length, dt) function ⇒ stable shapes ⇒ the reuse cache stays warm.
+            nb = int(ch.count * ch.dt) // 10800 + 2   # JRA 3-hourly bracket depth + pad
+            tables, sched = forcing.stack_tables(
+                _chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), nb=nb)
+            tab_p = shard_mesh.partition_forcing_tables(tables, part)
+            seq_p = None
         else:
             # HOST-build the per-chunk forcing (xp=np): a global [n_steps, nod2D] stack is
             # ~2.65 GB/field at NG5 (7.4 M × 48 steps) — building it on GPU 0 OOMs before
@@ -563,12 +589,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             seq = forcing.stack(_chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), xp=np)
             seq_p = shard_mesh.partition_step_forcing(seq, part)
         tc_host = time.perf_counter()
+        _fkw = (dict(forcing_tables=tab_p, forcing_sched=sched, forcing_const=fdc_p)
+                if (forcing_on_device and seq_p is None) else {})
         _chunk_out = run_steps_sharded_forced(
             sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
             bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
             use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
             boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
-            sample_fn=out_sample_fn, **cfg.physics_kwargs())
+            sample_fn=out_sample_fn, **_fkw, **cfg.physics_kwargs())
         # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else just the final state.
         state_p, acc_sum = _chunk_out if out_sample_fn is not None else (_chunk_out, None)
         folded_in = True                                     # the scan output is folded [P*Lmax]

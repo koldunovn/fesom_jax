@@ -1,0 +1,23 @@
+# CORE2 all-on BENCH twin of core2_full.yaml — identical physics (zstar + TKE + mEVP + GM,
+# dt=1800, JRA 1958), but ALL periodic output off and paths pointed at the perf scratch area,
+# so timing A/Bs (e.g. bench_core2_ondevice_forcing_ab.sbatch) never touch a production run
+# directory. Steps/restart-out come from the CLI (--steps / --restart-out).
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+dt: 1800.0
+mesh: data/mesh_core2
+partition: dist_4
+forcing:
+  kind: core2
+  start_year: 1958
+output_dir: /work/ab0995/a270088/port_jax/runs/perf
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+n_steps: 240

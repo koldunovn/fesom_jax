@@ -229,3 +229,118 @@ def test_forced_multistep_owned_matches(npes, core2_forced_seq):
     dense = _dense_forced(fx)
     sharded = _sharded_forced(fx, part, npes)
     _owned_match(dense, sharded, fx["mesh"], part, npes, tag="forced-kpp", fct_atol=1e-1)
+
+
+# ==========================================================================
+# 3. ON-DEVICE forcing (forcing.on_device — the bracket-table combine path)
+# ==========================================================================
+def test_fold_forcing_tables_places_nodes():
+    """Pure-host wiring gate (always runs): ``partition_forcing_tables`` +
+    ``_fold_forcing_tables`` put every node's coefficient column exactly where the
+    folded device axis expects it — device ``p``'s ``[…, p·Lmax:(p+1)·Lmax]`` slab,
+    owned+halo lanes in ``myList`` order. A transpose/moveaxis bug here would
+    silently feed one node's coefficients to another."""
+    from fesom_jax.surface_forcing import ForcingTables
+
+    nod2D, elem2D, edge2D, npes, nb, nm = 20, 30, 40, 3, 4, 2
+    part = partit.synth_block_partition(nod2D, elem2D, edge2D, npes)
+    rng = np.random.default_rng(7)
+    ft = ForcingTables(coef_a=rng.normal(size=(8, nb, nod2D)),
+                       coef_b=rng.normal(size=(8, nb, nod2D)),
+                       sss=rng.normal(size=(nm, nod2D)),
+                       chl=rng.normal(size=(nm, nod2D)))
+    ft_p = shard_mesh.partition_forcing_tables(ft, part)
+    folded, spec = ish._fold_forcing_tables(ft_p)
+    _, Lmax = shard_mesh.local_sizes(part)
+    L = Lmax["nod"]
+    for p in range(npes):
+        lst = part.myList_nod2D[p]
+        for name in ft._fields:
+            g = np.asarray(getattr(ft, name))
+            f = np.asarray(getattr(folded, name))
+            slab = f[..., p * L:(p + 1) * L][..., :len(lst)]
+            np.testing.assert_array_equal(slab, g[..., lst], err_msg=f"{name} dev {p}")
+    assert spec.coef_a == jax.sharding.PartitionSpec(None, None, "p")
+    assert spec.sss == jax.sharding.PartitionSpec(None, "p")
+
+
+def _tables_path_run(fx, part, npes, dates, mode):
+    """One run_steps_sharded_forced call on `dates` — mode: 'host-seq' (the classic
+    host-reader per-step stack) or 'tables' (the on-device bracket-table path).
+    Same partition/state/op."""
+    mesh = fx["mesh"]
+    cf = fx["cf"]
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    state_p = shard_mesh.partition_state(fx["state"], part)
+    sop = ssh.partition_ssh_operator(fx["op"], part)
+    fs_p = shard_mesh.partition_forcing_static(fx["fs"], part)
+    stress_p = jnp.zeros((npes, sm.Lmax["elem"], 2))
+    T = len(dates)
+    if mode == "host-seq":
+        seq_p = shard_mesh.partition_step_forcing(cf.stack(dates, xp=np), part)
+        return ish.run_steps_sharded_forced(sm, state_p, sop, stress_p, seq_p, fs_p, T,
+                                            dt=DT, npes=npes, kpp_cfg=KppConfig())
+    assert mode == "tables"
+    nb = int(T * DT) // 10800 + 2
+    tables, sched = cf.stack_tables(dates, nb=nb)
+    tab_p = shard_mesh.partition_forcing_tables(tables, part)
+    fdc_p = shard_mesh.partition_forcing_const(
+        surface_forcing.forcing_device_const(cf), part)
+    return ish.run_steps_sharded_forced(sm, state_p, sop, stress_p, None, fs_p, T,
+                                        dt=DT, npes=npes, kpp_cfg=KppConfig(),
+                                        forcing_tables=tab_p, forcing_sched=sched,
+                                        forcing_const=fdc_p)
+
+
+# Tolerance for the tables-vs-host-seq trajectory comparison. The in-scan combine's
+# rdate·coef_a+coef_b is FMA-CONTRACTED by XLA inside jit (single rounding, ~1e-9 rel
+# on the forcing fields at the time-interp's cancellation magnitudes — measured;
+# optimization_barrier and bitcast round-trips do NOT reliably prevent it, and eager
+# execution does not show it). So flag ON is VALUE-equivalent, not bit-identical, to
+# the host-reader seq; observed over these 7 kpp-only steps: ≤5e-9. The 1e-6 budget
+# keeps >3 decades of margin below any real wiring bug (a wrong bracket = hours of
+# wrong forcing = O(1e-2)+ in SST) while tolerating the roundoff-seed growth.
+_TABLES_ATOL = 1e-6
+
+
+@have_forcing
+def test_forcing_tables_matches_seq_serial(core2_forced_seq):
+    """``forcing.on_device`` gate at npes=1
+    (docs/plans/20260715-fesom-jax-ondevice-forcing.md): the tables path reproduces
+    the PRODUCTION host-reader seq trajectory to ≤ _TABLES_ATOL over a chunk that
+    crosses a 3-hourly bracket roll. Bit-level value correctness of the combine
+    itself (incl. rolls + clamp over 30 h) is pinned by the EAGER gates in
+    test_jra55.py; in-scan the combine is FMA-contracted (see _TABLES_ATOL), so the
+    step-level gate is a tight tolerance, not bytes."""
+    fx = core2_forced_seq
+    dates = [(YEAR, 15, i * 1800.0, 1) for i in range(7)]      # Jan 15 00:00–03:00
+    ser = partit.synth_serial(fx["mesh"].nod2D, fx["mesh"].elem2D, fx["mesh"].edge2D)
+    a = _tables_path_run(fx, ser, 1, dates, "host-seq")
+    c = _tables_path_run(fx, ser, 1, dates, "tables")
+    worst = _worst_diff(a, c)
+    assert worst < _TABLES_ATOL, f"tables vs host-seq max|Δ|={worst:.3e}"
+    print(f"FORCING_TABLES_SERIAL_OK (vs host-seq max|Δ|={worst:.2e})")
+
+
+@have_forcing
+@have_dist2
+def test_forcing_tables_matches_seq_npes2(core2_forced_seq):
+    """npes=2 (real dist_2 shards): the tables path == the host-seq path to
+    ≤ _TABLES_ATOL on the full folded output (same partition, same layout) — a node
+    scramble in partition_forcing_tables/_fold_forcing_tables would show as O(1)."""
+    npes = 2
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} fake-devices, have {NDEV}")
+    fx = core2_forced_seq
+    dates = [(YEAR, 15, i * 1800.0, 1) for i in range(7)]
+    part = partit.read_partition(CORE2_DIST, npes)
+    a = _tables_path_run(fx, part, npes, dates, "host-seq")
+    c = _tables_path_run(fx, part, npes, dates, "tables")
+    worst = 0.0
+    for fld in dataclasses.fields(State):
+        xa = np.asarray(getattr(a, fld.name))
+        xc = np.asarray(getattr(c, fld.name))
+        if xa.size:
+            worst = max(worst, float(np.max(np.abs(xa - xc))))
+    assert worst < _TABLES_ATOL, f"tables vs host-seq (npes=2) max|Δ|={worst:.3e}"
+    print(f"FORCING_TABLES_NPES2_OK (vs host-seq max|Δ|={worst:.2e}, full folded state)")

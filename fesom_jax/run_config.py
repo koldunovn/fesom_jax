@@ -92,7 +92,8 @@ _ARCHIVE_PERIODS = ("year", "month", "day")
 # files live. The four path keys are optional overrides of the env var / Levante default
 # (:mod:`fesom_jax.paths`); absent ⇒ the reader resolves them itself. Strict-keyed like every
 # other block: an unknown key raises rather than being silently ignored.
-_FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path")
+_FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path",
+                 "on_device")
 _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 
 

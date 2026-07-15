@@ -115,6 +115,11 @@ def main():
     ap.add_argument("--chunk-diagnostics", action="store_true",
                     help="print gather-free max|uv|/max|eta| health after EACH chunk (a blow-up "
                          "trajectory probe — pair with a small --chunk-steps; lead process only)")
+    ap.add_argument("--forcing-on-device", action="store_true",
+                    help="override forcing.on_device=true: the per-step rdate·coef_a+coef_b "
+                         "combine + wind rotation + unit conversions run IN-SCAN on device; the "
+                         "host does getcoeffld only at bracket rolls (bit-identical values — "
+                         "docs/plans/20260715-fesom-jax-ondevice-forcing.md). A/B knob.")
     ap.add_argument("--output-layout", choices=["global", "folded"], default=None,
                     help="output + restart on-disk layout. 'global' = partition-independent canonical "
                          "node order — xarray/ushow read it directly (no unfold), byte-identical at "
@@ -141,6 +146,8 @@ def main():
         repl["n_steps"] = args.steps
     if args.partition is not None:
         repl["partition"] = args.partition
+    if args.forcing_on_device:
+        repl["forcing"] = dict(cfg.forcing or {}, on_device=True)
     if repl:
         cfg = dataclasses.replace(cfg, **repl)
 

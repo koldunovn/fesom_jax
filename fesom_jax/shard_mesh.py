@@ -600,6 +600,40 @@ def partition_step_forcing(sf, partition: Partition):
     return StepForcing(**out)
 
 
+def partition_forcing_tables(ft, partition: Partition):
+    """Gather a :class:`~fesom_jax.surface_forcing.ForcingTables` to per-device padded
+    form: every leaf's (last) ``nod2D`` axis is sharded (``[…, nod2D]`` →
+    ``[P, …, Lmax_nod]``), the small table axes are preserved."""
+    from .surface_forcing import ForcingTables
+
+    _, Lmax = local_sizes(partition)
+    out = {}
+    for name in ft._fields:
+        arr = np.asarray(getattr(ft, name))
+        ax = _node_axis(arr.shape, partition.nod2D)
+        out[name] = _shard_along_axis(arr, partition.myList_nod2D, Lmax["nod"],
+                                      ax, _default_pad(arr.dtype))
+    return ForcingTables(**out)
+
+
+def partition_forcing_const(fc, partition: Partition):
+    """Gather a :class:`~fesom_jax.surface_forcing.ForcingDeviceConst` to per-device
+    padded form: the ``[nod2D]`` trig leaves shard to ``[P, Lmax_nod]``; the tiny
+    ``M`` rotation matrix is replicated as-is."""
+    from .surface_forcing import ForcingDeviceConst
+
+    _, Lmax = local_sizes(partition)
+    out = {}
+    for name in fc._fields:
+        arr = np.asarray(getattr(fc, name))
+        if name == "M" or arr.ndim == 0:
+            out[name] = arr                                   # [9] M / () scalars — replicated
+        else:
+            out[name] = _shard_along_axis(arr, partition.myList_nod2D, Lmax["nod"],
+                                          0, _default_pad(arr.dtype))
+    return ForcingDeviceConst(**out)
+
+
 # --------------------------------------------------------------------------
 # Export / reload  (flat .npy directory, loadable like load_mesh)
 # --------------------------------------------------------------------------

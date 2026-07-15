@@ -100,6 +100,88 @@ class StepForcing(NamedTuple):
     chl: jnp.ndarray                # chlorophyll for this step's month [mg/m³]
 
 
+class ForcingTables(NamedTuple):
+    """Per-CHUNK forcing coefficient tables for the ON-DEVICE combine
+    (``docs/plans/20260715-fesom-jax-ondevice-forcing.md``): the few bracket
+    coefficient fields a chunk touches, node axis LAST (shardable). Built by
+    :meth:`SurfaceForcing.stack_tables`; consumed with a :class:`ForcingSched` by
+    :func:`combine_step_forcing`. Replaces the ``[n_steps, nod2D]`` per-step stack
+    (H2D volume ÷ ~n_steps/n_brackets)."""
+    coef_a: jnp.ndarray             # [N_FLD, nb, nod2D] getcoeffld linear-in-time slope
+    coef_b: jnp.ndarray             # [N_FLD, nb, nod2D] getcoeffld intercept
+    sss: jnp.ndarray                # [nm, nod2D] month table: SSS restoring target [psu]
+    chl: jnp.ndarray                # [nm, nod2D] month table: chlorophyll [mg/m³]
+
+
+class ForcingSched(NamedTuple):
+    """Per-STEP schedule for :class:`ForcingTables` (tiny, replicated scan ``xs``)."""
+    rdate: jnp.ndarray              # [T] f64 — the reader's Julian step date
+    fidx: jnp.ndarray               # [T, N_FLD] i32 — per-field bracket row in the tables
+    midx: jnp.ndarray               # [T] i32 — month row in the sss/chl tables
+
+
+class ForcingDeviceConst(NamedTuple):
+    """Per-RUN device constants for :func:`combine_step_forcing`: the g2r rotation
+    trig table (mesh constants — the jra55 ROTCACHE, now device-resident) + the Euler
+    rotation matrix. Built once by :func:`forcing_device_const`; partitioned once."""
+    sgl: jnp.ndarray                # [nod2D] sin(glat)   } _g2r_trig order
+    cgl: jnp.ndarray                # [nod2D] cos(glat)
+    sgo: jnp.ndarray                # [nod2D] sin(glon)
+    cgo: jnp.ndarray                # [nod2D] cos(glon)
+    srl: jnp.ndarray                # [nod2D] sin(rlat)
+    crl: jnp.ndarray                # [nod2D] cos(rlat)
+    sro: jnp.ndarray                # [nod2D] sin(rlon)
+    cro: jnp.ndarray                # [nod2D] cos(rlon)
+    M: jnp.ndarray                  # [9] geographic→rotated Euler matrix (replicated)
+    prec_div: jnp.ndarray           # () 1000.0 — a RUNTIME operand so no backend can
+    #   strength-reduce the prec unit conversion into x·(1/1000.0) at compile time.
+    #   ⚠️ Even so, XLA *CPU*'s f64 divide is not correctly rounded (measured: 1 ULP
+    #   off vs numpy on ~13 % of operands, flags don't help) ⇒ prec_rain/prec_snow are
+    #   bit-exact vs the host reader on GPU (CUDA div.rn.f64 is IEEE) but ≤1 ULP on
+    #   CPU. The gates probe the platform divide and demand accordingly.
+
+
+def forcing_device_const(sf: "SurfaceForcing") -> ForcingDeviceConst:
+    """The :class:`ForcingDeviceConst` for this forcing's reader (host numpy — the
+    driver partitions + uploads it once)."""
+    return ForcingDeviceConst(*sf.jra._trig, M=np.asarray(sf.jra.M, dtype=np.float64),
+                              prec_div=np.float64(1000.0))
+
+
+def combine_step_forcing(tables: ForcingTables, rdate, fidx, midx,
+                         const: ForcingDeviceConst) -> StepForcing:
+    """ONE step's :class:`StepForcing` from the chunk tables — the device-side twin of
+    :meth:`SurfaceForcing.step_forcing`, run INSIDE the scan (all elementwise; fuses
+    into the step). Same expression order as the host reader
+    (:meth:`fesom_jax.jra55.JRA55Reader.step`) on bit-identical inputs (the table rows
+    are ``_getcoeffld``'s own outputs — the host ``_gather`` is untouched); executed
+    EAGERLY this is bit-identical to the host (gated, ``test_jra55``). ⚠️ INSIDE jit,
+    XLA FMA-contracts ``rdate·coef_a + coef_b`` (single rounding; ~1e-9 rel at the
+    time-interp's cancellation magnitudes — measured on CPU; barriers/bitcasts don't
+    reliably prevent it) ⇒ the in-scan path is VALUE-equivalent, not bit-identical, to
+    the host reader. ``forcing.on_device`` therefore defaults OFF, and the step-level
+    gates budget the roundoff-seed growth (`_TABLES_ATOL` in test_forcing_sharded)."""
+    def val(fi):
+        return rdate * tables.coef_a[fi][fidx[fi]] + tables.coef_b[fi][fidx[fi]]
+
+    u = val(jra55.I_XWIND)
+    v = val(jra55.I_YWIND)
+    if jra55.FORCE_ROTATION:
+        trig = (const.sgl, const.cgl, const.sgo, const.cgo,
+                const.srl, const.crl, const.sro, const.cro)
+        u, v = jra55._vector_g2r(u, v, None, None, None, None, const.M, trig=trig)
+    return StepForcing(
+        u_air=u, v_air=v,
+        shum=val(jra55.I_HUMI),
+        shortwave=val(jra55.I_QSR),
+        longwave=val(jra55.I_QLW),
+        Tair=val(jra55.I_TAIR) - 273.15,
+        prec_rain=val(jra55.I_PREC) / const.prec_div,
+        prec_snow=val(jra55.I_SNOW) / const.prec_div,
+        Ssurf_month=tables.sss[midx],
+        chl=tables.chl[midx])
+
+
 class SurfaceFluxes(NamedTuple):
     """Output of :func:`compute_surface_fluxes`. The step consumes ``stress_surf``
     (momentum) and ``bc_T``/``bc_S``/``sw_3d`` (tracer diffusion); the rest are
@@ -248,6 +330,42 @@ class SurfaceForcing:
         steps = [self.step_forcing(*d, xp=xp) for d in dates]
         return StepForcing(*[xp.stack(leaves, axis=0)
                              for leaves in zip(*steps)])
+
+    def stack_tables(self, dates, *, nb: int, nm: int = 2
+                     ) -> "tuple[ForcingTables, ForcingSched]":
+        """The on-device-forcing twin of :meth:`stack`: per-chunk coefficient TABLES +
+        per-step schedule instead of an ``[n_steps, nod2D]`` stack. Host numpy, pure
+        host op (the tables are partitioned/uploaded by the driver);
+        :func:`combine_step_forcing` turns row ``i`` back into :meth:`step_forcing`'s
+        :class:`StepForcing` bit-exactly (same coefficient fields, same op order).
+
+        ``nb``/``nm`` are the STATIC table depths (JRA brackets / months); fixed per
+        (chunk length, dt) so the compiled chunk executable is reusable. A chunk is a
+        few days ⇒ ``nm=2`` covers any single month roll (asserted)."""
+        dates = list(dates)
+        coef_a, coef_b, rdates, fidx = self.jra.bracket_schedule(dates, nb)
+        N = coef_a.shape[-1]
+        months: list[int] = []
+        midx = np.empty(len(dates), dtype=np.int32)
+        for i, d in enumerate(dates):
+            mo = int(d[3])
+            if not months or months[-1] != mo:
+                if mo in months:
+                    raise ValueError(f"non-monotonic month sequence in chunk dates ({months + [mo]})")
+                months.append(mo)
+            midx[i] = len(months) - 1
+        if len(months) > nm:
+            raise ValueError(f"chunk crosses {len(months) - 1} month boundaries but nm={nm}")
+        # dtype mirrors step_forcing's (no cast) so the ON/OFF paths agree byte-for-byte
+        sss_rows = [np.asarray(self.sss.month(mo)) for mo in months]
+        chl_rows = [np.asarray(self.chl_clim[mo - 1]) for mo in months]
+        sss_tab = np.zeros((nm, N), dtype=sss_rows[0].dtype)
+        chl_tab = np.zeros((nm, N), dtype=chl_rows[0].dtype)
+        for j in range(len(months)):
+            sss_tab[j] = sss_rows[j]
+            chl_tab[j] = chl_rows[j]
+        return (ForcingTables(coef_a=coef_a, coef_b=coef_b, sss=sss_tab, chl=chl_tab),
+                ForcingSched(rdate=rdates, fidx=fidx, midx=midx))
 
     def reopen_year(self, year: int):
         """Roll the JRA reader to ``year`` IN PLACE (keeps the year-independent interpolation

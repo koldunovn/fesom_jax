@@ -202,3 +202,113 @@ def test_wind_rotation_is_active(jra):
     # and the integrated field is physical.
     spd = np.hypot(np.asarray(jra["inr"].u_wind), np.asarray(jra["inr"].v_wind))
     assert np.isfinite(spd).all() and 1.0 < spd.max() < 60.0
+
+
+def test_bracket_schedule_matches_step(jra):
+    """``bracket_schedule`` (the on-device-forcing host seam): the per-chunk tables +
+    schedule reproduce ``step()`` BIT-for-bit over a window with the year-start clamp,
+    several 3-hourly rolls and the daily prra/prsn bracket — and ``_getcoeffld`` fires
+    per BRACKET (~once per roll), not per step."""
+    import collections
+    from fesom_jax import jra55
+
+    T = 60                                    # 30 h of dt=1800 from Jan 1 00:00
+    dates = [(YEAR, 1 + int(i * 1800.0 // 86400), (i * 1800.0) % 86400.0, 1)
+             for i in range(T)]
+
+    r_ref = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+    calls_ref = collections.Counter()
+    orig_ref = r_ref._getcoeffld
+    r_ref._getcoeffld = lambda f, rdate: (calls_ref.update([f.var]), orig_ref(f, rdate))[1]
+    ref = [r_ref.step(y, d, s) for (y, d, s, _m) in dates]
+    r_ref.close()
+
+    r = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+    calls = collections.Counter()
+    orig = r._getcoeffld
+    r._getcoeffld = lambda f, rdate: (calls.update([f.var]), orig(f, rdate))[1]
+    nb = int(T * 1800) // 10800 + 2
+    ca, cb, rdates, fidx = r.bracket_schedule(dates, nb)
+    assert ca.shape == (jra55.N_FLD, nb, r.N) and fidx.shape == (T, jra55.N_FLD)
+    # bracket economy: EXACTLY the step()-walk's _getcoeffld count (one per bracket),
+    # and every field fits the driver's nb formula
+    assert calls == calls_ref, f"schedule {dict(calls)} != step walk {dict(calls_ref)}"
+    assert all(c <= nb for c in calls.values()), f"nb formula too small: {calls}"
+
+    trig = r._trig
+    for i in range(T):
+        vals = [rdates[i] * ca[f, fidx[i, f]] + cb[f, fidx[i, f]]
+                for f in range(jra55.N_FLD)]
+        u, v = vals[jra55.I_XWIND], vals[jra55.I_YWIND]
+        if jra55.FORCE_ROTATION:
+            u, v = jra55._vector_g2r(u, v, None, None, None, None, r.M, trig=trig)
+        got = dict(u_wind=u, v_wind=v, shum=vals[jra55.I_HUMI],
+                   shortwave=vals[jra55.I_QSR], longwave=vals[jra55.I_QLW],
+                   Tair=vals[jra55.I_TAIR] - 273.15,
+                   prec_rain=vals[jra55.I_PREC] / 1000.0,
+                   prec_snow=vals[jra55.I_SNOW] / 1000.0)
+        for name in FIELDS:
+            np.testing.assert_array_equal(
+                got[name], np.asarray(getattr(ref[i], name)),
+                err_msg=f"step {i} field {name}")
+    r.close()
+    print("BRACKET_SCHEDULE_OK (bit-identical to step(), getcoeffld per bracket)")
+
+
+def test_combine_device_matches_host_bit(jra):
+    """``surface_forcing.combine_step_forcing`` (the in-scan device combine, run here
+    on the test backend) reproduces the host reader's fields BIT-for-bit from the same
+    tables — the op-order contract of the on-device forcing plan. Also pins the
+    month-table selection (Ssurf/chl) against ``step_forcing``'s."""
+    import jax
+    import jax.numpy as jnp
+    from fesom_jax import jra55
+    from fesom_jax.surface_forcing import (ForcingTables, ForcingDeviceConst,
+                                           combine_step_forcing)
+
+    assert jax.config.jax_enable_x64, "combine gate needs x64"
+    T = 12                                    # 6 h of dt=1800 from day 100 noon (interior)
+    dates = [(YEAR, INTERIOR_DAY, INTERIOR_SEC + i * 1800.0, 4) for i in range(T)]
+
+    r = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+    ref = [r.step(y, d, s) for (y, d, s, _m) in dates]
+
+    r2 = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+    nb = int(T * 1800) // 10800 + 2
+    ca, cb, rdates, fidx = r2.bracket_schedule(dates, nb)
+    N = r2.N
+    rng = np.random.default_rng(3)
+    sss_tab = rng.normal(size=(2, N))
+    chl_tab = rng.normal(size=(2, N))
+    tables = ForcingTables(coef_a=jnp.asarray(ca), coef_b=jnp.asarray(cb),
+                           sss=jnp.asarray(sss_tab), chl=jnp.asarray(chl_tab))
+    const = ForcingDeviceConst(*[jnp.asarray(t) for t in r2._trig],
+                               M=jnp.asarray(r2.M),
+                               prec_div=jnp.asarray(np.float64(1000.0)))
+    # Platform-divide probe: XLA CPU's f64 divide is NOT correctly rounded (1 ULP off
+    # vs numpy on ~13 % of operands, measured; flags don't help), while CUDA's
+    # div.rn.f64 is IEEE. Demand bit-exactness for prec_rain/prec_snow exactly where
+    # the backend can deliver it, ≤1 ULP otherwise.
+    probe = np.linspace(1e-9, 5e-6, 4096)
+    div_ieee = bool(np.array_equal(
+        np.asarray(jnp.asarray(probe) / jnp.asarray(np.float64(1000.0))),
+        probe / 1000.0))
+
+    sf_names = {"u_wind": "u_air", "v_wind": "v_air"}
+    for i in range(T):
+        sf = combine_step_forcing(tables, jnp.asarray(rdates[i]),
+                                  jnp.asarray(fidx[i]), jnp.asarray(np.int32(i % 2)),
+                                  const)
+        for name in FIELDS:
+            got = np.asarray(getattr(sf, sf_names.get(name, name)))
+            want = np.asarray(getattr(ref[i], name))
+            if name in ("prec_rain", "prec_snow") and not div_ieee:
+                np.testing.assert_allclose(got, want, rtol=2.3e-16, atol=0.0,
+                                           err_msg=f"step {i} field {name} (>1 ULP)")
+            else:
+                np.testing.assert_array_equal(got, want,
+                                              err_msg=f"step {i} field {name}")
+        np.testing.assert_array_equal(np.asarray(sf.Ssurf_month), sss_tab[i % 2])
+        np.testing.assert_array_equal(np.asarray(sf.chl), chl_tab[i % 2])
+    r.close(); r2.close()
+    print(f"COMBINE_DEVICE_OK (bit-identical; prec {'bit' if div_ieee else '<=1 ULP, non-IEEE platform divide'})")

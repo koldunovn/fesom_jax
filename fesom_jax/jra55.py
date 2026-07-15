@@ -514,6 +514,27 @@ class JRA55Reader:
         f.t_indx = t_indx
         f.t_indx_p1 = t_indx_p1
 
+    def _needs_refresh(self, f: _Field, rdate: float) -> bool:
+        """Whether ``f``'s cached bracket does not cover ``rdate`` (⇒ ``_getcoeffld``).
+
+        A clamped bracket (t_indx == t_indx_p1 ⇒ coef_a = 0, coef = d1) is
+        valid on its whole open side, so extend it to ±inf. The C's test
+        (lo == hi) never released the clamp, re-running _getcoeffld — a
+        netCDF read + gather per field — EVERY step while rdate sat before
+        the first record (first 1.5 h of a run, 12 h for prra/prsn) or past
+        the last one (same windows at every year end). Same values either
+        way; port_kokkos fixed it identically (7f64be1)."""
+        if f.t_indx <= 0:
+            return True
+        lo = f.nc_time[f.t_indx - 1]
+        hi = f.nc_time[f.t_indx_p1 - 1]
+        if f.t_indx_p1 == f.t_indx:
+            if f.t_indx == 1:
+                lo = -math.inf
+            if f.t_indx == f.Ntime:
+                hi = math.inf
+        return rdate < lo or rdate > hi
+
     # ---- per-step update (fesom_jra55_step) ----------------------------
     def step(self, year: int, day: int, sec: float) -> JRAFields:
         """``fesom_jra55_step`` (``:638``): refresh per-field coefficients as needed,
@@ -524,24 +545,7 @@ class JRA55Reader:
 
         vals = []
         for f in self.fields:
-            need = (f.t_indx <= 0)
-            if not need:
-                lo = f.nc_time[f.t_indx - 1]
-                hi = f.nc_time[f.t_indx_p1 - 1]
-                # A clamped bracket (t_indx == t_indx_p1 ⇒ coef_a = 0, coef = d1) is
-                # valid on its whole open side, so extend it to ±inf. The C's test
-                # (lo == hi) never released the clamp, re-running _getcoeffld — a
-                # netCDF read + gather per field — EVERY step while rdate sat before
-                # the first record (first 1.5 h of a run, 12 h for prra/prsn) or past
-                # the last one (same windows at every year end). Same values either
-                # way; port_kokkos fixed it identically (7f64be1).
-                if f.t_indx_p1 == f.t_indx:
-                    if f.t_indx == 1:
-                        lo = -math.inf
-                    if f.t_indx == f.Ntime:
-                        hi = math.inf
-                need = (rdate < lo or rdate > hi)
-            if need:
+            if self._needs_refresh(f, rdate):
                 self._getcoeffld(f, rdate)
             vals.append(rdate * f.coef_a + f.coef_b)
 
@@ -560,6 +564,62 @@ class JRA55Reader:
             prec_rain=vals[I_PREC] / 1000.0,
             prec_snow=vals[I_SNOW] / 1000.0,
         )
+
+    # ---- per-chunk bracket schedule (the on-device forcing seam) --------
+    def bracket_schedule(self, dates, nb: int):
+        """Per-chunk coefficient TABLES + per-step schedule for the on-device combine
+        (``docs/plans/20260715-fesom-jax-ondevice-forcing.md``): instead of evaluating
+        ``rdate·coef_a + coef_b`` on host every step, hand the device the (few) bracket
+        coefficient fields this chunk touches and let the scan combine them.
+
+        ``dates`` is the chunk's ``(year, day, sec[, month])`` sequence IN STEP ORDER
+        (the same tuples :meth:`step` would get); ``nb`` is the STATIC bracket-table
+        depth (pad target — fixed per (chunk length, dt) so the compiled executable is
+        reusable across chunks). Returns ``(coef_a, coef_b, rdates, fidx)`` with
+        ``coef_a``/``coef_b`` ``[N_FLD, nb, nod2D]`` float64, ``rdates [T]`` float64 and
+        ``fidx [T, N_FLD]`` int32, satisfying BIT-exactly (same values, same op order)
+
+            rdates[i]·coef_a[f, fidx[i, f]] + coef_b[f, fidx[i, f]]
+                == the raw ``vals[f]`` of ``step(*dates[i])``
+
+        because the table rows ARE ``_getcoeffld``'s outputs — the host ``_gather`` is
+        untouched (bit-exactness note above) and only fires at bracket rolls (~once per
+        3 h / day per field) instead of per step. Unused pad rows stay zero and are
+        never indexed. Uses/advances the same per-field bracket cache as :meth:`step`
+        (afterwards the cache holds the chunk's LAST bracket — exactly as if
+        :meth:`step` had walked the chunk)."""
+        dates = list(dates)
+        T = len(dates)
+        cal0 = self.fields[0].calendar
+        rdates = np.empty(T, dtype=np.float64)
+        for i, d in enumerate(dates):
+            year, day, sec = d[0], d[1], d[2]
+            # the exact step() expression (same op order ⇒ same f64 value)
+            rdates[i] = float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
+
+        coef_a = np.zeros((N_FLD, nb, self.N), dtype=np.float64)
+        coef_b = np.zeros((N_FLD, nb, self.N), dtype=np.float64)
+        fidx = np.empty((T, N_FLD), dtype=np.int32)
+        for fi, f in enumerate(self.fields):
+            nb_used = 0
+            cur_key = None
+            for i in range(T):
+                rdate = float(rdates[i])
+                if self._needs_refresh(f, rdate):
+                    self._getcoeffld(f, rdate)
+                key = (f.t_indx, f.t_indx_p1)
+                if key != cur_key:
+                    if nb_used >= nb:
+                        raise ValueError(
+                            f"JRA55 bracket table overflow for '{f.var}': chunk of {T} "
+                            f"steps touches more than nb={nb} brackets — raise nb "
+                            f"(driver formula: chunk_seconds//10800 + 2).")
+                    coef_a[fi, nb_used] = f.coef_a
+                    coef_b[fi, nb_used] = f.coef_b
+                    cur_key = key
+                    nb_used += 1
+                fidx[i, fi] = nb_used - 1
+        return coef_a, coef_b, rdates, fidx
 
     def close(self):
         for f in self.fields:

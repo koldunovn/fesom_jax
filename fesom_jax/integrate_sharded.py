@@ -187,6 +187,37 @@ def _fold_forcing_seq(sf_seq):
     return type(sf_seq)(**data), type(sf_seq)(**spec)
 
 
+def _fold_forcing_tables(ft):
+    """Fold a partitioned :class:`~fesom_jax.surface_forcing.ForcingTables`
+    (``[P, …, Lmax_nod]`` leaves from :func:`shard_mesh.partition_forcing_tables`) to
+    ``shard_map`` inputs: ``[…, P*Lmax_nod]`` + a ``PartitionSpec(None…, 'p')`` per
+    leaf (table axes replicated, the folded node axis sharded). The tables are a
+    per-chunk device CONSTANT (not scan ``xs``) — the schedule indexes into them."""
+    data, spec = {}, {}
+    for name in ft._fields:
+        arr = np.asarray(getattr(ft, name))                # [P, …, Lmax]
+        P, L = arr.shape[0], arr.shape[-1]
+        mid = arr.shape[1:-1]                               # the small table axes
+        moved = np.moveaxis(arr, 0, -2)                     # […, P, Lmax]
+        data[name] = moved.reshape(mid + (P * L,))          # […, P*Lmax]
+        spec[name] = PartitionSpec(*([None] * len(mid)), "p")
+    return type(ft)(**data), type(ft)(**spec)
+
+
+def _fold_forcing_const(fc):
+    """Fold a partitioned :class:`~fesom_jax.surface_forcing.ForcingDeviceConst`
+    (``[P, Lmax_nod]`` trig leaves + the replicated ``[9]`` ``M``) to ``shard_map``
+    inputs, mirroring :func:`_fold_forcing`."""
+    data, spec = {}, {}
+    for name in fc._fields:
+        arr = getattr(fc, name)
+        if name == "M" or np.ndim(arr) == 0:
+            data[name], spec[name] = np.asarray(arr), _R    # [9] M / () scalars — replicated
+        else:
+            data[name], spec[name] = _fold(arr), _P         # [P, Lmax] → [P*Lmax]
+    return type(fc)(**data), type(fc)(**spec)
+
+
 def folded_operator(sop: ShardedSSHOperator) -> tuple[SSHOperator, SSHOperator]:
     """Fold the per-device :class:`ShardedSSHOperator` to a ``shard_map`` input
     :class:`SSHOperator` (``[P*nnz_max]`` rows/cols/vals, ``[P*Lmax_nod]`` diag,
@@ -603,7 +634,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              use_padded: bool = False, use_coloured: bool = False,
                              bootstrap_ab2: bool = True, state_is_folded: bool = False,
                              return_folded: bool = False, return_executable: bool = False,
-                             reuse_executable: bool = False, sample_fn=None):
+                             reuse_executable: bool = False, sample_fn=None,
+                             forcing_tables=None, forcing_sched=None, forcing_const=None):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     Like :func:`run_steps_sharded` but the surface forcing **changes every step** — the real
@@ -651,11 +683,31 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
 
     if forcing_static is None:
         raise ValueError("run_steps_sharded_forced needs forcing_static (the CORE2 forced path)")
-    seq_folded, seq_spec = _fold_forcing_seq(step_forcing_seq)
-    # leaf 0's leading dim is n_steps — every forcing field must be stacked to n_steps.
-    T = int(np.asarray(getattr(seq_folded, seq_folded._fields[0])).shape[0])
-    if T != n_steps:
-        raise ValueError(f"step_forcing_seq has {T} steps but n_steps={n_steps}")
+    # Two mutually exclusive per-step forcing mechanisms:
+    #  * step_forcing_seq — the [n_steps, nod2D]-stacked host build (scan xs = the fields);
+    #  * forcing_tables + forcing_sched + forcing_const — the ON-DEVICE combine
+    #    (docs/plans/20260715-fesom-jax-ondevice-forcing.md): the tables are a per-chunk
+    #    node-sharded CONSTANT, the scan xs is the tiny replicated schedule, and
+    #    surface_forcing.combine_step_forcing builds each step's StepForcing in-scan.
+    use_tables = forcing_tables is not None
+    if use_tables:
+        if step_forcing_seq is not None:
+            raise ValueError("pass either step_forcing_seq or forcing_tables, not both")
+        if forcing_sched is None or forcing_const is None:
+            raise ValueError("forcing_tables needs forcing_sched and forcing_const")
+        seq_folded = jax.tree.map(np.asarray, forcing_sched)      # tiny [T,…] host leaves
+        seq_spec = jax.tree.map(lambda _: _R, seq_folded)         # replicated scan xs
+        tab_folded, tab_spec = _fold_forcing_tables(forcing_tables)
+        con_folded, con_spec = _fold_forcing_const(forcing_const)
+        T = int(seq_folded.rdate.shape[0])
+        if T != n_steps:
+            raise ValueError(f"forcing_sched has {T} steps but n_steps={n_steps}")
+    else:
+        seq_folded, seq_spec = _fold_forcing_seq(step_forcing_seq)
+        # leaf 0's leading dim is n_steps — every forcing field must be stacked to n_steps.
+        T = int(np.asarray(getattr(seq_folded, seq_folded._fields[0])).shape[0])
+        if T != n_steps:
+            raise ValueError(f"step_forcing_seq has {T} steps but n_steps={n_steps}")
 
     # forcing_static (device-constant) + the optional global boundary_node, as in run_steps_sharded.
     fsf, fsf_spec = _fold_forcing(forcing_static)
@@ -663,6 +715,9 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     have_bn = boundary_node_p is not None
     if have_bn:
         extras.append(_fold(boundary_node_p)); extras_spec.append(_P)
+    if use_tables:
+        extras.extend([tab_folded, con_folded])
+        extras_spec.extend([tab_spec, con_spec])
     extras, extras_spec = tuple(extras), tuple(extras_spec)
 
     def body(m, s, o, stress, h, seq, *ex):
@@ -670,8 +725,15 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              use_coloured, col_meta)
         fs_ = ex[0]
         bn_ = ex[1] if have_bn else None
+        if use_tables:
+            from .surface_forcing import combine_step_forcing
+            tab_ = ex[1 + have_bn]
+            con_ = ex[2 + have_bn]
 
         def one(carry, is_first, sf_step):
+            if use_tables:  # sf_step is a ForcingSched slice — combine in-scan (elementwise)
+                sf_step = combine_step_forcing(tab_, sf_step.rdate, sf_step.fidx,
+                                               sf_step.midx, con_)
             return stepmod.step(carry, m, o, stress, params, dt=dt, is_first_step=is_first,
                                 step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
@@ -726,7 +788,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     # rebuilt every call and fed to it ⇒ bit-identical to a fresh compile (asserted on GPU).
     if reuse_executable:
         key = (id(sm), id(sop), id(params), int(n_steps), float(dt), bool(bootstrap_ab2),
-               bool(state_is_folded), bool(use_ragged), bool(use_padded), int(npes), bool(have_bn),
+               bool(state_is_folded), bool(use_ragged), bool(use_padded), bool(use_coloured),
+               int(npes), bool(have_bn), bool(use_tables),
                id(ice_cfg), id(gm_cfg), id(kpp_cfg), id(tke_cfg),
                id(ale_cfg), id(visc_cfg), id(tracer_cfg), id(sample_fn))
         jfn = _FORCED_JIT_CACHE.get(key)
