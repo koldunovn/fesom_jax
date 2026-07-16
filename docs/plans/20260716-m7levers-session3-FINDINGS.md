@@ -196,3 +196,25 @@ window); all ratios stay within-protocol.
   to be archived when the new one lands (avoid cross-protocol best-row mixing).
 - CPU campaign macros left on the old logs DELIBERATELY (self-contained accessibility story,
   pre-fusion protocol noted; re-measuring the CPU campaign is out of scope).
+
+## 9. FINAL macro re-measures + SESSION CLOSE (evening)
+
+- **Decomp (26311383, 150-step, all finite):** oce 54.96 → `coreMsOce`=55; ice +14.8 → 15;
+  kpp+gm +15.0 → 15 (was 58/18/15 under the old protocol).
+- **Prod physics (26311413, 150-step, all finite; padded 87.9 / ragged 89.8 / allgather
+  85.5 ms):** `coreStepProd` 0.094→0.085, `coreSYPDProd` 52→58 — allgather is the best
+  transport at CORE2-4 prod physics. Old prod log archived; every quoted macro is now
+  single-protocol.
+- paper_jax commits this session: 57a71d4 (policy), f764162 (re-measure pass), 69d8d10
+  (decomp/prod macros). PDF builds clean; only the retired 128-GPU macros are "--".
+- **Task #4 (paper re-measure) COMPLETE** except the Kokkos-comparison refresh, which is
+  BLOCKED on the Kokkos session's post-M7 ledger (in-text TODO at the §5 comparison
+  sentence; their curves are m524-vintage).
+
+### Open user decisions at session close
+1. Push main (local 293293a, 9 ahead) + merge this branch (forcing levers certified,
+   CGPOLY gated; both opt-in, OFF = byte-identical).
+2. Kokkos comparison data for fig10 (core2@4/8N GPU, CPU anchors, 32N; post-M7 NG5) —
+   theirs to produce.
+3. Gate-0 leftovers for the levers-ON figure plan: EVPWIDE profile? cheb tuning? (defaults:
+   skip / optional) — then the combined 1-yr cert (docs/plans/20260716-levers-on-scaling-figure.md).
