@@ -121,6 +121,9 @@ Monotone strong scaling (4→8 doubling efficiency 76 %, 8→16 62 %).
 the bench harness (compile ~72 s) — that failure mode is a run_from_config-chain property, not
 a forca20-32 property.
 
+**ng5-32 (26301829, both rows bench-finite CLEAN, max_uv=1.989, reps 0.03 %):**
+coloured, per_step 876.93 / 877.18 ms (peak_gpu 41.3 GiB).
+
 **⇒ CORE2 now SCALES 4→8 GPU (78.1→68.4) instead of anti-scaling** — the padded+fusions
 stack inverted the paper's "small mesh anti-scales past one node" §5 story (the 0714 handoff's
 predicted upgrade: "saturates rather than degrades"). Paper-pass consequences: (a)
