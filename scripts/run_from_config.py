@@ -120,6 +120,10 @@ def main():
                          "combine + wind rotation + unit conversions run IN-SCAN on device; the "
                          "host does getcoeffld only at bracket rolls (bit-identical values — "
                          "docs/plans/20260715-fesom-jax-ondevice-forcing.md). A/B knob.")
+    ap.add_argument("--cheb-degree", type=int, default=None,
+                    help="override ssh.cheb_degree=N: the degree-N Chebyshev CG preconditioner "
+                         "(CGPOLY — 3x fewer solver iterations at equal tolerance; "
+                         "solver-tolerance-equivalent, NOT bit-identical). A/B + cert knob.")
     ap.add_argument("--output-layout", choices=["global", "folded"], default=None,
                     help="output + restart on-disk layout. 'global' = partition-independent canonical "
                          "node order — xarray/ushow read it directly (no unfold), byte-identical at "
@@ -148,6 +152,8 @@ def main():
         repl["partition"] = args.partition
     if args.forcing_on_device:
         repl["forcing"] = dict(cfg.forcing or {}, on_device=True)
+    if args.cheb_degree is not None:
+        repl["ssh"] = dict(cfg.ssh or {}, cheb_degree=int(args.cheb_degree))
     if repl:
         cfg = dataclasses.replace(cfg, **repl)
 

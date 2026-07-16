@@ -146,8 +146,9 @@ def main():
     # line format is untouched (the paper reducer regex); the extra line marks the leg.
     _cheb = int(os.environ.get("FESOM_CG_CHEB", "0") or 0)
     if _cheb:
-        op = ssh.enable_cheb_precond(op, _cheb)
-        print(f"[bench-cheb] CGPOLY ON: degree={_cheb} "
+        _kappa = float(os.environ.get("FESOM_CG_CHEB_KAPPA", "30") or 30)
+        op = ssh.enable_cheb_precond(op, _cheb, kappa_guess=_kappa)
+        print(f"[bench-cheb] CGPOLY ON: degree={_cheb} kappa={_kappa:g} "
               f"lam=[{op.cheb[1]:.4g}, {op.cheb[2]:.4g}]", flush=True)
     if args.npes == 1:
         # single-device baseline (1 GPU / 1 CPU node): the identity partition, zero halo —
