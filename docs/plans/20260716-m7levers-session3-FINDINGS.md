@@ -100,6 +100,16 @@ assumed — ladder #4 CLOSED.
 | 4 | padded | 78.30 / 77.99 |
 | 8 | padded | **68.20 / 68.54** |
 
+**farc (26301826, all 6 rows bench-finite CLEAN, max_uv=2.793 every row, reps ≤1 %):**
+
+| ngpu | transport | per_step rep1/rep2 (ms) |
+|---|---|---|
+| 4 | padded | 310.86 / 311.51 |
+| 8 | padded | 205.18 / 205.73 |
+| 16 | padded | 163.71 / 165.41 |
+
+Monotone strong scaling (4→8 doubling efficiency 76 %, 8→16 62 %).
+
 **⇒ CORE2 now SCALES 4→8 GPU (78.1→68.4) instead of anti-scaling** — the padded+fusions
 stack inverted the paper's "small mesh anti-scales past one node" §5 story (the 0714 handoff's
 predicted upgrade: "saturates rather than degrades"). Paper-pass consequences: (a)
