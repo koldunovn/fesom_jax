@@ -99,6 +99,11 @@ worktree leg look green (rc=0, "1 skipped"); `data/` is now symlinked into both 
   in the comm-bound/small-shard regime — the same "cost structure ≠ ranking" lesson as
   the halo transports. For the paper: quote the fusions as a small-shard/latency-regime
   win; the NG5-64 (more nodes, coloured transport) point remains unmeasured.
+- **dars-32 dt=120 confirmation (26299153, bench-finite CLEAN all 4 legs, max_uv=5.752
+  both legs): main 332.78/333.05 vs branch 332.93/333.07 ms/step — WASH again (+0.05 %).**
+  Confirms the dt=60 result at the near-production dt (user: dars usually recovers at
+  dt=120): the fusion saving is invisible at 99k nodes/GPU regardless of dt. dars fusion
+  A/B question is CLOSED — quote the dt=60/dt=120 pair as the compute-dominated anchor.
 - **FINDING (extends §3): XLA FMA-contracts `rdate·coef_a+coef_b` INSIDE jit** — ~1e-9 rel on
   the forcing fields (100 % of elements; eager does NOT contract, so eager bit-gates pass while
   in-scan values differ). `--xla_allow_excess_precision=false`, `optimization_barrier`, bitcast
