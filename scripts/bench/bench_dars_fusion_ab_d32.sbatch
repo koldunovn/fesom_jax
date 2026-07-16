@@ -3,6 +3,13 @@
 # SAME allocation, interleaved x2. The comm-matters companion to
 # bench_core2_fusion_ab_d8.sbatch — see that script's header for the full design
 # (device-only timing, PYTHONPATH leg isolation, padded both legs, mEVP ON).
+#
+# dt=60, NOT 180 (learned from job 26274791): at dt=180 the dars cold start blows up
+# INSIDE the 25-step window (bench-finite: 118M non-finite T, both legs) — with a NaN
+# state the SSH CG collapses, removing exactly the psum traffic the fusion targets, and
+# the A/B read a meaningless 0.0% tie. dt=60 is the known-stable dars bench regime
+# (configs/dars_kpp_evp_dt60.yaml); the ice exchange fusion is dt-independent (fixed 120
+# subcycles/step), the CG share is somewhat smaller at dt=60 — note it when quoting.
 #SBATCH --job-name=jax_fusion_ab_dars
 #SBATCH -A ab0995_gpu
 #SBATCH -p gpu
@@ -24,7 +31,7 @@ BRANCH_TREE=/home/a/a270088/port_jax
 MAIN_TREE=/home/a/a270088/port_jax_main_ab
 M=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
 C="--name dars --mesh-dir $M --dist-dir $POOL/dars \
-   --npes 32 --steps 25 --warmup 5 --dt 180 --full 1 --mevp 1 \
+   --npes 32 --steps 25 --warmup 5 --dt 60 --full 1 --mevp 1 \
    --ic-dir $M --year 1958 --halo padded"
 echo "=== $(date) nodes=$SLURM_JOB_NODELIST  dars-32 fusion A/B ==="
 echo "main   = $(git -C $MAIN_TREE rev-parse --short HEAD)  ($MAIN_TREE)"
