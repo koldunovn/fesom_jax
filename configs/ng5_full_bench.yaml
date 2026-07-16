@@ -1,0 +1,24 @@
+# NG5 all-on BENCH twin of ng5.yaml (zstar + KPP + mEVP, GM off — eddies resolved at ~5 km;
+# JRA 1958) for the all-levers-ON production-loop envelope. ALL periodic output OFF — the
+# production config snapshots into its run directory; this twin exists so a bench can never
+# touch it. Steps/partition via CLI; NG5 legs also pass --local-forcing (bit-identical
+# host-side lever, part of BOTH A/B legs).
+ale: {}
+gm: null
+kpp: {}
+tke: null
+ice: {}
+visc: {gamma1: 0.2}
+tracer: {}
+dt: 180.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_ng5
+partition: dist_64
+forcing:
+  kind: core2
+  start_year: 1958
+output_dir: /work/ab0995/a270088/port_jax/runs/perf
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+n_steps: 240

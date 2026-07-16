@@ -1,0 +1,22 @@
+# FORCA20 all-on BENCH twin of forca20_tke_mevp_prod.yaml (zstar + TKE + mEVP, GM off,
+# JRA 1958) for the all-levers-ON production-loop envelope. dt=180 (the cold-start year-1
+# production dt; NO ramp — a 240-step bench never reaches it). ALL periodic output OFF —
+# the prod config's restart_out points into a production run directory; this twin exists
+# so a bench can never touch it. Steps/partition via CLI.
+ale: {}
+gm: null
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+dt: 180.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20
+partition: dist_32
+forcing: {kind: core2, start_year: 1958}
+output_dir: /work/ab0995/a270088/port_jax/runs/perf
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+n_steps: 240

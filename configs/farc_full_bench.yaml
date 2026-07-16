@@ -1,0 +1,19 @@
+# farc all-on BENCH twin of farc_tke_mevp.yaml (zstar + TKE + mEVP, GM off, JRA 1958) for
+# the all-levers-ON production-loop envelope. ALL periodic output OFF; steps/partition via CLI.
+ale: {}
+gm: null
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+dt: 900.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_farc
+partition: dist_4
+forcing: {kind: core2, start_year: 1958}
+output_dir: /work/ab0995/a270088/port_jax/runs/perf
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+n_steps: 240

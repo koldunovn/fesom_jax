@@ -1,0 +1,24 @@
+# dars all-on BENCH twin of dars_tke_mevp.yaml (zstar + TKE + mEVP, GM off, JRA 1958) for
+# the all-levers-ON production-loop envelope (docs/plans/20260716-levers-on-scaling-figure.md).
+# dt=120, NO ramp: the dars cold start blows up at dt=180 within ~200 steps (dist_32-verified;
+# DARS_INSTABILITY memo) — 120 is the verified-finite bench regime; per-step cost is
+# dt-independent. ALL periodic output OFF; steps/partition come from the CLI.
+ale: {}
+gm: null
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+dt: 120.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing:
+  kind: core2
+  start_year: 1958
+output_dir: /work/ab0995/a270088/port_jax/runs/perf
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+n_steps: 240
