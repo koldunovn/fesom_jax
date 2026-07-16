@@ -40,11 +40,12 @@ tables/trig on the LOCAL sub-mesh (bit-identical to the global tables' local sha
 - **Pytest gate GREEN** (26300806, 8 passed + 1 pre-existing deselected):
   `test_local_forcing_tables_equal_global_partition` — strict byte equality of tables + sched +
   const vs the global partition at synth npes=4, plus all existing forcing gates.
-- **Driver smoke:** first attempt (26301028, dist_4 + 4 fake CPU devices) SEGFAULTED in ALL
-  THREE legs incl. two that run no new code — an XLA:CPU fake-device × full-all-on-step harness
-  limit, NOT a wiring issue. Resubmitted at dist_1 (26301615, the session-2-certified smoke
-  environment); gate: local-tables ≡ global-tables restarts BIT-identical + host-vs-tables
-  within the FMA-seed slow-field budget.
+- **Driver smoke GREEN (26301615, dist_1): local-tables ≡ global-tables restarts
+  BIT-IDENTICAL (leg B == leg C, every field), host-vs-tables within the FMA-seed slow-field
+  budget (worst uv 3.8e-5 vs 1e-4).** First attempt (26301028, dist_4 + 4 fake CPU devices)
+  SEGFAULTED in ALL THREE legs incl. two that run no new code — an XLA:CPU fake-device ×
+  full-all-on-step harness limit, NOT a wiring issue (lesson in PORTING_LESSONS).
+  **Increment COMPLETE** — NG5 now gets both host-forcing levers combined when opted in.
 
 ## 4. Ladder #2 — CGPOLY (Chebyshev-preconditioned CG): IMPLEMENTED, gates GREEN, A/Bs landing
 
@@ -83,7 +84,27 @@ register-spill catastrophe is an ENGINE property, not a physics one: the scan-ba
 TKE is ~3 % of the step ⇒ no TKE kernel lever needed on the JAX side. Measured, not
 assumed — ladder #4 CLOSED.
 
-## 6. Queue/keep-out notes
+## 6. RE-MEASURE envelope — rows as they land (protocol: scripts/bench/remeasure/README.md)
+
+**core2 (26301823, all 8 rows bench-finite CLEAN, max_uv=1.120 every row, reps ≤0.5 %):**
+
+| ngpu | transport | per_step rep1/rep2 (ms) |
+|---|---|---|
+| 1 | (allgather tag; zero halo) | 192.68 / 192.52 |
+| 2 | padded | 126.51 / 126.62 |
+| 4 | padded | 78.30 / 77.99 |
+| 8 | padded | **68.20 / 68.54** |
+
+**⇒ CORE2 now SCALES 4→8 GPU (78.1→68.4) instead of anti-scaling** — the padded+fusions
+stack inverted the paper's "small mesh anti-scales past one node" §5 story (the 0714 handoff's
+predicted upgrade: "saturates rather than degrades"). Paper-pass consequences: (a)
+`fig_scaling`'s acceptance check EXPECTS anti-scaling 4→8 — it will now report "scales", fine
+(it prints, doesn't assert); (b) §5 text re-scope alongside the transport-envelope edit.
+NOTE cross-protocol: 150-step rows are NOT comparable with the 25-step A/B numbers (the
+150-window amortizes the expensive early steps — CORE2-8 comes out 68.4 vs 72 in the 25-step
+window); all ratios stay within-protocol.
+
+## 7. Queue/keep-out notes
 
 - `m7abenv` jobs 26299413/26299414 (+ 16-node pending) are the KOKKOS session's — untouched.
 - CGPOLY-ON changes d_eta within soltol ⇒ the paper re-measure (protocol-consistent with the
