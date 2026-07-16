@@ -70,10 +70,15 @@ through partition/fold/shard_map; bounds from a fixed-seed host power iteration
   drop (~254 → ~168/step at 127→42 iters) on top of psums 254→84 — and CORE2-8 is the
   latency-bound point (cf. the fusions' −8.6 % from collective count alone).
   Stacked ladder at CORE2-8: 79.3 (pre-branch) → 72.5 (fusions) → **57.1 ms/step (CGPOLY)**.
-- **Pending:** NG5-64 judge A/B (26301617, 16 nodes, queued) + dars-32 dt120 compute-dominated
-  anchor (26301703). Protocol note: the bench's `--warmup` flag is DEAD (parsed, never used —
-  timing is the 2nd call of one compiled N-step run from cold); all A/Bs are the standard cold
-  25-step protocol, comparable with the fusion A/Bs.
+- **dars-32 dt120 A/B (26301703, bench-finite CLEAN ×4, max_uv identical): OFF 333.56/333.78 →
+  ON 321.66/321.52 ms/step = −3.6 %.** The compute-dominated anchor where the fusions WASHED —
+  CGPOLY still pays there because it cuts real WORK, not just collective count (net SpMV
+  applications drop ~1.5× at k=3 with iters÷3), on top of psums÷3. Regime map so far:
+  −20.7 % latency-bound (CORE2-8), −3.6 % compute-bound (dars-32).
+- **Pending:** NG5-64 judge A/B (26301617, 16 nodes, queued). Protocol note: the bench's
+  `--warmup` flag is DEAD (parsed, never used — timing is the 2nd call of one compiled N-step
+  run from cold); all A/Bs are the standard cold 25-step protocol, comparable with the fusion
+  A/Bs.
 
 ## 5. Ladder #4 — TKE decomp profile: DONE (26301643) — the Kokkos spill does NOT transfer
 
