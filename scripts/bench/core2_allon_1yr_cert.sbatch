@@ -18,7 +18,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=0
-#SBATCH --time=03:30:00
+#SBATCH --time=03:00:00
 #SBATCH -o /home/a/a270088/port_jax/scripts/logs/allon_1yr_cert.%j.log
 #SBATCH -e /home/a/a270088/port_jax/scripts/logs/allon_1yr_cert.%j.log
 source /sw/etc/profile.levante 2>/dev/null

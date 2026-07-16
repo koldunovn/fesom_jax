@@ -218,3 +218,18 @@ window); all ratios stay within-protocol.
    theirs to produce.
 3. Gate-0 leftovers for the levers-ON figure plan: EVPWIDE profile? cheb tuning? (defaults:
    skip / optional) — then the combined 1-yr cert (docs/plans/20260716-levers-on-scaling-figure.md).
+
+## 10. Levers-ON track started (evening; user: next priority — Kokkos refresh DEFERRED while they optimize)
+
+- **CGPOLY tuning A/B (26312901, all legs finite):** off 72.52 · k2κ30 58.18 · k3κ30 57.38 ·
+  k4κ30 57.27 · k3κ100 62.75 · k4κ100 56.61 ms/step. Top three within ~1.3 % (≈ noise, single
+  reps); k3κ100 clearly worse. **Verdict: keep k=3/κ=30** — the config with the full evidence
+  chain (gates + 3-scale A/Bs); a ≤1 % nominal k4κ100 gain doesn't buy re-validation.
+- **Combined all-levers 1-yr cert SUBMITTED (26312994, CHEB_DEGREE=3):** 3 legs (off/off-rerun/
+  on = --forcing-on-device --cheb-degree 3), the session-2 floor-controlled design; expect
+  ~1¾ h (26280985 took 1:43).
+- **Far points re-added to the baseline figure grid (user):** dars-128 (26312903), ng5-128
+  (26312905), forca20-64 (26312980), forca20-128 (26312981) — the old figure had forca20
+  64/128 (319.6/478.2 ms, old protocol, curve turned over); my envelope had silently
+  shortened that curve to 32. All four under the frozen 150-step protocol.
+- New plumbing: `--cheb-degree` on run_from_config; `FESOM_CG_CHEB_KAPPA` env in the bench.
