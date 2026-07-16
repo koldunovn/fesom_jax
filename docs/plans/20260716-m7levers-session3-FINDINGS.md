@@ -121,6 +121,17 @@ Monotone strong scaling (4→8 doubling efficiency 76 %, 8→16 62 %).
 the bench harness (compile ~72 s) — that failure mode is a run_from_config-chain property, not
 a forca20-32 property.
 
+**dars 8/16/32 (26301824, all 6 rows bench-finite CLEAN at dt=120 — the 150-step horizon
+HOLDS incl. dist_32; max_uv 3.71 every row, reps ≤0.9 %):**
+
+| ngpu | transport | per_step rep1/rep2 (ms) |
+|---|---|---|
+| 8 | padded | 942.21 / 942.13 |
+| 16 | ragged | 497.76 / 495.58 |
+| 32 | ragged | 290.04 / 292.55 |
+
+Doubling efficiency 95 % (8→16) and 85 % (16→32).
+
 **ng5-32 (26301829, both rows bench-finite CLEAN, max_uv=1.989, reps 0.03 %):**
 coloured, per_step 876.93 / 877.18 ms (peak_gpu 41.3 GiB).
 
