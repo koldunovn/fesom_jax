@@ -63,7 +63,7 @@ def _single_device_solve(op, ssh_rhs, x0):
     with the same warm-start ``rtol_fwd`` ``solve_ssh`` uses."""
     d_eta = np.asarray(ssh.solve_ssh(op, jnp.asarray(ssh_rhs), x0=jnp.asarray(x0)))
     matvec = lambda x: ssh.ssh_matvec(op, x)        # noqa: E731
-    precond = lambda r: ssh.ssh_precond(op, r)      # noqa: E731
+    precond = ssh.ssh_precond_for(op)               # MITgcm, or Chebyshev if op.cheb
     x0d = lax.stop_gradient(jnp.asarray(x0))
     b_eff = jnp.asarray(ssh_rhs) - matvec(x0d)
     nrhs = ssh_rhs.shape[0]
@@ -73,10 +73,14 @@ def _single_device_solve(op, ssh_rhs, x0):
     return d_eta, int(iters)
 
 
-def _shard_inputs(mesh, part, ssh_rhs_global, x0_global):
+def _shard_inputs(mesh, part, ssh_rhs_global, x0_global, cheb=None):
     """Build the per-device sharded operator, halo map, rhs and warm-start for a
-    partition — all ``[P, …]`` then folded to ``[P*…]`` for ``PartitionSpec('p')``."""
-    sop = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=DT), part)
+    partition — all ``[P, …]`` then folded to ``[P*…]`` for ``PartitionSpec('p')``.
+    ``cheb`` (a degree) enables the Chebyshev preconditioner on the global op first."""
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    if cheb:
+        op = ssh.enable_cheb_precond(op, cheb)
+    sop = ssh.partition_ssh_operator(op, part)
     sm = shard_mesh.build_sharded_mesh(mesh, part)
     P, Lmax, nnz = sop.P, sop.Lmax_nod, sop.nnz_max
     src_dev, src_lane = sm.exchange["nod"]          # [P, Lmax] each
@@ -88,11 +92,11 @@ def _shard_inputs(mesh, part, ssh_rhs_global, x0_global):
     return sop, src_dev, src_lane, omask, rhs_PL, x0_PL
 
 
-def _sharded_solve(mesh, part, ssh_rhs_global, x0_global, npes):
+def _sharded_solve(mesh, part, ssh_rhs_global, x0_global, npes, cheb=None):
     """Run the sharded ``solve_ssh`` under ``shard_map`` → ``d_eta`` ``[P, Lmax]``
     and (separately) the forward PCG iteration count (replicated scalar)."""
     sop, sdev, slane, omask, rhs_PL, x0_PL = _shard_inputs(
-        mesh, part, ssh_rhs_global, x0_global)
+        mesh, part, ssh_rhs_global, x0_global, cheb=cheb)
     P, Lmax, nnz, Ng = sop.P, sop.Lmax_nod, sop.nnz_max, int(mesh.nod2D)
     jmesh = halo.device_mesh(devices=jax.devices()[:npes])
     spec = PartitionSpec("p")
@@ -108,7 +112,8 @@ def _sharded_solve(mesh, part, ssh_rhs_global, x0_global, npes):
 
     def _ops(rows, cols, sv, pv, diagv, sd, sl, om):
         op_local = ssh.SSHOperator(rows=rows, cols=cols, stiff_vals=sv,
-                                   precond_vals=pv, diag=diagv, n_nodes=Lmax)
+                                   precond_vals=pv, diag=diagv, n_nodes=Lmax,
+                                   cheb=sop.cheb)
         h = ssh.SSHHalo(src_dev=sd, src_lane=sl, owned_mask=om, n_global=Ng,
                         axis_name="p")
         return op_local, h
@@ -121,7 +126,7 @@ def _sharded_solve(mesh, part, ssh_rhs_global, x0_global, npes):
         op_local, h = _ops(rows, cols, sv, pv, diagv, sd, sl, om)
         x0d = lax.stop_gradient(x0)
         matvec = lambda x: ssh.ssh_matvec(op_local, x, h)        # noqa: E731
-        precond = lambda r: ssh.ssh_precond(op_local, r, h)      # noqa: E731
+        precond = ssh.ssh_precond_for(op_local, h)
         b_eff = rhs - matvec(x0d)
         reduce_fn = lambda u, v: reductions.global_dot(u, v, h.owned_mask, "p")  # noqa: E731
         rtol = SOLTOL * jnp.sqrt(reduce_fn(rhs, rhs) / Ng)
@@ -244,3 +249,81 @@ def test_partition_operator_loop_bound(npes):
     # every local col index is a valid local node lane (< Lmax_nod), never -1
     assert int(sop.cols.min()) >= 0 and int(sop.cols.max()) < sop.Lmax_nod
     assert int(sop.rows.min()) >= 0 and int(sop.rows.max()) < sop.Lmax_nod
+
+
+# --------------------------------------------------------------------------
+# 5. CGPOLY — the Chebyshev polynomial preconditioner (M7 lever, kokkos Task E.3)
+# --------------------------------------------------------------------------
+@pytest.mark.skipif(not CORE2_MESH.is_dir() or not (SSH_RHS_DIR / "ssh_rhs_step1.npy").is_file(),
+                    reason="CORE2 mesh / captured ssh_rhs missing")
+@pytest.mark.parametrize("degree", [2, 3])
+def test_cheb_precond_equal_tolerance_fewer_iters(degree):
+    """Dense CORE2, the captured real step-1 ``ssh_rhs``: the Chebyshev-preconditioned
+    solve stops at the SAME unpreconditioned-residual tolerance (the stop criterion is
+    precond-independent ⇒ equal-tolerance by construction, verified on the actual
+    residual) with SUBSTANTIALLY fewer iterations. The E.3 verify wants ≥1.8× at
+    k=2–3; the hard gate here is ≥1.5× (kill-fast: if this fails, the lever dies per
+    spec, not the suite's calibration). Both early-stopped iterates are reported
+    against each other at the loose-tolerance level."""
+    mesh = load_mesh(CORE2_MESH)
+    op0 = ssh.build_ssh_operator(mesh, dt=DT)
+    ssh_rhs = np.load(SSH_RHS_DIR / "ssh_rhs_step1.npy")
+    x0 = np.zeros(mesh.nod2D)
+    opc = ssh.enable_cheb_precond(op0, degree)
+    deg, lmin, lmax = opc.cheb
+    assert deg == degree and 0.0 < lmin < lmax
+
+    d_ref, it_ref = _single_device_solve(op0, ssh_rhs, x0)
+    d_chb, it_chb = _single_device_solve(opc, ssh_rhs, x0)
+
+    # equal tolerance, verified on the actual unpreconditioned residuals
+    rms_b = float(np.sqrt(np.mean(ssh_rhs ** 2)))
+    for tag, x in (("mitgcm", d_ref), ("cheb", d_chb)):
+        r = np.asarray(ssh.ssh_matvec(op0, jnp.asarray(x))) - ssh_rhs
+        rms_r = float(np.sqrt(np.mean(r ** 2)))
+        assert rms_r <= SOLTOL * rms_b, (
+            f"{tag}: RMS residual {rms_r:.3e} above tolerance {SOLTOL * rms_b:.3e}")
+
+    ratio = it_ref / max(it_chb, 1)
+    scale = max(float(np.max(np.abs(d_ref))), 1e-12)
+    rel = float(np.max(np.abs(d_chb - d_ref))) / scale
+    print(f"CHEB_ITERS k={degree}: mitgcm={it_ref} cheb={it_chb} ratio={ratio:.2f} "
+          f"lam=[{lmin:.4g},{lmax:.4g}] d_eta rel maxdiff={rel:.2e}")
+    assert it_chb < it_ref, "Chebyshev must reduce the CG iteration count"
+    assert ratio >= 1.5, (
+        f"CGPOLY k={degree}: iters ratio {ratio:.2f} < 1.5 — the lever misses its "
+        f"spec (E.3 wants ≥1.8× at k=2–3); kill or retune cheb_kappa")
+
+
+@avail
+@pytest.mark.parametrize("npes", [2])
+def test_cheb_sharded_matches_single_device(npes):
+    """Sharded Chebyshev-preconditioned solve (k=3): the iteration count is
+    device-count-identical (the same load-bearing invariant as the MITgcm path —
+    the polynomial adds SpMVs but no new reductions) and owned-node d_eta matches
+    the single-device cheb solve to the reassociation budget."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    opc = ssh.enable_cheb_precond(ssh.build_ssh_operator(mesh, dt=DT), 3)
+    part = partit.read_partition(CORE2_DIST, npes)
+    ssh_rhs = np.load(SSH_RHS_DIR / "ssh_rhs_step1.npy")
+    x0 = np.zeros(mesh.nod2D)
+
+    d_eta_ref, iters_1 = _single_device_solve(opc, ssh_rhs, x0)
+    d_eta_N, iters_N = _sharded_solve(mesh, part, ssh_rhs, x0, npes, cheb=3)
+
+    assert iters_N == iters_1, (
+        f"cheb npes={npes}: sharded CG took {iters_N} iters vs {iters_1} "
+        f"single-device — iteration-count drift under the polynomial precond")
+    scale = max(float(np.max(np.abs(d_eta_ref))), 1e-12)
+    worst = 0.0
+    for d in range(npes):
+        md = int(part.myDim_nod2D[d])
+        owned_gids = part.myList_nod2D[d][:md]
+        diff = np.max(np.abs(d_eta_N[d, :md] - d_eta_ref[owned_gids]))
+        worst = max(worst, diff)
+    assert worst <= 1e-9 * scale, (
+        f"cheb npes={npes}: owned d_eta max|Δ|={worst:.3e} (scale {scale:.3e}) "
+        f"exceeds the 1e-9 reassociation budget")
+    print(f"CHEB_SHARDED_OK npes={npes} iters={iters_N}")

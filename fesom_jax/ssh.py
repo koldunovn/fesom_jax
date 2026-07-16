@@ -71,12 +71,17 @@ class SSHOperator:
     precond_vals: jax.Array  # (nnz,) f8   M^{-1} (MITgcm symmetric)
     diag: jax.Array          # (N,)  f8    diag(S)  (diagnostics / preconditioner)
     n_nodes: int = dataclasses.field(metadata={"static": True})
+    # CGPOLY (M7 lever, port_kokkos Task E.3): (degree, lam_min, lam_max) enables the
+    # degree-k Chebyshev polynomial preconditioner (:func:`ssh_precond_cheb`) in place
+    # of the MITgcm M⁻¹. STATIC meta (Python floats via :func:`enable_cheb_precond`) —
+    # identical on every process ⇒ identical executables. None (default) ⇒ byte-identical.
+    cheb: tuple = dataclasses.field(default=None, metadata={"static": True})
 
 
 tree_util.register_dataclass(
     SSHOperator,
     data_fields=["rows", "cols", "stiff_vals", "precond_vals", "diag"],
-    meta_fields=["n_nodes"],
+    meta_fields=["n_nodes", "cheb"],
 )
 
 
@@ -153,10 +158,11 @@ class ShardedSSHOperator:
     cols: np.ndarray          # [P, nnz_max] i4  local col (node) lane
     stiff_vals: np.ndarray    # [P, nnz_max] f8
     precond_vals: np.ndarray  # [P, nnz_max] f8
-    diag: np.ndarray          # [P, Lmax_nod] f8  (gathered; unused at runtime)
+    diag: np.ndarray          # [P, Lmax_nod] f8  (the Chebyshev diag scaling; pad lanes 1.0)
     P: int
     nnz_max: int
     Lmax_nod: int
+    cheb: tuple = None        # carried through from the global op (static meta)
 
 
 def partition_ssh_operator(op: SSHOperator, partition) -> ShardedSSHOperator:
@@ -228,7 +234,7 @@ def partition_ssh_operator(op: SSHOperator, partition) -> ShardedSSHOperator:
 
     return ShardedSSHOperator(
         rows=rows_PL, cols=cols_PL, stiff_vals=sv_PL, precond_vals=pv_PL,
-        diag=diag_PL, P=P, nnz_max=nnz_max, Lmax_nod=Lmax_nod,
+        diag=diag_PL, P=P, nnz_max=nnz_max, Lmax_nod=Lmax_nod, cheb=op.cheb,
     )
 
 
@@ -239,7 +245,7 @@ def local_ssh_operator(sop: ShardedSSHOperator, d: int) -> SSHOperator:
         rows=jnp.asarray(sop.rows[d]), cols=jnp.asarray(sop.cols[d]),
         stiff_vals=jnp.asarray(sop.stiff_vals[d]),
         precond_vals=jnp.asarray(sop.precond_vals[d]),
-        diag=jnp.asarray(sop.diag[d]), n_nodes=sop.Lmax_nod,
+        diag=jnp.asarray(sop.diag[d]), n_nodes=sop.Lmax_nod, cheb=sop.cheb,
     )
 
 
@@ -358,6 +364,86 @@ def ssh_precond(op: SSHOperator, r, halo: "SSHHalo | None" = None):
     return jax.ops.segment_sum(
         op.precond_vals * r[op.cols], op.rows, num_segments=op.n_nodes
     )
+
+
+def enable_cheb_precond(op: SSHOperator, degree: int, *, kappa_guess: float = 30.0,
+                        power_iters: int = 100, safety: float = 1.05) -> SSHOperator:
+    """Enable the degree-``degree`` Chebyshev polynomial preconditioner on ``op``
+    (the M7 CGPOLY lever, port_kokkos Task E.3) — call on the GLOBAL operator
+    before :func:`partition_ssh_operator` (the bounds ride along as static meta).
+
+    Host-only and DETERMINISTIC: ``lam_max`` of the diag-scaled operator
+    ``D^{-1/2}·S·D^{-1/2}`` via fixed-seed power iteration (×``safety`` head-room —
+    power iteration converges from below), ``lam_min = lam_max/kappa_guess``. The
+    ``kappa_guess`` only tunes EFFICIENCY, never correctness: the Chebyshev
+    polynomial ``p_k`` is positive on ``(0, lam_max]`` regardless of where the true
+    smallest eigenvalue sits, so ``M⁻¹`` stays SPD for any SPD ``S`` whose spectrum
+    is ≤ ``lam_max`` (the ×1.05 covers the power-iteration under-estimate)."""
+    if degree < 1:
+        raise ValueError(f"Chebyshev precond degree must be >= 1, got {degree}")
+    rows = np.asarray(op.rows)
+    cols = np.asarray(op.cols)
+    vals = np.asarray(op.stiff_vals)
+    diag = np.asarray(op.diag)
+    n = op.n_nodes
+    dis = 1.0 / np.sqrt(np.where(diag > 0.0, diag, 1.0))
+    A = sp.coo_matrix((vals * dis[rows] * dis[cols], (rows, cols)),
+                      shape=(n, n)).tocsr()
+    v = np.random.default_rng(0).standard_normal(n)     # FIXED seed ⇒ same floats everywhere
+    v /= np.linalg.norm(v)
+    lam = 1.0
+    for _ in range(power_iters):
+        w = A @ v
+        lam = float(np.linalg.norm(w))
+        if lam == 0.0:                                   # degenerate (S=0) — keep lam sane
+            lam = 1.0
+            break
+        v = w / lam
+    lam_max = lam * safety
+    lam_min = lam_max / kappa_guess
+    return dataclasses.replace(op, cheb=(int(degree), float(lam_min), float(lam_max)))
+
+
+def ssh_precond_cheb(op: SSHOperator, r, halo: "SSHHalo | None" = None):
+    """``M⁻¹ @ r`` — the degree-k Chebyshev polynomial preconditioner (CGPOLY):
+    ``k`` Chebyshev semi-iterations on the diag-scaled system ``(D⁻¹S)·z = D⁻¹r``
+    from ``z₀=0``, i.e. ``M⁻¹ = p_k(D⁻¹S)·D⁻¹ = D^{-1/2}·p_k(D^{-1/2}SD^{-1/2})·D^{-1/2}``
+    — symmetric positive definite (``p_k > 0`` on ``(0, lam_max]``).
+
+    Cost: ``k`` SpMV(+halo) and NO dot products — that is the point of the lever:
+    the per-CG-iteration collective count stays at 2 psums while the ITERATION count
+    drops (the polynomial eats condition number), so the Allreduce-latency share of
+    the solve shrinks with the iteration ratio. Payoff regime is many-node
+    (Allreduce-latency-bound); at small scale it is roughly halo-neutral (adds k
+    SpMV-halos per apply while cutting iterations) — a flat small-scale A/B is
+    EXPECTED (port_kokkos E.3 spec). The recurrence is the classical Chebyshev
+    iteration (Saad, Alg. 12.1) with STATIC coefficients (``op.cheb`` meta floats),
+    so no extra device scalars or collectives enter the graph. Output valid on
+    OWNED lanes (halo rows incomplete — the same contract as :func:`ssh_precond`)."""
+    degree, lam_min, lam_max = op.cheb
+    theta = 0.5 * (lam_max + lam_min)
+    delta = 0.5 * (lam_max - lam_min)
+    sigma1 = theta / delta
+    inv_d = 1.0 / op.diag                 # sharded: pad lanes are 1.0 ⇒ finite
+    f = inv_d * r
+    rho = 1.0 / sigma1
+    d = f / theta
+    z = d
+    for _ in range(degree):
+        res = f - inv_d * ssh_matvec(op, z, halo)   # SpMV refreshes z's halo lanes
+        rho_new = 1.0 / (2.0 * sigma1 - rho)
+        d = rho_new * rho * d + (2.0 * rho_new / delta) * res
+        z = z + d
+        rho = rho_new
+    return z
+
+
+def ssh_precond_for(op: SSHOperator, halo: "SSHHalo | None" = None):
+    """The preconditioner apply ``r → M⁻¹r`` selected by ``op.cheb``: the Chebyshev
+    polynomial when enabled, else the MITgcm ``M⁻¹`` (byte-identical default)."""
+    if op.cheb is not None:
+        return lambda r: ssh_precond_cheb(op, r, halo)
+    return lambda r: ssh_precond(op, r, halo)
 
 
 # ==========================================================================
@@ -584,7 +670,10 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = Non
         def matvec(x):
             return ssh_matvec(op, x, halo) + stiff_increment_matvec(
                 mesh, hbar, x, dt=dt, alpha=alpha, theta=theta, halo=halo)
-    precond = lambda r: ssh_precond(op, r, halo)  # noqa: E731
+    # MITgcm M⁻¹ by default; the Chebyshev polynomial (CGPOLY) when op.cheb is set —
+    # the stop criterion measures the UNpreconditioned residual either way, so the
+    # two preconds solve to the same tolerance (only the iteration count changes).
+    precond = ssh_precond_for(op, halo)
 
     # Solve for the correction δ = S⁻¹·b_eff from δ0=0 (linear), then d_eta = x0+δ.
     # For x0=0 (step 1) b_eff = ssh_rhs and this is exactly the C's solve-from-zero.

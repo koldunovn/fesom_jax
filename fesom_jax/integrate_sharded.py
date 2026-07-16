@@ -225,7 +225,7 @@ def folded_operator(sop: ShardedSSHOperator) -> tuple[SSHOperator, SSHOperator]:
     op = SSHOperator(
         rows=_fold(sop.rows), cols=_fold(sop.cols),
         stiff_vals=_fold(sop.stiff_vals), precond_vals=_fold(sop.precond_vals),
-        diag=_fold(sop.diag), n_nodes=sop.Lmax_nod,
+        diag=_fold(sop.diag), n_nodes=sop.Lmax_nod, cheb=sop.cheb,
     )
     return op, jax.tree.map(lambda _: _P, op)
 

@@ -83,7 +83,7 @@ _SUBCONFIGS = {
     "tke": TkeConfig, "ice": IceConfig,
 }
 # Non-physics scalar/spec fields that pass through YAML verbatim.
-_SPEC_FIELDS = ("dt", "mesh", "partition", "forcing", "output_dir", "snapshot_every",
+_SPEC_FIELDS = ("dt", "mesh", "partition", "forcing", "ssh", "output_dir", "snapshot_every",
                 "checkpoint_every", "restart_in", "restart_out",
                 "restart_archive_out", "restart_archive_period", "restart_archive_length",
                 "n_steps", "duration")
@@ -95,6 +95,11 @@ _ARCHIVE_PERIODS = ("year", "month", "day")
 _FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path",
                  "on_device")
 _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
+# The `ssh:` mapping — SSH CG solver options. `cheb_degree` (int ≥1) enables the degree-k
+# Chebyshev polynomial preconditioner (CGPOLY, ssh.enable_cheb_precond) in place of the
+# MITgcm M⁻¹ — a many-node comm lever (fewer CG iterations ⇒ fewer psums); absent/0 ⇒ the
+# byte-identical default. `cheb_kappa` tunes the assumed condition number (default 30).
+_SSH_KEYS = ("cheb_degree", "cheb_kappa")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,6 +119,7 @@ class RunConfig:
     mesh: Optional[str] = None
     partition: Optional[str] = None
     forcing: Optional[dict] = None
+    ssh: Optional[dict] = None             # SSH solver options (_SSH_KEYS); None = defaults
     output_dir: Optional[str] = None
     snapshot_every: int = 0
     checkpoint_every: int = 0
@@ -139,6 +145,12 @@ class RunConfig:
         f = self.forcing or {}
         return {k: f.get(k) for k in _FORCING_PATH_KEYS}
 
+    def ssh_cheb(self) -> tuple:
+        """The CGPOLY knobs from the ``ssh:`` block as ``(degree, kappa_guess)``;
+        ``degree == 0`` ⇒ the lever is OFF (the byte-identical MITgcm default)."""
+        s = self.ssh or {}
+        return int(s.get("cheb_degree", 0) or 0), float(s.get("cheb_kappa", 30.0))
+
     def validate(self) -> None:
         """Cross-field validity (mirrors the in-kernel guards, fail-fast at config load)."""
         if self.forcing is not None:
@@ -146,6 +158,12 @@ class RunConfig:
                 raise TypeError(f"forcing must be a mapping or null, "
                                 f"got {type(self.forcing).__name__}")
             _check_keys(self.forcing, _FORCING_KEYS, "forcing")
+        if self.ssh is not None:
+            if not isinstance(self.ssh, dict):
+                raise TypeError(f"ssh must be a mapping or null, got {type(self.ssh).__name__}")
+            _check_keys(self.ssh, _SSH_KEYS, "ssh")
+            if int(self.ssh.get("cheb_degree", 0) or 0) < 0:
+                raise ValueError(f"ssh.cheb_degree must be >= 0, got {self.ssh['cheb_degree']}")
         if self.kpp is not None and self.tke is not None:
             raise ValueError(
                 "kpp and tke are both set — the model runs exactly one vertical-mixing scheme "

@@ -165,7 +165,14 @@ def main():
     mesh = load_mesh(mesh_dir); _lap("load_mesh")
     part = _build_partition(mesh, cfg.partition, args.dist_dir or mesh_dir); _lap("partition")
     sm = shard_mesh.build_sharded_mesh(mesh, part); _lap("sharded_mesh")
-    sop = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=cfg.dt), part); _lap("ssh_op")
+    op = ssh.build_ssh_operator(mesh, dt=cfg.dt)
+    cheb_deg, cheb_kap = cfg.ssh_cheb()
+    if cheb_deg:                    # CGPOLY (ssh.cheb_degree): Chebyshev CG preconditioner
+        op = ssh.enable_cheb_precond(op, cheb_deg, kappa_guess=cheb_kap)
+        if _IS_LEAD:
+            print(f"[run] CGPOLY: Chebyshev precond degree={cheb_deg} "
+                  f"lam=[{op.cheb[1]:.4g}, {op.cheb[2]:.4g}]", flush=True)
+    sop = ssh.partition_ssh_operator(op, part); _lap("ssh_op")
 
     # cold IC vs restart: run_from_config reads cfg.restart_in itself; only build the cold IC here.
     # HOST-build (xp=np) so the global State is never materialized on GPU 0 (the dars/NG5 setup-OOM

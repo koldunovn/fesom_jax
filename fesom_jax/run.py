@@ -348,7 +348,11 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if sop is not None and d == cfg.dt:
             return sop
         if d not in _sop_cache:
-            _sop_cache[d] = ssh.partition_ssh_operator(ssh.build_ssh_operator(mesh, dt=d), part)
+            op_d = ssh.build_ssh_operator(mesh, dt=d)
+            deg, kap = cfg.ssh_cheb()
+            if deg:                       # CGPOLY (ssh.cheb_degree): Chebyshev precond
+                op_d = ssh.enable_cheb_precond(op_d, deg, kappa_guess=kap)
+            _sop_cache[d] = ssh.partition_ssh_operator(op_d, part)
         return _sop_cache[d]
 
     # --- initial State: cold = HOST [P,Lmax]; resume = FOLDED [P*Lmax] device (read_restart) ---

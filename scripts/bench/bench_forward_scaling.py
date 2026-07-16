@@ -141,6 +141,14 @@ def main():
 
     mesh = load_mesh(args.mesh_dir)
     op = ssh.build_ssh_operator(mesh, dt=DT)
+    # CGPOLY A/B switch (env, not CLI — the sbatch legs differ only by environment):
+    # FESOM_CG_CHEB=<k> enables the degree-k Chebyshev CG preconditioner. The [bench]
+    # line format is untouched (the paper reducer regex); the extra line marks the leg.
+    _cheb = int(os.environ.get("FESOM_CG_CHEB", "0") or 0)
+    if _cheb:
+        op = ssh.enable_cheb_precond(op, _cheb)
+        print(f"[bench-cheb] CGPOLY ON: degree={_cheb} "
+              f"lam=[{op.cheb[1]:.4g}, {op.cheb[2]:.4g}]", flush=True)
     if args.npes == 1:
         # single-device baseline (1 GPU / 1 CPU node): the identity partition, zero halo —
         # no dist_1 needed; the sharded path reduces to the dense model (S.2 no-op invariant).
