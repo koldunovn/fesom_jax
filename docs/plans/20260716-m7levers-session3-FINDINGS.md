@@ -1,0 +1,91 @@
+# M7-levers session 3 — findings (2026-07-16, live document)
+
+*Branch `perf/kokkos-m7-levers`. Continues `docs/plans/20260715-m7levers-session2-FINDINGS.md`
+per `docs/HANDOFF-20260716-m7levers-session3.md`. Plan: finish the speed ladder, then the paper
+re-measure with `forcing.on_device` OFF.*
+
+## 1. dt=120 dars fusion A/B harvested (first action) — WASH, question CLOSED
+
+Job 26299153, bench-finite CLEAN all 4 legs (max_uv=5.752 both legs): main 332.78/333.05 vs
+branch 332.93/333.07 ms/step = **+0.05 %**. Confirms the dt=60 wash at the near-production dt.
+Banked into the session-2 findings table. The fusions stay quoted as a small-shard/latency-regime
+lever (−8.6 % CORE2-8, ~0 at dars-32).
+
+## 2. Reducer selection policy UNIFIED (paper re-measure prerequisite (a))
+
+`paper_jax` commit `57a71d4`: `make_numbers._row` now takes the FASTEST (min `sstep_s`) matching
+row — the same policy as `fig_scaling._best_per_ngpu` — so re-runs entering the bench glob can
+never split the figure from the text macros (0713 gotcha 1 / 0714 prerequisite (a), done
+consciously). Exposed + fixed a latent under-filter: the "MPI-decomposed Kokkos twin" per-node
+macros (`kokkosOneNode*/TwoNode*/FourNode*`) matched BOTH backends and leaned on JSON row order —
+now pinned `label='Kokkos (CPU)'`. `_numbers.tex` byte-identical on the current `scaling.csv`
+(the fix is pure hardening today).
+
+**⚠️ Discovered for the re-measure:** the reducer globs `scripts/logs/bench_*.out` (77 files,
+including the OLD contaminated-protocol rows). Under best-per-point selection an old
+faster-but-dishonest row would beat an honest new one — **ARCHIVE (move, never delete) the old
+`.out` logs out of the glob before `make data` consumes the re-measure** (e.g.
+`scripts/logs/pre_m7_protocol/`). Also: the figure/macros pin `halo=ragged` — the transport-
+envelope decision (padded ≤16 GPUs, coloured at NG5-64) must drop/replace that pin in the same
+paper pass.
+
+## 3. Ladder #1 — NG5 local-forcing on-device increment: DONE (commit `5f462c7`)
+
+`forcing.on_device` now composes with `--local-forcing` instead of raising:
+`LocalForcing.stack_tables_partitioned` + `forcing_const_partitioned` build the bracket
+tables/trig on the LOCAL sub-mesh (bit-identical to the global tables' local shards —
+`bracket_schedule`'s `_gather` is per-node) and scatter `[P, …, Lmax]` via one generic
+`_scatter_last`; `run.py` routes the combined path in the chunk loop.
+
+- **Pytest gate GREEN** (26300806, 8 passed + 1 pre-existing deselected):
+  `test_local_forcing_tables_equal_global_partition` — strict byte equality of tables + sched +
+  const vs the global partition at synth npes=4, plus all existing forcing gates.
+- **Driver smoke:** first attempt (26301028, dist_4 + 4 fake CPU devices) SEGFAULTED in ALL
+  THREE legs incl. two that run no new code — an XLA:CPU fake-device × full-all-on-step harness
+  limit, NOT a wiring issue. Resubmitted at dist_1 (26301615, the session-2-certified smoke
+  environment); gate: local-tables ≡ global-tables restarts BIT-identical + host-vs-tables
+  within the FMA-seed slow-field budget.
+
+## 4. Ladder #2 — CGPOLY (Chebyshev-preconditioned CG): IMPLEMENTED, gates GREEN, A/Bs landing
+
+Commit `00f6e3c`. Degree-k Chebyshev polynomial over the DIAG-scaled operator replaces the
+MITgcm M⁻¹ when enabled (opt-in: `ssh: {cheb_degree: k}` config / `FESOM_CG_CHEB=k` bench env;
+default OFF ⇒ byte-identical). `(degree, lam_min, lam_max)` ride as STATIC meta on `SSHOperator`
+through partition/fold/shard_map; bounds from a fixed-seed host power iteration
+(λmax×1.05, λmin=λmax/κ, κ=30 default). Apply = k SpMV+halo, NO dot products.
+
+- **Synthetic sanity (login node):** M⁻¹ symmetric to 3e-16, SPD, bounds cover the spectrum,
+  diag/cheb iters ratio 3.6× at k=3.
+- **Gates GREEN (26301449, 12/12 incl. all pre-existing S.6):** on the captured REAL CORE2
+  step-1 rhs at equal unpreconditioned-residual tolerance:
+  **MITgcm 127 iters → cheb k=2: 55 (2.31×) → k=3: 42 (3.02×)** — far past the E.3 ≥1.8×
+  verify. Sharded k=3: iteration count device-identical, owned d_eta ≤1e-9 budget.
+  Early-stopped iterates agree to 2.3e-5 rel (both are valid soltol-1e-5 solutions —
+  CGPOLY ON is solver-tolerance-equivalent, NOT byte-identical ⇒ same class as the C's
+  early stop; default-ON would need its own climate cert, per the kokkos E.5 precedent).
+- **CORE2-8 A/B (26301616, bench-finite CLEAN ×4, max_uv identical): OFF 72.26/71.78 →
+  ON 57.06/57.20 ms/step = −20.7 %.** The "flat at small scale is EXPECTED" spec warning was
+  WRONG in the good direction here: with iters÷3 at k=3, total halo exchanges per solve ALSO
+  drop (~254 → ~168/step at 127→42 iters) on top of psums 254→84 — and CORE2-8 is the
+  latency-bound point (cf. the fusions' −8.6 % from collective count alone).
+  Stacked ladder at CORE2-8: 79.3 (pre-branch) → 72.5 (fusions) → **57.1 ms/step (CGPOLY)**.
+- **Pending:** NG5-64 judge A/B (26301617, 16 nodes, queued) + dars-32 dt120 compute-dominated
+  anchor (26301703). Protocol note: the bench's `--warmup` flag is DEAD (parsed, never used —
+  timing is the 2nd call of one compiled N-step run from cold); all A/Bs are the standard cold
+  25-step protocol, comparable with the fusion A/Bs.
+
+## 5. Ladder #4 — TKE decomp profile: DONE (26301643) — the Kokkos spill does NOT transfer
+
+CORE2 all-on dist_4/1-node, FESOM_REUSE_EXE=1 (the post-recompile-fix protocol): all-on
+90.55 ms/step; component deltas — **TKE 2.84 ms (~3 %)**, zstar 5.44, GM 9.36, mEVP ice
+14.34, bare ocean 58.03 (matches the 58 ms bench base). The Kokkos `tke_column_loop`
+register-spill catastrophe is an ENGINE property, not a physics one: the scan-based XLA
+TKE is ~3 % of the step ⇒ no TKE kernel lever needed on the JAX side. Measured, not
+assumed — ladder #4 CLOSED.
+
+## 6. Queue/keep-out notes
+
+- `m7abenv` jobs 26299413/26299414 (+ 16-node pending) are the KOKKOS session's — untouched.
+- CGPOLY-ON changes d_eta within soltol ⇒ the paper re-measure (protocol-consistent with the
+  63-yr production figures) runs with cheb OFF **and** on_device OFF; CGPOLY is quoted as an
+  opt-in lever with its own A/B numbers (user decision pending on any default flip).
