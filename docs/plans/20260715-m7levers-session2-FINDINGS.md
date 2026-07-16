@@ -81,8 +81,15 @@ worktree leg look green (rc=0, "1 skipped"); `data/` is now symlinked into both 
 - **Sharded-step tail GREEN: 26273635, 13 passed rc=0 (2 h 11 m)** ⇒ the branch's merge gate
   passed; the gated state (`293293a`) merged to main per the handoff.
 - **Fusion attribution BANKED (CORE2-8, 26274790): main 79.32/79.26 → branch 72.55/72.44
-  ms/step = −8.6 %**, same allocation, interleaved ×2, mEVP+padded, reps agree to 0.1 %.
-  dars-32 leg (26274791) still queued.
+  ms/step = −8.6 %**, same allocation, interleaved ×2, mEVP+padded, reps agree to 0.1 %,
+  bench-finite CLEAN all four legs.
+- **⚠️ dars-32 leg (26274791, dt=180) INVALID — do not quote:** all four legs tied at
+  ~328.3 ms/step but `bench-finite` showed 118M non-finite T in BOTH legs (the known dars
+  dt=180 cold-start blowup, inside the 25-step window). With a NaN state the SSH CG
+  collapses — removing exactly the psum traffic the fusion targets — so the tie is
+  meaningless. Rerun at dt=60 (the stable dars bench regime): job 26292164, commit
+  `e6f13d4`. Lesson re-learned: **always read the bench-finite line before banking a row**
+  (the DARS_INSTABILITY memo's exact scenario).
 - **FINDING (extends §3): XLA FMA-contracts `rdate·coef_a+coef_b` INSIDE jit** — ~1e-9 rel on
   the forcing fields (100 % of elements; eager does NOT contract, so eager bit-gates pass while
   in-scan values differ). `--xla_allow_excess_precision=false`, `optimization_barrier`, bitcast
