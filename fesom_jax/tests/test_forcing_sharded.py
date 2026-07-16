@@ -156,6 +156,49 @@ def test_local_forcing_equals_global_partition(core2_forced_seq):
             err_msg=f"local vs global partitioned forcing differs in {name}")
 
 
+@have_forcing
+def test_local_forcing_tables_equal_global_partition(core2_forced_seq):
+    """``--local-forcing`` + ``forcing.on_device`` (the NG5 increment):
+    ``LocalForcing.stack_tables_partitioned`` == ``forcing.stack_tables`` +
+    ``partition_forcing_tables`` **byte for byte** (with ``local_parts`` = ALL partitions
+    every shard is filled — the strict-equality case, as in the stack_partitioned gate),
+    the ``ForcingSched`` identical (node-independent), and ``forcing_const_partitioned``
+    == the globally partitioned ``forcing_device_const``. Locks the sub-mesh bracket
+    build + table scatter before an NG5 run relies on it."""
+    from fesom_jax.forcing_local import build_local_forcing
+    fx = core2_forced_seq
+    mesh, cf = fx["mesh"], fx["cf"]
+    npes = 4
+    part = partit.synth_block_partition(mesh.nod2D, mesh.elem2D, mesh.edge2D, npes)
+    # 7 half-hour steps from Jan 15 00:00 — crosses one 3-hourly JRA bracket roll
+    dates = [(YEAR, 15, i * 1800.0, 1) for i in range(7)]
+    nb = int(len(dates) * 1800) // 10800 + 2
+
+    tables_g, sched_g = cf.stack_tables(dates, nb=nb)
+    tab_p_global = shard_mesh.partition_forcing_tables(tables_g, part)
+    fdc_p_global = shard_mesh.partition_forcing_const(
+        surface_forcing.forcing_device_const(cf), part)
+
+    lf = build_local_forcing(mesh, YEAR, part, npes, local_parts=list(range(npes)),
+                             static=cf.static)
+    tab_p_local, sched_l = lf.stack_tables_partitioned(dates, nb=nb)
+    fdc_p_local = lf.forcing_const_partitioned()
+
+    for name in sched_g._fields:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(sched_l, name)), np.asarray(getattr(sched_g, name)),
+            err_msg=f"local vs global ForcingSched differs in {name}")
+    for name in tab_p_global._fields:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(tab_p_local, name)), np.asarray(getattr(tab_p_global, name)),
+            err_msg=f"local vs global partitioned ForcingTables differs in {name}")
+    for name in fdc_p_global._fields:
+        np.testing.assert_array_equal(
+            np.asarray(getattr(fdc_p_local, name)), np.asarray(getattr(fdc_p_global, name)),
+            err_msg=f"local vs global partitioned ForcingDeviceConst differs in {name}")
+    print("LOCAL_FORCING_TABLES_OK")
+
+
 def _dense_forced(fx, stack=None):
     mesh = fx["mesh"]
     return integ.integrate(fx["state"], mesh, fx["op"], jnp.zeros((mesh.elem2D, 2)),

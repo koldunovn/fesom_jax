@@ -77,3 +77,13 @@ absolute win is smaller but stays on the critical path (host lever ⇒ holds at 
    flag (`forcing_on_device`, default OFF ⇒ byte-identical).
 4. CORE2 dense gate → sharded gate → A/B the CORE2 hindcast config (same-allocation, ≥150 steps,
    a100_80) → flip the default if green.
+   *(1–4 DONE in session 2 — −12 % CORE2 all-on, 1-yr climate cert PASS; default stays OFF by
+   user decision — VALUE-equivalent only, see PORTING_LESSONS `ONDEVICE_FORCING_XLA_CPU_DIVIDE`.)*
+5. **NG5 `--local-forcing` increment (DONE 2026-07-16):** `LocalForcing.stack_tables_partitioned`
+   + `forcing_const_partitioned` build the bracket tables/trig on the LOCAL sub-mesh (the same
+   ~16× interpolation saving as `stack_partitioned` — `bracket_schedule`'s `_gather` is per-node
+   ⇒ sub-mesh rows bit-identical to the global tables' local shards) and scatter `[P, …, Lmax]`;
+   `run.py` routes `on_device` + `local_forcing` through them instead of raising. Gates: byte-id
+   pytest (`test_local_forcing_tables_equal_global_partition`) + driver smoke
+   (`ondevice_local_forcing_smoke.sbatch`: local-tables ≡ global-tables restarts BIT-identical,
+   host-vs-tables within the FMA-seed budget).

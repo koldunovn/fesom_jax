@@ -542,12 +542,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if forcing_stack is not None:
             raise ValueError("forcing.on_device is incompatible with an injected forcing_stack")
         if local_forcing is not None:
-            raise ValueError("forcing.on_device does not support local_forcing yet "
-                             "(the NG5 local-build path still uses the per-step stack)")
-        if forcing is None:
+            # NG5 increment: the trig/const table comes from the LOCAL sub-mesh reader,
+            # scattered like stack_partitioned (non-local rows stay pad — never read).
+            fdc_p = local_forcing.forcing_const_partitioned()
+        elif forcing is None:
             raise ValueError("forcing.on_device needs a SurfaceForcing (calendar forcing)")
-        from .surface_forcing import forcing_device_const
-        fdc_p = shard_mesh.partition_forcing_const(forcing_device_const(forcing), part)
+        else:
+            from .surface_forcing import forcing_device_const
+            fdc_p = shard_mesh.partition_forcing_const(forcing_device_const(forcing), part)
 
     t_loop0 = time.perf_counter()
     cur_year = int(year)                     # the year the forcing reader was built for
@@ -567,21 +569,26 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             lo = ch.start - start_step
             seq = jax.tree.map(lambda x, lo=lo: x[lo: lo + ch.count], forcing_stack)
             seq_p = shard_mesh.partition_step_forcing(seq, part)
+        elif forcing_on_device:
+            # ON-DEVICE combine: host builds only this chunk's bracket coefficient TABLES
+            # (getcoeffld at rolls — ~n_steps× less host work + H2D than the per-step stack).
+            # nb is a (chunk length, dt) function ⇒ stable shapes ⇒ the reuse cache stays warm.
+            nb = int(ch.count * ch.dt) // 10800 + 2   # JRA 3-hourly bracket depth + pad
+            _dates = _chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp)
+            if local_forcing is not None:
+                # LOCAL tables (the NG5 increment): bracket-interp ONLY this process's
+                # local-partition nodes and scatter — combines both host-forcing levers.
+                tab_p, sched = local_forcing.stack_tables_partitioned(_dates, nb=nb)
+            else:
+                tables, sched = forcing.stack_tables(_dates, nb=nb)
+                tab_p = shard_mesh.partition_forcing_tables(tables, part)
+            seq_p = None
         elif local_forcing is not None:
             # LOCAL forcing build (the NG5 host-forcing fix): interpolate ONLY this process's
             # local-partition nodes (~npes× less) and scatter into [P, n_steps, Lmax] — bit-
             # identical to the global build's local shards (the non-local rows are never read).
             seq_p = local_forcing.stack_partitioned(
                 _chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), xp=np)
-        elif forcing_on_device:
-            # ON-DEVICE combine: host builds only this chunk's bracket coefficient TABLES
-            # (getcoeffld at rolls — ~n_steps× less host work + H2D than the per-step stack).
-            # nb is a (chunk length, dt) function ⇒ stable shapes ⇒ the reuse cache stays warm.
-            nb = int(ch.count * ch.dt) // 10800 + 2   # JRA 3-hourly bracket depth + pad
-            tables, sched = forcing.stack_tables(
-                _chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), nb=nb)
-            tab_p = shard_mesh.partition_forcing_tables(tables, part)
-            seq_p = None
         else:
             # HOST-build the per-chunk forcing (xp=np): a global [n_steps, nod2D] stack is
             # ~2.65 GB/field at NG5 (7.4 M × 48 steps) — building it on GPU 0 OOMs before

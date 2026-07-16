@@ -70,6 +70,44 @@ class LocalForcing:
         self.lane = {p: np.searchsorted(self.local_nodes, np.asarray(part.myList_nod2D[p]))
                      for p in self.local_parts}
 
+    def _scatter_last(self, arr):
+        """Scatter a ``[…, n_local]`` host array into ``[P, …, Lmax]`` (only
+        ``local_parts``' myList lanes filled; every other row/lane takes
+        ``_default_pad`` — never read by the per-shard sharding callback)."""
+        pad = _default_pad(arr.dtype)
+        full = np.full((self.npes,) + arr.shape[:-1] + (self.L,), pad, arr.dtype)
+        for p in self.local_parts:
+            idx = self.lane[p]
+            full[p, ..., :len(idx)] = arr[..., idx]
+        return full
+
+    def stack_tables_partitioned(self, dates, *, nb: int, nm: int = 2):
+        """The ``forcing.on_device`` twin of :meth:`stack_partitioned` (the NG5 increment):
+        per-chunk bracket coefficient TABLES built on the local sub-mesh only — the same
+        ``npes / len(local_parts)`` interpolation saving, since ``bracket_schedule``'s
+        ``_gather`` is per-node — scattered into ``[P, …, Lmax]``
+        :class:`~fesom_jax.surface_forcing.ForcingTables` exactly like
+        :func:`~fesom_jax.shard_mesh.partition_forcing_tables`'s local shards (bit-identical;
+        the non-local rows stay pad). The returned
+        :class:`~fesom_jax.surface_forcing.ForcingSched` is node-independent, hence identical
+        to the global build's."""
+        tables, sched = self.cf.stack_tables(dates, nb=nb, nm=nm)
+        return (type(tables)(**{name: self._scatter_last(np.asarray(getattr(tables, name)))
+                                for name in tables._fields}), sched)
+
+    def forcing_const_partitioned(self):
+        """The local twin of ``partition_forcing_const(forcing_device_const(cf))``: the g2r
+        trig table comes from the LOCAL sub-mesh reader (per-node ⇒ bit-identical to the
+        global table's local shards), scattered like :meth:`_scatter_last`; the ``M``
+        rotation matrix and scalars are replicated as-is."""
+        from .surface_forcing import forcing_device_const
+        fc = forcing_device_const(self.cf)
+        out = {}
+        for name in fc._fields:
+            arr = np.asarray(getattr(fc, name))
+            out[name] = arr if (name == "M" or arr.ndim == 0) else self._scatter_last(arr)
+        return type(fc)(**out)
+
     def stack_partitioned(self, dates, *, xp=np) -> StepForcing:
         """Interpolate ``dates`` for the local nodes and scatter into ``[P, n_steps, Lmax]``
         (only ``local_parts`` filled; pad lanes + non-local rows take ``_default_pad`` — the
