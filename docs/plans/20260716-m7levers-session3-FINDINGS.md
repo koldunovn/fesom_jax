@@ -75,10 +75,21 @@ through partition/fold/shard_map; bounds from a fixed-seed host power iteration
   CGPOLY still pays there because it cuts real WORK, not just collective count (net SpMV
   applications drop ~1.5× at k=3 with iters÷3), on top of psums÷3. Regime map so far:
   −20.7 % latency-bound (CORE2-8), −3.6 % compute-bound (dars-32).
-- **Pending:** NG5-64 judge A/B (26301617, 16 nodes, queued). Protocol note: the bench's
-  `--warmup` flag is DEAD (parsed, never used — timing is the 2nd call of one compiled N-step
-  run from cold); all A/Bs are the standard cold 25-step protocol, comparable with the fusion
-  A/Bs.
+- **NG5-64 JUDGE A/B (26301617, bench-finite CLEAN ×4, max_uv identical 0.698): OFF
+  515.01/500.25 → ON 460.23/458.00 ms/step = −9.6 %** (−8.2 % against the faster OFF rep —
+  the OFF legs spread 2.9 % within-job, the ON legs 0.5 %). **CGPOLY regime map COMPLETE:
+  −20.7 % latency-bound (CORE2-8) / −9.6 % at scale (NG5-64) / −3.6 % compute-bound
+  (dars-32) — the lever pays EVERYWHERE measured.** Bonus observation: the OFF leg (507.6
+  mean, fusions in) vs the pre-branch coloured NG5-64 number (543.3, job 26232225) suggests
+  the fusions are worth ~−6.5 % at NG5-64 — the point session 2 left unmeasured — but that is
+  a CROSS-allocation comparison (quote cautiously; within-job OFF spread alone is 2.9 %).
+- Protocol note: the bench's `--warmup` flag is DEAD (parsed, never used — timing is the 2nd
+  call of one compiled N-step run from cold); all A/Bs are the standard cold 25-step protocol,
+  comparable with the fusion A/Bs.
+- **Ladder Gate-0 leftovers (see docs/plans/20260716-levers-on-scaling-figure.md):** CG1R
+  default NO (CGPOLY already cut the psum pool 3×); EVPWIDE decide on an NG5-64 phase profile
+  (1 extra 16-node job), not speculatively; optional cheb degree/kappa tuning (1 cheap
+  CORE2-8 job).
 
 ## 5. Ladder #4 — TKE decomp profile: DONE (26301643) — the Kokkos spill does NOT transfer
 
