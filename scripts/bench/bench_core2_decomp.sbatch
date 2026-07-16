@@ -14,13 +14,13 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --time=00:30:00
-#SBATCH -o /home/a/a270088/port_jax/scripts/bench_core2_decomp.%j.out
-#SBATCH -e /home/a/a270088/port_jax/scripts/bench_core2_decomp.%j.out
+#SBATCH -o /home/a/a270088/port_jax/scripts/logs/bench_core2_decomp.%j.out
+#SBATCH -e /home/a/a270088/port_jax/scripts/logs/bench_core2_decomp.%j.out
 source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1
-COMMON="--name core2 --mesh-dir $PWD/data/mesh_core2 --dist-dir $POOL/core2 --npes 4 --steps 10 \
+COMMON="--name core2 --mesh-dir $PWD/data/mesh_core2 --dist-dir $POOL/core2 --npes 4 --steps 150 \
         --ragged 0 --dt 1800 --full 1 --ic-dir $PWD/data/ic_core2 --year 1958"
 echo "=== node $(hostname)  $(date) ==="
 echo "######## oce (ice=0 kpp=0 gm=0) ########";     "$PY" scripts/bench/bench_forward_scaling.py $COMMON --ice 0 --kpp 0 --gm 0

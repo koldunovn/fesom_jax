@@ -150,6 +150,14 @@ shards shrink to 48k nodes/GPU).
 **ng5-32 (26301829, both rows bench-finite CLEAN, max_uv=1.989, reps 0.03 %):**
 coloured, per_step 876.93 / 877.18 ms (peak_gpu 41.3 GiB).
 
+**ng5-64 (26301830, both rows bench-finite CLEAN, max_uv=1.989):** coloured, per_step
+485.85 / 488.48 ms — 32→64 doubling efficiency 90 %.
+
+**ENVELOPE COMPLETE (2026-07-16): 15/15 points, every row bench-finite clean, reps ≤1 %.**
+Best-per-point summary (ms/step): core2 192.6/126.6/78.1/68.4 @1/2/4/8 · farc 311/205/164
+@4/8/16 · dars 942/497/291/243 @8/16/32/64 (dt=120) · forca20 439/296 @16/32 ·
+ng5 877/487 @32/64.
+
 **⇒ CORE2 now SCALES 4→8 GPU (78.1→68.4) instead of anti-scaling** — the padded+fusions
 stack inverted the paper's "small mesh anti-scales past one node" §5 story (the 0714 handoff's
 predicted upgrade: "saturates rather than degrades"). Paper-pass consequences: (a)
@@ -165,3 +173,26 @@ window); all ratios stay within-protocol.
 - CGPOLY-ON changes d_eta within soltol ⇒ the paper re-measure (protocol-consistent with the
   63-yr production figures) runs with cheb OFF **and** on_device OFF; CGPOLY is quoted as an
   opt-in lever with its own A/B numbers (user decision pending on any default flip).
+
+## 8. PAPER DATA PASS (2026-07-16 pm, paper_jax f764162)
+
+- 54 old-protocol GPU logs ARCHIVED (moved) to `scripts/logs/pre_m7_protocol/`; CPU-campaign
+  + prod logs retained; the 7 new `bench_rm_*.out` + refreshed decomp/prod logs form the glob.
+- Transport-envelope selection landed: fig_scaling `_jax_full_best` + make_numbers pins
+  dropped (kept: the allgather pins on the decomposition rows, `ngpu=1` on `\coreStepCPU` —
+  its sentence describes the single-process run; best-row would have swapped in the 8-proc
+  1.51 s row).
+- Macro shifts (old→new): coreStep .087→.078, coreSYPD 57→63, coreStepTwoNode .123→.068
+  (anti-scaling INVERTED), darsEff 91/81/56→95/85/60, ngEffSixtyFour 72→90, ngSYPD
+  1.12→1.35, commShareFour 44→38; 128-GPU macros now "--" (no new-protocol data — §5
+  turnover claims removed).
+- §5 edits: strong-scaling paragraph rewritten (saturates-not-degrades, farc ×1.9, fusion
+  buy-back ~9 % sentence + source comments), dars validity note simplified (all rows dt=120
+  verified-finite), caption transport note, 8.1 GiB peak. **In-text TODO: the Kokkos dashed
+  curves are m524-VINTAGE** — refresh + re-scope the comparison sentence when the post-M7
+  Kokkos ledger lands (their session; do not submit).
+- Two macros re-measuring under the new protocol: coreMs* decomposition (26311383, script
+  moved into the glob + steps=150) and coreStepProd (26311413, + padded leg). Old prod log
+  to be archived when the new one lands (avoid cross-protocol best-row mixing).
+- CPU campaign macros left on the old logs DELIBERATELY (self-contained accessibility story,
+  pre-fusion protocol noted; re-measuring the CPU campaign is out of scope).
