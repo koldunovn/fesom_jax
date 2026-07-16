@@ -19,6 +19,8 @@ partition: dist_4                              # 1 node ×4 A100; restart-portab
 forcing:
   kind: core2
   start_year: 1958
+  # on_device: true  # opt-in in-scan JRA interp (−12 % on CORE2 all-on; value-equivalent,
+  #                  # NOT bit-identical — keep OFF for bit comparisons)
 output_dir: /work/ab0995/a270088/port_jax/runs/farc
 snapshot_every: 96       # ~1/day at dt=900
 checkpoint_every: 480    # ~5 days

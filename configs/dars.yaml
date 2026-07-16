@@ -18,6 +18,8 @@ partition: dist_16                                       # >=2 nodes; restart-po
 forcing:
   kind: core2
   start_year: 1958
+  # on_device: true  # opt-in in-scan JRA interp (−12 % on CORE2 all-on; value-equivalent,
+  #                  # NOT bit-identical — keep OFF for bit comparisons)
 output_dir: /work/ab0995/a270088/port_jax/runs/dars
 snapshot_every: 480      # ~1/day at dt=180
 checkpoint_every: 2400   # ~5 days

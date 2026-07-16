@@ -11,6 +11,8 @@ dt: 180.0
 dt_ramp: {after_step: 175200, dt: 240.0}   # bump to 240 after 1 model year (ramp-aware calendar)
 mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20
 partition: dist_32
-forcing: {kind: core2, start_year: 1958}
+forcing: {kind: core2, start_year: 1958}   # add on_device: true for the −12 % in-scan JRA
+                                           # interp (value-equivalent, NOT bit-identical —
+                                           # keep OFF for bit comparisons; 1-yr certified)
 restart_in: null
 restart_out: /work/ab0995/a270088/port_jax/runs/forca20_hindcast_v2/restart   # overridden via --restart-out by run_forca20_hindcast.sbatch

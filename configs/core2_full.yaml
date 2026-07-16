@@ -28,6 +28,9 @@ partition: dist_4         # CORE2 ANTI-scales past 4 GPU (halo-bound) ⇒ dist_4
 forcing:
   kind: core2
   start_year: 1958
+  # on_device: true  # opt-in speed lever, −12 % measured on THIS config (jra interp moves
+  #                  # in-scan on GPU; 1-yr climate-certified, job 26280985). VALUE-equivalent,
+  #                  # NOT bit-identical (in-jit FMA) — keep OFF for any bit-level comparison.
 output_dir: /work/ab0995/a270088/port_jax/runs/core2
 snapshot_every: 48        # steps (~1/day at dt=1800)
 checkpoint_every: 1440    # steps (~1 month)

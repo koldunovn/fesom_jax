@@ -28,6 +28,8 @@ partition: dist_64                            # 16 nodes ×4 A100-80 = 64 GPU; d
 forcing:
   kind: core2                                 # JRA55 + L&Y09 bulk (mesh-agnostic by interp; A5 stages it)
   start_year: 1958
+  # on_device NOT supported here yet: NG5 runs use --local-forcing, which the on-device
+  # path doesn't cover (raises). The local-forcing increment is on the ladder.
 output_dir: /work/ab0995/a270088/port_jax/runs/ng5
 snapshot_every: 480      # steps (~1/day at dt=180) — time-subsampled instantaneous snapshots
 checkpoint_every: 2400   # steps (~5 days) — portable restart cadence
