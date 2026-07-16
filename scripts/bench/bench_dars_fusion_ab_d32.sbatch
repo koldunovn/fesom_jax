@@ -30,8 +30,10 @@ POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1
 BRANCH_TREE=/home/a/a270088/port_jax
 MAIN_TREE=/home/a/a270088/port_jax_main_ab
 M=/work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+# DT overridable: sbatch --export=ALL,DT=120 …  (dars usually recovers at dt=120 per the
+# Kokkos session's finding; dt=60 is the conservative floor. bench-finite decides validity.)
 C="--name dars --mesh-dir $M --dist-dir $POOL/dars \
-   --npes 32 --steps 25 --warmup 5 --dt 60 --full 1 --mevp 1 \
+   --npes 32 --steps 25 --warmup 5 --dt ${DT:-60} --full 1 --mevp 1 \
    --ic-dir $M --year 1958 --halo padded"
 echo "=== $(date) nodes=$SLURM_JOB_NODELIST  dars-32 fusion A/B ==="
 echo "main   = $(git -C $MAIN_TREE rev-parse --short HEAD)  ($MAIN_TREE)"
