@@ -143,6 +143,10 @@ HOLDS incl. dist_32; max_uv 3.71 every row, reps ≤0.9 %):**
 
 Doubling efficiency 95 % (8→16) and 85 % (16→32).
 
+**dars 64 (26301825, both rows bench-finite CLEAN, max_uv=3.707):** ragged, per_step
+242.27 / 243.76 ms — 16→32→64 doubling efficiency 85 % → 60 % (the curve flattens as the
+shards shrink to 48k nodes/GPU).
+
 **ng5-32 (26301829, both rows bench-finite CLEAN, max_uv=1.989, reps 0.03 %):**
 coloured, per_step 876.93 / 877.18 ms (peak_gpu 41.3 GiB).
 
