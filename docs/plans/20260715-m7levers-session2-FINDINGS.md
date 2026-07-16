@@ -90,6 +90,15 @@ worktree leg look green (rc=0, "1 skipped"); `data/` is now symlinked into both 
   meaningless. Rerun at dt=60 (the stable dars bench regime): job 26292164, commit
   `e6f13d4`. Lesson re-learned: **always read the bench-finite line before banking a row**
   (the DARS_INSTABILITY memo's exact scenario).
+- **dars-32 dt=60 rerun (26292164, bench-finite CLEAN, max_uv identical both legs):
+  main 319.97/320.17 vs branch 320.73/320.35 ms/step — a WASH (+0.1 %, within the ~0.2 %
+  within-job spread).** Read: the fusions save a FIXED per-step collective count
+  (~120 exchange launches + ~40 psums); at dars-32 the shards are big (99k nodes/GPU,
+  compute-dominated, 320 ms step) so that fixed saving is invisible, while at CORE2-8
+  (16k nodes/GPU, latency-bound, 72 ms step) the same fusions are −8.6 %. The lever pays
+  in the comm-bound/small-shard regime — the same "cost structure ≠ ranking" lesson as
+  the halo transports. For the paper: quote the fusions as a small-shard/latency-regime
+  win; the NG5-64 (more nodes, coloured transport) point remains unmeasured.
 - **FINDING (extends §3): XLA FMA-contracts `rdate·coef_a+coef_b` INSIDE jit** — ~1e-9 rel on
   the forcing fields (100 % of elements; eager does NOT contract, so eager bit-gates pass while
   in-scan values differ). `--xla_allow_excess_precision=false`, `optimization_barrier`, bitcast
