@@ -5284,3 +5284,41 @@ Cite the C source (`file:line`) or dump probe that proves it.
      all-on steps (the stiff amplifier). Gate structure: eager bit-gates for VALUES, tight
      tolerance (+ wrong-bracket tripwire: slow ocean fields ≤1e-4 rel) for in-scan trajectories,
      and the flag defaults OFF so the production path stays byte-identical.**
+
+## M7 levers session 3 — NG5 local-forcing on-device increment + CGPOLY (2026-07-16)
+
+- **Composing two host-side levers is a scatter, not new math.** `forcing.on_device` (bracket
+  tables) and `--local-forcing` (sub-mesh interpolation) compose because BOTH reduce to "a
+  per-node host product placed into `[P, …, Lmax]` lanes": `bracket_schedule`'s `_gather` is
+  per-node, so a sub-mesh reader's `coef_a/b` rows are bit-identically the global tables'
+  local shards — the same claim `stack_partitioned` already carried for the per-step stack.
+  `LocalForcing.stack_tables_partitioned` is ~20 lines (one generic `_scatter_last`); the
+  driver seam is an `if` in the chunk loop. Gate the composition, not the pieces: the
+  byte-equality pytest (`local_parts` = ALL ⇒ strict full-array equality vs
+  `partition_forcing_tables`) plus a driver A/B/C smoke where local-tables ≡ global-tables
+  restarts must be BIT-identical (both feed byte-identical inputs to the SAME executable —
+  a far stronger driver gate than any tolerance).
+- **XLA:CPU fake-device harness limit:** the FULL all-on CORE2 step (mevp+kpp+gm) under
+  `--xla_force_host_platform_device_count=4` SEGFAULTS in compile/exec (job 26301028 — all
+  three legs, including two that ran no new code), while the same step at dist_1 and the
+  pytest-scale shard_map cases are fine. Fake-device smoke ≠ fake-device pytest: keep driver
+  smokes at dist_1 (the multi-partition scatter belongs to the synth-partition pytest, which
+  costs nothing and proves bytes).
+- **CGPOLY transfers, and the JAX port is where it shines on paper:** a degree-k Chebyshev
+  polynomial on the DIAG-scaled operator (NOT composed with the MITgcm M⁻¹) as the CG
+  preconditioner, coefficients from a fixed-seed host power iteration (`lam_max`×1.05,
+  `lam_min = lam_max/30`). On the captured REAL CORE2 step-1 rhs: 127 → 55 iters at k=2
+  (2.31×), 127 → 42 at k=3 (3.02×) at equal unpreconditioned-residual tolerance — the
+  kokkos E.3 verify wanted ≥1.8×. Implementation notes that mattered: (1) carry
+  `(degree, lam_min, lam_max)` as STATIC pytree meta on the operator — it rides
+  partition/fold/shard_map for free and keys recompilation correctly; (2) the polynomial
+  needs NO new collectives (halo refresh lives inside `ssh_matvec`), so the iteration-count
+  device-parity invariant is inherited, not re-proven; (3) λmin is an EFFICIENCY knob, not a
+  correctness one — p_k > 0 on (0, λmax] regardless, so a bad κ_guess can't make M⁻¹
+  indefinite (only λmax coverage matters — hence the safety factor on the power iteration,
+  which converges from below); (4) validate the recurrence on a synthetic SPD system on the
+  login node BEFORE any cluster job — a dense-materialized M⁻¹ symmetry/SPD check catches
+  sign errors in seconds.
+- **The wall-clock verdict is regime-dependent even at a 3× iteration cut:** each apply adds
+  k SpMV+halos, so exchanges/solve barely move while psums/solve drop ~3× — flat small-scale
+  A/Bs are EXPECTED (do not kill on them); judge at the Allreduce-latency point (NG5-64).

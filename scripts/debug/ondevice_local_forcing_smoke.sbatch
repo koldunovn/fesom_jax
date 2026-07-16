@@ -1,7 +1,11 @@
 #!/bin/bash
-# LOCAL-forcing on-device DRIVER smoke (CPU, CORE2 all-on, dist_4 + 4 fake devices — the
-# multi-partition scatter is actually exercised): the NG5 increment routes
-# --local-forcing + forcing.on_device through LocalForcing.stack_tables_partitioned /
+# LOCAL-forcing on-device DRIVER smoke (CPU, CORE2 all-on, dist_1 — the same environment
+# as the session-2-certified ondevice_forcing_driver_smoke; dist_4 + 4 fake CPU devices
+# segfaults the full all-on step in XLA:CPU, job 26301028, all three legs incl. the two
+# that don't touch the new code — a harness limit, not a wiring one. The multi-partition
+# scatter itself is proven byte-identical by the pytest gate at synth npes=4,
+# test_local_forcing_tables_equal_global_partition). The smoke proves the DRIVER ROUTING:
+# --local-forcing + forcing.on_device goes through LocalForcing.stack_tables_partitioned /
 # forcing_const_partitioned instead of raising. Three legs:
 #   A  --local-forcing                      (host per-step stack — the production NG5 path)
 #   B  --local-forcing --forcing-on-device  (the NEW combined path)
@@ -25,7 +29,6 @@ PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 REPO=/home/a/a270088/port_jax
 cd $REPO
 export JAX_PLATFORMS=cpu PYTHONUNBUFFERED=1 FESOM_REUSE_EXE=1
-export XLA_FLAGS=--xla_force_host_platform_device_count=4
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2
 OUT=/scratch/a/a270088/ondev_local_smoke.$SLURM_JOB_ID
 mkdir -p "$OUT"
@@ -35,7 +38,7 @@ run_leg () {  # $1 = leg name, $2… = extra flags
   echo "=== $(date) LEG=$LEG ==="
   srun "$PY" scripts/run_from_config.py configs/core2_full_bench.yaml \
       --mesh-dir data/mesh_core2 --dist-dir "$POOL" --ic-dir data/ic_core2 \
-      --partition dist_4 --steps 12 --chunk-steps 6 --progress \
+      --partition dist_1 --steps 12 --chunk-steps 6 --progress \
       --restart-out "$OUT/restart_$LEG" "$@"
   echo "=== LEG=$LEG rc=$? ==="
 }

@@ -19,6 +19,9 @@ PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export XLA_FLAGS="--xla_gpu_enable_command_buffer=" PYTHONUNBUFFERED=1
+# The old ~520 ms/step all-on number was partly the per-chunk-recompile bug — always
+# re-run this decomposition with the executable reuse cache ON (the post-fix protocol).
+export FESOM_REUSE_EXE=1
 echo "=== $(date) core2 perf decomposition (dist_4/1node) ==="
 srun --ntasks=1 --cpu-bind=none "$PY" scripts/bench/core2_perf_decomp.py
 echo "=== done $(date) ==="
