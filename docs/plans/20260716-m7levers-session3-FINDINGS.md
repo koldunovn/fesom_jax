@@ -110,6 +110,17 @@ assumed — ladder #4 CLOSED.
 
 Monotone strong scaling (4→8 doubling efficiency 76 %, 8→16 62 %).
 
+**forca20 (26301827, all 4 rows bench-finite CLEAN, max_uv=2.973 every row, reps ≤0.5 %):**
+
+| ngpu | transport | per_step rep1/rep2 (ms) |
+|---|---|---|
+| 16 | ragged | 438.25 / 440.38 |
+| 32 | ragged | 295.34 / 296.53 |
+
+16→32 doubling efficiency 74 %. The production-chain dist_32 COMPILE-HANG did NOT reproduce in
+the bench harness (compile ~72 s) — that failure mode is a run_from_config-chain property, not
+a forca20-32 property.
+
 **⇒ CORE2 now SCALES 4→8 GPU (78.1→68.4) instead of anti-scaling** — the padded+fusions
 stack inverted the paper's "small mesh anti-scales past one node" §5 story (the 0714 handoff's
 predicted upgrade: "saturates rather than degrades"). Paper-pass consequences: (a)
