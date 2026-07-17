@@ -8,8 +8,10 @@
 
 ale: {}            # zstar vertical coordinate
 gm: null           # GM OFF — eddies are resolved at ~5 km
-kpp: {}            # KPP vertical mixing (FESOM2 default)
-tke: null          # (KPP xor TKE — exactly one mixing scheme)
+kpp: null          # (KPP xor TKE — exactly one mixing scheme)
+tke: {}            # TKE vertical mixing — USER DECISION 2026-07-17: NG5 production is TKE
+                   # (better differentiability); the old `kpp: {}` here predated the
+                   # Phase-9b TKE port and was never revisited (memory: ng5-mixing-is-tke)
 ice: {}            # mEVP sea ice (required for the LKF deformation figure, Task B4)
 
 visc:
