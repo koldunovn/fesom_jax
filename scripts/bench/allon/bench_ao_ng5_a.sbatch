@@ -24,7 +24,7 @@ CONFIG=configs/ng5_full_bench.yaml
 DIST=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/ng5
 IC=/work/ab0995/a270088/fesom_jax_meshes/mesh_ng5
 EXTRA_BOTH="--local-forcing"
-ON_FLAGS="--forcing-on-device --cheb-degree 3"
+ON_FLAGS="--cheb-degree 3"   # NG5: tables REGRESS device time +36% here (26322951, KPP suspect) — cheb-only is the optimized NG5 config
 run_leg() { # $1=npes $2=srun-nodes $3=transport-flag $4=leg $5... extra
   local NP=$1 SN=$2 TR=$3 LEG=$4; shift 4
   echo "#### ao-ng5_a npes=$NP LEG=$LEG $(date +%T) ####"

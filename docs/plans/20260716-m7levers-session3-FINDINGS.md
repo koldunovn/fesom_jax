@@ -254,3 +254,17 @@ NG5 operator would hide in the kernel A/B and explode here). Decomposition job 2
 
 **forca20-64 baseline row (26312980, CLEAN):** 257.98 / 267.98 ms — the curve still
 descends at 64 (56 % doubling eff from 32).
+
+## 12. NG5 regression ATTRIBUTED (26322951) — tables, not CGPOLY; per-mesh lever set adopted
+
+Decomposition at ng5-32 (production loop, --local-forcing in all legs): off 1494.8 ·
+**cheb-only 1469.3 (−1.7 %, CGPOLY fine)** · **tables-only 2026.6 (+35.6 % — the on-device
+TABLES path is the whole regression, device-side)**. Every winning mesh (core2/farc/forca20)
+runs TKE + the GLOBAL tables path; NG5 is KPP + the local-tables path — **OPEN INVESTIGATION
+`TABLES_NG5_DEVICE_REGRESSION`**: disambiguate KPP-vs-local-tables later (e.g. a CORE2 kernel
+A/B kpp+tables vs tke+tables); not needed for the figure.
+
+**Figure decision: the optimized configuration is PER-MESH** (levers are per-config opt-ins):
+core2/farc/dars/forca20 = tables + cheb; NG5 = local-forcing + cheb, tables OFF (documented
+with the regression number). ng5_b (tables+cheb, 26315978) CANCELLED while still pending;
+both NG5 jobs resubmitted with ON = cheb-only (26323963 ng5-32 ×2 reps, 26323964 ng5-64).
