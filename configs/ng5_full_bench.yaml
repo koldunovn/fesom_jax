@@ -1,12 +1,14 @@
-# NG5 all-on BENCH twin of ng5.yaml (zstar + KPP + mEVP, GM off — eddies resolved at ~5 km;
-# JRA 1958) for the all-levers-ON production-loop envelope. ALL periodic output OFF — the
-# production config snapshots into its run directory; this twin exists so a bench can never
-# touch it. Steps/partition via CLI; NG5 legs also pass --local-forcing (bit-identical
+# NG5 all-on BENCH twin (zstar + TKE + mEVP, GM off — eddies resolved at ~5 km; JRA 1958)
+# for the all-levers-ON production-loop envelope. ⚠️ MIXING = TKE by USER DECISION 2026-07-17:
+# ng5.yaml still says kpp — that config predates the TKE port (Phase 9b) and was never
+# revisited; NG5 production uses TKE (better differentiability). ALL periodic output OFF —
+# the production config snapshots into its run directory; this twin exists so a bench can
+# never touch it. Steps/partition via CLI; NG5 legs also pass --local-forcing (bit-identical
 # host-side lever, part of BOTH A/B legs).
 ale: {}
 gm: null
-kpp: {}
-tke: null
+kpp: null
+tke: {}
 ice: {}
 visc: {gamma1: 0.2}
 tracer: {}
