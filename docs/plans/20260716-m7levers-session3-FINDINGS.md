@@ -268,3 +268,21 @@ A/B kpp+tables vs tke+tables); not needed for the figure.
 core2/farc/dars/forca20 = tables + cheb; NG5 = local-forcing + cheb, tables OFF (documented
 with the regression number). ng5_b (tables+cheb, 26315978) CANCELLED while still pending;
 both NG5 jobs resubmitted with ON = cheb-only (26323963 ng5-32 ×2 reps, 26323964 ng5-64).
+
+## 13. ⚠️ ALL-ON INSTRUMENT UNDER INVESTIGATION (2026-07-17 midday)
+
+Two anomalies in the ao (production-loop) harness:
+1. **ao dars-8 ran at ~100 s/step** (26315973 TIMEOUT after 2 chunks; chunk2 == chunk1 ⇒ NOT
+   compile) — vs 0.94 s/step for the same mesh/count in the kernel bench.
+2. **ao core2-4 OFF measured 239 ms/step where the session-2 ondev A/B measured 112.5** on
+   the SAME config + instrument class (26278428). The off/on RATIOS in §11 are internally
+   fair (interleaved, same env) but the ABSOLUTE ao numbers are 2× suspect — the optimized
+   figure must not use them until resolved.
+
+Env differences vs the certified session-2 template: (a) my ao harness passes a per-point
+TRANSPORT flag (session-2 ran the dist_4 default = allgather); (b) allocator settings
+(PREALLOCATE=false) are shared with session-2 but untested at dars scale. Instrument-check
+job 26325214 (core2 dist_4, OFF only, 4 legs: {noflag, --padded} × {prealloc off, on})
+splits it. ao dars_b (64) CANCELLED pending the verdict; dars_a partial (TIMEOUT) not banked.
+The ng5-TKE decision job (26324321, still queued) shares the harness — its RATIOS still
+decide the NG5 lever set; absolutes inherit the caveat.
