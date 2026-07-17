@@ -5322,3 +5322,20 @@ Cite the C source (`file:line`) or dump probe that proves it.
 - **The wall-clock verdict is regime-dependent even at a 3× iteration cut:** each apply adds
   k SpMV+halos, so exchanges/solve barely move while psums/solve drop ~3× — flat small-scale
   A/Bs are EXPECTED (do not kill on them); judge at the Allreduce-latency point (NG5-64).
+
+## All-ON envelope harvest (2026-07-17) — the two-compile chunk-accounting trap
+
+- **`run_from_config` compiles TWO XLA executables, not one**: chunk 1 (the cold `[P,Lmax]`
+  host-entry graph) AND chunk 2 (the folded `[P*Lmax]` steady-state graph). Any per-step
+  reduction over production-loop chunk timings must start at chunk 3. A parser that starts at
+  chunk 2 amortizes a full compile into every number — ours inflated a whole envelope ~2×,
+  manufactured a phantom "instrument discrepancy" vs a certified older measurement (which had
+  reduced over chunks 3–5), and sent a 4-leg diagnostic job chasing environment variables that
+  were always innocent (prealloc ±0.5 %, transport flag +1.5 %). The tell in hindsight: chunk 2
+  ≈ chunk 1 ≫ chunks 3+ in EVERY log. Reduce from the first steady chunk, and assert
+  `chunk_n ≈ chunk_{n+1}` before trusting a mean.
+- **Corollary: never diagnose across two changes at once.** The same wrong parser made a real
+  dars anomaly look like part of the same problem; with the parser fixed, what remains is real
+  and SPECIFIC: dars-8 production-loop compiles take ~80 min PER EXECUTABLE (×2) where core2
+  takes 25 s and the dars KERNEL graph took 172 s — a prod-physics × mesh-size × graph-shape
+  XLA pathology, isolated only after the accounting was right.
