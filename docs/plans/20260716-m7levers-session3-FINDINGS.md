@@ -286,3 +286,30 @@ job 26325214 (core2 dist_4, OFF only, 4 legs: {noflag, --padded} × {prealloc of
 splits it. ao dars_b (64) CANCELLED pending the verdict; dars_a partial (TIMEOUT) not banked.
 The ng5-TKE decision job (26324321, still queued) shares the harness — its RATIOS still
 decide the NG5 lever set; absolutes inherit the caveat.
+
+## 14. INSTRUMENT VERDICT (26325214): the harness was fine — the PARSER was wrong; CORRECTED ao table
+
+`run_from_config` compiles TWO executables — chunk 1 (cold [P,Lmax] entry) AND chunk 2 (the
+folded steady-state graph). Session-2's 112.5 ms/step reduced over chunks 3–5; my parser used
+chunks 2–5, silently amortizing a full second XLA compile into every number (§11/§13 inflation
++ the fake "2× discrepancy"). Check job: chunks-3+ = 113.9/113.2/115.3/116.0 ms/step across
+{noflag,padded}×{prealloc off,on} — session-2 reproduced exactly; prealloc irrelevant; the
+padded flag +1.5 % at dist_4. **§11's quarantine is LIFTED; §13 was a parser artifact.**
+
+**CORRECTED all-ON production-loop table (chunks 3–5, off/on ×2 interleaved):**
+
+| mesh | ngpu | OFF → ON ms/step | Δ |
+|---|---|---|---|
+| core2 | 1 / 2 / 4 / 8 | 275→252 / 182→157 / 117→92 / 101→74 | −8.1 / −13.9 / −20.8 / −26.9 % |
+| farc | 4 / 8 / 16 | 389→288 / 301→197 / 255→153 | −25.9 / −34.6 / −39.7 % |
+| forca20 | 16 / 32 | 740→406 / 569→265 | −45.1 / **−53.4 %** |
+| ng5-32 KPP (single reps) | | off 1317 · chebonly 1267 · tabonly 1726 | cheb −3.8 %; tables +31 % (regression stands) |
+
+Coherence: ao core2-4 OFF 116.7 ≈ session-2 112.5; ON 92.4 = session-2's forcing-only 99 plus
+CGPOLY. The gains GROW with mesh size (host-forcing share + CG share both grow) — forca20-32
+optimized is 2.1× the baseline.
+
+**dars still open:** dars-8 production-loop showed TWO ~80-min compiles (vs 25 s at core2, 172 s
+kernel dars) — a prod-physics × dars-size × production-graph compile pathology; never reached a
+warm chunk. HOLD ao dars until the fig10prod dars_a KERNEL job (same physics, same mesh) reveals
+whether the kernel graph compiles sanely — that splits graph-shape vs physics-size.
