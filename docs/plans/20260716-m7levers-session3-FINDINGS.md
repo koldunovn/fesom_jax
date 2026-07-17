@@ -233,3 +233,24 @@ window); all ratios stay within-protocol.
   64/128 (319.6/478.2 ms, old protocol, curve turned over); my envelope had silently
   shortened that curve to 32. All four under the frozen 150-step protocol.
 - New plumbing: `--cheb-degree` on run_from_config; `FESOM_CG_CHEB_KAPPA` env in the bench.
+
+## 11. ALL-ON envelope — first results (2026-07-17 morning) + an NG5 regression caught
+
+Production-loop A/B (ms/step, chunks 2–5 mean, off/on ×2 interleaved; jobs 26315972/75/76/77):
+
+| mesh | ngpu | OFF | ON | Δ |
+|---|---|---|---|---|
+| core2 | 1 / 2 / 4 / 8 | 387 / 308 / 239 / 224 | 371 / 289 / 216 / 200 | −4.3 / −6.2 / −9.7 / −10.8 % |
+| farc | 4 / 8 / 16 | 500 / 411 / 364 | 405 / 316 / 265 | −19.1 / −23.1 / −27.1 % |
+| forca20 | 16 / 32 | 848 / 690 | 534 / 399 | **−37.0 / −42.2 %** |
+| ng5 | 32 | 1486 | 1985 | **+33.6 % ⚠️ REGRESSION** |
+
+The ng5-32 split is diagnostic: host share fell 13.2→1.0 s/chunk (the forcing lever WORKS)
+but device time rose 50→80 s/chunk. NG5's ON leg is unique three ways: the only user of the
+NEW local-tables path, coloured transport, KPP; and CGPOLY there runs at REAL iteration
+counts (the kernel A/Bs ran 25 cold steps where CG has not spun up — a κ=30 mis-fit to the
+NG5 operator would hide in the kernel A/B and explode here). Decomposition job 26322951
+(off / tables-only / cheb-only at ng5-32) attributes it before any retune.
+
+**forca20-64 baseline row (26312980, CLEAN):** 257.98 / 267.98 ms — the curve still
+descends at 64 (56 % doubling eff from 32).
