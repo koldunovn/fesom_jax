@@ -313,3 +313,18 @@ optimized is 2.1× the baseline.
 kernel dars) — a prod-physics × dars-size × production-graph compile pathology; never reached a
 warm chunk. HOLD ao dars until the fig10prod dars_a KERNEL job (same physics, same mesh) reveals
 whether the kernel graph compiles sanely — that splits graph-shape vs physics-size.
+
+## 15. fig10 v2 (production physics, levers OFF) — rows as they land
+
+**core2 (26331912, all 8 rows bench-finite CLEAN, max_uv=1.155 — matches the prod re-bench
+trajectory; reps ≤0.3 %):** model=FULL(mevp+tke+gm+zstar+JRA1958)
+
+| ngpu | transport | per_step rep1/rep2 (ms) |
+|---|---|---|
+| 1 | (allgather tag) | 229.54 / 229.24 |
+| 2 | padded | 145.91 / 146.06 |
+| 4 | padded | 87.77 / 87.64 |
+| 8 | padded | 74.09 / 74.22 |
+
+Cross-check: the 4-GPU row ≡ the independent prod re-bench (26311413: 87.88 padded) at rep
+level. Scaling 4→8 holds under production physics too (87.8→74.1).
