@@ -17,7 +17,7 @@ source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
 unset FESOM_CG_CHEB
-C="--name core2 --mesh-dir data/mesh_core2 --dist-dir /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2 --steps 150 --dt 1800 \
+C="--name core2 --mesh-dir data/mesh_core2 --dist-dir /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2 --steps 150 --full 1 --dt 1800 \
    --ice 1 --mevp 1 --tke 1 --kpp 0 --gm 1 --zstar 1 --ic-dir data/ic_core2 --year 1958"
 echo "=== $(date) nodes=$SLURM_JOB_NODELIST fig10prod core2 (sha $(git rev-parse --short HEAD)) ==="
 run_pt() { local NP=$1 SN=$2 TR=$3 REP=$4

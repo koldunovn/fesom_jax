@@ -17,7 +17,7 @@ source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd /home/a/a270088/port_jax
 unset FESOM_CG_CHEB
-C="--name forca20 --mesh-dir /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20 --dist-dir /work/ab0995/a270088/meshes/FORCA20 --steps 150 --dt 240 \
+C="--name forca20 --mesh-dir /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20 --dist-dir /work/ab0995/a270088/meshes/FORCA20 --steps 150 --full 1 --dt 240 \
    --ice 1 --mevp 1 --tke 1 --kpp 0 --gm 0 --zstar 1 --ic-dir /work/ab0995/a270088/fesom_jax_meshes/mesh_forca20 --year 1958"
 echo "=== $(date) nodes=$SLURM_JOB_NODELIST fig10prod forca20_b (sha $(git rev-parse --short HEAD)) ==="
 run_pt() { local NP=$1 SN=$2 TR=$3 REP=$4
