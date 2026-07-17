@@ -328,3 +328,7 @@ trajectory; reps ≤0.3 %):** model=FULL(mevp+tke+gm+zstar+JRA1958)
 
 Cross-check: the 4-GPU row ≡ the independent prod re-bench (26311413: 87.88 padded) at rep
 level. Scaling 4→8 holds under production physics too (87.8→74.1).
+
+**farc (26331916, all 6 rows CLEAN, reps ≤0.2 %):** padded — 283.22/282.71 (4) ·
+198.75/198.43 (8) · 152.92/153.21 (16) ms. NOTE production physics is FASTER than the old
+uniform bench model here (283/199/153 vs 311/205/164): farc production drops GM and runs TKE.
