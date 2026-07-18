@@ -346,3 +346,10 @@ around the in-scan combine feeding the TKE stack); NOT a bench iteration.
 **NG5 optimized config FINAL: --local-forcing + cheb-degree 3, tables OFF** (−3.6 % at 32,
 reproducible). ng5-64 ao (cheb-only, TKE) submitted; the ng5-32 ao point is complete from
 this job. fig10 v2 ng5 rows are unaffected (levers off).
+
+**dars-64 (26331914, both rows CLEAN, max_uv=3.546):** ragged, 226.87/229.00 ms — again
+FASTER than the old uniform model (243: GM off + TKE). **Compile datum for the dars
+pathology: the KERNEL graph with the full production physics compiles in 66.5 s at dars-64**
+— vs ~80 min/executable for the production-loop graph at dars-8. Points at the
+run_from_config chunked graph (fold/unfold plumbing) × large shards, not the physics;
+dars_a (kernel prod-physics at 8/16/32) will nail the shard-size dependence.
