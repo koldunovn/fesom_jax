@@ -360,3 +360,7 @@ dars_a (kernel prod-physics at 8/16/32) will nail the shard-size dependence.
 **forca20 16/32 (26331919, all 4 rows CLEAN, reps ≤0.15 %):** ragged — 389.37/389.00 (16) ·
 258.14/258.06 (32) ms. Curve to 64 (26331917): 389→258→~244. Production physics again
 faster than the old uniform model (439/296 at 16/32).
+
+**ng5-32 (26331920, both rows CLEAN, max_uv=2.010, reps 0.02 %):** coloured,
+755.30/755.46 ms (peak 48.2 GiB) — production physics (TKE+mEVP+zstar) is −14 % vs the old
+uniform model here too (877 → 755: KPP→TKE + GM-off outweigh zstar+mEVP).
