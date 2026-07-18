@@ -392,3 +392,18 @@ cert, 21–53 % production-loop gains, adjoint 1.5e-13, NG5 exception); intro bu
 conclusions re-scoped (no 128/Kokkos claims; conclusions quote the measured optimization
 path). CPU paragraph KEPT its Kokkos/Fortran anchors (division-of-labour story — judgment
 call flagged to the user). PDF builds clean.
+
+## 18. dars-8 compile-cliff BISECT (26348710): the culprit is ZSTAR
+
+Time-boxed probes at the 435k-lane dars-8 shard: full KILLED@50m (control) ·
+**nozstar compiled in 41.3 s** · notke KILLED · nomevp KILLED. ⇒ the z★ machinery — prime
+suspect the per-CG-iteration stiffness increment (`stiff_increment_matvec`: element-gradient
++ edge-scatter assembly INSIDE the while_loop body) — trips a superlinear XLA pass above
+~300k-lane shards (fine at 240k/91 s and 280k/143 s). Old linfs model at the same shard: 172 s.
+
+**Future-work idea (not implemented): hoist the z★ increment out of the loop.** ΔA depends
+only on hbar, which is FIXED during a solve — its COO values could be assembled ONCE per step
+and added to the operator instead of being recomputed per iteration. Would likely fix both the
+compile cliff and some runtime; NOT bit-identical (different summation grouping) ⇒ needs the
+lever discipline (opt-in + gates + cert). Also upstream-reportable as a minimal XLA repro
+(while_loop body with a large segment_sum assembly). Paper note sharpened (paper_jax d55...).
