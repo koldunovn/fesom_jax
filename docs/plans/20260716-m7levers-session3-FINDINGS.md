@@ -364,3 +364,6 @@ faster than the old uniform model (439/296 at 16/32).
 **ng5-32 (26331920, both rows CLEAN, max_uv=2.010, reps 0.02 %):** coloured,
 755.30/755.46 ms (peak 48.2 GiB) — production physics (TKE+mEVP+zstar) is −14 % vs the old
 uniform model here too (877 → 755: KPP→TKE + GM-off outweigh zstar+mEVP).
+
+**ng5-64 (26331921, both rows CLEAN, reps 0.6 %):** coloured, 440.43/437.97 ms — 32→64
+doubling efficiency 86 %; again −10 % vs the old uniform model (487→439).
