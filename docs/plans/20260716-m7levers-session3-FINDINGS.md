@@ -356,3 +356,7 @@ dars_a (kernel prod-physics at 8/16/32) will nail the shard-size dependence.
 
 **forca20-64 (26331917, both rows CLEAN, max_uv=3.038):** ragged, 240.37/246.66 ms
 (reps 2.6 % — a touch noisier than usual; both finite).
+
+**forca20 16/32 (26331919, all 4 rows CLEAN, reps ≤0.15 %):** ragged — 389.37/389.00 (16) ·
+258.14/258.06 (32) ms. Curve to 64 (26331917): 389→258→~244. Production physics again
+faster than the old uniform model (439/296 at 16/32).
