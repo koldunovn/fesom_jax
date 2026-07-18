@@ -240,6 +240,27 @@ def test_grad_finite_difference(mesh, chain):
             f"comp {j}: AD {g_ad[j]:.6e} vs FD {gfd:.6e}"
 
 
+def test_grad_cheb_precond_independent(mesh, chain):
+    """CGPOLY AD gate: the implicit-diff gradient is PRECONDITIONER-INDEPENDENT.
+    ``custom_linear_solve`` computes the cotangent by a TIGHT transpose solve, so the
+    Chebyshev preconditioner changes only that solve's convergence path, never its
+    limit: d(Σ w·d_eta)/d(ssh_rhs) with cheb == with MITgcm == S⁻¹w to ~1e-9 —
+    even though the loose FORWARD iterates differ at the soltol level. This is the
+    lever's adjoint-safety contract."""
+    _, _, ssh_rhs, op = chain
+    opc = ssh.enable_cheb_precond(op, 3)
+    w = jnp.asarray(np.random.RandomState(3).randn(mesh.nod2D))
+
+    g_mit = np.asarray(jax.grad(lambda b: jnp.sum(w * ssh.solve_ssh(op, b)))(ssh_rhs))
+    g_chb = np.asarray(jax.grad(lambda b: jnp.sum(w * ssh.solve_ssh(opc, b)))(ssh_rhs))
+    u_ref = np.asarray(ssh.solve_ssh(op, w, forward_tol=1e-14))    # exact S⁻¹·w
+    assert np.all(np.isfinite(g_chb))
+    scale = float(np.max(np.abs(u_ref)))
+    assert np.max(np.abs(g_chb - u_ref)) <= 1e-9 * scale, "cheb adjoint != S^-1 w"
+    assert np.max(np.abs(g_chb - g_mit)) <= 1e-9 * scale, "cheb vs MITgcm adjoint drift"
+    print(f"CHEB_AD_OK rel(g_chb-u_ref)={np.max(np.abs(g_chb-u_ref))/scale:.2e}")
+
+
 def test_grad_flows_to_upstream_increment(mesh, chain):
     """Gradient flows through both substeps: d(Σ d_eta)/d(du) is finite & nonzero
     — exercising compute_ssh_rhs → custom_linear_solve end-to-end."""
