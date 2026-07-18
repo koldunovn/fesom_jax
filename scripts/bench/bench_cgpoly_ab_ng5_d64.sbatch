@@ -5,8 +5,8 @@
 # rises ~(1+k)/2-fold per iteration — pays where Allreduce latency dominates, i.e. HERE
 # (16 nodes, the fusions' regime map from session 2). Same-code env A/B (FESOM_CG_CHEB),
 # interleaved ×2, coloured transport (fastest at NG5-64, Phase 8d).
-# --warmup 30: CG iteration count settles ~step 30 from cold — an iteration-count lever
-# timed inside the spin-up window is understated.
+# NOTE the bench's --warmup flag is DEAD (parsed, never consumed) — standard cold
+# 25-step protocol, comparable with the fusion A/Bs and the NG5 halo confirms.
 #SBATCH --job-name=jax_cgpoly_ab_ng5
 #SBATCH -A ab0995_gpu
 #SBATCH -p gpu
@@ -26,7 +26,7 @@ cd /home/a/a270088/port_jax
 export JDIST=1 GPUS_PER_NODE=4
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1
 M=/work/ab0995/a270088/fesom_jax_meshes/mesh_ng5
-C="--name ng5 --mesh-dir $M --dist-dir $POOL/ng5 --npes 64 --steps 25 --warmup 30 \
+C="--name ng5 --mesh-dir $M --dist-dir $POOL/ng5 --npes 64 --steps 25 \
    --dt 180 --full 1 --halo coloured --ic-dir $M --year 1958"
 echo "=== $(date) nodes=$SLURM_JOB_NODELIST  CGPOLY A/B ng5-64 (sha $(git rev-parse --short HEAD)) ==="
 for REP in 1 2; do

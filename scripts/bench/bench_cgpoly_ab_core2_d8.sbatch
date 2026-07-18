@@ -4,8 +4,10 @@
 # SpMV-halos per apply while cutting iterations ⇒ roughly halo-neutral at small scale; the
 # judge point is NG5-64, bench_cgpoly_ab_ng5_d64.sbatch). Same-code env A/B: the legs differ
 # ONLY by FESOM_CG_CHEB (no worktrees needed — the lever is opt-in on one commit).
-# --warmup 30: the CG iteration count settles ~step 30 from cold (the Kokkos 300-step
-# protocol note) — timing before that UNDERSTATES an iteration-count lever.
+# NOTE the bench's --warmup flag is DEAD (parsed, never consumed — timing is the 2nd call
+# of one compiled N-step run from cold), so this is the standard cold 25-step protocol,
+# comparable with every other A/B in the campaign. The settled-regime iteration ratio is
+# pinned separately by the pytest gate (CHEB_ITERS on the captured real rhs).
 #SBATCH --job-name=jax_cgpoly_ab_core2
 #SBATCH -A ab0995_gpu
 #SBATCH -p gpu
@@ -25,7 +27,7 @@ cd /home/a/a270088/port_jax
 export JDIST=1 GPUS_PER_NODE=4
 POOL=/pool/data/AWICM/FESOM2/MESHES_FESOM2.1
 C="--name core2 --mesh-dir data/mesh_core2 --dist-dir $POOL/core2 --npes 8 \
-   --steps 25 --warmup 30 --dt 1800 --full 1 --mevp 1 --halo padded \
+   --steps 25 --dt 1800 --full 1 --mevp 1 --halo padded \
    --ic-dir data/ic_core2 --year 1958"
 echo "=== $(date) nodes=$SLURM_JOB_NODELIST  CGPOLY A/B core2-8 (sha $(git rev-parse --short HEAD)) ==="
 for REP in 1 2; do
