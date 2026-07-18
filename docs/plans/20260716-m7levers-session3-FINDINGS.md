@@ -379,3 +379,16 @@ cliff exactly as predicted (≤240k lanes). Prod-physics dars curve: 450→272�
 excluded from the prod-physics figure pending the bisect (the curve starts at 16 — an
 honest caption note: "the 8-GPU point is unmeasurable at production physics due to an XLA
 compile pathology under investigation").
+
+## 17. fig10 v2 PAPER PASS DONE (paper_jax 379340a, user-scoped 2026-07-18)
+
+Scope per user: production-physics figure WITHOUT the 128-GPU points (auto-land later via
+`make data`), Kokkos comparison COMMENTED OUT (restore notes at every site), optimization
+paragraph added. Delivered: PROD_MODEL exact-string selection in paths.py (anti-mix);
+JAX-only fig10; table/macros fully prod (coreStep 0.085, dars from 16, dars-8 excluded with
+an in-text XLA-pathology note); §5 protocol rewritten (bridge dissolved), decomposition from
+the production harness (58/14/9/5/3 ms), NEW "Optional accelerations" paragraph (levers,
+cert, 21–53 % production-loop gains, adjoint 1.5e-13, NG5 exception); intro bullet +
+conclusions re-scoped (no 128/Kokkos claims; conclusions quote the measured optimization
+path). CPU paragraph KEPT its Kokkos/Fortran anchors (division-of-labour story — judgment
+call flagged to the user). PDF builds clean.
