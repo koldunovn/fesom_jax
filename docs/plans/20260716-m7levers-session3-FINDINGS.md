@@ -353,3 +353,6 @@ pathology: the KERNEL graph with the full production physics compiles in 66.5 s 
 — vs ~80 min/executable for the production-loop graph at dars-8. Points at the
 run_from_config chunked graph (fold/unfold plumbing) × large shards, not the physics;
 dars_a (kernel prod-physics at 8/16/32) will nail the shard-size dependence.
+
+**forca20-64 (26331917, both rows CLEAN, max_uv=3.038):** ragged, 240.37/246.66 ms
+(reps 2.6 % — a touch noisier than usual; both finite).
