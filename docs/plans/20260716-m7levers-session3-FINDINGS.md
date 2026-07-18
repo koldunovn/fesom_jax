@@ -367,3 +367,7 @@ uniform model here too (877 → 755: KPP→TKE + GM-off outweigh zstar+mEVP).
 
 **ng5-64 (26331921, both rows CLEAN, reps 0.6 %):** coloured, 440.43/437.97 ms — 32→64
 doubling efficiency 86 %; again −10 % vs the old uniform model (487→439).
+
+**ng5-64 all-ON (26346561, TKE, ON = local+cheb only): OFF 857.6 → ON 818.4 ms/step =
+−4.6 %** (chunks 3+, ×2 reps). NG5 optimized points complete: −3.6 % @32, −4.6 % @64.
+All-ON envelope now complete EXCEPT dars (held on the compile cliff).
