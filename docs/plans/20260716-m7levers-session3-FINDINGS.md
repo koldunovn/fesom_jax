@@ -371,3 +371,11 @@ doubling efficiency 86 %; again −10 % vs the old uniform model (487→439).
 **ng5-64 all-ON (26346561, TKE, ON = local+cheb only): OFF 857.6 → ON 818.4 ms/step =
 −4.6 %** (chunks 3+, ×2 reps). NG5 optimized points complete: −3.6 % @32, −4.6 % @64.
 All-ON envelope now complete EXCEPT dars (held on the compile cliff).
+
+**dars 16/32 (26348702, all 4 rows CLEAN, max_uv=3.546, reps ≤0.3 %):** ragged —
+451.08/449.85 (16, compile 91 s) · 271.90/271.92 (32, compile 66 s). Below the compile
+cliff exactly as predicted (≤240k lanes). Prod-physics dars curve: 450→272→228 @16/32/64
+(doubling eff 83 %/60 %), again faster than the uniform model (497/291/243). dars-8 stays
+excluded from the prod-physics figure pending the bisect (the curve starts at 16 — an
+honest caption note: "the 8-GPU point is unmeasurable at production physics due to an XLA
+compile pathology under investigation").
