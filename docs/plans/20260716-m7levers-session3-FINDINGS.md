@@ -332,3 +332,17 @@ level. Scaling 4→8 holds under production physics too (87.8→74.1).
 **farc (26331916, all 6 rows CLEAN, reps ≤0.2 %):** padded — 283.22/282.71 (4) ·
 198.75/198.43 (8) · 152.92/153.21 (16) ms. NOTE production physics is FASTER than the old
 uniform bench model here (283/199/153 vs 311/205/164): farc production drops GM and runs TKE.
+
+## 16. NG5-TKE verdict (26324321): the tables pathology is NOT KPP — it is the LOCAL-tables
+path × downstream graph, and TKE makes it 5× WORSE
+
+ng5-32 TKE, ×2 reps each (chunks 3+): off 1261/1253 · **cheb-only 1210/1215 (−3.6 %)** ·
+**tables+cheb 6378/6372 (+407 % — FIVE TIMES slower; host share 0.3 % ⇒ all device)**.
+Under KPP the same tables path cost +31 % ⇒ KPP exonerated; the discriminator vs the healthy
+meshes (which run TKE + GLOBAL tables) is the LOCAL-tables route (NG5 = its only user), with
+severity modulated by the consumer graph (TKE ≫ KPP). Filed under
+`TABLES_NG5_DEVICE_REGRESSION`: needs an HLO-level look (suspect: fusion/remat catastrophe
+around the in-scan combine feeding the TKE stack); NOT a bench iteration.
+**NG5 optimized config FINAL: --local-forcing + cheb-degree 3, tables OFF** (−3.6 % at 32,
+reproducible). ng5-64 ao (cheb-only, TKE) submitted; the ng5-32 ao point is complete from
+this job. fig10 v2 ng5 rows are unaffected (levers off).
