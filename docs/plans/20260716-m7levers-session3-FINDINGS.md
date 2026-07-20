@@ -417,3 +417,7 @@ compile 75 s. The dist_128 no-wsplit blowup risk did NOT materialize at dt=120 �
 protocol artifact; the "turns over at 128" language returns for dars when the figure updates
 (ng5-128/forca20-128 pending). NOTE: the user renamed "code twin"→"code shadow" across the
 paper (intro/conclusions rewritten) — all future edits must use SHADOW terminology.
+
+**forca20-128 (26331918, both reps CLEAN, max_uv=3.037):** ragged, 354.93/336.60 ms (reps
+5.4 % — comm-dominated noise) — **forca20 also anti-scales 64→128** (244→~346). Compile
+wobble: rep1 619 s vs rep2 86 s (excluded from timing; noted).
