@@ -421,3 +421,14 @@ paper (intro/conclusions rewritten) — all future edits must use SHADOW termino
 **forca20-128 (26331918, both reps CLEAN, max_uv=3.037):** ragged, 354.93/336.60 ms (reps
 5.4 % — comm-dominated noise) — **forca20 also anti-scales 64→128** (244→~346). Compile
 wobble: rep1 619 s vs rep2 86 s (excluded from timing; noted).
+
+## 20. CAMPAIGN COMPLETE (2026-07-20): all far points in — the partition-size wall
+
+**ng5-128 (26331922, CLEAN, reps 0.2 %):** coloured, 348.13/348.97 ms — **NG5 STILL SCALES
+at 128** (439→348, 63 % doubling eff, 58k nodes/GPU). With dars-128 (turns over, 25k/GPU)
+and forca20-128 (turns over, 17k/GPU) the hierarchy states ONE rule: the communication wall
+is set by per-GPU partition size (~≲25k nodes), not GPU count — CORE2 hits it at 8 GPUs,
+dars/forca20 at 128, NG5 not yet. fig10 now complete 1–128 GPUs, every row verified finite;
+§5 turnover sentence restored with the partition-size framing; intro/conclusions back to
+"128 GPUs" (SHADOW terminology per the user's manuscript pass). Both wsplit twins cancelled
+unstarted (originals finite). paper_jax 15222b1. Ready for the final Overleaf sync.
