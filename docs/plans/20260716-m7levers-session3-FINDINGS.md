@@ -407,3 +407,13 @@ and added to the operator instead of being recomputed per iteration. Would likel
 compile cliff and some runtime; NOT bit-identical (different summation grouping) ⇒ needs the
 lever discipline (opt-in + gates + cert). Also upstream-reportable as a minimal XLA repro
 (while_loop body with a large segment_sum assembly). Paper note sharpened (paper_jax d55...).
+
+## 19. dars-128 far point (26331915): CLEAN — and the curve genuinely turns over
+
+Both reps bench-finite (max_uv=3.546, identical to 16/32/64): 291.52/296.50 ms, ragged,
+compile 75 s. The dist_128 no-wsplit blowup risk did NOT materialize at dt=120 ⇒ wsplit twin
+26360576 cancelled unstarted (user decision: no wsplit re-measure). **dars anti-scales 64→128
+(227→292 ms) under the honest protocol** — the turnover at 24k nodes/GPU is real, not the old
+protocol artifact; the "turns over at 128" language returns for dars when the figure updates
+(ng5-128/forca20-128 pending). NOTE: the user renamed "code twin"→"code shadow" across the
+paper (intro/conclusions rewritten) — all future edits must use SHADOW terminology.
