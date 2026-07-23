@@ -432,3 +432,24 @@ dars/forca20 at 128, NG5 not yet. fig10 now complete 1–128 GPUs, every row ver
 §5 turnover sentence restored with the partition-size framing; intro/conclusions back to
 "128 GPUs" (SHADOW terminology per the user's manuscript pass). Both wsplit twins cancelled
 unstarted (originals finite). paper_jax 15222b1. Ready for the final Overleaf sync.
+
+## 21. 128-GPU TURNOVER RACE (26385868): NOT a fluke — and NOT a wall. It was the TRANSPORT.
+
+Fresh 32-node allocation, prod physics, all four legs bench-finite:
+| point | banked ragged | race ragged | race COLOURED |
+|---|---|---|---|
+| dars-128 | 291.5/296.5 | 302.7 (reproduces ⇒ no fluke) | **189.7** |
+| forca20-128 | 354.9/336.6 | 348.7 (reproduces) | **235.8** |
+
+**The §20 "partition-size wall at ≲25k nodes/GPU" rule is FALSIFIED as stated**: on the
+P-independent coloured transport dars KEEPS SCALING to 128 (227→190, 60 % doubling eff) and
+forca20 flattens without degrading (240→236). The turnover was the ragged all-to-all's
+P-scaling (P doubled 64→128) — precisely the cost structure the paper's transport table
+describes, now demonstrated at scale. With per-point best transport, NO mesh turns over in
+the measured range; core2's saturation at 8 GPUs remains the only genuine plateau.
+
+Pending before the paper rewrite (frozen protocol: min 2 reps): coloured rep2 at 128
+(26433532) + coloured ×2 at 64 for dars/forca20 (26433533 — those points were only ever
+measured ragged; the crossover to coloured may sit at or below 64). Then: figure re-selects
+best transport automatically (same model string, best-per-ngpu), §5 protocol line + turnover
+paragraph rewritten, intro/conclusions "stops scaling" claims re-scoped.
