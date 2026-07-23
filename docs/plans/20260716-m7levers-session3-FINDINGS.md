@@ -453,3 +453,18 @@ Pending before the paper rewrite (frozen protocol: min 2 reps): coloured rep2 at
 measured ragged; the crossover to coloured may sit at or below 64). Then: figure re-selects
 best transport automatically (same model string, best-per-ngpu), §5 protocol line + turnover
 paragraph rewritten, intro/conclusions "stops scaling" claims re-scoped.
+
+## 22. TRANSPORT FIX PROMOTED — paper coherent (2026-07-21, paper_jax f2e242c)
+
+rep2 (26433532) confirms coloured-128: dars 188.9 (rep1 189.7), forca20 234.1 (rep1 235.8) —
+2-rep, bench-finite. The hold is released. Coordinated pass:
+- best-transport-per-point selects coloured at 64/128 ⇒ dars 450/272/217/189, forca20
+  389/258/233/234, ng5 755/438/348 — NO mesh turns over; only CORE2 saturates (8 GPUs).
+- §5 turnover paragraph REWRITTEN (turnover = ragged's P-scaling, not a partition wall; coloured
+  P-independent removes it; best-transport-per-point). intro/conclusions re-scoped. macros:
+  darsStepOneTwentyEight 0.29→0.19, forcaStepOneTwentyEight 0.34→0.23, darsEffSixtyFour 60→63.
+- farc production dt 900→1200 (20 min, user; forca20 stays 240 — mixup corrected).
+- fig10 + 3-panel Kokkos preview regenerated; main.pdf clean.
+**Paper performance story is now internally consistent and reflects the honest best-transport
+scaling.** The Kokkos comparison stays a preview (fig10_preview_kokkos_3panel.pdf), NOT in the
+build. Overleaf sync pending (user).
