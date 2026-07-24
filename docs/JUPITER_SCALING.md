@@ -4,7 +4,19 @@ Clone-and-run instructions to reproduce the Levante strong-scaling campaign on t
 exascale system **JUPITER** (GH200 Grace–Hopper nodes). Levante tops out at 16 nodes /
 64 GPUs; JUPITER is where NG5/dars scale past that.
 
-> **Status.** The *code* and the *launch pattern* below are the exact ones the Levante
+> **⚠️ THIS PLAN HAS BEEN EXECUTED — read [`JUPITER_SCALING_FINDINGS.md`](JUPITER_SCALING_FINDINGS.md) first.**
+> The campaign ran on 2026-07-23 and the FINDINGS file supersedes every `⚠️VERIFY` marker
+> below, plus three things this plan got wrong:
+> 1. **§2 the "crux" is a non-issue** — no NGC container needed; a plain venv +
+>    `pip install "jax[cuda12]==0.10.1"` gives GPU JAX on aarch64 in ~3.5 min. (The JSC
+>    `jax/0.8.1` module is **CPU-only** and unusable.)
+> 2. **§1 the data transfer is unnecessary** — `data/mesh_core2` does *not* ship in the repo
+>    (only the `pi` mesh does; Levante's `data/` was a /work symlink), and
+>    `scripts/prepare_mesh.py` regenerates every export on JUPITER instead of moving 24 GB.
+> 3. **§4 "padded ≤16 GPUs, coloured beyond" is WRONG on JUPITER** — use `coloured` for every
+>    multi-node point. Padded is bandwidth-bound and collapses ~4× under fabric contention.
+>
+> *Original status.* The *code* and the *launch pattern* below are the exact ones the Levante
 > campaign used (verified). Everything JUPITER-specific — module/container names,
 > partitions, account, filesystem paths, NCCL fabric settings — is marked **⚠️VERIFY**
 > and must be checked on the machine; they were not tested here (no JUPITER access from
