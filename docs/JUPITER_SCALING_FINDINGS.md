@@ -411,13 +411,23 @@ host-side compile at all.
 Anchors re-run at the END of the same job confirm no drift over its 1 h 40 m:
 P=64 235.9 → **251.6**, P=256 247.7 → **248.9**.
 
-**Status: the effect is confirmed; the root cause is OPEN after TEN eliminated hypotheses.**
-Full record, and the ranked next experiments, in
-**[`HANDOFF-20260724-ng5-128-cliff.md`](HANDOFF-20260724-ng5-128-cliff.md)**. Eliminated:
-bad node · machine state · node balance · elem/edge balance · coloured buffer volume ·
-colouring rounds K · SSH `nnz_max` (max/mean 1.011) · device count (dars at P=128 is normal) ·
-raw collective performance at 64/128/256 GPUs (`ppermute` **flat**: 64.5 / 65.6 / 70.1 µs) ·
-CG non-convergence (iteration counts **identical** at all P: 86/99/97, `hit_cap=0`).
+**Status (updated 2026-07-24, ablation job 1035822): the cliff is LOCALISED — it requires
+zstar AND ice together.** At P=128, same allocation: baseline-prod 649.5 ms and tke-OFF
+644.0 ms (both CLIFF, true compile ~58–64 s) vs zstar-OFF 222.2 ms, ice-OFF 193.4 ms,
+ocean-only 171.3 ms (all healthy, ratios 0.83–0.91 vs their own P=64). The excess is a
+JOINT term: removing either member removes the same ~430–456 ms, so it belongs to no
+single component's ops — the signature of a global execution-mode switch (collective
+overlap loss), matching the serialized-collective arithmetic (~9,400 ppermute rounds/step
+× ~65 µs ≈ 610 ms). Compile inflation decouples: it follows zstar alone (ice-OFF keeps
+zstar: healthy runtime, compile still 2×). Full record, verdict table and the running
+HLO-diff (job 1036111) + nsys (1036137) experiments in
+**[`HANDOFF-20260724-ng5-128-cliff.md`](HANDOFF-20260724-ng5-128-cliff.md)**. Eliminated
+(now twelve): bad node · machine state · node balance · elem/edge balance · coloured buffer
+volume · colouring rounds K · SSH `nnz_max` (max/mean 1.011) · device count (dars at P=128
+is normal) · raw collective performance at 64/128/256 GPUs (`ppermute` **flat**: 64.5 /
+65.6 / 70.1 µs) · CG non-convergence (iteration counts **identical** at all P: 86/99/97,
+`hit_cap=0`) · partition exchange structure at elem/edge kinds (clean at all P,
+`partition_structure.py`) · any SINGLE physics component (the ablation).
 
 Two facts now constrain any explanation:
 
