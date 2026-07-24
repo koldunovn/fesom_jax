@@ -411,8 +411,16 @@ host-side compile at all.
 Anchors re-run at the END of the same job confirm no drift over its 1 h 40 m:
 P=64 235.9 → **251.6**, P=256 247.7 → **248.9**.
 
-**Status (updated 2026-07-24, ablation job 1035822): the cliff is LOCALISED — it requires
-zstar AND ice together.** At P=128, same allocation: baseline-prod 649.5 ms and tke-OFF
+**Status (updated 2026-07-24 evening): ROOT CAUSE FOUND — one XLA fusion decision.** At
+exactly the ng5/dist_128 shape (`Lmax_nod=59637`) XLA's `multi_output_fusion` merges the
+per-step surface-flux balance reduction (`sss_runoff._area_mean`) into the 1,425-op vmapped
+ice-thermodynamics fusion, flipping it from `kind=kLoop` (pure elementwise, what P=64/256
+get) to `kind=kInput` (reduction-emitter codegen) — and that kernel runs **383 ms once per
+step** (nsys job 1036137), which is the whole cliff. The zstar×ice joint dependence is the
+dataflow ice-thermo → water_flux/virtual_salt → balance mean → zstar SSH consumers that
+exists only with both on. Fix: `FESOM_BALANCE_BARRIER=1` (`lax.optimization_barrier` on the
+`_area_mean` input, byte-identical numerics), confirmation job 1036604. Full chain of
+evidence in the handoff. Earlier same day, the ablation had localised it: At P=128, same allocation: baseline-prod 649.5 ms and tke-OFF
 644.0 ms (both CLIFF, true compile ~58–64 s) vs zstar-OFF 222.2 ms, ice-OFF 193.4 ms,
 ocean-only 171.3 ms (all healthy, ratios 0.83–0.91 vs their own P=64). The excess is a
 JOINT term: removing either member removes the same ~430–456 ms, so it belongs to no

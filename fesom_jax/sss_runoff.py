@@ -41,6 +41,7 @@ the new month where ``month_now`` is already the new month. ⚠️ The runoff mi
 from __future__ import annotations
 
 import dataclasses
+import os
 from typing import NamedTuple
 
 import numpy as np
@@ -48,6 +49,7 @@ import netCDF4
 from scipy.ndimage import uniform_filter
 
 import jax.numpy as jnp
+from jax import lax
 
 from . import paths
 from .config import RAD
@@ -257,7 +259,18 @@ def _area_mean(x, areasvol_surf, ocean_area, *, owned_mask=None, axis_name=None)
     Phase 8: when ``owned_mask`` is given (sharded path, S.7 threads it in) the sum is
     an owned-node sum + ``psum`` over devices via :func:`reductions.global_sum`. The
     default (``owned_mask=None``) is the **exact** single-device ``jnp.sum`` ⇒ the
-    ``npes==1`` path is byte-identical to ``v1.0``."""
+    ``npes==1`` path is byte-identical to ``v1.0``.
+
+    ``FESOM_BALANCE_BARRIER=1`` (env, trace-time static) puts a
+    ``lax.optimization_barrier`` on ``x`` first — semantically the identity, numerically
+    byte-identical, but it stops XLA fusing this reduction into its producer.  Added for
+    the ng5 x P=128 cliff (HANDOFF-20260724): at exactly those shapes XLA's
+    multi_output_fusion merged this reduce + the whole vmapped ice-thermodynamics
+    producer + the post-subtract consumers into one 1,425-op kInput fusion whose kernel
+    runs 383 ms (nsys job 1036137) — the entire 2.7x cliff.  The barrier costs one
+    [Lmax_nod] f64 materialisation (~0.5 MB) per call."""
+    if os.environ.get("FESOM_BALANCE_BARRIER"):
+        x = lax.optimization_barrier(x)
     if owned_mask is None:
         return jnp.sum(x * areasvol_surf) / ocean_area
     from . import reductions

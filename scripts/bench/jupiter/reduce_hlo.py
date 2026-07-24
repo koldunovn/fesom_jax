@@ -63,14 +63,15 @@ def parse(path: Path):
     distance ~1 (done immediately follows start); a hidden collective has a large one."""
     total, per_comp, fus, wnames = Counter(), {}, Counter(), set()
     overlap = {}                # opcode-base -> list of distances
-    comp, pos, start_pos = None, 0, {}
+    inflight = {}               # comp -> max concurrent open async collectives
+    comp, pos, start_pos, live = None, 0, {}, 0
     with open(path, errors="replace") as f:
         for line in f:
             m = _COMP.match(line)
             if m:
                 comp = m.group(1)
                 per_comp.setdefault(comp, Counter())
-                pos, start_pos = 0, {}
+                pos, start_pos, live = 0, {}, 0
                 continue
             m = _ASSIGN.match(line)
             if m:
@@ -90,12 +91,16 @@ def parse(path: Path):
                     nm = _RESNAME.match(line)
                     if nm:
                         start_pos[nm.group(1)] = (op[:-6], pos)
+                        live += 1
+                        if comp:
+                            inflight[comp] = max(inflight.get(comp, 0), live)
                 elif op.endswith("-done"):
                     om = _OPERAND.search(line.split("=", 1)[1])
                     if om and om.group(1) in start_pos:
                         base, p0 = start_pos.pop(om.group(1))
                         overlap.setdefault(base, []).append(pos - p0)
-    return total, per_comp, fus, wnames, overlap
+                        live -= 1
+    return total, per_comp, fus, wnames, overlap, inflight
 
 
 def biggest_after_opt(d: Path) -> Path | None:
@@ -123,11 +128,11 @@ def main():
         if f is None:
             print(f"[reduce_hlo] {d.name}: NO after_optimizations dump", file=sys.stderr)
             continue
-        total, per_comp, fus, wnames, overlap = parse(f)
+        total, per_comp, fus, wnames, overlap, inflight = parse(f)
         while_bodies = {c: cnt for c, cnt in per_comp.items() if c in wnames}
         results[d.name] = dict(file=f.name, size=f.stat().st_size, total=total,
                                per_comp=per_comp, fus=fus, wb=while_bodies,
-                               overlap=overlap)
+                               overlap=overlap, inflight=inflight)
 
     names = list(results)
     print(f"{'':34s} " + " ".join(f"{n:>14s}" for n in names))
@@ -162,6 +167,16 @@ def main():
         for c, cnt in top:
             keys = ", ".join(f"{o}:{v}" for o, v in cnt.most_common(6))
             print(f"   {sum(cnt.values()):7d}  {c[:80]:80s} {keys}")
+        print(f"-- {n}: while bodies (instrs / cp-start / ar-start / ag-start / max-inflight)")
+        for c, cnt in sorted(results[n]["wb"].items(),
+                             key=lambda kv: -sum(kv[1].values())):
+            tot = sum(cnt.values())
+            if tot < 30:
+                continue
+            print(f"   {tot:7d}  cp:{cnt['collective-permute-start']:4d} "
+                  f"ar:{cnt['all-reduce-start']:3d} ag:{cnt['all-gather-start']:3d} "
+                  f"dus:{cnt['dynamic-update-slice']:3d} "
+                  f"maxinflight:{results[n]['inflight'].get(c, 0):3d}  {c[:60]}")
 
 
 if __name__ == "__main__":
