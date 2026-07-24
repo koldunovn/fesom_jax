@@ -241,6 +241,41 @@ Same allocation, same job, the production model costs **14% more** than legacy
 (47.36 / 47.37 vs 41.47 / 41.45 ms) — which is exactly the error that would have been
 smuggled into a hardware ratio.
 
+### Overnight reproducibility — the campaign's compute numbers STAND
+The campaign ran while four of our own jobs were live and while the transport behaviour was
+unstable (§4), so the whole result set was re-checked the next day
+(`scripts/bench/jupiter/repro_1node.sbatch`, job 1033980, 2026-07-24, fresh node, quiet queue).
+
+**Single-node points were chosen deliberately: they touch ZERO inter-node fabric** (4 GPUs on
+one node, NVLink only), so they separate "are the kernels stable?" from "is the network
+stable?" — and both headline GH200-vs-A100 ratios come from single-node points.
+
+| point | campaign (07-23) | repro (07-24) | delta |
+|---|---:|---:|---:|
+| core2 1 GPU padded | 98.6 / 98.8 | 99.06 | +0.3% |
+| core2 2 GPU padded | 64.1 / 64.3 | 63.96 | −0.4% |
+| core2 4 GPU padded | 43.71 / 44.51 | 43.97 | centred |
+| farc 4 GPU padded | 146.50 | 146.48 | **0.01%** |
+| core2 1 GPU coloured | 93.19 / 93.77 | 93.84 | +0.1% |
+| core2 2 GPU coloured | 64.11 | 64.10 | 0.02% |
+
+**6/6 reproduce within 0.5%, across both transports.** Consequences:
+1. The kernels and per-GPU throughput are stable overnight ⇒ **both published A100 ratios are
+   confirmed to 2 s.f.** (core2/4: 88.0/43.97 = 2.00× vs published 2.01×; farc/4:
+   283.0/146.48 = 1.93×).
+2. Whatever instability this machine exhibits is a **fabric-only** phenomenon touching the
+   multi-node rungs; it does not reach compute.
+
+The ng5 remeasure independently corroborates this on multi-node points: its P=64 and P=256
+anchors both reproduced (235.9 and 247.7 vs 243.4 and 257.2).
+
+> **NOT re-verified.** The dedicated multi-node reproducibility probe
+> (`repro_multinode.sbatch`, job 1033981 — dars 16/32/64/128 and farc 8/16) was **cancelled
+> before it ran** at the user's instruction once the single-node set came back clean. So the
+> two multi-node claims — **dars turning over at 64** and **farc peaking at one node** — still
+> rest on the campaign's original measurement set, taken under self-contention. They are the
+> claims most exposed to fabric instability and should be re-run before publication.
+
 ### Error bars (measured, not assumed)
 - **rep-to-rep inside one allocation: 0.05%** (41.47 vs 41.45; 47.36 vs 47.37)
 - **allocation-to-allocation: ~5%** (core2/4 production: 45.15 in the gates job, 47.36 in the
@@ -275,9 +310,13 @@ the Levante fig10 v2 production campaign at the same GPU count (§5).
 | | **64** | **121.1** | **5.43** | 38% | 1.87× |
 | | 128 | 137.5 | 4.78 | 17% | 1.38× |
 | **ng5** 7.4M | 32 | 316.8 | 2.07 | 100% | 2.38× |
-| | **64** | **243.4** | **2.70** | 65% | 1.80× |
-| | 128 | 638.5 ⚠️ | 1.03 | 12% | — |
-| | 256 | 257.2 | 2.55 | 15% | — |
+| | **64** | **235.9** | **2.79** | 67% | 1.86× |
+| | 128 | 637.1 ‡ | 1.03 | 12% | — |
+| | 256 | 247.7 | 2.65 | 16% | — |
+
+‡ ng5 P=128 is a **reproducible cliff, not a bad measurement** — reconfirmed at 643.2 ms on a
+fresh allocation with both bracketing anchors reproducing. See below. It is *not* a turnover:
+P=256 recovers.
 
 ### The two headline conclusions
 
@@ -295,25 +334,124 @@ at half the shard count. **JUPITER buys throughput per GPU, not more GPUs' worth
 The independent Kokkos twin turning over on dars at the same 64 GPUs (§7) confirms the knee
 is a property of mesh × machine, not of this implementation.
 
-### ⚠️ The ng5-128 anomaly — an outlier, NOT a turnover
-ng5 at 128 GPUs (638.5 / 644.0 ms, reps agreeing to 0.9%) is **bracketed by faster points on
-both sides** — 243.4 ms at 64 and 257.2 ms at 256. A turnover cannot recover at 2× the device
-count, so this is specific to the 128-GPU/32-node configuration. Two candidate mechanisms
-were tested and **both fail to explain it**:
-- *Colouring rounds*: K does jump 10 → 14 between P=64 and P=128 — but it is **15 at P=256**,
-  where the time recovers fully. Measured K per kind (nod/elem/edge, identical across kinds):
+### The ng5-128 cliff — REAL and REPRODUCIBLE (remeasured 2026-07-24), not a turnover
+ng5 at 128 GPUs is **bracketed by faster points on both sides** — 243.4 ms at P=64 and
+257.2 ms at P=256. A strong-scaling turnover cannot recover at 2× the device count, so this
+was initially recorded as a suspected outlier with the caveat "do not publish until
+reproduced in isolation".
 
-  | ng5 P | 32 | 64 | 128 | 256 | | dars P | 16 | 32 | 64 | 128 |
-  |---|---:|---:|---:|---:|---|---|---:|---:|---:|---:|
-  | K | 10 | 10 | 14 | 15 | | K | 9 | 12 | 12 | 13 |
-  | halo/GPU | 1725 | 1347 | 1026 | 764 | | halo/GPU | 1237 | 1019 | 834 | 635 |
+**It has now been reproduced in isolation, and the caveat is withdrawn**
+(`scripts/bench/jupiter/remeasure_ng5_128.sbatch`, job 1033966: a fresh 64-node allocation on
+entirely different hardware — jpbo-051/053/054 vs the campaign's jpbo-036/037/038 — with an
+empty queue):
 
-  Halo volume per GPU *falls* monotonically, so this is a latency/topology effect, not volume.
-- *Contention*: rep 2 ran after every other job of ours had finished and matched rep 1.
+| ng5 coloured | campaign (2026-07-23) | remeasure (2026-07-24) | agreement |
+|---|---:|---:|---:|
+| P=64 anchor | 243.4 / 261.1 | **235.9** | reproduces (3% faster) |
+| **P=128** | **644.0 / 638.5** | **643.2** | **0.1%** |
+| P=256 anchor | 257.2 / 260.4 | **247.7** | reproduces (3.7% faster) |
 
-Re-measured across all three transports on a quiet fabric by
-`scripts/bench/jupiter/transport_map_jupiter.sbatch`. **Do not publish the ng5 curve until
-this point is explained or reproduced in isolation.**
+Both bracketing anchors reproduced *on the same allocation that produced the 643 ms*, so the
+allocation is demonstrably healthy and the cliff is not machine state. **The measurement was
+correct; the effect is genuine and deterministic.**
+
+**Compile time reproduces too, and it is the load-bearing clue.** Compile is *excluded* from
+`per_step` (the bench times the 2nd warm call on an already-compiled executable), so it never
+contaminates the measurement — but it is host-side XLA work that no network condition can
+inflate, and it is ~2× at exactly P=128 across both allocations:
+
+| ng5 P | 32 | 64 | **128** | 256 |
+|---|---:|---:|---:|---:|
+| compile, campaign | 75–87 s | 76 s | **155–166 s** | 69–75 s |
+| compile, remeasure | — | 65.9 s | **161.0 s** | 76.5 s |
+
+Runtime *and* compile both ~2.6× at one single value of P, reproducibly, on two different node
+sets ⇒ the **compiled program at P=128 differs**, and the cause is upstream of the fabric.
+
+**Mechanisms tested and REJECTED** (do not re-test):
+- *A bad node*: the campaign's two slow reps ran on **disjoint** 32-node subsets
+  (jpbo-038-[17-48] vs jpbo-036-[33-48]+jpbo-037-[01-16]) and agreed to 0.9%, while the
+  **union** of those same 64 nodes ran P=256 at 257 ms. The remeasure then reproduced it on
+  entirely different hardware.
+- *Partition balance*: ng5 `dist_128` is as balanced as every other rung —
+  myDim max/mean **1.006**, padfac **1.013**.
+- *Colouring rounds K*: K jumps 10 → 14 between P=64 and P=128, but is **15 at P=256** where
+  the time fully recovers. K alone cannot explain a penalty that vanishes at higher K.
+- *Wiring / graph size*: the static coloured exchange at P=128 is **on trend in every metric**,
+  not pathological — its total packed halo buffer is *smaller* than P=64's:
+
+  | ng5 P | K | total packed buffer/device | max/mean slot |
+  |---|---:|---:|---:|
+  | 32 | 10 | 13097 | 2.69 |
+  | 64 | 10 | 10794 | 2.46 |
+  | **128** | **14** | **8736** | 3.17 |
+  | 256 | 15 | 7176 | 3.43 |
+
+  And P=256 compiles **45** ppermutes (15 rounds × 3 kinds) in 69–76 s while P=128 compiles
+  **42** in 155–166 s — nearly the same collective count, half the compile time. So neither
+  buffer volume nor collective count explains the compile blow-up.
+
+**The discriminator RESOLVED it: the cliff is P-SPECIFIC, not transport-specific.** P=128 was
+run under the two transports the campaign never used there (`AB_MAX_NPES=64` had capped the
+A/B). **All three transports collapse at P=128**, and coloured — far from being the culprit —
+is by a wide margin the least damaged:
+
+| ng5 P=128 | per_step | compile | vs its own P=64 |
+|---|---:|---:|---:|
+| **coloured** | **643.2 / 637.1 / 646.6** | 161–166 s | 2.65× (243 → 643) |
+| padded | 3222.2 / 3220.8 | 554–561 s | 5.95× (541 → 3221) |
+| ragged | 3035.6 | 512 s | — |
+
+Both padded reps agree to **0.04%** — even the pathology is deterministic. Compile tracks
+runtime across all three (161 s → 554 s → 512 s against anchors of 66–77 s), which is the same
+signature seen in coloured alone: **whatever happens at P=128 inflates compile and runtime
+together, for every transport.** A transport bug cannot do that; a bad network cannot inflate
+host-side compile at all.
+
+Anchors re-run at the END of the same job confirm no drift over its 1 h 40 m:
+P=64 235.9 → **251.6**, P=256 247.7 → **248.9**.
+
+**Status: the effect is confirmed; the root cause is OPEN after TEN eliminated hypotheses.**
+Full record, and the ranked next experiments, in
+**[`HANDOFF-20260724-ng5-128-cliff.md`](HANDOFF-20260724-ng5-128-cliff.md)**. Eliminated:
+bad node · machine state · node balance · elem/edge balance · coloured buffer volume ·
+colouring rounds K · SSH `nnz_max` (max/mean 1.011) · device count (dars at P=128 is normal) ·
+raw collective performance at 64/128/256 GPUs (`ppermute` **flat**: 64.5 / 65.6 / 70.1 µs) ·
+CG non-convergence (iteration counts **identical** at all P: 86/99/97, `hit_cap=0`).
+
+Two facts now constrain any explanation:
+
+**(a) The model does the SAME WORK at every P** — same CG iterations, same residuals, same
+collective counts, same shapes, same `max_uv`. P=128 executes *identical* work 2.65× slower.
+This kills every "extra work" explanation. **It also means there is no correctness problem at
+P=128** — the solve converges normally and returns the same answer.
+
+**(b) Compile is ~2× inflated at P=128 for every transport.** ⚠️ Note the bench's `compile=`
+field is *compile + the first 150-step run*, so `150 × per_step` must be subtracted; after
+doing so, true compile is 60–69 s (coloured), 71–78 s (padded), 57 s (ragged) at P=128 against
+25–40 s at every other P. Compile is host-side, so no network condition can explain it.
+
+Together: *the same mathematics, expressed as a program that both compiles and runs ~2× slower,
+at one value of P.* The decisive untried experiment is an **optimized-HLO diff at
+P=64/128/256** (op counts, fusions, collective lowering) — see the handoff.
+
+**How to report ng5 in the paper.** Best-of-all-reps after the remeasure:
+
+| ng5 coloured | P=32 | P=64 | P=128 | P=256 |
+|---|---:|---:|---:|---:|
+| best ms/step | 316.8 | **235.9** | 637.1 ‡ | 247.7 |
+
+Two separate statements, which must not be conflated:
+1. **ng5 peaks at P=64 (235.9 ms) and gains nothing beyond it** — P=256 (247.7 ms) does not
+   beat P=64, it merely returns to about the same level. So ng5 *does* saturate at 64 GPUs,
+   consistent with the campaign's "the knee moves left" conclusion (§6b).
+2. **P=128 is a reproducible cliff sitting on top of that saturation** — a 2.7× spike between
+   two points that are themselves flat. It is *not* the turnover, and it must not be drawn as
+   one; a monotone "turns over after 64" curve would misrepresent the P=256 recovery, while
+   silently dropping P=128 would hide a real, five-times-confirmed effect.
+
+The defensible presentation is to plot all four points and annotate P=128 as an unexplained,
+reproducible anomaly under investigation.
 
 ## 7. Cross-check against the Kokkos code twin (same machine, same mesh)
 

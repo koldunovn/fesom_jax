@@ -35,6 +35,7 @@ Literal vectorized port of ``fesom_ssh.c`` for the Phase-2 pi config (linfs ALE,
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import jax
 import jax.numpy as jnp
@@ -560,6 +561,17 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
 
         init = (x0, r0, z0, z0, sold0, resid0, jnp.array(0))
         final = lax.while_loop(cond, body, init)
+        # DIAGNOSTIC (env-gated, inert by default): report the PCG trip count + whether it
+        # STOPPED ON maxiter rather than on the tolerance.  Added while chasing the ng5 x
+        # P=128 cliff: the loop is data-dependent, so a configuration that stops converging
+        # and runs to MAXITER (=500, vs the ~127 typical) multiplies every per-iteration cost
+        # — which is invisible to every static/structural check.  `hit_cap=1` is the smoking
+        # gun and ALSO a correctness warning: the returned eta is then NOT solved to soltol.
+        if os.environ.get("FESOM_CG_ITERS"):
+            jax.debug.print(
+                "[cg-iters] it={it} hit_cap={cap} resid={r:.3e} rtol={t:.3e}",
+                it=final[6], cap=(final[6] >= maxiter).astype(jnp.int32),
+                r=final[5], t=rtol, ordered=False)
         return final if return_iters else final[0]
 
     if return_iters:
