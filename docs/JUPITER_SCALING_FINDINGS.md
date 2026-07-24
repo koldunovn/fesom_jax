@@ -314,9 +314,12 @@ the Levante fig10 v2 production campaign at the same GPU count (§5).
 | | 128 | 637.1 ‡ | 1.03 | 12% | — |
 | | 256 | 247.7 | 2.65 | 16% | — |
 
-‡ ng5 P=128 is a **reproducible cliff, not a bad measurement** — reconfirmed at 643.2 ms on a
-fresh allocation with both bracketing anchors reproducing. See below. It is *not* a turnover:
-P=256 recovers.
+‡ ng5 P=128: the 637.1 was a **reproducible XLA artifact, root-caused and FIXED 2026-07-24**
+— one `multi_output_fusion` decision at exactly this shape produced a 383 ms/step kernel;
+with the (now default) `optimization_barrier` fix the same config runs **236.2 ms**
+(2.79 Mnodlev-throughput-equivalent ≈ the P=64 point; job 1036604). The table row keeps the
+campaign-era measured value; use 236.2 for any forward-looking number. Full chain: §6d
+status paragraph + `HANDOFF-20260724-ng5-128-cliff.md`.
 
 ### The two headline conclusions
 
@@ -453,23 +456,26 @@ Together: *the same mathematics, expressed as a program that both compiles and r
 at one value of P.* The decisive untried experiment is an **optimized-HLO diff at
 P=64/128/256** (op counts, fusions, collective lowering) — see the handoff.
 
-**How to report ng5 in the paper.** Best-of-all-reps after the remeasure:
+**How to report ng5 in the paper.** Best-of-all-reps; P=128 now has TWO numbers — the XLA
+pathology (barrier off) and the fixed measurement (barrier on, the new default):
 
 | ng5 coloured | P=32 | P=64 | P=128 | P=256 |
 |---|---:|---:|---:|---:|
-| best ms/step | 316.8 | **235.9** | 637.1 ‡ | 247.7 |
+| best ms/step | 316.8 | **235.9** | **236.2** ‡ (637.1 unfixed) | 247.7 |
 
-Two separate statements, which must not be conflated:
-1. **ng5 peaks at P=64 (235.9 ms) and gains nothing beyond it** — P=256 (247.7 ms) does not
-   beat P=64, it merely returns to about the same level. So ng5 *does* saturate at 64 GPUs,
-   consistent with the campaign's "the knee moves left" conclusion (§6b).
-2. **P=128 is a reproducible cliff sitting on top of that saturation** — a 2.7× spike between
-   two points that are themselves flat. It is *not* the turnover, and it must not be drawn as
-   one; a monotone "turns over after 64" curve would misrepresent the P=256 recovery, while
-   silently dropping P=128 would hide a real, five-times-confirmed effect.
+‡ 236.2 = `FESOM_BALANCE_BARRIER=1` (now the default), job 1036604, single rep so far —
+take one confirming rep before the figure freezes. The 637.1 was a root-caused XLA
+`multi_output_fusion` cost-model artifact (six independent reproductions; see the status
+paragraph above), not a property of the model or the machine.
 
-The defensible presentation is to plot all four points and annotate P=128 as an unexplained,
-reproducible anomaly under investigation.
+Two statements for the text:
+1. **ng5 saturates at P=64 (235.9 ms) and stays flat through P=256** — with the fix, the
+   curve is 235.9 / 236.2 / 247.7 at 64/128/256: a clean plateau, consistent with the
+   campaign's "the knee moves left" conclusion (§6b). No cliff remains.
+2. **The unfixed 637.1 ms is worth a footnote, not a plotted point**: one XLA fusion
+   decision (the surface-flux balance reduce merged into the ice-thermodynamics fusion at
+   exactly the ng5/dist_128 shape) produced a 383 ms/step kernel; a semantics-preserving
+   `optimization_barrier` (verified bitwise-identical) removes it. Plot the fixed curve.
 
 ## 7. Cross-check against the Kokkos code twin (same machine, same mesh)
 

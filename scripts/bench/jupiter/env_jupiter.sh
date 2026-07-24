@@ -30,6 +30,9 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 export XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export XLA_FLAGS="--xla_gpu_enable_command_buffer="
 export PYTHONUNBUFFERED=1
+# NB the surface-flux balance fusion barrier (fesom_jax/sss_runoff.py) is DEFAULT-ON —
+# it fixed the ng5 x P=128 cliff (637 -> 236 ms; HANDOFF-20260724). Set
+# FESOM_BALANCE_BARRIER=0 only to deliberately reproduce the sick XLA fusion.
 
 # --- NCCL over NDR InfiniBand (jax.distributed collectives) ------------------------
 # JUPITER: 4x200G NICs per node, one per GH200 superchip.  Leave NCCL to auto-detect

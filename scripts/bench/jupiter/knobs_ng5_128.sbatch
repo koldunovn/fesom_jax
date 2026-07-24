@@ -7,13 +7,20 @@
 # ice thermo -> water_flux/virtual_salt -> balance mean only exists with both on.)
 # Each leg changes exactly ONE thing vs the campaign env:
 #
-#   ctrl       unchanged (expect ~640-660 ms — revalidates the cliff on this allocation)
-#   barrier    FESOM_BALANCE_BARRIER=1 — lax.optimization_barrier on the _area_mean
-#              input (model-side surgical fix; byte-identical numerics). Expect ~240 ms.
+#   ctrl       cliff reproduction (expect ~640-660 ms)
+#   barrier    the fix — lax.optimization_barrier on the _area_mean input (byte-identical
+#              numerics). Expect ~240 ms.
 #   mofoff     --xla_disable_hlo_passes=multi_output_fusion (compiler-side confirmation:
 #              the monster is a 6-output MOF product)
 #   cbuf       XLA command buffers at DEFAULT (independent launch-path test, cheap)
 #   barrier64  the fix at P=64 (16N) — no-regression guard on a healthy config
+#
+# RESULT (job 1036604, 2026-07-24): ctrl 647.1 ms / barrier 236.2 ms — fix CONFIRMED,
+# and FESOM_BALANCE_BARRIER became DEFAULT-ON in fesom_jax/sss_runoff.py afterwards.
+# The legs below were updated for the new default: ctrl now sets =0 explicitly (the only
+# way to reproduce the cliff), the barrier/barrier64 legs run the default. NB in the
+# 1036604 run itself the ctrl/barrier/mofoff legs imported the pre-flip code (opt-in
+# semantics); cbuf/barrier64 imported the post-flip code — see the log's env lines.
 #
 #   sbatch scripts/bench/jupiter/knobs_ng5_128.sbatch
 #
@@ -55,11 +62,11 @@ leg () {   # leg <tag> <npes> [ENV=VAL ...] — one srun per knob, everything el
   [ $rc -eq 0 ] || echo "#### [$tag] rc=$rc ####"
 }
 
-leg ctrl      128
-leg barrier   128 FESOM_BALANCE_BARRIER=1
-leg mofoff    128 XLA_FLAGS="$BASEXLA --xla_disable_hlo_passes=multi_output_fusion"
-leg cbuf      128 XLA_FLAGS=
-leg barrier64 64  FESOM_BALANCE_BARRIER=1
+leg ctrl      128 FESOM_BALANCE_BARRIER=0
+leg barrier   128
+leg mofoff    128 FESOM_BALANCE_BARRIER=0 XLA_FLAGS="$BASEXLA --xla_disable_hlo_passes=multi_output_fusion"
+leg cbuf      128 FESOM_BALANCE_BARRIER=0 XLA_FLAGS=
+leg barrier64 64
 
 echo "=== done $(date) ==="
 echo "=== barrier at ~240 ms + ctrl at ~650 ms = root cause CONFIRMED and FIXED ==="
