@@ -5339,3 +5339,56 @@ Cite the C source (`file:line`) or dump probe that proves it.
   and SPECIFIC: dars-8 production-loop compiles take ~80 min PER EXECUTABLE (×2) where core2
   takes 25 s and the dars KERNEL graph took 172 s — a prod-physics × mesh-size × graph-shape
   XLA pathology, isolated only after the accounting was right.
+
+## JUPITER strong-scaling — the ng5×P=128 cliff root-caused (2026-07-24)
+
+*The whole arc: a 2.7× step-time cliff at exactly (ng5, P=128) — flanked by healthy P=64 and
+P=256 — survived twelve eliminated hypotheses before falling in one day to
+ablation → HLO diff → nsys, chained as slurm jobs. Chronicle:
+`docs/HANDOFF-20260724-ng5-128-cliff.md` (untracked); verdict tables:
+`JUPITER_SCALING_FINDINGS.md`. Jobs: 1035822 (ablation), 1036111 (HLO), 1036137 (nsys),
+1036604 (fix confirmation).*
+
+- **[xla-perf] XLA's fusion cost model can flip at ONE shard shape and cost 2.7×.** At
+  exactly `Lmax_nod=59637` (ng5/dist_128 — not at 118035 or 30166, the P=64/256 shapes)
+  `multi_output_fusion` merged the surface-flux balance reduce (`sss_runoff._area_mean`)
+  into the 1,425-op vmapped ice-thermo producer+consumer complex, flipping the fusion
+  `kind=kLoop → kInput`: reduction-emitter codegen for the monster → a **383 ms/step
+  kernel** (`input_add_multiply_reduce_select_fusion`) and ~2× compile. Fix:
+  `lax.optimization_barrier` on the reduce input — bitwise-identical outputs (verified
+  CPU+CUDA at N=59637), 647.1 → 236.2 ms/step, **now DEFAULT-ON**
+  (`FESOM_BALANCE_BARRIER=0` reproduces the sick fusion; `sss_runoff.py`). Cross-check:
+  `--xla_disable_hlo_passes=multi_output_fusion` alone also cures it (238.7 ms).
+
+- **[method] A component ablation can "localise" a fusion pathology to the wrong thing.**
+  The cliff needed zstar AND ice *jointly* — removing either cured it — yet neither
+  component was slow: the fused dataflow (ice thermo → water_flux/virtual_salt → balance
+  mean → zstar SSH consumers) spans both, and the fusion neighbourhood is what mattered.
+  Read "excess vanishes when removing EITHER of two components" as *shared dataflow
+  region*, not as "component X is expensive".
+
+- **[method] For shape/P-specific slowdowns: nsys top-kernels by MEAN duration first.**
+  Every structural check (op counts, schedule overlap, partitions, collectives probe) was
+  clean while one kernel carried the entire excess. A single `input_*_fusion` with mean
+  ≫ 1 ms is the tell; then grep the HLO dump for that fusion's `kind=` at sick vs healthy
+  shapes. Machinery committed: `scripts/bench/jupiter/{dump_wrap.sh,reduce_hlo.py,
+  reduce_nsys.py,hlo_dump_ng5.sbatch,profile_ng5_128.sbatch}`.
+
+- **[xla-diag] `--steps 5` gives the byte-same step graph as `--steps 150`.**
+  `run_steps_sharded` is one eager step + `lax.scan(length=n_steps-1, xs=None)` — only
+  the trip-count constant differs (any n≥2). HLO dumps and cliff reproduction cost ~5 min
+  a leg, not ~10. Corollary: keep `FESOM_CG_ITERS` UNSET in any dump leg —
+  `jax.debug.print` inserts callback ops and contaminates the graph diff.
+
+- **[slurm] `sbatch --dependency=afterany:<jobid>` chains keep the one-job-at-a-time
+  timing discipline without babysitting.** Ablation → HLO dump → nsys → knob scan ran
+  back-to-back on a quiet queue, each leg with the allocation to itself; editing a
+  PENDING job's script does nothing (sbatch snapshots it) — `scancel` + resubmit, and
+  re-chain any dependents of the cancelled id (their `afterany` is satisfied by the
+  cancellation).
+
+- **[xla-diag] Flag existence is probe-able offline; pass names come from a toy dump.**
+  Unknown `XLA_FLAGS` are a hard error (`parse_flags_from_env` F-abort), so a CPU-only
+  `python -c "import jax; jax.numpy.zeros(1)"` validates spellings; exact HLO pass names
+  for `--xla_disable_hlo_passes` fall out of a 5-line jit + `--xla_dump_hlo_pass_re` on
+  the login GPU (this jaxlib: `priority-fusion`, `multi_output_fusion`).
