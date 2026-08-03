@@ -1,0 +1,17 @@
+# Test whether w_split enables SUSTAINED dt=180: cold spin-up at dt=60 (stable), ramp to dt=180
+# at step 480 (8h, past the cold shock). If the dt=180 phase stays FINITE ⇒ w_split works and the
+# cold start just needs a dt-ramp-up (FESOM practice); the flat-dt=180-from-rest blew up on the shock.
+ale: {use_wsplit: true, wsplit_maxcfl: 1.0}
+gm: null
+kpp: {}
+tke: null
+ice: {}
+visc: {}
+tracer: {}
+dt: 60.0
+dt_ramp: {after_step: 480, dt: 180.0}
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars_canary/wsplit_ramp

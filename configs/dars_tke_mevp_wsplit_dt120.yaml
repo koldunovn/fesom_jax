@@ -1,0 +1,18 @@
+# dars LONG-RUN, paper-matched physics: TKE + mEVP(whichEVP=1) + zstar + W_SPLIT, dt=120.
+# Stabilizers (proven on KPP+EVP): w_split cures the vertical-advection CFL tracer mode (mixing-
+# scheme-independent), dt=120 keeps the 2Δx VELOCITY CFL under threshold. ⚠️ dars TKE+mEVP HUNG
+# to compile at dist_16 (197k/GPU, the >66-min XLA cliff at 3.16M) — run at dist_64 (49.4k/GPU,
+# the smallest per-GPU graph) to clear it; the canary's compile-cap protects against a hang.
+ale: {use_wsplit: true, wsplit_maxcfl: 1.0}
+gm: null
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+dt: 120.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_64
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars_tke_mevp_dt120/restart

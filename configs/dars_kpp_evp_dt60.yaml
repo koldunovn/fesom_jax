@@ -1,0 +1,14 @@
+# dars FALLBACK (fully B0/perf-validated): KPP + standard-EVP + zstar, GM off, dt 180->240.
+ale: {}
+ice: {}
+gm: null
+kpp: {}
+tke: null
+visc: {}
+tracer: {}
+dt: 60.0
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing: {kind: core2, start_year: 1958}
+restart_in: null
+restart_out: /work/ab0995/a270088/port_jax/runs/dars_3yr_kpp_evp/restart

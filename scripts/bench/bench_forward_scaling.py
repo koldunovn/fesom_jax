@@ -93,6 +93,9 @@ def main():
     ap.add_argument("--ic-dir", default=None,
                     help="dir with cached T_ic.npy/S_ic.npy (PHC IC); else interpolate live.")
     ap.add_argument("--year", type=int, default=1958, help="JRA55 forcing year (Kokkos used 1958).")
+    ap.add_argument("--state-out", default=None,
+                    help="npz path for the final State (transport A/B bit-exactness gates; "
+                         "single-process runs only)")
     ap.add_argument("--out-zarr", default=None,
                     help="if set, write the final State to this Zarr store — each GPU writes its "
                          "own shard in parallel (no gather), the scaling output path for NG5.")
@@ -116,8 +119,17 @@ def main():
         # only way past the XLA:CPU all_gather rendezvous crash at >=32 in-process
         # devices — docs/PARALLELISM.md). Launch: srun -n <npes> with
         # XLA_FLAGS=--xla_force_host_platform_device_count=1 per process.
-        jax.config.update("jax_cpu_collectives_implementation", "gloo")
-        jax.distributed.initialize()          # SLURM auto-detect (srun sets the env)
+        # FESOM_CPU_COLL=mpi routes the collectives through the system MPI instead
+        # (MPItrampoline + an MPIwrapper shim, MPITRAMPOLINE_LIB) — the multi-node CPU
+        # path, since gloo-over-TCP costs ~6x once a rank crosses the node boundary.
+        jax.config.update("jax_cpu_collectives_implementation",
+                          os.environ.get("FESOM_CPU_COLL", "gloo"))
+        # Heartbeat: a rank is declared dead after 100 s (JAX default) without one. The
+        # host-side setup on big meshes — global mesh load + global State + PHC IC, per rank —
+        # can run long enough to trip that, so allow raising it.
+        jax.distributed.initialize(                       # SLURM auto-detect (srun sets the env)
+            heartbeat_timeout_seconds=int(os.environ.get("FESOM_JDIST_HEARTBEAT", "100")),
+            initialization_timeout=int(os.environ.get("FESOM_JDIST_INIT_TIMEOUT", "300")))
     elif os.environ.get("JDIST"):             # multi-node: 1 process/node, all local GPUs
         jax.distributed.initialize(
             local_device_ids=list(range(int(os.environ.get("GPUS_PER_NODE", "4")))))
@@ -244,6 +256,16 @@ def main():
         print(f"[bench-finite] {args.name} npes={args.npes} steps={args.steps} "
               f"nonfinite_T={nbad_T} nonfinite_uv={nbad_uv} max_uv={max_uv:.3f} m/s",
               flush=True)
+
+    # Optional exact-state dump for transport A/B gates: the halo transports are forward
+    # BIT-EXACT, so two runs differing only in transport must produce identical arrays. Saves
+    # the folded final State (single-process only — np.asarray gathers addressable shards).
+    if args.state_out and jax.process_count() == 1:
+        np.savez(args.state_out, T=np.asarray(out_state.T), S=np.asarray(out_state.S),
+                 uv=np.asarray(out_state.uv), eta_n=np.asarray(out_state.eta_n),
+                 d_eta=np.asarray(out_state.d_eta))   # d_eta IS the CG solve output
+        if proc0:
+            print(f"[bench] state dumped → {args.state_out}", flush=True)
 
     # Optional gather-free output: each GPU writes its own shard of the FOLDED final State to
     # Zarr in parallel (the NG5 scaling output path — no global gather to rank 0). jfn(*jargs)
