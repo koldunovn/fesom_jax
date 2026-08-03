@@ -199,8 +199,10 @@ with plots, is [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic
 
 ### 2. Backward — gradients
 
-Continuing from **§1** (the packaged `pi` mesh — so this needs **no data**; it is identical at CORE2
-scale, just with that mesh and `dt`):
+Continuing from **§1** (the packaged `pi` mesh — so this needs **no data**). The *code* is identical
+at CORE2 scale — the *memory* is not: reverse mode stores the forward pass, and a naive `jax.grad`
+fits only **1–2 CORE2 steps** on an 80 GB A100. For any real window pass `remat_segments=-1` — see
+**Gradient memory** below.
 
 ```python
 import jax
@@ -212,13 +214,33 @@ def loss(params):                                    # any scalar functional of 
     return jnp.sum(jnp.where(wet, sN.T[:, 0], 0.0)) / jnp.sum(wet)   # mean SST
 
 g = jax.grad(loss)(Params.defaults())                # d(mean SST) / d(every physics param)
-print(g.k_ver, g.a_ver, g.k_gm, g.redi_kmax)         # mixing / eddy sensitivities
+print(g.k_ver, g.a_ver)                              # vertical-mixing sensitivities
+print(g.k_gm, g.redi_kmax)                           # eddy params — GM is OFF in this minimal
+                                                     # run, so these are structurally 0.0
 ```
 
 `jax.grad` works w.r.t. **params** (the ML hooks), the **initial state**, and the **forcing** (e.g.
 `d(a_ice)/d(air-temperature)`) — flowing through the CG solve and the EVP scan. See
 `fesom_jax/tests/test_gradient_sharded.py` for validated examples. (Read
 **[Limitations](#limitations--what-it-can-and-cant-do)** on the useful time horizon.)
+
+#### Gradient memory: `remat_segments`
+
+Reverse mode must hold every step's intermediates for the backward pass, and a CORE2 step is
+expensive to store — **~37 GiB on an A100-80GB (measured)**, so a naive `jax.grad` caps at 1–2
+steps: one simulated hour at `dt=1800`, while the gradient is physically meaningful over
+hours→days. The remedy is built in and is **not an approximation**:
+
+```python
+sN = integrate(state0, mesh, op, stress, n_steps=N, params=p, dt=1800.0,
+               remat_segments=-1)    # O(√N) checkpointing: store ~√N carries, recompute the rest
+```
+
+`remat_segments=K` stores every K-th step; `-1` selects the O(√N) schedule — **start with `-1`**
+(a hand-picked K interacts non-monotonically with XLA's own rematerialization, so K=2 can fit
+where K=3 does not). The gradient is **bit-identical** to the unrematerialized one — the trade is
+compute (roughly one extra forward pass), never accuracy. In-step memory has a separate knob,
+`remat_blocks=True` (nested `jax.checkpoint` over the step's substeps); both compose.
 
 ### 2b. Reverse-mode (adjoint) vs forward-mode (tangent-linear)
 
@@ -232,6 +254,8 @@ tangent-linear model): one forward sweep carries the tangent alongside the prima
 ck0 = jnp.float64(Params.defaults().tke_c_k)          # one global scalar knob
 mld_field, dmld_dck = jax.jvp(                         # forward-mode: d(MLD field)/d(c_k)
     lambda ck: window_mean_mld_field(ck, state0), (ck0,), (1.0,))
+# (illustrative: window_mean_mld_field = your integrate-N-steps → window-mean-MLD wrapper;
+#  the working version is in scripts/paper/core2_lw_avgadj.py)
 ```
 
 **Rule of thumb — pay for the small side:** reverse mode costs about one extra model run per
@@ -445,7 +469,8 @@ $PY scripts/plot_sypd.py     # -> docs/figures/jax_vs_kokkos_sypd.png
 
 ## Performance
 
-Full model (real JRA+PHC+ice), ragged halo, A100, vs **Kokkos M5.24 CUDA** (`SCALING_M524.md`):
+Full model (real JRA+PHC+ice), ragged halo, **A100-SXM with NVLink** (Levante `-p gpu`), vs
+**Kokkos M5.24 CUDA** (`SCALING_M524.md`):
 
 | mesh / scale | JAX s/step | Kokkos s/step | gap | JAX SYPD (prod. dt) |
 |---|---|---|---|---|
@@ -462,6 +487,15 @@ Full model (real JRA+PHC+ice), ragged halo, A100, vs **Kokkos M5.24 CUDA** (`SCA
 Pattern: **compute-bound → JAX competitive-to-faster; comms-bound → Kokkos's hand-tuned MPI wins**
 (the gap widens as the per-GPU shard shrinks). The ragged halo is *necessary* multi-node — at
 dars-8 / NG5 the `all_gather` halo OOMs while ragged fits.
+
+⚠️ **These numbers have a hardware precondition: the GPU interconnect.** The halo exchange runs
+every timestep, so inter-GPU bandwidth is on the critical path, and the table was measured on
+NVLink (hundreds of GB/s between devices). On **PCIe**-attached A100s the same code measures
+**7.6× slower** at CORE2 1-node (0.659 s/step ≈ 7.5 SYPD, measured on AWI's Albedo) — and CORE2
+there *anti-scales*: 4 GPUs ran 2.1× slower than 1, so on PCIe prefer a single GPU
+(`partition: null`) over a `dist_4` multi-GPU split. Check your topology with
+`nvidia-smi topo -m` (NV# links between GPUs = NVLink); size campaigns from a measured step on
+your own machine, not from this table.
 
 ---
 
