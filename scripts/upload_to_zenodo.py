@@ -154,7 +154,7 @@ METADATA = {
     ],
     "access_right": "open",
     "license": "cc-by-4.0",
-    "version": "1.1",
+    "version": "1.2",
     "keywords": ["ocean model", "FESOM", "FESOM2", "fesom-jax", "JAX", "CORE2",
                  "differentiable model", "JRA55-do", "ocean forcing", "climate"],
     "related_identifiers": [
