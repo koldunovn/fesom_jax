@@ -437,6 +437,11 @@ def build_and_cache_ic(mesh, path: str | None = None,
     return res
 
 
+# The pi IC (T_ic/S_ic for the packaged 3140-node pi mesh) ships inside the package, like
+# fesom_jax.mesh.DEFAULT_PI_MESH_DIR — so the pi demo cold-starts with no external data.
+PACKAGED_PI_IC_DIR = Path(__file__).resolve().parent / "data" / "ic_pi"
+
+
 def phc_initial_state(mesh, ic_dir: str | Path | None = None,
                       base_T: float = 10.0, base_S: float = 35.0, *, xp=None):
     """Build a :class:`~fesom_jax.state.State` from the **cached PHC IC** (the

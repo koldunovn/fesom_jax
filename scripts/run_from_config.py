@@ -54,7 +54,10 @@ def main():
     ap.add_argument("config", help="RunConfig YAML")
     ap.add_argument("--mesh-dir", help="override cfg.mesh (the mesh directory)")
     ap.add_argument("--dist-dir", help="directory holding the dist_<N> partition (for cfg.partition)")
-    ap.add_argument("--ic-dir", default="data/ic_core2", help="cold PHC IC cache directory")
+    ap.add_argument("--ic-dir", default=None,
+                    help="cold IC cache directory (T_ic.npy/S_ic.npy). Default: the packaged "
+                         "pi IC when running the packaged pi mesh, else $FESOM_IC_DIR, else "
+                         "data/ic_core2")
     ap.add_argument("--year", type=int, default=1958, help="forcing start year")
     ap.add_argument("--chunk-steps", type=int, default=240,
                     help="time-chunk length (steps) for the per-step forcing scan (~few days)")
@@ -167,8 +170,8 @@ def main():
         if args.progress and _IS_LEAD:
             print(f"[run.setup] {label}: +{_time.perf_counter() - _t0:.1f}s", flush=True)
 
-    mesh_dir = args.mesh_dir or cfg.mesh
-    mesh = load_mesh(mesh_dir); _lap("load_mesh")
+    mesh_dir = args.mesh_dir or cfg.mesh          # None ⇒ the packaged pi mesh (mesh: null)
+    mesh = load_mesh(mesh_dir) if mesh_dir is not None else load_mesh(); _lap("load_mesh")
     part = _build_partition(mesh, cfg.partition, args.dist_dir or mesh_dir); _lap("partition")
     sm = shard_mesh.build_sharded_mesh(mesh, part); _lap("sharded_mesh")
     op = ssh.build_ssh_operator(mesh, dt=cfg.dt)
@@ -186,18 +189,34 @@ def main():
     import numpy as np
     state0 = None
     if cfg.restart_in is None:
-        from fesom_jax.phc_ic import cold_start_state
+        from fesom_jax.phc_ic import cold_start_state, PACKAGED_PI_IC_DIR
+        ic_dir = args.ic_dir
+        if ic_dir is None and mesh_dir is None and PACKAGED_PI_IC_DIR.is_dir():
+            # The packaged-pi run uses the packaged pi IC, NOT $FESOM_IC_DIR — that names the
+            # fetch_data CORE2 cache, whose 126 858-node fields cannot fit the 3140-node pi mesh.
+            ic_dir = PACKAGED_PI_IC_DIR
         # THE canonical cold start (one shared helper ⇒ no drift from the run scripts): PHC IC +
         # the seeded sea-ice IC (a_ice=0.9 where SST<0, NH/SH m_ice split — fesom_ice_initial_state).
         # xp=np keeps the global State on the host (the big-mesh setup-OOM fix).
-        state0 = cold_start_state(mesh, args.ic_dir, xp=np); _lap("cold_start_state")
+        # ic_dir=None resolves $FESOM_IC_DIR → data/ic_core2 (fesom_jax.paths).
+        state0 = cold_start_state(mesh, ic_dir, xp=np); _lap("cold_start_state")
     sst0 = None if state0 is None else np.asarray(state0.T[:, 0])
-    # Input-data paths: the run YAML's optional `forcing: {jra_dir,sss_path,runoff_path,chl_path}`
-    # keys win; absent (all None) ⇒ each reader resolves $FESOM_* → the Levante default
-    # (fesom_jax/paths.py, docs/DATA.md) — the historical behaviour.
-    fpaths = cfg.forcing_paths()
-    forcing = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0,
-                                               **fpaths); _lap("forcing_setup")
+    if cfg.forcing is None:
+        # `forcing: null` = UNFORCED (the documented `null = OFF`). Never fall through to the
+        # $FESOM_*/Levante default forcing paths — that silently runs the wrong physics
+        # (usability review P2: a 1.65 °C SST divergence measured against the intended run).
+        forcing = None
+        if args.local_forcing or args.forcing_on_device:
+            raise SystemExit("error: --local-forcing/--forcing-on-device need `forcing:` "
+                             "configured (the run is unforced: `forcing: null`)")
+        _lap("forcing_setup (unforced)")
+    else:
+        # Input-data paths: the run YAML's optional `forcing: {jra_dir,sss_path,runoff_path,chl_path}`
+        # keys win; absent (all None) ⇒ each reader resolves $FESOM_* → the Levante default
+        # (fesom_jax/paths.py, docs/DATA.md) — the historical behaviour.
+        fpaths = cfg.forcing_paths()
+        forcing = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0,
+                                                   **fpaths); _lap("forcing_setup")
 
     # The NG5 host-forcing fix: build a LOCAL-node forcing (interp only this process's owned
     # partitions, ~npes× less). forcing.static is reused for the (cheap, once) static path.

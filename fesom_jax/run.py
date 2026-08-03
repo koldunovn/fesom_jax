@@ -38,7 +38,7 @@ import jax
 import numpy as np
 
 from . import shard_mesh, ssh, ushow_output, zarr_output
-from .integrate_sharded import run_steps_sharded_forced
+from .integrate_sharded import folded_state, run_steps_sharded, run_steps_sharded_forced
 from .run_config import RunConfig
 
 _SECONDS = {"s": 1.0, "h": 3600.0, "d": 86400.0, "mo": 30 * 86400.0, "yr": 365 * 86400.0}
@@ -303,7 +303,10 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     ``cfg.restart_in`` is read (device-count-portable) and ``start_step`` taken from its metadata.
     ``forcing_stack`` (a ``StepForcing`` stacked over the FULL run) overrides the calendar forcing
     (the test path); production builds each chunk's forcing from ``forcing`` (a ``SurfaceForcing``) via
-    the calendar. ``accumulate_stats`` folds each chunk-final State into an
+    the calendar. **Neither** ⇒ a genuinely UNFORCED run (``forcing: null`` — the pi demo): the bare
+    step with no surface-flux application, demo-scale, gated to cold starts / no ice / no mean-output
+    streams / a single chunk (see the ``unforced`` block below for why a zero forcing stack would be
+    silently wrong physics instead). ``accumulate_stats`` folds each chunk-final State into an
     :class:`~fesom_jax.zarr_output.OnlineStats` (a coarse, gather-free time mean). Returns a
     :class:`RunResult`; writes the portable restart to ``out_dir`` / ``cfg.restart_out`` if set.
 
@@ -337,6 +340,31 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         _om = (("host_gather" if not multiproc else "all_gather")
                if output_layout == "global" else "folded")
         print(f"[run] output_layout={output_layout} (output+restart → {_om})", flush=True)
+
+    # `forcing: null` = a genuinely UNFORCED run (the pi demo; the documented `null = OFF`).
+    # NOT a zero StepForcing: zeroed bulk-formula inputs are strong forcing (0 °C air and
+    # 0 W/m² longwave drive large heat loss, and Ssurf_month=0 restores salinity toward
+    # 0 psu) — silently wrong physics (usability review P2). Unforced routes to the bare
+    # sharded runner (no surface-flux application at all), demo-scale, with explicit gates:
+    unforced = forcing is None and forcing_stack is None
+    if unforced:
+        if cfg.ice is not None:
+            raise ValueError("forcing: null cannot run sea ice — ice thermodynamics needs "
+                             "atmospheric fluxes. Set `ice: null` too, or configure `forcing:`.")
+        if daily_out is not None or monthly_out is not None:
+            raise ValueError("forcing: null does not support daily/monthly mean-output "
+                             "streams; drop daily_out/monthly_out.")
+        if restart_archive_out is not None:
+            raise ValueError("forcing: null does not support archival restarts; use the "
+                             "plain restart_out.")
+        if local_forcing is not None:
+            raise ValueError("local_forcing needs cfg.forcing (a calendar forcing)")
+        if cfg.restart_in is not None:
+            raise ValueError("forcing: null supports cold starts only — the unforced runner "
+                             "has no restart-continuation path (it would re-bootstrap AB2)")
+        if cfg.dt_ramp:
+            raise ValueError("forcing: null does not support dt_ramp (multi-chunk chaining "
+                             "is a forced-path feature)")
     if sm is None:
         sm = shard_mesh.build_sharded_mesh(mesh, part)
 
@@ -377,28 +405,35 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     else:
         raise ValueError("run_from_config: set cfg.n_steps or cfg.duration")
     cs = int(chunk_steps) if chunk_steps else max(1, n_steps)
-    # split chunks at forcing-year boundaries AND (when a mean-output stream is active) at the output
-    # period boundary — DAY for daily output (finest; months align to days), else MONTH — so no chunk
-    # straddles a period and its every-step sum belongs to exactly one period. dt-independent, so the
-    # true-time-mean output (the diurnal-aliasing fix) works at any mesh/dt. See :class:`_MeanStream`.
-    _out_period = "day" if daily_out is not None else ("month" if monthly_out is not None else None)
-    _split = list(_year_boundaries(year, cfg.dt, start_step, n_steps, cfg.dt_ramp))
-    if _out_period is not None:
-        _split += _period_boundaries(year, cfg.dt, start_step, n_steps,
-                                     period=_out_period, dt_ramp=cfg.dt_ramp)
     _archive_targets = set()
-    if restart_archive_out is not None and restart_archive_period is not None:
-        _archive_targets = set(_archive_boundaries(
-            year, cfg.dt, start_step, n_steps, period=restart_archive_period,
-            length=restart_archive_length, dt_ramp=cfg.dt_ramp))
-        _split += list(_archive_targets)
-    chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt,
-                         split_at=sorted(set(_split)))
+    if unforced:
+        # No forcing reader to roll and no calendar streams ⇒ no boundary splits; and the bare
+        # runner has no folded-chaining/bootstrap plumbing, so an unforced run is ONE chunk
+        # (chunk_steps is ignored — forward scan memory is O(1) in steps anyway).
+        chunks = plan_chunks(n_steps, max(1, n_steps), start_step=start_step,
+                             dt_ramp=cfg.dt_ramp, dt=cfg.dt, split_at=[])
+        assert len(chunks) == 1, "unforced runs must plan to a single chunk"
+    else:
+        # split chunks at forcing-year boundaries AND (when a mean-output stream is active) at the
+        # output period boundary — DAY for daily output (finest; months align to days), else MONTH —
+        # so no chunk straddles a period and its every-step sum belongs to exactly one period.
+        # dt-independent, so the true-time-mean output (the diurnal-aliasing fix) works at any
+        # mesh/dt. See :class:`_MeanStream`.
+        _out_period = ("day" if daily_out is not None
+                       else ("month" if monthly_out is not None else None))
+        _split = list(_year_boundaries(year, cfg.dt, start_step, n_steps, cfg.dt_ramp))
+        if _out_period is not None:
+            _split += _period_boundaries(year, cfg.dt, start_step, n_steps,
+                                         period=_out_period, dt_ramp=cfg.dt_ramp)
+        if restart_archive_out is not None and restart_archive_period is not None:
+            _archive_targets = set(_archive_boundaries(
+                year, cfg.dt, start_step, n_steps, period=restart_archive_period,
+                length=restart_archive_length, dt_ramp=cfg.dt_ramp))
+            _split += list(_archive_targets)
+        chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt,
+                             split_at=sorted(set(_split)))
 
-    if forcing is None and forcing_stack is None:
-        raise ValueError("run_from_config: provide forcing (SurfaceForcing) or forcing_stack")
-    fstatic = forcing.static
-    fs_p = shard_mesh.partition_forcing_static(fstatic, part)
+    fs_p = None if unforced else shard_mesh.partition_forcing_static(forcing.static, part)
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)
 
     # mEVP sea-ice boundary condition (the EVP zeros u_ice/v_ice at PHYSICAL-coast nodes,
@@ -562,14 +597,16 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         # Roll the forcing reader to this chunk's CALENDAR YEAR if it changed (calendar paths only;
         # chunks never straddle a year boundary — plan_chunks split_at=_year_boundaries). reopen_year
         # swaps only the per-year file handles and KEEPS the interpolation stencil (year-independent).
-        if forcing_stack is None:
+        if forcing_stack is None and not unforced:
             cy = _chunk_dates(year, cfg.dt, ch.start, 1, cfg.dt_ramp)[0][0]
             if cy != cur_year:
                 (local_forcing if local_forcing is not None else forcing).reopen_year(cy)
                 cur_year = cy
                 if progress:
                     print(f"[run.progress] forcing → year {cy} @ step {ch.start}", flush=True)
-        if forcing_stack is not None:
+        if unforced:
+            seq_p = None
+        elif forcing_stack is not None:
             lo = ch.start - start_step
             seq = jax.tree.map(lambda x, lo=lo: x[lo: lo + ch.count], forcing_stack)
             seq_p = shard_mesh.partition_step_forcing(seq, part)
@@ -600,16 +637,27 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             seq = forcing.stack(_chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), xp=np)
             seq_p = shard_mesh.partition_step_forcing(seq, part)
         tc_host = time.perf_counter()
-        _fkw = (dict(forcing_tables=tab_p, forcing_sched=sched, forcing_const=fdc_p)
-                if (forcing_on_device and seq_p is None) else {})
-        _chunk_out = run_steps_sharded_forced(
-            sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
-            bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
-            use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
-            boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
-            sample_fn=out_sample_fn, **_fkw, **cfg.physics_kwargs())
-        # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else just the final state.
-        state_p, acc_sum = _chunk_out if out_sample_fn is not None else (_chunk_out, None)
+        if unforced:
+            # The bare (unforced) sharded runner: single chunk (asserted above), cold [P,Lmax]
+            # host input, [P,Lmax] output. Fold the result so everything downstream (chunk
+            # diagnostics, stats, the restart writer) sees the forced path's folded [P*Lmax]
+            # contract. Demo-scale path — the fold reshape is fine there.
+            _out = run_steps_sharded(
+                sm, state_p, _sop_for(ch.dt), stress_p, ch.count, dt=ch.dt, npes=npes,
+                use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
+                boundary_node_p=boundary_node_p, **cfg.physics_kwargs())
+            state_p, acc_sum = folded_state(_out)[0], None
+        else:
+            _fkw = (dict(forcing_tables=tab_p, forcing_sched=sched, forcing_const=fdc_p)
+                    if (forcing_on_device and seq_p is None) else {})
+            _chunk_out = run_steps_sharded_forced(
+                sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
+                bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
+                use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
+                boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
+                sample_fn=out_sample_fn, **_fkw, **cfg.physics_kwargs())
+            # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else the final state.
+            state_p, acc_sum = _chunk_out if out_sample_fn is not None else (_chunk_out, None)
         folded_in = True                                     # the scan output is folded [P*Lmax]
         step_now = ch.start + ch.count
         if progress:

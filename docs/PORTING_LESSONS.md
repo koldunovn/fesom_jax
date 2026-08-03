@@ -5477,3 +5477,37 @@ ablation → HLO diff → nsys, chained as slurm jobs. Chronicle:
   layout. Deterministic, yes; keyed to the partition, no. The trigger includes the *exchange
   pattern*, and notably degree 6 fires FEWER exchanges per step (189 vs 254) but in tighter
   bursts. Before generalising from repeats, vary the axes you did not think were part of the key.
+
+## Usability-review fixes P9/P1/P2/P3 (2026-08-03, branch fix/usability-review)
+
+External three-system review (Levante + Albedo + laptop) of `main@0383a17`: numerics clean on all
+three, every blocking finding in packaging/docs. Lessons from fixing the first tranche:
+
+- **[zenodo] A resume that skips "already on the draft" files by NAME can publish a manifest
+  describing bytes that were never uploaded.** Exactly how data-package v1.1 shipped: the mesh zip
+  was re-zipped (content-identical ⇒ same size, new sha256 — zip timestamps live in fixed-width
+  fields), the manifest was regenerated from staging, and the uploader skipped the upload because
+  the filename already existed on the carried-over draft. Published records are immutable, so the
+  inconsistency is permanent. Skip only on a draft-md5 match. Corollary for any fetcher: the
+  record's own checksum verifies what the record SERVES; a manifest verifies what the uploader
+  INTENDED — treat "md5 passes, manifest sha doesn't" as stale metadata (warn), not as a corrupt
+  download (die), or one stale hash strands every future user.
+
+- **[config] `forcing: null` must never become a zero forcing stack.** Zeroed bulk-formula inputs
+  ARE forcing: 0 °C air + 0 W/m² longwave over an 18 °C ocean drive enormous heat loss, and
+  `Ssurf_month=0` restores surface salinity toward 0 psu. (The reviewer's suggested fix — "pass a
+  zero forcing stack" — would have swapped one silently-wrong ocean for another.) "Off" must route
+  to the bare step with no surface-flux application at all; `run_from_config` now gates the
+  unforced mode explicitly (no ice, cold start, single chunk) instead of reinterpreting null.
+
+- **[method] The development machine cannot test its own data fetcher.** P9 (the fetcher pinned a
+  Zenodo version with no partitions, and the v1.1 manifest defect behind it) was invisible on
+  Levante because Levante never runs the fetcher — it has the local data. The one-command
+  quick-start had zero test coverage for the same reason: it always worked *here*. The fix is a
+  test that runs the DOCUMENTED command as a subprocess with all `FESOM_*` scrubbed from the env —
+  the closest in-repo approximation of a fresh machine.
+
+- **[test] With an editable install, a subprocess test silently tests the WRONG checkout.** The new
+  pi_demo test first failed with an ImportError because the script under `port_jax_review/` imported
+  `fesom_jax` from the pip-`-e`-installed `~/port_jax`. Pin `PYTHONPATH` to the repo the test lives
+  in; otherwise a worktree/branch test quietly validates another branch's library.
