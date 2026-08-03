@@ -34,7 +34,9 @@ dependencies = [
 # needed on Levante). Install with:  pip install -e ".[cuda,dev]"
 cuda = ["jax[cuda12]>=0.4.34"]
 dev = ["pytest>=8"]
-viz = ["matplotlib>=3.7"]   # scaling/SYPD plots (scripts/plot_sypd.py)
+# viz also carries jupyter: the examples/ notebooks are part of the documented on-ramp and
+# `pip install -e ".[cuda,dev,viz]"` is the install line the README gives for running them.
+viz = ["matplotlib>=3.7", "jupyter>=1.0"]   # scaling/SYPD plots + the examples/ notebooks
 
 [tool.setuptools.packages.find]
 include = ["fesom_jax*"]

@@ -29,6 +29,27 @@ def probe_gid() -> int:
     return PROBE_GID
 
 
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    """Close with an honest coverage summary (usability review P5): most verification gates
+    read unpublished Fortran/C reference dumps and SKIP without them, so a green run off
+    Levante must say what it did NOT verify — otherwise a newcomer reads 'green' as
+    'numerics verified locally' when the gates never ran."""
+    skipped = terminalreporter.stats.get("skipped", [])
+    if not skipped:
+        return
+    needles = ("dump", "fixture missing", "reference")
+    gated = sum(1 for r in skipped
+                if any(n in str(getattr(r, "longrepr", "")).lower() for n in needles))
+    terminalreporter.write_sep("-", "fesom-jax gate coverage")
+    terminalreporter.write_line(
+        f"{len(skipped)} test(s) skipped; {gated} of them are verification gates needing "
+        f"Fortran/C reference dumps that are not published (docs/REFERENCE_RUNS.md).")
+    if gated:
+        terminalreporter.write_line(
+            "A green result does NOT mean those gates ran — the vs-Fortran numerics "
+            "verification only executes where the dumps exist. The data-free gates did run.")
+
+
 @pytest.fixture
 def load_dump(fixtures_dir):
     """Return ``load(name) -> list[DumpRecord]``; skips the test if the dump is

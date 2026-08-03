@@ -248,6 +248,19 @@ def main():
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")
 
+    if cfg.ice is None and cfg.forcing is not None:
+        # `ice: null` on a FORCED run is a diagnostic setting, not supported physics: without ice
+        # thermodynamics the polar ocean cools far below freezing while staying finite and exiting 0
+        # (inherited FESOM behaviour — usability review P8 measured −24.6 °C over 22 % of ocean
+        # nodes with no warning at all). Collective (all ranks call), like --diagnostics below.
+        from fesom_jax.diagnostics import state_diagnostics as _sd
+        _tmin = float(_sd(res.state_p)["T_min"])
+        if _IS_LEAD and _tmin < -2.5:
+            print(f"WARNING: T_min={_tmin:.1f} degC is below seawater freezing and this run has "
+                  f"`ice: null` under forcing. Sub-freezing water is EXPECTED without ice "
+                  f"thermodynamics — treat the run as diagnostic, or enable ice (`ice: {{}}`).",
+                  flush=True)
+
     if args.diagnostics:
         # Gather-free scalar reductions on the FOLDED sharded final State (no restart re-read, no
         # global gathered to one device) — runs on EVERY process (each global reduction is a

@@ -1,0 +1,19 @@
+# The recorded environment (docs/ENV.md "Recorded versions", installed 2026-06-05,
+# Python 3.12.13). The pyproject pins are floors; use this file to reproduce the
+# documented set exactly:
+#
+#     pip install -e ".[cuda,dev]" -c constraints.txt
+#
+# Newer sets are expected to work (JAX 0.11.0 ran the full suite + a model year,
+# A/B'd at no performance difference) — but the version-specific caveats in docs/
+# were recorded against these.
+jax==0.10.1
+jaxlib==0.10.1
+jax-cuda12-plugin==0.10.1
+jax-cuda12-pjrt==0.10.1
+numpy==2.4.6
+scipy==1.17.1
+netCDF4==1.7.4
+pytest==9.0.3
+# zarr intentionally unpinned here: docs/ENV.md did not record its exact version;
+# the pyproject bound (zarr>=2.17,<3) is the constraint that matters.

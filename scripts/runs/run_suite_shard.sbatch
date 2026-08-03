@@ -10,7 +10,9 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --hint=nomultithread
 #SBATCH --mem=200G
-#SBATCH --time=01:30:00
+# Expect 2-3 h: the sharded-gradient group runs long since the Phase-8b ragged halo
+# (pre-existing; usability review P19 measured 2-3x the old 01:30 allocation).
+#SBATCH --time=04:00:00
 #SBATCH -o /home/a/a270088/port_jax/scripts/run_suite_shard.%j.out
 #SBATCH -e /home/a/a270088/port_jax/scripts/run_suite_shard.%j.out
 source /sw/etc/profile.levante 2>/dev/null

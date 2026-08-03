@@ -321,6 +321,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     newest one. This is a SEPARATE, additive stream — the plain rolling ``checkpoint_every``
     restart (if also set) is unaffected."""
     cfg.validate()
+    _t_entry = time.perf_counter()          # progress prints are relative to entry, not node uptime
     npes = part.npes
     # Output / restart on-disk layout. 'global' (default) = partition-INDEPENDENT canonical node
     # order (xarray/ushow read it directly; byte-identical at any device count) — it host-gathers
@@ -454,7 +455,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # WHERE the wall-clock goes, not a production fast-path). Lets a long NG5 run be diagnosed live.
     stats = None
     if progress:
-        print(f"[run.progress] setup done @ {time.perf_counter():.0f}s; {len(chunks)} chunks "
+        print(f"[run.progress] setup done @ {time.perf_counter() - _t_entry:.0f}s; {len(chunks)} chunks "
               f"x ~{chunks[0].count if chunks else 0} steps, n_steps={n_steps} npes={npes}",
               flush=True)
     # restart/checkpoint target + a small writer (used for the rolling checkpoint AND the final
