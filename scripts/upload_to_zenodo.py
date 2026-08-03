@@ -407,9 +407,14 @@ def main() -> int:
 
     dep_id = dep["id"]
     bucket = dep["links"]["bucket"]
-    already = {f["filename"] for f in dep.get("files", [])}
+    # name -> md5 of what the draft already holds. The skip below compares CHECKSUMS, not names:
+    # v1.1 shipped a stale core2_mesh_ic.zip because a rebuilt (re-zipped, content-identical,
+    # hence same-size) archive was skipped on its name while the regenerated manifest carried the
+    # new hash. Same name + different bytes must re-upload (the bucket PUT overwrites).
+    already = {f["filename"]: (f.get("checksum") or "").replace("md5:", "")
+               for f in dep.get("files", [])}
     if already:
-        print(f"  {len(already)} file(s) already on this draft -- they will be skipped")
+        print(f"  {len(already)} file(s) already on this draft -- unchanged ones will be skipped")
 
     # 2. metadata FIRST -- so a mistake surfaces before 10 GB of upload -------
     code, resp = _api(host, "PUT", f"/api/deposit/depositions/{dep_id}", token,
@@ -441,7 +446,20 @@ def main() -> int:
         todo += [(p["name"], f, p["offset"], p["length"]) for p in plans[f]]
     # MANIFEST.json is always re-uploaded: on a --new-version-of run Zenodo carries the OLD one
     # over, and it does not know about any archive we are adding now. The bucket PUT overwrites.
-    pending = [t for t in todo if t[0] not in already or t[0] == "MANIFEST.json"]
+    # Everything else is skipped only when the draft's md5 matches the local bytes (hashing a
+    # skip candidate costs one read; skipping on the name alone is how v1.1 published a manifest
+    # describing bytes that were never uploaded).
+    pending = []
+    for t in todo:
+        name, src, offset, length = t
+        if name == "MANIFEST.json" or name not in already:
+            pending.append(t)
+            continue
+        if already[name] and already[name] == _hash_slice(src, offset, length):
+            print(f"  {name}: already on the draft (md5 verified) -- skipped")
+        else:
+            print(f"  {name}: on the draft but with DIFFERENT bytes -- re-uploading")
+            pending.append(t)
     print(f"\nuploading {len(pending)} of {len(todo)} files "
           f"({sum(t[3] for t in pending) / 2**30:.2f} GB to go)")
 

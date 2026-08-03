@@ -30,10 +30,11 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-# The Zenodo record holding the package: https://doi.org/10.5281/zenodo.21324319
-# (concept DOI 10.5281/zenodo.21324318 always resolves to the newest version).
+# The Zenodo package, by its CONCEPT id (https://doi.org/10.5281/zenodo.21324318): the API
+# resolves it to the newest version. Never pin a version id here — v1.0 (21324319) shipped
+# without core2_partitions.zip, and a pinned id repeats that mistake at the next revision.
 # Override with $FESOM_ZENODO_RECORD or --record.
-ZENODO_RECORD = os.environ.get("FESOM_ZENODO_RECORD", "21324319")
+ZENODO_RECORD = os.environ.get("FESOM_ZENODO_RECORD", "21324318")
 ZENODO_API = "https://zenodo.org/api/records/{record}"
 
 # Zenodo's edge returns an HTML 403 to any request with no User-Agent. urllib sets one by default,
@@ -159,9 +160,20 @@ def reassemble(archive: dict, files: dict, dest: Path) -> Path:
         print(f"  {name}: verifying sha256...", flush=True)
         got = sha256sum(out)
         if got != archive["sha256"]:
-            _die(f"{name}: sha256 mismatch (got {got}, expected {archive['sha256']}) — "
-                 "delete it and re-run")
-        print(f"  {name}: verified")
+            # Distinguish a corrupt transfer from a stale manifest: Zenodo's own md5 says what
+            # the record actually serves. (v1.1 published a re-zipped, content-identical
+            # core2_mesh_ic.zip's sha in MANIFEST.json with the v1.0 bytes still on the record,
+            # so an md5-clean sha mismatch is a record-metadata defect, not a bad download —
+            # don't strand the user on it.)
+            md5 = files[name]["md5"]
+            if not md5 or md5sum(out) != md5:
+                _die(f"{name}: checksum mismatch (sha256 got {got}, manifest expects "
+                     f"{archive['sha256']}) — corrupt download; delete it and re-run")
+            print(f"  WARNING: {name}: matches the record's own md5 but not MANIFEST.json's "
+                  f"sha256.\n           The record's manifest is stale for this file; the "
+                  f"contents are the published ones. Continuing.", flush=True)
+        else:
+            print(f"  {name}: verified")
         return out
 
     print(f"  {name}: {len(parts)} part(s), {archive['size'] / 2**30:.2f} GB")
@@ -240,6 +252,23 @@ def main() -> int:
         mpath = dest / "MANIFEST.json"
         download(files["MANIFEST.json"]["url"], mpath, files["MANIFEST.json"]["size"])
         manifest = json.loads(mpath.read_text())
+
+    # Fail before the FIRST byte if the record cannot satisfy the request — not after the
+    # mesh archive with the forcing still missing (how v1.0's absent partitions stranded
+    # users with 370 MB and no way forward).
+    def _have(name: str) -> bool:
+        if manifest is not None:
+            a = next((a for a in manifest["archives"] if a["name"] == name), None)
+            if a is not None:
+                return all(p in files for p in a["parts"])
+        return name in files
+
+    missing = [n for n in want if not _have(n)]
+    if missing:
+        _die(f"record {args.record} is missing {', '.join(missing)}. It has: {sorted(files)}\n"
+             "       (an older version? The default record id is the concept id, which always\n"
+             "       resolves to the newest — if you passed --record or set "
+             "$FESOM_ZENODO_RECORD, try without it.)")
 
     for name in want:
         if manifest and any(a["name"] == name for a in manifest["archives"]):
