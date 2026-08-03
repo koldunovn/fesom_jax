@@ -23,6 +23,7 @@ one device == the dense step, byte-identical — the proof the plumbing is corre
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import jax
 import jax.numpy as jnp
@@ -241,6 +242,37 @@ def unfold_state(folded: State, P: int) -> State:
 _RKINDS = ("nod", "elem", "edge")
 
 
+def _ssh_halo_override(ragged: bool, padded: bool, coloured: bool) -> str | None:
+    """Transport for the CG's 2-D node halo when it should differ from the main one.
+
+    ``FESOM_SSH_HALO=padded|allgather|coloured`` (unset ⇒ same as the main transport).
+
+    Why this knob exists: the transports are ranked on the 3-D fields, where the exchange is
+    BANDWIDTH-bound and coloured's K neighbour rounds beat one dense ``all_to_all``. The CG's
+    node halo is a different regime — a 2-D field (CORE2: ~32 KB per rank), run ~2× per
+    iteration × ~127 iterations, so it is LATENCY-bound, and coloured pays K sequential
+    ``ppermute`` collectives (6+ on CORE2) where padded pays one ``all_to_all``. Same argument
+    as [[padded-a2a-halo-branch]]: a single-scale ranking is a cost STRUCTURE, not a verdict.
+
+    Returns ``None`` when the request matches what the main transport already does.
+    """
+    m = os.environ.get("FESOM_SSH_HALO", "").strip().lower()
+    if not m:
+        return None
+    if m not in ("coloured", "padded", "allgather"):
+        raise ValueError(f"FESOM_SSH_HALO must be coloured|padded|allgather, got {m!r}")
+    cur = ("coloured" if coloured else "padded" if padded else
+           "ragged" if ragged else "allgather")
+    if m == cur:
+        return None
+    if m == "coloured":
+        # would need the node kind's STATIC (perms, slots, offs), which only reaches
+        # _make_halo_ctx when the MAIN transport is coloured.
+        raise ValueError("FESOM_SSH_HALO=coloured is only available when the main halo is "
+                         "coloured (the ppermute perms are static meta); got main=" + cur)
+    return m
+
+
 def _halo_arrays(sm: ShardedMesh, ragged: bool = False, padded: bool = False,
                  coloured: bool = False) -> tuple[dict, dict]:
     """Fold the per-kind exchange maps + the node owned-mask to ``[P*Lmax_kind]``
@@ -277,6 +309,15 @@ def _halo_arrays(sm: ShardedMesh, ragged: bool = False, padded: bool = False,
             ha[f"pps_{k}"] = _fold(r.pad_src).astype(np.int32)
             ha[f"ppv_{k}"] = _fold(r.pad_valid)
             ha[f"ppp_{k}"] = _fold(r.pad_slotpos).astype(np.int32)
+    # The CG-halo override needs the OTHER transport's maps for the node kind only (the SSH
+    # solve is node-only), so fold just those three arrays rather than all kinds.
+    _ov = _ssh_halo_override(ragged, padded, coloured)
+    if _ov == "padded" and not padded:
+        r = sm.exchange_ragged["nod"]
+        ha["pps_nod"] = _fold(r.pad_src).astype(np.int32)
+        ha["ppv_nod"] = _fold(r.pad_valid)
+        ha["ppp_nod"] = _fold(r.pad_slotpos).astype(np.int32)
+        ha.setdefault("rhm_nod", _fold(r.halo_mask))          # allgather main folds no rhm
     ha["owned_nod"] = _fold(sm.owned_mask["nod"])
     return ha, {k: _P for k in ha}
 
@@ -327,13 +368,29 @@ def _make_halo_ctx(h: dict, n_global: int, use_ragged: bool, use_padded: bool,
     rmaps = (_coloured_ctx(h) if use_coloured
              else _ragged_ctx(h) if use_ragged
              else _padded_ctx(h) if use_padded else None)
-    ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
-                       owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
-                       ragged=rmaps["nod"] if rmaps is not None else None,
-                       recv_max=recv_max["nod"] if use_ragged else 0,
-                       use_ragged=use_ragged, use_padded=use_padded,
-                       use_coloured=use_coloured,
-                       col_meta=col_meta["nod"] if use_coloured else None)
+    # The CG's node halo may run a DIFFERENT transport from the 3-D fields (see
+    # _ssh_halo_override): latency-bound 2-D exchange, ~254 of them per step.
+    ov = _ssh_halo_override(use_ragged, use_padded, use_coloured)
+    if ov == "padded":
+        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
+                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
+                           ragged={"pad_src": h["pps_nod"], "pad_valid": h["ppv_nod"],
+                                   "pad_slotpos": h["ppp_nod"], "halo_mask": h["rhm_nod"]},
+                           recv_max=0, use_ragged=False, use_padded=True,
+                           use_coloured=False, col_meta=None)
+    elif ov == "allgather":
+        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
+                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
+                           ragged=None, recv_max=0, use_ragged=False, use_padded=False,
+                           use_coloured=False, col_meta=None)
+    else:
+        ssh_halo = SSHHalo(src_dev=h["sd_nod"], src_lane=h["sl_nod"],
+                           owned_mask=h["owned_nod"], n_global=n_global, axis_name="p",
+                           ragged=rmaps["nod"] if rmaps is not None else None,
+                           recv_max=recv_max["nod"] if use_ragged else 0,
+                           use_ragged=use_ragged, use_padded=use_padded,
+                           use_coloured=use_coloured,
+                           col_meta=col_meta["nod"] if use_coloured else None)
     return HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
                    owned_mask={"nod": h["owned_nod"]},
                    exch_ragged=rmaps, recv_max=recv_max,
