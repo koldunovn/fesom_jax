@@ -43,7 +43,7 @@ The model needs JAX with float64 enabled.
 ```bash
 # new conda/mamba env (Python 3.12)
 mamba create -y -n fesom-jax python=3.12 pip
-mamba activate fesom-jax
+conda activate fesom-jax   # NOT `mamba activate` — on stock mamba installs it exits 0 without activating
 
 git clone https://github.com/koldunovn/fesom_jax.git
 cd fesom_jax
@@ -446,7 +446,9 @@ built with that run's partition. Two CORE2 caches coexist: `data/ic_core2` = the
 
 ## Reproducing the benchmarks
 
-Prebuilt SLURM scripts in `scripts/` (each loops the relevant `--npes` / halo / mesh):
+Prebuilt SLURM scripts in `scripts/` (each loops the relevant `--npes` / halo / mesh). **They are
+Levante examples, not portable** — partitions, accounts and absolute paths are site-specific; adapt
+them before use elsewhere:
 
 ```bash
 sbatch scripts/bench/bench_core2_2node.sbatch     # CORE2 2 nodes (ragged + allgather)

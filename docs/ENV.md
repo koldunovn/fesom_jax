@@ -21,7 +21,7 @@ on CPU (with a "no GPU" warning) — GPU is verified on a compute node.
 ```bash
 # 1. dedicated env (Python 3.12)
 mamba create -y -n fesom-jax python=3.12 pip
-mamba activate fesom-jax
+conda activate fesom-jax   # `conda activate`, not `mamba activate` (which can exit 0 without activating)
 
 # 2. install the package + GPU JAX + dev tools
 cd /home/a/a270088/port_jax
@@ -50,9 +50,24 @@ srun -A ab0995_gpu -p gpu-devel --gres=gpu:1 -t 5 \
 ```
 Expect a `CudaDevice` in the device list and `float64` output.
 
+## Jupyter (the examples/ notebooks)
+
+Register the env as a **named kernel** — a wrong kernel surfaces as the misleading
+`ModuleNotFoundError: No module named 'jax'`:
+
+```bash
+python -m ipykernel install --user --name fesom-jax
+# headless execution pinned to that kernel:
+jupyter nbconvert --execute --ExecutePreprocessor.kernel_name=fesom-jax examples/01_pi_quickstart.ipynb
+```
+
 ## Recorded versions
 
 Installed 2026-06-05 into mamba env `fesom-jax` (`pip install -e ".[cuda,dev]"`).
+The pyproject pins are **floors** (`jax>=0.4.34`), so a bare install drifts to the newest JAX —
+0.11.0 as of 2026-07, which ran the full suite and a model year cleanly, but the version-specific
+caveats in these docs were recorded against the set below. Reproduce it exactly with the shipped
+constraints file: `pip install -e ".[cuda,dev]" -c constraints.txt`.
 
 - Python: **3.12.13**
 - JAX / jaxlib: **0.10.1**
@@ -75,3 +90,11 @@ Installed 2026-06-05 into mamba env `fesom-jax` (`pip install -e ".[cuda,dev]"`)
 > `Jax plugin configuration error ... cuInit(0) failed: ... CUDA error 303`
 > and falls back to CPU — expected (no GPU/driver on login nodes). On a GPU
 > compute node the CUDA plugin initializes normally.
+
+> **Fat login nodes can hard-ABORT instead** (any site whose login node reports very many
+> cores under a low per-user process limit): XLA's CPU backend sizes its compile-time thread
+> pools from the visible core count; when they overshoot `ulimit -u`, `pthread_create`
+> returns EAGAIN and XLA dies during compilation with
+> `Check failed: ret == 0 (11 vs. 0) Thread tf_foreach creation via pthread_create() failed`.
+> Not a broken installation — reinstalling changes nothing. Restrict the visible cores:
+> `taskset -c 0-15 python …` (measured trigger: a 256-core login node, `ulimit -u 2048`).

@@ -88,9 +88,14 @@ step (`n_steps: 1` / `"1step"`) is valid — useful for smoke tests.
 The restart writes the **FULL** prognostic State (every leaf, incl. the history/carry slots
 `T_old`/`S_old`/`uv_rhsAB`/`sigma*`/`tke`), so it reloads onto **any** device count: **save on 64 GPU →
 resume on 8** (or the reverse) — regardless of the on-disk layout, which follows `--output-layout`
-(§5.2; `reconstruct_global` auto-detects it, so older `folded` restarts still load too). A chained run
-is bit-identical to a continuous one (the restart round-trip is faithful and AB2 continues across the
-seam). See `fesom_jax/zarr_output.py` (`write_restart`/`read_restart`).
+(§5.2; `reconstruct_global` auto-detects it, so older `folded` restarts still load too). On CPU (or a
+single GPU) a chained run is bit-identical to a continuous one (the restart round-trip is faithful and
+AB2 continues across the seam). **Across device counts / on multi-GPU, expect roundoff-seeded chaotic
+divergence, not bit-identity**: the reduction order changes with the device layout, and the ocean
+amplifies that seed — measured on A100s: median ~3e-9 °C shortly after a cross-count resume, growing
+to ~1e-3 °C rms with local extremes ~0.3 °C in eddying regions. That is trajectory divergence, not
+state corruption (the restart file itself round-trips exactly); climatological statistics are
+unaffected. See `fesom_jax/zarr_output.py` (`write_restart`/`read_restart`).
 
 ---
 
@@ -201,4 +206,8 @@ sbatch scripts/runs/run_suite.sbatch
 ```
 
 The standing invariant: `RunConfig.defaults()` / config-off / `params=None` ⇒ **bit-identical** to the
-bare model — the regression guard, asserted in `test_run_config.py`.
+bare model — the regression guard, asserted in `test_run_config.py`. **The bitwise guarantee holds on
+CPU / a single device.** On GPU, XLA's reduction order is nondeterministic, so the exactness gates
+(including `test_defaults_bit_identical_step`) can fail there at roundoff — same commit, same
+environment: 551/551 on CPU vs 9 exactness-gate failures on GPU (measured 2026-07, A100). On GPU
+expect roundoff-level agreement, not bitwise; run the exactness gates on CPU.
