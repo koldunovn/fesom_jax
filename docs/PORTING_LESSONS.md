@@ -5392,3 +5392,88 @@ ablation → HLO diff → nsys, chained as slurm jobs. Chronicle:
   `python -c "import jax; jax.numpy.zeros(1)"` validates spellings; exact HLO pass names
   for `--xla_disable_hlo_passes` fall out of a 5-line jit + `--xla_dump_hlo_pass_re` on
   the login GPU (this jaxlib: `priority-fusion`, `multi_output_fusion`).
+
+## CPU strong-scaling campaign (2026-07-27) — multi-node CPU revived, and three of my own diagnoses overturned
+
+- **[transport] The "JAX-CPU is single-node" conclusion was a statement about the TRANSPORT,
+  not the backend.** The 2026-07-13 campaign measured gloo + *padded* and found 6×
+  anti-scaling across nodes; padded's dense `all_to_all` grows with rank count and is
+  ruinous on TCP. Coloured (Phase 8d, written the day *after* that campaign) sends K=Δ
+  neighbour-only `ppermute` rounds: at CORE2 2 nodes it is **2.9×** faster than padded, and
+  **11.8×** at the 16-ranks/node split (1004 vs 11682 ms). Multi-node CPU scales. Lesson:
+  when a capability is declared dead, check whether the machinery it depends on has changed
+  since — the verdict can expire without anyone re-running it.
+
+- **[jax] `jax_cpu_collectives_implementation='mpi'` cannot run a real model.** jaxlib 0.10.1
+  does ship `xla::cpu::MpiCollectives` + MPItrampoline, and an MPIwrapper shim built against
+  Levante's OpenMPI makes a 2-node `psum` pass — then every model run dies with *"Communicator
+  requested from a thread that is not the one MPI was initialized from"*. XLA demands all
+  collectives on the MPI-init thread; JAX's runtime doesn't oblige. A toy gate passing proves
+  nothing here: it only stayed on the main thread. (Also: Levante's OpenMPI has no SLURM PMI,
+  so `srun --mpi=pmix` can't launch it — `mpirun` only, and `--ntasks-per-node` must match
+  `--map-by ppr:N:node` or mpirun has no slots.)
+
+- **[method] Two OOM-killed runs reporting the same peak tell you NOTHING about demand.**
+  dars used 232 GB at 8 ranks/node and 227 GB at 4 — I read the near-equality as a per-*core*
+  memory term and reconfigured the whole big-mesh ladder around it. Both runs were simply
+  killed at the node ceiling; equal ceilings are an artifact of the ceiling. A single-rank
+  probe at 16 vs 128 cores settled it in one job: 24.25 vs 24.37 GB — **memory is
+  core-count-independent**. Compare only measurements that ran to completion.
+
+- **[memory] Per-rank host setup, not the shard, is what caps CPU meshes.** Every rank
+  materialises the global `State` + PHC IC and `build_sharded_mesh`'s `[P, Lmax, …]` gather
+  before taking its shard, so a node pays that transient once *per rank* (core2: 24 GB at
+  npes=1 vs 5.8 GB/rank at npes=16). dars needs ≤2 ranks/node; **ng5 OOMs at 1 rank/node** —
+  a single rank exceeds 251 GB, so NG5-on-CPU is unreachable on Levante at any rank count
+  until a shard-on-load path exists. This is the highest-value CPU follow-up.
+
+- **[debug] Never pipe a failing launcher through `tail -N`.** The leg script kept mpirun's
+  last 14 lines — which held the abort stack trace and *not* the error message above it. Two
+  diagnostic rounds went into a bogus "coordination service" theory (and a heartbeat-timeout
+  A/B) before a full log showed the real cause: the same `Gloo collective permute failed`
+  defect. Write the full log to a file, grep for the summary.
+
+- **[gloo] The coloured/gloo collective-permute defect is structural per (mesh, npes), and its
+  obvious explanation is wrong.** It kills CORE2 npes=8, CORE2 npes=128 and farc npes=32 while
+  neighbouring rungs pass. Hypothesis "gloo can't handle partial permutation rounds" is
+  **refuted**: the passing configs are *more* partial (core2 npes=16: 5/6 rounds partial, 42
+  idle slots, passes; npes=8: 1/3, 4 slots, fails; farc npes=64 passes with 207 idle slots vs
+  32's 114 that fails). Root cause open; reproducer is CORE2 `dist_8` + `--halo coloured` on
+  CPU. Upstream candidate alongside the ragged-transpose bug.
+
+## CPU deep-dive: the collective, not the exchange, is what caps JAX-CPU (2026-07-27, branch perf/cpu-cg-collectives)
+
+- **[jax] JAX's CPU all-reduce is O(P); its neighbour exchange is O(1) in rank count.** Measured
+  in-graph (chain of dependent collectives in ONE jit, differenced across chain lengths so
+  dispatch cancels): scalar `psum` 0.041 / 0.107 / 0.183 / 0.363 / **0.812 ms** at 2 / 4 / 8 /
+  16 / 32 ranks — doubling per doubling, a ring. `ppermute` over the same range: 0.039 → 0.060
+  ms, flat. MPI all-reduces in O(log P), which is precisely why the Fortran twin decomposes
+  CORE2 over 512 ranks and we stall at 32: the SSH CG pays 2 all-reduces × ~127 iterations, so
+  every added rank makes ~254 collectives/step dearer while shrinking each rank's work. **Do not
+  blame "JAX exchanges" for CPU scaling — blame the reductions.**
+
+- **[perf] Therefore: trade all-reduces for halo rounds. CGPOLY degree 6 = −29% on CPU**
+  (CORE2 32 ranks 994.9 → 705.3 ms, 4.95 → 6.99 SYPD; iterations 127 → 27). It also **erases the
+  multi-node degradation**: 4 nodes went 1292.8 → 716.2 ms (−45%), turning "anti-scales past 2
+  nodes" into "flat". **The optimum degree is backend-specific**: 1 on GPU (−21%), ≥6 on CPU,
+  because the two have opposite collective economics. Never inherit such a tuning across backends.
+
+- **[perf] The lever's size tracks the collective share, not the mesh**: CORE2 −28%, farc −44%
+  (10 k points/rank), dars −1 to −3% (99–197 k points/rank, compute-bound). And the two CPU
+  limits interact — the §5 memory wall forces dars onto 2 fat ranks/node, i.e. into exactly the
+  regime where the collective fix cannot help. Shard-on-load would fix both at once.
+
+- **[method] "One collective call" ≠ "one message".** I proposed routing the CG's 2-D halo
+  through padded on the theory that a dense `all_to_all` is one round vs coloured's six. It is
+  **52% slower** (and allgather 384% slower): a dense all-to-all is P−1 messages per rank (31 at
+  npes=32) where coloured is Δ≈6. Coloured wins on message COUNT — which also explains its win on
+  the 3-D fields, so the "bandwidth vs latency regime" story I built was wrong too. The
+  experiment still paid for itself: swapping *only* the CG halo moved the step 1.0 s → 4.9 s,
+  proving the CG halo is the dominant comm.
+
+- **[method] "Reproduced N times" proves the configuration fails, not that you know the key.**
+  §3b called the gloo defect "keyed to (mesh, npes), not flaky" on 4/4 + 3/3 + 2/2 reproductions.
+  Then farc npes=128 passed 5/5 at CG degree 0 and failed 3/3 at degree 6 — same mesh, ranks and
+  layout. Deterministic, yes; keyed to the partition, no. The trigger includes the *exchange
+  pattern*, and notably degree 6 fires FEWER exchanges per step (189 vs 254) but in tighter
+  bursts. Before generalising from repeats, vary the axes you did not think were part of the key.
