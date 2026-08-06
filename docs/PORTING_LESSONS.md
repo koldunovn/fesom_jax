@@ -5565,3 +5565,20 @@ three, every blocking finding in packaging/docs. Lessons from fixing the first t
   over its own budget (64 absolute — but 6e-5 relative on an O(1e6) field) and `pgf` looked
   clean at 4e-9 while actually being 2.5e-5 relative on an O(1e-4) field. The same file's newer
   `_slow_field_rel_check` already does this per-field and relative; prefer it when adding gates.
+
+## NN-GM (paper 3) — `docs/plans/20260806-fesom-jax-nn-eddy-param.md`
+
+### Task 0 — workspace + version verification (2026-08-06)
+
+- **[method] A recorded build SHA can name a commit that cannot even compile — verify
+  provenance by ancestry AND buildability, not by the hash alone.** The R2 `fesom.x`'s
+  documented commit 6b26861a lives on branch `llm-fix-3`, not an ancestor of main, and its
+  committed tree has `src/ice_fct.F90` accidentally EMPTIED while `ice_setup_step.F90` still
+  calls `ice_TG_rhs` — that tree cannot link, so the binary was necessarily built from a
+  dirty working tree (the file's real content in place). The useful checks, in order:
+  `git merge-base --is-ancestor <sha> main`; diff both sides to the merge-base; ask whether
+  the committed tree defines every symbol it calls; md5 the production working tree's files
+  against candidate blobs. Here they proved main@4ccdd35a src == the state actually
+  compiled — so the worktree branched from main is MORE faithful to the binary than
+  checking out the recorded SHA would have been. The definitive check stays behavioral:
+  Task 1's byte-identity gate reruns the rebuilt binary against the R2 outputs.
