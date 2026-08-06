@@ -122,15 +122,28 @@ taming near coasts/equator.
 **Files:**
 - Modify: `io_meandata.F90` (+ namelist plumbing) in the fesom2 worktree
 
-- [ ] add a per-entry snapshot flag to the output list: write instantaneous values at the
-      listed interval, bypassing mean accumulation; no multi-frequency machinery
-- [ ] wire namelist control + document usage in the worktree README
-- [ ] test: 1-day CORE2-mesh Fortran smoke run (compute node) — constant field: snapshot ==
-      mean; evolving field: snapshot ≠ mean and equals the model state at write time;
-      time-axis metadata and fill handling unchanged
-- [ ] **gate (bit-identity-when-disabled):** flag-off run produces output + restart files
-      byte-identical to the unpatched R2 binary on the same inputs
-- [ ] gate: smoke-run I/O overhead <~5% step time at the test cadence
+- [x] add a per-entry snapshot flag to the output list: write instantaneous values at the
+      listed interval, bypassing mean accumulation; no multi-frequency machinery — done
+      2026-08-06 (commit cda32816): optional `&nml_snap` group defines ADDITIONAL
+      `<id>_snap` streams (io_list format; absent ⇒ off); reuses the io_list definition
+      table so any mean-able field is snapshot-able; mean+snapshot of one field coexist.
+      Caveats: vec_autorotate does not apply to `*_snap` (native rotated frame, warned;
+      R2/CORE2 production runs vec_autorotate=.true. — pipeline unrotates); 0D refused
+- [x] wire namelist control + document usage in the worktree README — `SNAPSHOT_OUTPUT.md`
+- [x] test: 1-day CORE2-mesh Fortran smoke run (compute node) — 12/12 PASS (job 26745349,
+      dist_128, cold start 1958): `sst_snap[0] == sst[47]` BITWISE where sst is an
+      every-step mean (a 1-step mean ≡ instantaneous state, subsumes the constant-field
+      case); evolving fields snap≠mean (temp max 2.6, ssh max 1.0); r8 path; elemental
+      (u_snap) + ice shapes; fill patterns identical; time-axis metadata identical
+- [x] **gate (bit-identity-when-disabled): PASS** — via the rebuilt-unpatched control
+      (Revision Log (d) fallback): unpatched-4ccdd35a run D vs patched-flag-off run B =
+      **0/33 files differ** (all outputs + oce/ice restarts + clock). ⚠️ vs the Feb-22
+      production R2 binary (run A): 30/33 differ FROM STEP 1 (sst max 4.5e-2 at step 1,
+      polar-clustered) — the R2 binary's source is NOT today's main and NOT recoverable
+      from git (the llm-fix-3 ice_fct.F90 mangling); see Revision Log (h)
+- [x] gate: smoke-run I/O overhead <~5% step time at the test cadence — **PASS: +0.12%**
+      total (7.8826→7.8922 s; output component 0.48→0.77 s for 6 extra snapshot streams
+      incl. two 3D nodal + one 3D elemental, daily cadence)
 
 ### Task 2: Gradient-horizon scan — BEFORE the teacher launch (GATE HORIZON_OK)
 
@@ -460,3 +473,20 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
   (~1.1 @ 8192 expected); the compute-budget sign-off additionally needs a few days
   measured at dt=360 s (~3.3 SYPD expected). Snapshot cadence (GATE HORIZON_OK) is in
   DAYS, so the dt switch does not move the output protocol.
+- 2026-08-06 (h): **Task 1 COMPLETE + provenance finding.** Snapshot patch cda32816 on
+  `nn-eddy-output`; all three gates green (functional 12/12, byte-identity via control,
+  overhead +0.12%). The byte-identity investigation PROVED the Feb-22 production R2
+  binary (`~/fesom27/fesom2/bin/fesom.x`) computes a trajectory different from ANY
+  buildable git state: it diverges from today's main from STEP 1 (sst max 4.5e-2 K,
+  73% of >1e-3 diff nodes poleward of 50° ⇒ sea-ice advection), while an independent
+  unpatched rebuild of 4ccdd35a is byte-identical to our patched-flag-off binary. The
+  R2 binary was built from a working tree whose `ice_fct.F90` state matches no commit
+  (llm-fix-3 emptied the file; the content compiled on Feb 22 is unrecoverable).
+  Consequences: (1) the Task-1 gate legitimately uses the rebuilt-unpatched control;
+  (2) **the worktree binary (main 4ccdd35a + snapshot patch) is THIS project's Fortran
+  reference from now on** — teacher + all new Fortran baselines use it (clean git
+  provenance); (3) the 63-yr R2 hindcast remains valid for its statistical/clim
+  comparisons (paper 2), but pointwise re-use should note the caveat. Control build
+  worktree at /scratch/a/a270088/tmp/fesom2_ctrl (throwaway; scratch auto-expires —
+  `git worktree prune` in ~/fesom27/fesom2 afterwards). Smoke runs preserved in
+  /work/ab0995/a270088/nn_eddy/task1_smoke/.
