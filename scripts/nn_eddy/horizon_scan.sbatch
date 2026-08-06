@@ -25,7 +25,7 @@ WORK=/work/ab0995/a270088/port_jax
 SNAP=${SNAP:-$WORK/foundation_snaps/snap_step037440.pkl}
 SEASON=${SEASON:-winterNH}
 MARKS=${MARKS:-end}
-NLIST=${NLIST:-"1 2 3 5 7 10"}
+NLIST=${NLIST:-"1 2 3 5 7 10"}   # shortest first: each N is a fresh process, so an OOM at long N does not lose the short-N results
 RES=${RES:-scripts/nn_eddy/horizon_results.jsonl}
 echo "=== $(hostname) $(date) — Task-2 horizon scan seed=$SEASON marks=$MARKS N=[$NLIST] d ==="
 nvidia-smi -L 2>/dev/null || echo "(no nvidia-smi)"
