@@ -112,8 +112,22 @@ taming near coasts/equator.
       CMakeCache), 0 errors, `bin/fesom.x` produced; size differs from production only
       by embedded build metadata (2,227,832 vs 2,227,896 B). Version provenance
       verified — see Revision Log (d)
-- [ ] verify port_jax suite green in its worktree (sbatch, compute node) — job 26743651
-      running 2026-08-06
+- [x] verify port_jax suite green in its worktree (sbatch, compute node) — done
+      2026-08-06 with a documented caveat: **ocean 770 passed / 7 skipped, ice 50 passed
+      / 0 skipped** (jobs 26744089). ⚠️ SHARDING group: (a) it cannot finish in any
+      practical wall time — pre-existing since 2026-06-12
+      ([[sharded-suite-slow-phase8b]]); main has since raised its cap to 4 h (P19), our
+      branch point predates that; (b) it contains ONE real failure, identified by an
+      `-x` run (job 26746829): `test_forcing_sharded.py::test_forced_multistep_owned_
+      matches[2]` — sharded-vs-dense `uv` on owned nodes, max|Δ|=8.97e-3 vs 1e-7 atol.
+      **Not attributable to this project**: our branch's only diffs vs 8dca7e4 are
+      docs/ + scripts/ (zero `fesom_jax/` files), and halo.py/momentum.py/forcing.py/
+      surface_forcing.py are byte-identical between main and our base ⇒ pre-existing
+      port-wide. ➕ Matters for Task 9 (data-parallel windows across GPUs) — must be
+      fixed before that; surfaced to the user 2026-08-06.
+      ⚠️ Gotcha found: the worktree needs the gitignored `data` symlink
+      (`ln -s /work/ab0995/a270088/port_jax/data`) or ICE+sharding SKIP silently while
+      the suite still prints "ALL GREEN" (first run: 575 passed/202 skipped)
 - [x] gate: `git worktree list` clean in both repos; running chains untouched — verified
       2026-08-06 (fesom27: main + nn-eddy-output; port_jax: 4 worktrees incl. nn-eddy)
 
