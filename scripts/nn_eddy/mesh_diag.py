@@ -101,7 +101,13 @@ def moc_from_w(w, elem_nodes, elem_area, elem_nlevels, elem_lat_deg, *,
 
     lats = np.linspace(-90.0, 90.0, nlats)
     dlat = lats[1] - lats[0]
-    pos = ((np.asarray(elem_lat_deg) - lats[0]) / dlat).astype(int)
+    # ⚠️ Round the centroid before binning. On the CORE2 mesh two triangles have centroid
+    # latitudes of exactly 86.0 and 74.0 degrees — right on a bin edge — and our .npy mesh
+    # export differs from the mesh ASCII in the last bits (~1e-13 deg), which is enough to
+    # flip which bin they land in and to move ~7e-3 Sv of overturning by one bin. Rounding
+    # to 1e-9 deg (~0.1 mm) makes the assignment depend on the coordinate as written, not
+    # on accumulated round-off, so any copy of the mesh gives the same answer.
+    pos = ((np.round(np.asarray(elem_lat_deg, dtype=np.float64), 9) - lats[0]) / dlat).astype(int)
     pos = np.clip(pos, 0, nlats - 1)
 
     # triangle-mean w, converted to Sv, weighted by triangle area
@@ -144,17 +150,43 @@ def amoc_strength(lats, moc, zbar, *, lat_range=(20.0, 60.0), depth_range=(500.0
 # ---------------------------------------------------------------------------
 
 def load_mesh_arrays(mesh_dir: Path):
-    """The handful of exported mesh arrays the overturning needs."""
+    """The handful of exported mesh arrays the overturning needs.
+
+    ⚠️ ``elem_nlevels`` is returned as the exported ``nlevels`` MINUS ONE — the number of
+    interface levels that carry data. FESOM's mesh diagnostic stores the interface count,
+    and its deepest entry is where the netCDF fill value starts; pyfesom2's ``xmoc_data``
+    makes the same subtraction. Blanking at the unsubtracted count leaves one row of
+    9.97e36 fill values in the sum and the answer comes out at 1e43 Sv.
+    """
     mesh_dir = Path(mesh_dir)
-    geo = np.load(mesh_dir / "geo_coord_nod2D.npy")           # radians
+    geo = np.load(mesh_dir / "geo_coord_nod2D.npy")           # GEOGRAPHIC radians
     lon = np.degrees(geo[:, 0])
     lon = (lon + 180.0) % 360.0 - 180.0                        # -> [-180, 180)
     lat = np.degrees(geo[:, 1])
     return dict(lon_deg=lon, lat_deg=lat,
                 elem_nodes=np.load(mesh_dir / "elem_nodes.npy"),
                 elem_area=np.load(mesh_dir / "elem_area.npy"),
-                elem_nlevels=np.load(mesh_dir / "nlevels.npy"),
+                elem_nlevels=np.load(mesh_dir / "nlevels.npy") - 1,
                 zbar=np.load(mesh_dir / "zbar.npy"))
+
+
+def load_w(path, var: str = "w", time_index: int | None = None) -> np.ndarray:
+    """Read w as (nod2D, nl) with missing data zeroed.
+
+    ⚠️ FESOM writes ``9.96921e+36`` (the netCDF float fill) wherever a cell is dry **or**
+    its value rounds below 1e-30, so the raw array is not usable arithmetic:
+    ``np.asarray(ds.variables['w'][:])`` strips netCDF4's mask and silently hands back
+    those 1e36 values. Missing means "contributes nothing", so they are set to zero here.
+    """
+    from netCDF4 import Dataset
+
+    ds = Dataset(str(path))
+    v = ds.variables[var][:]                       # netCDF4 returns a MaskedArray
+    w = np.ma.filled(np.ma.masked_invalid(np.ma.masked_greater(np.ma.asarray(v), 1e30)), 0.0)
+    w = np.asarray(w, dtype=np.float64)
+    if w.ndim == 3:
+        w = w[time_index] if time_index is not None else w.mean(axis=0)
+    return w
 
 
 def main():
@@ -168,12 +200,8 @@ def main():
     ap.add_argument("--out", default="moc")
     args = ap.parse_args()
 
-    from netCDF4 import Dataset
     m = load_mesh_arrays(args.mesh)
-    ds = Dataset(args.w_file)
-    w = np.asarray(ds.variables[args.w_var][:])
-    if w.ndim == 3:
-        w = w[args.time] if args.time is not None else w.mean(axis=0)
+    w = load_w(args.w_file, args.w_var, args.time)
     if w.shape[0] != m["lon_deg"].size:      # (nl, nod2D) -> (nod2D, nl)
         w = w.T
 

@@ -156,3 +156,22 @@ def test_global_mask_is_everything():
     lon = np.linspace(-180, 180, 7)
     lat = np.linspace(-80, 80, 7)
     assert md.basin_mask(lon, lat, "Global").all()
+
+
+def test_bin_edge_element_is_round_off_robust():
+    """A triangle whose centroid sits exactly on a latitude-bin edge must land in the same
+    bin whether or not the stored coordinates carry last-bit round-off.
+
+    This is not hypothetical: on the CORE2 mesh two triangles have centroid latitudes of
+    exactly 86.0 and 74.0 degrees, and the .npy mesh export differs from the mesh ASCII by
+    ~1e-13 deg, which moved ~7e-3 Sv of Atlantic overturning by one bin.
+    """
+    g = _strip(nlat_bands=1)
+    w = np.ones((g["nnod"], g["nl"])) * 1.0e-5
+    out = []
+    for lat in (74.0, 74.0 - 1e-13, 74.0 + 1e-13):
+        _, moc = md.moc_from_w(w, g["elem_nodes"], g["elem_area"], g["elem_nlevels"],
+                               np.array([lat]))
+        out.append(moc)
+    assert np.allclose(out[0], out[1]) and np.allclose(out[0], out[2]), \
+        "bin assignment must not depend on last-bit round-off in the centroid latitude"
