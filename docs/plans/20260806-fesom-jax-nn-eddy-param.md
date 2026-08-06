@@ -104,11 +104,18 @@ taming near coasts/equator.
 - Create: worktree `/home/a/a270088/nn_eddy/fesom2` (branch `nn-eddy-output` off the
   `/home/a/a270088/fesom27/fesom2` checkout's current commit)
 
-- [ ] create both worktrees + data root; record layout in a README there (incl. "plan file
-      authoritative in main checkout" note)
-- [ ] verify FESOM2 builds unchanged in its worktree (same toolchain as the R2 binary)
-- [ ] verify port_jax suite green in its worktree (sbatch, compute node)
-- [ ] gate: `git worktree list` clean in both repos; running chains untouched
+- [x] create both worktrees + data root; record layout in a README there (incl. "plan file
+      authoritative in main checkout" note) — done 2026-08-06: `~/nn_eddy/{port_jax,fesom2}`
+      + `/work/ab0995/a270088/nn_eddy/` + README/CLAUDE.md/NEXT_SESSION_PROMPT.md
+- [x] verify FESOM2 builds unchanged in its worktree (same toolchain as the R2 binary)
+      — done 2026-08-06: `configure.sh` (env shell.intel, same mpif90 path as the R2
+      CMakeCache), 0 errors, `bin/fesom.x` produced; size differs from production only
+      by embedded build metadata (2,227,832 vs 2,227,896 B). Version provenance
+      verified — see Revision Log (d)
+- [ ] verify port_jax suite green in its worktree (sbatch, compute node) — job 26743651
+      running 2026-08-06
+- [x] gate: `git worktree list` clean in both repos; running chains untouched — verified
+      2026-08-06 (fesom27: main + nn-eddy-output; port_jax: 4 worktrees incl. nn-eddy)
 
 ### Task 1: Fortran snapshot-output patch (minimal)
 
@@ -151,8 +158,12 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
 - Create: run dir `/work/ab0995/a270088/nn_eddy/ng5_teacher/` (namelists, sbatch chain,
   monitor script)
 
-- [ ] ⚠️ BLOCKING prerequisite: obtain the AWI NG5 namelist set + `dist_*` partitions
-      (user provides the source setup)
+- [x] ⚠️ BLOCKING prerequisite: obtain the AWI NG5 namelist set + `dist_*` partitions
+      (user provides the source setup) — done 2026-08-06: user-provided source setup
+      `/home/a/a270088/DestinE/fesom2.6/work_NG5_1950_Rohit` (⚠️ fesom2.6/DestinE, ERA5
+      forcing, yearnew=1945, mEVP α=β=500, icepack namelist present — full coefficient
+      audit + JRA55-do forcing swap required, see Revision Log (d)); partitions already
+      at `/work/ab0995/a270088/meshes/NG5/dist_{1024,1920,2048,2560,3840,4096,7680,8192}`
 - [ ] adapt namelists: cvmix-TKE + mEVP + zstar, GM/Redi OFF, JRA55-do, PHC IC, **cold
       start 1958-01-01** (same transient as the student hindcast)
 - [ ] output protocol (cadence per GATE HORIZON_OK): 3D snapshots T,S,w (nodal) + u,v
@@ -396,3 +407,29 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
   1959–65); NG5 mesh export added; Arm B pivot scoped; module renamed fesom_filters→
   coarsen.py, MOC to scripts-only; paths fixed (fesom_jax/tests/,
   scripts/runs/run_suite.sbatch); authoritative-copy rule stated.
+- 2026-08-06 (c): Task-0 workspace created. Branch points: `nn-eddy` off 8dca7e4
+  (perf/cpu-cg-collectives HEAD — where this plan is committed; NOT off main, which
+  predates it), `nn-eddy-output` off 4ccdd35a (~/fesom27/fesom2 main HEAD, which already
+  carries NG5 partition-sweep configs — the likely namelist starting point for Task 3).
+- 2026-08-06 (d): **FESOM version verified per user directive** ("use the fesom version
+  the port is based on"): the R2 binary's recorded commit 6b26861a sits on branch
+  `llm-fix-3`, NOT an ancestor of main — but its ONLY src delta vs the merge-base
+  df1ab8cd is an accidentally *emptied* `src/ice_fct.F90` (that tree calls `ice_TG_rhs`
+  with no definition anywhere ⇒ cannot link; the binary must have been built with the
+  file present). Main @4ccdd35a has ZERO src changes since the merge-base and its
+  `ice_fct.F90` md5-matches the production working tree ⇒ **worktree branch point
+  4ccdd35a is the correct source state** (better than literal 6b26861a). Definitive
+  behavioral check remains Task 1's gate: rebuilt-unpatched worktree binary vs the R2
+  binary's outputs; if THAT differs, the gate control becomes rebuilt-unpatched vs
+  rebuilt-patched-flag-off (same toolchain: env `shell.intel`, intel-oneapi 2022.0.1 +
+  openmpi 4.1.2 + netcdf-fortran 4.5.3, via `configure.sh`).
+- 2026-08-06 (e): **Task-3 inputs materialized** (user provided): NG5 source setup =
+  `work_NG5_1950_Rohit` (see Task 3 checkbox); NG5 partitions already on /work. User
+  directive: Task-1 output testing starts from the CORE2 setup (`fesom2_core2`
+  namelists), NOT NG5. **Measured NG5 cost prior** (partition sweep, OUR fesom27
+  binary, dt=120 s, 30-day runs, monthly output): 0.61 SYPD @4096 cores, 0.98 @7680,
+  **1.10 SYPD @8192 cores (64 nodes)** — below the plan's 1.5–3 SYPD estimate ⇒ 10 SY
+  ≈ 9.1 wall-days ≈ **~1.8 M core-h** at 64 nodes, before snapshot-I/O overhead; feeds
+  the Task-3 compute-budget gate. ⚠️ dt: sweep needed 2-min (3-min blew up at mstep=47,
+  cold start); the fesom2.6 Rohit run used 6-min (240 steps/day, after a ramp trail
+  96→72→45→240 in comments) — teacher dt/ramp strategy is an open Task-3 decision.
