@@ -44,6 +44,7 @@ import argparse
 import datetime
 import json
 import math
+import os
 import pickle
 import re
 import time
@@ -152,11 +153,22 @@ def main():
     ap.add_argument("--truth-mult", type=float, default=1.25, help="truth GM κ multiplier m_true")
     ap.add_argument("--marks", choices=("end", "daily"), default="end")
     ap.add_argument("--run-start-year", type=int, default=1958)
+    ap.add_argument("--truth-cache", type=Path, default=None,
+                    help="npz holding the 10-day truth marks + weights (default: under $WORK/nn_eddy/horizon_truth)")
+    ap.add_argument("--recompute-truth", action="store_true", help="ignore any cached truth and rebuild it")
+    ap.add_argument("--no-remat-blocks", action="store_true",
+                    help="disable nested in-step rematerialization (uses much more memory; for A/B only)")
     ap.add_argument("--results", type=Path, default=ROOT / "scripts" / "nn_eddy" / "horizon_results.jsonl")
     args = ap.parse_args()
     ndays = args.n_days
     assert 1 <= ndays <= NDAYS_TRUTH, f"--n-days must be 1..{NDAYS_TRUTH}"
     n = ndays * STEPS_PER_DAY
+    # Nested in-step rematerialization. The per-step reverse working set on CORE2 is
+    # ~34-37 GiB and does NOT shrink with the window, so it, not the window length, is
+    # what OOMs an 80 GB card (step.py:155). remat_blocks recomputes the heavy sub-blocks
+    # one at a time: forward bit-identical, gradient identical, much less peak memory.
+    global REMAT_BLOCKS
+    REMAT_BLOCKS = not args.no_remat_blocks
 
     print(f"[setup] backend={jax.default_backend()} devices={jax.devices()}", flush=True)
     t0 = time.time()
@@ -168,9 +180,13 @@ def main():
     sst0 = np.asarray(phc_initial_state(mesh, IC_DIR).T[:, 0])
     cf = surface_forcing.build_surface_forcing(mesh, yr, sst_ic=sst0)
     n_truth = NDAYS_TRUTH * STEPS_PER_DAY
-    dates = surface_forcing.dates_for_steps(yr, DT, n_truth, start_month=mo, start_day=dy)
-    sfs_all = cf.stack(dates)
+    dates_all = surface_forcing.dates_for_steps(yr, DT, n_truth, start_month=mo, start_day=dy)
     fs = cf.static
+    # ⚠️ MEMORY: stack forcing only for the steps in hand. Keeping the whole
+    # NDAYS_TRUTH stack resident cost ~10 GB of the 80 GB card and pushed the N=1 d
+    # backward into OOM (2026-08-06); the adjoint itself is not the problem.
+    def stack_steps(lo, hi):
+        return cf.stack(dates_all[lo:hi])
     wet3d = jnp.asarray(mesh.node_layer_mask, jnp.float64)
     area3d = jnp.asarray(np.asarray(mesh.areasvol), jnp.float64) * wet3d
     kgm0 = float(Params.defaults().k_gm)
@@ -179,14 +195,11 @@ def main():
         # redi_kmax auto-syncs to k_gm in the C default config — couple them here too
         return build_params({"k_gm": kgm0 * m, "redi_kmax": kgm0 * m})
 
-    def day_slice(d):
-        return jax.tree.map(lambda x: x[d * STEPS_PER_DAY:(d + 1) * STEPS_PER_DAY], sfs_all)
-
     def step_body_for(p):
         def body(carry, sf):
             nxt = step(carry, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
                        forcing_static=fs, ice_cfg=ICE_FROZEN, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
-                       ale_cfg=ALE_CFG)
+                       ale_cfg=ALE_CFG, remat_blocks=REMAT_BLOCKS)
             return nxt, None
         return body
 
@@ -201,44 +214,83 @@ def main():
           f"date={yr}-{mo:02d}-{dy:02d}  N={ndays} d ({n} steps)  marks={args.marks}  "
           f"m_true={args.truth_mult}  config=zstar+TKE+mEVP+GM frozen-ice-adjoint", flush=True)
 
-    # --- truth trajectory: ALWAYS NDAYS_TRUTH days -> identical weights across all N.
-    # Host loop over the jitted one-day forward (one compile, NDAYS_TRUTH calls).
+    # --- truth trajectory: ALWAYS NDAYS_TRUTH days, so the per-level weights are
+    # identical for every window length. It does not depend on N, so it is computed
+    # ONCE and cached on disk: the sweep runs one process per N, and re-running a
+    # 10-day forward in each of them wasted ~3.5 min of A100 apiece.
+    cache = args.truth_cache or (Path("/work/ab0995/a270088/nn_eddy/horizon_truth") /
+                                 f"{Path(args.snap).stem}_m{args.truth_mult:g}_{NDAYS_TRUTH}d.npz")
     t1 = time.time()
-    m_true = jnp.asarray(args.truth_mult, jnp.float64)
-    truth_marks = []
-    s = st0
-    for d in range(NDAYS_TRUTH):
-        s = one_day(s, day_slice(d), m_true)
-        truth_marks.append(jax.device_get((s.T, s.S, s.eta_n)))
-    T_stack = jnp.asarray(np.stack([m[0] for m in truth_marks]))
-    S_stack = jnp.asarray(np.stack([m[1] for m in truth_marks]))
-    e_stack = jnp.asarray(np.stack([m[2] for m in truth_marks]))
-    w_T, w_S, w_eta = level_weights(T_stack, S_stack, e_stack, wet3d, area3d)
-    print(f"[truth] {NDAYS_TRUTH}-day truth + weights in {time.time()-t1:.1f}s  "
-          f"(w_T surf={float(w_T[0]):.3e}, w_eta={float(w_eta):.3e})", flush=True)
+    if cache.exists() and not args.recompute_truth:
+        z = np.load(cache)
+        truth_marks = [(z["T"][d], z["S"][d], z["eta"][d]) for d in range(NDAYS_TRUTH)]
+        w_T, w_S, w_eta = jnp.asarray(z["w_T"]), jnp.asarray(z["w_S"]), jnp.asarray(z["w_eta"])
+        print(f"[truth] loaded cached {NDAYS_TRUTH}-day truth from {cache} in {time.time()-t1:.1f}s", flush=True)
+    else:
+        # Host loop over the jitted one-day forward; marks are pulled to HOST each day
+        # and the device copies dropped, so the truth run leaves nothing resident.
+        m_true = jnp.asarray(args.truth_mult, jnp.float64)
+        truth_marks = []
+        s = st0
+        for d in range(NDAYS_TRUTH):
+            sfs_day = stack_steps(d * STEPS_PER_DAY, (d + 1) * STEPS_PER_DAY)
+            s = one_day(s, sfs_day, m_true)
+            truth_marks.append(jax.device_get((s.T, s.S, s.eta_n)))   # -> host numpy
+            jax.tree.map(lambda x: x.delete() if hasattr(x, "delete") else None, sfs_day)
+        del s, sfs_day
+        # weights need the whole mark stack, but only briefly: compute, then free.
+        T_stack = jnp.asarray(np.stack([m[0] for m in truth_marks]))
+        S_stack = jnp.asarray(np.stack([m[1] for m in truth_marks]))
+        e_stack = jnp.asarray(np.stack([m[2] for m in truth_marks]))
+        w_T, w_S, w_eta = level_weights(T_stack, S_stack, e_stack, wet3d, area3d)
+        w_T, w_S, w_eta = (jax.block_until_ready(x) for x in (w_T, w_S, w_eta))
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".tmp.npz")          # write-then-rename: never a torn cache
+        np.savez(tmp, T=np.stack([m[0] for m in truth_marks]),
+                 S=np.stack([m[1] for m in truth_marks]),
+                 eta=np.stack([m[2] for m in truth_marks]),
+                 w_T=np.asarray(w_T), w_S=np.asarray(w_S), w_eta=np.asarray(w_eta))
+        tmp.rename(cache)
+        for arr in (T_stack, S_stack, e_stack):
+            arr.delete()
+        del T_stack, S_stack, e_stack
+        print(f"[truth] computed {NDAYS_TRUTH}-day truth + weights in {time.time()-t1:.1f}s "
+              f"-> cached at {cache}", flush=True)
+    print(f"[truth] w_T surf={float(w_T[0]):.3e}, w_eta={float(w_eta):.3e}; "
+          f"device peak so far {peak_gb():.1f} GB", flush=True)
 
-    sfs_win = jax.tree.map(lambda x: x[:n], sfs_all)
+    # only the target mark(s) go back on the device: 'end' needs one, 'daily' needs ndays
+    mark_ids = list(range(ndays)) if args.marks == "daily" else [ndays - 1]
+    tgt = {d: tuple(jnp.asarray(x) for x in truth_marks[d]) for d in mark_ids}
+    del truth_marks
+    sfs_win = stack_steps(0, n)
+
+    # checkpoint segments: √N is the standard O(√N)-memory choice; SEG_MULT>1 stores
+    # fewer carries (more recompute) when the backward is tight on an 80 GB card.
+    seg_mult = float(os.environ.get("HORIZON_SEG_MULT", "1"))
+
+    def segments_for(length):
+        return max(2, int(round(seg_mult * math.sqrt(length))))
 
     def loss(m):
         if args.marks == "end":
-            # ONE rolled scan over all n steps (√n segments) -> final-state misfit:
-            # the sharpest N-day-lag probe, minimal compile
-            segs = max(2, int(round(math.sqrt(n))))
+            # ONE rolled scan over all n steps -> final-state misfit: the sharpest
+            # N-day-lag probe, and the smallest compile
             s_fin = _run_steps(step_body_for(params_for(m)), st0, xs=sfs_win,
-                               checkpoint=True, segments=segs)
-            d = ndays - 1
-            return stage1_misfit(s_fin.T, s_fin.S, s_fin.eta_n,
-                                 T_stack[d], S_stack[d], e_stack[d],
+                               checkpoint=True, segments=segments_for(n))
+            T_hat, S_hat, e_hat = tgt[ndays - 1]
+            return stage1_misfit(s_fin.T, s_fin.S, s_fin.eta_n, T_hat, S_hat, e_hat,
                                  w_T, w_S, w_eta, wet3d, area3d)
         # daily marks: in-graph day loop (unrolls ndays chunks — heavier compile)
-        segs = max(2, int(round(math.sqrt(STEPS_PER_DAY))))
         body = step_body_for(params_for(m))
+        segs = segments_for(STEPS_PER_DAY)
         L = jnp.asarray(0.0, jnp.float64)
         s_cur = st0
         for d in range(ndays):
-            s_cur = _run_steps(body, s_cur, xs=day_slice(d), checkpoint=True, segments=segs)
-            L = L + stage1_misfit(s_cur.T, s_cur.S, s_cur.eta_n,
-                                  T_stack[d], S_stack[d], e_stack[d],
+            day_xs = jax.tree.map(lambda x: x[d * STEPS_PER_DAY:(d + 1) * STEPS_PER_DAY], sfs_win)
+            s_cur = _run_steps(body, s_cur, xs=day_xs, checkpoint=True, segments=segs)
+            T_hat, S_hat, e_hat = tgt[d]
+            L = L + stage1_misfit(s_cur.T, s_cur.S, s_cur.eta_n, T_hat, S_hat, e_hat,
                                   w_T, w_S, w_eta, wet3d, area3d)
         return L / ndays
 
@@ -246,7 +298,8 @@ def main():
     rec = {"season": args.season, "snap": Path(args.snap).name, "date": f"{yr}-{mo:02d}-{dy:02d}",
            "n_days": ndays, "n_steps": n, "dt": DT, "marks": args.marks,
            "m_true": args.truth_mult, "kgm0": kgm0,
-           "config": "zstar+TKE+mEVP+GM", "adjoint": "frozen-ice"}
+           "config": "zstar+TKE+mEVP+GM", "adjoint": "frozen-ice",
+           "remat_blocks": REMAT_BLOCKS, "seg_mult": seg_mult}
     try:
         loss_jit = jax.jit(loss)
         grad_jit = jax.jit(jax.grad(loss))
