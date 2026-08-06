@@ -15,9 +15,10 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --hint=nomultithread
 #SBATCH --mem=200G
-# Wall budget — the suite GREW (ocean now 665 tests ~44 min + ice ~2 min + sharding ~30 min):
-# the old 65-min cap time-cut the sharding group (2026-06-18). 1:45 clears the full set with margin.
-#SBATCH --time=01:45:00
+# Wall budget — the suite KEEPS GROWING (2026-08-06: ocean 777 tests 1:14 + ice 2:28 +
+# sharding ~30 min; the 1:45 cap time-cut the sharding group AGAIN, same failure as
+# 2026-06-18). 2:30 clears the current set with margin — recheck when adding test groups.
+#SBATCH --time=02:30:00
 #SBATCH -o scripts/run_suite.%j.out
 #SBATCH -e scripts/run_suite.%j.out
 
