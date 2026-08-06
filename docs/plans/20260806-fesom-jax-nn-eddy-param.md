@@ -1,0 +1,398 @@
+# NN-GM: learning FESOM's eddy parameterization from NG5
+
+**Created:** 2026-08-06 (supersedes the same-day pre-brainstorm draft; decisions
+user-validated in the brainstorm dialogue; revised same day per plan-review — see Revision
+Log). **Status:** PLANNED.
+**Venue target:** JAMES-class paper (paper 3).
+**Authoritative copy:** THIS file in the main checkout (`~/port_jax/docs/plans/`); the
+worktrees hold code only — progress markers are updated here, nowhere else.
+
+## Overview
+
+Replace GM/Redi mesoscale eddy transport in FESOM with a neural network, trained end-to-end
+through the differentiable FESOM2-JAX model, taught by a coarse-grained eddy-resolving NG5
+Fortran run, polished on slow targets by EKI, and evaluated as **general hydrographic bias
+reduction** against the Scholz et al. (2019) FESOM2 assessment biases.
+
+Novelty (web-verified 2026-08-06): (a) first NN parameterization in FESOM / any
+unstructured-mesh ocean model; (b) first **online (a-posteriori) trained** eddy
+parameterization in a realistic global ocean–sea-ice model — prior art is offline-trained
+(Perezhogin et al. 2025, arXiv:2505.08900, MOM6; Zhang et al. 2023 JAMES); online training
+exists only in idealized settings (Frezat et al. 2022; arXiv:2412.06393). Only a
+differentiable global model can close this — the port's founding purpose
+(`docs/plans/20260605-fesom-jax-port.md`).
+
+Lessons imported from the idealized/offline literature: small local MLPs suffice; physics
+constraints (guaranteed APE sink) are essential; local nondimensionalization drives
+generalization; offline skill does not predict online skill; global deployments needed
+taming near coasts/equator.
+
+## Context (from discovery)
+
+- **Meshes:** CORE2 126,858 nodes / 48 lev / dt=1800 (student); NG5 7,402,886 / 70 lev /
+  5 km (teacher; ⚠️ NOT yet exported for the Python side — `docs/FORCING_MESHES.md` "needs
+  export"); farc 638k Arctic-refined (zero-shot test); FORCA20 2.13M (scaffolding only).
+- **GM/Redi:** `fesom_jax/gm.py` + `gm_redi.py`, ON in `configs/core2_full.yaml`
+  (`gm: {}`), κ defaults 1000 m²/s × resolution-scaled formula; `k_gm`/`redi_kmax` are
+  differentiable `Params` leaves. 63-yr v3 hindcast = default-GM baseline, already run.
+- **NN seam precedent:** `fesom_jax/tke_nn.py` (bounded-multiplier MLP, `zero_last` ⇒
+  bit-exact identity; ⚠️ it is a `Params` leaf ONLY — it has NO config/run_from_config
+  wiring, and `calibrate.py:124` hardcodes its pytree pass-through); `calibrate.py` (optax;
+  scalar/field/NN leaves), `eki.py`, `remat_blocks`/`remat_segments`, batched-window
+  scripts under `scripts/paper/`, perfect-model twin precedent
+  `fesom_jax/tests/test_nn_twin.py` (paper §3 E1).
+- **Missing pieces:** no FESOM→FESOM coarse-graining/remap exists; `run_from_config` takes
+  no trained-`Params` input (deployment path must be built, Task 7).
+- **Fortran:** FESOM2 clone at `/home/a/a270088/fesom27/fesom2` (built `fesom.x`, CORE2 R2
+  provenance). FESOM2 output has **no snapshot mode and no same-field multi-frequency** —
+  patch required. ⚠️ FESOM2 `u,v` are ELEMENTAL (CORE2 elem2D=244,659 vs nod2D=126,858,
+  ×1.93 size); node collocation happens in our pipeline, not in Fortran. FORCA20 run
+  (`/work/ab0995/a270088/fesom2_forca20`, 3 yr of MEAN output) = mechanics-pilot data only.
+- **Diagnostics to port:** pyfesom2 `xmoc` (w-based MOC, Sidorenko et al. 2020 GMD 13,3337)
+  + section transports (Drake/ACC). Analysis-only ⇒ scripts, zero library surface (the
+  long-window plan's precedent).
+- **Adjoint/limiter facts:** window-mean targets clean ≤ ~48 steps, blow-up by ~96 (longwindow
+  campaign) — the horizon for THIS loss is unknown until measured (Task 2). FCT limiter
+  gradients are subgradients — finite and FD-consistent where smooth
+  (`docs/LIMITER_GRADIENTS.md`), with a one-line `stop_gradient(ae)` escape hatch if
+  training signal proves noisy.
+- **House rules:** JRA55-do always; never year 2020; no heavy pytest/runs on login node
+  (suite via `scripts/runs/run_suite.sbatch`); NEVER-DELETE in unattended chains; never
+  blanket `git add <dir>`; env python
+  `/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python`; GPU `-A ab0995_gpu`.
+
+## Development Approach
+
+- **Testing approach: Regular + hard gates** (house style): implement → pytest units in
+  `fesom_jax/tests/` + oracle/bit-identity/conservation gates; suite on a compute node.
+- All code work in **dedicated worktrees** (Task 0); running chains and current dev untouched.
+- Every task ends with its tests/gates green before the next starts; library-touching tasks
+  end with the **full suite green**; checkboxes updated immediately; scope changes go to the
+  Revision Log.
+- Backward-compatibility invariants: `gm_nn=None` ⇒ JAX model bit-identical (suite green);
+  snapshot-flag-off ⇒ Fortran output byte-identical to the unpatched binary.
+
+## Testing Strategy
+
+- Unit tests per task (success + edge cases) in `fesom_jax/tests/`; script-level tests live
+  next to their scripts and are wired into pytest via a path fixture.
+- Gates are inline per task: conservation ~1e-12, bit-identity when disabled, pyfesom2
+  parity, stability gates for runs, and the three campaign gates HORIZON_OK / M3 / M4 /
+  anti-E2.
+- "e2e" = short sbatch smoke runs of the real models.
+
+## Progress Tracking
+
+- `[x]` immediately when done; ➕ for discovered tasks; ⚠️ for blockers; keep this file in
+  sync; move to `docs/plans/completed/` at the end.
+
+## What Goes Where
+
+- **Implementation Steps:** everything achievable in the worktrees (code, patches, runs we
+  launch, analysis, figures).
+- **Post-Completion:** paper writing, quota routines, possible upstreaming of the Fortran
+  patch, follow-up legs.
+
+## Implementation Steps
+
+### Task 0: Workspace — dedicated worktrees
+
+**Files:**
+- Create: `/home/a/a270088/nn_eddy/` (worktree container; data root
+  `/work/ab0995/a270088/nn_eddy/`)
+- Create: worktree `/home/a/a270088/nn_eddy/port_jax` (branch `nn-eddy` off `main`)
+- Create: worktree `/home/a/a270088/nn_eddy/fesom2` (branch `nn-eddy-output` off the
+  `/home/a/a270088/fesom27/fesom2` checkout's current commit)
+
+- [ ] create both worktrees + data root; record layout in a README there (incl. "plan file
+      authoritative in main checkout" note)
+- [ ] verify FESOM2 builds unchanged in its worktree (same toolchain as the R2 binary)
+- [ ] verify port_jax suite green in its worktree (sbatch, compute node)
+- [ ] gate: `git worktree list` clean in both repos; running chains untouched
+
+### Task 1: Fortran snapshot-output patch (minimal)
+
+**Files:**
+- Modify: `io_meandata.F90` (+ namelist plumbing) in the fesom2 worktree
+
+- [ ] add a per-entry snapshot flag to the output list: write instantaneous values at the
+      listed interval, bypassing mean accumulation; no multi-frequency machinery
+- [ ] wire namelist control + document usage in the worktree README
+- [ ] test: 1-day CORE2-mesh Fortran smoke run (compute node) — constant field: snapshot ==
+      mean; evolving field: snapshot ≠ mean and equals the model state at write time;
+      time-axis metadata and fill handling unchanged
+- [ ] **gate (bit-identity-when-disabled):** flag-off run produces output + restart files
+      byte-identical to the unpatched R2 binary on the same inputs
+- [ ] gate: smoke-run I/O overhead <~5% step time at the test cadence
+
+### Task 2: Gradient-horizon scan — BEFORE the teacher launch (GATE HORIZON_OK)
+
+Needs **no teacher data**: perfect-model twin on CORE2 with existing machinery — generate a
+"truth" trajectory with the default model, use the Stage-1 loss form (per-level
+variance-weighted T,S+SSH at the candidate target marks) and measure gradient health
+(finite, FD-consistent, informative) vs window length 1→10 days.
+
+**Files:**
+- Create: `scripts/nn_eddy/horizon_scan.py` (+ sbatch)
+
+- [ ] implement the scan on the exact Stage-1 loss form; include the
+      `stop_gradient(ae)` limiter escape hatch as a scan variant if signal is noisy
+- [ ] run 1→10-day windows on A100; record usable horizon H (longwindow prior: expect
+      1–5 days; window-mean variant as fallback axis)
+- [ ] tests: scan harness determinism on CPU; loss-form units
+- [ ] **GATE HORIZON_OK:** usable H established. **Protocol rule:** teacher 3D snapshot
+      cadence = min(H, 5) days (this SETS Task 3's namelist). **Pivot rule:** if H < 1 day
+      → switch Stage-1 loss to window-MEAN matching (longwindow-validated) and set cadence
+      for it; if that also fails → surface to user before any NG5 launch
+
+### Task 3: NG5 teacher campaign — setup and launch (LONG POLE, launch right after Task 2)
+
+**Files:**
+- Create: run dir `/work/ab0995/a270088/nn_eddy/ng5_teacher/` (namelists, sbatch chain,
+  monitor script)
+
+- [ ] ⚠️ BLOCKING prerequisite: obtain the AWI NG5 namelist set + `dist_*` partitions
+      (user provides the source setup)
+- [ ] adapt namelists: cvmix-TKE + mEVP + zstar, GM/Redi OFF, JRA55-do, PHC IC, **cold
+      start 1958-01-01** (same transient as the student hindcast)
+- [ ] output protocol (cadence per GATE HORIZON_OK): 3D snapshots T,S,w (nodal) + u,v
+      (native ELEMENTAL); **2D snapshots at the same cadence: SSH, a_ice, m_ice, uice,
+      vice** (window-init + η loss targets — means are NOT sufficient); daily 2D means
+      (SSH, ice, surface fluxes); monthly 3D means T,S,u,v,w; monthly restarts
+- [ ] replay runbook (the dense-target mechanism): documented procedure to rerun any month
+      from its restart at daily cadence (~0.4–0.5 TB/replayed month); test it on the
+      shakedown month
+- [ ] self-resubmitting chain — ⚠️ NEVER-DELETE rule: no rm/overwrite branches anywhere;
+      **test the chain: kill + resubmit resumes correctly and touches no existing output**
+- [ ] monitor script + cadence (clock/quota/output-volume checks, read-only) — runs for the
+      life of the campaign
+- [ ] shakedown: 1 month — volumes as budgeted, snapshots readable by our loaders,
+      **measure SYPD and node-h/SY**
+- [ ] **gate (compute budget):** present measured cost of 10 SY (+ Task-11 rungs) vs the
+      ab0995 allocation to the user for sign-off BEFORE the full chain proceeds
+- [ ] gate: year 1958 complete; storage on budget (~10.5 TB/decade at 5-daily — see
+      Technical Details); record achieved SYPD here
+
+### Task 4: Mesh diagnostics — AMOC + section transports (scripts-only)
+
+**Files:**
+- Create: `scripts/nn_eddy/mesh_diag.py`; Create: `scripts/nn_eddy/test_mesh_diag.py`
+
+- [ ] w-based MOC per pyfesom2 `xmoc` (node w → element means × `elem_area` → latitude
+      bins → cumsum, basin masks incl. Atlantic; Sidorenko et al. 2020)
+- [ ] section volume transport (Drake/ACC) per the pyfesom2 notebook
+- [ ] works on teacher (Fortran netCDF), JAX-student, and Fortran-baseline outputs
+- [ ] tests: synthetic w with analytically known MOC; bin/basin edge cases
+- [ ] gate: parity vs pyfesom2 on one real FORCA20/CORE2 monthly file (plot + numeric diff)
+
+### Task 5: `coarsen` I — mesh-Laplacian scale filter
+
+**Files:**
+- Create: `fesom_jax/coarsen.py`; Create: `fesom_jax/tests/test_coarsen.py`
+
+- [ ] iterated mesh-Laplacian filter on a FESOM mesh (fixed diffusion steps; target scale =
+      2× **local** CORE2 resolution); area-weighted, mask-aware (coast/bottom)
+- [ ] tests: constant preserved exactly; global area-weighted mean conserved ~1e-12; scale
+      response on synthetic spectra (small scales damped, large untouched)
+- [ ] gate: filtered FORCA20-mean field visually + spectrally sane (mechanics pilot)
+- [ ] full suite green (library touched)
+
+### Task 6: `coarsen` II — NG5→CORE2 aggregation + products pipeline
+
+**Files:**
+- Modify: `fesom_jax/coarsen.py`; Create: `scripts/nn_eddy/coarsen_stream.py`
+- Create: `fesom_jax/tests/test_coarsen_remap.py`
+
+- [ ] ➕ export the NG5 mesh for the Python side (coords, areas, nlvls, resolution — the
+      `docs/NEW_MESH.md` flow; currently "needs export")
+- [ ] element→node collocation for u,v (area-weighted mean — needed because Fortran saves
+      native elemental velocities)
+- [ ] conservative Voronoi-area-weighted aggregation teacher-nodes → CORE2 nodes
+      (host-precomputed sparse map, `build_h_map` pattern); conservative vertical remap
+      70→48 levels, ⚠️ bottom masks (sub-bottom-zero)
+- [ ] streaming postprocess: per snapshot emit (a) filtered state on CORE2 mesh and
+      (b) diagnosed eddy fluxes filter(u·τ) − filter(u)·filter(τ), τ∈{T,S}
+- [ ] tests: conservation through the full chain ~1e-12; bottom-mask cases; idempotence on
+      an already-coarse field; collocation units
+- [ ] gate (mechanics, on FORCA20 means): remap conservation + spectra. **Gate (flux
+      product): on the Task-3 shakedown month's REAL NG5 snapshots** — hotspot maps
+      physically sane (ACC/Agulhas/Gulf Stream); pipeline keeps pace with the run rate
+- [ ] full suite green
+
+### Task 7: `gm_nn` — network, seam, AND deployment path
+
+**Files:**
+- Create: `fesom_jax/gm_nn.py`; Modify: `fesom_jax/params.py` (leaf +
+  `register_dataclass` data_fields), `fesom_jax/calibrate.py` (generalize the hardcoded
+  `tke_nn` pytree pass-through), `fesom_jax/gm.py`, `fesom_jax/run_config.py` +
+  `run_from_config` (trained-params loading); Create: `fesom_jax/tests/test_gm_nn.py`
+
+- [ ] per-column MLP (~16,16 tanh, ~1–2k weights) on locally nondimensionalized features
+      (arcsinh): |∇h b|, N², isopycnal slope, f, resolution/Rossby-radius ratio, depth
+      fraction, shear/strain invariants
+- [ ] outputs per level: m_GM, m_Redi ∈ [1/M, M], M=3 (exp·tanh); κ = formula base × m
+      (APE sink by construction); `Params` leaf (NOT in hashable `GMConfig`)
+- [ ] **deployment path:** weights (de)serialization + a `params_file`-style config key so
+      `run_from_config` runs with trained params, surviving archival-restart leg chaining
+      (Task 11 depends on this)
+- [ ] tests: `zero_last` ⇒ m≡1 ⇒ full suite bit-identical; bounds under extreme inputs;
+      feature scaling units; gradient flows to every weight (masked-NaN rule); params
+      round-trip through file + across a restart leg
+- [ ] gate: 10-day CORE2 A100 run with random-perturbed NN stable; d(loss)/d(weights)
+      finite and nonzero through the assembled model; full suite green
+
+### Task 8: Stage 0 — offline pretrain + a-priori skill (GATE M3)
+
+**Files:**
+- Create: `scripts/nn_eddy/offline_fit.py`, `scripts/nn_eddy/apriori_eval.py` (+ sbatch)
+
+- [ ] project diagnosed fluxes onto GM/Redi form → target κ̂(node,level,time); fallbacks:
+      flux-divergence fit, one-step tendency matching
+- [ ] fit `gm_nn` offline (minibatch over snapshots/regions); regularize toward m=1
+- [ ] a-priori evaluation: R² by region/depth/season vs constant-κ GM and vs the formula κ
+- [ ] first **skill-vs-teacher-years curve** (also the NG5 stopping rule)
+- [ ] tests: projection algebra on synthetic GM-generated fluxes recovers κ exactly
+- [ ] **GATE M3:** offline κ-NN beats constant-κ GM a-priori; else pivot to Arm B (ψ_NN —
+      scoped in Technical Details, ~+2–3 wk) before proceeding
+
+### Task 9: Stage 1 — online training through the adjoint (GATE M4)
+
+**Files:**
+- Create: `scripts/nn_eddy/online_train.py` (+ sbatch)
+
+- [ ] **perfect-model twin control first** (test_nn_twin precedent, run through the FULL
+      window driver incl. the coarsen chain on a JAX-generated "teacher"): a known
+      perturbed-NN is recovered ⇒ driver + remap attribution is clean before real-teacher
+      training
+- [ ] window driver: init student from filtered NG5 SNAPSHOT state (T,S,u,v,SSH,ice; TKE
+      spun in-window), 6–12 h nudge-in discarded from loss
+- [ ] loss: per-level variance-weighted T,S (+SSH) at the cadence marks from HORIZON_OK;
+      velocities excluded; training years 1959–1965 ⇒ ~511 candidate windows (1966–67
+      held out); replay months supply denser targets if the curriculum needs them
+- [ ] training: adam via `calibrate.optimize`, `remat_blocks`, one window per A100
+      data-parallel; curriculum short→long windows within H; E2 trust-region reg around
+      Stage-0 weights; `stop_gradient(ae)` limiter escape hatch if signal noisy
+- [ ] tests: window-driver determinism (CPU); nudge-in mask; loss weights
+- [ ] **GATE M4:** 1-yr free run from trained weights **stable** and beats default GM vs
+      the filtered teacher on ≥3 of 5 metrics (T bias, S bias, SSH var, MLD, AMOC)
+
+### Task 10: Baseline-ladder rung — adjoint-calibrated static κ(x,z)
+
+**Files:**
+- Create: `scripts/nn_eddy/static_kappa_fit.py`
+
+- [ ] calibrate a static per-node/level κ_GM (+κ_Redi) **field** by adjoint (field leaves
+      already supported in `calibrate.py`) on the same windows/loss as Stage 1
+- [ ] regularize (smoothness + bounds); 1-yr stability run
+- [ ] tests: field-leaf gradient shape/masking; bounds
+- [ ] gate: converged static-κ run stable — isolates **state-dependence** (NN vs static map)
+
+### Task 11: Evaluation ladder, 63-yr deployment, figures
+
+**Files:**
+- Create: `scripts/nn_eddy/eval_ladder.py`, `scripts/nn_eddy/figs/` (+ sbatch)
+
+- [ ] ladder free runs (decadal): (1) default GM [done: v3], (2) scalar-tuned GM,
+      (3) static κ(x,z), (4) **NN-GM**, (5) no-GM, (6) offline-only-NN [gap exhibit] —
+      via the Task-7 deployment path
+- [ ] **headline: full 63-yr hindcast with NN-GM** (trained 1959–65; evaluated 1998–2007
+      vs WOA à la Scholz = 4-decade generalization); reuse v3 pipelines
+- [ ] figures: Fig-8 twin (30°W S-section, AAIW tongue S<34.7), zonal-mean T/S bias by
+      basin/depth, AMOC(φ,z) + ACC, MLD, SST/SSS maps; final skill-vs-teacher-years curve
+- [ ] claim tests: held-out teacher years 1966–67; farc zero-shot; interannual SO
+      eddy-flux variability (SAM) tracked by NN-κ but not constant-κ; conservation audit
+      (volume-mean S drift)
+- [ ] gate: pipeline regression — default-GM rung reproduces the known v3 numbers
+
+### Task 12: Stage 2 — EKI polish on slow targets (GATE anti-E2)
+
+**Files:**
+- Create: `scripts/nn_eddy/eki_polish.py`
+
+- [ ] freeze NN body; head = last layer or per-basin scalings (O(10–100) dof)
+- [ ] EKI (`eki.py`) multi-year forward ensembles vs slow metrics: AMOC, ACC, Fig-8/AAIW
+      section score, zonal-mean bias norms, MLD clim; targets teacher-clim and/or obs
+      (WOA, RAPID)
+- [ ] tests: head parameterization round-trip; ensemble bookkeeping
+- [ ] **GATE anti-E2:** the polished improvement **persists** in a fresh multi-decade
+      forward run — the deploy-gap test this project exists to pass
+
+### Task 13 (optional): Fortran round-trip
+
+**Files:**
+- Modify: fesom2 worktree (GM/Redi coefficient path); Create:
+  `scripts/nn_eddy/export_weights.py`
+
+- [ ] export weights + feature-scaling constants to a plain file
+- [ ] hand-coded ~100-line Fortran MLP inference where fer_GM/Redi coefficients are set
+- [ ] parity gate: JAX↔Fortran κ to fp precision on identical inputs
+- [ ] multi-year Fortran CORE2 run with the NN closure vs the JAX NN run and the Fortran
+      default baseline
+- [ ] gate: parity + stable run ⇒ the "runs unchanged in the production model" section
+
+### Task 14: Verify acceptance criteria
+
+- [ ] all Overview claims implemented or explicitly descoped in the Revision Log
+- [ ] full suite green (sbatch); `gm_nn=None` bit-identity re-verified; Fortran
+      flag-off byte-identity re-verified
+- [ ] gates HORIZON_OK / M3 / M4 / anti-E2 recorded with numbers in this plan
+- [ ] data products + run dirs inventoried (paths + sizes) for the paper's data statement
+
+### Task 15: Documentation and closeout
+
+- [ ] append lessons to `docs/PORTING_LESSONS.md` (house rule — per task, as we go)
+- [ ] update README "Differentiable capabilities" with `gm_nn`
+- [ ] move this plan to `docs/plans/completed/`
+
+## Technical Details
+
+- **Window arithmetic:** dt=1800 ⇒ 48 steps/day; candidate windows start at snapshot marks;
+  training years 1959–1965 ⇒ ~511 windows at 5-daily cadence (73/yr); 1966–67 held out.
+- **Storage budget (5-daily cadence):** per 3D snapshot: T,S,w nodal ≈ 3×2.1 GB + u,v
+  elemental ≈ 2×4.05 GB ⇒ ~14.4 GB; 73/yr ⇒ **~1.05 TB/yr, ~10.5 TB/decade**; 2D snapshots
+  negligible; coarse products ~50 GB; replay months ~0.4–0.5 TB each. All ≪ 100 TB budget.
+  Raw NG5 thinnable after coarsening (⚠️ manually only, never in automation).
+- **Compute budget:** NG5 ~1.5–3 SYPD on 40–80 nodes (estimate) ⇒ ~10 SY ≈ O(10⁶) core-h —
+  **measured in the Task-3 shakedown and signed off before the full chain** (gate). Ladder:
+  five decadal rungs + one 63-yr CORE2 run (single-GPU-cheap, v3-known cost).
+- **Loss:** L = Σ_lev w_lev (‖T−T̂‖² + λ_S‖S−Ŝ‖²)/σ²_lev + λ_η‖η−η̂‖², at HORIZON_OK cadence
+  marks, first 6–12 h excluded; w_lev from teacher anomaly variance.
+- **Arm B contingency (the M3 pivot, scoped):** ψ_NN — NN predicts a bolus streamfunction
+  through the existing `gm.py` bolus machinery (conservative by construction; subsumes GM);
+  same features/bounds discipline, new head + operator wiring, est. +2–3 wk. Triggered only
+  if the κ-projection a-priori fit fails.
+- **References:** Perezhogin et al. 2025 (arXiv:2505.08900); Zhang et al. 2023 JAMES;
+  Frezat et al. 2022; arXiv:2412.06393; Ross et al. 2023; Scholz et al. 2019 (GMD 12,4875,
+  Fig 8; eval 1998–2007, WOA); Sidorenko et al. 2020 (GMD 13,3337); Grooms et al. 2021
+  (GCM-Filters); Gent & McWilliams 1990; Visbeck et al. 1997.
+
+## Post-Completion
+
+**Manual/external:**
+- NG5 chain monitoring stays live for the campaign (script from Task 3; read-only).
+- Paper writing (own repo, model-paper pattern); co-author circle (AWI GM/backscatter
+  expertise natural); data publication via the Zenodo uploader.
+- Possible upstreaming of the Fortran snapshot patch to FESOM2.
+- Optional later legs: modern-era NG5 cold start for obs-era work; Arm B as a follow-up if
+  not triggered; NG5-JAX teacher.
+
+## Revision Log
+
+- 2026-08-06 (a): plan created from the brainstorm dialogue (supersedes the pre-brainstorm
+  draft): NG5 teacher (cold start 1958, not FORCA20/2008), snapshot patch scope corrected
+  (no multi-frequency; replay-from-restart bursts), w saved for mesh AMOC (pyfesom2 recipe),
+  evaluation reframed to general bias reduction anchored on Scholz et al. 2019 Fig 8,
+  static-κ ladder rung added, Fortran round-trip added as optional task.
+- 2026-08-06 (b): revised per plan-review agent (verdict NEEDS REVISION, 3 blockers + 10
+  major + 7 minor — all addressed): horizon scan moved BEFORE the NG5 launch and made a
+  gate (HORIZON_OK) that SETS the snapshot cadence, with an explicit pivot rule; SSH/ice/η
+  added as 2D snapshots to the teacher protocol; AWI-namelist prerequisite + compute-budget
+  sign-off + chain resume test + monitor checkbox added to Task 3; storage corrected for
+  ELEMENTAL u,v (~1.05 TB/yr) + element→node collocation added; flux-product pilot
+  re-anchored on shakedown NG5 snapshots (FORCA20 means = mechanics only); deployment path
+  for trained params (run_from_config + restart-leg carry) added to Task 7 incl. the
+  calibrate.py hardcode + register_dataclass; perfect-model twin control added before real
+  training; Fortran flag-off byte-identity gate added; window count fixed (511, train
+  1959–65); NG5 mesh export added; Arm B pivot scoped; module renamed fesom_filters→
+  coarsen.py, MOC to scripts-only; paths fixed (fesom_jax/tests/,
+  scripts/runs/run_suite.sbatch); authoritative-copy rule stated.
