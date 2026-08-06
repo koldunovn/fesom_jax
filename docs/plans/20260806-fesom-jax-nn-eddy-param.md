@@ -193,10 +193,8 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
       cold-start value) for the first 1–2 months, **monthly restarts from step one**,
       then stop+restart at a month boundary onto **dt=240 s (step_per_day=360)** for the
       rest of the campaign (Fortran cannot change dt in-run — FORCA20 precedent).
-      ⚠️ The user said "120 … then 240"; read as dt-SECONDS (720→360 spd) — the
-      spd-reading would start at a 12-min step where 3 min blew up. Flagged for
-      confirmation in NG5_TEACHER_SETUP.md; if spd=240 (dt=360 s) was meant it is a
-      one-line change worth ~1.5× throughput
+      ✅ CONFIRMED by user 2026-08-06: 120/240 are dt-SECONDS ⇒ step_per_day 720→360
+      (both stages more conservative than DestinE's dt=360 s / spd=240)
       **STAGED 2026-08-06** in `/work/ab0995/a270088/nn_eddy/ng5_teacher/` (not launched):
       config/oce/ice/tra/dyn/cvmix/forcing built FROM CORE2-R2 (JRA55-do + student-matched
       physics on our binary) with only resolution-dependent settings taken from the NG5
@@ -207,7 +205,13 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
       would have imposed a systematic polar surface-flux bias the NN would absorb into
       the closure. Teacher keeps 0.70/0.68. Inert differences recorded there too
       (visc_gamma2 0.0285 vs 0.285 — only read for opt_visc 5/8, we run 7; dead
-      /work/ollie + /albedo IDEMIX paths — inert under cvmix_TKE)
+      /work/ollie + /albedo IDEMIX paths — inert under cvmix_TKE).
+      **User directive 2026-08-06: sea-ice settings follow FESOM/JAX defaults** (the
+      DestinE ice values are ERA5-co-tuned). Full ice audit: DestinE deviates from the
+      FESOM template in exactly 4 keys and specifies nothing else ⇒ no other hidden
+      ERA5 tuning. Resolved: albi/albim → 0.70/0.68 (student); ice_diff → 10.0 (JAX
+      student value; FESOM template ships 0.0); whichEVP=1; alpha/beta_evp=500 kept
+      (resolution-scaled numerics, user-locked)
 - [ ] output protocol (cadence per GATE HORIZON_OK): 3D snapshots T,S,w (nodal) + u,v
       (native ELEMENTAL); **2D snapshots at the same cadence: SSH, a_ice, m_ice, uice,
       vice** (window-init + η loss targets — means are NOT sufficient); daily 2D means
@@ -430,6 +434,24 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
 - Possible upstreaming of the Fortran snapshot patch to FESOM2.
 - Optional later legs: modern-era NG5 cold start for obs-era work; Arm B as a follow-up if
   not triggered; NG5-JAX teacher.
+
+## Open scope question (user-raised 2026-08-06, not yet decided)
+
+**Easy backscatter (`opt_visc=5`) as a JAX capability + ladder rung.** FESOM ships
+`opt_visc=5` + `visc_easybsreturn=1.5` as its default and the user notes CORE2 "ideally"
+would run it. Findings (detail in `fesom2/NG5_TEACHER_SETUP.md`): (a) the TEACHER cannot —
+`check_validviscopt_5` (src/oce_dyn.F90:930) ABORTS opt_visc=5 on eddy-resolving/permitting
+meshes (resol/Rossby<1.5) citing spurious boundary currents + Drake <80 Sv, and says
+backscatter "was designed to energise coarse resolved configurations"; NG5 stays at 7 (as
+DestinE did). (b) CORE2 IS backscatter's design regime, so our opt_visc=7 there is the
+deviation — adopted to match the JAX student. (c) The blocker is the port: **JAX implements
+only opt_visc=7** (`fesom_jax/config.py` ViscConfig — no backscatter kernel), so switching
+the Fortran CORE2 alone would break the JAX↔Fortran match paper 2 rests on. ⇒ This is a
+PORT task (backscatter kernel + adjoint + bit-faithfulness cert), not a namelist edit.
+Attractive because backscatter is itself a coarse-mesh eddy-energy parameterization ⇒ a
+natural extra Task-11 ladder rung (and a competitor/complement to the NN). Est. non-trivial
+(new momentum kernel + adjoint + validation vs Fortran). **Decision deferred to the user;
+nothing in the current plan depends on it.**
 
 ## Revision Log
 
