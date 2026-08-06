@@ -29,6 +29,7 @@ import pytest
 from fesom_jax import surface_forcing, partit, shard_mesh, ssh
 from fesom_jax import integrate as integ
 from fesom_jax import integrate_sharded as ish
+from fesom_jax import step as stepmod
 from fesom_jax.surface_forcing import StepForcing
 from fesom_jax.kpp import KppConfig
 from fesom_jax.mesh import load_mesh
@@ -258,20 +259,86 @@ def test_forced_multistep_serial_matches_dense(core2_forced_seq):
     print(f"SHARDED_FORCING_OK (match={match:.2e}, per-step sensitivity={sensitivity:.2e})")
 
 
+def _teacher_forced_pair(fx, part, npes, k, teacher, sm):
+    """Step ``k`` of a TEACHER-FORCED forced trajectory: the dense step and the sharded forced
+    step, both started from ``teacher`` (the SINGLE-DEVICE state after ``k`` steps), both fed
+    ``stack[k]``. ``bootstrap_ab2``/``is_first_step`` follow the same ``(k == 0)`` rule the
+    production chunk driver uses for a restart continuation."""
+    mesh = fx["mesh"]
+    sf_k = jax.tree.map(lambda x: x[k], fx["stack"])            # [nod2D] leaves
+    seq_k = jax.tree.map(lambda x: x[k:k + 1], fx["stack"])     # [1, nod2D] leaves
+    d_next = stepmod.step(teacher, mesh, fx["op"], jnp.zeros((mesh.elem2D, 2)), dt=DT,
+                          is_first_step=(k == 0), step_forcing=sf_k,
+                          forcing_static=fx["fs"], kpp_cfg=KppConfig())
+    n_next = ish.run_steps_sharded_forced(
+        sm, shard_mesh.partition_state(teacher, part),
+        ssh.partition_ssh_operator(fx["op"], part),
+        jnp.zeros((npes, sm.Lmax["elem"], 2)),
+        shard_mesh.partition_step_forcing(seq_k, part),
+        shard_mesh.partition_forcing_static(fx["fs"], part),
+        1, dt=DT, npes=npes, kpp_cfg=KppConfig(), bootstrap_ab2=(k == 0))
+    return d_next, n_next
+
+
 @have_forcing
 @have_dist2
 @pytest.mark.parametrize("npes", [2])
 def test_forced_multistep_owned_matches(npes, core2_forced_seq):
-    """npes=2: the forced multi-step sharded run matches single-device on OWNED nodes — the
-    per-step forcing scan + the multi-step halo exchanges are correct across real shards."""
+    """npes=2 per-step gate, **teacher-forced** (``test_step_sharded``'s Decision 4): each
+    sharded forced step reads the SINGLE-DEVICE previous-step state, so the only N-vs-1
+    difference is the WITHIN-step reassociation — clean for momentum/SSH/ALE/EOS, the FCT floor
+    for tracers. That is what actually gates this path: the per-step forcing fold + the halo
+    exchanges on real shards, at the TIGHT 1e-7 clean budget. The free-running trajectory is
+    still run below, gated on what it can legitimately assert (finite + physically bounded).
+
+    **Why not compare the free-running 3-step run tightly?** It used to, and it failed on every
+    commit since the gate was written — ``uv`` owned max|Δ| = 8.969e-03 against the 1e-7 clean
+    budget, byte-identical on main@ceea184 / b296ee1 / perf/kokkos-m7-levers (jobs
+    26275895/26275933/26275876, ``docs/plans/20260715-m7levers-session2-FINDINGS.md`` §4). The
+    growth measurement (``scripts/debug/forced_owned_step_growth.py``, job 26747719) shows why
+    the failure is the gate's, not the port's:
+
+      * ``n=1`` — every clean field sits at **5e-13, bit-for-bit the npes=1 control**; ONLY T
+        (1.25e-2) and S (3.07e-3) differ, and ONLY on hop-0 nodes, i.e. exactly the owned/halo
+        interface. That is the documented FCT upwind-flip floor, not a missing exchange.
+      * ``n=2`` — the step-1 tracer flip has reached the EOS (density 1.5e-4 rel), the KPP
+        boundary-layer depth (Av 4.4e-1 rel — a SECOND discontinuous switch) and uv (2.8e-2
+        rel); the disturbance front has spread 4 hops in from the interface.
+      * ``n=3`` — uv 8.97e-3, the historical failure value.
+
+    So two steps of free running decorrelate the trajectory to the percent level, seeded by a
+    limiter flip on the partition boundary and amplified by two branch-valued schemes. No
+    absolute or relative budget can separate that from a real wiring bug (which is also O(1e-2)
+    and up), which is precisely why the per-step gate must be teacher-forced.
+    """
     if NDEV < npes:
         pytest.skip(f"needs {npes} fake-devices, have {NDEV}")
     from fesom_jax.tests.test_step_sharded import _owned_match
     fx = core2_forced_seq
     part = partit.read_partition(CORE2_DIST, npes)
-    dense = _dense_forced(fx)
-    sharded = _sharded_forced(fx, part, npes)
-    _owned_match(dense, sharded, fx["mesh"], part, npes, tag="forced-kpp", fct_atol=1e-1)
+    sm = shard_mesh.build_sharded_mesh(fx["mesh"], part)
+
+    teacher = fx["state"]
+    for k in range(fx["n"]):
+        d_next, n_next = _teacher_forced_pair(fx, part, npes, k, teacher, sm)
+        # FCT budget 5e-2: the measured per-step interface flip floor is 1.25e-2 on T
+        # (4x headroom); the clean fields keep _owned_match's 1e-7.
+        _owned_match(d_next, n_next, fx["mesh"], part, npes,
+                     tag=f"forced-kpp-tf-step{k + 1}", fct_atol=5e-2)
+        teacher = d_next            # teacher-force: next step reads the single-device state
+
+    # The FREE-RUNNING forced scan on real shards: chaotic vs single-device (above), so gate it
+    # the way test_multistep_scan_lowers_and_is_finite does — it LOWERS, RUNS, stays finite and
+    # physically bounded. A broken exchange blows this up long before it decorrelates.
+    free = _sharded_forced(fx, part, npes)
+    for fld in dataclasses.fields(State):
+        v = np.asarray(getattr(free, fld.name))
+        assert np.isfinite(v).all(), \
+            f"free-running forced n={fx['n']}: {fld.name} has non-finite lanes"
+    T_free = np.asarray(free.T)[np.asarray(sm.owned_mask["nod"])]
+    assert -5.0 < float(T_free.min()) and float(T_free.max()) < 45.0, \
+        f"free-running forced T out of range [{T_free.min():.2f}, {T_free.max():.2f}]"
+    print("SHARDED_FORCED_TF_OK (per-step teacher-forced at 1e-7 clean; free run bounded)")
 
 
 # ==========================================================================
