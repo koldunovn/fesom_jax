@@ -194,9 +194,8 @@ def main():
     @jax.jit
     def one_day(state0, sfs_day, m):
         segs = max(2, int(round(math.sqrt(STEPS_PER_DAY))))
-        s, _ = _run_steps(step_body_for(params_for(m)), state0, xs=sfs_day,
+        return _run_steps(step_body_for(params_for(m)), state0, xs=sfs_day,
                           checkpoint=True, segments=segs)
-        return s
 
     print(f"[setup] built in {time.time()-t0:.1f}s; seed={args.season} ({Path(args.snap).name}) "
           f"date={yr}-{mo:02d}-{dy:02d}  N={ndays} d ({n} steps)  marks={args.marks}  "
@@ -225,8 +224,8 @@ def main():
             # ONE rolled scan over all n steps (√n segments) -> final-state misfit:
             # the sharpest N-day-lag probe, minimal compile
             segs = max(2, int(round(math.sqrt(n))))
-            s_fin, _ = _run_steps(step_body_for(params_for(m)), st0, xs=sfs_win,
-                                  checkpoint=True, segments=segs)
+            s_fin = _run_steps(step_body_for(params_for(m)), st0, xs=sfs_win,
+                               checkpoint=True, segments=segs)
             d = ndays - 1
             return stage1_misfit(s_fin.T, s_fin.S, s_fin.eta_n,
                                  T_stack[d], S_stack[d], e_stack[d],
@@ -237,7 +236,7 @@ def main():
         L = jnp.asarray(0.0, jnp.float64)
         s_cur = st0
         for d in range(ndays):
-            s_cur, _ = _run_steps(body, s_cur, xs=day_slice(d), checkpoint=True, segments=segs)
+            s_cur = _run_steps(body, s_cur, xs=day_slice(d), checkpoint=True, segments=segs)
             L = L + stage1_misfit(s_cur.T, s_cur.S, s_cur.eta_n,
                                   T_stack[d], S_stack[d], e_stack[d],
                                   w_T, w_S, w_eta, wet3d, area3d)
