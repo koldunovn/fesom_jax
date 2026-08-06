@@ -191,9 +191,23 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
       structurally off; the Rohit dir's namelist.icepack is inert). **dt ramp DECIDED
       (user 2026-08-06):** cold start at dt=120 s (step_per_day=720, the sweep-proven
       cold-start value) for the first 1–2 months, **monthly restarts from step one**,
-      then stop+restart at a month boundary onto **step_per_day=240 (dt=360 s, the
-      DestinE production value)** for the rest of the campaign (Fortran cannot change
-      dt in-run — FORCA20 precedent)
+      then stop+restart at a month boundary onto **dt=240 s (step_per_day=360)** for the
+      rest of the campaign (Fortran cannot change dt in-run — FORCA20 precedent).
+      ⚠️ The user said "120 … then 240"; read as dt-SECONDS (720→360 spd) — the
+      spd-reading would start at a 12-min step where 3 min blew up. Flagged for
+      confirmation in NG5_TEACHER_SETUP.md; if spd=240 (dt=360 s) was meant it is a
+      one-line change worth ~1.5× throughput
+      **STAGED 2026-08-06** in `/work/ab0995/a270088/nn_eddy/ng5_teacher/` (not launched):
+      config/oce/ice/tra/dyn/cvmix/forcing built FROM CORE2-R2 (JRA55-do + student-matched
+      physics on our binary) with only resolution-dependent settings taken from the NG5
+      side, per the rule "numerics may differ with resolution, physics may not" —
+      full three-way audit in `fesom2/NG5_TEACHER_SETUP.md` (commit 8a1e82ef).
+      ⚠️ TRAP FOUND AND AVOIDED: DestinE-NG5 runs ice albedos albi/albim=0.65/0.55 vs
+      the FESOM2-default and student 0.70/0.68 — an ERA5-co-tuned physics constant that
+      would have imposed a systematic polar surface-flux bias the NN would absorb into
+      the closure. Teacher keeps 0.70/0.68. Inert differences recorded there too
+      (visc_gamma2 0.0285 vs 0.285 — only read for opt_visc 5/8, we run 7; dead
+      /work/ollie + /albedo IDEMIX paths — inert under cvmix_TKE)
 - [ ] output protocol (cadence per GATE HORIZON_OK): 3D snapshots T,S,w (nodal) + u,v
       (native ELEMENTAL); **2D snapshots at the same cadence: SSH, a_ice, m_ice, uice,
       vice** (window-init + η loss targets — means are NOT sufficient); daily 2D means
