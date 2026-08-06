@@ -165,7 +165,11 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
       audit + JRA55-do forcing swap required, see Revision Log (d)); partitions already
       at `/work/ab0995/a270088/meshes/NG5/dist_{1024,1920,2048,2560,3840,4096,7680,8192}`
 - [ ] adapt namelists: cvmix-TKE + mEVP + zstar, GM/Redi OFF, JRA55-do, PHC IC, **cold
-      start 1958-01-01** (same transient as the student hindcast)
+      start 1958-01-01** (same transient as the student hindcast). LOCKED (user
+      2026-08-06): **mEVP α=β=500** (the Rohit/template NG5 value, resolution-adjusted
+      from CORE2's 250) and **icepack OFF** (our fesom27 binary has USE_ICEPACK=OFF —
+      structurally off; the Rohit dir's namelist.icepack is inert). Open: dt/ramp
+      strategy — see Revision Log (f)
 - [ ] output protocol (cadence per GATE HORIZON_OK): 3D snapshots T,S,w (nodal) + u,v
       (native ELEMENTAL); **2D snapshots at the same cadence: SSH, a_ice, m_ice, uice,
       vice** (window-init + η loss targets — means are NOT sufficient); daily 2D means
@@ -433,3 +437,14 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
   the Task-3 compute-budget gate. ⚠️ dt: sweep needed 2-min (3-min blew up at mstep=47,
   cold start); the fesom2.6 Rohit run used 6-min (240 steps/day, after a ramp trail
   96→72→45→240 in comments) — teacher dt/ramp strategy is an open Task-3 decision.
+- 2026-08-06 (f): **NG5 config decisions locked by user + sweep-SYPD explained**: mEVP
+  α=β=500, icepack OFF (see Task 3). User hypothesized the sweep's 1.1 SYPD was
+  output-heavy — checked: the sweep FORCED monthly-only output (commit 1c4ba52c) and
+  disabled restarts (ff9ca26f); results.csv puts output at ~146 s of 4352 s/rank-mean
+  (**~3%**) at n8192 — output is exonerated. The lever is **dt**: sweep ran 2-min
+  (720 steps/day); the DestinE NG5 production ran **6-min** (step_per_day=240) ⇒ per-step
+  cost ≈ constant ⇒ expect **~3× ≈ 3.3 SYPD @ 8192 cores** at production dt, i.e. 10 SY
+  ≈ **~0.6 M core-h** — back inside the plan's O(10⁶) estimate. The sweep's 3-min
+  blow-up (mstep=47) was an unramped cold start; teacher needs a cold-start dt ramp
+  (FORCA20 precedent 180→240). Real SYPD incl. snapshot I/O = Task-3 shakedown output.
+  (Sweep run dirs on /scratch have expired; results.csv + repo commits are the record.)
