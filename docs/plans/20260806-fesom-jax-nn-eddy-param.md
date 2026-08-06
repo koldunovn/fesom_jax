@@ -155,11 +155,18 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
 **Files:**
 - Create: `scripts/nn_eddy/horizon_scan.py` (+ sbatch)
 
-- [ ] implement the scan on the exact Stage-1 loss form; include the
-      `stop_gradient(ae)` limiter escape hatch as a scan variant if signal is noisy
+- [x] implement the scan on the exact Stage-1 loss form; include the
+      `stop_gradient(ae)` limiter escape hatch as a scan variant if signal is noisy —
+      done 2026-08-06 (commit 156a0ae, `scripts/nn_eddy/horizon_scan.py`): perfect-model
+      GM-κ-multiplier twin (truth m_true=1.25, student m=1), per-level inverse-variance
+      T,S + SSH loss, endpoint-mark primary probe (`--marks daily` variant), frozen-ice
+      adjoint (= the Stage-1 training config), `loss(m_true)==0` in-process harness
+      check; the ae-hatch is documented-deferred (not config-wired; wire only if noisy)
 - [ ] run 1→10-day windows on A100; record usable horizon H (longwindow prior: expect
-      1–5 days; window-mean variant as fallback axis)
-- [ ] tests: scan harness determinism on CPU; loss-form units
+      1–5 days; window-mean variant as fallback axis) — job 26746271 running 2026-08-06
+      (winterNH seed, N=1,2,3,5,7,10 d, endpoint marks)
+- [x] tests: scan harness determinism on CPU; loss-form units — 7/7
+      (`scripts/tests/test_horizon_scan.py`; in-model check `loss_at_truth` per process)
 - [ ] **GATE HORIZON_OK:** usable H established. **Protocol rule:** teacher 3D snapshot
       cadence = min(H, 5) days (this SETS Task 3's namelist). **Pivot rule:** if H < 1 day
       → switch Stage-1 loss to window-MEAN matching (longwindow-validated) and set cadence
