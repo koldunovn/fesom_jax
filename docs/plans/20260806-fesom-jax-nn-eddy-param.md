@@ -168,8 +168,12 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
       start 1958-01-01** (same transient as the student hindcast). LOCKED (user
       2026-08-06): **mEVP α=β=500** (the Rohit/template NG5 value, resolution-adjusted
       from CORE2's 250) and **icepack OFF** (our fesom27 binary has USE_ICEPACK=OFF —
-      structurally off; the Rohit dir's namelist.icepack is inert). Open: dt/ramp
-      strategy — see Revision Log (f)
+      structurally off; the Rohit dir's namelist.icepack is inert). **dt ramp DECIDED
+      (user 2026-08-06):** cold start at dt=120 s (step_per_day=720, the sweep-proven
+      cold-start value) for the first 1–2 months, **monthly restarts from step one**,
+      then stop+restart at a month boundary onto **step_per_day=240 (dt=360 s, the
+      DestinE production value)** for the rest of the campaign (Fortran cannot change
+      dt in-run — FORCA20 precedent)
 - [ ] output protocol (cadence per GATE HORIZON_OK): 3D snapshots T,S,w (nodal) + u,v
       (native ELEMENTAL); **2D snapshots at the same cadence: SSH, a_ice, m_ice, uice,
       vice** (window-init + η loss targets — means are NOT sufficient); daily 2D means
@@ -182,7 +186,9 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
 - [ ] monitor script + cadence (clock/quota/output-volume checks, read-only) — runs for the
       life of the campaign
 - [ ] shakedown: 1 month — volumes as budgeted, snapshots readable by our loaders,
-      **measure SYPD and node-h/SY**
+      **measure SYPD and node-h/SY** — ⚠️ shakedown month runs at the ramp dt (120 s);
+      the budget gate needs the POST-switch rate too (measure a few dt=360 s days
+      before sign-off; expected ~3.3 SYPD @ 8192 from the sweep per-step cost)
 - [ ] **gate (compute budget):** present measured cost of 10 SY (+ Task-11 rungs) vs the
       ab0995 allocation to the user for sign-off BEFORE the full chain proceeds
 - [ ] gate: year 1958 complete; storage on budget (~10.5 TB/decade at 5-daily — see
@@ -448,3 +454,9 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
   blow-up (mstep=47) was an unramped cold start; teacher needs a cold-start dt ramp
   (FORCA20 precedent 180→240). Real SYPD incl. snapshot I/O = Task-3 shakedown output.
   (Sweep run dirs on /scratch have expired; results.csv + repo commits are the record.)
+- 2026-08-06 (g): **teacher dt ramp decided by user**: dt=120 s (spd=720) for months
+  1–2 with monthly restarts from the start, then stop+restart onto spd=240 (dt=360 s)
+  for the campaign. Consequence for the shakedown: month 1 measures the ramp-dt SYPD
+  (~1.1 @ 8192 expected); the compute-budget sign-off additionally needs a few days
+  measured at dt=360 s (~3.3 SYPD expected). Snapshot cadence (GATE HORIZON_OK) is in
+  DAYS, so the dt switch does not move the output protocol.
