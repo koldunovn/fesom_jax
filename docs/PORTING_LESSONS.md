@@ -5632,3 +5632,31 @@ three, every blocking finding in packaging/docs. Lessons from fixing the first t
   (correctly — peak memory is a process-global high-water mark), so it was recomputed six
   times at ~3.5 min of A100 each. Write it once to `$WORK` (write-to-temp-then-rename so a
   killed job cannot leave a torn cache) and load it thereafter.
+
+### Task 4 — overturning parity: three bugs the gate caught (2026-08-06)
+
+- **[gotcha] The /pool CORE2 mesh stores GEOGRAPHIC coordinates, so pyfesom2 must be
+  loaded with `abg=[0,0,0]`.** pyfesom2's DEFAULT is `abg=[50,15,-90]`, which rotates an
+  already-geographic mesh and silently produces geographically wrong basin masks — the
+  Mozambique Channel lands in the Atlantic while the tropical Atlantic drops out (30779
+  "Atlantic" nodes instead of 34412, AMOC 10.8 Sv instead of 18.4 Sv). Nothing errors; the
+  number just comes out plausible and wrong. Verified: at `abg=[0,0,0]` pyfesom2's
+  `mesh.x2/y2` match our exported `geo_coord_nod2D` to 0.000 deg; at the default they
+  differ by up to 180 deg in longitude and 15 deg in latitude.
+- **[gotcha] `np.asarray(nc_var[:])` strips netCDF4's mask and hands you the fill value.**
+  FESOM writes `9.96921e+36` wherever a cell is dry OR its value rounds below 1e-30
+  (io_meandata.F90's fill convention conflates "missing" with "zero"), so the raw array is
+  not arithmetic-safe: the first AMOC came out at 1e43 Sv. Read through the mask, or
+  `np.ma.masked_greater(..., 1e30)` then fill with 0.
+- **[gotcha] `nlevels` is the interface COUNT; data stops one level earlier.** Blanking at
+  `i >= nlevels` leaves exactly one row of fill values in the sum; pyfesom2's `xmoc_data`
+  subtracts 1 for this reason. Our .npy export stores the raw count.
+- **[method] A latitude-binned diagnostic needs round-off-proof bin edges.** Two CORE2
+  triangles have centroid latitudes of *exactly* 86.0 and 74.0 deg, and our .npy export
+  differs from the mesh ASCII in the last bits (~1e-13 deg) — enough to flip which bin
+  they fall in and move ~7e-3 Sv of Atlantic overturning. Bin on the ROUNDED centroid
+  (1e-9 deg) so the answer depends on the coordinate as written, not on which copy of the
+  mesh you loaded. Residual after the fix: 2.3e-13 Sv.
+- **[method] Parity gates earn their cost by failing.** All four issues above were
+  invisible in unit tests (which passed 11/11 on synthetic meshes) and only surfaced when
+  the same real file went through both implementations.
