@@ -5582,3 +5582,28 @@ three, every blocking finding in packaging/docs. Lessons from fixing the first t
   compiled — so the worktree branched from main is MORE faithful to the binary than
   checking out the recorded SHA would have been. The definitive check stays behavioral:
   Task 1's byte-identity gate reruns the rebuilt binary against the R2 outputs.
+
+### Task 1 — Fortran snapshot output + the byte-identity control (2026-08-06)
+
+- **[method] Design the byte-identity gate as patched-vs-REBUILT-unpatched, never
+  patched-vs-"the production binary" — and run both comparisons anyway.** A vs B (Feb-22
+  R2 binary vs patched-flag-off rebuild) failed 30/33 files; the naive conclusion "the
+  patch breaks bit-identity" would have been wrong. D vs B (unpatched rebuild vs patched
+  rebuild, same toolchain) = 0/33 differ — the patch is byte-clean; D vs A pinned the
+  divergence on the production binary itself. Diagnostics that localized it in minutes:
+  compare the FIRST output record, not the last (step-1 diff = different code, not chaos
+  growth), and map the >1e-3 nodes onto mesh latitude (73% poleward of 50° ⇒ sea ice ⇒
+  ice_fct.F90 — the one file whose git history was already known-mangled). Roundoff-seed
+  divergence would instead start ~1e-13 and grow.
+- **[fortran] Adding a component to a namelist-read derived type breaks every existing
+  namelist file** (positional value lists), so extend via a NEW optional group +
+  a module-level mode flag around the existing 1500-line id→pointer SELECT CASE —
+  19 lines changed in the mean path, none of them numeric: the definition loop reruns
+  appended entries with `def_snapshot_mode` set, def_stream renames to `<id>_snap`, and
+  update_means/output branch on `entry%snapshot`. Absent group ⇒ EOF iostat<0 ⇒ off;
+  malformed group ⇒ iostat>0 ⇒ hard error (silent-off would be the worst outcome).
+- **[test] An every-step MEAN stream is a free bitwise oracle for snapshot semantics:**
+  a 1-step mean is 0+x divided by 1 in the same precision ⇒ bit-equal to the
+  instantaneous state, so `sst_snap[rec 0] == sst_everystep[rec 47]` proves "snapshot =
+  state at write time" exactly, with no tolerance argument, and subsumes the
+  constant-field check (its degenerate case).
