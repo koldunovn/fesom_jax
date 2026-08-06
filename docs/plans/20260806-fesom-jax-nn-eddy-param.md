@@ -117,14 +117,26 @@ taming near coasts/equator.
       / 0 skipped** (jobs 26744089). ⚠️ SHARDING group: (a) it cannot finish in any
       practical wall time — pre-existing since 2026-06-12
       ([[sharded-suite-slow-phase8b]]); main has since raised its cap to 4 h (P19), our
-      branch point predates that; (b) it contains ONE real failure, identified by an
+      branch point predates that; (b) it contained one failure, identified by an
       `-x` run (job 26746829): `test_forcing_sharded.py::test_forced_multistep_owned_
       matches[2]` — sharded-vs-dense `uv` on owned nodes, max|Δ|=8.97e-3 vs 1e-7 atol.
       **Not attributable to this project**: our branch's only diffs vs 8dca7e4 are
       docs/ + scripts/ (zero `fesom_jax/` files), and halo.py/momentum.py/forcing.py/
       surface_forcing.py are byte-identical between main and our base ⇒ pre-existing
-      port-wide. ➕ Matters for Task 9 (data-parallel windows across GPUs) — must be
-      fixed before that; surfaced to the user 2026-08-06.
+      port-wide. ✅ **DIAGNOSED AND FIXED 2026-08-06 — it was the GATE, not the port,
+      so it does NOT block Task 9.** The growth measurement
+      (`scripts/debug/forced_owned_step_growth.py`, job 26747719) shows that after ONE
+      forced step at npes=2 every clean field is bit-identical to the npes=1 control
+      (`uv` 5.003e-13 in both) and only T/S differ (1.25e-2 / 3.07e-3) on hop-0 nodes
+      — the owned/halo interface exactly, i.e. the documented FCT upwind-flip floor,
+      not a missing exchange. Over the next two steps that flip passes through the EOS
+      and KPP's boundary-layer depth (`Av` 4.4e-1 rel) and decorrelates the whole
+      trajectory to the percent level; a contiguous-date control decorrelates the same,
+      so the test's Jan/Jul/Oct dates were not the cause. The test was a FREE-RUNNING
+      3-step compare held to the single-step budget, contradicting `test_step_sharded`'s
+      own "Decision 4"; it is now teacher-forced per step, keeping the 1e-7 clean budget
+      (measured margin: clean ≤2.7e-9, `uv` ≤5.4e-12). Whole file green 9/9, job
+      26747979. Lesson in `docs/PORTING_LESSONS.md`.
       ⚠️ Gotcha found: the worktree needs the gitignored `data` symlink
       (`ln -s /work/ab0995/a270088/port_jax/data`) or ICE+sharding SKIP silently while
       the suite still prints "ALL GREEN" (first run: 575 passed/202 skipped)

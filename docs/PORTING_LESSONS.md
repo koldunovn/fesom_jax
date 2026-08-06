@@ -5477,3 +5477,57 @@ ablation → HLO diff → nsys, chained as slurm jobs. Chronicle:
   layout. Deterministic, yes; keyed to the partition, no. The trigger includes the *exchange
   pattern*, and notably degree 6 fires FEWER exchanges per step (189 vs 254) but in tighter
   bursts. Before generalising from repeats, vary the axes you did not think were part of the key.
+
+## The forced sharded multi-step gate: a free-running compare is not a tight gate (2026-08-06)
+
+- **[method] A test that fails identically on every commit is a broken test until proven
+  otherwise — but "pre-existing" is a provenance claim, not a diagnosis.**
+  `test_forcing_sharded::test_forced_multistep_owned_matches[2]` had been failing at
+  `uv` owned max|Δ| = 8.969e-03 against a 1e-7 budget, byte-identical on main, on a clean
+  older commit and on a WIP branch (jobs 26275895/26275933/26275876). That A/B settled who
+  broke it (nobody) and was then read as "stale calibration" — a plausible hypothesis that
+  sat unverified for three weeks while the failure stayed in the suite. The A/B and the
+  diagnosis are different experiments; running the first does not discharge the second.
+
+- **[method] To separate an accumulated floor from a wiring bug, measure the step-1 state and
+  localise it geometrically.** `scripts/debug/forced_owned_step_growth.py` runs the same
+  dense-vs-sharded compare at n = 1, 2, 3 with an npes=1 control at each n, and bins every
+  offending entity by BFS hop distance to the nearest non-owned node. The answer was
+  unambiguous after one step: every clean field at npes=2 was *bit-identical to the npes=1
+  control* (`uv` 5.003e-13 in both), and the only differing fields were T (1.25e-2) and S
+  (3.07e-3), on 213 and 178 nodes, **all at hop 0** — the owned/halo interface exactly. That
+  is the FCT limiter flipping on reassociation where the shard-local flux assembly orders
+  neighbours differently, not a missing exchange: a broken exchange corrupts owned boundary
+  entities in every field that crosses it, on step one, and does not start life tracer-only.
+
+- **[physics] Two branch-valued schemes in series decorrelate a forced CORE2 trajectory to the
+  percent level in two timesteps.** The step-1 interface flip reaches the EOS at n=2
+  (`density` 1.5e-4 rel), flips KPP's boundary-layer depth (`Av` **4.4e-1 rel**), and lands in
+  `uv` at 2.8e-2 rel; the front spreads ~2 hops inward per step (h0:906 h1:126 h2:58 h3:27 h4:4
+  at n=2). The `uv` diff is 5e-13 → 2.2e-2 → 9.0e-3 — ten orders in one step, then bounded
+  oscillation, i.e. saturation, not growth. **No absolute or relative budget separates that
+  from a real wiring bug**, which is also O(1e-2) and up. Free-running multi-step compares
+  cannot be tight gates on this model; `test_step_sharded`'s "Decision 4" said so and this gate
+  had simply not followed it.
+
+- **[method] The obvious suspect was innocent, and only the control leg showed it.** The test
+  feeds Jan 15 / Jul 15 / Oct 15 as CONSECUTIVE timesteps (deliberately, so a mis-wired per-step
+  fold is detectable), which looks exactly like the reason a 3-step trajectory would decorrelate.
+  It is not: a control leg with three genuinely contiguous half-hour steps decorrelates the same
+  or slightly worse — `uv` 3.20e-2 rel 5.78e-2 at n=2 versus 2.16e-2 rel 2.83e-2 for the violent
+  dates, with an indistinguishable hop histogram. So softening the dates would not have rescued a
+  tight free-running gate either. Always run the control that would exonerate your suspect.
+
+- **[method] Recalibrate by changing the experiment, not the tolerance.** The fix teacher-forces
+  the gate — each sharded forced step reads the single-device previous state, with
+  `bootstrap_ab2=(k == 0)` (the production chunk driver's restart idiom) — so the clean budget
+  STAYS at 1e-7 and the gate gets stronger, not weaker. Loosening `uv` to ~1e-1 would have made
+  it green and worthless. The free-running run is still executed, gated on what it can honestly
+  assert: it lowers, runs, stays finite and physically bounded.
+
+- **[method] Absolute tolerances across fields whose scales span nine orders report the wrong
+  field.** `_owned_match` compares absolute diffs, so the reported failure was `uv` purely
+  because it is the first over-budget field in `State`'s declaration order; `ssh_rhs` was 640x
+  over its own budget (64 absolute — but 6e-5 relative on an O(1e6) field) and `pgf` looked
+  clean at 4e-9 while actually being 2.5e-5 relative on an O(1e-4) field. The same file's newer
+  `_slow_field_rel_check` already does this per-field and relative; prefer it when adding gates.
