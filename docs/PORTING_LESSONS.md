@@ -5607,3 +5607,28 @@ three, every blocking finding in packaging/docs. Lessons from fixing the first t
   instantaneous state, so `sst_snap[rec 0] == sst_everystep[rec 47]` proves "snapshot =
   state at write time" exactly, with no tolerance argument, and subsumes the
   constant-field check (its degenerate case).
+
+### Task 2 — horizon scan: the OOM was mine, not the adjoint's (2026-08-06)
+
+- **[method] When a gradient OOMs, check what you left resident BEFORE blaming the
+  adjoint.** The scan died at N=1 day (48 steps) asking for 37 GiB — but the longwindow
+  campaign had run 48 steps of the same model fine. Two of my own habits caused it: I
+  stacked surface forcing for the whole 10-day truth window (`dates_for_steps(..., 480)`)
+  and sliced it per window, keeping ~5-10 GB resident, where the C1 script stacks exactly
+  `n` steps; and I kept all ten truth marks on the device when the endpoint loss needs
+  one. The tell was in the numbers: the request grew only 37→42→47 GiB for N=1→3 days, so
+  it was dominated by a FIXED block, not by the window.
+- **[perf] `remat_blocks=True` is the lever for the fixed term.** The CORE2 per-step
+  reverse working set is ~34-37 GiB and independent of window length (`step.py:155`), so
+  √N checkpointing of the scan cannot touch it — only nested in-step rematerialization
+  can. Forward bit-identical, gradient identical. Any new long-window adjoint script
+  should switch it on from the start; the E1 twin already learned this
+  ([[e1-nn-twin-memory-fix]]) and I did not carry it over.
+- **[perf] √N really is the optimum for scan segments** (stored carries ≈ S + N/S, minimal
+  at S=√N), so a "more segments to save memory" knob is a trap — it moves you off the
+  optimum in the wrong direction. Cut the per-step term instead.
+- **[method] Cache what does not depend on the swept variable.** The 10-day truth
+  trajectory is identical for every window length, but the sweep runs one process per N
+  (correctly — peak memory is a process-global high-water mark), so it was recomputed six
+  times at ~3.5 min of A100 each. Write it once to `$WORK` (write-to-temp-then-rename so a
+  killed job cannot leave a torn cache) and load it thereafter.
