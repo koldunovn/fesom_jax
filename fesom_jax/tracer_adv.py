@@ -33,6 +33,8 @@ reference + a constant-tracer property. (See ``docs/REFERENCE_RUNS.md``.)
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -368,6 +370,15 @@ def fill_up_dn_grad(mesh: Mesh, tr_xy):
     return jnp.stack([g0, g1, g2, g3], axis=-1)          # (edge, nl, 4)
 
 
+# The docs/LIMITER_GRADIENTS.md option (c) escape hatch: treat the Zalesak limiter
+# factors as constants in the BACKWARD pass (`adf = stop_gradient(ae) * adf`). The
+# forward is untouched, so results are bit-identical; only the gradient changes, and it
+# becomes a BIASED gradient that ignores how the limiter itself responds to the state.
+# Off by default. Enable per-process with FESOM_FCT_STOPGRAD_AE=1 (an env switch rather
+# than a config field so it cannot silently change a production run's gradients).
+FCT_STOP_GRADIENT_AE = os.environ.get("FESOM_FCT_STOPGRAD_AE", "0") == "1"
+
+
 def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
                   dt: float = DT_DEFAULT, exch=None):
     """Zalesak flux limiter (``oce_tra_adv_fct``, ``fesom_tracer_adv.c:851``).
@@ -456,12 +467,16 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
                        jnp.minimum(_shift_down(minus_fac), plus_fac),
                        jnp.minimum(_shift_down(plus_fac), minus_fac))
     ae_v = jnp.where(k == nzmin, ae_surf, ae_int)
+    if FCT_STOP_GRADIENT_AE:
+        ae_v = jax.lax.stop_gradient(ae_v)
     adf_v_lim = ops.mask_below_bottom(ae_v * adf_v, mesh.node_iface_mask)
 
     n1, n2 = mesh.edges[:, 0], mesh.edges[:, 1]
     ae_h = jnp.where(adf_h >= 0.0,
                      jnp.minimum(plus_fac[n1], minus_fac[n2]),
                      jnp.minimum(minus_fac[n1], plus_fac[n2]))
+    if FCT_STOP_GRADIENT_AE:
+        ae_h = jax.lax.stop_gradient(ae_h)
     adf_h_lim = ae_h * adf_h
     return adf_h_lim, adf_v_lim
 
