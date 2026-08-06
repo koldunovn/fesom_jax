@@ -251,12 +251,29 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
 **Files:**
 - Create: `scripts/nn_eddy/mesh_diag.py`; Create: `scripts/nn_eddy/test_mesh_diag.py`
 
-- [ ] w-based MOC per pyfesom2 `xmoc` (node w → element means × `elem_area` → latitude
-      bins → cumsum, basin masks incl. Atlantic; Sidorenko et al. 2020)
-- [ ] section volume transport (Drake/ACC) per the pyfesom2 notebook
-- [ ] works on teacher (Fortran netCDF), JAX-student, and Fortran-baseline outputs
-- [ ] tests: synthetic w with analytically known MOC; bin/basin edge cases
-- [ ] gate: parity vs pyfesom2 on one real FORCA20/CORE2 monthly file (plot + numeric diff)
+- [x] w-based MOC per pyfesom2 `xmoc` (node w → element means × `elem_area` → latitude
+      bins → cumsum, basin masks incl. Atlantic; Sidorenko et al. 2020) — done
+      2026-08-06, `scripts/nn_eddy/mesh_diag.py` (commit 22b2deb). Basin masks read
+      pyfesom2's OWN GeoJSON polygons (identical regions by construction);
+      `amoc_strength()` = peak in a RAPID-like 20–60°N / 500–3000 m box
+- [ ] section volume transport (Drake/ACC) per the pyfesom2 notebook — ⚠️ pyfesom2 does
+      this with ~1000 lines of broken-line intersection machinery (`transport.py`);
+      decide between a faithful port and a simpler equivalent flux-through-a-line
+- [x] works on teacher (Fortran netCDF), JAX-student, and Fortran-baseline outputs —
+      `load_w()` handles any (time,nl,nod2D)/(nod2D,nl) netCDF incl. the fill convention
+- [x] tests: synthetic w with analytically known MOC; bin/basin edge cases — 12 tests
+      (`scripts/tests/test_mesh_diag.py`), incl. a bin-edge round-off regression
+- [x] **gate PASS: parity vs pyfesom2 on a real CORE2 file** — 1958 annual-mean w from
+      the Fortran R2 hindcast, Atlantic_MOC: **max|Δ| = 2.3e-13 Sv**, masks identical
+      (34412/34412 nodes), AMOC 18.390 Sv both. Reference + comparison scripts committed
+      (`pyfesom2_ref_moc.py`, `compare_moc_vs_pyfesom2.py`). ⚠️ The gate caught FOUR real
+      issues invisible to unit tests — see PORTING_LESSONS Task 4: (1) **pyfesom2's
+      default `abg=[50,15,-90]` is WRONG for the /pool CORE2 mesh** (it stores geographic
+      coords ⇒ use `abg=[0,0,0]`); the default silently puts the Mozambique Channel in the
+      Atlantic (AMOC 10.8 vs 18.4 Sv) — affects any pyfesom2 analysis on this mesh;
+      (2) `np.asarray(nc_var[:])` strips the mask ⇒ 9.97e36 fills enter the sums (1e43 Sv);
+      (3) `nlevels` is the interface count ⇒ blank at `nlevels-1`; (4) two CORE2 triangles
+      sit exactly on latitude-bin edges ⇒ bin on the rounded centroid
 
 ### Task 5: `coarsen` I — mesh-Laplacian scale filter
 
