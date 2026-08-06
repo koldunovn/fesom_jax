@@ -435,7 +435,14 @@ variance-weighted T,S+SSH at the candidate target marks) and measure gradient he
 - Optional later legs: modern-era NG5 cold start for obs-era work; Arm B as a follow-up if
   not triggered; NG5-JAX teacher.
 
-## Open scope question (user-raised 2026-08-06, not yet decided)
+## Resolved scope question — easy backscatter: DECIDED, NOT PURSUED (user 2026-08-06)
+
+**Decision: `opt_visc=7` for BOTH teacher and student; backscatter is not ported.** User:
+"If there is no backscatter in JAX - we will work with what we have, so option 7 for both."
+Likewise **mEVP (`whichEVP=1`) for both** — already the case on both sides (teacher
+namelist.ice; JAX `IceConfig(whichEVP=1)`, the validated all-on path; note the JAX *dataclass
+default* is 0, so runs must pass whichEVP=1 explicitly as the paper configs do).
+Do not re-litigate. Background kept for the record:
 
 **Easy backscatter (`opt_visc=5`) as a JAX capability + ladder rung.** FESOM ships
 `opt_visc=5` + `visc_easybsreturn=1.5` as its default and the user notes CORE2 "ideally"
@@ -450,8 +457,8 @@ the Fortran CORE2 alone would break the JAX↔Fortran match paper 2 rests on. �
 PORT task (backscatter kernel + adjoint + bit-faithfulness cert), not a namelist edit.
 Attractive because backscatter is itself a coarse-mesh eddy-energy parameterization ⇒ a
 natural extra Task-11 ladder rung (and a competitor/complement to the NN). Est. non-trivial
-(new momentum kernel + adjoint + validation vs Fortran). **Decision deferred to the user;
-nothing in the current plan depends on it.**
+(new momentum kernel + adjoint + validation vs Fortran). **CLOSED 2026-08-06 — not pursued;
+opt_visc=7 both sides. Revisit only if a referee asks for a backscatter baseline.**
 
 ## Revision Log
 
