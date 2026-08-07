@@ -33,6 +33,8 @@ reference + a constant-tracer property. (See ``docs/REFERENCE_RUNS.md``.)
 
 from __future__ import annotations
 
+import os
+
 import jax
 import jax.numpy as jnp
 
@@ -368,6 +370,15 @@ def fill_up_dn_grad(mesh: Mesh, tr_xy):
     return jnp.stack([g0, g1, g2, g3], axis=-1)          # (edge, nl, 4)
 
 
+# The docs/LIMITER_GRADIENTS.md option (c) escape hatch: treat the Zalesak limiter
+# factors as constants in the BACKWARD pass (`adf = stop_gradient(ae) * adf`). The
+# forward is untouched, so results are bit-identical; only the gradient changes, and it
+# becomes a BIASED gradient that ignores how the limiter itself responds to the state.
+# Off by default. Enable per-process with FESOM_FCT_STOPGRAD_AE=1 (an env switch rather
+# than a config field so it cannot silently change a production run's gradients).
+FCT_STOP_GRADIENT_AE = os.environ.get("FESOM_FCT_STOPGRAD_AE", "0") == "1"
+
+
 def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
                   dt: float = DT_DEFAULT, exch=None):
     """Zalesak flux limiter (``oce_tra_adv_fct``, ``fesom_tracer_adv.c:851``).
@@ -456,12 +467,16 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
                        jnp.minimum(_shift_down(minus_fac), plus_fac),
                        jnp.minimum(_shift_down(plus_fac), minus_fac))
     ae_v = jnp.where(k == nzmin, ae_surf, ae_int)
+    if FCT_STOP_GRADIENT_AE:
+        ae_v = jax.lax.stop_gradient(ae_v)
     adf_v_lim = ops.mask_below_bottom(ae_v * adf_v, mesh.node_iface_mask)
 
     n1, n2 = mesh.edges[:, 0], mesh.edges[:, 1]
     ae_h = jnp.where(adf_h >= 0.0,
                      jnp.minimum(plus_fac[n1], minus_fac[n2]),
                      jnp.minimum(minus_fac[n1], plus_fac[n2]))
+    if FCT_STOP_GRADIENT_AE:
+        ae_h = jax.lax.stop_gradient(ae_h)
     adf_h_lim = ae_h * adf_h
     return adf_h_lim, adf_v_lim
 
@@ -530,7 +545,8 @@ def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
 
 
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
-                   *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None, w_i=None):
+                   *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None, w_i=None,
+                   freeze_limited_flux: bool = False):
     """One tracer's FCT advection + ALE reconstruction
     (``fesom_tracer_advect_one_fct``, ``fesom_tracer_adv.c:1199``). Returns
     ``(T_new, T_old_new)`` with ``T_old_new = T`` (the AB2 ``valuesold`` save).
@@ -572,6 +588,16 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
                  - adv_flux_ver(mesh, w_full, T))
     # 5 — Zalesak limit (exchanges fct_plus/fct_minus internally)
     adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, hnode_new, dt=dt, exch=exch)
+    # Backward-only (AdjointConfig.freeze_advection): drop the whole limited antidiffusive
+    # correction from the adjoint, so the backward sees plain monotone upwind advection
+    # while the forward keeps full FCT. The NWP incremental-4D-Var practice of running
+    # more diffusive numerics in the tangent-linear/adjoint model than in the nonlinear
+    # forward. Distinct from FCT_STOP_GRADIENT_AE, which freezes only the limiter FACTOR
+    # and leaves the antidiffusive flux live -- that deletes the limiter's own stabilizing
+    # negative feedback (as the tracer steepens, ae falls) while keeping the term it damps.
+    if freeze_limited_flux:
+        adf_h = jax.lax.stop_gradient(adf_h)
+        adf_v = jax.lax.stop_gradient(adf_v)
     # 6-7 — assemble del_ttf  8 — reconstruct (T_new = LO + limited antidiff)
     del_ttf = flux2dtracer_fct(mesh, T, LO, adf_h, adf_v, hnode, hnode_new, dt=dt)
     T_new = ale_reconstruct(mesh, T, del_ttf, hnode, hnode_new)

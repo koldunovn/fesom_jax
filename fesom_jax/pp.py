@@ -25,6 +25,7 @@ shear/N² path is exercised by the synthetic unit + gradient tests.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from . import ops
@@ -121,12 +122,13 @@ def pp_mixing(mesh: Mesh, uvnode, bvfreq, *, k_ver=K_VER, a_ver=A_VER, Z3d=None)
     return Kv, Av
 
 
-def mo_convect(mesh: Mesh, Kv, Av, bvfreq):
+def mo_convect(mesh: Mesh, Kv, Av, bvfreq, *, freeze_increment: bool = False):
     """Convective adjustment (``fesom_mo_convect``, use_instabmix branch): where
     ``N²<0`` raise ``Kv`` (node) / ``Av`` (element, if ANY vertex N²<0) to
     ``instabmix_kv``. No-op where the column is stably stratified."""
     if not USE_INSTABMIX:
         return Kv, Av
+    Kv_in, Av_in = Kv, Av
     nl = mesh.nl
     imix = INSTABMIX_KV
     nmask = _interior_iface_mask(mesh.ulevels_nod2D, mesh.nlevels_nod2D, nl)
@@ -136,10 +138,17 @@ def mo_convect(mesh: Mesh, Kv, Av, bvfreq):
     any_neg = jnp.any(b_corners < 0.0, axis=1)                      # (elem2D,nl)
     emask = _interior_iface_mask(mesh.ulevels, mesh.nlevels, nl)
     Av = jnp.where(emask & any_neg, jnp.maximum(Av, imix), Av)
+    if freeze_increment:
+        # Backward-only (AdjointConfig.freeze_convection): keep the bump's VALUE but differentiate
+        # only the pre-convection coefficients, so the N^2<0 switch contributes no gradient
+        # while the closure's own state-dependence stays live.
+        Kv = Kv_in + jax.lax.stop_gradient(Kv - Kv_in)
+        Av = Av_in + jax.lax.stop_gradient(Av - Av_in)
     return Kv, Av
 
 
-def mixing_pp(mesh: Mesh, uv, bvfreq, *, k_ver=K_VER, a_ver=A_VER, Z3d=None):
+def mixing_pp(mesh: Mesh, uv, bvfreq, *, k_ver=K_VER, a_ver=A_VER, Z3d=None,
+              freeze_convection: bool = False):
     """Driver mirror of ``fesom_step.c:122-135``: node velocity → PP → convection.
     Returns ``(Kv, Av, uvnode)`` — the substep-4 dump fields (+ uvnode for reuse).
     ``k_ver``/``a_ver`` thread the differentiable backgrounds (default = config).
@@ -147,5 +156,5 @@ def mixing_pp(mesh: Mesh, uv, bvfreq, *, k_ver=K_VER, a_ver=A_VER, Z3d=None):
     shear spacing (JZ.6)."""
     uvnode = compute_vel_nodes(mesh, uv)
     Kv, Av = pp_mixing(mesh, uvnode, bvfreq, k_ver=k_ver, a_ver=a_ver, Z3d=Z3d)
-    Kv, Av = mo_convect(mesh, Kv, Av, bvfreq)
+    Kv, Av = mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection)
     return Kv, Av, uvnode

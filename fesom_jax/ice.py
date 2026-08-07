@@ -104,15 +104,44 @@ class IceConfig(NamedTuple):
     ch_atm_ice: float = CH_ATM_ICE  # 1.75e-3 sensible-heat over ice
     ce_atm_ice: float = CE_ATM_ICE  # 1.75e-3 evaporation over ice
     cd_atm_ice: float = CD_ATM_ICE  # 1.2e-3  atm-ice momentum drag
-    # --- adjoint mode (paper §2; how the ice block is treated in the BACKWARD pass) ---
-    #   "exact"      : autodiff the full ice step (default; forward == backward transpose).
-    #   "frozen"     : stop_gradient the ice update in the backward — the FORWARD still runs the
-    #                  full mEVP ice (identity under stop_gradient), only the gradient skips it.
-    #                  Tames the mEVP rheology adjoint blow-up for OCEAN-parameter calibration
-    #                  (the ice-mediated sensitivity is dropped). The MITgcm/ECCO-style cheap path.
-    #   "free_drift" : (PLANNED) custom_vjp free-drift adjoint — drop the internal-stress ∇·σ in
-    #                  the backward, keep wind/ocean-drag/Coriolis/tilt; retains ice-momentum
-    #                  sensitivity (and enables adjoint sea-ice calibration). NOT yet implemented.
+    # --- adjoint mode: how the ice block is treated in the BACKWARD pass -----------------
+    # The FORWARD is identical in all three modes — `stop_gradient` is the identity, so the ice
+    # trajectory is bit-for-bit the validated model whichever you pick. Only the gradient
+    # changes. Measured numbers and provenance: docs/ADJOINT_HORIZON.md.
+    #
+    #   "rheology"  : RECOMMENDED. Differentiate ice thermodynamics, advection, cut-off and the
+    #                 ocean-to-ice coupling, but unroll ZERO momentum-solver subcycles in the
+    #                 backward, so only the ice VELOCITY is dark. This is the one cut that is
+    #                 actually needed: freezing each piece of an ice step in turn showed the
+    #                 momentum solve is solely responsible (dL/dm 3.4e-05 frozen against
+    #                 2.0e+39 exact) while every other component is harmless. Over a 5-day
+    #                 window it is clean and reproducible and changes an eddy-diffusivity
+    #                 gradient by 0.21% against "frozen" — so it costs nothing in stability and
+    #                 recovers the pathway that matters: eddy transport changes SST, which
+    #                 changes ice growth, which changes the surface heat and salt fluxes back
+    #                 into the ocean.
+    #
+    #   "frozen"    : stop_gradient the WHOLE ice update, so no gradient flows through ice at
+    #                 all. Heavier-handed than needed but the most conservative option, and the
+    #                 one every published adjoint sea-ice study fell back to before free-drift
+    #                 approximations existed.
+    #
+    #   "exact"     : differentiate everything. **Returns NaN on realistic configurations.** The
+    #                 subcycled EVP/mEVP momentum solve is a fixed-point iteration whose reverse
+    #                 pass amplifies by ~1.18 per sweep — 4e8 per model step over 120 sweeps —
+    #                 so it overflows float64 within the first simulated day. This is not a
+    #                 defect of this port: it is the reason adjoint sea-ice models are rare
+    #                 (Kauker et al. 2009; Fenty and Heimbach 2013), and every published
+    #                 alternative either discards the rheology, reduces it to free drift
+    #                 (Koldunov et al. 2017), simplifies it (Usui et al. 2016; Toyoda et al.
+    #                 2015, 2019; Lyu et al. 2023) or damps the adjoint artificially. Kept as
+    #                 the default only because it is the mathematically faithful one; use
+    #                 "rheology" for anything real.
+    #
+    #   "free_drift": (PLANNED) drop the internal stress in the backward while keeping wind,
+    #                 ocean drag, Coriolis and tilt, so ice-momentum sensitivity survives. The
+    #                 standard intermediate rung in the literature. "rheology" is cheaper and
+    #                 already available; free drift would recover more.
     adjoint_mode: str = "exact"
 
     # ---- derived (fesom_ice.c:85-86, 233, 84) ----

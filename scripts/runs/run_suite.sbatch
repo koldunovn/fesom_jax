@@ -15,15 +15,18 @@
 #SBATCH --cpus-per-task=16
 #SBATCH --hint=nomultithread
 #SBATCH --mem=200G
-# Wall budget — the suite GREW (ocean now 665 tests ~44 min + ice ~2 min + sharding ~30 min):
-# the old 65-min cap time-cut the sharding group (2026-06-18). 1:45 clears the full set with margin.
-#SBATCH --time=01:45:00
-#SBATCH -o /home/a/a270088/port_jax/scripts/run_suite.%j.out
-#SBATCH -e /home/a/a270088/port_jax/scripts/run_suite.%j.out
+# Wall budget — the suite KEEPS GROWING (2026-08-06: ocean 777 tests 1:14 + ice 2:28 +
+# sharding ~30 min; the 1:45 cap time-cut the sharding group AGAIN, same failure as
+# 2026-06-18). 2:30 clears the current set with margin — recheck when adding test groups.
+#SBATCH --time=02:30:00
+#SBATCH -o scripts/run_suite.%j.out
+#SBATCH -e scripts/run_suite.%j.out
 
 source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
-cd /home/a/a270088/port_jax
+# Submit from the repo root of whichever checkout/worktree should be tested;
+# output lands in that checkout's scripts/ (relative -o resolves vs submit dir).
+cd "${SLURM_SUBMIT_DIR:-/home/a/a270088/port_jax}"
 export JAX_PLATFORMS=cpu
 # 128 physical cores/node, SMT off (--hint=nomultithread). The --cpus-per-task cgroup
 # binds all threads to the 16 allocated physical cores (no oversubscription / the

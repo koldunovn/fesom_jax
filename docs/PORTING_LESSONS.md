@@ -5565,3 +5565,224 @@ three, every blocking finding in packaging/docs. Lessons from fixing the first t
   over its own budget (64 absolute — but 6e-5 relative on an O(1e6) field) and `pgf` looked
   clean at 4e-9 while actually being 2.5e-5 relative on an O(1e-4) field. The same file's newer
   `_slow_field_rel_check` already does this per-field and relative; prefer it when adding gates.
+
+## NN-GM (paper 3) — `docs/plans/20260806-fesom-jax-nn-eddy-param.md`
+
+### Task 0 — workspace + version verification (2026-08-06)
+
+- **[method] A recorded build SHA can name a commit that cannot even compile — verify
+  provenance by ancestry AND buildability, not by the hash alone.** The R2 `fesom.x`'s
+  documented commit 6b26861a lives on branch `llm-fix-3`, not an ancestor of main, and its
+  committed tree has `src/ice_fct.F90` accidentally EMPTIED while `ice_setup_step.F90` still
+  calls `ice_TG_rhs` — that tree cannot link, so the binary was necessarily built from a
+  dirty working tree (the file's real content in place). The useful checks, in order:
+  `git merge-base --is-ancestor <sha> main`; diff both sides to the merge-base; ask whether
+  the committed tree defines every symbol it calls; md5 the production working tree's files
+  against candidate blobs. Here they proved main@4ccdd35a src == the state actually
+  compiled — so the worktree branched from main is MORE faithful to the binary than
+  checking out the recorded SHA would have been. The definitive check stays behavioral:
+  Task 1's byte-identity gate reruns the rebuilt binary against the R2 outputs.
+
+### Task 1 — Fortran snapshot output + the byte-identity control (2026-08-06)
+
+- **[method] Design the byte-identity gate as patched-vs-REBUILT-unpatched, never
+  patched-vs-"the production binary" — and run both comparisons anyway.** A vs B (Feb-22
+  R2 binary vs patched-flag-off rebuild) failed 30/33 files; the naive conclusion "the
+  patch breaks bit-identity" would have been wrong. D vs B (unpatched rebuild vs patched
+  rebuild, same toolchain) = 0/33 differ — the patch is byte-clean; D vs A pinned the
+  divergence on the production binary itself. Diagnostics that localized it in minutes:
+  compare the FIRST output record, not the last (step-1 diff = different code, not chaos
+  growth), and map the >1e-3 nodes onto mesh latitude (73% poleward of 50° ⇒ sea ice ⇒
+  ice_fct.F90 — the one file whose git history was already known-mangled). Roundoff-seed
+  divergence would instead start ~1e-13 and grow.
+- **[fortran] Adding a component to a namelist-read derived type breaks every existing
+  namelist file** (positional value lists), so extend via a NEW optional group +
+  a module-level mode flag around the existing 1500-line id→pointer SELECT CASE —
+  19 lines changed in the mean path, none of them numeric: the definition loop reruns
+  appended entries with `def_snapshot_mode` set, def_stream renames to `<id>_snap`, and
+  update_means/output branch on `entry%snapshot`. Absent group ⇒ EOF iostat<0 ⇒ off;
+  malformed group ⇒ iostat>0 ⇒ hard error (silent-off would be the worst outcome).
+- **[test] An every-step MEAN stream is a free bitwise oracle for snapshot semantics:**
+  a 1-step mean is 0+x divided by 1 in the same precision ⇒ bit-equal to the
+  instantaneous state, so `sst_snap[rec 0] == sst_everystep[rec 47]` proves "snapshot =
+  state at write time" exactly, with no tolerance argument, and subsumes the
+  constant-field check (its degenerate case).
+
+### Task 2 — horizon scan: the OOM was mine, not the adjoint's (2026-08-06)
+
+- **[method] When a gradient OOMs, check what you left resident BEFORE blaming the
+  adjoint.** The scan died at N=1 day (48 steps) asking for 37 GiB — but the longwindow
+  campaign had run 48 steps of the same model fine. Two of my own habits caused it: I
+  stacked surface forcing for the whole 10-day truth window (`dates_for_steps(..., 480)`)
+  and sliced it per window, keeping ~5-10 GB resident, where the C1 script stacks exactly
+  `n` steps; and I kept all ten truth marks on the device when the endpoint loss needs
+  one. The tell was in the numbers: the request grew only 37→42→47 GiB for N=1→3 days, so
+  it was dominated by a FIXED block, not by the window.
+- **[perf] `remat_blocks=True` is the lever for the fixed term.** The CORE2 per-step
+  reverse working set is ~34-37 GiB and independent of window length (`step.py:155`), so
+  √N checkpointing of the scan cannot touch it — only nested in-step rematerialization
+  can. Forward bit-identical, gradient identical. Any new long-window adjoint script
+  should switch it on from the start; the E1 twin already learned this
+  ([[e1-nn-twin-memory-fix]]) and I did not carry it over.
+- **[perf] √N really is the optimum for scan segments** (stored carries ≈ S + N/S, minimal
+  at S=√N), so a "more segments to save memory" knob is a trap — it moves you off the
+  optimum in the wrong direction. Cut the per-step term instead.
+- **[method] Cache what does not depend on the swept variable.** The 10-day truth
+  trajectory is identical for every window length, but the sweep runs one process per N
+  (correctly — peak memory is a process-global high-water mark), so it was recomputed six
+  times at ~3.5 min of A100 each. Write it once to `$WORK` (write-to-temp-then-rename so a
+  killed job cannot leave a torn cache) and load it thereafter.
+
+### Task 4 — overturning parity: three bugs the gate caught (2026-08-06)
+
+- **[gotcha] The /pool CORE2 mesh stores GEOGRAPHIC coordinates, so pyfesom2 must be
+  loaded with `abg=[0,0,0]`.** pyfesom2's DEFAULT is `abg=[50,15,-90]`, which rotates an
+  already-geographic mesh and silently produces geographically wrong basin masks — the
+  Mozambique Channel lands in the Atlantic while the tropical Atlantic drops out (30779
+  "Atlantic" nodes instead of 34412, AMOC 10.8 Sv instead of 18.4 Sv). Nothing errors; the
+  number just comes out plausible and wrong. Verified: at `abg=[0,0,0]` pyfesom2's
+  `mesh.x2/y2` match our exported `geo_coord_nod2D` to 0.000 deg; at the default they
+  differ by up to 180 deg in longitude and 15 deg in latitude.
+- **[gotcha] `np.asarray(nc_var[:])` strips netCDF4's mask and hands you the fill value.**
+  FESOM writes `9.96921e+36` wherever a cell is dry OR its value rounds below 1e-30
+  (io_meandata.F90's fill convention conflates "missing" with "zero"), so the raw array is
+  not arithmetic-safe: the first AMOC came out at 1e43 Sv. Read through the mask, or
+  `np.ma.masked_greater(..., 1e30)` then fill with 0.
+- **[gotcha] `nlevels` is the interface COUNT; data stops one level earlier.** Blanking at
+  `i >= nlevels` leaves exactly one row of fill values in the sum; pyfesom2's `xmoc_data`
+  subtracts 1 for this reason. Our .npy export stores the raw count.
+- **[method] A latitude-binned diagnostic needs round-off-proof bin edges.** Two CORE2
+  triangles have centroid latitudes of *exactly* 86.0 and 74.0 deg, and our .npy export
+  differs from the mesh ASCII in the last bits (~1e-13 deg) — enough to flip which bin
+  they fall in and move ~7e-3 Sv of Atlantic overturning. Bin on the ROUNDED centroid
+  (1e-9 deg) so the answer depends on the coordinate as written, not on which copy of the
+  mesh you loaded. Residual after the fix: 2.3e-13 Sv.
+- **[method] Parity gates earn their cost by failing.** All four issues above were
+  invisible in unit tests (which passed 11/11 on synthetic meshes) and only surfaced when
+  the same real file went through both implementations.
+
+## Task: FESOM restart reproducibility (2026-08-07)
+
+Hunting why a stopped-and-restarted FESOM run does not reproduce a continuous one. Five
+causes; full write-up in `~/nn_eddy/fesom2/RESTART_REPRODUCIBILITY.md`.
+
+- **[method] "The binary restart path already saves it, the netCDF path does not" is a
+  goldmine heuristic.** Three of the five causes (EVP stresses `sigma11/12/22`, the ice
+  Newton seed `t_skin`, and `hnode_new`) were fields that FESOM's derived-type binary dump
+  writes and `ini_ocean_io`/`ini_ice_io` simply omit. Enumerating `write_bin_array` calls
+  and diffing against the `def_*_var` list is a five-minute shortlist for this bug class.
+- **[gotcha] An array that looks like scratch can be prognostic because of CALL ORDER.**
+  `hnode_new` is filled by `vert_vel_ale` and consumed by `update_thickness_ale` at the end
+  of the step — obviously temporary. But `init_Redi_GM` runs *before* `vert_vel_ale` and
+  weights the baroclinic wave speed with it, so GM reads the previous step's value. Grep for
+  readers and compare their position in the step, not just for writers.
+- **[gotcha] Anything built once under `logical, save :: lfirst` from evolving state is a
+  restart bug.** FESOM's SSH preconditioner was built on the first solve of the run from a
+  matrix that accumulates an increment every step, so a cold start and a restart used
+  different preconditioners. The velocity RHS in the same codebase gets this right
+  (`if (lfirst .and. .not. r_restart)`) — so the pattern to sweep for is a saved first-call
+  flag *without* an `r_restart` guard.
+- **[gotcha] An iterative solver stopped on a tolerance makes its INITIAL GUESS part of the
+  state.** `d_eta` is both CG's initial guess and its answer; because the CG stops at a
+  relative residual (1e-5) rather than machine precision, not restoring it leaves an
+  O(1e-5) difference. Same for any fixed-iteration-count Newton solve with no convergence
+  test (`t_skin`, `imax=5`).
+- **[method] Two independent causes in one subsystem read as "no effect" when tested
+  singly.** Saving `d_eta` alone had been tried and dismissed; it only works once the
+  preconditioner is history-independent. When a plausible fix does nothing, consider that
+  something downstream is masking it before crossing it off.
+- **[method] Switching physics options OFF bisects faster than instrumenting them.** Once
+  the elevation chain was clean, `Fer_GM=.false. Redi=.false.` collapsed the tracer residual
+  to round-off in one 4-minute job — cheaper and more decisive than the 14 GB of 3D output
+  the alternative would have cost. Then walk the surviving subsystem's intermediates in
+  computation order and find the first link whose inputs are bit-identical but output is not
+  (`MLD1` ok, `N2` ok, `fer_C` off by 1.2e-3 -> found it).
+- **[gotcha] A saturating quantity hides the error that produced it.** `fer_K` was
+  bit-identical because it clamps at `K_GM_max`, even though the `cm` it was computed from
+  was wrong. The error reached the tracers only via the unclamped `fer_c`. Do not read
+  "downstream field is identical" as "upstream is fine".
+- **[gotcha] `cmake --build build` writes `build/lib/libfesom.so` and does NOT refresh the
+  repo's `bin/` and `lib64/`.** Only `cmake --install build` (or a full `./configure.sh`) does.
+  This bites twice. A staging copy that falls back to the stale root `lib64/` silently tests the
+  wrong library — one "verification" here actually re-ran the previous night's build and read
+  as the fix making things worse. Worse, `bin/fesom.x` carries `RPATH=$ORIGIN/../lib64`, so ANY
+  script pointing at `bin/fesom.x` loads that stale library: the NG5 teacher chain was pointed
+  there and would have run the whole campaign without the restart fixes, despite them being
+  committed AND built. Print the library md5 and `ldd`'s resolved path in every job script, and
+  run `cmake --install` before pointing a campaign at `bin/fesom.x`.
+- **[method] Reproducibility must be judged AT the restart step, not later.** After all five
+  fixes the restart is exact (SST 5e-14 K) but round-off amplifies ~5x per step and reaches
+  7e-2 K within the following day — indistinguishable from the pre-fix day-later number.
+  A "does the restart reproduce?" test that compares a day out would have called every one
+  of these fixes a failure.
+- **[gotcha] Differencing two runs? Check the record counts first.** A run still writing its
+  last records lines up silently at the wrong time. `min(a.shape[0], b.shape[0])-1` compared
+  a 91-record file at step 90 against a 96-record file at step 95 and produced a clean-looking
+  "55x improvement" from a tolerance change that in truth does nothing. The tell was that the
+  quantity being compared fluctuates by an order of magnitude between adjacent steps, so any
+  single-step comparison is fragile — plot the curve, don't quote one step.
+- **[method] A plateau at a suspicious value is not evidence.** The restart-vs-continuous ssh
+  difference appeared to saturate at 5e-06 relative, which is exactly the SSH solver's 1e-5
+  tolerance — a very persuasive coincidence. Sweeping the tolerance 1e-5 -> 1e-8 showed the
+  two divergence curves lie on top of each other (2.98e-06 m in both at the same step) for
+  3x the runtime. Test the mechanism by varying the parameter, not by matching magnitudes.
+- **[method] "Max over the mesh" is an event counter, not a level.** The headline 7e-02 K of
+  post-restart SST divergence was 7 ice-covered nodes in Baffin Bay; the area-weighted RMS was
+  1.3e-04 K and the median 5e-10 K. Gate reproducibility on an area-weighted norm.
+- **[method] Distinguish "the trajectory has a jump" from "two trajectories diverge".** For
+  training data only the first matters. Measure it directly: compare the step-to-step change
+  AT the restart against the typical step-to-step change either side. Ratio 1.0000 means the
+  restart is invisible in the trajectory, whatever two runs do relative to each other later.
+
+### 2026-08-07 — the adjoint-knob tests were measuring nothing (13 failures, 5 causes, 1 real bug)
+
+The `AdjointConfig` / `IceConfig.adjoint_mode` tests landed with 13 failures across three files.
+Every one traced to a test defect except a single genuine one. The common shape is worth more
+than the individual fixes.
+
+- **[method] A fixture that omits a subsystem's initialisation tests nothing, and it fails in a
+  way that looks like a broken feature.** Two independent instances, same day, same commit.
+  (1) `test_adjoint_config_tke.py` built its CORE2 state with a bare `phc_initial_state`, whose
+  `tke` is 0 (`state.py:81`, the C cold-start `calloc` mirror). `KappaH` is proportional to the
+  turbulent kinetic energy, so the closure emitted `Kv/Av = 0` and EVERY derivative through it
+  was exactly zero — all five TKE flags returned the baseline gradient to the last bit.
+  (2) `test_ice_adjoint_mode.py` did the same and never called `ice.seed_ice(...)`, so it tested
+  the sea-ice adjoint on an ocean with `a_ice` identically zero — measured, 0 nodes. Both files
+  had the correct idiom available: the TKE file seeds `tke=1e-3` in its own closure-level fixture
+  with a comment warning of exactly this trap, and four other test files call `seed_ice`.
+  **Assert the subsystem is on in the fixture** — `count_nonzero(a_ice) > 1000` costs nothing and
+  would have caught both on the first run.
+- **[gotcha] `freeze_mixing` drives the gradient of ANY vertical-mixing parameter to exactly
+  zero, by design.** It `stop_gradient`s Kv/Av (`step.py:331`), which is the only route those
+  parameters have to the loss. So a test that differentiates w.r.t. `k_ver` (or `tke_c_k`) and
+  asserts "the gradient is nonzero" or "the flags compose" cannot pass. Differentiate w.r.t. the
+  STATE instead: an SST perturbation reaches T through stratification->Kv AND through advection
+  and the PGF, so no single flag severs it.
+- **[gotcha] `k_ver` is live only on the PP branch.** `step.py:320` reads it in the `else:` of the
+  mixing seam; TKE and KPP never see it. d/d(k_ver) is exactly 0 on those paths. `test_ale_zstar`
+  already knew this ("PP path (KPP off) so k_ver is live"); the new tests did not.
+- **[method] Test a knob where it acts, not through eight layers of dilution.** `adjoint_mode`
+  "rheology" vs "exact" differ only by the mEVP momentum solve, whose effect on a one-step
+  surface-temperature loss is below rounding — SST gives the two modes BIT-IDENTICAL values and
+  an ocean-velocity control (which does reach `srfoce_u/v`) separates them by 23 ulp. A longer
+  window is not available either: "exact" NaNs inside the first day. At the solver's own boundary
+  the same knob is unmissable: `adjoint_subcycles=0` gives EXACTLY 0.0 against -5.22e+04.
+  Prefer a structural zero to a small difference — rounding cannot fake it.
+- **[gotcha] Exact forward equality is a CPU assertion.** Measured with the closure awake: CPU
+  bit-identical under all nine flags; GPU moved four of them by one ulp, including
+  `freeze_gm_slope`, which `step.py:259` reads only inside `if gm_cfg is not None:` — a Python
+  branch the fixture never enters, so it cannot reach the traced graph at all. An inert flag
+  cannot change a computation. Recompiling an identical config 5x in a CLEAN process is stable on
+  both platforms, so this is process-state-dependent (autotuning/allocator), not plain recompile
+  noise. Assert `==` on CPU, `rel=1e-14` on GPU.
+- **[gotcha] The one REAL bug, and a signature-parity gate caught it.** `adjoint_damping` — the
+  Newtonian-damping route that `docs/ADJOINT_HORIZON.md` records as measured and falsified — was
+  left in `mevp_dynamics`' shipping signature, diverging it from `evp_dynamics` and breaking the
+  `whichEVP` function-swap contract (`ice_step.py:97`). Deleted 2026-08-07. Cheap structural
+  gates that assert nothing numerical still earn their place.
+- **[method] The rule all of the above are instances of: a gradient assertion needs something
+  INDEPENDENT to compare against.** "finite", "nonzero", "changed" are all satisfiable by a
+  structurally dead path. 13 files in this suite assert only that, and all three failing files
+  were among them; the files carrying finite-difference checks were not. An FD check costs two
+  extra forwards and cannot be fooled — if the path is dead, AD returns 0 and FD does not.
+  Same lesson as GATE HORIZON_OK, which passed on FD *sign* alone and was wrong by 411%.
