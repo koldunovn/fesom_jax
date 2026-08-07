@@ -19,8 +19,13 @@ from pathlib import Path
 import pytest
 
 TESTS_DIR = Path(__file__).resolve().parent
-MANIFEST = TESTS_DIR.parents[1] / "scripts" / "runs" / "suite_groups.txt"
-VALID_GROUPS = {"unit", "core2", "ice", "sharding"}
+ROOT = TESTS_DIR.parents[1]
+MANIFEST = ROOT / "scripts" / "runs" / "suite_groups.txt"
+VALID_GROUPS = {"unit", "core2", "ice", "sharding", "scripts"}
+# ⚠️ BOTH directories. Until 2026-08-08 every runner globbed fesom_jax/tests/ only, so the seven
+# files under scripts/tests/ had never run in the suite — including the 12 mesh-diagnostic tests
+# and the 7 horizon-scan harness tests the plan records as passing. They passed by hand.
+TEST_DIRS = ("fesom_jax/tests", "scripts/tests")
 
 # A file in `unit` that touches any of these is really a CORE2-cost file and belongs in `core2`;
 # putting it in `unit` is how a group silently acquires minutes-long tests.
@@ -39,6 +44,8 @@ def _manifest():
         pytest.skip(f"group manifest missing: {MANIFEST}")
     entries = {}
     dupes = []
+    # entries are repo-relative PATHS, not bare filenames: two directories are in scope and a
+    # bare name could not say which.
     for line in MANIFEST.read_text().splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -51,9 +58,13 @@ def _manifest():
     return entries, dupes
 
 
+def _on_disk():
+    return {f"{d}/{p.name}" for d in TEST_DIRS for p in (ROOT / d).glob("test_*.py")}
+
+
 def test_every_test_file_is_classified():
     entries, _ = _manifest()
-    on_disk = {p.name for p in TESTS_DIR.glob("test_*.py")}
+    on_disk = _on_disk()
     missing = sorted(on_disk - set(entries))
     assert not missing, (
         f"these test files are in no suite group: {missing}\n"
@@ -64,7 +75,7 @@ def test_every_test_file_is_classified():
 
 def test_the_manifest_has_no_stale_entries():
     entries, _ = _manifest()
-    on_disk = {p.name for p in TESTS_DIR.glob("test_*.py")}
+    on_disk = _on_disk()
     stale = sorted(set(entries) - on_disk)
     assert not stale, (f"{MANIFEST.name} lists files that do not exist: {stale} — a renamed "
                        f"file would otherwise stop running with nothing to show for it")
@@ -94,19 +105,23 @@ def test_the_conventions_that_define_the_groups_hold():
     """The two mechanical rules, so the manifest cannot drift away from what its header says."""
     entries, _ = _manifest()
     wrong = []
-    for name, group in sorted(entries.items()):
-        p = TESTS_DIR / name
+    for rel, group in sorted(entries.items()):
+        p = ROOT / rel
+        name = p.name
         if not p.is_file():
             continue
+        if rel.startswith("scripts/tests/") != (group == "scripts"):
+            wrong.append(f"{rel}: everything under scripts/tests/ belongs to the 'scripts' "
+                         f"group and nothing else does, but it is in {group!r}")
         if name.startswith("test_ice_") and group != "ice":
-            wrong.append(f"{name}: named test_ice_* but in {group!r}")
+            wrong.append(f"{rel}: named test_ice_* but in {group!r}")
         if (name.endswith("_sharded.py") or name == "test_halo.py") and group != "sharding":
-            wrong.append(f"{name}: needs 4 fake devices but is in {group!r}")
+            wrong.append(f"{rel}: needs 4 fake devices but is in {group!r}")
         if group == "unit" and name not in MARKER_SCAN_EXEMPT:
             src = p.read_text()
             hit = [m for m in CORE2_MARKERS if m in src]
             if hit:
-                wrong.append(f"{name}: in 'unit' but references {hit} — that is CORE2 cost")
+                wrong.append(f"{rel}: in 'unit' but references {hit} — that is CORE2 cost")
     assert not wrong, "manifest violates its own conventions:\n  " + "\n  ".join(wrong)
 
 

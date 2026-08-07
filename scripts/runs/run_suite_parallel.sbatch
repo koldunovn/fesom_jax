@@ -26,7 +26,7 @@
 #SBATCH --job-name=jax_suite_par
 #SBATCH -p compute
 #SBATCH -A ab0995
-#SBATCH --array=0-3
+#SBATCH --array=0-4
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -50,7 +50,7 @@ MANIFEST=scripts/runs/suite_groups.txt
 # assigning to it is silently ignored — the array tasks read out gid 1221/1260/1291 as group
 # names and the run died with "group 1221 is empty" (2026-08-08). The empty-group guard below is
 # the only reason that took one minute to find instead of looking like a pytest problem.
-SUITE_GROUPS=(unit core2 ice sharding)
+SUITE_GROUPS=(unit core2 ice sharding scripts)
 GROUP=${SUITE_GROUPS[${SLURM_ARRAY_TASK_ID:-0}]}
 
 echo "=== node $(hostname)  $(date)  array task ${SLURM_ARRAY_TASK_ID} ==="
@@ -61,7 +61,12 @@ echo "=== checkout: $(pwd)  branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/nul
 # Every test file must be in the manifest. Checked HERE too, not only in the pytest gate: if a
 # new file is unclassified, this run must not quietly test less than the whole suite and then
 # print a pass.
-ON_DISK=$(cd fesom_jax/tests && ls test_*.py | sort)
+#
+# ⚠️ BOTH directories. Until 2026-08-08 every runner globbed fesom_jax/tests/ only, so the seven
+# files under scripts/tests/ had never run in the suite at all — including the 12 mesh-diagnostic
+# tests and the 7 horizon-scan harness tests the plan records as passing. They passed; they just
+# passed by hand.
+ON_DISK=$( { ls fesom_jax/tests/test_*.py; ls scripts/tests/test_*.py; } 2>/dev/null | sort)
 LISTED=$(awk '!/^#/ && NF {print $2}' "$MANIFEST" | sort)
 UNCLASSIFIED=$(comm -23 <(echo "$ON_DISK") <(echo "$LISTED"))
 if [ -n "$UNCLASSIFIED" ]; then
@@ -71,7 +76,7 @@ if [ -n "$UNCLASSIFIED" ]; then
     exit 2
 fi
 
-FILES=$(awk -v g="$GROUP" '!/^#/ && $1 == g {printf "fesom_jax/tests/%s ", $2}' "$MANIFEST")
+FILES=$(awk -v g="$GROUP" '!/^#/ && $1 == g {printf "%s ", $2}' "$MANIFEST")
 NFILES=$(wc -w <<<"$FILES")
 echo "=== GROUP: $GROUP  ($NFILES files, from $MANIFEST) ==="
 [ "$NFILES" -gt 0 ] || { echo "group $GROUP is empty"; exit 2; }
@@ -80,7 +85,11 @@ echo "=== GROUP: $GROUP  ($NFILES files, from $MANIFEST) ==="
 # that nothing ever printed which tests were expensive.
 PYTEST_ARGS="-q -p no:cacheprovider --durations=25"
 
-if [ "$GROUP" = "sharding" ]; then
+if [ "$GROUP" = "scripts" ]; then
+    # These import their target by path and need the repo root on sys.path, which running pytest
+    # from the root already provides. Kept as their own group for that reason, not for cost.
+    $PY -m pytest $PYTEST_ARGS $FILES
+elif [ "$GROUP" = "sharding" ]; then
     # 4 CPU fake devices; these tests skip cleanly when only 1 device is visible, which is why
     # they must NOT be folded into another group — they would silently pass by skipping.
     XLA_FLAGS=--xla_force_host_platform_device_count=4 \

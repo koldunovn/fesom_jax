@@ -1,4 +1,4 @@
-# Which suite group each test file belongs to.  <group> <file>
+# Which suite group each test file belongs to.  <group> <path-from-repo-root>
 #
 # Grouped by COST, not by subsystem. The old grouping was "ice", "sharding", and "everything
 # else" — and "everything else" is not a category, it is a default. It grew to 920 tests and
@@ -14,98 +14,112 @@
 #   sharding  — needs XLA_FLAGS=--xla_force_host_platform_device_count=4, and 300 GB: it OOM'd
 #               at 209 GB against a 200 GB request on 2026-08-07, which read as a sharding
 #               failure and was a scheduling one.
+#   scripts   — the tests that live next to their scripts under scripts/tests/. ⚠️ These had
+#               NEVER run in the suite: every runner globbed fesom_jax/tests/ only, so seven
+#               files — including the 12 Task-4 mesh-diagnostic tests and the 7 horizon-scan
+#               harness tests that the plan records as passing — only ever ran when somebody
+#               invoked pytest by hand (found 2026-08-08). They are cheap; they are their own
+#               group because they need the repo root on sys.path, not the package dir.
 #
-# ⚠️ EVERY test_*.py must appear here exactly once. fesom_jax/tests/test_suite_groups.py fails
-# if one does not, so a new file cannot join the largest group by accident. Put a new file in
-# `core2` if it touches data/mesh_core2, data/ic_core2* or build_surface_forcing; `unit`
-# otherwise.
+# ⚠️ EVERY test_*.py under fesom_jax/tests/ AND scripts/tests/ must appear here exactly once.
+# fesom_jax/tests/test_suite_groups.py fails if one does not, so a new file cannot join the
+# largest group by accident. Put a new file in `core2` if it touches data/mesh_core2,
+# data/ic_core2* or build_surface_forcing; `unit` otherwise; `scripts` if it lives under
+# scripts/tests/.
 
-core2 test_adjoint_config_prod.py
-core2 test_adjoint_config_tke.py
-core2 test_ale_zstar.py
-core2 test_core2_step.py
-core2 test_forcing.py
-core2 test_gm_bolus.py
-core2 test_gm_bolus_adv.py
-core2 test_gm_coeffs.py
-core2 test_gm_redi.py
-core2 test_gm_slopes.py
-core2 test_gm_step.py
-core2 test_gradient_core2.py
-core2 test_jra55.py
-core2 test_kpp_bldepth.py
-core2 test_kpp_blmix.py
-core2 test_kpp_enhance.py
-core2 test_kpp_ri_iwmix.py
-core2 test_kpp_step.py
-core2 test_mesh_core2.py
-core2 test_mevp.py
-core2 test_partition_state.py
-core2 test_paths.py
-core2 test_phc_ic.py
-core2 test_prepare_mesh.py
-core2 test_run_entry.py
-core2 test_shard_mesh.py
-core2 test_sss_runoff.py
-core2 test_step_core2.py
-core2 test_sw_alpha_beta.py
-core2 test_tke_replay.py
-core2 test_tke_step.py
-core2 test_ushow_output.py
-ice test_ice_adjoint_mode.py
-ice test_ice_adv.py
-ice test_ice_coupling.py
-ice test_ice_evp.py
-ice test_ice_ic.py
-ice test_ice_step.py
-ice test_ice_thermo.py
-sharding test_forcing_sharded.py
-sharding test_gradient_sharded.py
-sharding test_halo.py
-sharding test_reductions_sharded.py
-sharding test_scatter_sharded.py
-sharding test_ssh_sharded.py
-sharding test_step_sharded.py
-unit test_adjoint_config.py
-unit test_adjoint_stab.py
-unit test_ale.py
-unit test_calib_twin.py
-unit test_calibrate.py
-unit test_canonical_redist.py
-unit test_coarsen.py
-unit test_coarsen_remap.py
-unit test_config.py
-unit test_diagnostics.py
-unit test_eki.py
-unit test_eos.py
-unit test_gm_eki.py
-unit test_gm_nn.py
-unit test_gradient.py
-unit test_identity_gates.py
-unit test_integrate.py
-unit test_kpp_wscale.py
-unit test_longwindow.py
-unit test_mesh.py
-unit test_momentum.py
-unit test_nn_twin.py
-unit test_obs_compare.py
-unit test_obs_ice.py
-unit test_ops.py
-unit test_partit.py
-unit test_pgf.py
-unit test_pi_demo.py
-unit test_pp.py
-unit test_reference_dump.py
-unit test_release.py
-unit test_restart.py
-unit test_run_config.py
-unit test_sensitivity.py
-unit test_ssh.py
-unit test_state.py
-unit test_step_pi.py
-unit test_stream_output.py
-unit test_suite_groups.py
-unit test_surface_bc.py
-unit test_tke_nn.py
-unit test_tracers.py
-unit test_verify.py
+core2 fesom_jax/tests/test_adjoint_config_prod.py
+core2 fesom_jax/tests/test_adjoint_config_tke.py
+core2 fesom_jax/tests/test_ale_zstar.py
+core2 fesom_jax/tests/test_core2_step.py
+core2 fesom_jax/tests/test_forcing.py
+core2 fesom_jax/tests/test_gm_bolus.py
+core2 fesom_jax/tests/test_gm_bolus_adv.py
+core2 fesom_jax/tests/test_gm_coeffs.py
+core2 fesom_jax/tests/test_gm_redi.py
+core2 fesom_jax/tests/test_gm_slopes.py
+core2 fesom_jax/tests/test_gm_step.py
+core2 fesom_jax/tests/test_gradient_core2.py
+core2 fesom_jax/tests/test_jra55.py
+core2 fesom_jax/tests/test_kpp_bldepth.py
+core2 fesom_jax/tests/test_kpp_blmix.py
+core2 fesom_jax/tests/test_kpp_enhance.py
+core2 fesom_jax/tests/test_kpp_ri_iwmix.py
+core2 fesom_jax/tests/test_kpp_step.py
+core2 fesom_jax/tests/test_mesh_core2.py
+core2 fesom_jax/tests/test_mevp.py
+core2 fesom_jax/tests/test_partition_state.py
+core2 fesom_jax/tests/test_paths.py
+core2 fesom_jax/tests/test_phc_ic.py
+core2 fesom_jax/tests/test_prepare_mesh.py
+core2 fesom_jax/tests/test_run_entry.py
+core2 fesom_jax/tests/test_shard_mesh.py
+core2 fesom_jax/tests/test_sss_runoff.py
+core2 fesom_jax/tests/test_step_core2.py
+core2 fesom_jax/tests/test_sw_alpha_beta.py
+core2 fesom_jax/tests/test_tke_replay.py
+core2 fesom_jax/tests/test_tke_step.py
+core2 fesom_jax/tests/test_ushow_output.py
+ice fesom_jax/tests/test_ice_adjoint_mode.py
+ice fesom_jax/tests/test_ice_adv.py
+ice fesom_jax/tests/test_ice_coupling.py
+ice fesom_jax/tests/test_ice_evp.py
+ice fesom_jax/tests/test_ice_ic.py
+ice fesom_jax/tests/test_ice_step.py
+ice fesom_jax/tests/test_ice_thermo.py
+scripts scripts/tests/test_coarsen_stream.py
+scripts scripts/tests/test_horizon_scan.py
+scripts scripts/tests/test_lw_forward_seam.py
+scripts scripts/tests/test_lw_foundation_check.py
+scripts scripts/tests/test_mesh_diag.py
+scripts scripts/tests/test_section_transport.py
+scripts scripts/tests/test_write_namelist.py
+sharding fesom_jax/tests/test_forcing_sharded.py
+sharding fesom_jax/tests/test_gradient_sharded.py
+sharding fesom_jax/tests/test_halo.py
+sharding fesom_jax/tests/test_reductions_sharded.py
+sharding fesom_jax/tests/test_scatter_sharded.py
+sharding fesom_jax/tests/test_ssh_sharded.py
+sharding fesom_jax/tests/test_step_sharded.py
+unit fesom_jax/tests/test_adjoint_config.py
+unit fesom_jax/tests/test_adjoint_stab.py
+unit fesom_jax/tests/test_ale.py
+unit fesom_jax/tests/test_calib_twin.py
+unit fesom_jax/tests/test_calibrate.py
+unit fesom_jax/tests/test_canonical_redist.py
+unit fesom_jax/tests/test_coarsen.py
+unit fesom_jax/tests/test_coarsen_remap.py
+unit fesom_jax/tests/test_config.py
+unit fesom_jax/tests/test_diagnostics.py
+unit fesom_jax/tests/test_eki.py
+unit fesom_jax/tests/test_eos.py
+unit fesom_jax/tests/test_gm_eki.py
+unit fesom_jax/tests/test_gm_nn.py
+unit fesom_jax/tests/test_gradient.py
+unit fesom_jax/tests/test_identity_gates.py
+unit fesom_jax/tests/test_integrate.py
+unit fesom_jax/tests/test_kpp_wscale.py
+unit fesom_jax/tests/test_longwindow.py
+unit fesom_jax/tests/test_mesh.py
+unit fesom_jax/tests/test_momentum.py
+unit fesom_jax/tests/test_nn_twin.py
+unit fesom_jax/tests/test_obs_compare.py
+unit fesom_jax/tests/test_obs_ice.py
+unit fesom_jax/tests/test_ops.py
+unit fesom_jax/tests/test_partit.py
+unit fesom_jax/tests/test_pgf.py
+unit fesom_jax/tests/test_pi_demo.py
+unit fesom_jax/tests/test_pp.py
+unit fesom_jax/tests/test_reference_dump.py
+unit fesom_jax/tests/test_release.py
+unit fesom_jax/tests/test_restart.py
+unit fesom_jax/tests/test_run_config.py
+unit fesom_jax/tests/test_sensitivity.py
+unit fesom_jax/tests/test_ssh.py
+unit fesom_jax/tests/test_state.py
+unit fesom_jax/tests/test_step_pi.py
+unit fesom_jax/tests/test_stream_output.py
+unit fesom_jax/tests/test_suite_groups.py
+unit fesom_jax/tests/test_surface_bc.py
+unit fesom_jax/tests/test_tke_nn.py
+unit fesom_jax/tests/test_tracers.py
+unit fesom_jax/tests/test_verify.py
