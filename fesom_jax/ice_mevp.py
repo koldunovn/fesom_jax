@@ -42,6 +42,7 @@ from .config import DENSITY_0
 from .forcing import _safe_speed
 from .halo import exchange_pair
 from .ice import IceConfig
+from . import adjoint_stab
 from .ice_evp import _safe_sqrt, bc_index_nod2D, boundary_node_mask, strain_rates, stress_div_scatter
 from .mesh import Mesh
 
@@ -119,7 +120,8 @@ def mevp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation,
 # One pseudo-time iteration — fesom_ice_maevp.c:224-322 (element σ + scatter, node solve, edge-BC)
 # --------------------------------------------------------------------------
 def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: MevpStatic,
-                 u_anchor, v_anchor, srfoce_u, srfoce_v, stress_ax, stress_ay, rdt):
+                 u_anchor, v_anchor, srfoce_u, srfoce_v, stress_ax, stress_ay, rdt,
+                 *, freeze_viscosity: bool = False):
     """One mEVP pseudo-time iteration. Returns the new ``(u_aux, v_aux, σ11, σ12, σ22)`` AFTER
     the edge-BC, BEFORE the halo exchange (the C dump placement, :324-337).
 
@@ -135,7 +137,17 @@ def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: Me
     eps2 = eps11 - eps22                                       # :250
     radicand = eps1 * eps1 + vale * (eps2 * eps2 + 4.0 * eps12 * eps12)   # :253
     delta = _safe_sqrt(radicand)                              # AD-safe sqrt (Δ=0 at cold start)
-    pressure = st.pressure_fac / (delta + cfg.delta_min)      # T10 ADDITIVE δmin (:254)
+    # Backward-only (reachable via mevp_iterate(freeze_viscosity=True); NOT an AdjointConfig flag —
+    # measured ineffective, see docs/ADJOINT_HORIZON.md): remove the viscosity's dependence on the
+    # strain rate from the adjoint, keeping its value. `pressure = P/(Delta+dmin)` IS the bulk
+    # viscosity in this mEVP form, and d(pressure)/d(Delta) = -P/(Delta+dmin)^2 blows up as the
+    # ice goes rigid (Delta -> 0), which is where the exact adjoint of the rheology dies.
+    # Published practice: Toyoda et al. (2019), used by Lyu et al. (2023, Ocean Sci. 19, 305)
+    # to build a usable approximated adjoint of viscous-plastic rheology, which beat the
+    # free-drift adjoint by a further 7.9% cost reduction over a 1-year assimilation window.
+    # stop_gradient is the identity in the forward, so the ice trajectory is unchanged.
+    _delta_v = jax.lax.stop_gradient(delta) if freeze_viscosity else delta
+    pressure = st.pressure_fac / (_delta_v + cfg.delta_min)   # T10 ADDITIVE δmin (:254)
     det1 = cfg.mevp_det1
     s12n = det1 * s12 + pressure * eps12 * vale               # :258  (NO 0.5 — T2)
     s11n = det1 * s11 + 0.5 * pressure * (eps1 - delta + eps2 * vale)    # :259
@@ -179,7 +191,9 @@ def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: Me
 # --------------------------------------------------------------------------
 # Full mEVP driver — the 120-iteration scan — fesom_ice_maevp.c:66-363
 # --------------------------------------------------------------------------
-def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
+def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
+                  adjoint_damping: float = 0.0,
+                  a_ice, m_ice, m_snow,
                   u_ice, v_ice, sigma11, sigma12, sigma22,
                   srfoce_u, srfoce_v, elevation, stress_ax, stress_ay,
                   boundary_node=None, exch=None):
@@ -205,16 +219,66 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
     st = mevp_setup(cfg, mesh, a_ice, m_ice, m_snow, elevation, boundary_node)
     rdt = cfg.ice_dt                                          # T1: the FULL ice step
 
+    # Backward-only Newtonian damping of the subcycle carry (adjoint_damping = the damping
+    # timescale in SWEEPS; 0 or None = off). This is the one published stabilization that keeps
+    # EVP rheology in the adjoint rather than removing it: Kauker-line parameter-optimization
+    # work adds a term eps_N*sigma to the linearized stress equations, with eps_N the ratio of
+    # the subcycle step to a Newtonian damping timescale T_N, using T_N = 7 sweeps generally
+    # and 3 in thick (h>3 m) strongly converging ice. Applying it to the cotangent per sweep is
+    # the same operator; the forward is untouched (stop_gradient identity).
+    #
+    # ⚠️ For THIS configuration the usable window is very narrow. The measured amplification is
+    # 1.1795 per sweep, so a per-sweep damping factor gamma gives net 1.1795*gamma, and over
+    # 120 sweeps and a 48-step day the result swings from annihilated at T_N=6 (1e-44) to blown
+    # at T_N=7 (1e+27), with exact cancellation at T_N=6.57. A single global constant therefore
+    # cannot be right everywhere, which is presumably why the published version varies it in
+    # space. Treat this as a diagnostic unless a spatially varying version is built.
+    _gamma = None if not adjoint_damping else 1.0 - 1.0 / float(adjoint_damping)
+    _damp = (None if _gamma is None
+             else (lambda g, _f=_gamma: jax.tree.map(lambda x: x * _f, g)))
+
     def body(carry, _):
         u_i, v_i, s11, s12, s22 = carry
         u_i, v_i, s11, s12, s22 = mevp_iterate(
             cfg, mesh, u_i, v_i, s11, s12, s22, st,
             u_ice, v_ice, srfoce_u, srfoce_v, stress_ax, stress_ay, rdt)   # anchor = frozen entry
         u_i, v_i = exchange_pair(exch, u_i, v_i, "nod")      # fused halo refresh for next strain read
-        return (u_i, v_i, s11, s12, s22), None
+        out = (u_i, v_i, s11, s12, s22)
+        if _damp is not None:
+            out = adjoint_stab.cotangent_op(_damp, out)
+        return out, None
 
     init = (u_ice, v_ice, sigma11, sigma12, sigma22)          # T11: σ carried, NOT zeroed
     body = jax.checkpoint(body)                               # cap the 120-iteration backward memory
+
+    # Backward-only: differentiate through only the LAST `adjoint_subcycles` sweeps.
+    #
+    # Why this knob exists. The reverse pass through the full 120 sweeps amplifies by a
+    # measured 1.1795 PER SWEEP — 4e8 per ice step — even though each individual relaxation
+    # contracts at mevp_det1 = 0.9960. The coupled stress<->momentum loop gain exceeds one in
+    # the LINEARIZATION while the nonlinear iteration stays bounded, because the plastic yield
+    # holds the forward together and the tangent-linear model has no such cap. So this is not
+    # a term that can be frozen (freezing the viscosity's strain dependence, the Toyoda/Lyu
+    # move, was measured to change nothing) — it is the unrolling itself.
+    #
+    # It also cannot be fixed the way solve_ssh's conjugate gradient was, by handing JAX a
+    # transpose solve via custom_linear_solve. That works there because the SSH step solves a
+    # LINEAR system, so its answer is A^-1 b however it was found. mEVP is an explicit
+    # pseudo-time relaxation with no matrix to transpose; it is only 38% relaxed after its 120
+    # sweeps (0.9960^120), so the model's answer really is the 120th iterate rather than a
+    # fixed point; and with a linearized spectral radius above one the implicit derivative
+    # (I - J)^-1 is ill-posed anyway. MITgcm CAN use the transpose-solve route because its
+    # viscous-plastic solver is a linear solve (LSOR) with the viscosities held fixed.
+    #
+    # Truncating is the available middle ground, and it is a controlled one: 0 sweeps is
+    # exactly a frozen rheology (measured clean), 120 is the exact-but-useless gradient, and K
+    # in between costs 1.1795^K of amplification for the sensitivity of the last K sweeps.
+    # `adjoint_subcycles < 0` (the default) means all of them ⇒ a dead branch, unchanged.
+    n_free = int(cfg.evp_rheol_steps)
+    n_grad = n_free if adjoint_subcycles < 0 else min(int(adjoint_subcycles), n_free)
+    if n_grad < n_free:
+        init, _ = lax.scan(body, init, None, length=n_free - n_grad)
+        init = jax.tree.map(jax.lax.stop_gradient, init)       # cut the earlier sweeps loose
     (u_ice, v_ice, sigma11, sigma12, sigma22), _ = lax.scan(
-        body, init, None, length=cfg.evp_rheol_steps)
+        body, init, None, length=n_grad) if n_grad else (init, None)
     return u_ice, v_ice, sigma11, sigma12, sigma22            # T8 final copy; no extra exchange

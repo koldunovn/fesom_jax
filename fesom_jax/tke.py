@@ -70,6 +70,11 @@ class TkeConfig(NamedTuple):
     # --- test-only diagnostics (the 13 budget/aux terms; never in model State) ---
     with_diags: bool = False      # compute + return the budget diagnostics (JT.1 gate)
 
+    # NOTE: how the BACKWARD pass treats this closure is NOT set here — it is one flag of
+    # :class:`fesom_jax.adjoint_stab.AdjointConfig` (``freeze_mixing=True``), passed to ``step`` as
+    # ``adjoint_cfg``, so that every backward-only simplification lives in one object rather
+    # than being scattered across the physics configs. See docs/ADJOINT_HORIZON.md.
+
     def validate(self) -> "TkeConfig":
         """Raise on an un-ported combination (the C ``fesom_tke_alloc:247-253`` abort
         parity). Called at the step seam whenever ``tke_cfg is not None``; returns ``self``
@@ -129,7 +134,8 @@ def _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch):
 
 
 def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
-               params, *, dt: float = DT_DEFAULT, exch=None, Z3d=None):
+               params, *, dt: float = DT_DEFAULT, exch=None, Z3d=None,
+               freeze_convection: bool = False):
     """Assembled classical-TKE vertical-mixing driver — the mirror of ``fesom_tke_mixing``
     (``fesom_tke.c:270-505``) followed by the shared ``mo_convect`` (``fesom_step.c:264``).
     Returns ``(Kv, Av, uvnode, tke_new)`` — the ``(Kv, Av, uvnode)`` triple PP/KPP return
@@ -197,5 +203,5 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
 
     # --- Kv/Av wiring (fesom_tke.c:484-505, pre-mo_convect) + the shared mo_convect ---
     Kv, Av = _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch)
-    Kv, Av = pp.mo_convect(mesh, Kv, Av, bvfreq)               # fesom_step.c:264 (shared)
+    Kv, Av = pp.mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection)
     return Kv, Av, uvnode, tke_new

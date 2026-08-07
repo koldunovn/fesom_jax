@@ -36,8 +36,8 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from . import (ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh, tke,
-               tracer_adv, tracer_diff)
+from . import (adjoint_stab, ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh,
+               tke, tracer_adv, tracer_diff)
 from .config import DT_DEFAULT
 from .mesh import Mesh
 from .params import Params
@@ -53,7 +53,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          *, dt: float = DT_DEFAULT, is_first_step: bool = False,
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
          kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
-         halo_ctx=None, boundary_node=None, remat_blocks: bool = False) -> State:
+         halo_ctx=None, boundary_node=None, adjoint_cfg=None,
+         remat_blocks: bool = False) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -121,6 +122,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     st = state
     if params is None:
         params = Params.defaults()
+    # Backward-only simplifications, one flag per term. None ⇒ all off ⇒ every `if _adj.x`
+    # below is a dead branch and the traced graph is exactly the pre-existing one.
+    _adj = adjoint_cfg if adjoint_cfg is not None else adjoint_stab.AdjointConfig()
     # zstar seam (Phase 9a): None ⇒ linfs (the byte-identical dead branch). A non-None
     # AleConfig means zstar — validate the mode here (the C's fesom_ale_mode_init exit(1)
     # parity; static arg ⇒ this is a trace-time Python guard, no runtime cost).
@@ -202,10 +206,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             # sensitivity). See IceConfig.adjoint_mode; "free_drift" is the planned upgrade.
             if ice_cfg.adjoint_mode == "frozen":
                 ice_out = jax.tree.map(jax.lax.stop_gradient, ice_out)
-            elif ice_cfg.adjoint_mode != "exact":
+            elif ice_cfg.adjoint_mode not in ("exact", "rheology"):
+                # "rheology" is handled inside ice_surface_step (it unrolls zero rheology
+                # subcycles in the backward); nothing to do to the ice output here.
                 raise NotImplementedError(
-                    f"IceConfig.adjoint_mode={ice_cfg.adjoint_mode!r} not implemented "
-                    "(planned: 'free_drift' custom_vjp adjoint); use 'exact' or 'frozen'.")
+                    f"IceConfig.adjoint_mode={ice_cfg.adjoint_mode!r} not implemented; use "
+                    "'exact', 'rheology' (freeze only the momentum solve — recommended) or "
+                    "'frozen' (freeze the whole ice update).")
             stress_surf = ice_out.stress_surf
             bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
             heat_flux, water_flux = ice_out.heat_flux, ice_out.water_flux
@@ -225,6 +232,15 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     live geometry; hpressure unused under zstar). Z3d_live=None ⇒ static (byte-identical).
     density, hpressure, bvfreq = _ckpt(
         lambda: eos.compute_pressure_bv(mesh, st.T, st.S, st.hnode, Z3d=Z3d_live))()
+    # ---- backward-only simplifications (adjoint_cfg) -----------------------------------
+    # Every flag below replaces "differentiate this term as written" with "use the value it
+    # computes, but omit its dependence on the ocean state in the adjoint". stop_gradient is
+    # the identity in the forward, so an all-False config (the default, adjoint_cfg=None) is
+    # a DEAD BRANCH: the traced graph and the trajectory are unchanged. See
+    # fesom_jax.adjoint_stab.AdjointConfig and docs/ADJOINT_HORIZON.md for the measured
+    # effect of each one. Sea ice has its own equivalent switch, IceConfig.adjoint_mode.
+    if _adj.freeze_stratification:
+        bvfreq = jax.lax.stop_gradient(bvfreq)
     density = _exch(density, "nod")
     hpressure = _exch(hpressure, "nod")
     bvfreq = _exch(bvfreq, "nod")
@@ -240,7 +256,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     from params = the 2nd ML-hook). GM/Redi is stateless ⇒ recomputed from T/S/N².
     gm_diag = None
     if gm_cfg is not None:
-        gm_diag = _ckpt(lambda: gm.gm_diagnostics(mesh, st.T, st.S, bvfreq, hnode_new, st.helem,
+        _bv_gm = jax.lax.stop_gradient(bvfreq) if _adj.freeze_gm_slope else bvfreq
+        gm_diag = _ckpt(lambda: gm.gm_diagnostics(mesh, st.T, st.S, _bv_gm, hnode_new, st.helem,
                                                   params, gm_cfg, exch=_exch,
                                                   Z3d=Z3d_live, zbar3=zbar3_live))()
 
@@ -253,6 +270,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     if ale_cfg is not None:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_shchepetkin(
             mesh, density, Z3d_live, st.helem))()
+        if _adj.freeze_pgf:
+            pgf_x, pgf_y = jax.lax.stop_gradient(pgf_x), jax.lax.stop_gradient(pgf_y)
     else:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_linfs(mesh, hpressure))()
     pgf_x = _exch(pgf_x, "elem")
@@ -280,6 +299,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 "for an unforced run.")
         Kv, Av, uvnode, tke_new = _ckpt(lambda: tke.mixing_tke(
             mesh, st.uv, bvfreq, st.tke, stress_node_surf, st.hnode, tke_cfg, params,
+            freeze_convection=_adj.freeze_convection,
             dt=dt, exch=_exch, Z3d=Z3d_live))()
     elif kpp_cfg is not None:
         if heat_flux is None:
@@ -294,13 +314,25 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         Kv, Av, uvnode = _ckpt(lambda: kpp.mixing_kpp(
             mesh, st.uv, bvfreq, dbsfc, sw_alpha, sw_beta, st.S,
             heat_flux, water_flux, stress_node_surf, sw_3d, st.hnode, kpp_cfg, exch=_exch,
+            freeze_convection=_adj.freeze_convection,
             Z3d=Z3d_live, zbar3=zbar3_live))()
     else:
-        Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq,
-                                      k_ver=params.k_ver, a_ver=params.a_ver, Z3d=Z3d_live)
+        Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq, k_ver=params.k_ver,
+                                      a_ver=params.a_ver, Z3d=Z3d_live,
+                                      freeze_convection=_adj.freeze_convection)
     uvnode = _exch(uvnode, "nod")
     Kv = _exch(Kv, "nod")
     Av = _exch(Av, "elem")
+
+    # adjoint_cfg.freeze_mixing — use the coefficients the closure just computed but omit their
+    # dependence on the ocean state in the backward (the ECCO practice). Placed AFTER the
+    # mixing seam and BEFORE the GM/Redi K33 augmentation below, so the eddy-parameterization
+    # gradient path is untouched. Measured: this is the one that makes the adjoint usable.
+    if _adj.freeze_mixing:
+        Kv = jax.lax.stop_gradient(Kv)
+        Av = jax.lax.stop_gradient(Av)
+    if _adj.freeze_tke_state and tke_new is not None:
+        tke_new = jax.lax.stop_gradient(tke_new)
 
     # 5 — momentum RHS (lagged eta_n, w_e, uv; shifts the OLD AB slot). Embeds
     #     momentum_adv_scalar, which exchanges its node uvnode_rhs internally (S.7).
@@ -324,7 +356,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     None ⇒ static column-uniform zbar/Z (byte-identical). w_split: the LAGGED st.w_i adds the
     #     implicit vertical momentum advection (the C solves momentum before the new w ⇒ w_i lagged,
     #     like w_e in substep 5). use_wsplit off ⇒ w_i=None ⇒ unchanged.
-    du = _ckpt(lambda: momentum.impl_vert_visc(mesh, st.uv, uv_rhs, Av, stress_surf, dt=dt,
+    _av_visc = jax.lax.stop_gradient(Av) if _adj.freeze_vert_visc else Av
+    du = _ckpt(lambda: momentum.impl_vert_visc(mesh, st.uv, uv_rhs, _av_visc, stress_surf, dt=dt,
                                                elem_geo=elem_geo_live,
                                                w_i=(st.w_i if _use_wsplit else None)))()
     du = _exch(du, "elem")
@@ -409,11 +442,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
         mesh, uv_adv, w_e_adv, st.helem, st.hnode,
         hnode_new, st.T, st.T_old, dt=dt, exch=_exch,
-        Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv))()
+        Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
+        freeze_limited_flux=_adj.freeze_advection))()
     S_adv, S_old = _ckpt(lambda: tracer_adv.advect_one_fct(
         mesh, uv_adv, w_e_adv, st.helem, st.hnode,
         hnode_new, st.S, st.S_old, dt=dt, exch=_exch,
-        Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv))()
+        Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
+        freeze_limited_flux=_adj.freeze_advection))()
     T_adv = _exch(T_adv, "nod")
     S_adv = _exch(S_adv, "nod")
 
@@ -438,8 +473,12 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                      mesh, st.S, slope_tap, Ki, hnode_new, dt=dt, zbar3=zbar3_live, Z3d=Z3d_live))()
                  + _ckpt(lambda: gm_redi.diff_part_hor_redi(
                      mesh, st.S, slope_tap, Ki, st.hnode, hnode_new, st.helem, dt=dt))())
-        Kv_eff = Kv + _ckpt(lambda: gm_redi.k33_augmentation(
+        _k33 = _ckpt(lambda: gm_redi.k33_augmentation(
             mesh, slope_tap, Ki, zbar3=zbar3_new, Z3d=Z3d_new))()
+        # NOTE this one is unlike the others: K33 is how the eddy coefficients reach the
+        # vertical diffusion, so freezing it cuts part of the gradient path of the very
+        # parameter being trained. Off unless you are deliberately isolating that term.
+        Kv_eff = Kv + (jax.lax.stop_gradient(_k33) if _adj.freeze_k33 else _k33)
     # zstar bc_T surface term −dt·sval·water_flux (is_nonlinfs=1): sval = the POST-advection
     # (+Redi) surface T, the C's `trarr[surface]` at the diffusion (fesom_tracer_diff.c:292) —
     # NOT the start-of-step T, so it lands HERE, not in the forcing-step bc_T. bc_S has no such

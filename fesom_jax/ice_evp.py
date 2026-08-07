@@ -234,7 +234,8 @@ def velocity_update(cfg: IceConfig, mesh: Mesh, u_ice, v_ice, u_rhs, v_rhs,
 # --------------------------------------------------------------------------
 # Full EVP driver — the 120-subcycle scan
 # --------------------------------------------------------------------------
-def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
+def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
+                 a_ice, m_ice, m_snow,
                  u_ice, v_ice, sigma11, sigma12, sigma22,
                  srfoce_u, srfoce_v, elevation, stress_ax, stress_ay,
                  boundary_node=None, exch=None):
@@ -269,6 +270,14 @@ def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, a_ice, m_ice, m_snow,
 
     init = (u_ice, v_ice, sigma11, sigma12, sigma22)
     body = jax.checkpoint(body)                               # cap the 120-step backward memory
+    # Backward-only: unroll only the LAST `adjoint_subcycles` sweeps (see
+    # ice_mevp.mevp_dynamics for why, and IceConfig.adjoint_mode="rheology" for the switch).
+    # -1 (the default) = all of them => a dead branch, unchanged.
+    _nf = int(cfg.evp_rheol_steps)
+    _ng = _nf if adjoint_subcycles < 0 else min(int(adjoint_subcycles), _nf)
+    if _ng < _nf:
+        init, _ = lax.scan(body, init, None, length=_nf - _ng)
+        init = jax.tree.map(jax.lax.stop_gradient, init)
     (u_ice, v_ice, sigma11, sigma12, sigma22), _ = lax.scan(
-        body, init, None, length=cfg.evp_rheol_steps)
+        body, init, None, length=_ng) if _ng else (init, None)
     return u_ice, v_ice, sigma11, sigma12, sigma22

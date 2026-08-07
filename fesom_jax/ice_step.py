@@ -95,12 +95,18 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     # traced value, so this is a trace-time selection (no lax.cond). whichEVP=0 ⇒ standard EVP
     # (byte-identical); =1 ⇒ mEVP (ice_mevp.mevp_dynamics, same signature + outputs).
     _evp = ice_mevp.mevp_dynamics if cfg.whichEVP == 1 else ice_evp.evp_dynamics
+    # IceConfig.adjoint_mode="rheology": run all the subcycles in the forward but unroll NONE
+    # of them in the backward, so ice thermodynamics, advection, cut-off and the ocean-to-ice
+    # coupling stay differentiated while only the ice VELOCITY is dark. Measured: this alone is
+    # what tames the ice adjoint (docs/ADJOINT_HORIZON.md).
+    _evp_kw = {"adjoint_subcycles": 0} if cfg.adjoint_mode == "rheology" else {}
     u_ice, v_ice, s11, s12, s22 = _evp(
         cfg, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow,
         u_ice=state.u_ice, v_ice=state.v_ice,
         sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,
         srfoce_u=srf.u, srfoce_v=srf.v, elevation=srf.ssh,
-        stress_ax=stress_ax, stress_ay=stress_ay, boundary_node=boundary_node, exch=exch)
+        stress_ax=stress_ax, stress_ay=stress_ay, boundary_node=boundary_node, exch=exch,
+        **_evp_kw)
 
     a_adv, m_adv, ms_adv = ice_adv.fct_solve(
         cfg, mesh, state.a_ice, state.m_ice, state.m_snow, u_ice, v_ice, exch=exch)

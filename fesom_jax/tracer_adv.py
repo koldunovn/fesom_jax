@@ -545,7 +545,8 @@ def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
 
 
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
-                   *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None, w_i=None):
+                   *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None, w_i=None,
+                   freeze_limited_flux: bool = False):
     """One tracer's FCT advection + ALE reconstruction
     (``fesom_tracer_advect_one_fct``, ``fesom_tracer_adv.c:1199``). Returns
     ``(T_new, T_old_new)`` with ``T_old_new = T`` (the AB2 ``valuesold`` save).
@@ -587,6 +588,16 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
                  - adv_flux_ver(mesh, w_full, T))
     # 5 — Zalesak limit (exchanges fct_plus/fct_minus internally)
     adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, hnode_new, dt=dt, exch=exch)
+    # Backward-only (AdjointConfig.freeze_advection): drop the whole limited antidiffusive
+    # correction from the adjoint, so the backward sees plain monotone upwind advection
+    # while the forward keeps full FCT. The NWP incremental-4D-Var practice of running
+    # more diffusive numerics in the tangent-linear/adjoint model than in the nonlinear
+    # forward. Distinct from FCT_STOP_GRADIENT_AE, which freezes only the limiter FACTOR
+    # and leaves the antidiffusive flux live -- that deletes the limiter's own stabilizing
+    # negative feedback (as the tracer steepens, ae falls) while keeping the term it damps.
+    if freeze_limited_flux:
+        adf_h = jax.lax.stop_gradient(adf_h)
+        adf_v = jax.lax.stop_gradient(adf_v)
     # 6-7 — assemble del_ttf  8 — reconstruct (T_new = LO + limited antidiff)
     del_ttf = flux2dtracer_fct(mesh, T, LO, adf_h, adf_v, hnode, hnode_new, dt=dt)
     T_new = ale_reconstruct(mesh, T, del_ttf, hnode, hnode_new)
