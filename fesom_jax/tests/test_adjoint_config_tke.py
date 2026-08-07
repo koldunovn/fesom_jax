@@ -21,6 +21,7 @@ This file closes that gap in two stages, cheapest first:
 
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import jax
@@ -116,33 +117,70 @@ core2_only = pytest.mark.skipif(
     not (MESH_DIR.is_dir() and (IC_DIR / "T_ic.npy").is_file()),
     reason="CORE2 mesh / PHC IC missing")
 
-# On the TKE path these five are live; the rest need the eddy parameterization (off here) or
-# are already covered by the pi tests.
+# Live on the TKE path WITHIN A SINGLE STEP. `freeze_tke_state` is deliberately absent: it
+# stop_gradients `tke_new`, the prognostic TKE handed to the NEXT step, which a one-step fixture
+# produces and never consumes. Measured 2026-08-07 — one step: 1.11e-16 (one ulp, i.e. nothing);
+# two steps: 2.18e-04. It gets its own two-step test below; no control variable can rescue it
+# here. The remaining flags need the eddy parameterization (off here) or are covered on pi.
 TKE_PATH_FLAGS = ["freeze_mixing", "freeze_stratification", "freeze_convection",
-                  "freeze_tke_state", "freeze_vert_visc"]
+                  "freeze_vert_visc"]
+
+TKE_SEED = 1.0e-3          # the value the closure-level fixture above uses, for the same reason
+
+
+def _build_core2(n_steps=1):
+    """CORE2 TKE step(s) as a function of a uniform SURFACE-TEMPERATURE perturbation.
+
+    ⚠️ Two things here are load-bearing and both were got wrong originally (measured 2026-08-07,
+    identical on CPU and GPU).
+
+    **The TKE must be seeded.** ``phc_initial_state`` carries ``tke = 0`` (``state.py:81`` — the
+    C cold-start ``calloc`` mirror), ``KappaH`` is proportional to the turbulent kinetic energy,
+    so a cold column emits ``Kv/Av = 0`` and EVERY derivative through the closure is exactly
+    zero. With the cold state all five flags returned the baseline gradient to the last bit —
+    the tests were measuring a closure that was switched off. This is the same trap the
+    ``closure`` fixture above documents ("with tke==0 ... every derivative collapses to zero and
+    the test would pass vacuously"); the step-level fixture walked into it.
+
+    **The control cannot be a mixing parameter.** ``k_ver`` is not read at all on the TKE path
+    (``step.py:320`` — only the PP ``else:`` branch reads it), so d/d(k_ver) is exactly 0 here.
+    And ``freeze_mixing`` stop_gradients Kv/Av (``step.py:331``), so ``tke_c_k`` dies too: seeded,
+    it is −2.349392554415e−02 with no flags and exactly 0.0 under ``freeze_mixing``. A surface
+    perturbation survives, reaching T through stratification→Kv and through advection/PGF.
+    Seeded, with this control: baseline +8.081567181611e−01, freeze_mixing/freeze_stratification
+    +8.070188136225e−01, freeze_vert_visc Δ8.79e−07, freeze_convection Δ3.76e−09."""
+    mesh = load_mesh(MESH_DIR)
+    state = phc_initial_state(mesh, IC_DIR)
+    imask = np.asarray(mesh.node_iface_mask)
+    state = dataclasses.replace(
+        state, tke=jnp.asarray(np.where(imask, TKE_SEED, 0.0), jnp.float64))
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+    fs = cf.static
+    sfs = [cf.step_forcing(*d) for d in surface_forcing.dates_for_steps(YEAR, DT, n_steps)]
+    wet0 = jnp.asarray(mesh.node_layer_mask[:, 0])
+
+    def make(cfg):
+        def loss(eps):
+            st = dataclasses.replace(state, T=state.T.at[:, 0].add(jnp.where(wet0, eps, 0.0)))
+            for i, sf in enumerate(sfs):
+                st = stepmod.step(st, mesh, op, None, Params.defaults(), dt=DT,
+                                  is_first_step=(i == 0), step_forcing=sf, forcing_static=fs,
+                                  tke_cfg=TkeConfig(), adjoint_cfg=cfg)
+            return jnp.sum(jnp.where(wet0, st.T[:, 0], 0.0)) / jnp.sum(wet0)
+        return jax.jit(loss), jax.jit(jax.grad(loss))
+
+    return make, jnp.asarray(0.0, jnp.float64)   # control point: unperturbed initial state
 
 
 @pytest.fixture(scope="module")
 def core2_tke():
-    """One CORE2 TKE step as a function of the background diffusivity, per AdjointConfig."""
-    mesh = load_mesh(MESH_DIR)
-    state = phc_initial_state(mesh, IC_DIR)
-    op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
-    fs = cf.static
-    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
+    return _build_core2(n_steps=1)
 
-    def make(cfg):
-        def loss(kver):
-            p = Params(k_ver=kver, a_ver=jnp.asarray(Params.defaults().a_ver, jnp.float64))
-            fin = stepmod.step(state, mesh, op, None, p, dt=DT, is_first_step=True,
-                               step_forcing=sf0, forcing_static=fs, tke_cfg=TkeConfig(),
-                               adjoint_cfg=cfg)
-            wet0 = jnp.asarray(mesh.node_layer_mask[:, 0])
-            return jnp.sum(jnp.where(wet0, fin.T[:, 0], 0.0)) / jnp.sum(wet0)
-        return jax.jit(loss), jax.jit(jax.grad(loss))
 
-    return make, jnp.asarray(1.0e-4, jnp.float64)
+@pytest.fixture(scope="module")
+def core2_tke_2step():
+    return _build_core2(n_steps=2)
 
 
 @core2_only
@@ -157,12 +195,27 @@ def test_core2_tke_default_is_a_dead_branch(core2_tke):
 @core2_only
 @pytest.mark.parametrize("flag", AdjointConfig._fields)
 def test_core2_tke_forward_bit_identical(core2_tke, flag):
-    """The production configuration's forward must not move by one bit under any flag."""
+    """The production configuration's forward must not move under any flag.
+
+    ⚠️ EXACT on CPU, tolerance on GPU, and that is not a fudge. Each ``make()`` builds a fresh
+    ``jax.jit`` closure, so this compares SEPARATELY COMPILED instances of the same program, and
+    on GPU those can differ by an ulp from reduction-order alone. Measured 2026-08-07: setting
+    ``freeze_gm_slope`` — read only inside ``if gm_cfg is not None:`` (``step.py:259``), a Python
+    branch this fixture never enters, so the flag cannot reach the traced graph at all — still
+    moved the GPU forward by exactly one ulp, while a different, arbitrary subset of flags
+    "moved" on each run. An inert flag cannot change a computation: the differences come from
+    compilation, not from the flags. Byte-identity is a CPU property
+    (``docs/PORTING_LESSONS.md``, 2026-06); asserting it on GPU tests the compiler, not the port.
+    """
     make, k0 = core2_tke
     l_off, _ = make(AdjointConfig())
     l_on, _ = make(AdjointConfig(**{flag: True}))
     a, b = float(l_off(k0)), float(l_on(k0))
-    assert a == b, f"{flag}=True moved the CORE2 TKE forward: {a!r} vs {b!r}"
+    if jax.default_backend() == "cpu":
+        assert a == b, f"{flag}=True moved the CORE2 TKE forward: {a!r} vs {b!r}"
+    else:
+        assert a == pytest.approx(b, rel=1e-14, abs=0.0), \
+            f"{flag}=True moved the CORE2 TKE forward beyond recompile noise: {a!r} vs {b!r}"
 
 
 @core2_only
@@ -176,6 +229,33 @@ def test_core2_tke_flag_changes_the_gradient(core2_tke, flag):
     a, b = float(g_off(k0)), float(g_on(k0))
     assert np.isfinite(a) and np.isfinite(b)
     assert a != b, f"{flag}=True did not change the CORE2 TKE gradient ({a:.6e})"
+
+
+@core2_only
+def test_core2_tke_state_flag_needs_two_steps(core2_tke, core2_tke_2step):
+    """``freeze_tke_state`` cuts the gradient of ``tke_new`` — the prognostic TKE handed to the
+    NEXT step. Over one step that output is produced and never consumed, so the flag provably
+    cannot do anything; over two it must. Both halves are asserted, because the one-step half is
+    what stops someone "fixing" the two-step fixture back into a one-step one.
+
+    Measured 2026-08-07: 1 step 1.11e-16 (one ulp of the +8.08e-01 baseline, i.e. nothing);
+    2 steps +7.400086138349e-01 -> +7.397908554600e-01, a difference of 2.18e-04."""
+    make1, k1 = core2_tke
+    _, g1_off = make1(AdjointConfig())
+    _, g1_on = make1(AdjointConfig(freeze_tke_state=True))
+    a1, b1 = float(g1_off(k1)), float(g1_on(k1))
+    assert abs(a1 - b1) <= 4.0 * np.spacing(abs(a1)), \
+        f"freeze_tke_state moved the ONE-step gradient by {abs(a1 - b1):.3e} — more than " \
+        f"rounding. The carry it freezes should be unread after a single step; re-derive."
+
+    make2, k2 = core2_tke_2step
+    _, g2_off = make2(AdjointConfig())
+    _, g2_on = make2(AdjointConfig(freeze_tke_state=True))
+    a2, b2 = float(g2_off(k2)), float(g2_on(k2))
+    assert np.isfinite(a2) and np.isfinite(b2)
+    assert abs(a2 - b2) > 1e-6 * abs(a2), \
+        f"freeze_tke_state did not change the TWO-step gradient ({a2:.6e} vs {b2:.6e}) — the " \
+        f"inter-step TKE carry is not reaching the loss, so the flag is untested"
 
 
 @core2_only

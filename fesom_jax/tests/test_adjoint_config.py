@@ -25,6 +25,8 @@ only exist on the TKE path are exercised for wiring, not for effect, and are mar
 
 from __future__ import annotations
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -32,7 +34,7 @@ import pytest
 
 from fesom_jax import ssh
 from fesom_jax.adjoint_stab import AdjointConfig
-from fesom_jax.config import A_VER, K_VER
+from fesom_jax.config import A_VER
 from fesom_jax import forcing, ic
 from fesom_jax.integrate import integrate
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
@@ -53,27 +55,53 @@ def setup():
     return mesh, op, stress, st0
 
 
-def _loss_fn(setup, cfg):
-    """mean SST after N steps, as a function of the background vertical diffusivity."""
-    mesh, op, stress, st0 = setup
+K_VER_LIFTED = jnp.asarray(1.0e-4, jnp.float64)   # signal-lifted, as in test_gradient.py
 
-    def loss(kver):
-        p = Params(k_ver=kver, a_ver=jnp.asarray(A_VER, jnp.float64))
-        fin = integrate(st0, mesh, op, stress, n_steps=N, params=p, dt=DT, adjoint_cfg=cfg)
+
+def _loss_fn(setup, cfg):
+    """mean SST after N steps, as a function of a uniform SURFACE-TEMPERATURE perturbation.
+
+    ⚠️ The control is the initial STATE, not ``k_ver``, and that is load-bearing. ``k_ver``
+    reaches the loss only through Kv/Av (``step.py:320``, the PP branch), and ``freeze_mixing``
+    puts ``stop_gradient`` on exactly those (``step.py:331``) — so d(loss)/d(k_ver) is EXACTLY
+    zero under that flag, at any number of steps, and any test comparing gradients under it is
+    comparing zero with zero. Measured 2026-08-07 on this fixture: baseline −1.084736e−03,
+    freeze_mixing +0.0. That is what broke ``test_flags_compose`` (it got ab == a == 0) and
+    ``test_frozen_mixing_gradient_stays_sane`` (it asserts nonzero). Swapping in a *different*
+    mixing parameter does not help — they all die the same way.
+
+    A surface-temperature perturbation reaches T through stratification→Kv AND through
+    advection and the pressure gradient, so no single flag can sever the whole path. Measured
+    with this control: baseline +8.207637e−01, freeze_mixing +8.138278e−01 (same sign, nonzero),
+    and mixing / advection / both give three distinct values."""
+    mesh, op, stress, st0 = setup
+    p = Params(k_ver=K_VER_LIFTED, a_ver=jnp.asarray(A_VER, jnp.float64))
+
+    def loss(eps):
+        st = dataclasses.replace(st0, T=st0.T.at[:, 0].add(eps))
+        fin = integrate(st, mesh, op, stress, n_steps=N, params=p, dt=DT, adjoint_cfg=cfg)
         return jnp.mean(fin.T[:, 0])
 
     return jax.jit(loss), jax.jit(jax.grad(loss))
 
 
-K0 = jnp.asarray(1.0e-4, jnp.float64)     # signal-lifted, as in test_gradient.py
+K0 = jnp.asarray(0.0, jnp.float64)        # control point: the unperturbed initial state
 
 # Every flag, and whether the pi/PP configuration actually exercises it. The TKE-only and
 # GM-only flags are wired through the same seam but their code path is inactive here, so
 # they are checked for "does not break anything" rather than "changes the gradient".
 ALL_FLAGS = [f for f in AdjointConfig._fields]
 ACTIVE_ON_PI = ["freeze_mixing", "freeze_convection", "freeze_vert_visc",
-                "freeze_advection", "freeze_pgf"]
-INACTIVE_ON_PI = ["freeze_stratification", "freeze_tke_state", "freeze_gm_slope", "freeze_k33"]
+                "freeze_advection"]
+# ⚠️ freeze_pgf is INACTIVE here, not active. Its stop_gradient sits inside
+# `if ale_cfg is not None:` (step.py:270-274) — the zstar branch — and this fixture calls
+# `integrate` with no ale_cfg, so it runs the linfs pressure-gradient path where the flag is
+# never read. Listing it as active made test_active_flag_changes_the_gradient[freeze_pgf] fail
+# against a knob that cannot fire; measured 2026-08-07, it returns bit-identical to baseline.
+# Production DOES run zstar, so freeze_pgf needs an effect-test under ale_cfg — see
+# test_adjoint_config_tke.py, which is the CORE2 tier.
+INACTIVE_ON_PI = ["freeze_stratification", "freeze_tke_state", "freeze_gm_slope", "freeze_k33",
+                  "freeze_pgf"]
 
 
 def test_every_flag_is_covered():
@@ -83,11 +111,21 @@ def test_every_flag_is_covered():
 
 
 def test_default_config_is_a_dead_branch(setup):
-    """adjoint_cfg=None and AdjointConfig() must agree bit-for-bit, forward and gradient."""
+    """adjoint_cfg=None and AdjointConfig() must agree, forward and gradient.
+
+    ⚠️ Exact on CPU, tolerance on GPU — same reason as
+    ``test_adjoint_config_tke.test_core2_tke_forward_bit_identical``: the two configs are
+    separate ``jax.jit`` closures, so this compares separately-compiled programs, and on GPU
+    those can land an ulp apart. Observed failing on GPU 2026-08-07 for exactly that."""
     loss_none, grad_none = _loss_fn(setup, None)
     loss_off, grad_off = _loss_fn(setup, AdjointConfig())
-    assert float(loss_none(K0)) == float(loss_off(K0))
-    assert float(grad_none(K0)) == float(grad_off(K0))
+    ln, lo = float(loss_none(K0)), float(loss_off(K0))
+    gn, go = float(grad_none(K0)), float(grad_off(K0))
+    if jax.default_backend() == "cpu":
+        assert ln == lo and gn == go, f"forward {ln!r} vs {lo!r}; gradient {gn!r} vs {go!r}"
+    else:
+        assert ln == pytest.approx(lo, rel=1e-14, abs=0.0)
+        assert gn == pytest.approx(go, rel=1e-12, abs=0.0)
 
 
 @pytest.mark.parametrize("flag", ALL_FLAGS)
