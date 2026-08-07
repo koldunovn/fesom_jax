@@ -42,7 +42,6 @@ from .config import DENSITY_0
 from .forcing import _safe_speed
 from .halo import exchange_pair
 from .ice import IceConfig
-from . import adjoint_stab
 from .ice_evp import _safe_sqrt, bc_index_nod2D, boundary_node_mask, strain_rates, stress_div_scatter
 from .mesh import Mesh
 
@@ -192,7 +191,6 @@ def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: Me
 # Full mEVP driver — the 120-iteration scan — fesom_ice_maevp.c:66-363
 # --------------------------------------------------------------------------
 def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
-                  adjoint_damping: float = 0.0,
                   a_ice, m_ice, m_snow,
                   u_ice, v_ice, sigma11, sigma12, sigma22,
                   srfoce_u, srfoce_v, elevation, stress_ax, stress_ay,
@@ -219,23 +217,16 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
     st = mevp_setup(cfg, mesh, a_ice, m_ice, m_snow, elevation, boundary_node)
     rdt = cfg.ice_dt                                          # T1: the FULL ice step
 
-    # Backward-only Newtonian damping of the subcycle carry (adjoint_damping = the damping
-    # timescale in SWEEPS; 0 or None = off). This is the one published stabilization that keeps
-    # EVP rheology in the adjoint rather than removing it: Kauker-line parameter-optimization
-    # work adds a term eps_N*sigma to the linearized stress equations, with eps_N the ratio of
-    # the subcycle step to a Newtonian damping timescale T_N, using T_N = 7 sweeps generally
-    # and 3 in thick (h>3 m) strongly converging ice. Applying it to the cotangent per sweep is
-    # the same operator; the forward is untouched (stop_gradient identity).
-    #
-    # ⚠️ For THIS configuration the usable window is very narrow. The measured amplification is
-    # 1.1795 per sweep, so a per-sweep damping factor gamma gives net 1.1795*gamma, and over
-    # 120 sweeps and a 48-step day the result swings from annihilated at T_N=6 (1e-44) to blown
-    # at T_N=7 (1e+27), with exact cancellation at T_N=6.57. A single global constant therefore
-    # cannot be right everywhere, which is presumably why the published version varies it in
-    # space. Treat this as a diagnostic unless a spatially varying version is built.
-    _gamma = None if not adjoint_damping else 1.0 - 1.0 / float(adjoint_damping)
-    _damp = (None if _gamma is None
-             else (lambda g, _f=_gamma: jax.tree.map(lambda x: x * _f, g)))
+    # ⚠️ Backward-only Newtonian damping of the subcycle carry USED TO LIVE HERE
+    # (`adjoint_damping`, a damping timescale in sweeps). It was the one published stabilization
+    # that keeps EVP rheology in the adjoint rather than removing it — the Kauker-line eps_N*sigma
+    # term, T_N = 7 sweeps generally and 3 in thick converging ice. It was implemented, measured
+    # and REJECTED (docs/ADJOINT_HORIZON.md): amplification is 1.1795/sweep, so over 120 sweeps
+    # and a 48-step day the result swings from annihilated at T_N=6 (1e-44) to blown at T_N=7
+    # (1e+27), cancelling exactly at 6.57 — a single global constant cannot be right anywhere.
+    # Removed 2026-08-07: it also diverged mevp_dynamics' signature from evp_dynamics', breaking
+    # the whichEVP dispatch-parity gate (test_mevp.py). Use adjoint_subcycles=0 instead
+    # (IceConfig.adjoint_mode="rheology"), which is what the measurements actually support.
 
     def body(carry, _):
         u_i, v_i, s11, s12, s22 = carry
@@ -243,10 +234,7 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
             cfg, mesh, u_i, v_i, s11, s12, s22, st,
             u_ice, v_ice, srfoce_u, srfoce_v, stress_ax, stress_ay, rdt)   # anchor = frozen entry
         u_i, v_i = exchange_pair(exch, u_i, v_i, "nod")      # fused halo refresh for next strain read
-        out = (u_i, v_i, s11, s12, s22)
-        if _damp is not None:
-            out = adjoint_stab.cotangent_op(_damp, out)
-        return out, None
+        return (u_i, v_i, s11, s12, s22), None
 
     init = (u_ice, v_ice, sigma11, sigma12, sigma22)          # T11: σ carried, NOT zeroed
     body = jax.checkpoint(body)                               # cap the 120-iteration backward memory

@@ -333,11 +333,10 @@ def main():
                          "and it recovers the pathway that matters here: eddy transport changes "
                          "SST, which changes ice growth, which changes the surface heat and salt "
                          "fluxes back into the ocean. Only the ice velocity stays dark.")
-    ap.add_argument("--ice-damping", type=float, default=0.0,
-                    help="with --ice exact: Newtonian damping timescale for the mEVP adjoint, in "
-                         "SWEEPS (0 = off). The published stabilization that keeps EVP rheology "
-                         "rather than removing it. For this configuration the usable window is "
-                         "narrow: annihilated at 6, blown at 7, exact cancellation at 6.57.")
+    # --ice-damping (Newtonian damping of the mEVP adjoint) was removed 2026-08-07 along with
+    # ice_mevp.mevp_dynamics(adjoint_damping=...). Measured and rejected: the usable window is
+    # annihilated at T_N=6, blown at T_N=7, cancelling exactly at 6.57, so no single global
+    # constant works. Numbers kept in docs/ADJOINT_HORIZON.md; use --ice rheology instead.
     ap.add_argument("--freeze", default="", help="comma-separated freeze targets (see below)")
     ap.add_argument("--gamma", type=float, default=1.0, help="per-step cotangent discount")
     ap.add_argument("--filter-factor", type=float, default=0.0,
@@ -371,14 +370,6 @@ def main():
     mix_kw = ({"tke_cfg": TKE_CFG} if args.mixing == "tke" else {"kpp_cfg": KppConfig()})
     ice_cfg = (ICE_FROZEN if args.ice == "frozen"
                else IceConfig(whichEVP=ICE_FROZEN.whichEVP, adjoint_mode="exact"))
-    if args.ice_damping:
-        _mevp_d = ice_mevp.mevp_dynamics
-
-        def _mevp_damped(*a, **k):
-            k["adjoint_damping"] = args.ice_damping
-            return _mevp_d(*a, **k)
-
-        ice_mevp.mevp_dynamics = _mevp_damped
     if args.ice == "rheology":
         # Differentiate the ice, but unroll ZERO mEVP relaxation sweeps in the backward. The
         # forward still runs all 120, so the trajectory is untouched. Installed for the whole
@@ -494,7 +485,7 @@ def main():
            "n_days": ndays, "n_steps": n, "dt": DT, "chunk_steps": K, "n_chunks": n_chunks,
            "marks": "end", "m_true": args.truth_mult, "kgm0": kgm0,
            "config": f"zstar+{args.mixing.upper()}+mEVP+GM", "adjoint": f"{args.ice}-ice",
-           "ice_damping": args.ice_damping, "freeze": knobs, "gamma": args.gamma, "filter_factor": args.filter_factor,
+           "freeze": knobs, "gamma": args.gamma, "filter_factor": args.filter_factor,
            "clip": args.clip, "stab": stab_cfg.describe(), "tag": args.tag}
     try:
         with patched(knobs):
