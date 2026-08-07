@@ -5660,3 +5660,53 @@ three, every blocking finding in packaging/docs. Lessons from fixing the first t
 - **[method] Parity gates earn their cost by failing.** All four issues above were
   invisible in unit tests (which passed 11/11 on synthetic meshes) and only surfaced when
   the same real file went through both implementations.
+
+## Task: FESOM restart reproducibility (2026-08-07)
+
+Hunting why a stopped-and-restarted FESOM run does not reproduce a continuous one. Five
+causes; full write-up in `~/nn_eddy/fesom2/RESTART_REPRODUCIBILITY.md`.
+
+- **[method] "The binary restart path already saves it, the netCDF path does not" is a
+  goldmine heuristic.** Three of the five causes (EVP stresses `sigma11/12/22`, the ice
+  Newton seed `t_skin`, and `hnode_new`) were fields that FESOM's derived-type binary dump
+  writes and `ini_ocean_io`/`ini_ice_io` simply omit. Enumerating `write_bin_array` calls
+  and diffing against the `def_*_var` list is a five-minute shortlist for this bug class.
+- **[gotcha] An array that looks like scratch can be prognostic because of CALL ORDER.**
+  `hnode_new` is filled by `vert_vel_ale` and consumed by `update_thickness_ale` at the end
+  of the step — obviously temporary. But `init_Redi_GM` runs *before* `vert_vel_ale` and
+  weights the baroclinic wave speed with it, so GM reads the previous step's value. Grep for
+  readers and compare their position in the step, not just for writers.
+- **[gotcha] Anything built once under `logical, save :: lfirst` from evolving state is a
+  restart bug.** FESOM's SSH preconditioner was built on the first solve of the run from a
+  matrix that accumulates an increment every step, so a cold start and a restart used
+  different preconditioners. The velocity RHS in the same codebase gets this right
+  (`if (lfirst .and. .not. r_restart)`) — so the pattern to sweep for is a saved first-call
+  flag *without* an `r_restart` guard.
+- **[gotcha] An iterative solver stopped on a tolerance makes its INITIAL GUESS part of the
+  state.** `d_eta` is both CG's initial guess and its answer; because the CG stops at a
+  relative residual (1e-5) rather than machine precision, not restoring it leaves an
+  O(1e-5) difference. Same for any fixed-iteration-count Newton solve with no convergence
+  test (`t_skin`, `imax=5`).
+- **[method] Two independent causes in one subsystem read as "no effect" when tested
+  singly.** Saving `d_eta` alone had been tried and dismissed; it only works once the
+  preconditioner is history-independent. When a plausible fix does nothing, consider that
+  something downstream is masking it before crossing it off.
+- **[method] Switching physics options OFF bisects faster than instrumenting them.** Once
+  the elevation chain was clean, `Fer_GM=.false. Redi=.false.` collapsed the tracer residual
+  to round-off in one 4-minute job — cheaper and more decisive than the 14 GB of 3D output
+  the alternative would have cost. Then walk the surviving subsystem's intermediates in
+  computation order and find the first link whose inputs are bit-identical but output is not
+  (`MLD1` ok, `N2` ok, `fer_C` off by 1.2e-3 -> found it).
+- **[gotcha] A saturating quantity hides the error that produced it.** `fer_K` was
+  bit-identical because it clamps at `K_GM_max`, even though the `cm` it was computed from
+  was wrong. The error reached the tracers only via the unclamped `fer_c`. Do not read
+  "downstream field is identical" as "upstream is fine".
+- **[gotcha] `cmake --build build` writes `build/lib/libfesom.so`; the repo root has a
+  STALE `lib64/libfesom.so`.** A copy that falls back to the latter silently tests the wrong
+  library — one "verification" here actually re-ran the previous night's build and read as
+  the fix making things worse. Print the library md5 in every job script.
+- **[method] Reproducibility must be judged AT the restart step, not later.** After all five
+  fixes the restart is exact (SST 5e-14 K) but round-off amplifies ~5x per step and reaches
+  7e-2 K within the following day — indistinguishable from the pre-fix day-later number.
+  A "does the restart reproduce?" test that compares a day out would have called every one
+  of these fixes a failure.
