@@ -17,9 +17,23 @@ PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
 cd "${SLURM_SUBMIT_DIR:-/home/a/a270088/nn_eddy/port_jax}"
 export JAX_PLATFORMS=cpu
 echo "=== $(hostname) $(date) — adjoint-knob tests (CPU group) ==="
+echo "=== checkout: $(pwd)  commit: $(git rev-parse --short HEAD 2>/dev/null)  branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) ==="
+# See adjoint_tests_gpu.sbatch: the editable install points at the MAIN checkout, so assert
+# which fesom_jax we actually got before spending an hour testing the wrong one.
+"$PY" - <<'EOF' || exit 1
+import sys, pathlib
+sys.path.insert(0, str(pathlib.Path.cwd()))
+import fesom_jax
+here, got = pathlib.Path.cwd().resolve(), pathlib.Path(fesom_jax.__file__).resolve()
+print(f"[import] fesom_jax <- {got}")
+if here not in got.parents:
+    sys.exit(f"FATAL: fesom_jax imported from {got}, not from the checkout under test {here}")
+EOF
 "$PY" -m pytest -v -p no:randomly \
   fesom_jax/tests/test_adjoint_stab.py \
   fesom_jax/tests/test_adjoint_config.py \
   fesom_jax/tests/test_adjoint_config_tke.py \
   fesom_jax/tests/test_gradient.py
-echo "=== done $(date) rc=$? ==="
+rc=$?
+echo "=== done $(date) rc=$rc ==="
+exit $rc
