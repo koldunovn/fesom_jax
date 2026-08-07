@@ -5733,3 +5733,56 @@ causes; full write-up in `~/nn_eddy/fesom2/RESTART_REPRODUCIBILITY.md`.
   training data only the first matters. Measure it directly: compare the step-to-step change
   AT the restart against the typical step-to-step change either side. Ratio 1.0000 means the
   restart is invisible in the trajectory, whatever two runs do relative to each other later.
+
+### 2026-08-07 — the adjoint-knob tests were measuring nothing (13 failures, 5 causes, 1 real bug)
+
+The `AdjointConfig` / `IceConfig.adjoint_mode` tests landed with 13 failures across three files.
+Every one traced to a test defect except a single genuine one. The common shape is worth more
+than the individual fixes.
+
+- **[method] A fixture that omits a subsystem's initialisation tests nothing, and it fails in a
+  way that looks like a broken feature.** Two independent instances, same day, same commit.
+  (1) `test_adjoint_config_tke.py` built its CORE2 state with a bare `phc_initial_state`, whose
+  `tke` is 0 (`state.py:81`, the C cold-start `calloc` mirror). `KappaH` is proportional to the
+  turbulent kinetic energy, so the closure emitted `Kv/Av = 0` and EVERY derivative through it
+  was exactly zero — all five TKE flags returned the baseline gradient to the last bit.
+  (2) `test_ice_adjoint_mode.py` did the same and never called `ice.seed_ice(...)`, so it tested
+  the sea-ice adjoint on an ocean with `a_ice` identically zero — measured, 0 nodes. Both files
+  had the correct idiom available: the TKE file seeds `tke=1e-3` in its own closure-level fixture
+  with a comment warning of exactly this trap, and four other test files call `seed_ice`.
+  **Assert the subsystem is on in the fixture** — `count_nonzero(a_ice) > 1000` costs nothing and
+  would have caught both on the first run.
+- **[gotcha] `freeze_mixing` drives the gradient of ANY vertical-mixing parameter to exactly
+  zero, by design.** It `stop_gradient`s Kv/Av (`step.py:331`), which is the only route those
+  parameters have to the loss. So a test that differentiates w.r.t. `k_ver` (or `tke_c_k`) and
+  asserts "the gradient is nonzero" or "the flags compose" cannot pass. Differentiate w.r.t. the
+  STATE instead: an SST perturbation reaches T through stratification->Kv AND through advection
+  and the PGF, so no single flag severs it.
+- **[gotcha] `k_ver` is live only on the PP branch.** `step.py:320` reads it in the `else:` of the
+  mixing seam; TKE and KPP never see it. d/d(k_ver) is exactly 0 on those paths. `test_ale_zstar`
+  already knew this ("PP path (KPP off) so k_ver is live"); the new tests did not.
+- **[method] Test a knob where it acts, not through eight layers of dilution.** `adjoint_mode`
+  "rheology" vs "exact" differ only by the mEVP momentum solve, whose effect on a one-step
+  surface-temperature loss is below rounding — SST gives the two modes BIT-IDENTICAL values and
+  an ocean-velocity control (which does reach `srfoce_u/v`) separates them by 23 ulp. A longer
+  window is not available either: "exact" NaNs inside the first day. At the solver's own boundary
+  the same knob is unmissable: `adjoint_subcycles=0` gives EXACTLY 0.0 against -5.22e+04.
+  Prefer a structural zero to a small difference — rounding cannot fake it.
+- **[gotcha] Exact forward equality is a CPU assertion.** Measured with the closure awake: CPU
+  bit-identical under all nine flags; GPU moved four of them by one ulp, including
+  `freeze_gm_slope`, which `step.py:259` reads only inside `if gm_cfg is not None:` — a Python
+  branch the fixture never enters, so it cannot reach the traced graph at all. An inert flag
+  cannot change a computation. Recompiling an identical config 5x in a CLEAN process is stable on
+  both platforms, so this is process-state-dependent (autotuning/allocator), not plain recompile
+  noise. Assert `==` on CPU, `rel=1e-14` on GPU.
+- **[gotcha] The one REAL bug, and a signature-parity gate caught it.** `adjoint_damping` — the
+  Newtonian-damping route that `docs/ADJOINT_HORIZON.md` records as measured and falsified — was
+  left in `mevp_dynamics`' shipping signature, diverging it from `evp_dynamics` and breaking the
+  `whichEVP` function-swap contract (`ice_step.py:97`). Deleted 2026-08-07. Cheap structural
+  gates that assert nothing numerical still earn their place.
+- **[method] The rule all of the above are instances of: a gradient assertion needs something
+  INDEPENDENT to compare against.** "finite", "nonzero", "changed" are all satisfiable by a
+  structurally dead path. 13 files in this suite assert only that, and all three failing files
+  were among them; the files carrying finite-difference checks were not. An FD check costs two
+  extra forwards and cannot be fooled — if the path is dead, AD returns 0 and FD does not.
+  Same lesson as GATE HORIZON_OK, which passed on FD *sign* alone and was wrong by 411%.

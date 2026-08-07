@@ -144,7 +144,13 @@ why the chunked reverse pass reports the cotangent norm at every chunk boundary.
 **Verify that a diagnostic knob actually fired.** A knob wired to a call site that is not on
 the active code path silently reports "this term is not the amplifier" for a term never
 tested. `scripts/nn_eddy/adjoint_horizon.py` counts wrapper invocations and aborts if a
-requested knob never fired; `test_adjoint_config.py` asserts every flag moves the gradient.
+requested knob never fired; `test_adjoint_config.py` asserts every flag that is LIVE ON THE PI
+PATH moves the gradient. ⚠️ That is not every flag. `freeze_pgf` is read only under zstar
+(`step.py:273`, inside `if ale_cfg is not None`) and `freeze_gm_slope`/`freeze_k33` only when a
+`gm_cfg` is passed — and neither the pi fixture nor the CORE2 fixture supplies either, while
+production runs `zstar+TKE+mEVP+GM`. So those three have no effect-test anywhere; they are
+covered for "does not break anything", not for "does something". Closing that gap needs a CORE2
+fixture built with `ale_cfg`+`gm_cfg` (open, 2026-08-07).
 
 **Import path: `python scripts/foo.py` does not put the cwd on `sys.path`.** It puts the
 *script's* directory there. From this worktree, `import fesom_jax` therefore resolved through
