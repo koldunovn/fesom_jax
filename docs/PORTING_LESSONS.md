@@ -5701,10 +5701,15 @@ causes; full write-up in `~/nn_eddy/fesom2/RESTART_REPRODUCIBILITY.md`.
   bit-identical because it clamps at `K_GM_max`, even though the `cm` it was computed from
   was wrong. The error reached the tracers only via the unclamped `fer_c`. Do not read
   "downstream field is identical" as "upstream is fine".
-- **[gotcha] `cmake --build build` writes `build/lib/libfesom.so`; the repo root has a
-  STALE `lib64/libfesom.so`.** A copy that falls back to the latter silently tests the wrong
-  library — one "verification" here actually re-ran the previous night's build and read as
-  the fix making things worse. Print the library md5 in every job script.
+- **[gotcha] `cmake --build build` writes `build/lib/libfesom.so` and does NOT refresh the
+  repo's `bin/` and `lib64/`.** Only `cmake --install build` (or a full `./configure.sh`) does.
+  This bites twice. A staging copy that falls back to the stale root `lib64/` silently tests the
+  wrong library — one "verification" here actually re-ran the previous night's build and read
+  as the fix making things worse. Worse, `bin/fesom.x` carries `RPATH=$ORIGIN/../lib64`, so ANY
+  script pointing at `bin/fesom.x` loads that stale library: the NG5 teacher chain was pointed
+  there and would have run the whole campaign without the restart fixes, despite them being
+  committed AND built. Print the library md5 and `ldd`'s resolved path in every job script, and
+  run `cmake --install` before pointing a campaign at `bin/fesom.x`.
 - **[method] Reproducibility must be judged AT the restart step, not later.** After all five
   fixes the restart is exact (SST 5e-14 K) but round-off amplifies ~5x per step and reaches
   7e-2 K within the following day — indistinguishable from the pre-fix day-later number.
