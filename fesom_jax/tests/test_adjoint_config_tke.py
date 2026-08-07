@@ -36,6 +36,8 @@ from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
 from fesom_jax.params import Params
 from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.state import State
+from fesom_jax.tests._identity_gates import (assert_dead_branch_gradient,
+                                             assert_forward_identity)
 from fesom_jax.tke import TkeConfig, mixing_tke
 
 RNG = np.random.default_rng(0)
@@ -185,11 +187,18 @@ def core2_tke_2step():
 
 @core2_only
 def test_core2_tke_default_is_a_dead_branch(core2_tke):
+    """Exact on CPU; on GPU calibrated against a real flag's effect, for the same
+    separately-compiled-closures reason as ``test_core2_tke_forward_bit_identical``. The
+    reference effect is ``freeze_mixing``, measured on this fixture at +8.081567181611e-01
+    against a baseline of +8.070188136225e-01."""
     make, k0 = core2_tke
     l_none, g_none = make(None)
     l_off, g_off = make(AdjointConfig())
-    assert float(l_none(k0)) == float(l_off(k0))
-    assert float(g_none(k0)) == float(g_off(k0))
+    what = "adjoint_cfg=None vs AdjointConfig() on the CORE2 TKE step"
+    assert_forward_identity(l_off, l_none, k0, what)
+    assert_dead_branch_gradient(
+        float(g_none(k0)), float(g_off(k0)), what,
+        signal_fn=lambda: float(make(AdjointConfig(freeze_mixing=True))[1](k0)))
 
 
 @core2_only
@@ -206,16 +215,16 @@ def test_core2_tke_forward_bit_identical(core2_tke, flag):
     "moved" on each run. An inert flag cannot change a computation: the differences come from
     compilation, not from the flags. Byte-identity is a CPU property
     (``docs/PORTING_LESSONS.md``, 2026-06); asserting it on GPU tests the compiler, not the port.
+
+    The GPU bound is no longer a relative-ulp constant. ``_identity_gates`` calibrates it
+    against the loss's response to a 1e-10 K perturbation of the control, so the assertion says
+    "smaller than a tenth of a negligible physical change" rather than "within N ulp", and it
+    also fails if the control turns out not to reach the loss at all.
     """
     make, k0 = core2_tke
     l_off, _ = make(AdjointConfig())
     l_on, _ = make(AdjointConfig(**{flag: True}))
-    a, b = float(l_off(k0)), float(l_on(k0))
-    if jax.default_backend() == "cpu":
-        assert a == b, f"{flag}=True moved the CORE2 TKE forward: {a!r} vs {b!r}"
-    else:
-        assert a == pytest.approx(b, rel=1e-14, abs=0.0), \
-            f"{flag}=True moved the CORE2 TKE forward beyond recompile noise: {a!r} vs {b!r}"
+    assert_forward_identity(l_off, l_on, k0, f"{flag}=True on the CORE2 TKE forward")
 
 
 @core2_only

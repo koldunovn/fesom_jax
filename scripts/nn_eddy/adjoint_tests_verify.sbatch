@@ -34,7 +34,8 @@ EOF
   fesom_jax/tests/test_adjoint_config.py \
   fesom_jax/tests/test_adjoint_config_tke.py \
   fesom_jax/tests/test_ice_adjoint_mode.py \
-  fesom_jax/tests/test_mevp.py
+  fesom_jax/tests/test_mevp.py \
+  fesom_jax/tests/test_identity_gates.py
 rc=$?
 echo "=== done $(date) rc=$rc ==="
 exit $rc

@@ -40,6 +40,7 @@ from fesom_jax.ice import IceConfig
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
 from fesom_jax.phc_ic import phc_initial_state
+from fesom_jax.tests._identity_gates import assert_forward_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 MESH_DIR = ROOT / "data" / "mesh_core2"
@@ -112,12 +113,16 @@ def test_unknown_mode_fails_loudly(core2):
 @pytest.mark.parametrize("mode", MODES)
 def test_forward_is_identical_across_modes(core2, mode):
     """stop_gradient is the identity: the ice trajectory must not move by a single bit,
-    whichever mode is chosen. This is the whole basis for switching modes in production."""
+    whichever mode is chosen. This is the whole basis for switching modes in production.
+
+    Bit-identical on CPU. On GPU the two modes are separate ``jax.jit`` closures, so this
+    compares two separately-compiled programs; ``frozen`` landed 2 ulp from ``exact`` there
+    (job 26780293) and failed a bare ``==``. The GPU bound is calibrated instead — see
+    ``_identity_gates``."""
     make, k0 = core2
     ref, _ = make("exact")
     loss, _ = make(mode)
-    a, b = float(ref(k0)), float(loss(k0))
-    assert a == b, f"adjoint_mode={mode!r} moved the forward: {a!r} vs {b!r}"
+    assert_forward_identity(ref, loss, k0, f"adjoint_mode={mode!r}")
 
 
 @pytest.mark.parametrize("mode", MODES)
@@ -208,13 +213,15 @@ def test_rheology_forward_is_identical_on_standard_evp_too(core2):
     backward is checked by
     :func:`test_adjoint_subcycles_zero_cuts_the_momentum_gradient`\\ ``[0]``, at the solver's own
     boundary; asserting it through a full step here would be comparing ulps (see
-    :func:`test_rheology_differs_from_frozen`)."""
+    :func:`test_rheology_differs_from_frozen`).
+
+    ⚠️ This is the loosest of the identity gates on GPU and the reason is structural: the two
+    programs differ by a ``stop_gradient`` inside a 120-sweep subcycle loop, which is enough for
+    XLA to reassociate the accumulation, and the two forwards landed 2.9e-13 apart — ~160 ulp,
+    against a ``rel=1e-14`` tolerance that had been sized from the 1-ulp mEVP case (job
+    26780293). The calibrated bound in ``_identity_gates`` covers it with ~300x margin while
+    still being 1e-11 of the value."""
     make, k0 = core2
     l_ex, _ = make("exact", whichEVP=0)
     l_rh, _ = make("rheology", whichEVP=0)
-    a, b = float(l_ex(k0)), float(l_rh(k0))
-    if jax.default_backend() == "cpu":
-        assert a == b, f"standard-EVP forward moved under adjoint_mode='rheology': {a!r} vs {b!r}"
-    else:
-        assert a == pytest.approx(b, rel=1e-14, abs=0.0), \
-            f"standard-EVP forward moved beyond recompile noise: {a!r} vs {b!r}"
+    assert_forward_identity(l_ex, l_rh, k0, "adjoint_mode='rheology' on the standard EVP")

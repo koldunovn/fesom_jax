@@ -39,6 +39,8 @@ from fesom_jax import forcing, ic
 from fesom_jax.integrate import integrate
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
 from fesom_jax.params import Params
+from fesom_jax.tests._identity_gates import (assert_dead_branch_gradient,
+                                             assert_forward_identity)
 
 DT = 100.0
 N = 8            # enough steps for the mixing/convection feedback to reach the loss
@@ -113,29 +115,38 @@ def test_every_flag_is_covered():
 def test_default_config_is_a_dead_branch(setup):
     """adjoint_cfg=None and AdjointConfig() must agree, forward and gradient.
 
-    ⚠️ Exact on CPU, tolerance on GPU — same reason as
-    ``test_adjoint_config_tke.test_core2_tke_forward_bit_identical``: the two configs are
-    separate ``jax.jit`` closures, so this compares separately-compiled programs, and on GPU
-    those can land an ulp apart. Observed failing on GPU 2026-08-07 for exactly that."""
+    ⚠️ Exact on CPU, calibrated on GPU. The two configs are separate ``jax.jit`` closures, so
+    this compares two separately-compiled programs; on GPU XLA reassociates the 8-step reverse
+    pass differently between them and the gradients landed 4.7e-11 apart (job 26780293). That
+    is 2e5 ulp, not one, so a "one ulp" tolerance was the wrong shape of fix. The GPU branch
+    instead measures what a flag that really does something is worth in this fixture and
+    requires the dead-branch difference to be a millionth of it. See
+    ``_identity_gates.py``."""
     loss_none, grad_none = _loss_fn(setup, None)
     loss_off, grad_off = _loss_fn(setup, AdjointConfig())
-    ln, lo = float(loss_none(K0)), float(loss_off(K0))
-    gn, go = float(grad_none(K0)), float(grad_off(K0))
-    if jax.default_backend() == "cpu":
-        assert ln == lo and gn == go, f"forward {ln!r} vs {lo!r}; gradient {gn!r} vs {go!r}"
-    else:
-        assert ln == pytest.approx(lo, rel=1e-14, abs=0.0)
-        assert gn == pytest.approx(go, rel=1e-12, abs=0.0)
+    what = "adjoint_cfg=None vs AdjointConfig()"
+    assert_forward_identity(loss_off, loss_none, K0, what)
+
+    # freeze_mixing is the reference effect: measured on this fixture it moves the gradient
+    # from +8.207637e-01 to +8.138278e-01, i.e. by ~7e-3. Built lazily — CPU never needs it.
+    def signal():
+        _, grad_frozen = _loss_fn(setup, AdjointConfig(freeze_mixing=True))
+        return float(grad_frozen(K0))
+
+    assert_dead_branch_gradient(float(grad_none(K0)), float(grad_off(K0)), what,
+                                signal_fn=signal)
 
 
 @pytest.mark.parametrize("flag", ALL_FLAGS)
 def test_flag_leaves_the_forward_bit_identical(setup, flag):
     """stop_gradient is the identity in the forward. Any flag that moves the trajectory by a
-    single bit is wired wrong, and would silently change the physics of a production run."""
+    single bit is wired wrong, and would silently change the physics of a production run.
+
+    Bit-identical on CPU; on GPU, below a tenth of the response to a 1e-10 K perturbation,
+    because the comparison is between two separately-compiled programs (``_identity_gates``)."""
     loss_off, _ = _loss_fn(setup, AdjointConfig())
     loss_on, _ = _loss_fn(setup, AdjointConfig(**{flag: True}))
-    a, b = float(loss_off(K0)), float(loss_on(K0))
-    assert a == b, f"{flag}=True moved the forward: {a!r} vs {b!r}"
+    assert_forward_identity(loss_off, loss_on, K0, f"{flag}=True")
 
 
 @pytest.mark.parametrize("flag", ACTIVE_ON_PI)
