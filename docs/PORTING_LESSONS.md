@@ -5710,3 +5710,21 @@ causes; full write-up in `~/nn_eddy/fesom2/RESTART_REPRODUCIBILITY.md`.
   7e-2 K within the following day — indistinguishable from the pre-fix day-later number.
   A "does the restart reproduce?" test that compares a day out would have called every one
   of these fixes a failure.
+- **[gotcha] Differencing two runs? Check the record counts first.** A run still writing its
+  last records lines up silently at the wrong time. `min(a.shape[0], b.shape[0])-1` compared
+  a 91-record file at step 90 against a 96-record file at step 95 and produced a clean-looking
+  "55x improvement" from a tolerance change that in truth does nothing. The tell was that the
+  quantity being compared fluctuates by an order of magnitude between adjacent steps, so any
+  single-step comparison is fragile — plot the curve, don't quote one step.
+- **[method] A plateau at a suspicious value is not evidence.** The restart-vs-continuous ssh
+  difference appeared to saturate at 5e-06 relative, which is exactly the SSH solver's 1e-5
+  tolerance — a very persuasive coincidence. Sweeping the tolerance 1e-5 -> 1e-8 showed the
+  two divergence curves lie on top of each other (2.98e-06 m in both at the same step) for
+  3x the runtime. Test the mechanism by varying the parameter, not by matching magnitudes.
+- **[method] "Max over the mesh" is an event counter, not a level.** The headline 7e-02 K of
+  post-restart SST divergence was 7 ice-covered nodes in Baffin Bay; the area-weighted RMS was
+  1.3e-04 K and the median 5e-10 K. Gate reproducibility on an area-weighted norm.
+- **[method] Distinguish "the trajectory has a jump" from "two trajectories diverge".** For
+  training data only the first matters. Measure it directly: compare the step-to-step change
+  AT the restart against the typical step-to-step change either side. Ratio 1.0000 means the
+  restart is invisible in the trajectory, whatever two runs do relative to each other later.
