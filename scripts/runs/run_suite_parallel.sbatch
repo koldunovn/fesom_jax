@@ -1,69 +1,91 @@
 #!/bin/bash
-# Full JAX test suite, three groups AS A JOB ARRAY so they run concurrently.
+# Full JAX test suite, four COST groups as a job array so they run concurrently.
 #
-# Why this exists. run_suite.sbatch runs ocean, ice and sharding sequentially in one job,
-# and the wall time has to cover their SUM: ocean ~1:14 + ice ~2:28 + sharding ~0:30 = ~4:12
-# against a 2:30 cap. The sharding group is last, so it is the one that gets time-cut — which
-# has now happened twice (2026-06-18, 2026-08-06) and both times looked like a sharding
-# failure rather than a scheduling one. Running the groups in parallel makes the wall time the
-# LONGEST group (~2:30) instead of the sum, and gives each its own budget.
+# History, because the shape of this script is a response to two specific failures.
 #
-# Same three groups, same flags, same environment as run_suite.sbatch — only the scheduling
-# differs. Submit from the repo root of whichever checkout should be tested.
+# `run_suite.sbatch` runs the groups sequentially in one job, so the wall time must cover their
+# SUM and the last group is always the one time-cut. That happened twice (2026-06-18,
+# 2026-08-06) and both times read as a sharding failure rather than a scheduling one. An array
+# makes the wall time the LONGEST group and gives each its own budget.
+#
+# The groups then had a second problem: they were "ice", "sharding", and "everything else".
+# "Everything else" is a default, not a category. It reached 920 tests and 3:28 of wall time
+# without anyone deciding that — a new file joined it by doing nothing, and nothing reported
+# per-test cost, so the growth was invisible. Three changes fix that:
+#
+#   1. Groups come from `scripts/runs/suite_groups.txt`, one line per file. There is no
+#      residual group left for a file to fall into.
+#   2. `fesom_jax/tests/test_suite_groups.py` FAILS if a test file is in no group, so the
+#      omission surfaces on whoever adds the file rather than months later.
+#   3. `--durations=25` on every group. Per-test cost is now always in the log, which is the
+#      only reason anyone would notice the next time a group starts growing.
 #
 #   sbatch scripts/runs/run_suite_parallel.sbatch
-#   # then: grep -h "passed\|failed\|GROUP" scripts/run_suite_par.*.out
+#   grep -hE "GROUP|passed|failed|slowest" scripts/run_suite_par.*.out
 #
 #SBATCH --job-name=jax_suite_par
 #SBATCH -p compute
 #SBATCH -A ab0995
-#SBATCH --array=0-2
+#SBATCH --array=0-3
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --hint=nomultithread
-#SBATCH --mem=200G
+#SBATCH --mem=300G
 #SBATCH --time=06:00:00
 #SBATCH -o scripts/run_suite_par.%A_%a.out
 #SBATCH -e scripts/run_suite_par.%A_%a.out
+# NB --mem=300G, not 200G: the sharding group OOM'd at 209 GB against a 200 GB request on
+# 2026-08-07. That is a real failure and it looked exactly like a sharding bug. The array shares
+# one --mem for all tasks, so the largest group sets it.
 
 source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
-cd "${SLURM_SUBMIT_DIR:-/home/a/a270088/port_jax}"
+cd "${SLURM_SUBMIT_DIR:-/home/a/a270088/port_jax}" || exit 1
 export JAX_PLATFORMS=cpu
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 
-ICE_FILES="test_ice_adv test_ice_coupling test_ice_evp test_ice_ic test_ice_step test_ice_thermo"
-SHARD_FILES="fesom_jax/tests/test_halo.py"
-for f in fesom_jax/tests/test_*_sharded.py; do [ -e "$f" ] && SHARD_FILES="$SHARD_FILES $f"; done
+MANIFEST=scripts/runs/suite_groups.txt
+GROUPS=(unit core2 ice sharding)
+GROUP=${GROUPS[${SLURM_ARRAY_TASK_ID:-0}]}
 
 echo "=== node $(hostname)  $(date)  array task ${SLURM_ARRAY_TASK_ID} ==="
 echo "=== checkout: $(pwd)  branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) ==="
+[ -n "$GROUP" ] || { echo "no group for array task ${SLURM_ARRAY_TASK_ID}"; exit 2; }
+[ -f "$MANIFEST" ] || { echo "missing $MANIFEST"; exit 2; }
 
-case "${SLURM_ARRAY_TASK_ID}" in
-  0)
-    echo "=== GROUP: ocean (everything except ice and sharding) ==="
-    IGNORE=""
-    for f in $ICE_FILES;  do IGNORE="$IGNORE --ignore=fesom_jax/tests/$f.py"; done
-    for f in $SHARD_FILES; do IGNORE="$IGNORE --ignore=$f"; done
-    $PY -m pytest fesom_jax/tests/ -q -p no:cacheprovider $IGNORE
-    rc=$?
-    ;;
-  1)
-    echo "=== GROUP: ice (separate process — the jit cache of the whole suite plus the"
-    echo "===        assembled ice step exceeds a generous RAM budget in one) ==="
-    $PY -m pytest fesom_jax/tests/test_ice_*.py -q -p no:cacheprovider
-    rc=$?
-    ;;
-  2)
-    echo "=== GROUP: sharding (4 CPU fake-devices; skips cleanly in the 1-device group) ==="
+# Every test file must be in the manifest. Checked HERE too, not only in the pytest gate: if a
+# new file is unclassified, this run must not quietly test less than the whole suite and then
+# print a pass.
+ON_DISK=$(cd fesom_jax/tests && ls test_*.py | sort)
+LISTED=$(awk '!/^#/ && NF {print $2}' "$MANIFEST" | sort)
+UNCLASSIFIED=$(comm -23 <(echo "$ON_DISK") <(echo "$LISTED"))
+if [ -n "$UNCLASSIFIED" ]; then
+    echo "ABORT: test files in no suite group — this run would silently skip them:"
+    echo "$UNCLASSIFIED" | sed 's/^/  /'
+    echo "Add each to $MANIFEST ('core2' if it loads the CORE2 mesh/IC/forcing, else 'unit')."
+    exit 2
+fi
+
+FILES=$(awk -v g="$GROUP" '!/^#/ && $1 == g {printf "fesom_jax/tests/%s ", $2}' "$MANIFEST")
+NFILES=$(wc -w <<<"$FILES")
+echo "=== GROUP: $GROUP  ($NFILES files, from $MANIFEST) ==="
+[ "$NFILES" -gt 0 ] || { echo "group $GROUP is empty"; exit 2; }
+
+# `--durations=25` everywhere: the only reason the ocean group's growth to 3:28 was invisible is
+# that nothing ever printed which tests were expensive.
+PYTEST_ARGS="-q -p no:cacheprovider --durations=25"
+
+if [ "$GROUP" = "sharding" ]; then
+    # 4 CPU fake devices; these tests skip cleanly when only 1 device is visible, which is why
+    # they must NOT be folded into another group — they would silently pass by skipping.
     XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-        $PY -m pytest $SHARD_FILES -q -p no:cacheprovider
-    rc=$?
-    ;;
-  *) echo "unknown array task"; rc=2 ;;
-esac
+        $PY -m pytest $PYTEST_ARGS $FILES
+else
+    $PY -m pytest $PYTEST_ARGS $FILES
+fi
+rc=$?          # read rc immediately: a $(date) in between would overwrite $?
 
 echo ""
-echo "=== GROUP ${SLURM_ARRAY_TASK_ID} rc=$rc  $(date) ==="
+echo "=== GROUP $GROUP rc=$rc  $(date) ==="
 exit $rc

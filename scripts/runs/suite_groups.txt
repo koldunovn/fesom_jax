@@ -1,0 +1,111 @@
+# Which suite group each test file belongs to.  <group> <file>
+#
+# Grouped by COST, not by subsystem. The old grouping was "ice", "sharding", and "everything
+# else" — and "everything else" is not a category, it is a default. It grew to 920 tests and
+# 3:28 of wall time without anyone deciding that, because nothing reported per-test cost and a
+# new file joined it by doing nothing. Cost is what the scheduler actually cares about.
+#
+#   unit      — pi mesh, closures, algebra, pytrees. Hundreds of tests, seconds each.
+#   core2     — anything that assembles a CORE2 step or loads the CORE2 mesh/IC/forcing.
+#               This is where the wall time is: a handful of tests, minutes each.
+#   ice       — the assembled sea-ice step. Kept separate for MEMORY, not for time: the jit
+#               cache of the whole suite plus the ice step exceeds a generous RAM budget in one
+#               process.
+#   sharding  — needs XLA_FLAGS=--xla_force_host_platform_device_count=4, and 300 GB: it OOM'd
+#               at 209 GB against a 200 GB request on 2026-08-07, which read as a sharding
+#               failure and was a scheduling one.
+#
+# ⚠️ EVERY test_*.py must appear here exactly once. fesom_jax/tests/test_suite_groups.py fails
+# if one does not, so a new file cannot join the largest group by accident. Put a new file in
+# `core2` if it touches data/mesh_core2, data/ic_core2* or build_surface_forcing; `unit`
+# otherwise.
+
+core2 test_adjoint_config_prod.py
+core2 test_adjoint_config_tke.py
+core2 test_ale_zstar.py
+core2 test_core2_step.py
+core2 test_forcing.py
+core2 test_gm_bolus.py
+core2 test_gm_bolus_adv.py
+core2 test_gm_coeffs.py
+core2 test_gm_redi.py
+core2 test_gm_slopes.py
+core2 test_gm_step.py
+core2 test_gradient_core2.py
+core2 test_jra55.py
+core2 test_kpp_bldepth.py
+core2 test_kpp_blmix.py
+core2 test_kpp_enhance.py
+core2 test_kpp_ri_iwmix.py
+core2 test_kpp_step.py
+core2 test_mesh_core2.py
+core2 test_mevp.py
+core2 test_partition_state.py
+core2 test_paths.py
+core2 test_phc_ic.py
+core2 test_prepare_mesh.py
+core2 test_run_entry.py
+core2 test_shard_mesh.py
+core2 test_sss_runoff.py
+core2 test_step_core2.py
+core2 test_sw_alpha_beta.py
+core2 test_tke_replay.py
+core2 test_tke_step.py
+core2 test_ushow_output.py
+ice test_ice_adjoint_mode.py
+ice test_ice_adv.py
+ice test_ice_coupling.py
+ice test_ice_evp.py
+ice test_ice_ic.py
+ice test_ice_step.py
+ice test_ice_thermo.py
+sharding test_forcing_sharded.py
+sharding test_gradient_sharded.py
+sharding test_halo.py
+sharding test_reductions_sharded.py
+sharding test_scatter_sharded.py
+sharding test_ssh_sharded.py
+sharding test_step_sharded.py
+unit test_adjoint_config.py
+unit test_adjoint_stab.py
+unit test_ale.py
+unit test_calib_twin.py
+unit test_calibrate.py
+unit test_canonical_redist.py
+unit test_coarsen.py
+unit test_coarsen_remap.py
+unit test_config.py
+unit test_diagnostics.py
+unit test_eki.py
+unit test_eos.py
+unit test_gm_eki.py
+unit test_gm_nn.py
+unit test_gradient.py
+unit test_identity_gates.py
+unit test_integrate.py
+unit test_kpp_wscale.py
+unit test_longwindow.py
+unit test_mesh.py
+unit test_momentum.py
+unit test_nn_twin.py
+unit test_obs_compare.py
+unit test_obs_ice.py
+unit test_ops.py
+unit test_partit.py
+unit test_pgf.py
+unit test_pi_demo.py
+unit test_pp.py
+unit test_reference_dump.py
+unit test_release.py
+unit test_restart.py
+unit test_run_config.py
+unit test_sensitivity.py
+unit test_ssh.py
+unit test_state.py
+unit test_step_pi.py
+unit test_stream_output.py
+unit test_suite_groups.py
+unit test_surface_bc.py
+unit test_tke_nn.py
+unit test_tracers.py
+unit test_verify.py
