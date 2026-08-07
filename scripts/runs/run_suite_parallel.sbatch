@@ -46,8 +46,12 @@ export JAX_PLATFORMS=cpu
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 
 MANIFEST=scripts/runs/suite_groups.txt
-GROUPS=(unit core2 ice sharding)
-GROUP=${GROUPS[${SLURM_ARRAY_TASK_ID:-0}]}
+# ⚠️ NOT `GROUPS`. That is a bash BUILT-IN array holding the current user's group IDs, and
+# assigning to it is silently ignored — the array tasks read out gid 1221/1260/1291 as group
+# names and the run died with "group 1221 is empty" (2026-08-08). The empty-group guard below is
+# the only reason that took one minute to find instead of looking like a pytest problem.
+SUITE_GROUPS=(unit core2 ice sharding)
+GROUP=${SUITE_GROUPS[${SLURM_ARRAY_TASK_ID:-0}]}
 
 echo "=== node $(hostname)  $(date)  array task ${SLURM_ARRAY_TASK_ID} ==="
 echo "=== checkout: $(pwd)  branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) ==="

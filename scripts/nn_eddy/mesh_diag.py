@@ -148,6 +148,155 @@ def amoc_strength(lats, moc, zbar, *, lat_range=(20.0, 60.0), depth_range=(500.0
 
 
 # ---------------------------------------------------------------------------
+# section volume transport (Drake / ACC and friends)
+#
+# DECISION (plan Task 4, taken 2026-08-08): a direct line integral of the normal velocity, NOT
+# a port of pyfesom2's broken-line machinery.
+#
+# pyfesom2's `transport.py` spends ~1000 lines building a "broken line": walking an arbitrary
+# multi-segment user path, finding every triangle edge it crosses, computing the intersection
+# geometry and orienting each crossing. That machinery exists to serve arbitrary interactively
+# drawn paths and to plot the section. What this project needs is one number per section per
+# snapshot for a handful of FIXED sections, compared between runs and over time.
+#
+# For that, the honest discretization is the definition itself:
+#
+#     T = ∫∫ u·n  dl dz
+#
+# Chop the great circle from A to B into sub-segments much shorter than an element, find the
+# element each sub-segment's midpoint falls in, and sum `u_elem·n × ds × dz`. First-order
+# accurate, converges as the sub-segment length shrinks (tested), and needs no edge topology at
+# all. FESOM already stores u, v on ELEMENTS, so there is no collocation step and therefore none
+# of the non-conservative interpolation that `coarsen.elem_to_node` carries.
+#
+# Three things this must get right, and all three are the same lesson as the remap:
+#
+# * **The section is a GREAT CIRCLE, interpolated on the unit sphere**, not a straight line in
+#   lon/lat. Drake Passage is at 68°W so it happens not to care, but a zonal section at high
+#   latitude or anything crossing the dateline does, and a lon/lat interpolation there is wrong
+#   in a way that produces a plausible number.
+# * **The normal is defined explicitly**: n = r × t, i.e. the LEFT of the direction of travel
+#   A→B. For a section running north→south that is EASTWARD, so Drake Passage entered as
+#   (South America → Antarctica) gives the ACC a positive transport. Asserted in the tests
+#   rather than left to the reader.
+# * **The bottom is masked per element** from `nlevels-1`, the same subtraction `load_mesh_arrays`
+#   documents. Without it the deepest layer contributes either fill values or water that is not
+#   there.
+
+def _unit_xyz(lon_deg, lat_deg):
+    lon, lat = np.radians(lon_deg), np.radians(lat_deg)
+    cl = np.cos(lat)
+    return np.stack([cl * np.cos(lon), cl * np.sin(lon), np.sin(lat)], axis=-1)
+
+
+def _xyz_to_lonlat(v):
+    v = v / np.linalg.norm(v, axis=-1, keepdims=True)
+    return np.degrees(np.arctan2(v[..., 1], v[..., 0])), np.degrees(np.arcsin(v[..., 2]))
+
+
+def great_circle_points(lon0, lat0, lon1, lat1, n):
+    """``n`` points along the great circle from A to B inclusive, by spherical interpolation.
+
+    Straight interpolation of the Cartesian endpoints and renormalising ("nlerp") lands on the
+    same great circle as the exact slerp — only the spacing differs — and for a section that is
+    then subdivided finely, uneven spacing is handled by using each sub-segment's own length.
+    """
+    a, b = _unit_xyz(lon0, lat0), _unit_xyz(lon1, lat1)
+    t = np.linspace(0.0, 1.0, n)[:, None]
+    v = (1.0 - t) * a[None, :] + t * b[None, :]
+    return v / np.linalg.norm(v, axis=1, keepdims=True)
+
+
+EARTH_R = 6371000.0
+
+
+def element_centroids_lonlat(elem_nodes, lon_deg, lat_deg):
+    """Element centroids as (lon, lat) in degrees, averaged **in 3-D on the unit sphere**.
+
+    ⚠️ Averaging longitudes directly puts the centroid of a triangle straddling the dateline in
+    the middle of the Pacific on the wrong side. The 3-D mean has no seam.
+    """
+    v = _unit_xyz(lon_deg, lat_deg)[np.asarray(elem_nodes)]         # (elem, 3, 3)
+    return _xyz_to_lonlat(v.mean(axis=1))
+
+
+def section_transport(u_elem, v_elem, *, lon0, lat0, lon1, lat1, elem_nodes, lon_deg, lat_deg,
+                      elem_nlevels, zbar, n_sub=2000, return_profile=False,
+                      centroid_xyz=None):
+    """Volume transport across the great-circle section A→B, in Sv.
+
+    ``u_elem``, ``v_elem``: (elem2D, nz1) eastward/northward velocity on elements [m/s].
+    ``elem_nlevels``: the ALREADY-SUBTRACTED level count (see :func:`load_mesh_arrays`).
+    ``n_sub``: number of sub-segments. Increase until the answer stops moving; on CORE2 (~1°)
+    a Drake-Passage section is ~900 km, so 2000 sub-segments is ~450 m each, far below the
+    element size, and the result is converged.
+
+    Positive = flow to the LEFT of A→B (see the module comment: north→south ⇒ eastward).
+
+    Returns the total in Sv, or ``(total, per_level)`` if ``return_profile``.
+    """
+    u_elem = np.asarray(u_elem, dtype=np.float64)
+    v_elem = np.asarray(v_elem, dtype=np.float64)
+    zbar = np.asarray(zbar, dtype=np.float64)
+    dz = -np.diff(zbar)                                            # (nz1,) positive thickness
+    nz1 = dz.size
+    if u_elem.shape[1] != nz1:
+        raise ValueError(f"u_elem has {u_elem.shape[1]} layers, zbar implies {nz1}")
+
+    pts = great_circle_points(lon0, lat0, lon1, lat1, n_sub + 1)    # (n_sub+1, 3) unit vectors
+    mid = pts[:-1] + pts[1:]
+    mid /= np.linalg.norm(mid, axis=1, keepdims=True)
+    seg = pts[1:] - pts[:-1]
+    # chord vs arc: identical to O(ds^2/R^2), and ds/R ~ 7e-5 here
+    ds = np.linalg.norm(seg, axis=1) * EARTH_R                     # (n_sub,) metres
+
+    # local east/north at each midpoint, and the section tangent expressed in them
+    lon_m, lat_m = _xyz_to_lonlat(mid)
+    lam, phi = np.radians(lon_m), np.radians(lat_m)
+    east = np.stack([-np.sin(lam), np.cos(lam), np.zeros_like(lam)], axis=1)
+    north = np.stack([-np.sin(phi) * np.cos(lam), -np.sin(phi) * np.sin(lam), np.cos(phi)],
+                     axis=1)
+    t_e = np.einsum("ij,ij->i", seg, east)
+    t_n = np.einsum("ij,ij->i", seg, north)
+    tn = np.hypot(t_e, t_n)
+    tn[tn == 0.0] = 1.0
+    t_e, t_n = t_e / tn, t_n / tn
+    # n = r x t in the local frame: (up) x (t_e*east + t_n*north) = t_e*north - t_n*east,
+    # i.e. rotate the tangent 90 degrees anticlockwise = the LEFT of the direction of travel.
+    n_e, n_n = -t_n, t_e
+
+    # which element each midpoint sits in: nearest centroid on the unit sphere. Exact
+    # point-in-triangle would be the pedantic version; with sub-segments two orders of magnitude
+    # shorter than an element, nearest-centroid differs only within half an element of a
+    # boundary and the convergence test shows it does not matter.
+    from scipy.spatial import cKDTree
+
+    if centroid_xyz is None:
+        clon, clat = element_centroids_lonlat(elem_nodes, lon_deg, lat_deg)
+        centroid_xyz = _unit_xyz(clon, clat)
+    _, idx = cKDTree(centroid_xyz).query(mid, k=1, workers=-1)
+
+    valid = np.arange(nz1)[None, :] < np.asarray(elem_nlevels)[idx][:, None]
+    un = (u_elem[idx] * n_e[:, None] + v_elem[idx] * n_n[:, None]) * valid
+    per_level = (un * ds[:, None]).sum(axis=0) * dz / 1.0e6        # Sv per layer
+    total = float(per_level.sum())
+    return (total, per_level) if return_profile else total
+
+
+# Fixed sections. Each is entered so that the CLIMATOLOGICALLY POSITIVE direction comes out
+# positive under the "left of A→B" convention, which for a north→south section is eastward.
+SECTIONS = {
+    # Drake Passage at 68W, Tierra del Fuego to the Antarctic Peninsula. Observed ~134-174 Sv
+    # (Donohue et al. 2016 puts the total at 173.3 +/- 10.7 Sv; older estimates ~134).
+    "Drake": dict(lon0=-68.0, lat0=-54.5, lon1=-68.0, lat1=-63.5),
+    # ACC south of Africa, 20E, Cape Agulhas to Antarctica.
+    "ACC_20E": dict(lon0=20.0, lat0=-34.0, lon1=20.0, lat1=-69.5),
+    # ACC south of Tasmania, 147E.
+    "ACC_147E": dict(lon0=147.0, lat0=-43.5, lon1=147.0, lat1=-67.0),
+}
+
+
+# ---------------------------------------------------------------------------
 
 def load_mesh_arrays(mesh_dir: Path):
     """The handful of exported mesh arrays the overturning needs.
@@ -189,9 +338,34 @@ def load_w(path, var: str = "w", time_index: int | None = None) -> np.ndarray:
     return w
 
 
+def load_elem_field(path, var: str, n_elem: int, time_index: int | None = None) -> np.ndarray:
+    """Read an ELEMENTAL field as (elem2D, nz1), fills zeroed and orientation fixed.
+
+    Same fill trap as :func:`load_w`: FESOM writes 9.96921e+36 where a cell is dry, and
+    ``np.asarray(masked_array)`` hands those straight back as numbers.
+    """
+    from netCDF4 import Dataset
+
+    with Dataset(str(path)) as ds:
+        v = ds.variables[var][:]
+    a = np.ma.filled(np.ma.masked_invalid(np.ma.masked_greater(np.ma.asarray(v), 1e30)), 0.0)
+    a = np.asarray(a, dtype=np.float64)
+    if a.ndim == 3:
+        a = a[time_index] if time_index is not None else a.mean(axis=0)
+    if a.shape[0] != n_elem:                       # (nz1, elem) -> (elem, nz1)
+        a = a.T
+    return a
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--w-file", required=True, help="netCDF with variable w (time, nod2D, nl) or (nod2D, nl)")
+    ap.add_argument("--w-file", help="netCDF with variable w (time, nod2D, nl) or (nod2D, nl)")
+    ap.add_argument("--u-file", help="netCDF with ELEMENTAL u; with --v-file switches to "
+                                    "section-transport mode instead of the overturning")
+    ap.add_argument("--v-file")
+    ap.add_argument("--sections", default="Drake,ACC_20E,ACC_147E",
+                    help=f"comma-separated names from {sorted(SECTIONS)}")
+    ap.add_argument("--n-sub", type=int, default=2000)
     ap.add_argument("--w-var", default="w")
     ap.add_argument("--mesh", required=True, help="exported mesh dir (data/mesh_core2)")
     ap.add_argument("--basin", default="Atlantic_MOC")
@@ -201,6 +375,32 @@ def main():
     args = ap.parse_args()
 
     m = load_mesh_arrays(args.mesh)
+
+    if args.u_file and args.v_file:
+        n_elem = m["elem_nodes"].shape[0]
+        u = load_elem_field(args.u_file, "u", n_elem, args.time)
+        v = load_elem_field(args.v_file, "v", n_elem, args.time)
+        clon, clat = element_centroids_lonlat(m["elem_nodes"], m["lon_deg"], m["lat_deg"])
+        cxyz = _unit_xyz(clon, clat)
+        out = {}
+        for name in args.sections.split(","):
+            name = name.strip()
+            if name not in SECTIONS:
+                raise SystemExit(f"unknown section {name!r}; have {sorted(SECTIONS)}")
+            total, prof = section_transport(
+                u, v, **SECTIONS[name], elem_nodes=m["elem_nodes"], lon_deg=m["lon_deg"],
+                lat_deg=m["lat_deg"], elem_nlevels=m["elem_nlevels"], zbar=m["zbar"],
+                n_sub=args.n_sub, return_profile=True, centroid_xyz=cxyz)
+            print(f"{name:10s} {total:9.2f} Sv   (top 500 m: "
+                  f"{prof[m['zbar'][1:] > -500.0].sum():7.2f} Sv)")
+            out[name] = total
+            out[name + "_profile"] = prof
+        np.savez(f"{args.out}_sections.npz", zbar=m["zbar"], **out)
+        print(f"wrote {args.out}_sections.npz")
+        return 0
+
+    if not args.w_file:
+        raise SystemExit("need either --w-file (overturning) or --u-file + --v-file (sections)")
     w = load_w(args.w_file, args.w_var, args.time)
     if w.shape[0] != m["lon_deg"].size:      # (nl, nod2D) -> (nod2D, nl)
         w = w.T
