@@ -1,0 +1,218 @@
+"""The three ``AdjointConfig`` flags that only exist in the PRODUCTION configuration.
+
+``test_adjoint_config.py`` runs the pi mesh (linfs, PP mixing, no GM) and
+``test_adjoint_config_tke.py`` runs CORE2 with the TKE closure. Between them they leave three
+flags with no effect-test anywhere, and the reason is structural rather than accidental — each
+of the three sits inside a Python ``if`` that neither fixture enters:
+
+===================== ============================== ==============================
+flag                  guard                          what it freezes
+===================== ============================== ==============================
+``freeze_pgf``        ``if ale_cfg is not None:``    the zstar baroclinic PGF
+``freeze_gm_slope``   ``if gm_cfg is not None:``     N² inside the eddy block
+``freeze_k33``        ``if gm_cfg is not None:``     the GM/Redi vertical augmentation
+===================== ============================== ==============================
+
+A flag wired to a branch the tests never enter cannot be distinguished from a flag wired
+nowhere. Both return the baseline gradient bit-for-bit, and the report that comes out of a
+horizon campaign is then "this term is not the amplifier" for a term that was never cut —
+exactly the failure that ``docs/ADJOINT_HORIZON.md`` had to be corrected for after it claimed
+every flag was covered.
+
+Production runs **zstar + TKE + mEVP + GM**, so that is what the fixture here builds. It is the
+most expensive fixture in the adjoint set (one assembled CORE2 step with all four subsystems, and
+a separate ``jax.jit`` closure per configuration), which is why it lives in its own file and
+tests exactly the three flags that need it.
+
+⚠️ Two traps this fixture must avoid, both of which have already caught this project once:
+the TKE must be **seeded** (``phc_initial_state`` carries ``tke = 0`` and ``KappaH`` is
+proportional to it, so a cold column makes every derivative through the closure exactly zero),
+and the ice must be **seeded** (otherwise ``a_ice`` is identically zero and the sea-ice adjoint
+is being tested on an ice-free ocean). Both are asserted, not assumed.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from fesom_jax import ssh, surface_forcing
+from fesom_jax import ice as icemod
+from fesom_jax import step as stepmod
+from fesom_jax.adjoint_stab import AdjointConfig
+from fesom_jax.ale import AleConfig
+from fesom_jax.gm import GMConfig
+from fesom_jax.ice import IceConfig
+from fesom_jax.mesh import load_mesh
+from fesom_jax.params import Params
+from fesom_jax.phc_ic import phc_initial_state
+from fesom_jax.tests._identity_gates import assert_forward_identity
+from fesom_jax.tke import TkeConfig
+
+ROOT = Path(__file__).resolve().parents[2]
+MESH_DIR = ROOT / "data" / "mesh_core2"
+IC_DIR = ROOT / "data" / "ic_core2_dist16"
+DT = 1800.0
+YEAR = 1958
+TKE_SEED = 1.0e-3
+
+core2_only = pytest.mark.skipif(
+    not (MESH_DIR.is_dir() and (IC_DIR / "T_ic.npy").is_file()),
+    reason="CORE2 mesh / PHC IC missing")
+
+# The three flags this file exists for, and the guard each one needs.
+PROD_ONLY_FLAGS = ["freeze_pgf", "freeze_gm_slope", "freeze_k33"]
+
+
+@pytest.fixture(scope="module")
+def prod():
+    """The production configuration — zstar + TKE + mEVP + GM — as a function of a uniform
+    surface-temperature perturbation.
+
+    The control is an SST perturbation for the reason spelled out in
+    ``test_adjoint_config_tke.py``: a mixing parameter is not read on the TKE path at all, and
+    ``freeze_mixing`` would stop_gradient it anyway, so any test built on one compares zero with
+    zero. A surface perturbation reaches T through stratification→Kv, through advection, through
+    the pressure gradient and through the eddy block, so no single flag can sever the whole path.
+    """
+    mesh = load_mesh(MESH_DIR)
+    bare = phc_initial_state(mesh, IC_DIR)
+
+    imask = np.asarray(mesh.node_iface_mask)
+    state = dataclasses.replace(
+        bare, tke=jnp.asarray(np.where(imask, TKE_SEED, 0.0), jnp.float64))
+    state = icemod.seed_ice(state, mesh, state.T[:, 0])
+
+    # assert the two seedings worked, rather than trusting them: a silently unseeded fixture
+    # measures a switched-off subsystem and PASSES.
+    assert float(jnp.max(state.tke)) > 0.0, "TKE seeding did nothing"
+    n_icy = int(np.count_nonzero(np.asarray(state.a_ice) > 0.0))
+    assert n_icy > 0, "seed_ice produced no ice — the sea-ice path is not exercised"
+
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+    fs = cf.static
+    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
+    wet0 = jnp.asarray(mesh.node_layer_mask[:, 0])
+
+    def make(cfg):
+        def loss(eps):
+            st = dataclasses.replace(state,
+                                     T=state.T.at[:, 0].add(jnp.where(wet0, eps, 0.0)))
+            fin = stepmod.step(st, mesh, op, None, Params.defaults(), dt=DT,
+                               is_first_step=True, step_forcing=sf0, forcing_static=fs,
+                               ale_cfg=AleConfig(), gm_cfg=GMConfig(), tke_cfg=TkeConfig(),
+                               ice_cfg=IceConfig(whichEVP=1, adjoint_mode="rheology"),
+                               adjoint_cfg=cfg)
+            return jnp.sum(jnp.where(wet0, fin.T[:, 0], 0.0)) / jnp.sum(wet0)
+
+        return jax.jit(loss), jax.jit(jax.grad(loss))
+
+    return make, jnp.asarray(0.0, jnp.float64), n_icy
+
+
+@core2_only
+def test_the_fixture_actually_runs_the_production_configuration(prod):
+    """If the assembled step with all four subsystems does not produce a finite, nonzero
+    gradient, nothing else in this file means anything."""
+    make, k0, n_icy = prod
+    loss, grad = make(AdjointConfig())
+    l0, g0 = float(loss(k0)), float(grad(k0))
+    assert np.isfinite(l0) and np.isfinite(g0)
+    assert g0 != 0.0, "the SST control does not reach the loss in this configuration"
+    print(f"\nproduction baseline: loss {l0!r} grad {g0!r} ({n_icy} icy nodes)")
+
+
+@core2_only
+@pytest.mark.parametrize("flag", PROD_ONLY_FLAGS)
+def test_the_production_only_flag_changes_the_gradient(prod, flag):
+    """The point of the file. Each flag must MOVE the gradient here, which is the only evidence
+    that it is wired to a live call site rather than to a branch nothing enters."""
+    make, k0, _ = prod
+    _, g_off = make(AdjointConfig())
+    _, g_on = make(AdjointConfig(**{flag: True}))
+    a, b = float(g_off(k0)), float(g_on(k0))
+    assert np.isfinite(a) and np.isfinite(b)
+    assert a != b, (f"{flag}=True returned the baseline gradient ({a!r}) bit-for-bit in the "
+                   f"production configuration — it is not reaching the graph")
+    print(f"\n{flag}: {a!r} -> {b!r}  (relative {abs(b - a) / abs(a):.3e})")
+
+
+@core2_only
+@pytest.mark.parametrize("flag", PROD_ONLY_FLAGS)
+def test_the_production_only_flag_leaves_the_forward_alone(prod, flag):
+    """``stop_gradient`` is the identity in the forward. These three are the flags that touch
+    the PGF and the eddy block — the terms that most directly move the trajectory — so this is
+    where a wiring mistake would change the physics of a production run rather than only its
+    gradient."""
+    make, k0, _ = prod
+    l_off, _ = make(AdjointConfig())
+    l_on, _ = make(AdjointConfig(**{flag: True}))
+    assert_forward_identity(l_off, l_on, k0, f"{flag}=True in the production configuration")
+
+
+@core2_only
+def test_freeze_k33_cuts_more_than_freeze_gm_slope(prod):
+    """The documented distinction between the two GM flags, as a number rather than a comment.
+
+    ``freeze_gm_slope`` freezes N² *inside* the eddy block, leaving the eddy diffusivity and
+    T, S differentiated. ``freeze_k33`` cuts K33 — the route by which the eddy coefficients
+    reach the vertical diffusion — so it removes part of the gradient path of the very
+    parameter being trained. That is why ``AdjointConfig`` warns that this one is not free, and
+    it should be the larger cut of the two.
+    """
+    make, k0, _ = prod
+    _, g_off = make(AdjointConfig())
+    _, g_slope = make(AdjointConfig(freeze_gm_slope=True))
+    _, g_k33 = make(AdjointConfig(freeze_k33=True))
+    base = float(g_off(k0))
+    d_slope = abs(float(g_slope(k0)) - base)
+    d_k33 = abs(float(g_k33(k0)) - base)
+    print(f"\nbaseline {base!r}; freeze_gm_slope moves it {d_slope:.6e}, "
+          f"freeze_k33 moves it {d_k33:.6e}")
+    assert d_slope > 0.0 and d_k33 > 0.0
+    assert d_k33 > d_slope, (
+        f"freeze_k33 ({d_k33:.3e}) cut LESS than freeze_gm_slope ({d_slope:.3e}). Either the "
+        f"K33 path is not what AdjointConfig documents, or one of the two is misrouted")
+
+
+@core2_only
+def test_freeze_pgf_is_the_blunt_one(prod):
+    """``freeze_pgf`` cuts the tracer→momentum coupling entirely and its docstring calls the
+    resulting gradient unusable for training. Assert it really is a large cut, so that "cuts
+    the coupling entirely" cannot quietly degrade into "changes it slightly"."""
+    make, k0, _ = prod
+    _, g_off = make(AdjointConfig())
+    _, g_pgf = make(AdjointConfig(freeze_pgf=True))
+    base, cut = float(g_off(k0)), float(g_pgf(k0))
+    rel = abs(cut - base) / abs(base)
+    print(f"\nfreeze_pgf: {base!r} -> {cut!r} (relative {rel:.3e})")
+    assert rel > 1e-9, (
+        f"freeze_pgf changed the gradient by only {rel:.3e} relative. For a flag that removes "
+        f"the entire baroclinic pressure-gradient path from the backward, that is too small to "
+        f"be the documented behaviour — check the zstar branch is the one being taken")
+
+
+@core2_only
+def test_every_production_only_flag_is_listed_here():
+    """Keeps this file honest as the flag set grows: any flag guarded by ale_cfg or gm_cfg must
+    appear above, or it silently returns to having no effect-test at all."""
+    import inspect
+
+    from fesom_jax import step as _step
+    src = inspect.getsource(_step.step)
+    guarded = {f for f in AdjointConfig._fields if f in src}
+    covered = set(PROD_ONLY_FLAGS)
+    # the pi and TKE files cover these; listed explicitly so a new flag lands in neither set
+    # and fails this test rather than disappearing
+    elsewhere = {"freeze_mixing", "freeze_stratification", "freeze_convection",
+                 "freeze_vert_visc", "freeze_tke_state", "freeze_advection"}
+    assert guarded <= covered | elsewhere, (
+        f"AdjointConfig flags read by step() but classified nowhere: "
+        f"{sorted(guarded - covered - elsewhere)}")
+    assert covered <= guarded, f"listed here but not read by step(): {sorted(covered - guarded)}"

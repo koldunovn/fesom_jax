@@ -243,8 +243,12 @@ def build_remap(fine_mesh_dir, coarse_mesh_dir) -> RemapMap:
     tree = cKDTree(_xyz(clon, clat))
     _, fine_cell = tree.query(_xyz(flon, flat), k=1, workers=-1)
 
-    farea = np.load(fine_dir / "area.npy")
-    farea = farea[:, 0] if farea.ndim == 2 else farea
+    # ⚠️ mmap. On NG5 `area.npy` is (7402886, 70) f8 = 4.1 GB on disk and only its surface
+    # column (59 MB) is wanted; reading the whole array to slice one column is the difference
+    # between a 4 GB allocation and nothing. `np.array(...)` forces the copy so the mmap is not
+    # kept alive inside the returned RemapMap.
+    farea = np.load(fine_dir / "area.npy", mmap_mode="r")
+    farea = np.array(farea[:, 0] if farea.ndim == 2 else farea, dtype=np.float64)
     return RemapMap(
         fine_cell=jnp.asarray(fine_cell.astype(np.int32)),
         fine_area=jnp.asarray(np.asarray(farea, dtype=np.float64)),
