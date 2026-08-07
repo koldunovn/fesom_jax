@@ -43,10 +43,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--csv", type=pathlib.Path, default=CSV)
     ap.add_argument("--set-gb", type=float, default=9.18,
-                    help="measured size of one snapshot set on disk (9.18 at deflate level 1, "
-                         "~14.7 uncompressed)")
+                    help="measured size of one snapshot set ON DISK. 9.18 GB at deflate level 1 "
+                         "(months 01-02); pass ~14.7 for compression_level=0 (months 03+) or the "
+                         "size actually measured there — the per-month output cost is computed "
+                         "from this and the observed write rate, so a stale value skews it.")
     ap.add_argument("--sets-per-month", type=int, default=6)
     ap.add_argument("--nodes", type=int, default=64)
+    ap.add_argument("--spd", type=int, default=None,
+                    help="analyse only samples at this step_per_day (default: the latest in the "
+                         "CSV). Rates from different dt are not comparable.")
     args = ap.parse_args()
 
     rows = [r for r in csv.DictReader(args.csv.open()) if r.get("mstep")]
@@ -67,9 +72,23 @@ def main() -> int:
         ivals.append(dict(dt=dt, dms=dms, mb_min=dkb / 1024.0 / (dt / 60.0),
                           spd=int(b["spd"] or 0), iso=b["iso"]))
 
+    # ⚠️ Restrict to ONE time step before computing any rate. The chain switches step_per_day
+    # from 720 to 360 at a month boundary, so a CSV that spans the switch holds two populations
+    # whose steps/s are not comparable, and averaging them produces a number that describes
+    # neither. Default to the LATEST step_per_day present, which is the configuration anyone
+    # asking is asking about; --spd picks another.
+    present = sorted({i["spd"] for i in ivals if i["spd"]})
+    spd = args.spd or (ivals[-1]["spd"] if ivals[-1]["spd"] else 720)
+    if len(present) > 1:
+        print(f"⚠️ CSV spans step_per_day {present}; analysing spd={spd} only "
+              f"(pass --spd to choose). Rates across a dt switch are not comparable.\n")
+    ivals = [i for i in ivals if i["spd"] == spd]
+    if len(ivals) < 2:
+        print(f"only {len(ivals)} intervals at spd={spd} — let the sampler run longer")
+        return 1
+
     writing = [i for i in ivals if i["mb_min"] > GROWTH_MB_PER_MIN]
     quiet = [i for i in ivals if i["mb_min"] <= GROWTH_MB_PER_MIN]
-    spd = max((i["spd"] for i in ivals), default=720) or 720
 
     def rate(group):
         t = sum(i["dt"] for i in group)
