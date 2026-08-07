@@ -182,10 +182,23 @@ def test_freeze_k33_cuts_more_than_freeze_gm_slope(prod):
 
 
 @core2_only
-def test_freeze_pgf_is_the_blunt_one(prod):
-    """``freeze_pgf`` cuts the tracer→momentum coupling entirely and its docstring calls the
-    resulting gradient unusable for training. Assert it really is a large cut, so that "cuts
-    the coupling entirely" cannot quietly degrade into "changes it slightly"."""
+def test_freeze_pgf_reaches_the_gradient_at_all(prod):
+    """``freeze_pgf`` removes the whole baroclinic pressure-gradient path from the backward, and
+    ``AdjointConfig`` calls the resulting gradient unusable for training. **Over ONE step that
+    still shows up as a tiny number, and that is correct, not a bug.**
+
+    Measured on this fixture: +7.919790246248722e-01 → +7.91978909160614e-01, i.e. 1.46e-07
+    relative. The reason it is small has nothing to do with wiring: an SST perturbation reaches
+    momentum through the PGF, and momentum can only get back into T through advection *within
+    the same step*, so at one step the PGF contributes to dT/dSST at second order. Over a
+    30-day window that path is the tracer→momentum→tracer feedback and it dominates — which is
+    what "unusable for training" refers to.
+
+    So this test asserts the flag REACHES the graph (1.46e-07 is 145× the 1e-9 floor and
+    infinitely more than the exact 0.0 it returned before ``ale_cfg`` was passed), and does not
+    pretend a one-step fixture can measure how blunt the cut is. Doing that needs a multi-step
+    window, which belongs in the horizon campaign, not in a unit test.
+    """
     make, k0, _ = prod
     _, g_off = make(AdjointConfig())
     _, g_pgf = make(AdjointConfig(freeze_pgf=True))
@@ -193,9 +206,9 @@ def test_freeze_pgf_is_the_blunt_one(prod):
     rel = abs(cut - base) / abs(base)
     print(f"\nfreeze_pgf: {base!r} -> {cut!r} (relative {rel:.3e})")
     assert rel > 1e-9, (
-        f"freeze_pgf changed the gradient by only {rel:.3e} relative. For a flag that removes "
-        f"the entire baroclinic pressure-gradient path from the backward, that is too small to "
-        f"be the documented behaviour — check the zstar branch is the one being taken")
+        f"freeze_pgf changed the gradient by only {rel:.3e} relative — below the 1e-9 floor, "
+        f"which for a one-step fixture means the zstar branch is probably not the one being "
+        f"taken, i.e. ale_cfg is not reaching step()")
 
 
 @core2_only

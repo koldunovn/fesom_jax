@@ -176,6 +176,78 @@ STATE_NAMES = ("temp", "salt", "u", "v")
 FLUX_NAMES = ("uT_eddy", "vT_eddy", "uS_eddy", "vS_eddy")
 
 
+def verify_conservation(month, rec, rmap, fine, teacher: pathlib.Path, max_levels=None):
+    """Check the horizontal aggregation ON THE REAL FILES, three ways.
+
+    ⚠️ **The area-integral check alone proves less than it looks.** The coarse value is
+    ``num/den`` and the coarse weight is ``den``, so ``Σ(value × weight) ≈ Σ num`` is close to an
+    algebraic identity: it holds even if the mask is wrong, even if the slice is transposed, as
+    long as BOTH sides use the same wrong thing. It is worth printing — it would catch a
+    normalisation or scatter bug — but it is not the plumbing check. Two others are:
+
+    * **Range.** An area-weighted average cannot leave the range of its inputs. If any coarse
+      value falls outside the fine level's own min/max, the script is aggregating something other
+      than what it measured the range of — a transpose, a wrong record, or netCDF fill leaking in
+      (FESOM writes 9.96921e+36 for dry cells and ``np.asarray`` on a MaskedArray hands those
+      back as numbers).
+    * **Wet area.** The summed surface weight must equal the fine mesh's own total wet area. A
+      mask built from the wrong level, or off by one on ``nlevels``, changes this and nothing
+      else notices.
+
+    The vertical remap is deliberately NOT in the loop — separate operator, its own conservation
+    test, and mixing them would leave a failure ambiguous.
+    """
+    with netCDF4.Dataset(teacher / f"temp_snap.fesom.{month}.nc") as ds:
+        nz1 = ds.variables["temp_snap"].shape[1]
+        if max_levels:
+            nz1 = min(nz1, int(max_levels))
+    worst = 0.0
+    worst_k = -1
+    area = np.asarray(rmap.fine_area)
+    out_of_range = []
+    area_err = None
+    for k in range(nz1):
+        m = np.asarray(fine.layer_mask(k))
+        with netCDF4.Dataset(teacher / f"temp_snap.fesom.{month}.nc") as ds:
+            T = np.asarray(ds.variables["temp_snap"][rec, k, :], dtype=np.float64)
+        Tc, w = coarsen.aggregate_horizontal_with_weight(
+            jnp.asarray(T), rmap, fine_mask=jnp.asarray(m))
+        Tc, w = np.asarray(Tc), np.asarray(w)
+
+        fine_int = float((area * m * T).sum())
+        coarse_int = float((Tc * w).sum())
+        rel = abs(coarse_int - fine_int) / max(abs(fine_int), 1e-30)
+        if rel > worst:
+            worst, worst_k = rel, k
+
+        wetf = m > 0
+        if wetf.any():
+            lo, hi = float(T[wetf].min()), float(T[wetf].max())
+            got = Tc[w > 0]
+            if got.size and (got.min() < lo - 1e-9 or got.max() > hi + 1e-9):
+                out_of_range.append((k + 1, lo, hi, float(got.min()), float(got.max())))
+        if k == 0:
+            fine_wet_area = float((area * m).sum())
+            coarse_wet_area = float(w.sum())
+            area_err = abs(coarse_wet_area - fine_wet_area) / fine_wet_area
+            print(f"  surface wet area: fine {fine_wet_area / 1e12:.4f} x 1e12 m^2, "
+                  f"coarse {coarse_wet_area / 1e12:.4f}, rel {area_err:.2e}")
+        if k % 10 == 0 or k == nz1 - 1:
+            print(f"  level {k + 1:3d}/{nz1}: fine {fine_int:+.10e}  coarse {coarse_int:+.10e}"
+                  f"  rel {rel:.2e}  range [{T[wetf].min() if wetf.any() else 0:+.3f}, "
+                  f"{T[wetf].max() if wetf.any() else 0:+.3f}]", flush=True)
+
+    print(f"\narea integral: worst relative discrepancy {worst:.3e} at level {worst_k + 1}")
+    print(f"wet area     : relative discrepancy {area_err:.3e} at the surface")
+    print(f"range        : {len(out_of_range)} level(s) with a coarse value outside the fine "
+          f"level's own min/max")
+    for k, lo, hi, glo, ghi in out_of_range[:5]:
+        print(f"    level {k}: fine [{lo:+.4f}, {hi:+.4f}], coarse [{glo:+.4f}, {ghi:+.4f}]")
+    ok = worst < 1e-12 and (area_err or 0.0) < 1e-12 and not out_of_range
+    print("VERIFY OK" if ok else "VERIFY FAILED")
+    return 0 if ok else 1
+
+
 def process_record(month, rec, rmap, fine, teacher: pathlib.Path, verbose=True,
                    max_levels=None):
     """Coarse-grain one snapshot record, level by level. Returns (state, flux, weight, time).
@@ -278,6 +350,9 @@ def main():
     ap.add_argument("--map-cache", type=pathlib.Path, default=None)
     ap.add_argument("--max-levels", type=int, default=None,
                     help="truncate the column — SMOKE TEST ONLY, output is not usable")
+    ap.add_argument("--verify-conservation", action="store_true",
+                    help="check the area integral is preserved on the REAL files, per level, "
+                         "and exit; writes nothing")
     args = ap.parse_args()
 
     cache = args.map_cache or (args.out / "remap_ng5_to_core2.npz")
@@ -292,6 +367,14 @@ def main():
     recs = ([int(x) for x in args.records.split(",")] if args.records
             else list(range(n_rec)))
     print(f"[run] month {args.month}: {n_rec} records in file, processing {recs}")
+
+    if args.verify_conservation:
+        rc = 0
+        for r in recs:
+            print(f"[verify rec {r}] area-integral conservation, level by level")
+            rc |= verify_conservation(args.month, r, rmap, fine, args.teacher,
+                                      max_levels=args.max_levels)
+        return rc
 
     times, states, fluxes, weights = [], [], [], []
     for r in recs:
