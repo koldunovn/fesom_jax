@@ -102,12 +102,25 @@ def main() -> int:
 
     print(f"samples {len(rows)}, span {t_all / 60:.0f} min, step_per_day={spd} "
           f"(dt={86400 / spd:.0f} s)\n")
+    # Is the archive growing essentially all the time? At compression_level=0 it is — 2.0 GB/min
+    # averaged over everything — and then the growing/quiet split does not partition anything and
+    # its per-regime rates are unstable: over a 22 min window they read 3.97 growing / 2.66 quiet,
+    # and over 29 min of the same run 2.88 / 4.56. Printing them invites reading noise as signal.
+    growing_share = t_writ / max(t_all, 1e-9)
+    degenerate = growing_share > 0.6
+
     print(f"{'regime':22s} {'wall min':>9s} {'steps':>8s} {'steps/s':>8s} {'GB/min':>8s}")
-    for name, g, (r, t, s) in (("archive growing", writing, (r_writ, t_writ, s_writ)),
-                               ("archive quiet", quiet, (r_quiet, t_quiet, s_quiet)),
-                               ("both", ivals, (r_all, t_all, s_all))):
+    rows = [("both", ivals, (r_all, t_all, s_all))] if degenerate else [
+        ("archive growing", writing, (r_writ, t_writ, s_writ)),
+        ("archive quiet", quiet, (r_quiet, t_quiet, s_quiet)),
+        ("both", ivals, (r_all, t_all, s_all))]
+    for name, g, (r, t, s) in rows:
         mb = sum(i["mb_min"] * i["dt"] / 60.0 for i in g) / max(t / 60.0, 1e-9)
         print(f"{name:22s} {t / 60:9.1f} {s:8d} {r:8.2f} {mb / 1024:8.2f}")
+    if degenerate:
+        print(f"  (per-regime rates suppressed: the archive is growing in "
+              f"{100 * growing_share:.0f}% of the samples, so the split partitions nothing and "
+              f"its numbers are noise)")
 
     if r_quiet <= 0:
         print("\nno step progress in the quiet samples yet — cannot split the two regimes")
@@ -124,12 +137,13 @@ def main() -> int:
     # DIAGNOSTIC: only meaningful while writing stalls the model completely.
     steps_while_writing = sum(i["dms"] for i in writing)
     share = steps_while_writing / max(s_all, 1)
-    if share > 0.1:
+    if degenerate or share > 0.1:
         print(f"\ncompute/output split: NOT APPLICABLE. {100 * share:.0f}% of the steps were "
-              f"taken while the archive was growing\n  ({r_writ:.2f} steps/s writing vs "
-              f"{r_quiet:.2f} quiet), so output is OVERLAPPING compute rather than blocking it "
-              f"and there is no stall to measure.\n  That is the good outcome: at "
-              f"compression_level=1 the model took ZERO steps for ~12 min per snapshot set.")
+              f"taken while the archive was growing, so output is OVERLAPPING compute rather "
+              f"than blocking it and there is no stall to measure.\n  That is the good outcome: "
+              f"at compression_level=1 the model took ZERO steps for ~12 min per snapshot set, "
+              f"which is what made the split possible.\n  The ACHIEVED rate above is the only "
+              f"number to quote; a no-output ceiling would need a run with the snapshots off.")
         if t_writ > 0:
             mbs = sum(i["mb_min"] * i["dt"] / 60.0 for i in writing) / (t_writ / 60.0) / 60.0
             print(f"  write throughput while growing: {mbs:.0f} MB/s "
