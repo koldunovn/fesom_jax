@@ -317,19 +317,37 @@ def remap_vertical(field, fine_depth, coarse_depth, *, fine_mask=None):
     return jnp.where(den > 0.0, num / jnp.where(den > 0.0, den, 1.0), 0.0)
 
 
-def elem_to_node(field_elem, mesh: Mesh):
+def elem_to_node(field_elem, mesh: Mesh, *, elem_mask=None):
     """Area-weighted element->node collocation.
 
     FESOM stores velocities on ELEMENTS while tracers live on nodes, so the teacher's
     u,v arrive elemental (and 1.93x larger than the nodal fields on CORE2). Everything
     downstream — the aggregation map, the eddy-flux products — is node-based, so this is
     where the two meet. ``field_elem``: (elem2D,) or (elem2D, nl).
+
+    ``elem_mask`` (same shape, 1 wet / 0 dry) excludes dry elements from BOTH the numerator
+    and the denominator, exactly as ``fine_mask`` does for nodes in
+    :func:`aggregate_horizontal_with_weight`. A node whose every adjacent element is dry
+    comes back 0.
+
+    ⚠️ **Pass it whenever the field can contain below-bottom entries, which on real FESOM
+    output is always.** Without a mask this function averages every adjacent element
+    unconditionally, so a WET node next to a DRY element inherits a third of whatever that
+    element holds — and FESOM writes ``_FillValue = 9.96921e+36`` there. Measured on NG5
+    month 01 (2026-08-08): 473,770 of 3,778,615 wet (node, level) cells came out at ~7.6e+36,
+    starting at level 3 and reaching 12.5% of the column. The surface was clean, which is
+    exactly why it survived a look at a surface map. Zeroing the fill before the call is
+    **not** sufficient on its own: the dry element then contributes a spurious zero and
+    dilutes the node's velocity toward the bottom, which looks physical.
     """
     x2 = field_elem.ndim == 2
     fe = field_elem if x2 else field_elem[:, None]
-    w = mesh.elem_area[:, None]
+    w = jnp.broadcast_to(mesh.elem_area[:, None], fe.shape)
+    if elem_mask is not None:
+        m = elem_mask if elem_mask.ndim == 2 else elem_mask[:, None]
+        w = w * jnp.broadcast_to(m, fe.shape).astype(w.dtype)
     vals = jnp.broadcast_to((w * fe)[:, None, :], (fe.shape[0], 3, fe.shape[1]))
-    wts = jnp.broadcast_to(jnp.broadcast_to(w, fe.shape)[:, None, :], vals.shape)
+    wts = jnp.broadcast_to(w[:, None, :], vals.shape)
     num = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D)
     den = ops.scatter_add(wts, mesh.elem_nodes, mesh.nod2D)
     out = jnp.where(den > 0.0, num / jnp.where(den > 0.0, den, 1.0), 0.0)

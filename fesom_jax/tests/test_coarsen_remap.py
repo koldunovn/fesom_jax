@@ -475,3 +475,67 @@ def test_the_tracer_chain_conserves_the_volume_integral():
     other = float(np.einsum("n,k,nk->", np.asarray(wgt2)[:, 0], dz_c, np.asarray(h2)))
     assert abs(other - fine_int) / abs(fine_int) < 1e-12
     np.testing.assert_allclose(np.asarray(v), np.asarray(h2), rtol=1e-12)
+
+
+def test_elem_to_node_masks_dry_elements_out_of_both_numerator_and_denominator(mesh):
+    """The bug this exists to prevent, found on real NG5 output 2026-08-08.
+
+    Without a mask, ``elem_to_node`` averages every adjacent element unconditionally, so a WET
+    node next to a DRY element inherits a third of whatever that element holds — and FESOM
+    writes ``_FillValue = 9.96921e+36`` below the bottom. Measured on month 01: 473,770 of
+    3,778,615 wet (node, level) cells came out at ~7.6e+36, starting at level 3. The surface was
+    clean, which is exactly why a surface map did not show it.
+
+    Zeroing the fill first is NOT enough, and the second half of this test is that point: a dry
+    element contributing a spurious zero dilutes the node toward the bottom, which looks like
+    physics. The mask must remove it from the weight as well.
+    """
+    rng = np.random.default_rng(21)
+    dry = rng.random(mesh.elem2D) < 0.25
+    m = jnp.asarray((~dry).astype(float))
+
+    # a poisoned field: the fill value where dry, a real value where wet
+    fe = np.full(mesh.elem2D, 3.0)
+    fe[dry] = 9.96921e36
+    got = np.asarray(coarsen.elem_to_node(jnp.asarray(fe), mesh, elem_mask=m))
+    en, ea = np.asarray(mesh.elem_nodes), np.asarray(mesh.elem_area)
+    touched = np.zeros(mesh.nod2D, dtype=bool)
+    for k in range(3):
+        np.add.at(touched, en[:, k], ~dry)
+    np.testing.assert_allclose(got[touched], 3.0, rtol=1e-14)
+    assert (got[~touched] == 0.0).all(), "a node with no wet element must be 0, not fill/3"
+    assert np.abs(got).max() < 1e3, f"fill leaked: max {np.abs(got).max():.3e}"
+
+    # ... and zeroing instead of masking is measurably WRONG, not merely different
+    fz = np.where(dry, 0.0, 3.0)
+    zeroed = np.asarray(coarsen.elem_to_node(jnp.asarray(fz), mesh))
+    diluted = touched & (zeroed < 2.999)
+    assert diluted.sum() > 0.1 * touched.sum(), \
+        "the zeroing variant should dilute many wet nodes — if not, this mesh has too few " \
+        "wet/dry neighbours for the test to discriminate"
+    # the masked answer is exact where the zeroed one is diluted
+    np.testing.assert_allclose(got[diluted], 3.0, rtol=1e-14)
+
+
+def test_elem_to_node_without_a_mask_is_unchanged(mesh):
+    """The mask is opt-in: every existing caller must get bit-identical results, since the
+    suite's GM/momentum gates compare against Fortran dumps."""
+    rng = np.random.default_rng(22)
+    fe = jnp.asarray(rng.normal(0.0, 1.0, mesh.elem2D))
+    a = np.asarray(coarsen.elem_to_node(fe, mesh))
+    b = np.asarray(coarsen.elem_to_node(fe, mesh, elem_mask=jnp.ones(mesh.elem2D)))
+    np.testing.assert_array_equal(a, b)
+
+
+def test_elem_to_node_mask_works_per_level(mesh):
+    """Bathymetry is per level: an element is wet at the surface and dry at depth, so the mask
+    must be (elem2D, nl) and applied level by level."""
+    nk = 3
+    fe = np.full((mesh.elem2D, nk), 2.0)
+    fe[:, 2] = 9.96921e36                       # whole deepest level is below the bottom
+    m = np.ones((mesh.elem2D, nk))
+    m[:, 2] = 0.0
+    got = np.asarray(coarsen.elem_to_node(jnp.asarray(fe), mesh, elem_mask=jnp.asarray(m)))
+    np.testing.assert_allclose(got[:, 0], 2.0, rtol=1e-14)
+    np.testing.assert_allclose(got[:, 1], 2.0, rtol=1e-14)
+    assert (got[:, 2] == 0.0).all(), "a fully dry level must be 0, not fill"

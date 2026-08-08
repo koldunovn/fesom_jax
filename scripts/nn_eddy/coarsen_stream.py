@@ -101,12 +101,24 @@ class FineMesh:
         # convention — nlevels is an INTERFACE count, so the layer bound is exclusive)
         self._ulev = np.load(d / "ulevels_nod2D.npy")
         self._nlev = np.load(d / "nlevels_nod2D.npy")
+        # ELEMENTAL level counts, for u/v. Same interface-count convention as the nodal ones.
+        self._eulev = np.load(d / "ulevels.npy")
+        self._enlev = np.load(d / "nlevels.npy")
         self.nl = int(np.load(d / "zbar.npy").shape[0])
         self.zbar = np.load(d / "zbar.npy")
 
     def layer_mask(self, k: int) -> np.ndarray:
         """1.0 where layer ``k`` is a real wet layer of this node, else 0.0."""
         return ((self._ulev - 1 <= k) & (k < self._nlev - 1)).astype(np.float64)
+
+    def elem_layer_mask(self, k: int) -> np.ndarray:
+        """1.0 where layer ``k`` is a real wet layer of this ELEMENT, else 0.0.
+
+        ⚠️ Needed because ``elem_to_node`` averages every adjacent element, so a wet node next
+        to a dry element inherits a third of what that element holds — and FESOM writes
+        ``_FillValue = 9.96921e+36`` below the bottom. See the note on ``elem_to_node``.
+        """
+        return ((self._eulev - 1 <= k) & (k < self._enlev - 1)).astype(np.float64)
 
 
 def build_or_load_map(cache: pathlib.Path, fine_dir, coarse_dir) -> RemapMap:
@@ -148,15 +160,32 @@ def build_or_load_map(cache: pathlib.Path, fine_dir, coarse_dir) -> RemapMap:
 # the per-level kernel
 # ---------------------------------------------------------------------------
 
-def level_products(T, S, u_el, v_el, mask, rmap, fine):
+FILL_ABOVE = 1e30      # FESOM's netCDF float fill is 9.96921e+36
+
+
+def read_slice(ds, var, rec, k):
+    """One (record, level) slice as float64 with the fill turned into an explicit NaN-free zero.
+
+    ⚠️ ``np.asarray(ds.variables[v][rec, k, :])`` STRIPS netCDF4's mask and hands the fill value
+    back as an ordinary number. That is the trap ``mesh_diag.load_w`` documents, and this script
+    walked into it: below-bottom entries entered the products at 9.96921e+36. Zeroing here is
+    necessary but NOT sufficient — a zeroed dry element still dilutes its neighbouring nodes, so
+    the caller must ALSO pass the element mask. Both, or neither works.
+    """
+    raw = np.ma.asarray(ds.variables[var][rec, k, :])
+    a = np.ma.filled(np.ma.masked_greater(np.ma.masked_invalid(raw), FILL_ABOVE), 0.0)
+    return np.asarray(a, dtype=np.float64)
+
+
+def level_products(T, S, u_el, v_el, mask, rmap, fine, elem_mask=None):
     """One fine level in, the coarse state and eddy fluxes for that level out.
 
     Returns ``(state, flux, weight)`` where ``state`` is (T,S,u,v), ``flux`` is
     (u'T', v'T', u'S', v'S') and ``weight`` is the wet cell area — 0 marks a coarse cell with
     nothing under it, which the caller must keep as "no data" rather than as a zero.
     """
-    u = coarsen.elem_to_node(u_el, fine)
-    v = coarsen.elem_to_node(v_el, fine)
+    u = coarsen.elem_to_node(u_el, fine, elem_mask=elem_mask)
+    v = coarsen.elem_to_node(v_el, fine, elem_mask=elem_mask)
 
     def agg(x):
         val, wgt = coarsen.aggregate_horizontal_with_weight(x, rmap, fine_mask=mask)
@@ -204,12 +233,25 @@ def verify_conservation(month, rec, rmap, fine, teacher: pathlib.Path, max_level
     worst = 0.0
     worst_k = -1
     area = np.asarray(rmap.fine_area)
+    _mask_warned = set()
     out_of_range = []
     area_err = None
     for k in range(nz1):
         m = np.asarray(fine.layer_mask(k))
         with netCDF4.Dataset(teacher / f"temp_snap.fesom.{month}.nc") as ds:
-            T = np.asarray(ds.variables["temp_snap"][rec, k, :], dtype=np.float64)
+            T = read_slice(ds, "temp_snap", rec, k)
+            # cross-check the MESH mask against the DATA's own fill pattern. They are independent
+            # sources of the same truth, so a disagreement means one of them is wrong — which is
+            # the only way to catch an off-by-one in either.
+            filled = np.asarray(np.ma.getmaskarray(
+                np.ma.masked_greater(np.ma.asarray(ds.variables["temp_snap"][rec, k, :]),
+                                     FILL_ABOVE)))
+        n_disagree = int(((m > 0) & filled).sum() + ((m == 0) & ~filled).sum())
+        if n_disagree and k not in _mask_warned:
+            _mask_warned.add(k)
+            print(f"  ⚠️ level {k + 1}: mesh mask and data fill disagree on {n_disagree} nodes "
+                  f"(mesh wet & filled: {int(((m > 0) & filled).sum())}, "
+                  f"mesh dry & unfilled: {int(((m == 0) & ~filled).sum())})")
         Tc, w = coarsen.aggregate_horizontal_with_weight(
             jnp.asarray(T), rmap, fine_mask=jnp.asarray(m))
         Tc, w = np.asarray(Tc), np.asarray(w)
@@ -284,15 +326,12 @@ def process_record(month, rec, rmap, fine, teacher: pathlib.Path, verbose=True,
         t0 = time.time()
         for k in range(nz1):
             m = jnp.asarray(fine.layer_mask(k))
-            T = jnp.asarray(np.asarray(ds["temp"].variables["temp_snap"][rec, k, :],
-                                       dtype=np.float64))
-            S = jnp.asarray(np.asarray(ds["salt"].variables["salt_snap"][rec, k, :],
-                                       dtype=np.float64))
-            ue = jnp.asarray(np.asarray(ds["u"].variables["u_snap"][rec, k, :],
-                                        dtype=np.float64))
-            ve = jnp.asarray(np.asarray(ds["v"].variables["v_snap"][rec, k, :],
-                                        dtype=np.float64))
-            st, fl, w = level_products(T, S, ue, ve, m, rmap, fine)
+            em = jnp.asarray(fine.elem_layer_mask(k))
+            T = jnp.asarray(read_slice(ds["temp"], "temp_snap", rec, k))
+            S = jnp.asarray(read_slice(ds["salt"], "salt_snap", rec, k))
+            ue = jnp.asarray(read_slice(ds["u"], "u_snap", rec, k))
+            ve = jnp.asarray(read_slice(ds["v"], "v_snap", rec, k))
+            st, fl, w = level_products(T, S, ue, ve, m, rmap, fine, elem_mask=em)
             for arr, x in zip(state, st):
                 arr[:, k] = np.asarray(x)
             for arr, x in zip(flux, fl):

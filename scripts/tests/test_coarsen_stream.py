@@ -59,7 +59,7 @@ def cs():
 N_FINE, N_COARSE, N_ELEM, NL = 8, 2, 4, 4      # NL interfaces => 3 layers
 
 
-def _fake_fine_mesh(dirpath: pathlib.Path, *, nlev=None):
+def _fake_fine_mesh(dirpath: pathlib.Path, *, nlev=None, enlev=None):
     dirpath.mkdir(parents=True, exist_ok=True)
     # two clusters of four, one near 0E and one near 90E, so the coarse assignment is obvious
     lon = np.array([0.0, 0.5, -0.5, 0.2, 90.0, 90.5, 89.5, 90.2])
@@ -77,6 +77,14 @@ def _fake_fine_mesh(dirpath: pathlib.Path, *, nlev=None):
     np.save(dirpath / "nlevels_nod2D.npy",
             (np.full(N_FINE, NL, dtype=np.int32) if nlev is None
              else np.asarray(nlev, dtype=np.int32)))
+    # ELEMENTAL level counts, for u/v. ⚠️ These were missing from this fixture, which is
+    # precisely why the suite could not catch the fill-value leak found on real NG5 output
+    # (2026-08-08): with no elemental bathymetry there is no dry element, so there is nothing
+    # for a wet node to inherit a fill value from.
+    np.save(dirpath / "ulevels.npy", np.ones(N_ELEM, dtype=np.int32))
+    np.save(dirpath / "nlevels.npy",
+            (np.full(N_ELEM, NL, dtype=np.int32) if enlev is None
+             else np.asarray(enlev, dtype=np.int32)))
     return dirpath
 
 
@@ -185,6 +193,85 @@ def test_the_dry_part_of_a_cell_does_not_enter_the_flux(cs, meshes):
 # ---------------------------------------------------------------------------
 # the layer-validity convention
 # ---------------------------------------------------------------------------
+
+def test_a_dry_element_next_to_a_wet_node_cannot_leak_its_fill_value(cs, tmp_path):
+    """Regression for the real failure, found on NG5 month 01 on 2026-08-08.
+
+    ``elem_to_node`` averages every adjacent element, so a WET node beside a DRY element
+    inherits a third of what that element holds — and FESOM writes ``_FillValue = 9.96921e+36``
+    below the bottom. On the real month that put 473,770 of 3,778,615 wet (node, level) cells at
+    ~7.6e+36, starting at level 3. The surface was clean, which is why a surface map missed it.
+
+    Element 0 of the west cluster is given only ONE valid layer while its nodes keep three, so at
+    layer 1 node 1 (which touches ONLY element 0) is wet beside a dry element, while node 3
+    (which touches only the still-wet element 1) is clean. The snapshot slice carries the fill in
+    element 0. The answer must be finite and physical.
+
+    ⚠️ Getting this case to reproduce the bug took three tries, and the two failures are worth
+    recording because both are ways a regression test can silently stop testing:
+      1. a UNIFORM T makes the contamination cancel exactly in agg(u*T) − agg(u)*agg(T);
+      2. so does a contaminated u that is uniform INSIDE the coarse cell — which is what happens
+         if every element under the cell is dry.
+    The covariance is zero whenever either field is constant on the cell, so the case needs both
+    fields varying and a MIX of wet and dry elements under one cell. The real data has exactly
+    that, which is why the real residual was 7.6e+36 rather than a clean cancellation.
+    """
+    fine_dir = _fake_fine_mesh(tmp_path / "fine", enlev=[2, NL, NL, NL])
+    coarse_dir = _fake_coarse_mesh(tmp_path / "coarse")
+    rmap = coarsen.build_remap(fine_dir, coarse_dir)
+    fine = cs.FineMesh(fine_dir)
+
+    k = 1
+    em = fine.elem_layer_mask(k)
+    np.testing.assert_array_equal(em, [0.0, 1.0, 1.0, 1.0])
+    nm = fine.layer_mask(k)
+    assert (nm > 0).all(), "the nodes must still be wet here, or the case is not the one"
+
+    FILL = 9.96921e36
+    ue = jnp.asarray(np.where(em > 0, 0.5, FILL))
+    # ⚠️ T must VARY inside the cell. With a uniform T the contamination cancels exactly in
+    # agg(u*T) - agg(u)*agg(T) and the unmasked flux comes out 0.0 — a correct answer that hides
+    # the bug. The real data varies, which is why the real residual was 7.6e+36.
+    T = jnp.asarray(np.where(np.arange(N_FINE) < 4, np.arange(N_FINE) + 1.0, 4.0))
+
+    state, flux, w = cs.level_products(T, jnp.zeros(N_FINE), ue, jnp.zeros(N_ELEM),
+                                       jnp.asarray(nm), rmap, fine, elem_mask=jnp.asarray(em))
+    # the STATE is contaminated directly, with no cancellation to hide behind
+    u_coarse = np.asarray(state[2])
+    assert np.isfinite(u_coarse).all() and np.abs(u_coarse).max() < 1e3, \
+        f"coarse u reached {np.abs(u_coarse).max():.3e} — fill leaked into the state"
+    for f, name in zip(flux, cs.FLUX_NAMES):
+        a = np.asarray(f)
+        assert np.isfinite(a).all(), f"{name} not finite"
+        assert np.abs(a).max() < 1e3, f"{name} reached {np.abs(a).max():.3e} — fill leaked"
+
+    # and WITHOUT the mask both must blow up, or this test proves nothing
+    bad_state, bad_flux, _ = cs.level_products(T, jnp.zeros(N_FINE), ue, jnp.zeros(N_ELEM),
+                                               jnp.asarray(nm), rmap, fine, elem_mask=None)
+    assert np.abs(np.asarray(bad_state[2])).max() > 1e30, \
+        "the unmasked path did NOT leak into u, so this case no longer reproduces the bug"
+    assert np.abs(np.asarray(bad_flux[0])).max() > 1e30, \
+        "the unmasked path did NOT leak into the flux — is T uniform inside the cell again?"
+
+
+def test_the_reader_turns_the_netcdf_fill_into_zero(cs, tmp_path):
+    """``np.asarray(ds.variables[v][rec, k, :])`` strips netCDF4's mask and returns the fill as
+    an ordinary number. ``read_slice`` must not do that."""
+    teacher = tmp_path / "teacher"
+    _fake_teacher_month(teacher, n_rec=1)
+    path = teacher / "temp_snap.fesom.1958_01.nc"
+    with netCDF4.Dataset(path, "a") as ds:
+        v = ds.variables["temp_snap"]
+        arr = np.asarray(v[:])
+        arr[0, 1, 0] = 9.96921e36
+        v[:] = arr
+    with netCDF4.Dataset(path) as ds:
+        naive = np.asarray(ds.variables["temp_snap"][0, 1, :])
+        got = cs.read_slice(ds, "temp_snap", 0, 1)
+    assert np.abs(naive).max() > 1e30, "the fixture did not actually store a fill value"
+    assert np.abs(got).max() < 1e3, f"read_slice let the fill through: {np.abs(got).max():.3e}"
+    assert got[0] == 0.0
+
 
 def test_layer_mask_treats_nlevels_as_an_interface_count(cs, tmp_path):
     """``nlevels = 4`` means interfaces 0..3, i.e. layers 0,1,2 — layer 3 does not exist. Off
