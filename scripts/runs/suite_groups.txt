@@ -66,6 +66,7 @@ ice fesom_jax/tests/test_ice_evp.py
 ice fesom_jax/tests/test_ice_ic.py
 ice fesom_jax/tests/test_ice_step.py
 ice fesom_jax/tests/test_ice_thermo.py
+scripts scripts/tests/test_check_coarse_product.py
 scripts scripts/tests/test_coarsen_stream.py
 scripts scripts/tests/test_horizon_scan.py
 scripts scripts/tests/test_lw_forward_seam.py
