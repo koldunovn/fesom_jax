@@ -5,17 +5,18 @@ This is the measurement the compute-budget gate turns on. The chain's log stamps
 on anything, so ``sample_teacher_rate.sh`` records (wallclock, last model step, archive size)
 every 60 s and this reads it back.
 
-The split is possible because the two regimes are cleanly separable in the raw samples:
+⚠️ **The split rests on an assumption that stopped being true.** At ``compression_level=1``
+(months 01-02) writing a snapshot set stalled the model completely: zero steps for ~12 minutes
+while the archive grew at 0.6-1.1 GB/min. That made the two regimes trivially separable. At
+``compression_level=0`` (months 03+) the writes are fast enough that the model **keeps stepping
+through them** — measured 2026-08-08: 3.97 steps/s in the "archive growing" samples against
+3.19 in the quiet ones, i.e. no stall at all, and the naive split reported "-19% of the wall time
+is output".
 
-* while a snapshot set is being written the model does **zero** steps and the archive grows at
-  0.6-1.1 GB/min;
-* while it is stepping, the archive is static and the step counter advances.
-
-So "compute rate" is the step rate over samples where the archive is not growing, and "output
-cost" is the wall time where it is. Both matter separately, because **the output cost does not
-change when the time step does** — halving the number of steps halves the compute and leaves
-the writes exactly where they were. That is the whole reason 64 nodes currently buys little
-over 32.
+So this script now reports the OVERALL rate as the primary number, which is assumption-free, and
+attempts the split only as a diagnostic. If the writing bucket contains a material share of the
+steps, the split is declared INVALID and the reason is printed rather than a nonsense percentage.
+That the split *fails* is itself the result worth having: output no longer blocks compute.
 
 ⚠️ Instantaneous step rate is NOT reliable per sample. FESOM prints its progress marker only
 every 960 steps, so a one-minute sample sees either 0 or 960 and neither is the rate. Always
@@ -115,7 +116,26 @@ def main() -> int:
     def sypd(steps_per_s):
         return steps_per_s / spd * 86400 / 365.0
 
-    print(f"\ncompute-only  {r_quiet:.2f} steps/s => {sypd(r_quiet):.3f} SYPD")
+    # PRIMARY, assumption-free: what the run actually achieved over the whole window.
+    print(f"\nACHIEVED      {r_all:.2f} steps/s => {sypd(r_all):.3f} SYPD at {args.nodes} nodes")
+    print(f"              => 10 SY in {10 / sypd(r_all):.1f} wall days = "
+          f"{10 / sypd(r_all) * 24 * args.nodes:,.0f} node-h")
+
+    # DIAGNOSTIC: only meaningful while writing stalls the model completely.
+    steps_while_writing = sum(i["dms"] for i in writing)
+    share = steps_while_writing / max(s_all, 1)
+    if share > 0.1:
+        print(f"\ncompute/output split: NOT APPLICABLE. {100 * share:.0f}% of the steps were "
+              f"taken while the archive was growing\n  ({r_writ:.2f} steps/s writing vs "
+              f"{r_quiet:.2f} quiet), so output is OVERLAPPING compute rather than blocking it "
+              f"and there is no stall to measure.\n  That is the good outcome: at "
+              f"compression_level=1 the model took ZERO steps for ~12 min per snapshot set.")
+        if t_writ > 0:
+            mbs = sum(i["mb_min"] * i["dt"] / 60.0 for i in writing) / (t_writ / 60.0) / 60.0
+            print(f"  write throughput while growing: {mbs:.0f} MB/s "
+                  f"(deflate level 1 measured 13 MB/s)")
+        return 0
+    print(f"compute-only  {r_quiet:.2f} steps/s => {sypd(r_quiet):.3f} SYPD")
     print(f"as observed   {r_all:.2f} steps/s => {sypd(r_all):.3f} SYPD  "
           f"({100 * (1 - r_all / r_quiet):.0f}% of the wall time is output)")
 
