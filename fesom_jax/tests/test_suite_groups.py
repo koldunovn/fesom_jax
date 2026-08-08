@@ -9,6 +9,14 @@ per-test cost.
 Checking the manifest from inside the suite (rather than only in the sbatch that reads it) means
 the failure lands on whoever adds the file, in the run they are already doing, instead of on
 whoever next looks at why a group takes three and a half hours.
+
+⚠️ These tests read the manifest at RUN time, so the manifest is mutable state that an
+in-flight suite depends on. Editing it mid-run makes them compare new data against old code and
+fail for no real reason — which is what happened on 2026-08-08 (job 26785831 started at 01:42
+with bare filenames and four groups; the manifest gained repo-relative paths and a fifth group at
+02:05, and the three tests below failed while the rest of the group was green). Same lazy-read
+hazard as editing a running bash script, milder consequences. **Do not edit the manifest while a
+suite is running.**
 """
 
 from __future__ import annotations
