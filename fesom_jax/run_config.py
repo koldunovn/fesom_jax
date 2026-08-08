@@ -46,6 +46,12 @@ YAML schema (every key optional; absent ⇒ the bit-identical default)::
     restart_archive_length: 1       # fire every Nth `period` boundary (1 = every one)
     n_steps: 1440           # OR a duration string the A6 driver parses
     duration: 2yr
+    params_file: /work/.../gm_nn_stage0.npz   # trained gm_nn weights; absent/null = default GM
+
+``params_file`` is the **deployment path for a trained closure** (NN-GM plan Task 7): the ``.npz``
+:func:`fesom_jax.gm_nn.save_gm_nn` writes, re-read on every leg of a restart chain, so which
+weights a run used is a property of its config rather than of the submitting shell. Absent or
+``null`` ⇒ ``params.gm_nn is None`` ⇒ default GM/Redi, byte-identical to a pre-seam run.
 
 ``restart_out``/``checkpoint_every`` are the ROLLING restart (crash recovery + chain hand-off —
 frequent, single directory, always overwritten, mirrors nothing before it existed). By contrast
@@ -86,7 +92,7 @@ _SUBCONFIGS = {
 _SPEC_FIELDS = ("dt", "mesh", "partition", "forcing", "ssh", "output_dir", "snapshot_every",
                 "checkpoint_every", "restart_in", "restart_out",
                 "restart_archive_out", "restart_archive_period", "restart_archive_length",
-                "n_steps", "duration")
+                "n_steps", "duration", "params_file")
 _ARCHIVE_PERIODS = ("year", "month", "day")
 # The `forcing:` mapping — WHAT the forcing is (`kind`/`start_year`) plus WHERE its input
 # files live. The four path keys are optional overrides of the env var / Levante default
@@ -130,6 +136,7 @@ class RunConfig:
     restart_archive_length: int = 1                 # fire every Nth `period` boundary
     n_steps: Optional[int] = None
     duration: Optional[str] = None
+    params_file: Optional[str] = None   # .npz of trained gm_nn weights; None ⇒ default GM
 
     # ----------------------------------------------------------------------
     @classmethod
@@ -144,6 +151,21 @@ class RunConfig:
         reader resolves it via ``$FESOM_*`` / the Levante default, :mod:`fesom_jax.paths`)."""
         f = self.forcing or {}
         return {k: f.get(k) for k in _FORCING_PATH_KEYS}
+
+    def load_params(self):
+        """The differentiable :class:`~fesom_jax.params.Params` this run's ``params_file``
+        describes, or ``None`` when there is no file.
+
+        ``None`` rather than ``Params.defaults()`` on purpose: the runners already treat
+        ``params=None`` as the defaults, so a config without ``params_file`` takes the exact
+        pre-existing code path and stays byte-identical. Called once per leg by
+        :func:`fesom_jax.run.run_from_config`, so a restart chain picks the weights up again on
+        every resubmit."""
+        if self.params_file is None:
+            return None
+        from .gm_nn import load_gm_nn
+        from .params import Params
+        return dataclasses.replace(Params.defaults(), gm_nn=load_gm_nn(self.params_file))
 
     def ssh_cheb(self) -> tuple:
         """The CGPOLY knobs from the ``ssh:`` block as ``(degree, kappa_guess)``;

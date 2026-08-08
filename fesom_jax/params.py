@@ -44,6 +44,12 @@ NN-replaces, so ``Params``-exposure is first-class, not an add-on):
 Like the GM leaves they carry **defaults** so older constructions stay valid; when
 ``tke_cfg is None`` they are unused → ``d/d(tke_c_k)=0``.
 
+The NN-GM project (paper 3) adds the NN form of the 2nd hook:
+
+* ``gm_nn`` — a bounded-multiplier MLP (:mod:`fesom_jax.gm_nn`) that turns the scalar
+  ``k_gm``/``redi_kmax`` ceilings into state-dependent fields. The scalars remain the base
+  the network multiplies, so both stay live and both stay differentiable.
+
 :meth:`Params.defaults` reproduces the config constants exactly (so passing
 ``Params.defaults()`` is numerically identical to the un-parameterised path).
 """
@@ -89,6 +95,12 @@ class Params:
     # (the regression invariant + deployment fallback). Kept un-annotated as a concrete type to
     # avoid an import cycle (tke_nn need not be imported to construct a baseline ``Params``).
     tke_nn: object = None
+    # Bounded-multiplier NN on the GM/Redi diffusivities (the Arm-A eddy closure of the NN-GM
+    # project, plan Task 7). Same contract as ``tke_nn``: ``None`` (default) ⇒ unused, no leaves,
+    # byte-identical to the scalar-κ path; a :class:`fesom_jax.gm_nn.GmNN` ⇒
+    # ``gm.gm_diagnostics`` scales ``fer_K`` by m_GM and ``Ki`` by m_Redi. A zero-last-layer NN
+    # ⇒ multipliers ≡ 1 ⇒ STILL bit-identical. Un-annotated for the same import-cycle reason.
+    gm_nn: object = None
 
     @staticmethod
     def defaults() -> "Params":
@@ -109,6 +121,6 @@ class Params:
 tree_util.register_dataclass(
     Params,
     data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
-                 "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn"],
+                 "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn", "gm_nn"],
     meta_fields=[],
 )

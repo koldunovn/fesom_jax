@@ -286,6 +286,7 @@ class RunResult(NamedTuple):
 
 
 def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=None,
+                    params=None,
                     state0=None, forcing_stack=None, start_step=0, year=1958,
                     chunk_steps=None, devices=None, out_dir=None, use_ragged=False,
                     use_padded=False, use_coloured=False,
@@ -310,6 +311,10 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     :class:`~fesom_jax.zarr_output.OnlineStats` (a coarse, gather-free time mean). Returns a
     :class:`RunResult`; writes the portable restart to ``out_dir`` / ``cfg.restart_out`` if set.
 
+    ``params`` (a :class:`~fesom_jax.params.Params`) may be injected; otherwise it comes from
+    ``cfg.params_file`` (trained ``gm_nn`` weights), and is ``None`` when there is no file — the
+    pre-existing default-parameter path, byte for byte.
+
     ``restart_archive_out`` (if set) additionally writes ARCHIVAL restarts: an immutable,
     uniquely-named directory (``_archive_tag`` — mirrors FESOM3's ``fesom.<YYYY>.<DDD>.<SSSSS>``)
     at every ``restart_archive_length``-th ``restart_archive_period`` ('year'/'month'/'day')
@@ -323,6 +328,20 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     cfg.validate()
     _t_entry = time.perf_counter()          # progress prints are relative to entry, not node uptime
     npes = part.npes
+    # Differentiable parameters: injected, else read from cfg.params_file (trained gm_nn weights),
+    # else None ⇒ the runners' own Params.defaults() path, byte-identical to a pre-seam run. Read
+    # per leg, so a restart chain keeps running the same closure after every resubmit.
+    _params_src = "injected" if params is not None else None
+    if params is None:
+        params = cfg.load_params()
+        _params_src = f"cfg.params_file={cfg.params_file}" if params is not None else None
+    if params is not None and jax.process_index() == 0:
+        # Which weights a run used is the first thing anyone asks of a result months later, so
+        # say it in the log AND say where they came from — "injected" and "read from the config"
+        # are different provenance and only one of them survives in the YAML.
+        print(f"[run] params: gm_nn="
+              f"{'set' if getattr(params, 'gm_nn', None) is not None else 'none'} "
+              f"({_params_src})", flush=True)
     # Output / restart on-disk layout. 'global' (default) = partition-INDEPENDENT canonical node
     # order (xarray/ushow read it directly; byte-identical at any device count) — it host-gathers
     # owned lanes on ONE process. 'folded' = the gather-free sharded [P*Lmax] write. A multi-node
@@ -645,7 +664,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             # contract. Demo-scale path — the fold reshape is fine there.
             _out = run_steps_sharded(
                 sm, state_p, _sop_for(ch.dt), stress_p, ch.count, dt=ch.dt, npes=npes,
-                use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
+                params=params, use_ragged=use_ragged, use_padded=use_padded,
+                use_coloured=use_coloured,
                 boundary_node_p=boundary_node_p, **cfg.physics_kwargs())
             state_p, acc_sum = folded_state(_out)[0], None
         else:
@@ -653,6 +673,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     if (forcing_on_device and seq_p is None) else {})
             _chunk_out = run_steps_sharded_forced(
                 sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
+                params=params,
                 bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
                 use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
                 boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,

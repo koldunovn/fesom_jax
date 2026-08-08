@@ -94,6 +94,10 @@ def grid_scan(loss_fn: Callable, base: dict, leaf: str, values: Iterable):
 
 # Fields of Params that are array/scalar tunables (everything registered as a leaf).
 _PARAM_FIELDS = frozenset(f.name for f in dataclasses.fields(Params))
+# Leaves that are themselves PYTREES (NN weight bundles), not scalars/fields: they pass through
+# `build_params` untouched, because `jnp.asarray` on a dataclass of weight tuples raises. A SET,
+# not a chain of special cases — the next network only adds its name here.
+_NN_LEAVES = frozenset({"tke_nn", "gm_nn"})
 
 
 def build_params(tun: dict) -> Params:
@@ -104,9 +108,9 @@ def build_params(tun: dict) -> Params:
     tunable dict and the model's structured parameter pytree — to add a tunable, add its
     key to ``tun`` (one line), nothing else changes.
 
-    Scalar/array leaves (``k_gm``, ``k_ver``, …) are coerced to float64; a pytree leaf
-    (the ``tke_nn`` MLP, once present) is passed through unchanged. Raises on an unknown
-    key (a typo'd leaf name is a silent no-op otherwise).
+    Scalar/array leaves (``k_gm``, ``k_ver``, …) are coerced to float64; the pytree leaves
+    (``_NN_LEAVES`` — the ``tke_nn`` / ``gm_nn`` MLPs) pass through unchanged. Raises on an
+    unknown key (a typo'd leaf name is a silent no-op otherwise).
 
     ⚠️ This is **generic** — it does NOT impose the C ``Redi_Kmax = K_GM_max`` auto-sync.
     A GM experiment couples them by passing both (``{'k_gm': θ, 'redi_kmax': θ}``), exactly
@@ -120,6 +124,6 @@ def build_params(tun: dict) -> Params:
             f"valid Params fields are {sorted(_PARAM_FIELDS)}")
     repl = {}
     for k, v in tun.items():
-        # tke_nn (a pytree leaf) passes through; scalars/fields → float64 arrays.
-        repl[k] = v if k == "tke_nn" else jnp.asarray(v, jnp.float64)
+        # NN weight bundles pass through; scalars/fields → float64 arrays.
+        repl[k] = v if k in _NN_LEAVES else jnp.asarray(v, jnp.float64)
     return dataclasses.replace(Params.defaults(), **repl)

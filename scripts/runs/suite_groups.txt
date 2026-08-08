@@ -35,6 +35,7 @@ core2 fesom_jax/tests/test_forcing.py
 core2 fesom_jax/tests/test_gm_bolus.py
 core2 fesom_jax/tests/test_gm_bolus_adv.py
 core2 fesom_jax/tests/test_gm_coeffs.py
+core2 fesom_jax/tests/test_gm_nn_seam.py
 core2 fesom_jax/tests/test_gm_redi.py
 core2 fesom_jax/tests/test_gm_slopes.py
 core2 fesom_jax/tests/test_gm_step.py
@@ -73,8 +74,10 @@ scripts scripts/tests/test_lw_forward_seam.py
 scripts scripts/tests/test_lw_foundation_check.py
 scripts scripts/tests/test_mesh_diag.py
 scripts scripts/tests/test_section_transport.py
+scripts scripts/tests/test_student_year.py
 scripts scripts/tests/test_write_namelist.py
 sharding fesom_jax/tests/test_forcing_sharded.py
+sharding fesom_jax/tests/test_gm_nn_sharded.py
 sharding fesom_jax/tests/test_gradient_sharded.py
 sharding fesom_jax/tests/test_halo.py
 sharding fesom_jax/tests/test_reductions_sharded.py

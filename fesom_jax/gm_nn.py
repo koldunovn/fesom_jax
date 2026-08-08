@@ -140,6 +140,17 @@ def column_features(slope, n2, grad_b, coriolis, depth, depth_frac, strain, *, s
     negative and zero, which a ``log`` is not. That matters because these fields carry masked
     lanes on an unstructured mesh and a single NaN poisons the whole reverse pass.
 
+    This is the ONE place the feature list is defined and ordered, and every producer must come
+    through it: the model seam (:func:`fesom_jax.gm.gm_nn_multipliers`), the offline fit's
+    product-derived features, and the twin. Two orderings, or two sets of arcsinh scales, is a
+    silent train/deploy skew that no test on either side alone would catch.
+
+    ``strain`` is currently passed as **0.0** by the seam — the strain/shear invariant needs the
+    element velocities threaded into the GM coefficient block, which it does not receive, so the
+    feature is deferred to the plan's D2 screen. It is kept in the layout rather than dropped so
+    that a weight file trained now still loads if strain lands later; the cost is that its
+    first-layer row sees no gradient until then.
+
     ``smoothed`` — optional tuple of the SAME seven fields after mesh-Laplacian smoothing. When
     given, the output is the local features concatenated with the smoothed ones, giving the
     point-wise network the horizontal context a CNN would get from its receptive field. Keep the
@@ -163,3 +174,59 @@ def column_features(slope, n2, grad_b, coriolis, depth, depth_frac, strain, *, s
             f"smoothed must hold the same {N_FEATURES_LOCAL} fields as the local ones, in the "
             f"same order; got {len(smoothed)}")
     return jnp.concatenate([local, _f(*smoothed)], axis=-1)
+
+
+# ============================================================================
+# Weight (de)serialization — the deployment path
+# ============================================================================
+def save_gm_nn(path, nn: GmNN) -> None:
+    """Write ``nn`` to an ``.npz``: ``W0..W{n-1}``, ``b0..b{n-1}``, ``log_m_max``, ``hidden``,
+    ``two_scale``.
+
+    The file format IS the deployment interface: training writes it, a forward run reads it
+    through ``RunConfig.params_file``, and a restart-leg chain re-reads it on every leg.
+
+    **``log_m_max`` must be in the file.** It is a ``meta`` field of the pytree precisely so the
+    optimiser cannot train the safety bound away — which means it is NOT among the weights, and
+    an npz of weights alone would silently rebuild with the class default. A network trained
+    under ``m_max=3`` reloaded as ``m_max=3`` is the whole safety argument; reloaded as anything
+    else it is a different closure wearing the same weights.
+
+    ``hidden``/``two_scale`` are redundant with the weight shapes on purpose: they let
+    :func:`load_gm_nn` catch a file whose shapes and intent disagree, rather than discovering it
+    at the first matmul inside a jitted step."""
+    import numpy as np
+    arrays = {f"W{i}": np.asarray(W, np.float64) for i, W in enumerate(nn.Ws)}
+    arrays.update({f"b{i}": np.asarray(b, np.float64) for i, b in enumerate(nn.bs)})
+    arrays["log_m_max"] = np.asarray(nn.log_m_max, np.float64)
+    arrays["hidden"] = np.asarray([W.shape[1] for W in nn.Ws[:-1]], np.int64)
+    arrays["two_scale"] = np.asarray(nn.Ws[0].shape[0] == n_features(True), bool)
+    np.savez(path, **arrays)
+
+
+def load_gm_nn(path) -> GmNN:
+    """Read a :class:`GmNN` back from :func:`save_gm_nn`'s ``.npz`` — float64, exact, and with
+    the same treedef (``log_m_max`` included) as the object that was saved.
+
+    Validates the recorded ``hidden``/``two_scale`` against the actual weight shapes and raises
+    on disagreement: a weight file is the one artefact that outlives the session that made it,
+    so it either reconstructs the network it describes or it fails here."""
+    import numpy as np
+    with np.load(path) as z:
+        n = sum(1 for k in z.files if k.startswith("W"))
+        if n == 0 or any(f"b{i}" not in z.files for i in range(n)):
+            raise ValueError(f"{path}: not a gm_nn weight file (found keys {sorted(z.files)})")
+        Ws = tuple(jnp.asarray(z[f"W{i}"], jnp.float64) for i in range(n))
+        bs = tuple(jnp.asarray(z[f"b{i}"], jnp.float64) for i in range(n))
+        if "hidden" in z.files:
+            hidden = tuple(int(h) for h in z["hidden"])
+            actual = tuple(int(W.shape[1]) for W in Ws[:-1])
+            if hidden != actual:
+                raise ValueError(f"{path}: recorded hidden sizes {hidden} disagree with the "
+                                 f"weight shapes {actual}")
+        if "two_scale" in z.files:
+            want = n_features(bool(z["two_scale"]))
+            if int(Ws[0].shape[0]) != want:
+                raise ValueError(f"{path}: two_scale={bool(z['two_scale'])} implies "
+                                 f"{want} input features, but W0 takes {Ws[0].shape[0]}")
+        return GmNN(Ws=Ws, bs=bs, log_m_max=float(z["log_m_max"]))

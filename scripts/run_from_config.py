@@ -64,6 +64,9 @@ def main():
     ap.add_argument("--restart-in", help="override cfg.restart_in (resume here; any device count)")
     ap.add_argument("--restart-out", help="override cfg.restart_out (write the restart here)")
     ap.add_argument("--steps", type=int, help="override cfg.n_steps")
+    ap.add_argument("--params-file", default=None,
+                   help="override cfg.params_file (.npz of trained gm_nn weights; absent = "
+                        "default GM/Redi)")
     ap.add_argument("--partition", help="override cfg.partition (e.g. dist_8 -> dist_16 for a "
                                         "device-count-change restart)")
     ap.add_argument("--ragged", action="store_true",
@@ -153,6 +156,8 @@ def main():
         repl["n_steps"] = args.steps
     if args.partition is not None:
         repl["partition"] = args.partition
+    if args.params_file is not None:
+        repl["params_file"] = args.params_file
     if args.forcing_on_device:
         repl["forcing"] = dict(cfg.forcing or {}, on_device=True)
     if args.cheb_degree is not None:
