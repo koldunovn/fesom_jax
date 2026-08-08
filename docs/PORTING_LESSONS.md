@@ -6056,3 +6056,53 @@ in doubt) but that the hole pattern is *identical* to the 3-D product's surface 
 against the vertically-remapped 3-D weight. That identity is what lets a downstream join mask both
 files with ONE mask; without it, a cell that is a hole in one and not the other silently
 contributes a ~1 m fabricated SSH error to the loss.
+
+## 2026-08-08 (8) — "in bounds" is not evidence that the thing under test is switched on
+
+The M1 stability gate ran 10 days from a developed state with a randomly-perturbed GM network and
+checked T, S and |η| at every daily mark against generous bounds. It passed. It also told me
+almost nothing, and I nearly recorded it as if it had.
+
+The two arms — perturbed network and `gm_nn=None` control — produced daily global extrema that
+agreed to **0.01 K on 8 of 10 days**. That is the *correct* behaviour for a bounded κ multiplier:
+a global min/max is set by the coldest polar water and the warmest tropical surface point, and GM
+has no authority over either. But it is indistinguishable from the outcome where the network never
+reached the step at all, and a gate whose pass condition is satisfied equally by "works" and "not
+plumbed in" is not a gate. Measuring the trajectory difference directly settled it in one number:
+**max|ΔT| = 0.671 K at day 10** (area-RMS 2.5e-3 K, max|ΔS| = 0.347, max|Δη| = 4.8 mm). Active,
+and by a wide margin.
+
+The rule: for any gate on a *new* code path, ask what the pass condition would look like if the
+path were dead. If the answer is "the same", the gate needs a term that can only be nonzero when
+the path runs. `seam_gate.py` now refuses a `stable` verdict when the two arms are bit-identical.
+
+## 2026-08-08 (9) — closing over a big array puts it in the executable, once per executable
+
+The gradient half of the same gate died twice with `RESOURCE_EXHAUSTED: Out of memory while trying
+to allocate 49.53GiB` on an 80 GB A100 — while evaluating a **forward** pass whose stability-mode
+twin had just run in 13 GB. The number is absurd on its face, which is what made it findable: no
+tensor in a 5-day CORE2 window is 49 GB.
+
+Buried above the traceback was the real message: `A large amount of constants were captured during
+lowering (4.58GB total)`, and again at 3.77 GB. My `loss` closed over the 240-step forcing stack,
+the target `State`, the wet mask, the area array and the weights, and I jitted **three** separate
+functions over it (forward, loss, grad). Each lowering embeds those closures as compile-time
+constants, so the same gigabytes were resident once per executable, and XLA then fused a step whose
+working set had nowhere to go.
+
+The fix is to pass every large array as an **argument**. What stings is that this plan's own M6
+already says so — "windows enter the jitted `value_and_grad` as ARGUMENTS (fixed shapes ⇒ ONE
+compile) — do NOT close over the batch" — as an argument about retracing and compile count. It is
+the same rule for memory, and I wrote a script that violated it three days after the plan recorded
+it. Reading a plan's rules as advice about the thing they were written about is how you rediscover
+them.
+
+Two smaller things from the same failure:
+* **A traceback's line numbers come from the file as it is NOW, not as the job read it.** I had
+  edited `seam_gate.py` while the job ran, so the rendered source lines pointed at unrelated
+  comments and the frames looked nonsensical. `executable_name=` in the JAX error and the
+  allocator warnings above the traceback were the trustworthy parts. (Mirror of the
+  sbatch-snapshots-at-submission lesson: the .sbatch is frozen at submit, the .py is read at
+  process start, and the traceback is rendered later still.)
+* Pull what you need to host and free the rest: keeping a whole 1.8 GB `State` alive to reference
+  three of its fields is most of a jitted graph's headroom on this mesh.

@@ -276,7 +276,16 @@ def run_gradient(args):
     ``loss_at_probe`` here means the plumbing is wrong, before any gradient is believed. It is
     exact rather than approximate only because the target comes through the IDENTICAL graph
     (same remat, same checkpoint segmentation) as the loss; a differently-segmented forward
-    reassociates and would leave a small nonzero residual that hides real plumbing bugs."""
+    reassociates and would leave a small nonzero residual that hides real plumbing bugs.
+
+    ⚠️ **Big arrays are ARGUMENTS, never closures.** The first version of this function closed
+    over the 240-step forcing stack, the target state, the masks and the weights, and jitted
+    three separate functions (forward, loss, grad). Each lowering then embedded those arrays as
+    compile-time constants — measured 4.58 GB and 3.77 GB in two of them — and the run died with
+    ``RESOURCE_EXHAUSTED: 49.53GiB`` on an 80 GB card while merely evaluating a FORWARD
+    (jobs 26798462/3). The child plan's M6 already states this rule for the training driver
+    ("windows enter the jitted value_and_grad as ARGUMENTS — do NOT close over the batch"); it
+    is written there as a compile-count argument and it is a memory argument too."""
     n = GRAD_DAYS * STEPS_PER_DAY
     mesh, op, st0, cf, dates = build(args.snap, args.year, n)
     fs = cf.static
@@ -284,18 +293,23 @@ def run_gradient(args):
     wet3d = jnp.asarray(mesh.node_layer_mask, jnp.float64)
     area3d = jnp.asarray(np.asarray(mesh.areasvol), jnp.float64) * wet3d
     sfs = cf.stack(dates[:n])
-    segments = max(2, int(round(math.sqrt(n))))          # the horizon-scan √N choice
+    # segments: √N is the standard O(√N)-memory choice; --seg-mult > 1 stores fewer carries and
+    # recomputes more, the knob horizon_scan exposes as $HORIZON_SEG_MULT.
+    segments = max(2, int(round(args.seg_mult * math.sqrt(n))))
 
-    def forward(alpha):
+    def forward(alpha, state0, xs):
         p = dataclasses.replace(Params.defaults(), gm_nn=scaled_last_layer(nn, alpha))
-        return _run_steps(body_for(mesh, op, fs, p, remat=True), st0, xs=sfs,
+        return _run_steps(body_for(mesh, op, fs, p, remat=True), state0, xs=xs,
                           checkpoint=True, segments=segments)
 
-    fwd_jit = jax.jit(forward)
     a1 = jnp.asarray(1.0, jnp.float64)
     t0 = time.time()
-    tgt = fwd_jit(a1)
-    T_hat, S_hat, e_hat = tgt.T, tgt.S, tgt.eta_n
+    tgt = jax.jit(forward)(a1, st0, sfs)
+    # Pull the three target fields to HOST and drop the device State: keeping a whole 1.8 GB
+    # State alive for three arrays is most of a jitted graph's headroom.
+    T_hat, S_hat, e_hat = (jnp.asarray(x) for x in jax.device_get((tgt.T, tgt.S, tgt.eta_n)))
+    _free(tgt)
+    del tgt
     print(f"[target] 5-day reference trajectory in {time.time()-t0:.1f} s", flush=True)
 
     # Per-level inverse-variance weights. A single-mark loss has no temporal variance of its
@@ -320,13 +334,16 @@ def run_gradient(args):
     print(f"[weights] w_T surf={float(w_T[0]):.3e}  w_S surf={float(w_S[0]):.3e}  "
           f"w_eta={float(w_eta):.3e}", flush=True)
 
-    def loss(alpha):
-        s = forward(alpha)
-        return stage1_misfit(s.T, s.S, s.eta_n, T_hat, S_hat, e_hat,
-                            w_T, w_S, w_eta, wet3d, area3d)
+    def loss_of(alpha, state0, xs, Th, Sh, eh, wT, wS, we, wet, area):
+        """The 5-day misfit. EVERY large array is a parameter — see the docstring's warning."""
+        s = forward(alpha, state0, xs)
+        return stage1_misfit(s.T, s.S, s.eta_n, Th, Sh, eh, wT, wS, we, wet, area)
 
-    loss_jit = jax.jit(loss)
-    grad_jit = jax.jit(jax.grad(loss))
+    _big = (st0, sfs, T_hat, S_hat, e_hat, w_T, w_S, w_eta, wet3d, area3d)
+    _loss_jit = jax.jit(loss_of)
+    _grad_jit = jax.jit(jax.grad(loss_of, argnums=0))
+    loss_jit = lambda a: _loss_jit(a, *_big)              # noqa: E731
+    grad_jit = lambda a: _grad_jit(a, *_big)              # noqa: E731
     l_at_probe = float(loss_jit(a1))                      # harness self-check: must be 0
     t1 = time.time()
     ad = float(grad_jit(a1))
@@ -371,6 +388,8 @@ def main():
                     help="init weight scale — larger = a more aggressive multiplier field")
     ap.add_argument("--alpha0", type=float, default=0.5,
                     help="probe point for the FD check (off the loss minimum at alpha=1)")
+    ap.add_argument("--seg-mult", type=float, default=1.0,
+                    help="checkpoint segments = seg_mult*sqrt(n); >1 trades recompute for memory")
     ap.add_argument("--results", type=Path, default=OUT_DEFAULT / "seam_gate.jsonl")
     args = ap.parse_args()
 
