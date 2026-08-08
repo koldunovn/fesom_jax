@@ -5786,3 +5786,92 @@ than the individual fixes.
   were among them; the files carrying finite-difference checks were not. An FD check costs two
   extra forwards and cannot be fooled — if the path is dead, AD returns 0 and FD does not.
   Same lesson as GATE HORIZON_OK, which passed on FD *sign* alone and was wrong by 411%.
+
+---
+
+## 2026-08-08 — NN-GM session: seven ways a check can look like it is working
+
+All seven were found in one night, and the common thread is that each *passed* while measuring
+something other than what it claimed. Ordered by how much they cost.
+
+### 1. A netCDF MaskedArray converted with `np.asarray` hands you the fill value as a number
+
+FESOM writes `_FillValue = 9.96921e+36` below the bottom. `np.asarray(ds.variables[v][rec,k,:])`
+strips netCDF4's mask and returns those as ordinary floats. Already documented in
+`scripts/nn_eddy/mesh_diag.py:load_w`; I quoted it in a new `load_elem_field` and then wrote a
+different reader in `coarsen_stream.py` without it. **Knowing a trap and applying it are separate
+acts.** The rule: there should be ONE reader per file family, and nothing else should touch
+`ds.variables[...]` directly.
+
+### 2. Masking the value is not the same as masking the weight
+
+`elem_to_node` averaged all elements adjacent to a node. A WET node beside a DRY element inherited
+a third of the fill. Zeroing the fill first does not fix it — the dry element then contributes a
+spurious zero and *dilutes* the node's velocity toward the bottom, which looks physical and would
+never be questioned. A mask must leave both the numerator and the denominator, which is what
+`aggregate_horizontal` already did for nodes. 473,770 of 3,778,615 wet cells were affected, from
+level 3 down; **level 0 was clean, which is exactly why a surface map did not show it.**
+
+### 3. A covariance test is degenerate whenever either field is uniform
+
+`agg(u·τ) − agg(u)·agg(τ)` is **exactly** zero if u or τ is constant on the cell. Two successive
+attempts to write a regression for the fill leak returned a clean 0.0: first with a uniform τ,
+then with a u that was uniformly contaminated because every element under the cell was dry. A
+Reynolds-decomposition test needs both fields varying and, for the masking case, a mix of wet and
+dry elements under one cell. Assert that the broken path still fails, or the test can silently
+stop discriminating.
+
+### 4. A conservation identity can be nearly algebraic
+
+`Σ(value × weight) == Σ num` where `value = num/den` and `weight = den` holds to 3e-16 on real
+data **even with a wrong mask or a transposed slice**, as long as both sides use the same wrong
+thing. It is worth printing but it is not a plumbing check. The checks that actually test the
+plumbing: an area-weighted average cannot leave the range of its inputs, and the summed weight
+must equal the mesh's own wet area.
+
+### 5. A tolerance sized from one case fails on a structurally different one
+
+Three GPU identity gates failed while their CPU equivalents passed. The two sides of each are
+separate `jax.jit` closures, so XLA compiles two mathematically equivalent but structurally
+different programs. The spread: 1 ulp for a one-step mEVP forward, ~160 ulp for `whichEVP=0`
+(a `stop_gradient` inside a 120-sweep loop reorders the accumulation), **4.7e-11 relative — 2e5
+ulp — for a gradient through an 8-step reverse pass**. Every fixed tolerance had been sized from
+whichever case was measured first. Fix: calibrate against a scale measured in the same test — a
+tenth of the response to a 1e-10 K perturbation for forwards, a millionth of what a flag that
+really does something moves it for gradients (`fesom_jax/tests/_identity_gates.py`). It also then
+fails when the fixture's control is dead, which no constant can do.
+
+### 6. Tests that encode an assumed file convention instead of reading the file
+
+The teacher chain's 27 logic tests asserted `months_elapsed(1958, 32) == 1`, i.e. "the clock
+reports the first day of the next month with zero seconds". FESOM writes
+`(86400, LAST day of the completed month)` — after February, `86400.0 59 1958`. So the chain
+counted one month where two had passed, and would have run a third ramp month with the time-step
+switch a month late. `months_remaining` was off by one in the same direction, which is why the
+pair looked self-consistent. **A convention test must read a real artefact.** The fix converts the
+clock to an absolute instant and counts month ends, so it is correct under either convention.
+
+### 7. `strings | grep -c "^name$"` is a false-negative machine
+
+The chain probed its own binary for restart variables and reported `sigma11 in lib: 0` on every
+job while the feature was present throughout. Compilers pack short literals adjacent to their
+neighbours, so `sigma11` never gets a line of its own, while `hnode_new` and `d_eta` each happen
+to get four. Three trues and a false negative is worse than no check: it reads as a missing fix
+and invites redoing work. Probe a long unique string (the variable's description), with `grep -F`.
+
+### Two mechanical ones, for completeness
+
+* **`GROUPS` is a bash built-in array** of the current user's group IDs. Assigning to it is
+  silently ignored, so a suite runner read gid 1221 as a group name. It was found in one minute
+  only because an "empty group" guard existed; without it the run would have tested nothing and
+  exited 0.
+* **`cp` truncates the inode a running bash script is reading.** Bash reads a script lazily by
+  byte offset, and a self-resubmitting chain sits parked inside `srun` for hours with the file
+  open. `cp` opens the destination `O_TRUNC` and rewrites that inode, so the parked shell resumes
+  mid-token. `mv` swaps in a new inode and the running job reads its own to the end.
+
+### And a coverage hole the above made visible
+
+Every suite runner globbed `fesom_jax/tests/` only, so the seven files under `scripts/tests/` —
+64 tests, including the 12 mesh-diagnostic tests the plan records as passing — had **never run in
+the suite**. They passed; they only ever passed by hand.
