@@ -271,11 +271,18 @@ def test_mevp_precompute_P(mevp_s1):
     assert np.abs(pf).max() > 10.0                           # pressure_fac is non-trivial
 
 
-@pytest.mark.parametrize("it,tol", [(1, 1e-13), (2, 1e-13), (60, 1e-11), (120, 5e-12)])
+@pytest.mark.parametrize("it,tol", [(1, 1e-13), (2, 1e-13), (60, 1e-11), (120, 1e-11)])
 def test_mevp_iterate_velocity(mevp_s1, it, tol):
     """Per-iterate u_aux/v_aux (the BINDING metric) vs the C it{1,2,60,120} dump. it1 is
     bit-identical (pure wind-stress map, no scatter); the late-iterate floor is the accumulated
-    element→node scatter reassociation (16-rank C vs single-device JAX)."""
+    element→node scatter reassociation (16-rank C vs single-device JAX).
+
+    The ladder must be MONOTONE in it: the floor ACCUMULATES, so a bound tighter at it120
+    than at it60 is a constant fitted to one compilation, not a claim about the comparison.
+    That is how it failed 2026-08-07/08: an unrelated signature change re-fused the GPU graph,
+    the scatter order shifted, and it120 moved from 2.6e-12 to 7.2e-12 against the old 5e-12 —
+    while the identical build passed bit-exactly on CPU (verify.26786510), proving the number
+    that moved was the compilation, not the physics. it120 now shares it60's 1e-11."""
     from fesom_jax import io_dump
     f, m = _pt(f"it{it}", "node", mevp_s1["n_nod"])
     ua = io_dump.evp_component(f, m, f"it{it}", "u_aux")
@@ -414,7 +421,9 @@ def test_mevp_s2_replay(mesh):
         carry = im.mevp_iterate(cfg, mesh, *carry, st, u0, v0, u_w, v_w, sax, say, cfg.ice_dt)
         if it in (1, 2, 60, 120):
             snaps[it] = tuple(np.asarray(x) for x in carry)
-    tol = {1: 1e-13, 2: 1e-13, 60: 1e-11, 120: 5e-12}
+    tol = {1: 1e-13, 2: 1e-13, 60: 1e-11, 120: 1e-11}   # monotone in it — see
+    # test_mevp_iterate_velocity: the late-iterate floor is accumulated scatter
+    # reassociation and moves with the compilation, so it120 cannot be tighter than it60.
     for it in (1, 2, 60, 120):
         f, m = io_dump.load_mevp_dump(MEVP_DUMP, [f"it{it}"], step=2, array="node", n_nod=n_nod)
         ua = io_dump.evp_component(f, m, f"it{it}", "u_aux")
@@ -423,7 +432,7 @@ def test_mevp_s2_replay(mesh):
         assert du < tol[it] and dv < tol[it], f"s2 it{it} u|Δ|={du:.2e} v|Δ|={dv:.2e}"
     f, m = io_dump.load_mevp_dump(MEVP_DUMP, ["UF"], step=2, array="node", n_nod=n_nod)
     duf = float(np.abs(snaps[120][0] - io_dump.evp_component(f, m, "UF", "u_ice")).max())
-    assert duf < 5e-12, f"s2 UF u|Δ|={duf:.2e}"
+    assert duf < 1e-11, f"s2 UF u|Δ|={duf:.2e}"   # it120-class quantity ⇒ it120-class bound
 
 
 @pytest.fixture(scope="module")
