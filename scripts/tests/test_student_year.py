@@ -33,6 +33,18 @@ def test_branch_start_dates_1958():
     assert sy.branch_start_date(1958, 330) == (11, 27)
 
 
+def test_model_to_teacher_levels_trims_only_dry_padding():
+    """CORE2's JAX mesh carries 48 columns, the teacher product 47 true layers. Trimming
+    is legal only when every extra column is globally dry — and must REFUSE otherwise."""
+    import pytest
+    wet = np.ones((6, 5), bool)
+    wet[:, 4] = False                      # trailing dry padding
+    assert se.model_to_teacher_levels(wet, 4) == slice(0, 4)
+    wet[2, 4] = True                       # one wet cell in the "padding"
+    with pytest.raises(AssertionError, match="not padding"):
+        se.model_to_teacher_levels(wet, 4)
+
+
 def test_mark_index_absorbs_one_dt_offset():
     # teacher records sit one fine-dt SHORT of the round mark; both ramp (120 s) and
     # production (240 s) offsets must land on the same mark as the exact time

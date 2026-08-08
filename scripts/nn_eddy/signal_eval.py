@@ -47,6 +47,19 @@ def month_files(coarse_dir: Path, year: int):
     return sorted(p for p in coarse_dir.iterdir() if pat.match(p.name))
 
 
+def model_to_teacher_levels(wet_model, nz_teacher: int) -> slice:
+    """The JAX mesh arrays carry trailing below-bottom PADDING columns (CORE2: 48 columns,
+    the deepest two globally dry — verified 2026-08-08); the teacher product stores true
+    layers only (nz1=47). Trimming is exact ONLY if every extra column is globally dry —
+    assert it rather than assume it."""
+    import numpy as np
+    wm = np.asarray(wet_model)
+    assert wm.shape[1] >= nz_teacher, (wm.shape, nz_teacher)
+    assert wm[:, nz_teacher:].sum() == 0, \
+        "model columns beyond the teacher's carry wet cells — not padding; do NOT trim"
+    return slice(0, nz_teacher)
+
+
 def assemble_teacher(coarse_dir: Path, year: int):
     """-> (marks dict k -> (T[N,nz], S[N,nz]), wet mask [N,nz] bool, sorted mark list)."""
     import netCDF4
@@ -101,6 +114,10 @@ def main():
 
     mesh = load_mesh(args.mesh_dir)
     wet_model = np.asarray(mesh.node_layer_mask, bool)
+    sl = model_to_teacher_levels(wet_model, wet_t.shape[1])
+    wet_model = wet_model[:, sl]
+    T_s, S_s = T_s[:, :, sl], S_s[:, :, sl]
+    areasvol = np.asarray(mesh.areasvol)[:, sl]
     assert wet_model.shape == wet_t.shape == T_s.shape[1:], \
         (wet_model.shape, wet_t.shape, T_s.shape)
     wet = wet_model & wet_t
@@ -108,7 +125,7 @@ def main():
     print(f"[mask] student-wet cells with no teacher data (excluded): {excl} "
           f"({100*excl/max(wet_model.sum(),1):.2f}% of wet)", flush=True)
     wet3d = jnp.asarray(wet, jnp.float64)
-    area3d = jnp.asarray(np.asarray(mesh.areasvol), jnp.float64) * wet3d
+    area3d = jnp.asarray(areasvol, jnp.float64) * wet3d
 
     # weights: teacher anomaly variance over its own year of marks (floored), w_eta unused
     Tt_stack = jnp.asarray(np.stack([marks_t[k][0] for k in klist]), jnp.float64)
@@ -153,17 +170,19 @@ def main():
         for f in sorted(args.student_dir.glob(f"branch_d{day0:03d}_m*.npz")):
             b = np.load(f)
             m = float(b["mult"])
+            T5, S5 = b["T5"][:, sl], b["S5"][:, sl]
+            T10, S10 = b["T10"][:, sl], b["S10"][:, sl]
             k5, k10 = day0 // 5 + 1, day0 // 5 + 2
             row = dict(day0=day0, mult=m)
             if k5 in marks_t:
-                row["L5"] = misfit(b["T5"], b["S5"], *marks_t[k5])
+                row["L5"] = misfit(T5, S5, *marks_t[k5])
             if k10 in marks_t:
-                row["L10"] = misfit(b["T10"], b["S10"], *marks_t[k10])
+                row["L10"] = misfit(T10, S10, *marks_t[k10])
             if abs(m - 1.0) < 1e-9 and k5 in kmap_s and k10 in kmap_s:
                 floors.append(dict(day0=day0,
-                                   L5_floor=misfit(b["T5"], b["S5"],
+                                   L5_floor=misfit(T5, S5,
                                                    T_s[kmap_s[k5]], S_s[kmap_s[k5]]),
-                                   L10_floor=misfit(b["T10"], b["S10"],
+                                   L10_floor=misfit(T10, S10,
                                                     T_s[kmap_s[k10]], S_s[kmap_s[k10]])))
             rows.append(row)
         if rows:
