@@ -29,5 +29,34 @@ echo "=== checkout: $(pwd)  commit: $(git rev-parse --short HEAD 2>/dev/null) ==
 echo "=== args: $* ==="
 "$PY" scripts/nn_eddy/coarsen_stream.py "$@"
 rc=$?          # NB: read rc BEFORE anything else runs — $(date) would overwrite $?
+
+# Check every product this job wrote, in the same job. On 2026-08-08 a month completed with
+# FESOM's fill value in 12.5% of its column and reported sensible surface statistics; it was
+# caught by reading the file afterwards, which is a thing that happens once. Running the checker
+# here makes a contaminated product a FAILED JOB instead of a file somebody trusts. Skipped for
+# --verify-conservation and --max-levels runs, which write nothing usable.
+case " $* " in
+  *" --verify-conservation "*|*" --max-levels "*) ;;
+  *)
+    if [ "$rc" -eq 0 ]; then
+        OUTDIR=/work/ab0995/a270088/nn_eddy/coarse
+        for i in $(seq 1 $#); do
+            eval "a=\${$i}"; eval "b=\${$((i+1))}"
+            [ "$a" = "--out" ] && OUTDIR="$b"
+            [ "$a" = "--month" ] && MONTH="$b"
+        done
+        PROD="$OUTDIR/coarse_ng5_${MONTH}.nc"
+        if [ -f "$PROD" ]; then
+            echo "=== checking $PROD ==="
+            "$PY" scripts/nn_eddy/check_coarse_product.py "$PROD"
+            crc=$?
+            [ "$crc" -ne 0 ] && { echo "PRODUCT CHECK FAILED — do not train on this file"; rc=$crc; }
+        else
+            echo "WARNING: expected product $PROD not found; nothing checked"
+        fi
+    fi
+    ;;
+esac
+
 echo "=== done $(date) rc=$rc ==="
 exit $rc
