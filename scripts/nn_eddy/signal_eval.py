@@ -203,9 +203,44 @@ def main():
         print(f"  d{r['day0']:03d} m=1 vs year marks (nondet floor): "
               f"L5={r['L5_floor']:.3e}  L10={r['L10_floor']:.3e}")
 
+    # --- split branches: one coefficient at a time (k_gm axis vs redi_kmax axis)
+    split_rows, split_spreads = [], []
+    for day0 in (60, 150, 240, 330):
+        by_mult = {}
+        for f in sorted(args.student_dir.glob(f"branch2_d{day0:03d}_g*_r*.npz")):
+            b = np.load(f)
+            mg, mr = float(b["mult_gm"]), float(b["mult_redi"])
+            k5, k10 = day0 // 5 + 1, day0 // 5 + 2
+            row = dict(day0=day0, mult_gm=mg, mult_redi=mr)
+            if k5 in marks_t:
+                row["L5"] = misfit(b["T5"][:, sl], b["S5"][:, sl], *marks_t[k5])
+            if k10 in marks_t:
+                row["L10"] = misfit(b["T10"][:, sl], b["S10"][:, sl], *marks_t[k10])
+            by_mult[(round(mg, 4), round(mr, 4))] = row
+            split_rows.append(row)
+        for axis, up, dn in (("GM", (3.0, 1.0), (0.3333, 1.0)),
+                             ("Redi", (1.0, 3.0), (1.0, 0.3333))):
+            if up in by_mult and dn in by_mult:
+                for key, tag in (("L5", "S5"), ("L10", "S10")):
+                    if key in by_mult[up] and key in by_mult[dn]:
+                        split_spreads.append(dict(
+                            day0=day0, axis=axis, kind=tag,
+                            spread=abs(by_mult[up][key] - by_mult[dn][key]),
+                            up_minus_dn=by_mult[up][key] - by_mult[dn][key]))
+    if split_rows:
+        print("\n== split branches: one coefficient at a time ==")
+        for r in split_rows:
+            print(f"  d{r['day0']:03d} gm={r['mult_gm']:.4f} redi={r['mult_redi']:.4f}  "
+                  f"L5={r.get('L5', float('nan')):.6e}  L10={r.get('L10', float('nan')):.6e}")
+        for r in split_spreads:
+            sign = "up better" if r["up_minus_dn"] < 0 else "down better"
+            print(f"  d{r['day0']:03d} {r['axis']:4s} {r['kind']}: "
+                  f"spread={r['spread']:.3e}  ({sign})")
+
     json_out.write_text(json.dumps(dict(
         D=D, teacher_motion=mot_t, student_motion=mot_s, branches=branches,
-        spreads=spreads, floors=floors, excluded_cells=excl,
+        spreads=spreads, floors=floors, split_branches=split_rows,
+        split_spreads=split_spreads, excluded_cells=excl,
         n_teacher_marks=len(klist)), indent=1))
     print(f"\n[out] {json_out}", flush=True)
     return 0

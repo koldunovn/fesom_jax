@@ -33,6 +33,16 @@ def test_branch_start_dates_1958():
     assert sy.branch_start_date(1958, 330) == (11, 27)
 
 
+def test_split_paths_and_axes():
+    """Split filenames must encode both multipliers unambiguously, and SPLITS must move
+    exactly one coefficient per run (else the axis attribution is meaningless)."""
+    from pathlib import Path
+    assert sy.split_path(Path("/x"), 60, 3.0, 1.0).name == "branch2_d060_g3000_r1000.npz"
+    assert sy.split_path(Path("/x"), 330, 1.0 / 3.0, 1.0).name == "branch2_d330_g0333_r1000.npz"
+    for mg, mr in sy.SPLITS:
+        assert (mg == 1.0) != (mr == 1.0), (mg, mr)   # exactly one axis moves
+
+
 def test_model_to_teacher_levels_trims_only_dry_padding():
     """CORE2's JAX mesh carries 48 columns, the teacher product 47 true layers. Trimming
     is legal only when every extra column is globally dry — and must REFUSE otherwise."""

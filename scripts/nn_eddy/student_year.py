@@ -65,6 +65,11 @@ NMARKS = 73                                     # days 5..365
 BRANCH_DAYS = (60, 150, 240, 330)               # Mar/May/Aug/Nov — the seasonal spread
 BRANCH_LEN_DAYS = 10
 MULTS = (1.0 / 3.0, 1.0, 3.0)                   # the gm_nn bounds and their centre
+# --branches-split: vary ONE coefficient at a time (k_gm alone, redi_kmax alone) — the
+# gm_nn head is two independent bounded multipliers (N_OUT=2), so each axis's leverage
+# on the loss is a separate trainable signal worth knowing before training (user ask
+# 2026-08-08: indications exist that separating GM and Redi helps).
+SPLITS = ((3.0, 1.0), (1.0 / 3.0, 1.0), (1.0, 3.0), (1.0, 1.0 / 3.0))
 OUT_DEFAULT = Path("/work/ab0995/a270088/nn_eddy/student_free_1958")
 
 ALE_CFG = AleConfig()
@@ -88,6 +93,10 @@ def snap_path(out: Path, day: int) -> Path:
     return out / f"snap_day{day:03d}.pkl"
 
 
+def split_path(out: Path, day: int, m_gm: float, m_redi: float) -> Path:
+    return out / f"branch2_d{day:03d}_g{round(m_gm*1000):04d}_r{round(m_redi*1000):04d}.npz"
+
+
 def _atomic_savez(path: Path, **arrays):
     tmp = path.with_suffix(".tmp.npz")
     np.savez(tmp, **arrays)
@@ -103,10 +112,12 @@ def build_model():
     cf = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=np.asarray(st0.T[:, 0]))
     fs = cf.static
     kgm0 = float(Params.defaults().k_gm)
+    kredi0 = float(Params.defaults().redi_kmax)
 
-    def params_for(m):
-        # redi_kmax auto-syncs to k_gm in the default config — couple them here too
-        return build_params({"k_gm": kgm0 * m, "redi_kmax": kgm0 * m})
+    def params_for(m_gm, m_redi):
+        # two independent Params leaves (equal defaults, synced only by convention);
+        # the coupled experiment passes (m, m), the split one moves a single axis
+        return build_params({"k_gm": kgm0 * m_gm, "redi_kmax": kredi0 * m_redi})
 
     def body_for(p):
         def body(carry, sf):
@@ -117,12 +128,12 @@ def build_model():
         return body
 
     @jax.jit
-    def chunk(state0, sfs, m):                   # MARK_STEPS steps, developed state
-        return _run_steps(body_for(params_for(m)), state0, xs=sfs, checkpoint=False)
+    def chunk(state0, sfs, m_gm, m_redi):        # MARK_STEPS steps, developed state
+        return _run_steps(body_for(params_for(m_gm, m_redi)), state0, xs=sfs, checkpoint=False)
 
     @jax.jit
-    def first_chunk(state0, sfs, m):             # cold start: step 1 eager AB2 bootstrap
-        p = params_for(m)
+    def first_chunk(state0, sfs, m_gm, m_redi):  # cold start: step 1 eager AB2 bootstrap
+        p = params_for(m_gm, m_redi)
         sf0 = jax.tree.map(lambda x: x[0], sfs)
         st1 = step(state0, mesh, op, None, p, dt=DT, is_first_step=True, step_forcing=sf0,
                    forcing_static=fs, ice_cfg=ICE_CFG, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
@@ -164,7 +175,7 @@ def run_year(out: Path):
     t0 = time.time()
     for k in range(1, NMARKS + 1):
         sfs = cf.stack(dates_all[(k - 1) * MARK_STEPS : k * MARK_STEPS])
-        st = (first_chunk if k == 1 else chunk)(st, sfs, m1)
+        st = (first_chunk if k == 1 else chunk)(st, sfs, m1, m1)
         _free(sfs)
         day = MARK_DAYS * k
         T_m[k - 1], S_m[k - 1], eta_m[k - 1] = _pull_and_check(st, day)
@@ -205,11 +216,11 @@ def run_branches(out: Path):
                 continue
             mj = jnp.asarray(m, jnp.float64)
             sfs = cf.stack(dates[:MARK_STEPS])
-            st5 = chunk(base, sfs, mj)
+            st5 = chunk(base, sfs, mj, mj)
             _free(sfs)
             T5, S5, e5 = _pull_and_check(st5, day0 + 5)
             sfs = cf.stack(dates[MARK_STEPS:])
-            st10 = chunk(st5, sfs, mj)
+            st10 = chunk(st5, sfs, mj, mj)
             _free(sfs)
             T10, S10, e10 = _pull_and_check(st10, day0 + 10)
             _atomic_savez(dest, T5=T5, S5=S5, eta5=e5, T10=T10, S10=S10, eta10=e10,
@@ -220,17 +231,54 @@ def run_branches(out: Path):
     print(f"[branch] DONE in {(time.time()-t0)/60:.1f} min", flush=True)
 
 
+def run_branches_split(out: Path):
+    """One coefficient at a time: (m_gm, m_redi) over SPLITS — the per-axis leverage."""
+    mesh, _st0, cf, chunk, _first, _kgm0 = build_model()
+    t0 = time.time()
+    for day0 in BRANCH_DAYS:
+        with open(snap_path(out, day0), "rb") as f:
+            base = jax.device_put(pickle.load(f))
+        mo, dy = branch_start_date(1958, day0)
+        dates = surface_forcing.dates_for_steps(1958, DT, BRANCH_LEN_DAYS * STEPS_PER_DAY,
+                                                start_month=mo, start_day=dy)
+        for m_gm, m_redi in SPLITS:
+            dest = split_path(out, day0, m_gm, m_redi)
+            if dest.exists():
+                print(f"[split] {dest.name} exists — skipped", flush=True)
+                continue
+            g = jnp.asarray(m_gm, jnp.float64)
+            r = jnp.asarray(m_redi, jnp.float64)
+            sfs = cf.stack(dates[:MARK_STEPS])
+            st5 = chunk(base, sfs, g, r)
+            _free(sfs)
+            T5, S5, e5 = _pull_and_check(st5, day0 + 5)
+            sfs = cf.stack(dates[MARK_STEPS:])
+            st10 = chunk(st5, sfs, g, r)
+            _free(sfs)
+            T10, S10, e10 = _pull_and_check(st10, day0 + 10)
+            _atomic_savez(dest, T5=T5, S5=S5, eta5=e5, T10=T10, S10=S10, eta10=e10,
+                          mult_gm=np.float64(m_gm), mult_redi=np.float64(m_redi),
+                          day0=np.int32(day0))
+            print(f"[split] d{day0:03d} g={m_gm:.4f} r={m_redi:.4f}  "
+                  f"wall {time.time()-t0:7.1f}s -> {dest.name}", flush=True)
+        _free(base)
+    print(f"[split] DONE in {(time.time()-t0)/60:.1f} min", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     g = ap.add_mutually_exclusive_group(required=True)
     g.add_argument("--year", action="store_true")
     g.add_argument("--branches", action="store_true")
+    g.add_argument("--branches-split", action="store_true")
     ap.add_argument("--out", type=Path, default=OUT_DEFAULT)
     args = ap.parse_args()
     if args.year:
         run_year(args.out)
-    else:
+    elif args.branches:
         run_branches(args.out)
+    else:
+        run_branches_split(args.out)
     return 0
 
 

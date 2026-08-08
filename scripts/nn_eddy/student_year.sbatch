@@ -28,7 +28,8 @@ if [ ! -f "$OUT/marks_year.npz" ]; then
 else
   echo "=== marks_year.npz exists — year phase skipped ==="
 fi
-"$PY" scripts/nn_eddy/student_year.py --branches --out "$OUT"
+"$PY" scripts/nn_eddy/student_year.py --branches --out "$OUT" || exit $?
+"$PY" scripts/nn_eddy/student_year.py --branches-split --out "$OUT"
 rc=$?
 echo "=== done $(date) rc=$rc ==="
 exit $rc
