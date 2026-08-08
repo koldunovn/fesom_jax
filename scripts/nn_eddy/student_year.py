@@ -66,6 +66,9 @@ from fesom_jax.phc_ic import cold_start_state
 from fesom_jax.step import step
 from fesom_jax.tke import TkeConfig
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import nn_data as _nd  # noqa: E402
+
 MESH_DIR = ROOT / "data" / "mesh_core2"
 IC_DIR = ROOT / "data" / "ic_core2_dist864"
 DT = 1800.0
@@ -81,7 +84,7 @@ MULTS = (1.0 / 3.0, 1.0, 3.0)                   # the gm_nn bounds and their cen
 # on the loss is a separate trainable signal worth knowing before training (user ask
 # 2026-08-08: indications exist that separating GM and Redi helps).
 SPLITS = ((3.0, 1.0), (1.0 / 3.0, 1.0), (1.0, 3.0), (1.0, 1.0 / 3.0))
-OUT_DEFAULT = Path("/work/ab0995/a270088/nn_eddy/student_free_1958")
+OUT_DEFAULT = _nd.STUDENT_DIR
 
 ALE_CFG = AleConfig()
 TKE_CFG = TkeConfig()

@@ -63,6 +63,7 @@ import jax.numpy as jnp                                            # noqa: E402
 
 from fesom_jax import coarsen                                       # noqa: E402
 from fesom_jax.coarsen import RemapMap                              # noqa: E402
+import nn_data as _nd                                             # noqa: E402
 
 # ⚠️ `python scripts/foo.py` puts the SCRIPT's directory on sys.path, never the cwd, and the
 # editable install resolves fesom_jax to the MAIN checkout — which silently invalidated an
@@ -73,9 +74,9 @@ if _ROOT not in _got.parents:
     raise SystemExit(f"FATAL: fesom_jax imported from {_got}, not from {_ROOT}")
 
 TEACHER = pathlib.Path("/work/ba1583/a270088/nn_eddy/ng5_teacher")
-FINE_MESH = pathlib.Path("/work/ab0995/a270088/nn_eddy/mesh_ng5")
+FINE_MESH = _nd.MESH_NG5
 COARSE_MESH = pathlib.Path("/work/ab0995/a270088/port_jax/data/mesh_core2")
-OUT = pathlib.Path("/work/ab0995/a270088/nn_eddy/coarse")
+OUT = _nd.COARSE_DIR
 
 
 # ---------------------------------------------------------------------------

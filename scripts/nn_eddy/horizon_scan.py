@@ -80,6 +80,9 @@ from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.step import step
 from fesom_jax.tke import TkeConfig
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import nn_data as _nd  # noqa: E402
+
 MESH_DIR = ROOT / "data" / "mesh_core2"
 IC_DIR = ROOT / "data" / "ic_core2_dist864"
 DT = 1800.0
@@ -230,7 +233,7 @@ def main():
     # identical for every window length. It does not depend on N, so it is computed
     # ONCE and cached on disk: the sweep runs one process per N, and re-running a
     # 10-day forward in each of them wasted ~3.5 min of A100 apiece.
-    cache = args.truth_cache or (Path("/work/ab0995/a270088/nn_eddy/horizon_truth") /
+    cache = args.truth_cache or (_nd.data_path("horizon_truth") /
                                  f"{Path(args.snap).stem}_m{args.truth_mult:g}_{NDAYS_TRUTH}d.npz")
     t1 = time.time()
     if cache.exists() and not args.recompute_truth:

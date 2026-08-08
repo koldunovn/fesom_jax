@@ -37,15 +37,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 # four functions — two implementations of "which cells count", of which only this one had ever
 # been checked against a recorded number. Re-exported here so existing callers and the
 # module's own tests keep working through either name.
-from nn_data import (MARK_SECONDS, assemble_teacher, combined_mask,   # noqa: E402,F401
-                     mark_index, model_to_teacher_levels, month_files, student_grid)
+from nn_data import (COARSE_DIR, MARK_SECONDS, STUDENT_DIR,          # noqa: E402,F401
+                     assemble_teacher, combined_mask, mark_index,
+                     model_to_teacher_levels, month_files, student_grid)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--coarse-dir", type=Path, default=Path("/work/ab0995/a270088/nn_eddy/coarse"))
+    ap.add_argument("--coarse-dir", type=Path, default=COARSE_DIR)
     ap.add_argument("--student-dir", type=Path,
-                    default=Path("/work/ab0995/a270088/nn_eddy/student_free_1958"))
+                    default=STUDENT_DIR)
     ap.add_argument("--mesh-dir", type=Path,
                     default=Path(__file__).resolve().parents[2] / "data" / "mesh_core2")
     ap.add_argument("--year", type=int, default=1958)

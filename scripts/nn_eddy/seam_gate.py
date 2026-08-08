@@ -75,6 +75,7 @@ from fesom_jax.tke import TkeConfig  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from horizon_scan import level_weights, stage1_misfit  # noqa: E402  (loss forms, unit-tested)
+import nn_data as _nd  # noqa: E402
 
 MESH_DIR = ROOT / "data" / "mesh_core2"
 IC_DIR = ROOT / "data" / "ic_core2_dist864"
@@ -99,7 +100,7 @@ GM_CFG = GMConfig()
 # of this gate is unaffected by these, and the gradient half is impossible without them.
 ICE_CFG = IceConfig(whichEVP=1, adjoint_mode="rheology")
 ADJ_CFG = AdjointConfig(freeze_mixing=True)
-OUT_DEFAULT = Path("/work/ab0995/a270088/nn_eddy/seam_gate")
+OUT_DEFAULT = _nd.data_path("seam_gate")
 
 
 def seed_date(snap_path: str, year: int):
@@ -195,6 +196,7 @@ def run_stability(args):
     out = {"mode": "stability", "seed": args.seed, "w_scale": args.w_scale,
            "days": STAB_DAYS, "snap": args.snap.name, "year": args.year, "arms": {}}
 
+    final = {}
     for arm in ("control", "nn"):
         params = Params.defaults() if arm == "control" else \
             dataclasses.replace(Params.defaults(), gm_nn=nn)
@@ -215,6 +217,7 @@ def run_stability(args):
                 break
         wall = time.time() - t0
         n_done = len(marks) * STEPS_PER_DAY
+        final[arm] = jax.device_get((st.T, st.S, st.eta_n))
         out["arms"][arm] = dict(marks=marks, ok=all(m["ok"] for m in marks),
                                 days_completed=len(marks), wall_s=wall,
                                 s_per_step=wall / max(n_done, 1), peak_gb=peak_gb())
@@ -223,8 +226,36 @@ def run_stability(args):
         if arm == "nn":
             _free(st)
 
+    # ⚠️ "in bounds" is NOT evidence that the network did anything. On the first run of this gate
+    # the two arms' daily global extrema agreed to 0.01 K on 8 of 10 days — which is what a
+    # bounded kappa multiplier SHOULD look like in a global min/max (those extrema sit at the
+    # warmest tropical surface point and the coldest polar water, neither of which GM controls),
+    # but it is indistinguishable from a seam that never reached the step. So measure the
+    # trajectory difference directly and put a number on it, against the measured
+    # GPU-nondeterminism floor rather than against zero.
+    if len(final) == 2 and out["arms"]["nn"]["days_completed"] == STAB_DAYS \
+            and out["arms"]["control"]["days_completed"] == STAB_DAYS:
+        wet = np.asarray(mesh.node_layer_mask, bool)
+        area = np.asarray(mesh.areasvol) * wet
+        diff = {}
+        for i, name in enumerate(("T", "S")):
+            d = np.abs(final["nn"][i] - final["control"][i])
+            rms = float(np.sqrt((area * d ** 2).sum() / max(area.sum(), 1e-300)))
+            diff[name] = dict(max=float(d[wet].max()), area_rms=rms)
+        d_eta = np.abs(final["nn"][2] - final["control"][2])
+        diff["eta"] = dict(max=float(d_eta.max()))
+        out["trajectory_diff"] = diff
+        out["nn_is_active"] = bool(diff["T"]["max"] > 0.0 and diff["S"]["max"] > 0.0)
+        print(f"[active] day-{STAB_DAYS} nn-vs-control: "
+              f"max|dT|={diff['T']['max']:.3e} K (area-rms {diff['T']['area_rms']:.3e}), "
+              f"max|dS|={diff['S']['max']:.3e}, max|d eta|={diff['eta']['max']:.3e} m", flush=True)
+        if not out["nn_is_active"]:
+            print("[active] ⚠️ THE TWO ARMS ARE BIT-IDENTICAL — the perturbed network is not "
+                  "reaching the step. A 'stable' verdict here would be meaningless.", flush=True)
+
     c, m = out["arms"]["control"], out["arms"]["nn"]
-    out["stable"] = bool(m["ok"] and m["days_completed"] == STAB_DAYS)
+    out["stable"] = bool(m["ok"] and m["days_completed"] == STAB_DAYS
+                         and out.get("nn_is_active", True))
     out["s_per_step_overhead"] = m["s_per_step"] / c["s_per_step"] - 1.0 if c["s_per_step"] else None
     out["peak_gb_delta"] = m["peak_gb"] - c["peak_gb"]
     print(f"\n[cost] s/step {c['s_per_step']:.4f} (control) -> {m['s_per_step']:.4f} (nn), "

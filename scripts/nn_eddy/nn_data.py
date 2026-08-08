@@ -33,13 +33,37 @@ freshwater-flux experiment) must not silently become a constant that drowns its 
 from __future__ import annotations
 
 import dataclasses
+import os
 import re
 from pathlib import Path
 
 import numpy as np
 
 MARK_SECONDS = 5 * 86400.0
-COARSE_DIR = Path("/work/ab0995/a270088/nn_eddy/coarse")
+
+# ---------------------------------------------------------------------------
+# Where this project's data lives — ONE definition, imported by every script
+# ---------------------------------------------------------------------------
+# **ba1583, not ab0995** (user decision 2026-08-08, and the parent plan's Revision Log (j)
+# reached the same place for the M4 trajectories). Measured that day: the ab0995 /work mount was
+# at **98% — 2.5 P used of 2.6 P, 53 T free** — while ba1583 sat at 10% with 117 T free and
+# already held the 2.9 TB teacher run. The growth is not speculative either: coarse products run
+# ~13 GB per teacher year (ten years ≈ 130 GB) and M4's stored trajectories ~130 GB per year per
+# refresh (≈ 1.3 TB across the planned ten). Putting the products next to the teacher output that
+# generates them also means one directory to archive when the paper is written.
+#
+# Override with $NN_EDDY_DATA for a scratch experiment; do NOT hardcode a path in a script.
+DATA_ROOT = Path(os.environ.get("NN_EDDY_DATA", "/work/ba1583/a270088/nn_eddy"))
+COARSE_DIR = DATA_ROOT / "coarse"                 # coarse_ng5_*.nc + coarse_eta_ng5_*.nc
+TEACHER_DIR = DATA_ROOT / "ng5_teacher"           # the raw NG5 snapshot stream
+MESH_NG5 = DATA_ROOT / "mesh_ng5"                 # the NG5 mesh .npy export
+STUDENT_DIR = DATA_ROOT / "student_free_1958"     # student_year.py output + signal_eval.json
+
+
+def data_path(*parts) -> Path:
+    """A path under :data:`DATA_ROOT`. Use this for any NEW output directory so a future move is
+    one constant again, rather than another round of grep-and-edit."""
+    return DATA_ROOT.joinpath(*parts)
 
 
 def mark_index(t_seconds: float) -> int:
