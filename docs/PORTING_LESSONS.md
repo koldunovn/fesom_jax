@@ -5870,6 +5870,30 @@ and invites redoing work. Probe a long unique string (the variable's description
   open. `cp` opens the destination `O_TRUNC` and rewrites that inode, so the parked shell resumes
   mid-token. `mv` swaps in a new inode and the running job reads its own to the end.
 
+### The unifying rule: anything a long-running job reads AFTER it starts is mutable state
+
+Three of the items above are the same mistake wearing different clothes, and it took hitting it
+three times in one night to see that:
+
+| what was edited | who read it late | outcome |
+|---|---|---|
+| the chain's `.sbatch` | bash, lazily by byte offset, parked in `srun` for hours | would have resumed mid-token; handled correctly by `mv` |
+| `suite_groups.txt` | a pytest test, at test-RUN time | three spurious suite failures — new data against old code |
+| a test's `.py` source | pytest, to render a traceback, while running old bytecode | a failure report quoting a docstring the running code did not have |
+
+A process that has "already imported everything" is not therefore safe to edit around. The rule
+that covers all three:
+
+> Before editing any file, ask which running processes will read it *again*. Code is usually read
+> once at import; **scripts, data files and anything re-read for diagnostics are not.** If
+> something will re-read it, either wait for the boundary or replace the file by `mv` so the
+> reader keeps its own inode — and if the file is data a running job consults, waiting is the only
+> option, because a rename gives it the new content too.
+
+The practical form: `squeue` before touching a deployed script or a manifest. It costs a second
+and the failure mode is either an overnight chain death or an hour of confusion over failures that
+were never real.
+
 ### And a coverage hole the above made visible
 
 Every suite runner globbed `fesom_jax/tests/` only, so the seven files under `scripts/tests/` —
