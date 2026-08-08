@@ -113,14 +113,30 @@ def prod():
 
         return jax.jit(loss), jax.jit(jax.grad(loss))
 
-    return make, jnp.asarray(0.0, jnp.float64), n_icy
+    def make_kgm(cfg):
+        """The same step, differentiated with respect to ``params.k_gm`` — the GM diffusivity,
+        i.e. the parameter Arm A scales. Needed because ``AdjointConfig``'s claim about
+        ``freeze_k33`` is about the TRAINED parameter's gradient, which an SST control cannot
+        see."""
+        def loss(kgm):
+            p = dataclasses.replace(Params.defaults(), k_gm=kgm)
+            fin = stepmod.step(state, mesh, op, None, p, dt=DT, is_first_step=True,
+                               step_forcing=sf0, forcing_static=fs,
+                               ale_cfg=AleConfig(), gm_cfg=GMConfig(), tke_cfg=TkeConfig(),
+                               ice_cfg=IceConfig(whichEVP=1, adjoint_mode="rheology"),
+                               adjoint_cfg=cfg)
+            return jnp.sum(jnp.where(wet0, fin.T[:, 0], 0.0)) / jnp.sum(wet0)
+
+        return jax.jit(loss), jax.jit(jax.grad(loss))
+
+    return make, jnp.asarray(0.0, jnp.float64), n_icy, make_kgm, Params.defaults().k_gm
 
 
 @core2_only
 def test_the_fixture_actually_runs_the_production_configuration(prod):
     """If the assembled step with all four subsystems does not produce a finite, nonzero
     gradient, nothing else in this file means anything."""
-    make, k0, n_icy = prod
+    make, k0, n_icy, _, _ = prod
     loss, grad = make(AdjointConfig())
     l0, g0 = float(loss(k0)), float(grad(k0))
     assert np.isfinite(l0) and np.isfinite(g0)
@@ -133,7 +149,7 @@ def test_the_fixture_actually_runs_the_production_configuration(prod):
 def test_the_production_only_flag_changes_the_gradient(prod, flag):
     """The point of the file. Each flag must MOVE the gradient here, which is the only evidence
     that it is wired to a live call site rather than to a branch nothing enters."""
-    make, k0, _ = prod
+    make, k0, *_ = prod
     _, g_off = make(AdjointConfig())
     _, g_on = make(AdjointConfig(**{flag: True}))
     a, b = float(g_off(k0)), float(g_on(k0))
@@ -150,35 +166,48 @@ def test_the_production_only_flag_leaves_the_forward_alone(prod, flag):
     the PGF and the eddy block — the terms that most directly move the trajectory — so this is
     where a wiring mistake would change the physics of a production run rather than only its
     gradient."""
-    make, k0, _ = prod
+    make, k0, *_ = prod
     l_off, _ = make(AdjointConfig())
     l_on, _ = make(AdjointConfig(**{flag: True}))
     assert_forward_identity(l_off, l_on, k0, f"{flag}=True in the production configuration")
 
 
 @core2_only
-def test_freeze_k33_cuts_more_than_freeze_gm_slope(prod):
-    """The documented distinction between the two GM flags, as a number rather than a comment.
+def test_freeze_k33_is_not_free_with_respect_to_the_trained_parameter(prod):
+    """``AdjointConfig``'s distinctive claim about ``freeze_k33``, tested against the gradient the
+    claim is actually about.
 
-    ``freeze_gm_slope`` freezes N² *inside* the eddy block, leaving the eddy diffusivity and
-    T, S differentiated. ``freeze_k33`` cuts K33 — the route by which the eddy coefficients
-    reach the vertical diffusion — so it removes part of the gradient path of the very
-    parameter being trained. That is why ``AdjointConfig`` warns that this one is not free, and
-    it should be the larger cut of the two.
+    The docstring says K33 "cuts part of the gradient path of the eddy coefficients themselves —
+    unlike the others, this one is not free with respect to the parameter being trained". That is
+    a statement about **d(loss)/d(k_gm)**, not about d(loss)/d(SST).
+
+    ⚠️ I first wrote this as "freeze_k33 cuts more than freeze_gm_slope" measured on the SST
+    control, and the run falsified it: against SST, freeze_gm_slope moved the gradient 1.679e-03
+    and freeze_k33 only 1.390e-03. Nothing ever implied that ordering — the two cut different
+    paths, and an SST control cannot see the trained parameter's own path at all. The measurement
+    was right and my reasoning was wrong.
+
+    So: differentiate with respect to ``k_gm`` and assert the qualitative claim. ``freeze_k33``
+    must move that gradient materially; ``freeze_mixing`` — documented as free with respect to it,
+    because the eddy augmentation is added AFTER the closure runs — must move it far less.
     """
-    make, k0, _ = prod
-    _, g_off = make(AdjointConfig())
-    _, g_slope = make(AdjointConfig(freeze_gm_slope=True))
-    _, g_k33 = make(AdjointConfig(freeze_k33=True))
-    base = float(g_off(k0))
-    d_slope = abs(float(g_slope(k0)) - base)
-    d_k33 = abs(float(g_k33(k0)) - base)
-    print(f"\nbaseline {base!r}; freeze_gm_slope moves it {d_slope:.6e}, "
-          f"freeze_k33 moves it {d_k33:.6e}")
-    assert d_slope > 0.0 and d_k33 > 0.0
-    assert d_k33 > d_slope, (
-        f"freeze_k33 ({d_k33:.3e}) cut LESS than freeze_gm_slope ({d_slope:.3e}). Either the "
-        f"K33 path is not what AdjointConfig documents, or one of the two is misrouted")
+    _, _, _, make_kgm, kgm0 = prod
+    _, g_off = make_kgm(AdjointConfig())
+    _, g_k33 = make_kgm(AdjointConfig(freeze_k33=True))
+    _, g_mix = make_kgm(AdjointConfig(freeze_mixing=True))
+    base = float(g_off(kgm0))
+    assert np.isfinite(base) and base != 0.0, \
+        f"d(loss)/d(k_gm) is {base!r} — GM is not reaching the loss, so nothing here is testable"
+    r_k33 = abs(float(g_k33(kgm0)) - base) / abs(base)
+    r_mix = abs(float(g_mix(kgm0)) - base) / abs(base)
+    print(f"\nd(loss)/d(k_gm) = {base!r}; freeze_k33 moves it {r_k33:.3e} relative, "
+          f"freeze_mixing {r_mix:.3e}")
+    assert r_k33 > 1e-6, (
+        f"freeze_k33 changed d(loss)/d(k_gm) by only {r_k33:.3e} — it is supposed to cut part of "
+        f"the trained parameter's own gradient path")
+    assert r_k33 > r_mix, (
+        f"freeze_k33 ({r_k33:.3e}) did not cut the trained parameter's gradient more than "
+        f"freeze_mixing ({r_mix:.3e}), which AdjointConfig documents as free with respect to it")
 
 
 @core2_only
@@ -199,7 +228,7 @@ def test_freeze_pgf_reaches_the_gradient_at_all(prod):
     pretend a one-step fixture can measure how blunt the cut is. Doing that needs a multi-step
     window, which belongs in the horizon campaign, not in a unit test.
     """
-    make, k0, _ = prod
+    make, k0, *_ = prod
     _, g_off = make(AdjointConfig())
     _, g_pgf = make(AdjointConfig(freeze_pgf=True))
     base, cut = float(g_off(k0)), float(g_pgf(k0))
