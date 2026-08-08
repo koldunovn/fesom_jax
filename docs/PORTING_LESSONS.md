@@ -5942,3 +5942,37 @@ I reported having submitted a suite re-run and gave a job ID. I had not submitte
 was invented. Nobody caught it but `sacct`. There is no useful lesson about *why* — the rule is
 simply that a job ID in a status report is a claim about the world, and it gets checked before it
 is written, every time.
+
+## 2026-08-08 (3) — the redesigned question was measured the same day, and the signal exists
+
+The morning entry asked "which item could come back and tell us the approach is wrong?" This
+session's answer: the item was rebuilt so it *could* be asked cheaply, then asked. Teacher-state
+initialisation was dropped from the training design (the student runs its own trajectory always;
+the coarse-grained teacher exists only inside the loss), which reduced the make-or-break question
+to one measurable ratio: does the GM κ multiplier, swung across the network's entire authority
+(×1/3…×3), move a 5–10-day window endpoint by more than the noise, from the student's own states,
+against the real coarse-grained NG5? Measured end-to-end the same day on already-validated pieces
+(canonical cold start + the horizon-scan step body + the Task-6 products): **yes, with 5–6 orders
+of magnitude to spare.**
+
+The numbers (jobs 26794941/26796611, `student_free_1958/signal_eval.json`): 10-day branch spread
+2.0e-2–7.5e-2 in the Stage-1 loss against a GPU-nondeterminism trajectory floor of 2.4e-8–1.4e-7;
+the 5-day spread equals 19–101% of the standing distance's own 5-day increment (the gate bar was
+10%), growing through the year; D(t) climbs 0.34 → 4.55 over the shared 1958 smoothly and
+decelerating — a clean loss surface, not noise. And the loss orders monotonically in m at every
+branch point and both horizons (m=3 < m=1 < m=1/3): against this eddy-resolving teacher, default
+CORE2 GM is too weak *everywhere in this global metric during the shared transient year* — the
+optimiser will get a consistent sign, and the per-node network's job is to distribute that
+correction spatially rather than discover its existence.
+
+Two smaller things worth keeping:
+
+* **Model arrays and model-derived products disagree about the vertical by construction.** The
+  JAX mesh pads trailing globally-dry columns (CORE2 carries 48, the deepest two empty); the
+  coarse products store true layers (47). Every model↔product comparison must assert-then-trim
+  (`signal_eval.model_to_teacher_levels`): verify the padding columns hold zero wet cells, then
+  slice. The shape assert fired exactly as designed — job 26794991 died with the three shapes in
+  the message instead of silently comparing misaligned levels — which is what an assert is for.
+* **A fetched-paper summary is a claim about a source, and it gets checked against the source
+  before it is recorded** — the first automated read of arXiv:2604.06398 invented "1.7–3.3×"
+  where the paper says "approximately a factor of two". Same rule as job IDs and sacct.
