@@ -113,13 +113,18 @@ def prod():
 
         return jax.jit(loss), jax.jit(jax.grad(loss))
 
-    def make_kgm(cfg):
-        """The same step, differentiated with respect to ``params.k_gm`` — the GM diffusivity,
-        i.e. the parameter Arm A scales. Needed because ``AdjointConfig``'s claim about
-        ``freeze_k33`` is about the TRAINED parameter's gradient, which an SST control cannot
-        see."""
-        def loss(kgm):
-            p = dataclasses.replace(Params.defaults(), k_gm=kgm)
+    def make_param(cfg, which):
+        """The same step, differentiated with respect to one GM ``Params`` leaf.
+
+        ``which`` is ``"k_gm"`` or ``"redi_kmax"``. Both exist because **they are separate
+        differentiable leaves in this port** and they feed different terms: ``k_gm`` sets
+        ``fer_K`` (the bolus coefficient) and ``redi_kmax`` sets ``Ki`` (the isoneutral
+        diffusivity), from which ``K33`` is built. The C auto-syncs ``Redi_Kmax = K_GM_max``;
+        ``Params`` deliberately does not (see ``calibrate.build_params``), and ``gm_nn`` emits a
+        separate multiplier for each — so which leaf you differentiate is a real distinction, not
+        a detail."""
+        def loss(val):
+            p = dataclasses.replace(Params.defaults(), **{which: val})
             fin = stepmod.step(state, mesh, op, None, p, dt=DT, is_first_step=True,
                                step_forcing=sf0, forcing_static=fs,
                                ale_cfg=AleConfig(), gm_cfg=GMConfig(), tke_cfg=TkeConfig(),
@@ -129,14 +134,15 @@ def prod():
 
         return jax.jit(loss), jax.jit(jax.grad(loss))
 
-    return make, jnp.asarray(0.0, jnp.float64), n_icy, make_kgm, Params.defaults().k_gm
+    return (make, jnp.asarray(0.0, jnp.float64), n_icy, make_param,
+            Params.defaults().k_gm, Params.defaults().redi_kmax)
 
 
 @core2_only
 def test_the_fixture_actually_runs_the_production_configuration(prod):
     """If the assembled step with all four subsystems does not produce a finite, nonzero
     gradient, nothing else in this file means anything."""
-    make, k0, n_icy, _, _ = prod
+    make, k0, n_icy, *_ = prod
     loss, grad = make(AdjointConfig())
     l0, g0 = float(loss(k0)), float(grad(k0))
     assert np.isfinite(l0) and np.isfinite(g0)
@@ -173,41 +179,57 @@ def test_the_production_only_flag_leaves_the_forward_alone(prod, flag):
 
 
 @core2_only
-def test_freeze_k33_is_not_free_with_respect_to_the_trained_parameter(prod):
-    """``AdjointConfig``'s distinctive claim about ``freeze_k33``, tested against the gradient the
-    claim is actually about.
+def test_freeze_k33_cuts_redi_kmax_and_is_exactly_free_for_k_gm(prod):
+    """WHICH trained parameter ``freeze_k33`` is not free with respect to — and it is not the one
+    the name GM suggests.
 
-    The docstring says K33 "cuts part of the gradient path of the eddy coefficients themselves —
-    unlike the others, this one is not free with respect to the parameter being trained". That is
-    a statement about **d(loss)/d(k_gm)**, not about d(loss)/d(SST).
+    ``AdjointConfig`` says K33 "cuts part of the gradient path of the eddy coefficients themselves
+    — unlike the others, this one is not free with respect to the parameter being trained". The
+    coefficients are two separate ``Params`` leaves in this port, and they feed different terms:
 
-    ⚠️ I first wrote this as "freeze_k33 cuts more than freeze_gm_slope" measured on the SST
-    control, and the run falsified it: against SST, freeze_gm_slope moved the gradient 1.679e-03
-    and freeze_k33 only 1.390e-03. Nothing ever implied that ordering — the two cut different
-    paths, and an SST control cannot see the trained parameter's own path at all. The measurement
-    was right and my reasoning was wrong.
+        k_gm      -> fer_K, the bolus coefficient
+        redi_kmax -> Ki, the isoneutral diffusivity, from which K33 is built (gm.py: ki_top,
+                     then k33_augmentation(mesh, slope_tapered, Ki, ...))
 
-    So: differentiate with respect to ``k_gm`` and assert the qualitative claim. ``freeze_k33``
-    must move that gradient materially; ``freeze_mixing`` — documented as free with respect to it,
-    because the eddy augmentation is added AFTER the closure runs — must move it far less.
+    So ``d(K33)/d(k_gm)`` is **structurally zero** and ``freeze_k33`` is *exactly* free for
+    ``k_gm``; the leaf it bites is ``redi_kmax``. Both directions are asserted here, because the
+    exact zero is the stronger statement and rounding cannot fake it.
+
+    ⚠️ Two earlier versions of this test were falsified by their own runs, which is why the whole
+    story is written out:
+      1. "freeze_k33 cuts more than freeze_gm_slope", measured on an SST control — against SST it
+         moved the gradient 1.390e-03 against freeze_gm_slope's 1.679e-03. Nothing implied that
+         ordering, and an SST control cannot see a trained parameter's own path.
+      2. "freeze_k33 moves d(loss)/d(k_gm)" — measured **0.000e+00**, for the structural reason
+         above. That is the correct answer to a question about the wrong leaf.
+    The C auto-syncs ``Redi_Kmax = K_GM_max``, which is probably what made "the GM coefficient"
+    feel like one parameter; ``Params`` deliberately keeps them separate and ``gm_nn`` emits a
+    multiplier for each, so Task 9 must treat them as two.
     """
-    _, _, _, make_kgm, kgm0 = prod
-    _, g_off = make_kgm(AdjointConfig())
-    _, g_k33 = make_kgm(AdjointConfig(freeze_k33=True))
-    _, g_mix = make_kgm(AdjointConfig(freeze_mixing=True))
-    base = float(g_off(kgm0))
-    assert np.isfinite(base) and base != 0.0, \
-        f"d(loss)/d(k_gm) is {base!r} — GM is not reaching the loss, so nothing here is testable"
-    r_k33 = abs(float(g_k33(kgm0)) - base) / abs(base)
-    r_mix = abs(float(g_mix(kgm0)) - base) / abs(base)
-    print(f"\nd(loss)/d(k_gm) = {base!r}; freeze_k33 moves it {r_k33:.3e} relative, "
-          f"freeze_mixing {r_mix:.3e}")
-    assert r_k33 > 1e-6, (
-        f"freeze_k33 changed d(loss)/d(k_gm) by only {r_k33:.3e} — it is supposed to cut part of "
-        f"the trained parameter's own gradient path")
-    assert r_k33 > r_mix, (
-        f"freeze_k33 ({r_k33:.3e}) did not cut the trained parameter's gradient more than "
-        f"freeze_mixing ({r_mix:.3e}), which AdjointConfig documents as free with respect to it")
+    _, _, _, make_param, kgm0, redi0 = prod
+
+    _, g_gm_off = make_param(AdjointConfig(), "k_gm")
+    _, g_gm_k33 = make_param(AdjointConfig(freeze_k33=True), "k_gm")
+    base_gm = float(g_gm_off(kgm0))
+    assert np.isfinite(base_gm) and base_gm != 0.0, \
+        f"d(loss)/d(k_gm) is {base_gm!r} — the bolus path is not reaching the loss"
+    d_gm = abs(float(g_gm_k33(kgm0)) - base_gm)
+    print(f"\nd(loss)/d(k_gm)      = {base_gm!r}; freeze_k33 moves it {d_gm:.3e} (expect 0.0)")
+    assert d_gm == 0.0, (
+        f"freeze_k33 moved d(loss)/d(k_gm) by {d_gm:.3e}. K33 is built from Ki, which comes from "
+        f"redi_kmax, so this must be EXACTLY zero — a nonzero value means k_gm has acquired a "
+        f"path into K33 and the two leaves are no longer independent")
+
+    _, g_rd_off = make_param(AdjointConfig(), "redi_kmax")
+    _, g_rd_k33 = make_param(AdjointConfig(freeze_k33=True), "redi_kmax")
+    base_rd = float(g_rd_off(redi0))
+    assert np.isfinite(base_rd) and base_rd != 0.0, \
+        f"d(loss)/d(redi_kmax) is {base_rd!r} — the isoneutral path is not reaching the loss"
+    r_rd = abs(float(g_rd_k33(redi0)) - base_rd) / abs(base_rd)
+    print(f"d(loss)/d(redi_kmax) = {base_rd!r}; freeze_k33 moves it {r_rd:.3e} relative")
+    assert r_rd > 1e-6, (
+        f"freeze_k33 changed d(loss)/d(redi_kmax) by only {r_rd:.3e} — this IS the leaf whose "
+        f"gradient path it cuts, so it must move materially")
 
 
 @core2_only
