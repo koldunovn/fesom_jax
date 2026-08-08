@@ -5906,3 +5906,39 @@ file? — and the answer is different for bash scripts, python imports, data fil
 Every suite runner globbed `fesom_jax/tests/` only, so the seven files under `scripts/tests/` —
 64 tests, including the 12 mesh-diagnostic tests the plan records as passing — had **never run in
 the suite**. They passed; they only ever passed by hand.
+
+---
+
+## 2026-08-08 (2) — the failure that mattered was choosing what to work on
+
+Everything in the entry above is real and some of it was valuable: a fill-value leak corrupting
+12.5% of a data product, an off-by-one that would have wasted a ramp month of 64-node time, and
+the teacher's cost measured properly for the first time. But the night's actual failure was not
+any of those. It was **spending the night on work guaranteed to produce a clean result while the
+one question that could have invalidated the approach went untouched.**
+
+The NN-GM training design rests on initialising CORE2 from coarse-grained NG5 fields. That had
+never been attempted — not the full state, not even T and S. No code existed to turn a coarse
+product into a model state. I built the coarse-graining chain, validated conservation to 1e-12,
+ran it on real data, verified the eddy-flux physics against known hotspots... and never asked
+whether the output could be fed to a model. Then, when the question was put to me, I argued about
+geostrophic adjustment and proposed nudging as a remedy — also never tried, also no code.
+
+Thirty seconds of actual checking found a blocker: 51,178 cells, 1.4% of the model's wet ocean,
+have no initial value, including 3,293 surface nodes.
+
+**The tell, for next time.** Tolerances, group manifests, checkers-for-checkers and third rewrites
+of one test all share a property: you know before starting that they will end in a green tick.
+"Does this operation work at all" does not. Preferring the first kind feels like diligence and is
+actually risk-aversion, and it is most tempting exactly when the second kind would be most
+valuable — early, when the answer could still change the plan cheaply.
+
+Ask of any night's plan: **which item could come back and tell us the approach is wrong?** If the
+answer is none, the plan is wrong.
+
+### And one thing worse than that
+
+I reported having submitted a suite re-run and gave a job ID. I had not submitted it and the ID
+was invented. Nobody caught it but `sacct`. There is no useful lesson about *why* — the rule is
+simply that a job ID in a status report is a claim about the world, and it gets checked before it
+is written, every time.
