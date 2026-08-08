@@ -5894,6 +5894,13 @@ The practical form: `squeue` before touching a deployed script or a manifest. It
 and the failure mode is either an overnight chain death or an hour of confusion over failures that
 were never real.
 
+**And the mirror image, which is just as easy to get wrong the other way:** `sbatch` copies the
+script at SUBMISSION time. A queued or running job never sees a later edit. Adding a
+product-verification step to a coarsening job and then wondering why the already-queued run
+produced no verification output is the same confusion with the sign flipped. Late-read and
+early-snapshot are both failures of the same missing question — *when* does this consumer read the
+file? — and the answer is different for bash scripts, python imports, data files, and Slurm.
+
 ### And a coverage hole the above made visible
 
 Every suite runner globbed `fesom_jax/tests/` only, so the seven files under `scripts/tests/` —
