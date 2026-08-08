@@ -5976,3 +5976,83 @@ Two smaller things worth keeping:
 * **A fetched-paper summary is a claim about a source, and it gets checked against the source
   before it is recorded** — the first automated read of arXiv:2604.06398 invented "1.7–3.3×"
   where the paper says "approximately a factor of two". Same rule as job IDs and sacct.
+
+## 2026-08-08 (4) — the plan changed under the build, and three of my choices were the wrong ones
+
+The child build plan was revised by a plan-review pass *while I was implementing it*. Four of my
+decisions conflicted with the revision, and re-reading it cost minutes against a rewrite that
+would have cost hours:
+
+* I applied the multipliers "at every consumption site" and audited `fer_K`/`Ki` consumers by grep
+  to prove one multiplication covered them all. That was correct but for a weaker reason than the
+  real one. The features derive from `sigma_xy`, an element→node scatter that is **incomplete on
+  halo nodes**, so the multiplication must happen BEFORE `gm_diagnostics`' halo exchange. Applying
+  it "where consumed" (in `gm_redi.py`, post-exchange) would have been a sharding-correctness bug
+  that every single-device test passes and the standing suite never reaches, because the sharding
+  group cannot finish in practical wall time. The fix that makes it catchable is a test in a file
+  the sharding group *does* pick up (`test_*_sharded.py`) with a NON-trivial network — a
+  `zero_last` network passes that test wherever the multiplication sits.
+* I dropped the deferred `strain` feature and added a six-feature code path, arguing that a
+  constant-zero input leaves a first-layer row with permanently zero gradient. The argument is
+  true and the conclusion was still wrong: keeping the width means a weight file trained now
+  survives if strain lands at the D2 screen, and the revised gate is an FD check rather than
+  "gradient reaches every weight", so nothing trips on the dead row. I reverted to `strain = 0.0`
+  and wrote the trade-off into a test that asserts the strain row's gradient is *exactly* zero —
+  so the day someone threads strain, that test fails and points at the seam.
+* I fed the network the UNtapered slope, reasoning that the ODM95 taper hides convective columns
+  behind a feature value of zero. The plan specifies the tapered one. I switched, and recorded the
+  consequence in the docstring rather than the objection: the network has to read that regime off
+  small N² with large |∇_h b| instead, both of which it gets.
+
+The general shape: when a spec is revised mid-build, the disagreements worth having are the ones
+where the spec is *underdetermined*, and the ones I actually had were all already decided. Read
+the revision before defending the code.
+
+## 2026-08-08 (5) — two numbers that were assumed and turned out to be zero
+
+The plan justified de-meaning the SSH loss term by "student and coarse-grained teacher carry
+different global η means — bathymetry/volume budgets". Both means were measured instead of
+assumed: **1e-12…1e-11 m** on the coarse-grained teacher and **below 1e-5 m** on the student's own
+free year, across all 73 marks. FESOM conserves volume and an area-weighted aggregation preserves
+that, so there is no offset to remove on this mesh pair. The de-meaning stays (it is two lines and
+a different mesh pair or a freshwater experiment could break the property) but it is insurance,
+not a correction, and the plan now says so. The η signal itself is real and comparable on both
+sides — anomaly std 0.674 m teacher, 0.652 m student — so the term will carry gradient.
+
+Cheap measurements beat plausible mechanisms. The mechanism was real; its magnitude was zero.
+
+## 2026-08-08 (6) — a refactor that touches recorded gate numbers has exactly one acceptable outcome
+
+Lifting the teacher-data layer out of `signal_eval.py` into a shared `nn_data.py` moved the code
+that decides *which cells count* in every loss this project will compute. The bar the plan set was
+"reproduce holes exactly 51,178 and every spread/floor to 3 significant figures". What came back
+was better and it is worth insisting on the stronger version: **all 225 recorded values
+bit-identical, maximum relative difference exactly 0.** A behaviour-preserving refactor of pure
+array code should be bit-identical, not close — "agrees to 3 significant figures" would have meant
+something had changed and I would have had to find out what. The re-run also wrote to a NEW json
+path, so the recorded baseline it was being compared against was never at risk of being the thing
+overwritten.
+
+One mechanical trap in the same work: loading a module by path with
+`importlib.util.spec_from_file_location` fails on any module that defines a `dataclass` under
+`from __future__ import annotations`, because the dataclass machinery resolves field annotations
+through `sys.modules[cls.__module__]`, which is `None` for a module executed but never registered.
+It surfaces as `AttributeError: 'NoneType' object has no attribute '__dict__'` from inside
+`dataclasses.py` — nothing about your module. Register it in `sys.modules` before `exec_module`.
+
+## 2026-08-08 (7) — eta cost 19 seconds because I asked what the model already writes
+
+The plan's M2 wanted SSH in the coarse product, and the first shape of the work I reached for was
+"add 2D aggregation to `coarsen_stream.py` and regenerate the months". Two questions collapsed it.
+Does the teacher already output η? Yes — `ssh_snap.fesom.YYYY_MM.nc`, on the same 5-day stream as
+`temp_snap`, so there is no Fortran-side work at all. Does the 2-D field need to share a file with
+the 3-D ones? No — and it must not, because `coarsen_stream.write_output` opens with mode `"w"`,
+so "add eta to the product" means truncating twelve files whose numbers a passed gate depends on.
+
+A side-file cost **19 s for the first month and 54 s for the other eleven**, against ~35 min per
+3-D month regenerated. The check that makes it usable is not the physical bounds (those were never
+in doubt) but that the hole pattern is *identical* to the 3-D product's surface `cell_area` —
+123,565 wet / 3,293 holes, matching on every month, with the surface weights agreeing to 6e-8
+against the vertically-remapped 3-D weight. That identity is what lets a downstream join mask both
+files with ONE mask; without it, a cell that is a hole in one and not the other silently
+contributes a ~1 m fabricated SSH error to the loss.

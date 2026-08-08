@@ -68,11 +68,13 @@ ice fesom_jax/tests/test_ice_ic.py
 ice fesom_jax/tests/test_ice_step.py
 ice fesom_jax/tests/test_ice_thermo.py
 scripts scripts/tests/test_check_coarse_product.py
+scripts scripts/tests/test_coarsen_eta.py
 scripts scripts/tests/test_coarsen_stream.py
 scripts scripts/tests/test_horizon_scan.py
 scripts scripts/tests/test_lw_forward_seam.py
 scripts scripts/tests/test_lw_foundation_check.py
 scripts scripts/tests/test_mesh_diag.py
+scripts scripts/tests/test_nn_data.py
 scripts scripts/tests/test_section_transport.py
 scripts scripts/tests/test_student_year.py
 scripts scripts/tests/test_write_namelist.py
