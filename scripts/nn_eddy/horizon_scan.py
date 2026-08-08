@@ -47,13 +47,26 @@ import math
 import os
 import pickle
 import re
+import sys
 import time
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+# ⚠️ MUST precede `import fesom_jax`. `python scripts/foo.py` puts the SCRIPT's directory on
+# sys.path and NEVER the cwd, so a bare import resolves through the editable install — the MAIN
+# checkout, not this worktree. Harmless while the two agree; silently wrong the moment they do
+# not, which is now (`gm_nn.py` and the `gm.py` seam are worktree-only). Job 26798423 died on it.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 import fesom_jax  # noqa: F401  (enables x64)
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+_got = Path(fesom_jax.__file__).resolve()
+if ROOT not in _got.parents:
+    raise SystemExit(f"FATAL: fesom_jax imported from {_got}, not from {ROOT}")
 
 from fesom_jax import ssh, surface_forcing
 from fesom_jax.ale import AleConfig
@@ -67,7 +80,6 @@ from fesom_jax.phc_ic import phc_initial_state
 from fesom_jax.step import step
 from fesom_jax.tke import TkeConfig
 
-ROOT = Path(__file__).resolve().parents[2]
 MESH_DIR = ROOT / "data" / "mesh_core2"
 IC_DIR = ROOT / "data" / "ic_core2_dist864"
 DT = 1800.0

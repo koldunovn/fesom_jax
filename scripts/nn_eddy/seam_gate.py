@@ -41,27 +41,41 @@ import sys
 import time
 from pathlib import Path
 
-import fesom_jax  # noqa: F401  (enables x64)
-import jax
-import jax.numpy as jnp
-import numpy as np
+ROOT = Path(__file__).resolve().parents[2]
+# ⚠️ MUST come before `import fesom_jax`. `python scripts/foo.py` puts the SCRIPT's directory on
+# sys.path and never the cwd, so a bare import resolves through the editable install — which
+# points at the MAIN checkout. This script's whole subject (`gm_nn`, the seam in `gm.py`, the
+# `gm_nn` Params leaf) exists only in this worktree, so without these two lines the gate either
+# dies on an ImportError (as it did, job 26798423) or, worse for a script that happened to touch
+# only shared modules, measures the wrong code and reports it as this branch's number. The
+# assert below is the part that makes it impossible to get wrong quietly.
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-from fesom_jax import gm_nn, ssh, surface_forcing
-from fesom_jax.adjoint_stab import AdjointConfig
-from fesom_jax.ale import AleConfig
-from fesom_jax.gm import GMConfig
-from fesom_jax.ice import IceConfig
-from fesom_jax.integrate import _run_steps
-from fesom_jax.mesh import load_mesh
-from fesom_jax.params import Params
-from fesom_jax.phc_ic import phc_initial_state
-from fesom_jax.step import step
-from fesom_jax.tke import TkeConfig
+import fesom_jax  # noqa: E402,F401  (enables x64)
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+
+_got = Path(fesom_jax.__file__).resolve()
+if ROOT not in _got.parents:
+    raise SystemExit(f"FATAL: fesom_jax imported from {_got}, not from {ROOT}")
+
+from fesom_jax import gm_nn, ssh, surface_forcing  # noqa: E402
+from fesom_jax.adjoint_stab import AdjointConfig  # noqa: E402
+from fesom_jax.ale import AleConfig  # noqa: E402
+from fesom_jax.gm import GMConfig  # noqa: E402
+from fesom_jax.ice import IceConfig  # noqa: E402
+from fesom_jax.integrate import _run_steps  # noqa: E402
+from fesom_jax.mesh import load_mesh  # noqa: E402
+from fesom_jax.params import Params  # noqa: E402
+from fesom_jax.phc_ic import phc_initial_state  # noqa: E402
+from fesom_jax.step import step  # noqa: E402
+from fesom_jax.tke import TkeConfig  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from horizon_scan import level_weights, stage1_misfit  # noqa: E402  (loss forms, unit-tested)
 
-ROOT = Path(__file__).resolve().parents[2]
 MESH_DIR = ROOT / "data" / "mesh_core2"
 IC_DIR = ROOT / "data" / "ic_core2_dist864"
 DT = 1800.0
