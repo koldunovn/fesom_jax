@@ -6,15 +6,23 @@ is hardest to notice — silently accepting a real change. These tests cost no m
 the "losses" are one-line lambdas, so this file runs in milliseconds on any backend and can be
 grouped with the cheap unit tests.
 
-The GPU branch is exercised by replacing ``on_cpu`` rather than by needing a GPU, which is the
-only way to test it in the CPU suite. That is legitimate here because the helper's backend
-dependence is exactly one function call and nothing else in it touches a device.
+Both branches are exercised by replacing ``on_cpu``, rather than by needing the matching hardware.
+That is legitimate because the helper's backend dependence is exactly one function call and
+nothing else in it touches a device — and one test below pins that call against
+``jax.default_backend()``, which is the only part a monkeypatch cannot stand in for.
+
+⚠️ The CPU-branch tests originally relied on actually running on CPU, and consequently FAILED on
+the GPU verify run (job 26785391): with a GPU backend ``on_cpu()`` returns False, the helper takes
+the calibrated branch, and a test named "accepts only exact equality" quite correctly observed that
+it did not. Testing one branch backend-independently and leaving the other backend-dependent is
+half a job; both are pinned now.
 """
 
 from __future__ import annotations
 
 import math
 
+import jax
 import pytest
 
 from fesom_jax.tests import _identity_gates as G
@@ -23,20 +31,33 @@ ONE_ULP_ABOVE_ONE = math.nextafter(1.0, 2.0)   # 1.0 + 1e-16 rounds back to 1.0;
 
 
 @pytest.fixture
+def as_cpu(monkeypatch):
+    """Take the CPU (bit-exact) branch of every helper, whatever hardware this is."""
+    monkeypatch.setattr(G, "on_cpu", lambda: True)
+
+
+@pytest.fixture
 def as_gpu(monkeypatch):
-    """Take the non-CPU branch of every helper."""
+    """Take the non-CPU (calibrated) branch of every helper, whatever hardware this is."""
     monkeypatch.setattr(G, "on_cpu", lambda: False)
+
+
+def test_on_cpu_agrees_with_the_jax_backend():
+    """The one thing the monkeypatch cannot stand in for: that ``on_cpu`` actually reports the
+    backend. If this drifted, every test in this file would still pass while the helpers chose the
+    wrong branch in production."""
+    assert G.on_cpu() == (jax.default_backend() == "cpu")
 
 
 # --- CPU: bit-identical, and nothing weaker ------------------------------------------------
 
-def test_cpu_forward_accepts_only_exact_equality():
+def test_cpu_forward_accepts_only_exact_equality(as_cpu):
     G.assert_forward_identity(lambda x: 1.0, lambda x: 1.0, 0.0, "identical")
     with pytest.raises(AssertionError, match="moved the forward"):
         G.assert_forward_identity(lambda x: 1.0, lambda x: ONE_ULP_ABOVE_ONE, 0.0, "one ulp")
 
 
-def test_cpu_gradient_accepts_only_exact_equality_and_needs_no_signal():
+def test_cpu_gradient_accepts_only_exact_equality_and_needs_no_signal(as_cpu):
     """The reference-effect gradient costs an extra compile, so the CPU branch must not build
     it. If this ever regresses, the CPU suite silently doubles the cost of two tests."""
     def must_not_be_called():
