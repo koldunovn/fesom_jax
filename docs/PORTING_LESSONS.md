@@ -6106,3 +6106,648 @@ Two smaller things from the same failure:
   process start, and the traceback is rendered later still.)
 * Pull what you need to host and free the rest: keeping a whole 1.8 GB `State` alive to reference
   three of its fields is most of a jitted graph's headroom on this mesh.
+
+### 2026-08-08 (8) — I cited a superseded script as my existence proof, and lost a day to it
+
+The M1 gradient gate OOM'd three times. My diagnosis named `--seg-mult` as the knob and cited
+`horizon_scan.py` as proof that a longer window fits: "clean 30-day gradients at 34-37 GiB peak
+with the same `_run_steps` pattern". Every clause of that was wrong.
+
+* `horizon_scan.py` never took a clean 30-day gradient. Its own `horizon_results.jsonl` records
+  37 GB at 1 d, 55.8 GB at 5 d, **OOM at 7 and 10 d**, and a gradient already at 1e7 by 2 d. The
+  script had been SUPERSEDED the day before by `adjoint_horizon.py`, whose corrected verdict
+  (H >= 30 d) is what the plan records — I attributed the successor's result to the predecessor.
+* "34-37 GiB" is a comment inside that file describing the **per-step reverse working set**,
+  which explicitly "does NOT shrink with the window". I read a fixed-cost number as a
+  whole-window peak. It was in the same sentence that said so.
+* `adjoint_horizon.py` does not use the `_run_steps` whole-window pattern at all. It is chunked
+  reverse accumulation: boundaries on the HOST, a jitted VJP over ONE 48-step chunk at a time.
+  That is *why* it fits — 43.1 GB at 1 d, 56.9 GB at 30 d, device peak flat in window length.
+* And the knob I was reaching for was already at its optimum: `S + N/S` is minimised at `S=√N`,
+  which is `--seg-mult 1.0`. Bigger S = more outer carries, smaller S = more inner carries. At
+  1.93 GB per `State` the floor is ~60 GB of carries + ~18 GB working set at 5 days. Nothing to
+  tune. The arithmetic was available before any of the three jobs ran.
+
+**The lesson is not "read the docs".** The fact was fully documented, in the right words, in
+`docs/ADJOINT_HORIZON.md` §"Memory was never the real constraint" — measured numbers and all.
+It was lost because of WHERE it lived: reachable only from an already-ticked Task-2 checkbox, so
+it reads as closed history rather than as a live constraint on new code. Nothing at the failure
+site pointed to it. **A capability the whole campaign depends on must be recorded where someone
+LANDS when it bites** — in the docstring of the function whose knob they will reach for, in the
+project `CLAUDE.md`, in the plan's standing Technical Details — not only in the write-up of the
+task that discovered it. Done for this one; the plan's M6 checkbox, which prescribed the
+monolithic pattern by name, was the landmine this would have detonated next.
+
+**And: when a script is superseded, say so in its module docstring the same day.** A stale script
+that still runs is worse than a deleted one, because its numbers are quotable.
+
+### 2026-08-08 (9) — a precedent that fits the symptoms is not a diagnosis
+
+The 5-day seam gradient came back non-reproducible: three jobs, three answers (+5.93e-02,
++2.30e-03, +1.04e-02), two passes in one process spreading 2.877x with the sign flipping, while
+the loss agreed to three digits. `ADJOINT_HORIZON.md` 1.2 documents that exact symptom for the
+vertical mixing closure, with the cure. So I reasoned: `gm_nn` is a SECOND state-dependent
+diffusivity closure, built after those flags were measured, therefore `d(kappa)/d(state)` is the
+uncovered path. It was a good story. Every clause of it was checkable and I checked the wrong
+ones — that the flag existed, that no `stop_gradient` was in `gm.py`, that the horizon result
+used a constant kappa. All true, and all consistent with the hypothesis being false.
+
+Two experiments settled it, and the useful part is that BOTH were designed to be able to fail:
+
+* **`freeze_nn_features` A/B** (26801539). Built the switch, ran the window twice with the
+  network's inputs live and twice with them frozen. Chunk 0's cotangent blew up 8371x in the
+  control and **20270x frozen** — worse, and chunks 4->1 agreed between arms to four digits.
+  Refuted.
+* **`freeze_equivalence.py`** (26802525), which existed only because the user asked "are you
+  sure it isn't that you forgot to freeze mixing, and now you're blaming the NN?" That is the
+  duller and more likely explanation, and the project had TWO implementations of "freeze
+  mixing" — a library flag and a monkeypatch — with **nothing asserting they agree**. They do:
+  max|difference| exactly **0.000000e+00**, with the flag live at 0.948 relative. Also refuted,
+  and the test is now permanent.
+
+**What actually generalises.** I had stated the falsification criterion for the A/B in advance
+("if B still scatters, the network isn't it and the seed is next"), which is the only reason the
+negative result was worth anything instead of an invitation to patch further. And the diagnostic
+that localised the fault was a *trace*, not a scalar: the per-chunk cotangent norm showed four
+flat chunks and one at 1e4, which is "a switch is firing", against the 30-day run's log-spread of
+0.001 across all thirty. `seam_gate` had no such trace until I copied it over from
+`adjoint_horizon` — the sibling script had had it all along, for exactly this purpose.
+
+**Where it points, and the thing I never controlled for.** Chunk 0 runs the same compiled
+function as chunks 1-4 with the same switches; the only difference is that its input state is
+unpickled from disk rather than produced by the model. That was a difference between the broken
+5-day runs and the clean 30-day ones the whole time, sitting next to the one I fixated on.
+
+**Three smaller traps from the same afternoon**, all mine:
+* a `NamedTuple` config passed as an ARGUMENT to a differentiated function gets flattened as a
+  pytree and its bools become TRACERS, surfacing far away as a `TracerArrayConversionError` on
+  an index array inside the SSH solve. Close configs over; never pass them.
+* `step` refuses a `tke_cfg` without surface forcing, and the tempting dodge — drop `tke_cfg` —
+  deletes the very closure under test.
+* a completion monitor that re-evaluates every job each cycle and only exits when ALL are done
+  re-emits the finished ones every poll. One watch per thing, exiting on its own first terminal
+  state.
+
+---
+
+## 2026-08-09 — M3b, the February event, and four guards that were quietly not guarding
+
+### 2026-08-09 (1) — `${VAR:-default}` substitutes on EMPTY, so the flag you cleared is still set
+
+`FDH=${FDH:-1e-3}` in `adjoint_horizon_ladder.sbatch`. I submitted with `FDH=""` to skip the
+finite-difference check, exactly as the script's own `--fd-h` help documents ("empty to skip").
+The colon form substitutes the default when the variable is empty **as well as** when it is
+unset, so every one of those runs did the FD anyway. Each h value costs two extra full forwards:
+26 minutes at 60 days, 79 at 180. Job 26819415 sat silent for exactly 26 minutes after its last
+reverse chunk and I went looking for a hang — the answer was in the sbatch, one character wide.
+
+Use `${VAR-default}` when empty is a meaningful value. The same file had the trap twice: with
+`WEIGHTS=${WEIGHTS:-...}` there was no way to ask for per-rung weights at all, because the one
+value that means "none" was the one being overwritten.
+
+### 2026-08-09 (2) — a monkeypatch's signature is a private copy of a signature that moves
+
+`--freeze convect` had been dead for an unknown number of days. The wrapper declared
+`def w(mesh, Kv, Av, bvfreq)`; the library had since grown its OWN convection freeze
+(`pp.mo_convect(..., freeze_increment=)`, driven by `AdjointConfig.freeze_convection`) and
+`tke.py`/`kpp.py`/`pp.py` all pass that keyword now. Every request for the knob died in 27 s with
+a `TypeError`. Nothing said so until a GPU job spent a slot finding out.
+
+Every other wrapper in that file takes `(*a, **k)` and survived; only the one with a spelled-out
+signature broke. So: **`**kwargs` in a monkeypatch is not laziness, it is the only thing that
+survives the library moving.** And the drift is now testable without a GPU —
+`scripts/tests/test_freeze_knobs_install.py` installs each knob and compares the wrapper's
+accepted parameters against the original's, plus calls `mo_convect` the way the library calls it.
+
+The deeper point is the one this project already learned once: there were TWO implementations of
+"freeze mixing" and nothing asserting they agreed. This is the same shape, one term over. The
+standing decision is to retire the monkeypatches in favour of `AdjointConfig` — not done here on
+purpose, because every recorded freeze number came through the monkeypatch and a mid-campaign
+swap needs its own bit-identity gate.
+
+### 2026-08-09 (3) — a screen built on diluting statistics stops working exactly when it matters
+
+The amplification screen gated on two numbers: the MEDIAN per-step growth and the LOG-SPREAD
+across chunks. Both dilute with window length. Holding one ×1200 event fixed and lengthening the
+quiet plateau behind it:
+
+```
+flat chunks after the event      2        50       100       400
+median                        1.000413  1.000413  1.000413  1.000413   never fires
+log-spread                    0.0696    0.0205    0.0146    0.0074     stops firing at ~100
+```
+
+The median never fires at all — dilution is immediate, because the plateau outnumbers the event
+from the second chunk. The log-spread stops firing past ~100 quiet chunks, i.e. **the screen
+went blind on windows longer than about 100 days, and the campaign's target is a year.** On the
+real blown 60-day trace the median read 1.0001 (passes outright) and the log-spread cleared its
+bar by 1.2×. The screen got WEAKER as more evidence arrived.
+
+⚠️ **The obvious fix is unsafe.** Barring the worst SINGLE chunk looks right and is not: a
+30-day trace that is clean by every independent check (FD 7.9 %, gradient reproducing to 6.5e-4)
+contains one chunk at ×6.02 followed immediately by ×0.184 — a spike that reverses — giving it a
+worst-chunk rate of 1.03811 against a least-blown 1.07108. No usable gap. **A transient that the
+norm comes back from is not a blow-up.**
+
+The statistic that works is the worst rate over THREE consecutive chunks: the transient cancels
+against its own recovery, a real jump does not. Clean worst 1.01332, least blown 1.07108, bar at
+the geometric middle 1.030, 2.3× either side. All 52 recorded traces replay with zero verdict
+changes.
+
+### 2026-08-09 (4) — an equivalence test that shares a helper with the thing it tests cannot see its sign
+
+New `flux_divergence.py` reproduces `gm_redi.diff_part_hor_redi` with max|difference| **exactly
+0** when fed the Redi flux — the strongest gate this project has. It also returned **minus** the
+divergence, and that test could not tell, because both sides ran through the same
+un-normalised helper and the public function's sign never entered.
+
+What caught it was an independent analytic check: on a sphere a constant local-Cartesian flux is
+NOT divergence-free, its divergence is `-Fy·tanφ/R`. Measured against that: rms 2.5228e-07 vs a
+predicted 2.5292e-07, correlation 0.99998 — and slope **−0.9975**. A sign error that would have
+inverted every fitted κ, sitting behind a green exact-equality test.
+
+Second half of the same lesson: I first expected that check to give zero and treated the 8.85e-07
+residual as a failure. It was the physics. **Before calling a small residual an error, check
+whether the exact answer is actually zero.**
+
+### 2026-08-09 (5) — characterise the instrument before you publish its negative result
+
+`κ̂_div = -(∇·F)/∇²σ` drops `∇κ·∇σ`. Real `fer_K` spans orders of magnitude, so that term is not
+obviously small, and the real-data result being reported was a 43 % up-gradient population. If
+the estimator could manufacture that on its own the result would be about the instrument.
+
+Measured on analytic fields with κ known (`scripts/tests/test_divergence_fit.py`): median κ̂/κ =
+1.000 at every contrast, up-gradient 0.13 % at ±50 %, 0.95 % at ×10, **3.09 % at ×100**. The
+operator also annihilates a rotational flux to 0.43 % of a gradient flux from the same potential.
+So the ocean's 43 % is the ocean. The tests print the numbers rather than only asserting them,
+because a future change to the operator has to force a re-reading of the conclusion.
+
+### 2026-08-09 (6) — compare configurations on cumulative growth, not on the peak chunk
+
+Freezing the convective adjustment shrank the 1961-02-06 event from ×1406.8 to ×36.5 — a 38-fold
+reduction that reads as a fix. It is not: the growth is REDISTRIBUTED, with ×139.6 appearing on
+02-09 and ×44.9 on 02-07 where the baseline had ×10.0 and ×1.0, and the cumulative over the same
+nine chunks is **2.1× WORSE**. The final gradient does come out 10× smaller with the correct
+sign — and is still 5 orders from the FD's −9.80e−01.
+
+Three numbers, three different impressions. The peak chunk is the one that is easiest to quote
+and the one that misleads.
+
+### 2026-08-09 (7) — an option named for what it APPROXIMATES will be read as what it enables
+
+`--ice rheology` means ice thermodynamics, advection, cut-off and the ocean→ice coupling ALL
+differentiated, with zero mEVP sweeps unrolled. It is the training configuration. `--ice frozen`
+— the script's default — puts no ice in the backward at all. The name refers to the component
+being approximated, and reading it the other way is why every rung at 60, 90, 180, 365 and 731
+days was measured with no ice in the backward, in a campaign whose blow-ups all land in
+February, peak NH ice. Ice costs ~2 % of backward time, moves the gradient by 0.21–2.98 %, and
+does not touch stability at all.
+
+The fix that generalises is not a rename: it is a **guard that refuses the surprising default**
+past the length where it starts to matter, with the measured cost in the refusal text.
+
+### 2026-08-09 (8) — a results row must record everything that would change the number
+
+`adjoint_horizon_results.jsonl` carried the seed, the window, the freezes and a static
+`config` string — but not the boundary stride, the truth length, the weights source or (under a
+greppable name) the ice mode. So the 180-day row did not say it ran at stride 2 and the year rung
+did not say it ran at 19. That single omission is what made "season or stride?" a confound
+costing two five-hour jobs to resolve, when the record could have answered it.
+
+The provenance fields belonged to the checkpoint-identity dict, which is only built under
+`--ckpt-dir`. **Identity and provenance are the same list; write it in both places or in
+neither.**
+
+### 2026-08-09 (9) — a fixed temp filename is a race as soon as siblings become routine
+
+The truth cache wrote `cache.with_suffix(".tmp.npz")` then renamed. The rename is atomic, so
+readers were always safe — and two concurrent jobs on the same seed would interleave into that
+one temp file and rename the corruption into place. Not hypothetical any more: ice-on/ice-off
+contrasts and freeze-knob bisections are siblings with **byte-identical forwards**, which is
+exactly why they collide on the same truth. Temp name now carries the pid.
+
+### 2026-08-09 (10) — measure a claim against a reference through the SAME operator; the ratio is the result
+
+The rotational-flux hypothesis had never been measured, only inferred from the residuals it
+would explain. The measurement that settled it needs no κ estimator at all: for a flux varying
+on scale `L`, `η = |∇·F|·L/|F|` says how much of the field carries a divergence. The absolute
+number means little — a discrete operator damps at the grid scale — so it was computed for the
+teacher's flux AND for `G = -κ_formula ∇σ`, through the same operator on the same cells. Over
+36 months the ratio is min 0.757, median 0.774, max 1.509, **zero months below 0.5**. A
+rotationally dominated flux would be at a few percent.
+
+The same discipline applied to the follow-up: the flux turned out nearly collinear with the mean
+flow (|cos| 0.810) and only weakly down-gradient (|cos| 0.583). Those are two claims and thermal
+wind would make them one, so a **degeneracy check** went in before either was quoted:
+|cos(U, −∇σ)| = 0.470, a typical angle of ~62°, not 90°. Independent after all — but that was
+measured, not argued.
+
+### 2026-08-09 (11) — an attribution table measured where nothing could show reads as "these knobs do nothing"
+
+`AdjointConfig`'s docstring carried a table of every freeze flag's measured effect: a 2-day
+window, no other knob on, unfrozen scatter 1.21-1.55. Four flags landed inside that band and
+were recorded as **"inside the unfrozen scatter: no effect"**. The table was honest about its
+conditions and still misled completely, because "no effect" and "this experiment cannot resolve
+it" print the same.
+
+Re-measured on a 60-day window with `freeze_mixing` already on — so the baseline does not
+scatter and there is something to resolve against — **three of the four have effects**:
+
+| flag | 2-day table | 60-day, over freeze_mixing |
+|---|---|---|
+| `freeze_gm_slope` | 1.4298, "no effect" | **the entire cure**, x1.591 against a x4.363e+07 baseline |
+| `freeze_convection` | 1.2550, "no effect" | **2.12x WORSE** |
+| `freeze_advection` | 1.3238, "no effect" | 0.79 — a real 21 % |
+
+The one that mattered most was the one most confidently dismissed. And the failure is not
+carelessness in the measurement — the numbers are right — it is that a null result was written
+down as a property of the flag instead of a property of the experiment.
+
+**What to write instead of "no effect": the smallest effect the experiment could have seen.**
+Here that is "anything below ~1.5x/step is invisible at 2 days", which immediately says the
+table is silent about flags in that range rather than dismissive of them.
+
+The user asked the right question in one line — "maybe the other knobs are just as badly
+measured?" — after seeing ONE row overturned. Generalising from a single corrected entry to
+"the whole instrument may be blind" is the move; I had corrected the row and was about to move
+on.
+
+### 2026-08-09 (12) — the neighbouring model's option is not automatically the better one; check which way its literature moved
+
+MITgcm can run free-drift sea-ice dynamics in adjoint mode only, and our ice velocity has no
+gradient path at all, so adopting it looked like a straight upgrade. It is not. Toyoda et al.
+(2019), via Lyu et al. (2023): the adjoint of the rheology gives sensitivity to ice velocity
+**weaker by O(10²) in the central Arctic** than the free-drift adjoint — i.e. free drift
+OVERSTATES that sensitivity by ~100×, because nothing resists the motion. The field moved FROM
+free drift TOWARD approximated VP, not the other way; and even the VP adjoint needed viscosities
+frozen w.r.t. strain rate plus zeroing of any local sensitivity above 50× the global mean.
+
+Two transferable points. **The direction of travel in a literature is evidence**: a capability
+that exists and is switchable is not thereby recommended, and the papers that added the harder
+option say why. And **bound the prize before costing the work**: the entire ice contribution to
+our gradient is 0.21–2.98 % on clean windows, so any ice-dynamics pathway is worth less than
+that — against `jax.custom_vjp` plumbing whose primal and cotangent belong to different models.
+
+### 2026-08-09 (13) — a reduction in the diagnostic is not a reduction in the error
+
+The last two freeze knobs closed the attribution table, and one of them is instructive in a way
+a "no" usually is not. `freeze_vert_visc` cut the cumulative cotangent growth on the February
+window from ×4.363e+07 to ×3.541e+07 — a clean 19 % improvement, monotone, in the right
+direction, on the very statistic the bisection was being judged by. It is also worthless: the
+run ends at `dL/dm = -2.007128e+05` against a true finite difference of `-9.803512e-01`, which
+is five orders of magnitude wrong. The cure (`freeze_gm_slope`) does not improve the statistic
+by 19 %, it moves it by seven orders, to ×1.591.
+
+The transferable shape: **when the quantity you are bisecting on spans many orders of magnitude,
+a percentage change in it carries no information about whether the underlying problem is
+solved.** Only the ratio to the answer does. So a bisection over such a quantity has to carry
+the final gradient and its independent check in the same table as the diagnostic, or a row that
+is 19 % better will read as partial progress toward a fix that it is not on the path to. Every
+row in `AdjointConfig`'s table now quotes both.
+
+### 2026-08-09 (14) — the case that vindicates a screen is the one that passes its old bar
+
+The third amplification bar (worst 3-chunk stretch) was added on the argument that the median
+and the log-spread both dilute as windows grow. These two runs are the first measured instance
+of that argument being load-bearing rather than plausible: both record a median of **exactly
+1.0000/step** against a 1.010 bar — they pass the original screen outright — while their
+gradients are wrong by five and seven orders of magnitude. The log-spread catches them at 0.024
+against 0.020, and the 3-chunk statistic at 1.0900 against 1.030, both by comfortable margins.
+
+Worth recording because a screen that has never rejected something the old screen accepted is
+indistinguishable from a screen that does nothing, and until now the third bar had only been
+shown not to change any existing verdict — which is a compatibility check, not evidence of
+power. **Keep looking for the case that separates a new guard from the one it replaced; until
+you have it you have added cost, not coverage.**
+
+### 2026-08-09 (15) — cache the sample assembly, or an architecture screen measures the sampler
+
+`offline_fit.py` draws a random subsample of accepted cells per teacher mark, and the assembly
+(one `derive` + one `project` over 219 marks) is ~70 minutes against a fit measured in minutes.
+Running the architecture rungs as independent jobs would therefore have spent 70 minutes each to
+re-derive the same fields, and — the part that actually matters — would have given each rung a
+DIFFERENT random draw. The rungs differ by hidden-layer width; the draws differ by tens of
+thousands of cells; nothing in the output distinguishes the two, so a width that "won" might
+simply have been handed an easier subsample.
+
+The fix is a cache keyed on everything that changes which cells are drawn or what values they
+carry — months, every guard floor, per-mark count, seed — and a hard failure if a stored key
+disagrees. **A screen over variants must hold the data fixed by construction, not by the
+convention that everyone passes the same seed**, because the seed is not the whole key: the
+guard floors select cells too, and a sensitivity leg that changes a floor must get a different
+cache entry rather than silently reuse the old one.
+
+### 2026-08-09 (16) — score the closure forward, on every cell, about zero
+
+The projection-side metric for an eddy closure (R² of the fitted multiplier on the cells where
+the fit is well posed) has two properties that only became visible once the acceptance rate was
+measured: it lives on 2.1–2.4 % of the domain, and inside that set the flux is down-gradient by
+selection, because a cell is only accepted if the down-gradient ansatz explained it. A closure
+can therefore score respectably on it while reproducing almost none of the ocean's actual eddy
+flux, and nothing in the number says so.
+
+Three choices fix it, and all three are needed. **Run the closure forward through the same
+operator the projection inverts** — here `kappa_hat.gm_redi_flux`, already validated against a
+known κ by the synthetic check — so the comparison is against the teacher's raw flux rather
+than against a derived quantity. **Score every usable cell**, guard-free and unclipped, so the
+cells the architecture cannot reach are counted against it instead of being filtered out.
+**Take the explained variance about ZERO, not about the field mean**: the question is what
+fraction of the eddy flux the closure supplies, so a closure that supplies none must score 0,
+and one whose flux is further from the teacher's than no parameterization at all must go
+negative — which the mean-referenced version cannot express. Keep the projection-side metric as
+the gate if the plan defines it that way, but print both, and never quote the first alone.
+
+### 2026-08-09 (17) — one operator, two questions: the inverse problem and the deployed closure need different slopes
+
+`kappa_hat.gm_redi_flux` is the GM/Redi forward operator, written for `synthetic_check`: generate
+fluxes from a known κ, invert them with `project`, confirm the recovery. For that job it must use
+the same UNTAPERED neutral slope `project` uses, and it does.
+
+I then reused it to score a trained closure — run the NN's κ forward, compare the flux against the
+teacher's — and got an explained variance of **-2e+12**. That is not a bad closure; the ODM95 taper
+is a numerical safety device the STUDENT applies, and without it the slope `-∇σ/∂_zσ` diverges
+wherever stratification collapses, so the predicted flux overshot the teacher's by ~6 orders of
+magnitude. The same function, the same arguments, the wrong question.
+
+Two things to carry. **A shared forward operator needs the physically-consequential choice as an
+argument, not a constant**, with the default set to whichever caller existed first and the
+docstring naming the other caller's requirement explicitly — a reader who has only ever seen the
+inverse problem has no reason to suspect the taper matters. And **a score that can be
+catastrophically negative must be printed next to a magnitude ratio**: `-2e+12` reads like a
+finding about the ocean, while "RMS |F_pred| / RMS |F_teacher| = 1.4e+06" reads, correctly, like a
+bug. The evaluator now prints that ratio for every closure and flags anything past 1000x as not
+readable as skill.
+
+### 2026-08-09 (18) — before asking how well the model learned, ask what the model class can do at all
+
+Three rows of this evaluation compared trained networks against baselines, and every one of them
+confounded the same four questions: is the network too small, are the features too poor, was the
+training too short, or is the functional form simply wrong? A bad score cannot distinguish them,
+and the honest response to a bad score is usually "train it properly first" — which costs weeks
+and, if the fourth explanation is the true one, cannot possibly change the answer.
+
+The fix was one extra row: an ORACLE. Hand the model class a per-cell parameter chosen by
+minimising the error against the answer itself — no network, no features, no bound, only the sign
+constraint that defines the class. It is not a closure and cannot be deployed. What it gives is a
+**ceiling**: whatever it scores, nothing inside the class beats it, so a low value closes the
+class without any further training. Here it came out at 4.9 % of the temperature flux divergence,
+against a default closure at -20 % and a lightly trained network at -2.8 %, and it settled a
+decision that would otherwise have waited on a training campaign.
+
+Two design points that make such a row a bound rather than a tautology. **Count the degrees of
+freedom against the residuals**: two free coefficients fitted to one tracer's 2-component flux fit
+every cell exactly and would have "proved" the class perfect; fitting both tracers jointly, four
+components against two coefficients, keeps it overdetermined. And **impose the class's own
+constraints exactly** — here non-negativity by 2-variable NNLS, not by clipping the unconstrained
+solution, because clipping one coefficient leaves the other at a value that was optimal only in
+company with the coefficient just removed, so the result is neither the constrained optimum nor a
+bound on it.
+
+Generalises well past closures: any time you are about to spend weeks improving a fit, spend an
+hour computing what a cheating version of the same model class would score.
+
+### 2026-08-09 (19) — a ceiling is only an argument if the rival ceiling has the same degrees of freedom
+
+Lesson (18) added an oracle row to bound what a model class can do. The obvious next move — compute
+the rival class's ceiling and compare — is where such comparisons usually go wrong, because the two
+classes rarely have the same number of free parameters, and a class with more freedom scores higher
+for a reason that has nothing to do with physics.
+
+Here the two classes are a down-gradient diffusivity (two coefficients per cell, direction fixed by
+the neutral slope, sign constrained positive) and a bolus streamfunction (a free 2-vector per cell).
+Both were fitted to the SAME four residual components: x and y of the temperature flux and of the
+salinity flux. Two unknowns against four components in each case. That parity is what lets the
+difference — 0.5988 in explained variance of the temperature flux divergence — be attributed to the
+direction constraint rather than to parameter count.
+
+Two mechanics that made the parity real rather than nominal. **Fit the tracers jointly, never
+separately**: two unknowns against a single tracer's 2-vector fit every cell exactly in both classes
+and would have "proved" both perfect. And **pick the algebraic form that inherits the target's
+invariances**: the teacher's eddy flux is unchanged by adding a constant to temperature, so the
+rival had to be written as a skew flux (which sees only the vertical derivative) rather than the
+advective form u*·T, whose value depends on whether temperature is in Celsius or Kelvin. An
+advective formulation would have produced a number that changed with the unit.
+
+State the remaining asymmetry rather than burying it. Here the down-gradient class's constraint is
+imposed exactly, while the streamfunction class's real structural constraint — zero at the surface
+and the bottom, vertically coupled down a column — is not imposed at all. So the gap bounds the gain
+from above, and the robust conclusion is the CAUSE of the first class's failure, not the size of the
+second class's advantage.
+
+### 2026-08-09 (20) — say which averaging the bound is a bound on, because they differ in sign
+
+The same two ceilings computed per five-day mark and on monthly means do not merely differ in
+magnitude — the down-gradient one crosses zero, +0.0744 per mark against -0.0415 monthly. Neither
+is wrong. The per-mark fit gives the coefficient a fresh value every five days; the monthly fit
+demands one value for the month. The second is a strictly stronger constraint and therefore a
+strictly lower bound, and it is the right bar for "can this class reproduce the mean transport",
+while the first is the right bar for a closure that recomputes from the instantaneous state.
+
+The trap is that both are naturally described as "the ceiling of the class", and quoting the
+favourable one is invisible in the number. Report both, and label each with the constraint it
+encodes rather than with the averaging window, which is the incidental part.
+
+### 2026-08-09 (21) — a test that both the correct and the broken implementation pass
+
+The neighbouring session designed a two-sided check for an online accumulator of eddy-flux
+products: run with output every step, where the time mean of the product must equal the product
+of the time means to round-off, and run with daily output, where it must differ. The stated target
+was to separate "accumulates correctly" from "forms the product once, at write time".
+
+It does not separate them. On a one-step window the two implementations are the same expression,
+so both pass the first run. On a daily window both differ from the product of the means — the
+correct one by the true covariance, the broken one by `u(end)·T(end) − <u><T>` — so both pass the
+second. The check is real (it catches a missing division by the sample count, which would show as
+an exact factor of N) but it is not the check that was wanted.
+
+What separates them is **nested windows**: emit two accumulators in one run, one over a short
+interval and one over an interval that is an exact multiple of it. Correct accumulation makes the
+long window's value exactly the mean of the short ones, because the windows tile. Write-time
+formation makes the long window equal to the LAST short window, which the mean is not. One run,
+exact to round-off, no reproducibility question.
+
+The generalisable habit: for each failure mode you claim a test catches, write down what the broken
+implementation actually outputs and check that the test's assertion is FALSE for it. "The values
+differ, as expected" is not evidence unless the wrong implementation would have made them agree.
+
+### 2026-08-09 (22) — when the fix fails its own premise, ship the counter-result, not the fix
+
+A constrained least squares for a bolus streamfunction came out sane in the upper ocean and wrong
+in the abyss: the predicted flux was 2.4x the target below 1500 m and 2.8x below 3000 m, while the
+unconstrained version sat at 0.93-0.95 everywhere. The explanation was easy to reach — the
+objective is an unweighted sum of squared flux residuals, so weakly-stratified deep layers carry
+almost no weight, and a fit coupled down the column is free to put anything there in the service of
+the layers above. Minimum-norm regularisation is the textbook response.
+
+It failed its own test. On a synthetic column built to exactly that description, the UNregularised
+solve already returned exactly zero in the weak layers, and the ridge introduced a small nonzero
+instead of suppressing one — the opposite of the predicted effect. The ridge also moved
+well-determined solutions by ~0.3 %, so it was not free where it was not needed.
+
+The temptation at that point is to ship it anyway: the real-data symptom is real, the fix is
+standard, and the synthetic "just doesn't capture it". That reasoning would have put an
+unexplained correction into a number headed for a paper. What went in instead was the knob at
+default zero, a comment naming the measurement and the failed premise, and a test that pins the
+counter-result — the unregularised solve gives exactly 0.0 in the weak layers and the regularised
+one does not. A future fix now has to explain that observation rather than rediscover it.
+
+Two habits behind this. **A synthetic case built from your explanation is a test OF the
+explanation, not scaffolding for the fix** — when it disagrees, the explanation is what failed.
+And **record a failed diagnosis as a test, not as a deleted branch**, because the next person to
+see the symptom will reach for the same standard fix within about ten minutes.
+
+### 2026-08-09 (23) — a consistency residual that is a clean 1/N of the value is a missing sample, not round-off
+
+A new online eddy-flux output offers its own control: the interface reconstruction `Tint` is a
+plain two-point average of the layer field, so `<Tint> = ½(<T>(k−1) + <T>(k))` must hold exactly.
+It failed by 1.75e−2 on values of ~30. The obvious reading is accumulator precision — the stream
+is `prec 4` and FESOM's `io_meandata` really does accumulate in the output precision
+(`local_values_r4` is `real(real32)`), and 1800 sequential single-precision additions of a
+same-signed quantity land in that neighbourhood.
+
+It was wrong, and two measurements said so before any source was read. **The relative residual
+was 5.5556e−4 at every depth, for 100 % of 7.3 M nodes, with rms equal to the median** — a
+distribution with no spread at all, which round-off cannot produce. And 5.5556e−4 = 1/1800, the
+number of timesteps in the five-day window. A deficit of exactly one sample out of N, divided by
+N, is that number; nothing else is.
+
+Two generalisable habits. **Take the distribution before diagnosing, never the max** — the first
+pass printed only `max|err|`, and a max is consistent with both stories, so it cannot start a
+diagnosis. And **find the variable that differs in the suspected cause and read it**: salinity is
+written and accumulated in `real64` and showed the SAME relative residual as `real32`
+temperature, which excluded precision in one line without any source access. The actual cause was
+cold-start — the arrays the flux module fills are still zero when the averaging machinery takes
+its first sample of the run — so only the first window of each job segment is affected, which the
+second output record confirmed by closing the identity at exactly 0.0.
+
+### 2026-08-09 (24) — a dimensionally correct scale can still be the wrong scale by four orders of magnitude
+
+The Arm B network emits an O(1) number that a local dimensional scale multiplies into a bolus
+streamfunction, following the published recipe for making such a parameterization generalise
+across resolution. The scale first written was `Δ²·M²/N`, which has units of m²/s, passes every
+unit check, and is wrong: that is the scale of a DIFFUSIVITY. A streamfunction is a diffusivity
+times a slope, so the right combination is `Δ²·M⁴/N³` — also m²/s, and smaller by `S ≈ 1e−4`.
+
+The fit diverged to an explained variance of −7.7e+10 inside one epoch. That is the cheap
+outcome; the expensive one is a scale wrong by 3× rather than 1e4×, which trains to something
+plausible and merely underperforms.
+
+**A dimensional argument cannot distinguish two combinations with the same dimensions, so it is
+not a check — it is a hypothesis.** The check is to calibrate against a known-good instance of
+the quantity itself. Here that instance was free: the per-cell oracle already computes the best Ψ
+the class can use, so `median |Ψ_oracle| / Ψ_scale` is a direct measurement of whether the scale
+has the right magnitude. It is now printed for every mark at assembly, which turns any future
+edit to that expression into a number instead of an argument.
+
+### 2026-08-09 (25) — fit the gauge-invariant quantity, and say which one the bound was fitted on
+
+An eddy flux splits into rotational and divergent parts, the split is not unique in a bounded
+domain (Fox-Kemper, Ferrari & Pedlosky, JPO 33, 478, 2003), and the rotational part moves no
+tracer. So a skill number computed on the raw flux is gauge-dependent and a diffusivity
+diagnosed from it is contaminated — the standard result, and the reason diagnosed κ fields come
+out with "unphysically large positive and negative values" (Maddison, Marshall & Shipton, Ocean
+Modelling 2015). Measured on this teacher: `η = |∇·F|·Δ/|F|` is 0.466 against 0.610 for a
+down-gradient reference field, so the rotational excess is real but not dominant.
+
+Two consequences, and only the first is obvious. Train on the divergence — which is what the
+closest published analogue does (Perezhogin et al., GRL 2025, `‖S − ∇·T̂‖²/‖S‖²`) — because it is
+both the gauge-invariant quantity and the reported metric.
+
+The second: **a ceiling fitted on the flux and scored on the divergence is a LOWER bound on its
+class under a divergence objective, and can legitimately be beaten by something inside the
+class.** Every comparison of a trained closure against such a ceiling has to carry that sentence,
+or "the network reached 95 % of the ceiling" will be read as "the class is exhausted" when it may
+mean the ceiling was measured on the wrong objective.
+
+⚠️ It does not follow that removing the rotational part rescues a down-gradient closure. Here the
+same κ fit run against `∇·F` instead of `F` left **43.4 %** of cells wanting a negative
+diffusivity, against 34.9 % when fitted on the raw flux — slightly worse, not better. The
+rotational reading explains why the raw flux looks the way it does; it does not change the
+verdict on the class.
+
+### 2026-08-09 (26) — a per-cell oracle bounds the FORM, never the attainable skill; measure the gap's cause
+
+An oracle row (lesson 18) hands a model class a per-cell parameter chosen against the answer and
+reports what it scores. That is a real bound and it closed one arm of this project honestly. It is
+also routinely over-read, including by the person who computed it, as "what a trained closure
+should be aiming at". It is not. The oracle knows the answer cell by cell; a deployable closure
+maps local mean-state features to coefficients and cannot.
+
+Here a bolus-streamfunction network trained on the same objective reached +0.0010 against its own
+class's ceiling of +0.6177. Two measurements — both cheap, both worth making BEFORE concluding
+anything about the architecture — turned that from a failed fit into a result.
+
+**The best single global coefficient.** The prediction was linear in its two coefficients, so the
+optimum over the whole domain is a 2×2 normal-equation solve, not a fit: `(-0.0005, -0.0002)`,
+explained variance `+0.0000`. A constant multiple of the default closure, free in sign and
+direction, explains nothing at all. That immediately says the trained network's small number is
+not "barely better than trivial" — trivial is exactly zero, and it beat it.
+
+**The oracle's own coefficient, projected into the closure's basis and non-dimensionalised.**
+Median +0.016 against a robust spread of 0.39, with the default closure's sign winning in 54.6 %
+of cells and the orthogonal coefficient symmetric about zero to four digits. So what the oracle
+exploits is per-cell, sign-symmetric and centred on zero — eddy phase, not mean state. The gap
+between ceiling and closure is therefore not architecture, not features and not training length,
+and no amount of any of them will close it.
+
+Two habits. **Compute the best CONSTANT member of the class alongside the oracle**; it costs a
+linear solve and it separates "the features add nothing" from "there is nothing to add". And
+**project the oracle's answer into the closure's own parametrisation and look at its
+distribution** — a coefficient whose median is 4 % of its spread is telling you the target is
+mostly unpredictable, before any network is trained. The residual systematic part, small as it
+is, is what time averaging keeps while suppressing the rest, which is what makes a time-averaged
+target the whole experiment rather than a refinement of it.
+
+### 2026-08-09 (27) — the model's frame is not the frame your table's headings mean
+
+FESOM computes in a rotated frame — pole moved to 50°E/15°N so the singularity leaves the ocean —
+and the mesh carries both `coord_nod2D` (rotated) and `geo_coord_nod2D` (geographic). The rotated
+one is the attribute that comes to hand: right shape, right units, right dtype, no warning.
+
+Three analysis scripts here labelled latitude bands with it. Measured on core2: up to **15°** of
+error, median 10.9°, and **22.8 % of 126,858 nodes in a different band** — the "30N-60N" row held
+21,532 nodes instead of 28,720. A second copy of the same mistake rebuilt the Coriolis parameter
+as `2Ω sin(rotated lat)` for a resolution stratification, off by more than a factor of two at
+17.4 % of nodes, when the mesh already carried `coriolis_node = 2Ω sin(geo lat)`.
+
+Nothing failed. Every table printed, every band was populated, and the physics was untouched —
+the model's own computation must stay in the rotated frame and did. Only the HEADINGS were wrong,
+which is the hardest kind of error to notice because the numbers under them are real numbers about
+a real region, just not the region named.
+
+Two habits. **A derived coordinate used for labelling gets one function, named for the frame it
+returns** (`geo_latitude_deg`), so the choice is made once and is visible at every call site. And
+**when a mesh offers the same quantity twice, ask which one the OUTPUT means, not which one the
+code needs** — the model needed the rotated one and the reader needed the geographic one, and the
+same attribute served both until someone asked.
+
+### 2026-08-09 (28) — the architecture screen ranked the rungs backwards, and that IS the result
+
+Lesson (16) said the projection-side metric lives on 2 % of the ocean and must never be quoted
+alone. This is that warning turned into a controlled experiment, and it is stronger than the
+warning was.
+
+Four widths and depths, same cached sample set, same seed, same guard — so the rungs differ in
+nothing but shape. Holdout margin on the gate's own metric against explained variance of the
+temperature flux and its divergence on EVERY usable cell:
+
+    rung        gate margin    flux EV      div EV
+    8x8           +0.2368      -0.0168     -0.1073
+    16x16         +0.2598      -0.0184     -0.1065
+    16x16x16      +0.2631      -0.0215     -0.1399
+    32x32         +0.2786      -0.0199     -0.1119
+
+**The ranking on the gate is the reverse of the ranking on the flux.** The widest network wins the
+gate by the largest margin of the four and is beaten on flux by the smallest one; the deepest wins
+the gate over the incumbent and is clearly worst on the divergence. Nothing here is noise-level:
+the gate spread is 0.042 against a 0.05 bar, and the div spread is 0.033 on 42.8 M cells.
+
+The mechanism is not subtle once seen. Extra capacity buys a better fit on the 1.5-2.4 % of cells
+where the down-gradient projection is well posed — a set inside which the flux is down-gradient by
+selection — and that fit does not transfer to the other 98 %. A screen run on the gate metric alone
+would have selected 32x32, reported a 7 % improvement, and made the closure worse.
+
+Two habits. **Never select a hyperparameter on a metric computed on a selected subpopulation**,
+even one the plan names as the gate — the gate is a bar to clear, not an objective to optimise
+against. And **when two metrics disagree in RANK rather than in value, that disagreement is the
+finding**; report it instead of picking the metric that gives the cleaner story.
