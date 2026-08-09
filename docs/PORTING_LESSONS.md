@@ -6751,3 +6751,44 @@ Two habits. **Never select a hyperparameter on a metric computed on a selected s
 even one the plan names as the gate — the gate is a bar to clear, not an objective to optimise
 against. And **when two metrics disagree in RANK rather than in value, that disagreement is the
 finding**; report it instead of picking the metric that gives the cleaner story.
+
+### 2026-08-10 (29) — a test in a manifest and not in a runner is not a test
+
+A cost manifest classified every test file into five groups and a test enforced that no file was
+left unclassified. The runner invoked three of the five. The `scripts` group — 11 files, 96 tests,
+28 seconds — therefore existed on paper and ran nowhere, for two days, and the manifest's own
+header records that this exact discovery had already been made once before: the group was created
+in response to it and the runner was never updated.
+
+It surfaced from the far end. An edit to `coarsen_stream.py` could not be checked because its test
+file would not even collect — `ModuleNotFoundError: No module named 'nn_data'`, a sibling those
+scripts get for free when run as scripts and never get under pytest. A collection error in a file
+nothing runs is invisible indefinitely.
+
+Underneath it was a second layer of the same thing. Running the full suite for the first time in
+two days found it RED on two meta-tests, both of the form "something was added and not
+registered": eight test files missing from the manifest, and an `AdjointConfig` flag added by the
+seam work and never classified. Both tests were doing exactly their job; nobody was reading them.
+
+**A guard has two halves and they fail independently — the assertion, and something that executes
+it.** Adding the first is the satisfying half and is worth nothing alone. When you add a group, a
+manifest or a registry, the same change must add its invocation, and the cheapest way to prove
+the invocation exists is to break the assertion on purpose once and watch something go red.
+
+### 2026-08-10 (30) — `--durations` prints descending, so `tail` keeps the tests you do not care about
+
+Measuring which tests to put in a CI budget, the harness ran the group with `--durations=0` and
+piped it through `tail -80` to keep the log manageable. The list is sorted by cost, descending, so
+the tail is the CHEAPEST 50 entries. The job came back with a 34-minute wall, a clean summary
+line, and no information whatsoever about where the 34 minutes went — while looking like a
+successful measurement, because the numbers it did print were real numbers.
+
+The generalisable form is not about pytest. **When truncating a sorted stream, the interesting end
+is decided by the sort order, not by which end is conventional**, and `head`/`tail` do not know
+which one you meant. A truncation that silently drops the signal is worse than no truncation,
+because the output still parses.
+
+Two habits. Keep the whole output when the whole point of the run is to find the extreme — disk is
+cheaper than a repeated 35-minute job. And when a measurement returns a total with no
+decomposition, treat the missing decomposition as a defect in the harness rather than as a
+property of the thing measured.
