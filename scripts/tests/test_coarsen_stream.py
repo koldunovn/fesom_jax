@@ -384,3 +384,97 @@ def test_written_output_is_readable_and_marks_no_data(cs, meshes, tmp_path):
         assert ds.variables["temp"].shape == (1, N_COARSE, 2)
         assert float(ds.variables["time"][0]) == tv
         assert "NO DATA" in ds.description
+
+
+# ---------------------------------------------------------------------------
+# the ONLINE-ACCUMULATED source
+# ---------------------------------------------------------------------------
+def test_accumulated_path_gives_zero_when_there_is_no_subgrid_covariance(cs, meshes):
+    """Same invariant as the snapshot path, on the other source. If the accumulated product
+    equals the product of the accumulated constituents and both are uniform inside a coarse
+    cell, the diagnosed subgrid flux must be exactly 0 — not small."""
+    fine_dir, coarse_dir = meshes
+    rmap = coarsen.build_remap(fine_dir, coarse_dir)
+    cell = np.asarray(rmap.fine_cell)
+
+    T = jnp.asarray(np.where(cell == 0, 5.0, 12.0))
+    S = jnp.asarray(np.where(cell == 0, 34.0, 35.0))
+    u = jnp.asarray(np.where(cell == 0, 2.0, -1.0))
+    v = jnp.asarray(np.where(cell == 0, 0.5, 3.0))
+    mask = jnp.ones(N_FINE)
+    _, flux, w = cs.level_products_accum(u * T, v * T, u * S, v * S, u, v, T, S, mask, rmap)
+    assert (np.asarray(w) > 0).all()
+    for f, name in zip(flux, cs.FLUX_NAMES):
+        assert np.abs(np.asarray(f)).max() < 1e-12, f"{name} is not zero: {np.asarray(f)}"
+
+
+def test_accumulated_path_keeps_a_time_covariance_the_snapshot_path_cannot_see(cs, meshes):
+    """The whole point of the online streams, as an assertion.
+
+    Build a cell in which u and T are UNIFORM in space but anti-correlated in TIME, so that
+    ``<uT> != <u><T>`` while every spatial covariance is zero. The snapshot path, which forms the
+    product from one instant, has no way to represent this; the accumulated path must return it,
+    and must return exactly the time covariance."""
+    fine_dir, coarse_dir = meshes
+    rmap = coarsen.build_remap(fine_dir, coarse_dir)
+    cell = np.asarray(rmap.fine_cell)
+    mask = jnp.ones(N_FINE)
+
+    # two instants, spatially uniform within each coarse cell at both of them
+    u1 = np.where(cell == 0, 1.0, 2.0)
+    u2 = np.where(cell == 0, 3.0, -2.0)
+    T1 = np.where(cell == 0, 10.0, 20.0)
+    T2 = np.where(cell == 0, 30.0, 5.0)
+    um, Tm = 0.5 * (u1 + u2), 0.5 * (T1 + T2)
+    uTm = 0.5 * (u1 * T1 + u2 * T2)                 # what the model accumulates
+
+    z = jnp.zeros(N_FINE)
+    _, flux, _ = cs.level_products_accum(jnp.asarray(uTm), z, z, z,
+                                         jnp.asarray(um), z, jnp.asarray(Tm), z, mask, rmap)
+    got = np.asarray(flux[0])
+    # the time covariance is uniform per cell, so aggregation leaves it untouched
+    want0 = 0.5 * (u1[cell == 0][0] * T1[cell == 0][0] + u2[cell == 0][0] * T2[cell == 0][0]) \
+        - um[cell == 0][0] * Tm[cell == 0][0]
+    assert got[0] == pytest.approx(want0, rel=1e-12)
+    assert abs(want0) > 1.0, "the fixture must actually carry a time covariance"
+
+
+def test_accumulated_path_never_touches_the_element_mask(cs, meshes):
+    """``u_fx``/``v_fx`` arrive on NODES from the model's own ``compute_vel_nodes``. Re-deriving
+    nodal velocity from elements here would put a second, slightly different collocation operator
+    inside a decomposition whose validity rests on both terms sharing one — so the accumulated
+    path must take no element argument at all."""
+    import inspect
+    sig = inspect.signature(cs.level_products_accum)
+    assert "elem_mask" not in sig.parameters
+    assert "fine" not in sig.parameters, \
+        "the accumulated path needs no fine-mesh element data; taking it invites elem_to_node"
+
+
+def test_a_short_record_is_detected_by_the_control_identity(cs, tmp_path):
+    """The first output record of a run segment is short by exactly one accumulator sample in N,
+    and it is invisible in the amplitudes — measured 2026-08-09, that record's eddy covariance rms
+    sat dead centre of the other five. The identity is the only thing that finds it, so it is
+    checked rather than trusted to a list of which months start a segment."""
+    teacher = tmp_path / "teacher"
+    teacher.mkdir()
+    n_node, nz, nz_i, N = 50, 4, 5, 1800
+    rng = np.random.default_rng(0)
+    S_fx = 34.0 + rng.normal(scale=0.5, size=(2, nz, n_node))
+    Sint = np.zeros((2, nz_i, n_node))
+    for k in range(1, nz):
+        Sint[:, k, :] = 0.5 * (S_fx[:, k - 1, :] + S_fx[:, k, :])
+    Sint[0] *= (N - 1) / N          # record 0: one sample of N missing
+
+    for name, arr, nlev in (("S_fx", S_fx, nz), ("Sint", Sint, nz_i)):
+        with netCDF4.Dataset(teacher / f"{name}.fesom.1961_01.nc", "w") as ds:
+            ds.createDimension("time", 2)
+            ds.createDimension("lev", nlev)
+            ds.createDimension("nod2", n_node)
+            v = ds.createVariable(name, "f8", ("time", "lev", "nod2"))
+            v[:] = arr
+
+    short = cs.record_sample_deficit(teacher, "1961_01", 0, k=2)
+    good = cs.record_sample_deficit(teacher, "1961_01", 1, k=2)
+    assert short == pytest.approx(-1.0 / N, rel=1e-6), short
+    assert abs(good) < 1e-12, good

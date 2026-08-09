@@ -198,6 +198,122 @@ def level_products(T, S, u_el, v_el, mask, rmap, fine, elem_mask=None):
     return (Tc, Sc, uc, vc), (uT - uc * Tc, vT - vc * Tc, uS - uc * Sc, vS - vc * Sc), w
 
 
+def level_products_accum(uT, vT, uS, vS, u, v, T, S, mask, rmap):
+    """One fine level of the ONLINE-ACCUMULATED streams in, the same coarse outputs out.
+
+    The difference from :func:`level_products` is what the fine-resolution product means. There,
+    ``u*T`` is formed here, from one snapshot, so the residual is a purely SPATIAL covariance and
+    carries whatever the eddy field was doing that instant — internal waves, near-inertial motion,
+    the diurnal cycle. Here ``uT`` arrives already accumulated at every model step over the output
+    interval, so
+
+        agg(<uT>) - agg(<u>) * agg(<T>)
+
+    is the subgrid flux of the TIME-MEAN field: the time and space decompositions compose, with
+    one averaging operator in both terms. That is the quantity a parameterization is supposed to
+    supply, and it is the reason these streams were requested.
+
+    ⚠️ No ``elem_to_node`` and no element mask here, and that is not an oversight. ``u_fx``/``v_fx``
+    are written on NODES by the model's own ``compute_vel_nodes``, which excludes dry elements from
+    the numerator AND the denominator exactly as ``coarsen.elem_to_node`` does. Re-deriving nodal
+    velocity from elements would be a second, slightly different operator inside a decomposition
+    whose whole validity rests on both terms sharing one."""
+    def agg(x):
+        return coarsen.aggregate_horizontal_with_weight(x, rmap, fine_mask=mask)
+
+    (Tc, w), (Sc, _), (uc, _), (vc, _) = agg(T), agg(S), agg(u), agg(v)
+    (uTc, _), (vTc, _), (uSc, _), (vSc, _) = agg(uT), agg(vT), agg(uS), agg(vS)
+    return ((Tc, Sc, uc, vc),
+            (uTc - uc * Tc, vTc - vc * Tc, uSc - uc * Sc, vSc - vc * Sc), w)
+
+
+def record_sample_deficit(teacher: pathlib.Path, month: str, rec: int, k: int = 20) -> float:
+    """Relative violation of the control ``Tint == ½(T_fx[k-1] + T_fx[k])`` for one record.
+
+    ⚠️ **The first output record of every run segment is short by exactly one sample in N**, N
+    being the steps in the output interval — measured 2026-08-09 on 1961_01: −1/1800 at every
+    depth for 100 % of nodes with rms equal to median, and exactly 0.0 in records 1–5. The arrays
+    the flux module fills are still zero when the averaging machinery takes its first sample.
+
+    It is INVISIBLE in the amplitudes: that record's horizontal eddy covariance rms was 0.02224
+    against 0.0198–0.0235 for the other five, dead centre of the spread. A ~7 % systematic bias
+    hiding inside a ±10 % record-to-record variation is not something a plot will show, so the
+    identity is the only thing that finds it and the reader checks it rather than trusting a list
+    of which months start a segment.
+
+    Returns the median relative residual, a number near ``-1/N`` for a short record and near 0
+    otherwise."""
+    with netCDF4.Dataset(teacher / f"Sint.fesom.{month}.nc") as di, \
+         netCDF4.Dataset(teacher / f"S_fx.fesom.{month}.nc") as dl:
+        Si = np.ma.filled(np.ma.asarray(di.variables["Sint"][rec, k, :]).astype(np.float64),
+                          np.nan)
+        Sa = np.ma.filled(np.ma.asarray(dl.variables["S_fx"][rec, k - 1, :]).astype(np.float64),
+                          np.nan)
+        Sb = np.ma.filled(np.ma.asarray(dl.variables["S_fx"][rec, k, :]).astype(np.float64),
+                          np.nan)
+    ok = np.isfinite(Si) & np.isfinite(Sa) & np.isfinite(Sb)
+    ref = 0.5 * (Sa + Sb)
+    good = ok & (np.abs(ref) > 0)
+    if not good.any():
+        return float("nan")
+    return float(np.median(((Si - ref) / ref)[good]))
+
+
+def process_record_accum(month, rec, rmap, fine, teacher: pathlib.Path, verbose=True,
+                         max_levels=None):
+    """One record of the online-accumulated streams, coarse-grained. Same returns as
+    :func:`process_record`, so the driver, the vertical remap and the output schema are shared and
+    everything downstream reads the two products through one reader."""
+    names = dict(uT="uT", vT="vT", uS="uS", vS="vS",
+                 u="u_fx", v="v_fx", T="T_fx", S="S_fx")
+    ds = {}
+    for key, var in names.items():
+        p = teacher / f"{var}.fesom.{month}.nc"
+        if not p.exists():
+            raise SystemExit(f"missing accumulated stream {p} — this month predates the "
+                             f"eddy-flux output, use --source snap")
+        ds[key] = netCDF4.Dataset(p)
+    try:
+        # read the time, do not compute it — same reason as the snapshot path
+        t_val = float(ds["T"].variables["time"][rec])
+        nz1 = ds["T"].variables["T_fx"].shape[1]
+        if max_levels:
+            nz1 = min(nz1, int(max_levels))
+        n_lev_out = int(rmap.coarse_depth.shape[0]) - 1
+
+        state = [np.zeros((rmap.n_coarse, nz1)) for _ in STATE_NAMES]
+        flux = [np.zeros((rmap.n_coarse, nz1)) for _ in FLUX_NAMES]
+        weight = np.zeros((rmap.n_coarse, nz1))
+
+        t0 = time.time()
+        for k in range(nz1):
+            m = jnp.asarray(fine.layer_mask(k))
+            arr = {key: jnp.asarray(read_slice(ds[key], var, rec, k))
+                   for key, var in names.items()}
+            st, fl, w = level_products_accum(arr["uT"], arr["vT"], arr["uS"], arr["vS"],
+                                             arr["u"], arr["v"], arr["T"], arr["S"], m, rmap)
+            for a, x in zip(state, st):
+                a[:, k] = np.asarray(x)
+            for a, x in zip(flux, fl):
+                a[:, k] = np.asarray(x)
+            weight[:, k] = np.asarray(w)
+            if verbose and (k % 10 == 0 or k == nz1 - 1):
+                print(f"  level {k + 1:3d}/{nz1}  {time.time() - t0:6.1f} s", flush=True)
+    finally:
+        for d in ds.values():
+            d.close()
+
+    fz, cz = np.asarray(rmap.fine_depth)[:nz1 + 1], np.asarray(rmap.coarse_depth)
+    wet = jnp.asarray((weight > 0.0).astype(np.float64))
+    state_v = [np.asarray(coarsen.remap_vertical(jnp.asarray(a), fz, cz, fine_mask=wet))
+               for a in state]
+    flux_v = [np.asarray(coarsen.remap_vertical(jnp.asarray(a), fz, cz, fine_mask=wet))
+              for a in flux]
+    weight_v = np.asarray(coarsen.remap_vertical(jnp.asarray(weight), fz, cz, fine_mask=wet))
+    assert state_v[0].shape == (rmap.n_coarse, n_lev_out), state_v[0].shape
+    return state_v, flux_v, weight_v, t_val
+
+
 # ---------------------------------------------------------------------------
 # driver
 # ---------------------------------------------------------------------------
@@ -390,6 +506,14 @@ def main():
     ap.add_argument("--map-cache", type=pathlib.Path, default=None)
     ap.add_argument("--max-levels", type=int, default=None,
                     help="truncate the column — SMOKE TEST ONLY, output is not usable")
+    ap.add_argument("--source", choices=("snap", "accum"), default="snap",
+                    help="'snap' builds the eddy flux from one 5-day SNAPSHOT, an instantaneous "
+                         "spatial covariance. 'accum' builds it from the online-accumulated "
+                         "uT/vT/uS/vS and their u_fx/T_fx constituents, i.e. the subgrid flux of "
+                         "the TIME-MEAN field — the quantity a parameterization supplies.")
+    ap.add_argument("--allow-short-records", action="store_true",
+                    help="process an accumulated record that fails the one-sample control. Only "
+                         "the first record of a run segment does; see record_sample_deficit.")
     ap.add_argument("--verify-conservation", action="store_true",
                     help="check the area integral is preserved on the REAL files, per level, "
                          "and exit; writes nothing")
@@ -402,8 +526,9 @@ def main():
     print(f"[mesh] fine nod2D={fine.nod2D} elem2D={fine.elem2D} nl={fine.nl} "
           f"({time.time() - t0:.1f} s)")
 
-    with netCDF4.Dataset(args.teacher / f"temp_snap.fesom.{args.month}.nc") as ds:
-        n_rec = ds.variables["temp_snap"].shape[0]
+    probe, pvar = (("temp_snap", "temp_snap") if args.source == "snap" else ("T_fx", "T_fx"))
+    with netCDF4.Dataset(args.teacher / f"{probe}.fesom.{args.month}.nc") as ds:
+        n_rec = ds.variables[pvar].shape[0]
     recs = ([int(x) for x in args.records.split(",")] if args.records
             else list(range(n_rec)))
     print(f"[run] month {args.month}: {n_rec} records in file, processing {recs}")
@@ -416,12 +541,29 @@ def main():
                                       max_levels=args.max_levels)
         return rc
 
+    if args.source == "accum":
+        # Refuse a short record rather than silently averaging a ~7 % bias into the target. The
+        # deficit is exactly one sample in N and is invisible in the amplitudes, so this identity
+        # is the only thing that catches it.
+        bad = []
+        for r in recs:
+            d = record_sample_deficit(args.teacher, args.month, r)
+            status = "OK" if abs(d) < 1e-5 else f"SHORT by {-d:.3e} (~1/{int(round(-1/d))})"
+            print(f"[control rec {r}] median relative residual {d:+.4e}  {status}", flush=True)
+            if abs(d) >= 1e-5:
+                bad.append(r)
+        if bad and not args.allow_short_records:
+            raise SystemExit(f"records {bad} of {args.month} are short by one accumulator sample; "
+                             f"drop them with --records, or pass --allow-short-records if you "
+                             f"have decided the ~7 % bias on the eddy covariance is acceptable")
+
     times, states, fluxes, weights = [], [], [], []
+    proc = process_record if args.source == "snap" else process_record_accum
     for r in recs:
         print(f"[rec {r}] start", flush=True)
         t0 = time.time()
-        st, fl, w, tv = process_record(args.month, r, rmap, fine, args.teacher,
-                                       max_levels=args.max_levels)
+        st, fl, w, tv = proc(args.month, r, rmap, fine, args.teacher,
+                             max_levels=args.max_levels)
         times.append(tv)
         states.append(st)
         fluxes.append(fl)
@@ -434,6 +576,8 @@ def main():
     states_t = [[s[i] for s in states] for i in range(len(STATE_NAMES))]
     fluxes_t = [[f[i] for f in fluxes] for i in range(len(FLUX_NAMES))]
     tag = f"_SMOKE{args.max_levels}lev" if args.max_levels else ""
+    if args.source == "accum":
+        tag += "_accum"
     write_output(args.out / f"coarse_ng5_{args.month}{tag}.nc", args.month, times,
                  states_t, fluxes_t, weights, rmap.n_coarse,
                  int(rmap.coarse_depth.shape[0]) - 1)
