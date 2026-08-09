@@ -218,3 +218,20 @@ def load_weights(path: Path):
     :func:`model_to_teacher_levels` before these are applied."""
     z = np.load(path)
     return np.asarray(z["w_T"], np.float64), np.asarray(z["w_S"], np.float64)
+
+
+def geo_latitude_deg(mesh):
+    """Node latitude in degrees, GEOGRAPHIC — the one a table labelled "30N-60N" means.
+
+    ⚠️ ``mesh.coord_nod2D`` is the ROTATED grid (FESOM's pole is moved to lon 50, lat 15 with
+    gamma = -90 so the singularity leaves the ocean), and it is the attribute that comes to hand.
+    Using it for a latitude band is wrong by up to **15 degrees**, median 10.9, and it moves
+    **22.8 % of the 126,858 core2 nodes into a different band** — measured 2026-08-09. The
+    "30N-60N" band holds 21,532 nodes by rotated latitude against 28,720 by geographic.
+
+    Everything the model computes is done in the rotated frame and must stay there; this is only
+    for LABELLING output by region. The Coriolis parameter has the same trap and its own fix:
+    take ``mesh.coriolis_node``, which is already ``2*Omega*sin(geo lat)``, rather than
+    recomputing it from ``coord_nod2D`` — that recomputation is off by more than a factor of two
+    at 17.4 % of nodes."""
+    return np.degrees(np.asarray(mesh.geo_coord_nod2D)[:, 1])
