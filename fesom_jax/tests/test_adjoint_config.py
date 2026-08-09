@@ -102,8 +102,14 @@ ACTIVE_ON_PI = ["freeze_mixing", "freeze_convection", "freeze_vert_visc",
 # against a knob that cannot fire; measured 2026-08-07, it returns bit-identical to baseline.
 # Production DOES run zstar, so freeze_pgf needs an effect-test under ale_cfg — see
 # test_adjoint_config_tke.py, which is the CORE2 tier.
+# ⚠️ freeze_nn_features is INACTIVE here for the same STRUCTURAL reason as freeze_pgf: it is
+# read only inside `if nn is not None:` (gm.py:501-505), the branch taken when a network is
+# attached to `params`, and this fixture attaches none. A flag that cannot fire is not a flag
+# that does nothing — listing it as active would fail against a knob with no code path, which is
+# what happened to freeze_pgf on 2026-08-07. Its effect test belongs with the seam
+# (tests/test_gm_nn_seam.py), where a network exists.
 INACTIVE_ON_PI = ["freeze_stratification", "freeze_tke_state", "freeze_gm_slope", "freeze_k33",
-                  "freeze_pgf"]
+                  "freeze_pgf", "freeze_nn_features"]
 
 
 def test_every_flag_is_covered():
