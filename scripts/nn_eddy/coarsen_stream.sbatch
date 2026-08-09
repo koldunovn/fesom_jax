@@ -39,7 +39,16 @@ case " $* " in
   *" --verify-conservation "*|*" --max-levels "*) ;;
   *)
     if [ "$rc" -eq 0 ]; then
-        OUTDIR=/work/ab0995/a270088/nn_eddy/coarse
+        # ⚠️ ASK THE CODE where it writes; never hardcode it here. This line used to read
+        # /work/ab0995/a270088/nn_eddy/coarse. After the data root moved to ba1583 (behind
+        # nn_data.DATA_ROOT) the products went to the new path while the checker kept looking
+        # at the old one, found nothing, printed "WARNING: ... nothing checked" and exited 0 —
+        # so the whole point of running the checker in-job, that a contaminated product is a
+        # FAILED JOB rather than a file somebody trusts, was silently off. Jobs
+        # 26807590-26807598 ran with that hole and were checked by hand afterwards.
+        OUTDIR=$("$PY" -c "import sys; sys.path.insert(0, 'scripts/nn_eddy'); \
+import nn_data; print(nn_data.COARSE_DIR)")
+        [ -z "$OUTDIR" ] && { echo "FATAL: could not resolve nn_data.COARSE_DIR"; exit 3; }
         for i in $(seq 1 $#); do
             eval "a=\${$i}"; eval "b=\${$((i+1))}"
             [ "$a" = "--out" ] && OUTDIR="$b"
