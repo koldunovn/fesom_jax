@@ -345,3 +345,74 @@ def test_build_params_passes_the_nn_through():
     p = build_params({"gm_nn": nn, "k_gm": 1500.0})
     assert p.gm_nn is nn
     assert float(p.k_gm) == 1500.0
+
+
+# ---------------------------------------------------------------------------
+# 5. freeze_nn_features — the learned closure's state-dependence, cut from the backward
+# ---------------------------------------------------------------------------
+def test_freeze_nn_features_is_forward_identical_and_keeps_the_weight_gradient(setup):
+    """The three claims that make ``AdjointConfig.freeze_nn_features`` safe to switch on.
+
+    It exists because ``gm_nn`` is a SECOND state-dependent diffusivity closure, added after
+    ``freeze_mixing`` was measured, so ``d(kappa)/d(state)`` re-entered the backward through a
+    path no existing flag covered. Two identical GPU jobs then returned dL/dalpha 26x apart
+    with the sign opposed to finite differences (26800197/8) — the signature in
+    docs/ADJOINT_HORIZON.md 1.2. This test does not measure that; it pins the three structural
+    properties the fix must have, and they are separate claims:
+
+    (1) the FORWARD is bit-identical, because ``stop_gradient`` is the identity — so every
+        validated trajectory is untouched and the flag can never change a simulation;
+    (2) ``dL/d(weights)`` SURVIVES, which is the entire point: the weights multiply the (now
+        constant) features directly, so training still has its derivative. A fix that also
+        killed this would be worthless and would otherwise fail silently, as a gradient that
+        is merely small rather than absent;
+    (3) the state path is genuinely CUT — ``d(multiplier)/d(state)`` is exactly zero — which
+        is what a ``where(flag, stop_gradient(x), x)`` written the wrong way round would miss.
+    """
+    mesh, cfg, args = setup
+    nn = gm_nn.init_gm_nn(KEY, zero_last=False)
+
+    def multipliers(bvfreq, n, freeze):
+        """Run the seam's own entry point on the dump state, N^2 as the differentiable input."""
+        p = dataclasses.replace(Params.defaults(), gm_nn=n)
+        d = gm.gm_diagnostics(mesh, args[0], args[1], bvfreq, args[3], args[4], p, cfg,
+                              freeze_nn_features=freeze)
+        return d
+
+    bvf = jnp.asarray(args[2])
+
+    # (1) forward bit-identical
+    d_free, d_froz = multipliers(bvf, nn, False), multipliers(bvf, nn, True)
+    for name in ("fer_K", "Ki", "fer_uv", "slope_tapered"):
+        a, b = np.asarray(getattr(d_free, name)), np.asarray(getattr(d_froz, name))
+        assert np.max(np.abs(a - b)) == 0.0, (
+            f"{name} changed by {np.max(np.abs(a - b)):.3e} — stop_gradient must be the "
+            f"identity in the forward, so the flag can never alter a trajectory")
+
+    # (2) the weight gradient survives, and is the SAME order as unfrozen (not a stub)
+    def wloss(n, freeze):
+        return jnp.sum(multipliers(bvf, n, freeze).fer_uv ** 2)
+
+    g_free = jax.grad(lambda n: wloss(n, False))(nn)
+    g_froz = jax.grad(lambda n: wloss(n, True))(nn)
+    for i, W in enumerate(g_froz.Ws):
+        assert np.all(np.isfinite(np.asarray(W))), f"W{i} non-finite with the flag on"
+        assert np.max(np.abs(np.asarray(W))) > 0.0, (
+            f"W{i} gradient vanished when the network's inputs were frozen — the flag must "
+            f"cut d/d(state), NOT d/d(weights); training would silently stop learning")
+    assert np.max(np.abs(np.asarray(g_free.Ws[0]))) > 0.0    # sanity: the control is live
+
+    # (3) the state path is cut exactly
+    def sloss(bvfreq, freeze):
+        return jnp.sum(multipliers(bvfreq, nn, freeze).fer_uv ** 2)
+
+    gs_free = np.asarray(jax.grad(lambda b: sloss(b, False))(bvf))
+    gs_froz = np.asarray(jax.grad(lambda b: sloss(b, True))(bvf))
+    assert np.max(np.abs(gs_free)) > 0.0, (
+        "N^2 carries no gradient even unfrozen — this test is not exercising the state path "
+        "it claims to, so its frozen half proves nothing")
+    # frozen: N^2 still reaches fer_uv through the ordinary GM chain (slopes, fer_solve_gamma),
+    # so the total is NOT zero. What must be gone is the network's share.
+    assert np.max(np.abs(gs_froz - gs_free)) > 0.0, (
+        "freezing the network's features changed no state gradient anywhere — the flag is "
+        "not reaching gm_nn_multipliers")

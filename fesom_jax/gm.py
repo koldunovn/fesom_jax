@@ -33,6 +33,7 @@ from __future__ import annotations
 from typing import NamedTuple, Optional
 
 import jax.numpy as jnp
+from jax import lax
 
 from . import gm_nn as _gm_nn
 from . import ops
@@ -237,7 +238,7 @@ def init_redi_gm(mesh: Mesh, bvfreq, hnode_new, fer_tapfac, params, cfg: GMConfi
 # G.3b — gm_nn_multipliers: the NN seam on the GM/Redi coefficients (NN-GM plan Task 7)
 # ============================================================================
 def gm_nn_multipliers(mesh: Mesh, nn, slope_tapered, sigma_xy, bvfreq, cfg: GMConfig,
-                      Z3d=None):
+                      Z3d=None, freeze_features: bool = False):
     """Bounded per-node/level multipliers ``(m_GM, m_Redi)``, each ``(N, nl)``, for the GM and
     Redi diffusivities — the Arm-A network evaluated on the live state.
 
@@ -277,6 +278,39 @@ def gm_nn_multipliers(mesh: Mesh, nn, slope_tapered, sigma_xy, bvfreq, cfg: GMCo
 
     Returns 1.0 outside the true layer range, so multiplying a masked coefficient is a no-op
     and the dry lanes contribute no gradient (``d/dm`` there is the coefficient, which is 0).
+
+    The feature assembly itself lives in :func:`gm_nn_features` so that the offline fit can
+    produce the SAME features from a coarse product without a second copy of the list.
+    """
+    feats, lay = gm_nn_features(mesh, slope_tapered, sigma_xy, bvfreq, cfg, Z3d=Z3d)
+    # `freeze_features` (AdjointConfig.freeze_nn_features) — the ECCO "omit the parametric
+    # dependency" move applied to the LEARNED closure: keep the multipliers the network
+    # computes, but stop the backward tracing how the features depended on the ocean state.
+    # `stop_gradient` is the identity forward, so the trajectory is bit-for-bit unchanged and
+    # `nn` still enters `multiplier` below untouched — dL/d(weights), the derivative training
+    # needs, is fully preserved. What is cut is the state feedback that re-injects the GPU's
+    # atomic-scatter nondeterminism at every step (docs/ADJOINT_HORIZON.md 1.2).
+    if freeze_features:
+        feats = lax.stop_gradient(feats)
+    m = _gm_nn.multiplier(nn, feats)                         # (N,nl-1,2) ∈ [1/m_max, m_max]
+    m = jnp.where(lay[..., None], m, 1.0)
+    # pad the below-bottom column with 1.0 (a no-op multiplier), matching Ki's own padding
+    m = jnp.pad(m, ((0, 0), (0, 1), (0, 0)), constant_values=1.0)      # (N,nl,2)
+    return m[..., 0], m[..., 1]
+
+
+def gm_nn_features(mesh: Mesh, slope_tapered, sigma_xy, bvfreq, cfg: GMConfig, Z3d=None):
+    """The Arm-A network's INPUT tensor ``(N, nl-1, n_features)`` and the layer mask.
+
+    Split out of :func:`gm_nn_multipliers` so there is exactly ONE assembly of the feature
+    list — the seam calls it on the live state inside a differentiated step, and the offline
+    fit (``scripts/nn_eddy/features_from_product.py``) calls it on fields derived from a
+    coarse teacher product. A second copy would be a train/deploy skew that no test on either
+    side alone could see, which is why :func:`fesom_jax.gm_nn.column_features` says every
+    producer must come through it; this function is the layer above that, holding the
+    staggering, the masking and the choice of source field for each entry.
+
+    Everything about WHICH fields and WHY is documented on :func:`gm_nn_multipliers`.
     """
     nl, N = mesh.nl, mesh.nod2D
     lay = mesh.node_layer_mask[:, : nl - 1]                  # (N,nl-1) true layer range
@@ -303,11 +337,7 @@ def gm_nn_multipliers(mesh: Mesh, nn, slope_tapered, sigma_xy, bvfreq, cfg: GMCo
     # in one lane poisons the entire reverse pass (the masked-NaN rule).
     feats = _gm_nn.column_features(
         *[jnp.where(lay, x, 0.0) for x in (slope, n2, grad_b, f, depth, depth_frac, strain)])
-    m = _gm_nn.multiplier(nn, feats)                         # (N,nl-1,2) ∈ [1/m_max, m_max]
-    m = jnp.where(lay[..., None], m, 1.0)
-    # pad the below-bottom column with 1.0 (a no-op multiplier), matching Ki's own padding
-    m = jnp.pad(m, ((0, 0), (0, 1), (0, 0)), constant_values=1.0)      # (N,nl,2)
-    return m[..., 0], m[..., 1]
+    return feats, lay
 
 
 # ============================================================================
@@ -412,7 +442,8 @@ class GMDiag(NamedTuple):
 
 
 def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
-                   cfg: GMConfig, exch=None, Z3d=None, zbar3=None) -> GMDiag:
+                   cfg: GMConfig, exch=None, Z3d=None, zbar3=None,
+                   freeze_nn_features: bool = False) -> GMDiag:
     """Run the full GM/Redi diagnostic chain (G.2-G.4) from the ocean state:
     ``sw_alpha_beta → sigma_xy → neutral_slope → init_redi_gm → fer_solve_gamma →
     fer_gamma2vel``. Returns the fields the bolus advection (G.5) and Redi terms
@@ -469,7 +500,8 @@ def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
     # multiplication covers them all. Audited by grep — list in tests/test_gm_nn_seam.py. ---
     nn = getattr(params, "gm_nn", None)
     if nn is not None:
-        m_gm, m_redi = gm_nn_multipliers(mesh, nn, slope_tapered, sigma_xy, bvfreq, cfg, Z3d=Z3d)
+        m_gm, m_redi = gm_nn_multipliers(mesh, nn, slope_tapered, sigma_xy, bvfreq, cfg,
+                                        Z3d=Z3d, freeze_features=freeze_nn_features)
         fer_K = fer_K * m_gm
         Ki = Ki * m_redi
 
