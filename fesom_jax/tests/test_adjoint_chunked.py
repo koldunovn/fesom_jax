@@ -15,6 +15,8 @@ gate is the equivalence job in ``docs/ADJOINT_HORIZON.md``.
 
 from __future__ import annotations
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -67,8 +69,26 @@ def _advance(state, x, mesh, op, stress, params):
 XS_HOST = np.asarray(1.0 + 0.05 * np.cos(np.arange(N_STEPS)), dtype=np.float64)
 
 
+_HARNESS: dict = {}
+
+
 def _harness(fixture, chunk_steps):
-    """``(chunk_fn, xs_fn, loss_fn, n_chunks, xs_all)`` for a window of N_STEPS steps."""
+    """``(chunk_fn, xs_fn, loss_fn, n_chunks, xs_all)``, with ONE ``chunk_fn`` per chunk length.
+
+    ⚠️ Memoised, and not for speed. `chunked_grad` caches its compiled forward and backward on the
+    `chunk_fn` OBJECT, so a helper that builds a fresh closure per call defeats that cache and
+    leaves one executable per call resident. Run standalone this file passed; run inside the
+    `unit` group next to `test_adjoint_config.py` it died with XLA's
+    `INTERNAL: Failed to materialize symbols` — the CPU JIT out of dylib space, not a numerical
+    failure (job 26851939, array task 5). Reusing the object is what makes the library's cache do
+    its job here."""
+    key = (id(fixture), chunk_steps)
+    if key not in _HARNESS:
+        _HARNESS[key] = _build_harness(fixture, chunk_steps)
+    return _HARNESS[key]
+
+
+def _build_harness(fixture, chunk_steps):
     mesh, op, stress, st0 = fixture
     assert N_STEPS % chunk_steps == 0
     n_chunks = N_STEPS // chunk_steps

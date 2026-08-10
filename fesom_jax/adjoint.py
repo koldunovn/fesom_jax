@@ -154,12 +154,27 @@ class LegIncomplete(Exception):
         self.phase, self.chunk = phase, chunk
 
 
-@functools.lru_cache(maxsize=32)
+# ⚠️ maxsize is SMALL on purpose. Each entry holds a compiled executable, and for CORE2 that is
+# GB-scale on the device — this cache is not a place to be generous. It was 32 for one afternoon,
+# during which a sweep over four adjoint configurations in ONE process died with
+# `RESOURCE_EXHAUSTED: Failed to load in-memory CUBIN`: eight executables (a forward and a backward
+# per configuration) stayed resident because the cache still referenced every one of them, and the
+# ninth had nowhere to load. That looked exactly like "the unfrozen adjoint does not fit", which
+# was wrong and would have been a bad thing to believe.
+#
+# The cache exists for ONE call pattern: the same `chunk_fn` used repeatedly — a reproducibility
+# repeat, or a finite-difference sweep's two forwards per step size. Four entries cover that with
+# room to spare. **A sweep over CONFIGURATIONS still wants one process each**, which is what
+# `scripts/nn_eddy/adjoint_horizon.sbatch` has always done and says in its header.
+_JIT_CACHE = 4
+
+
+@functools.lru_cache(maxsize=_JIT_CACHE)
 def _jitted_forward(chunk_fn):
     return jax.jit(chunk_fn)
 
 
-@functools.lru_cache(maxsize=32)
+@functools.lru_cache(maxsize=_JIT_CACHE)
 def _jitted_backward(chunk_fn):
     @jax.jit
     def bwd(state, xs, params, cot):
@@ -168,7 +183,7 @@ def _jitted_backward(chunk_fn):
     return bwd
 
 
-# ⚠️ Both caches are keyed on the `chunk_fn` OBJECT, and that is load-bearing rather than a
+# Both caches are keyed on the `chunk_fn` OBJECT, and that is load-bearing rather than a
 # micro-optimisation. `jax.jit` returns a fresh wrapper with a fresh compilation cache every time
 # it is called, so jitting inside the function body would recompile the chunk — minutes on CORE2 —
 # on every call. The reference implementation defined `fwd_chunk`/`bwd_chunk` ONCE outside its
