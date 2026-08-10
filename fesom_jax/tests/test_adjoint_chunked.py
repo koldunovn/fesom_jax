@@ -69,33 +69,37 @@ def _advance(state, x, mesh, op, stress, params):
 XS_HOST = np.asarray(1.0 + 0.05 * np.cos(np.arange(N_STEPS)), dtype=np.float64)
 
 
-_HARNESS: dict = {}
+_CHUNK_FN: dict = {}
 
 
 def _harness(fixture, chunk_steps):
     """``(chunk_fn, xs_fn, loss_fn, n_chunks, xs_all)``, with ONE ``chunk_fn`` per chunk length.
 
-    ⚠️ Memoised, and not for speed. `chunked_grad` caches its compiled forward and backward on the
-    `chunk_fn` OBJECT, so a helper that builds a fresh closure per call defeats that cache and
-    leaves one executable per call resident. Run standalone this file passed; run inside the
-    `unit` group next to `test_adjoint_config.py` it died with XLA's
-    `INTERNAL: Failed to materialize symbols` — the CPU JIT out of dylib space, not a numerical
-    failure (job 26851939, array task 5). Reusing the object is what makes the library's cache do
-    its job here."""
-    key = (id(fixture), chunk_steps)
-    if key not in _HARNESS:
-        _HARNESS[key] = _build_harness(fixture, chunk_steps)
-    return _HARNESS[key]
+    ⚠️ **`chunk_fn` is memoised and the other four are NOT**, and both halves of that are
+    load-bearing.
 
+    Memoised, because `chunked_grad` caches its compiled forward and backward on the `chunk_fn`
+    OBJECT: a helper that builds a fresh closure per call defeats that cache and leaves one
+    executable per call resident. Run standalone this file passed; run inside the `unit` group it
+    died with XLA's `INTERNAL: Failed to materialize symbols` — the CPU JIT out of dylib space,
+    not a numerical failure (job 26851939, array task 5).
 
-def _build_harness(fixture, chunk_steps):
+    NOT memoised for `xs_all`, because `chunked_grad` DELETES what `xs_fn` hands it, and
+    `test_xs_fn_must_build_fresh_and_says_so` deliberately hands it an aliasing full-width slice
+    of `xs_all` — twice, expecting an intact array the second time. Memoising the whole tuple
+    (which this helper did for one afternoon) shares the freed array across the two calls, and the
+    escape-hatch half of that test dies with `Array has been deleted` from inside its own slicing
+    expression: the exact error the test exists to keep users from having to interpret, arriving
+    from the test's own bookkeeping instead of from the contract (job 26853569)."""
     mesh, op, stress, st0 = fixture
     assert N_STEPS % chunk_steps == 0
-    n_chunks = N_STEPS // chunk_steps
 
-    def chunk_fn(state, xs, params):
-        return scan_steps(lambda s, x: _advance(s, x, mesh, op, stress, params),
-                          state, xs, rematerialize=True)
+    key = (id(fixture), chunk_steps)
+    if key not in _CHUNK_FN:
+        def chunk_fn(state, xs, params):
+            return scan_steps(lambda s, x: _advance(s, x, mesh, op, stress, params),
+                              state, xs, rematerialize=True)
+        _CHUNK_FN[key] = chunk_fn
 
     def xs_fn(c):
         # ⚠️ Sliced on the HOST and put on the device fresh every call. Slicing a device array
@@ -103,7 +107,8 @@ def _build_harness(fixture, chunk_steps):
         # `chunked_grad` frees what `xs_fn` hands it — see test_xs_fn_must_build_fresh.
         return jnp.asarray(XS_HOST[c * chunk_steps:(c + 1) * chunk_steps])
 
-    return chunk_fn, xs_fn, (lambda s: _mean_sst(s, mesh)), n_chunks, jnp.asarray(XS_HOST)
+    return (_CHUNK_FN[key], xs_fn, (lambda s: _mean_sst(s, mesh)),
+            N_STEPS // chunk_steps, jnp.asarray(XS_HOST))
 
 
 def _monolithic(fixture, kver):
