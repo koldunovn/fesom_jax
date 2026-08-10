@@ -275,7 +275,19 @@ def test_every_production_only_flag_is_listed_here():
     # the pi and TKE files cover these; listed explicitly so a new flag lands in neither set
     # and fails this test rather than disappearing
     elsewhere = {"freeze_mixing", "freeze_stratification", "freeze_convection",
-                 "freeze_vert_visc", "freeze_tke_state", "freeze_advection"}
+                 "freeze_vert_visc", "freeze_tke_state", "freeze_advection",
+                 # ⚠️ covered by a THIRD file, which this set did not know about:
+                 # test_gm_nn_seam.py::test_freeze_nn_features_is_forward_identical_and_keeps_
+                 # the_weight_gradient. It cannot go in PROD_ONLY_FLAGS — it is read only inside
+                 # `if nn is not None` (gm.py:501), and the production fixture here attaches no
+                 # network, so the effect test would fail against a knob with no code path, which
+                 # is exactly what happened to freeze_pgf on the pi fixture on 2026-08-07.
+                 #
+                 # It was added by the seam work and classified in test_adjoint_config.py's
+                 # INACTIVE_ON_PI on 2026-08-10 (8f89684) — and THIS registry was missed, so the
+                 # core2 group stayed red. One registry describing another's contents drifts; a
+                 # flag now needs an entry in three places and only two of them fail loudly.
+                 "freeze_nn_features"}
     assert guarded <= covered | elsewhere, (
         f"AdjointConfig flags read by step() but classified nowhere: "
         f"{sorted(guarded - covered - elsewhere)}")
