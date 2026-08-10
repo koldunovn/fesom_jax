@@ -70,13 +70,19 @@ jobs:
           print(f"forward + gradient OK   d(meanT)/d(k_ver) = {float(g.k_ver):+.3e}")
           PY
 
-      - name: pi-mesh + data-free gates
-        # Everything that runs without external data; the CORE2-gated tests skip themselves.
-        # The three sharded suites are excluded: slow on a 2-core runner, and their substance
-        # (multi-device halo, sharded adjoint) needs real devices — see run_suite_shard.sbatch.
+      - name: the ci cost group, selected from the manifest
+        # ⚠️ The file list comes from scripts/runs/suite_groups.txt and MUST NOT be written out
+        # here. The previous version was a hand-maintained --ignore list naming three files;
+        # there are seven sharded suites, so four of them were running on a 2-core runner, and
+        # the whole selection cost 34 min 34 s against a 25-minute cap (job 26833068).
+        #
+        # The `ci` group is the measured one: every file at 30 s or less on an allocation shaped
+        # like this runner — 2 cores, 16 GB — which is 35 files and 320 s (job 26833514). What it
+        # excludes is not arbitrary either: test_adjoint_config.py alone was 1341 s.
+        #
+        # fesom_jax/tests/test_suite_groups.py fails if any test file is unclassified, so a new
+        # file cannot join or silently skip this run.
         run: |
-          python -m pytest -q -p no:cacheprovider --durations=10 \
-            fesom_jax/tests/ \
-            --ignore=fesom_jax/tests/test_gradient_sharded.py \
-            --ignore=fesom_jax/tests/test_step_sharded.py \
-            --ignore=fesom_jax/tests/test_forcing_sharded.py
+          FILES=$(awk 'NF && $1 !~ /^#/ && $1=="ci" {print $2}' scripts/runs/suite_groups.txt)
+          echo "$FILES" | wc -l | xargs echo "ci group files:"
+          python -m pytest -q -p no:cacheprovider --durations=10 $FILES

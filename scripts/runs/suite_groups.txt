@@ -5,7 +5,15 @@
 # 3:28 of wall time without anyone deciding that, because nothing reported per-test cost and a
 # new file joined it by doing nothing. Cost is what the scheduler actually cares about.
 #
-#   unit      — pi mesh, closures, algebra, pytrees. Hundreds of tests, seconds each.
+#   ci        — the subset of `unit` that a 2-core GitHub runner can carry: measured at 30 s
+#               or less per file on exactly that shape (2 cores, 16 GB, job 26833514). 35 files,
+#               320 s total. This is what .github/workflows/ci.yml runs, selected FROM THIS FILE
+#               so the workflow cannot drift from it — the previous hand-maintained --ignore list
+#               named 3 of the 7 sharded files and put 4 of them on the runner.
+#   unit      — pi mesh, closures, algebra, pytrees, but too slow for a 2-core runner.
+#               ⚠️ test_adjoint_config.py alone is 1341 s of the group's 2378 s. A file can be
+#               data-free and still not be cheap; the two properties are separate and this
+#               grouping keeps them separate.
 #   core2     — anything that assembles a CORE2 step or loads the CORE2 mesh/IC/forcing.
 #               This is where the wall time is: a handful of tests, minutes each.
 #   ice       — the assembled sea-ice step. Kept separate for MEMORY, not for time: the jit
@@ -87,48 +95,48 @@ sharding fesom_jax/tests/test_scatter_sharded.py
 sharding fesom_jax/tests/test_ssh_sharded.py
 sharding fesom_jax/tests/test_step_sharded.py
 unit fesom_jax/tests/test_adjoint_config.py
-unit fesom_jax/tests/test_adjoint_stab.py
-unit fesom_jax/tests/test_ale.py
+ci fesom_jax/tests/test_adjoint_stab.py
+ci fesom_jax/tests/test_ale.py
 unit fesom_jax/tests/test_calib_twin.py
-unit fesom_jax/tests/test_calibrate.py
-unit fesom_jax/tests/test_canonical_redist.py
-unit fesom_jax/tests/test_coarsen.py
-unit fesom_jax/tests/test_coarsen_remap.py
-unit fesom_jax/tests/test_config.py
-unit fesom_jax/tests/test_diagnostics.py
-unit fesom_jax/tests/test_eki.py
-unit fesom_jax/tests/test_eos.py
-unit fesom_jax/tests/test_gm_eki.py
-unit fesom_jax/tests/test_gm_nn.py
+ci fesom_jax/tests/test_calibrate.py
+ci fesom_jax/tests/test_canonical_redist.py
+ci fesom_jax/tests/test_coarsen.py
+ci fesom_jax/tests/test_coarsen_remap.py
+ci fesom_jax/tests/test_config.py
+ci fesom_jax/tests/test_diagnostics.py
+ci fesom_jax/tests/test_eki.py
+ci fesom_jax/tests/test_eos.py
+ci fesom_jax/tests/test_gm_eki.py
+ci fesom_jax/tests/test_gm_nn.py
 unit fesom_jax/tests/test_gradient.py
-unit fesom_jax/tests/test_identity_gates.py
+ci fesom_jax/tests/test_identity_gates.py
 unit fesom_jax/tests/test_integrate.py
-unit fesom_jax/tests/test_kpp_wscale.py
-unit fesom_jax/tests/test_longwindow.py
-unit fesom_jax/tests/test_mesh.py
+ci fesom_jax/tests/test_kpp_wscale.py
+ci fesom_jax/tests/test_longwindow.py
+ci fesom_jax/tests/test_mesh.py
 unit fesom_jax/tests/test_momentum.py
-unit fesom_jax/tests/test_nn_twin.py
-unit fesom_jax/tests/test_obs_compare.py
-unit fesom_jax/tests/test_obs_ice.py
-unit fesom_jax/tests/test_ops.py
-unit fesom_jax/tests/test_partit.py
-unit fesom_jax/tests/test_pgf.py
-unit fesom_jax/tests/test_pi_demo.py
-unit fesom_jax/tests/test_pp.py
-unit fesom_jax/tests/test_reference_dump.py
-unit fesom_jax/tests/test_release.py
-unit fesom_jax/tests/test_restart.py
-unit fesom_jax/tests/test_run_config.py
+ci fesom_jax/tests/test_nn_twin.py
+ci fesom_jax/tests/test_obs_compare.py
+ci fesom_jax/tests/test_obs_ice.py
+ci fesom_jax/tests/test_ops.py
+ci fesom_jax/tests/test_partit.py
+ci fesom_jax/tests/test_pgf.py
+ci fesom_jax/tests/test_pi_demo.py
+ci fesom_jax/tests/test_pp.py
+ci fesom_jax/tests/test_reference_dump.py
+ci fesom_jax/tests/test_release.py
+ci fesom_jax/tests/test_restart.py
+ci fesom_jax/tests/test_run_config.py
 unit fesom_jax/tests/test_sensitivity.py
-unit fesom_jax/tests/test_ssh.py
-unit fesom_jax/tests/test_state.py
+ci fesom_jax/tests/test_ssh.py
+ci fesom_jax/tests/test_state.py
 unit fesom_jax/tests/test_step_pi.py
-unit fesom_jax/tests/test_stream_output.py
-unit fesom_jax/tests/test_suite_groups.py
-unit fesom_jax/tests/test_surface_bc.py
-unit fesom_jax/tests/test_tke_nn.py
+ci fesom_jax/tests/test_stream_output.py
+ci fesom_jax/tests/test_suite_groups.py
+ci fesom_jax/tests/test_surface_bc.py
+ci fesom_jax/tests/test_tke_nn.py
 unit fesom_jax/tests/test_tracers.py
-unit fesom_jax/tests/test_verify.py
+ci fesom_jax/tests/test_verify.py
 scripts scripts/tests/test_adjoint_ckpt.py
 scripts scripts/tests/test_apriori_eval.py
 scripts scripts/tests/test_armb_fit.py

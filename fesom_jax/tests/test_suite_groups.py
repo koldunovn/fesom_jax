@@ -29,7 +29,7 @@ import pytest
 TESTS_DIR = Path(__file__).resolve().parent
 ROOT = TESTS_DIR.parents[1]
 MANIFEST = ROOT / "scripts" / "runs" / "suite_groups.txt"
-VALID_GROUPS = {"unit", "core2", "ice", "sharding", "scripts"}
+VALID_GROUPS = {"ci", "unit", "core2", "ice", "sharding", "scripts"}
 # ⚠️ BOTH directories. Until 2026-08-08 every runner globbed fesom_jax/tests/ only, so the seven
 # files under scripts/tests/ had never run in the suite — including the 12 mesh-diagnostic tests
 # and the 7 horizon-scan harness tests the plan records as passing. They passed by hand.
@@ -134,10 +134,44 @@ def test_the_conventions_that_define_the_groups_hold():
 
 
 def test_the_cost_split_is_still_worth_having():
-    """If `unit` ever stops being the large-and-cheap group, the split has lost its point and
-    should be revisited rather than left in place looking like it works."""
+    """If the cheap end ever stops being the big end, the split has lost its point and should be
+    revisited rather than left in place looking like it works.
+
+    ⚠️ Restated 2026-08-10 when `unit` was divided on MEASURED cost (job 26833514, on a 2-core
+    16 GB allocation shaped like a GitHub runner). `ci` took the 35 files at 30 s or less; `unit`
+    kept the 8 that are data-free and still slow, of which test_adjoint_config.py alone is 1341 s
+    against the old group's 2378. So the cheap group is now `ci`, and the old assertion
+    `unit > core2` inverted for a good reason rather than a bad one — which is exactly the case
+    this test is supposed to force someone to look at, so it is updated, not relaxed."""
     entries, _ = _manifest()
     have = collections.Counter(entries.values())
-    assert have["unit"] > have["core2"], (
-        f"unit={have['unit']} files, core2={have['core2']} — the cheap group is supposed to be "
-        f"the big one; if that has inverted, re-derive the grouping")
+    assert have["ci"] > have["core2"], (
+        f"ci={have['ci']} files, core2={have['core2']} — the cheap group is supposed to be the "
+        f"big one; if that has inverted, re-derive the grouping from a fresh timing run")
+    assert have["unit"] < have["ci"], (
+        f"unit={have['unit']} files against ci={have['ci']}: `unit` is the data-free-but-slow "
+        f"leftover and is meant to stay small. If it has grown, the 30 s cut needs re-deriving "
+        f"— a file does not move into it by being added, only by being measured.")
+
+
+def test_the_workflow_selects_from_this_manifest_and_does_not_keep_its_own_list():
+    """The coupling that drifted, asserted.
+
+    CI used to carry a hand-maintained ``--ignore`` list. It named three sharded test files; there
+    are seven, so four were running on a 2-core runner, and the whole selection took 34 min 34 s
+    against a 25-minute cap. Nothing failed — it just quietly cost more than it was allowed and
+    tested things a 2-core runner cannot meaningfully test.
+
+    A list in one file describing the contents of another is a registry, and registries drift.
+    This asserts the workflow reads the manifest instead of restating it."""
+    wf = ROOT / ".github" / "workflows" / "ci.yml"
+    if not wf.is_file():
+        pytest.skip("no workflow file in this checkout")
+    text = wf.read_text()
+    assert "suite_groups.txt" in text, \
+        "ci.yml must select its test files FROM the manifest, not restate them"
+    assert "--ignore=" not in text, \
+        "ci.yml has grown a hand-maintained ignore list again; select a group instead"
+    entries, _ = _manifest()
+    assert any(g == "ci" for g in entries.values()), \
+        "ci.yml selects the 'ci' group but no file is classified into it"
