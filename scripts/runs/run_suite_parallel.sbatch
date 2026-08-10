@@ -1,5 +1,5 @@
 #!/bin/bash
-# Full JAX test suite, four COST groups as a job array so they run concurrently.
+# Full JAX test suite, every COST group as a job array so they run concurrently.
 #
 # History, because the shape of this script is a response to two specific failures.
 #
@@ -26,18 +26,25 @@
 #SBATCH --job-name=jax_suite_par
 #SBATCH -p compute
 #SBATCH -A ab0995
-#SBATCH --array=0-4
+#SBATCH --array=0-5
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
 #SBATCH --hint=nomultithread
 #SBATCH --mem=300G
-#SBATCH --time=06:00:00
+#SBATCH --time=08:00:00
 #SBATCH -o scripts/run_suite_par.%A_%a.out
 #SBATCH -e scripts/run_suite_par.%A_%a.out
 # NB --mem=300G, not 200G: the sharding group OOM'd at 209 GB against a 200 GB request on
 # 2026-08-07. That is a real failure and it looked exactly like a sharding bug. The array shares
 # one --mem for all tasks, so the largest group sets it.
+#
+# ⚠️ 8:00:00, not 6:00:00, and 8 h is the `compute` partition maximum. Measured on 2026-08-08
+# (job 26794462): sharding 5:02:17, core2 3:23:32, ice 0:31:07, unit 0:33:31, scripts 0:00:31.
+# The SUM is ~9.5 h, which is why the sequential run_suite.sbatch cannot produce a green baseline
+# at all inside one job — it was time-cut at 2:30 on 2026-08-10 (job 26832970) partway through
+# its second group, and no wall time available on this partition would have saved it. The array's
+# budget only has to cover the LONGEST group, and sharding at 5 h is that group.
 
 source /sw/etc/profile.levante 2>/dev/null
 PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
@@ -46,17 +53,35 @@ export JAX_PLATFORMS=cpu
 export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-16}
 
 MANIFEST=scripts/runs/suite_groups.txt
+echo "=== node $(hostname)  $(date)  array task ${SLURM_ARRAY_TASK_ID} ==="
+echo "=== checkout: $(pwd)  branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) ==="
+[ -f "$MANIFEST" ] || { echo "missing $MANIFEST"; exit 2; }
+
 # ⚠️ NOT `GROUPS`. That is a bash BUILT-IN array holding the current user's group IDs, and
 # assigning to it is silently ignored — the array tasks read out gid 1221/1260/1291 as group
 # names and the run died with "group 1221 is empty" (2026-08-08). The empty-group guard below is
 # the only reason that took one minute to find instead of looking like a pytest problem.
-SUITE_GROUPS=(unit core2 ice sharding scripts)
+#
+# ⚠️ The group NAMES come from the manifest too, sorted, and are NOT written out here. They used
+# to be: `SUITE_GROUPS=(unit core2 ice sharding scripts)`. When the `ci` group was added on
+# 2026-08-10 the manifest, VALID_GROUPS in test_suite_groups.py and .github/workflows/ci.yml were
+# all updated and this line was not, so the array would have run five of six groups and printed a
+# pass — 35 files silently untested. That is the same registry-drift failure the manifest exists
+# to end, one level up. A list in one file describing the contents of another always drifts.
+mapfile -t SUITE_GROUPS < <(awk '!/^#/ && NF {print $1}' "$MANIFEST" | sort -u)
+NGROUPS=${#SUITE_GROUPS[@]}
 GROUP=${SUITE_GROUPS[${SLURM_ARRAY_TASK_ID:-0}]}
+echo "=== manifest groups (sorted): ${SUITE_GROUPS[*]} ==="
 
-echo "=== node $(hostname)  $(date)  array task ${SLURM_ARRAY_TASK_ID} ==="
-echo "=== checkout: $(pwd)  branch: $(git rev-parse --abbrev-ref HEAD 2>/dev/null) ==="
+# The --array range is a static SBATCH directive and cannot read the manifest, so it is the one
+# number that CAN still disagree with it. Refuse to run rather than test a subset: with 6 groups
+# and --array=0-4, tasks 0-4 would each pass and nobody would be told about group 5.
+if [ -n "$SLURM_ARRAY_TASK_COUNT" ] && [ "$SLURM_ARRAY_TASK_COUNT" -ne "$NGROUPS" ]; then
+    echo "ABORT: --array covers $SLURM_ARRAY_TASK_COUNT tasks but the manifest has $NGROUPS"
+    echo "groups (${SUITE_GROUPS[*]}). Set --array=0-$((NGROUPS - 1)) in this file."
+    exit 2
+fi
 [ -n "$GROUP" ] || { echo "no group for array task ${SLURM_ARRAY_TASK_ID}"; exit 2; }
-[ -f "$MANIFEST" ] || { echo "missing $MANIFEST"; exit 2; }
 
 # Every test file must be in the manifest. Checked HERE too, not only in the pytest gate: if a
 # new file is unclassified, this run must not quietly test less than the whole suite and then

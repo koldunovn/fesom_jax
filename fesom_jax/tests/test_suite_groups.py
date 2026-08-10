@@ -22,6 +22,7 @@ suite is running.**
 from __future__ import annotations
 
 import collections
+import re
 from pathlib import Path
 
 import pytest
@@ -175,3 +176,37 @@ def test_the_workflow_selects_from_this_manifest_and_does_not_keep_its_own_list(
     entries, _ = _manifest()
     assert any(g == "ci" for g in entries.values()), \
         "ci.yml selects the 'ci' group but no file is classified into it"
+
+
+def test_the_array_runner_covers_every_group():
+    """The same coupling one level up: the suite runner's array must span the manifest.
+
+    ``run_suite_parallel.sbatch`` used to hand-list ``SUITE_GROUPS=(unit core2 ice sharding
+    scripts)``. Adding the ``ci`` group on 2026-08-10 updated the manifest, ``VALID_GROUPS`` above
+    and ``ci.yml``, and missed that line — so the array would have run five of six groups, each
+    task would have passed, and 35 files would have gone untested behind a green summary. The
+    runner now reads the names from the manifest; the one number it still cannot read is the
+    static ``--array`` range, so that is what this asserts.
+
+    ⚠️ A group added to the manifest therefore needs the ``--array`` bound raised in the same
+    commit. That is the whole cost of the coupling, and it is paid here rather than in a run."""
+    runner = ROOT / "scripts" / "runs" / "run_suite_parallel.sbatch"
+    if not runner.is_file():
+        pytest.skip("no array runner in this checkout")
+    text = runner.read_text()
+    entries, _ = _manifest()
+    ngroups = len(set(entries.values()))
+
+    m = re.search(r"^#SBATCH\s+--array=0-(\d+)\s*$", text, re.M)
+    assert m, "run_suite_parallel.sbatch has no `#SBATCH --array=0-N` directive to check"
+    covered = int(m.group(1)) + 1
+    assert covered == ngroups, (
+        f"--array=0-{m.group(1)} runs {covered} tasks but the manifest has {ngroups} groups "
+        f"{sorted(set(entries.values()))}; set --array=0-{ngroups - 1}")
+
+    # Comments only, so the runner may quote the line it used to have without tripping this.
+    code = [ln for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+    literal = [ln for ln in code if re.search(r"SUITE_GROUPS=\(\s*\w", ln)]
+    assert not literal, (
+        f"run_suite_parallel.sbatch has re-grown a hand-written group list ({literal}); derive "
+        f"the names from {MANIFEST.name} — that list is what silently dropped a group once")
