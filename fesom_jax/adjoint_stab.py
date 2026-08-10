@@ -25,7 +25,7 @@ Three families of intervention live here, in increasing order of how much they c
    (``IceConfig.adjoint_mode="frozen"``) and for KPP's discrete level indices. It yields a
    *different* gradient, not an approximate one: the gradient of the model with that
    feedback loop cut. Whether that gradient is still useful is an empirical question, which
-   is what ``scripts/nn_eddy/adjoint_horizon.py`` measures.
+   is what ``adjoint_horizon.py`` (nn_eddy research repository) measures.
 
 2. **Diffuse** (:func:`make_nodal_smoother`) — apply a spatial low-pass to the cotangent
    each step. This is the classical "add viscosity to the adjoint" fix, and it has a

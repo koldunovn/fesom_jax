@@ -1,19 +1,22 @@
-"""Make the scripts under ``scripts/nn_eddy/`` importable by the tests that test them.
+"""Put the repository ROOT on ``sys.path`` for the tests under ``scripts/tests/``.
 
-Those scripts are written to be RUN (``python scripts/nn_eddy/coarsen_stream.py ...``), and a
-script's own directory goes on ``sys.path`` automatically when it is run that way. Under pytest
-it does not, so every one of them fails to import at collection with
-``ModuleNotFoundError: No module named 'nn_data'`` — a module they reach for as a sibling.
+The three test files here import their target by module name — ``core2_kpp_climate_run``,
+``core2_lw_foundation_check``, ``write_namelist`` — which are scripts written to be RUN, not
+imported. A script's own directory joins ``sys.path`` automatically when it is run directly;
+under pytest it does not, so the import has to be arranged here.
 
-⚠️ **This went unnoticed because the suite never ran these files.** ``scripts/runs/run_suite.sbatch``
-invokes three groups — ocean, ice, sharding — while the cost manifest defines five; the
-``scripts`` group has no invocation, so its 11 files only ever ran when somebody typed pytest by
-hand from the right directory. The manifest's own header records that this was discovered on
-2026-08-08 and a group was created for them; the runner was not updated to run it. Found again
-2026-08-10, from the other end: an edit to ``coarsen_stream.py`` could not be checked because its
-test file would not even collect.
+⚠️ **This used to add ``scripts/nn_eddy/`` as well, and must not.** That directory held the NN-GM
+research project, which moved to its own repository on 2026-08-10; the library no longer contains
+it and no test here needs it. Adding a path that does not exist is silent — ``sys.path`` accepts
+anything — so the coupling would have survived the split without a single error, and the next
+person to wonder whether the split was complete would have found a live reference to the moved
+directory.
 
-Both halves are needed. This file fixes the import; the runner change makes the fix matter.
+⚠️ **The reason this file exists at all is worth keeping.** These tests had NEVER run in the
+suite: every runner globbed ``fesom_jax/tests/`` only, so they passed only when somebody typed
+pytest by hand from the right directory (found 2026-08-08, and again 2026-08-10 from the other
+end, when an edit could not be checked because its test would not collect). The manifest defines
+a ``scripts`` group and ``run_suite_parallel.sbatch`` runs it; both halves are needed.
 """
 
 from __future__ import annotations
@@ -22,6 +25,5 @@ import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
-for p in (_ROOT, _ROOT / "scripts" / "nn_eddy"):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))

@@ -165,7 +165,7 @@ class LegIncomplete(Exception):
 # The cache exists for ONE call pattern: the same `chunk_fn` used repeatedly — a reproducibility
 # repeat, or a finite-difference sweep's two forwards per step size. Four entries cover that with
 # room to spare. **A sweep over CONFIGURATIONS still wants one process each**, which is what
-# `scripts/nn_eddy/adjoint_horizon.sbatch` has always done and says in its header.
+# `adjoint_horizon.sbatch` in the nn_eddy research repository has always done and says in its header.
 _JIT_CACHE = 4
 
 

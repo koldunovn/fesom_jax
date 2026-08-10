@@ -68,8 +68,9 @@ def _run_steps(body, init, *, xs=None, length=None, checkpoint=True, segments=0)
     a jitted ``jax.vjp`` over one chunk at a time, carrying the cotangent and summing the
     parameter cotangent. Device peak is then one chunk regardless of window length — measured
     43.1 GB at 1 day and 56.9 GB at **30 days**. Exact, not an approximation. Reference
-    implementation: ``scripts/nn_eddy/adjoint_horizon.py`` (``fwd_chunk``/``bwd_chunk`` and
-    the reverse loop); rationale in ``docs/ADJOINT_HORIZON.md``."""
+    implementation: ``adjoint_horizon.py`` in the nn_eddy research repository
+    (``fwd_chunk``/``bwd_chunk`` and the reverse loop); rationale in
+    ``docs/ADJOINT_HORIZON.md``."""
     if length is None:
         length = int(jax.tree.leaves(xs)[0].shape[0])
     step_fn = jax.checkpoint(body) if checkpoint else body

@@ -496,7 +496,7 @@ def test_grad_forced_multistep_matches_dense(npes, capsys):
     configuration we run — the whole campaign was single-GPU by default rather than by choice.
 
     Why the probe is a MEAN and not a sum of squares: three attempts at this comparison in
-    ``scripts/nn_eddy/sharded_grad_ab.py`` used bulk quadratic losses and every one was
+    ``scripts/adjoint/sharded_grad_ab.py`` used bulk quadratic losses and every one was
     noise-dominated — the dense reference alone moved by 17x, then by 105x WITH A SIGN FLIP,
     between identical runs, because GM's effect on a domain-integrated square over a short
     window is a minute difference of enormous numbers sitting under the GPU's atomic-scatter

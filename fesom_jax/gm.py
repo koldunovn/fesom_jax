@@ -304,7 +304,7 @@ def gm_nn_features(mesh: Mesh, slope_tapered, sigma_xy, bvfreq, cfg: GMConfig, Z
 
     Split out of :func:`gm_nn_multipliers` so there is exactly ONE assembly of the feature
     list — the seam calls it on the live state inside a differentiated step, and the offline
-    fit (``scripts/nn_eddy/features_from_product.py``) calls it on fields derived from a
+    fit (``features_from_product.py``, nn_eddy research repository) calls it on fields derived from a
     coarse teacher product. A second copy would be a train/deploy skew that no test on either
     side alone could see, which is why :func:`fesom_jax.gm_nn.column_features` says every
     producer must come through it; this function is the layer above that, holding the

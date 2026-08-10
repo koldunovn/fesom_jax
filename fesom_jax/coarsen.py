@@ -3,7 +3,7 @@
 The teacher is an eddy-resolving NG5 run; the student is CORE2. To learn what the student
 must parameterize, we need the teacher's state and its eddy fluxes *as the student would
 see them*: smoothed to the student's resolution. This module provides the smoothing half
-of that (the NG5→CORE2 aggregation is part II, `scripts/nn_eddy/coarsen_stream.py`).
+of that (the NG5→CORE2 aggregation is part II, `coarsen_stream.py` in the nn_eddy research repository).
 
 **The filter.** Iterated mesh-Laplacian diffusion — the standard diffusion-based spatial
 filter (Grooms et al. 2021, GCM-Filters) written for FESOM's triangular finite elements:

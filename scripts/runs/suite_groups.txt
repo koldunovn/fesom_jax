@@ -22,12 +22,18 @@
 #   sharding  — needs XLA_FLAGS=--xla_force_host_platform_device_count=4, and 300 GB: it OOM'd
 #               at 209 GB against a 200 GB request on 2026-08-07, which read as a sharding
 #               failure and was a scheduling one.
-#   scripts   — the tests that live next to their scripts under scripts/tests/. ⚠️ These had
-#               NEVER run in the suite: every runner globbed fesom_jax/tests/ only, so seven
-#               files — including the 12 Task-4 mesh-diagnostic tests and the 7 horizon-scan
-#               harness tests that the plan records as passing — only ever ran when somebody
-#               invoked pytest by hand (found 2026-08-08). They are cheap; they are their own
-#               group because they need the repo root on sys.path, not the package dir.
+#   scripts   — the tests that live next to their scripts under scripts/tests/. They are cheap;
+#               they are their own group because they need the repo ROOT on sys.path, not the
+#               package dir. ⚠️ These had NEVER run in the suite: every runner globbed
+#               fesom_jax/tests/ only, so they ran only when somebody invoked pytest by hand
+#               (found 2026-08-08).
+#               ⚠️ The group SHRANK from 20 files to 3 on 2026-08-10, when the NN-GM research
+#               project moved to its own repository and took 17 of its test files with it. The
+#               three survivors test LIBRARY-side scripts — scripts/archive/,
+#               scripts/paper/core2_lw_foundation_check.py and scripts/write_namelist.py — which
+#               is exactly why the group survives at all. The split plan's own text said "remove
+#               the scripts cost group"; reading the tree said otherwise. Do not delete it, and
+#               do not change the runner's --array range: the group COUNT is still 6.
 #
 # ⚠️ EVERY test_*.py under fesom_jax/tests/ AND scripts/tests/ must appear here exactly once.
 # fesom_jax/tests/test_suite_groups.py fails if one does not, so a new file cannot join the
@@ -75,16 +81,8 @@ ice fesom_jax/tests/test_ice_evp.py
 ice fesom_jax/tests/test_ice_ic.py
 ice fesom_jax/tests/test_ice_step.py
 ice fesom_jax/tests/test_ice_thermo.py
-scripts scripts/tests/test_check_coarse_product.py
-scripts scripts/tests/test_coarsen_eta.py
-scripts scripts/tests/test_coarsen_stream.py
-scripts scripts/tests/test_horizon_scan.py
 scripts scripts/tests/test_lw_forward_seam.py
 scripts scripts/tests/test_lw_foundation_check.py
-scripts scripts/tests/test_mesh_diag.py
-scripts scripts/tests/test_nn_data.py
-scripts scripts/tests/test_section_transport.py
-scripts scripts/tests/test_student_year.py
 scripts scripts/tests/test_write_namelist.py
 sharding fesom_jax/tests/test_forcing_sharded.py
 sharding fesom_jax/tests/test_gm_nn_sharded.py
@@ -137,13 +135,4 @@ ci fesom_jax/tests/test_surface_bc.py
 ci fesom_jax/tests/test_tke_nn.py
 unit fesom_jax/tests/test_tracers.py
 ci fesom_jax/tests/test_verify.py
-scripts scripts/tests/test_adjoint_ckpt.py
-scripts scripts/tests/test_apriori_eval.py
-scripts scripts/tests/test_armb_fit.py
-scripts scripts/tests/test_divergence_fit.py
-scripts scripts/tests/test_features_from_product.py
-scripts scripts/tests/test_flux_divergence.py
-scripts scripts/tests/test_freeze_knobs_install.py
-scripts scripts/tests/test_kappa_hat.py
 unit fesom_jax/tests/test_adjoint_chunked.py
-scripts scripts/tests/test_private_api_boundary.py
