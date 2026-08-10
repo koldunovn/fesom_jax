@@ -287,6 +287,56 @@ def make_loss(mesh, hnode, helem):
     return loss
 
 
+def make_window_loss(mesh, hnode, helem):
+    """``1 − EV`` of the WINDOW-MEAN flux divergence, on the usable cells of one window.
+
+    The construction, and why it is this one. A deployed closure runs on the INSTANTANEOUS state
+    every step and the ocean averages what it produces. So the network is applied to each mark's
+    own features, its predicted divergence is averaged over the window, and that average is
+    compared against the averaged teacher divergence. Running the network once on averaged
+    features would be a different and easier problem — a closure that sees a monthly mean state,
+    which no closure ever does.
+
+    Why bother: measured on the cached marks (``averaging_scan``, job 26833431), the oracle's
+    GM-direction coefficient goes from a signal-to-noise of 0.041 at one five-day mark to 0.204
+    over 22 months, and the fraction of cells wanting the GM sign from 0.546 to 0.639, while the
+    per-cell ceiling FALLS from 0.621 to 0.494. The predictable part and the ceiling converge, so
+    this is the regime where a feature-based closure has something to find."""
+    nl = mesh.nl
+
+    def loss(nn, window):
+        qT = qS = None
+        for b in window:
+            pT, pS = predict_flux(nn, b)
+            dT, dS = div_pair(mesh, pT, pS, hnode, helem, nl)
+            qT = dT if qT is None else qT + dT
+            qS = dS if qS is None else qS + dS
+        n = len(window)
+        qT, qS = qT / n, qS / n
+        tT = sum(b["dvT"] for b in window) / n
+        tS = sum(b["dvS"] for b in window) / n
+        m = window[0]["usable"]
+        w2 = window[0]["div_w"] ** 2
+        num = jnp.sum(jnp.where(m, (tT - qT) ** 2 + w2 * (tS - qS) ** 2, 0.0))
+        den = jnp.sum(jnp.where(m, tT ** 2 + w2 * tS ** 2, 0.0))
+        return num / jnp.maximum(den, 1e-300)
+
+    return loss
+
+
+def group_by_month(marks, batches):
+    """``[(month, [batch, ...]), ...]`` in month order, from the ``(month, record)`` list the
+    batches were assembled from. The window is a month because that is the unit the marks come
+    in; nothing in the loss depends on it being 30 days."""
+    out, order = {}, []
+    for (m, _r), b in zip(marks, batches):
+        if m not in out:
+            out[m] = []
+            order.append(m)
+        out[m].append(b)
+    return [(m, out[m]) for m in order]
+
+
 def ev_split(mesh, nn, b, hnode, helem):
     """Per-tracer explained variance about zero, for reporting. Not the training objective —
     that one is joint, because a single Ψ serves both tracers and letting the two compete for it
@@ -539,7 +589,7 @@ def assemble(mesh, marks, coarse_dir: Path, n_wet, hnode, helem, *, cache_dir: P
 # fit
 # ===========================================================================
 def fit(mesh, batches, hold, *, hidden, seed, epochs, lr, clip, init, hnode, helem,
-        verbose=True):
+        windows=None, windows_hold=None, verbose=True):
     import optax
     nn = init_head(jax.random.PRNGKey(seed), hidden, init)
     loss = make_loss(mesh, hnode, helem)
@@ -554,6 +604,10 @@ def fit(mesh, batches, hold, *, hidden, seed, epochs, lr, clip, init, hnode, hel
 
     dev = [to_device(b) for b in batches]
     devh = [to_device(b) for b in hold]
+    if windows is not None:
+        dev = [[to_device(b) for b in w] for _m, w in windows]
+        devh = [[to_device(b) for b in w] for _m, w in windows_hold]
+        loss = make_window_loss(mesh, hnode, helem)
     hist = []
     rng = np.random.default_rng(seed + 1)
     for ep in range(epochs):
@@ -619,6 +673,12 @@ def main():
                          "first explained variance is exactly 0.000 and every gain is measured "
                          "from nothing. 'gm' at the GM streamfunction (a=1, b=0) — measured at "
                          "EV -30.1, because a skew-only closure has no Redi term to cancel it")
+    ap.add_argument("--time-average", action="store_true",
+                    help="fit the WINDOW-MEAN divergence: the network runs on each mark's own "
+                         "features, its predicted divergence is averaged over the month, and "
+                         "that is compared against the averaged teacher divergence. One month "
+                         "per gradient step. This is the regime the predictable signal lives in "
+                         "— see make_window_loss and averaging_scan.")
     ap.add_argument("--baseline-only", action="store_true",
                     help="compute the no-features (a, b) baseline on the cached marks and stop; "
                          "no training")
@@ -674,9 +734,36 @@ def main():
         return
 
     hidden = tuple(int(x) for x in args.hidden.split(","))
+    win = win_hold = None
+    if args.time_average:
+        win = group_by_month(tr_marks, batches)
+        win_hold = group_by_month(ho_marks, hold)
+        sizes = sorted({len(w) for _m, w in win} | {len(w) for _m, w in win_hold})
+        print(f"[plan] TIME-AVERAGED: {len(win)} train windows, {len(win_hold)} holdout, "
+              f"{sizes} marks each", flush=True)
+        if min(sizes) < 2:
+            raise SystemExit("a window of one mark is not an average; pass --marks-per-month 6")
     nn, hist, dev, devh = fit(mesh, batches, hold, hidden=hidden, seed=args.seed,
                               epochs=args.epochs, lr=args.lr, clip=args.clip,
-                              init=args.init, hnode=hnode, helem=helem)
+                              init=args.init, hnode=hnode, helem=helem,
+                              windows=win, windows_hold=win_hold)
+
+    if args.time_average:
+        wl = make_window_loss(mesh, hnode, helem)
+        rows = [dict(window=i, ev_joint=1.0 - float(wl(nn, w))) for i, w in enumerate(devh)]
+        for r in rows:
+            print(f"  window {r['window']}: joint EV(div) {r['ev_joint']:+.4f}", flush=True)
+        rec = dict(train_months=train_months, holdout=hold_months, hidden=list(hidden),
+                   epochs=args.epochs, lr=args.lr, clip=args.clip, init=args.init,
+                   seed=args.seed, time_average=True, history=hist, holdout_windows=rows,
+                   holdout_mean_ev=float(np.mean([r["ev_joint"] for r in rows])))
+        tag = f"armb_tavg_seed{args.seed}"
+        save_armb(args.out / f"gm_nn_{tag}.npz", nn, hidden, args.seed)
+        (args.out / f"{tag}.json").write_text(json.dumps(rec, indent=2))
+        print(f"[result] holdout window-mean joint EV: {rec['holdout_mean_ev']:+.4f}", flush=True)
+        print(f"[done] {time.time()-t0:.0f}s", flush=True)
+        print("M3_ARMB_FIT_DONE", flush=True)
+        return
 
     print("[eval] holdout, per tracer, against the deployable ceiling on the same cells",
           flush=True)

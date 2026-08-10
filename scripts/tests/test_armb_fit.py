@@ -395,3 +395,76 @@ def test_train_and_holdout_months_are_never_allowed_to_overlap():
         capture_output=True, text=True, timeout=600)
     assert r.returncode != 0
     assert "share months" in (r.stderr + r.stdout)
+
+
+# ---------------------------------------------------------------------------
+# the window-averaged objective
+# ---------------------------------------------------------------------------
+def test_window_loss_averages_the_PREDICTION_not_the_features(monkeypatch):
+    """The distinction the whole time-averaged experiment rests on.
+
+    A deployed closure sees the instantaneous state and the ocean averages what it produces. So
+    the network must be applied per mark and its OUTPUT averaged. Running it once on averaged
+    features is a different, easier problem — a closure that gets shown a monthly mean, which no
+    closure ever is. The two agree only if the closure is linear in its features, and it is not.
+
+    Built so they must disagree: two marks whose features differ, through a network with a
+    nonlinearity that has actually been excited."""
+    rng = np.random.default_rng(41)
+    N, nlay, F = 24, 6, gm_nn.n_features()
+    mesh = _stub_mesh_and_loss(monkeypatch, nlay)
+    n_wet = rng.integers(2, nlay + 1, size=N)
+    wet, free = _column_masks(n_wet, nlay)
+    shat, scale = _unit(rng, N, nlay), rng.random((N, nlay)) + 0.5
+    nn = gm_nn.init_gm_nn(jax.random.PRNGKey(3), hidden=(8, 8), n_out=2, zero_last=False)
+
+    def mk(fmul):
+        return dict(feats_iface=jnp.asarray(fmul * rng.normal(size=(N, nlay, F))),
+                    scale_iface=jnp.asarray(scale), shat_iface=jnp.asarray(shat),
+                    free=jnp.asarray(free), wet=jnp.asarray(wet), usable=jnp.asarray(wet),
+                    dzT=jnp.asarray(rng.normal(size=(N, nlay))),
+                    dzS=jnp.asarray(rng.normal(size=(N, nlay))),
+                    dvT=jnp.asarray(rng.normal(size=(N, nlay))),
+                    dvS=jnp.asarray(rng.normal(size=(N, nlay))), div_w=1.0)
+
+    w = [mk(1.0), mk(3.0)]
+    per_mark_then_average = float(ab.make_window_loss(mesh, None, None)(nn, w))
+
+    # the shortcut: one call on averaged features
+    avg = dict(w[0])
+    for k in ("feats_iface", "dzT", "dzS", "dvT", "dvS"):
+        avg[k] = 0.5 * (w[0][k] + w[1][k])
+    averaged_features = float(ab.make_loss(mesh, None, None)(nn, avg))
+
+    assert per_mark_then_average != pytest.approx(averaged_features, rel=1e-3), \
+        "the two constructions agreed, so the fixture failed to excite the nonlinearity"
+
+
+def test_window_loss_reduces_to_the_per_mark_loss_on_a_window_of_one(monkeypatch):
+    """A window of one mark is not an average, and the two objectives must coincide there. If
+    they do not, the window path has picked up a factor or a different mask."""
+    rng = np.random.default_rng(43)
+    N, nlay, F = 18, 5, gm_nn.n_features()
+    mesh = _stub_mesh_and_loss(monkeypatch, nlay)
+    n_wet = rng.integers(2, nlay + 1, size=N)
+    wet, free = _column_masks(n_wet, nlay)
+    nn = gm_nn.init_gm_nn(jax.random.PRNGKey(7), hidden=(8,), n_out=2, zero_last=False)
+    b = dict(feats_iface=jnp.asarray(rng.normal(size=(N, nlay, F))),
+             scale_iface=jnp.asarray(rng.random((N, nlay)) + 0.5),
+             shat_iface=jnp.asarray(_unit(rng, N, nlay)),
+             free=jnp.asarray(free), wet=jnp.asarray(wet), usable=jnp.asarray(wet),
+             dzT=jnp.asarray(rng.normal(size=(N, nlay))),
+             dzS=jnp.asarray(rng.normal(size=(N, nlay))),
+             dvT=jnp.asarray(rng.normal(size=(N, nlay))),
+             dvS=jnp.asarray(rng.normal(size=(N, nlay))), div_w=0.8)
+    assert float(ab.make_window_loss(mesh, None, None)(nn, [b])) == \
+        pytest.approx(float(ab.make_loss(mesh, None, None)(nn, b)), rel=1e-12)
+
+
+def test_group_by_month_keeps_month_order_and_membership():
+    marks = [("1959_03", 0), ("1959_03", 2), ("1959_04", 0), ("1959_03", 5), ("1959_05", 1)]
+    batches = [f"b{i}" for i in range(len(marks))]
+    got = ab.group_by_month(marks, batches)
+    assert [m for m, _ in got] == ["1959_03", "1959_04", "1959_05"]
+    assert got[0][1] == ["b0", "b1", "b3"]
+    assert got[1][1] == ["b2"]
