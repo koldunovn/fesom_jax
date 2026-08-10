@@ -602,12 +602,16 @@ def fit(mesh, batches, hold, *, hidden, seed, epochs, lr, clip, init, hnode, hel
         upd, st_ = opt.update(g, st_, nn_)
         return optax.apply_updates(nn_, upd), st_, l
 
-    dev = [to_device(b) for b in batches]
-    devh = [to_device(b) for b in hold]
+    # ⚠️ Build ONE of the two, never both. A cached mark is ~400 MB on the device and there are
+    # 132 of them in the time-averaged configuration; materialising the flat list first and then
+    # the window list holds 2 x 53 GB at once, which is an OOM rather than a slowdown.
     if windows is not None:
         dev = [[to_device(b) for b in w] for _m, w in windows]
         devh = [[to_device(b) for b in w] for _m, w in windows_hold]
         loss = make_window_loss(mesh, hnode, helem)
+    else:
+        dev = [to_device(b) for b in batches]
+        devh = [to_device(b) for b in hold]
     hist = []
     rng = np.random.default_rng(seed + 1)
     for ep in range(epochs):
