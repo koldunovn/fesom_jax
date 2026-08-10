@@ -47,7 +47,7 @@ nvidia-smi -L 2>/dev/null || echo "(no nvidia-smi)"
     --snap "$SNAP" --year "${YEAR:-1960}" --seed 17 \
     --mode dotprod --days "${DAYS:-5}" \
     --dot-cotangents "${COTS:-loss,sst,heat}" \
-    --chunk-steps "${CHUNK:-48}" --seg-mult "${SEGM:-1.0}" \
+    --chunk-steps "${CHUNK:-48}" \
     --results /work/ba1583/a270088/nn_eddy/seam_gate/seam_gate.jsonl
 RC=$?
 echo "=== done $(date)  dotprod rc=$RC ==="

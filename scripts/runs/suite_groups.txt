@@ -146,3 +146,4 @@ scripts scripts/tests/test_flux_divergence.py
 scripts scripts/tests/test_freeze_knobs_install.py
 scripts scripts/tests/test_kappa_hat.py
 unit fesom_jax/tests/test_adjoint_chunked.py
+scripts scripts/tests/test_private_api_boundary.py

@@ -55,7 +55,7 @@ nvidia-smi -L 2>/dev/null || echo "(no nvidia-smi)"
     --snap "$SNAP" --year "${YEAR:-1960}" \
     --seed 17 --mode gradient --days "${DAYS:-30}" --repeat "${REPEAT:-2}" \
     --h-sweep "${HS:-1e-2,1e-3}" \
-    --chunk-steps "${CHUNK:-48}" --seg-mult "${SEGM:-1.0}" \
+    --chunk-steps "${CHUNK:-48}" \
     --results /work/ba1583/a270088/nn_eddy/seam_gate/seam_gate.jsonl
 RC=$?
 echo "=== done $(date)  gradient rc=$RC ==="

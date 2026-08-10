@@ -120,7 +120,7 @@ from fesom_jax.adjoint_stab import AdjointConfig  # noqa: E402
 from fesom_jax.ale import AleConfig  # noqa: E402
 from fesom_jax.gm import GMConfig  # noqa: E402
 from fesom_jax.ice import IceConfig  # noqa: E402
-from fesom_jax.integrate import _run_steps  # noqa: E402
+from fesom_jax.adjoint import scan_steps  # noqa: E402
 from fesom_jax.mesh import load_mesh  # noqa: E402
 from fesom_jax.params import Params  # noqa: E402
 from fesom_jax.phc_ic import phc_initial_state  # noqa: E402
@@ -259,12 +259,11 @@ def build(snap: Path, year: int, n_steps: int):
 
 
 def body_for(mesh, op, fs, params, remat):
-    def body(carry, sf):
-        nxt = step(carry, mesh, op, None, params, dt=DT, is_first_step=False, step_forcing=sf,
-                   forcing_static=fs, ice_cfg=ICE_CFG, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
-                   ale_cfg=ALE_CFG, adjoint_cfg=ADJ_CFG, remat_blocks=remat)
-        return nxt, None
-    return body
+    def one_step(s, sf):
+        return step(s, mesh, op, None, params, dt=DT, is_first_step=False, step_forcing=sf,
+                    forcing_static=fs, ice_cfg=ICE_CFG, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
+                    ale_cfg=ALE_CFG, adjoint_cfg=ADJ_CFG, remat_blocks=remat)
+    return one_step
 
 
 # ---------------------------------------------------------------------------
@@ -304,7 +303,7 @@ def run_stability(args):
 
         @jax.jit
         def one_day(state0, sfs_day, _body=body):
-            return _run_steps(_body, state0, xs=sfs_day, checkpoint=False)
+            return scan_steps(_body, state0, sfs_day, rematerialize=False)
 
         marks, st = [], st0
         t0 = time.time()
@@ -381,14 +380,18 @@ class ChunkedWindow:
         self.wet3d = jnp.asarray(mesh.node_layer_mask, jnp.float64)
         self.area3d = jnp.asarray(np.asarray(mesh.areasvol), jnp.float64) * self.wet3d
         # segments INSIDE one chunk — √K, the standard O(√K)-memory choice at chunk scale.
-        # This is the knob's correct scope; it was never the window-length knob.
-        self.segments = max(2, int(round(args.seg_mult * math.sqrt(K))))
-        nn, segments = self.nn, self.segments
+        # This is the knob's correct scope; it was never the window-length knob. Recorded in the
+        # results row, not passed to anything: `scan_steps` derives √K itself and takes no
+        # `segments` argument, because S + K/S is minimised at S=√K and BOTH directions cost more
+        # memory — a parameter whose only settings are worse than its default is a trap, not a
+        # dial. `--seg-mult` is gone with it.
+        self.segments = max(2, int(round(math.sqrt(K))))
+        nn = self.nn
 
         def run_chunk(state, sfs, alpha):
             p = dataclasses.replace(Params.defaults(), gm_nn=scaled_last_layer(nn, alpha))
-            return _run_steps(body_for(mesh, op, fs, p, remat=True), state, xs=sfs,
-                              checkpoint=True, segments=segments)
+            return scan_steps(body_for(mesh, op, fs, p, remat=True), state, sfs,
+                              rematerialize=True)
 
         def run_chunk_nockpt(state, sfs, alpha):
             """Same chunk WITHOUT the checkpointing scheme — for forward mode only.
@@ -400,8 +403,8 @@ class ChunkedWindow:
             ``jit(jvp_chunk)/jvp()/while/body/closed_call/checkpoint/checkpoint``. Values are
             unchanged — this is a compile-time change, not a numerical one."""
             p = dataclasses.replace(Params.defaults(), gm_nn=scaled_last_layer(nn, alpha))
-            return _run_steps(body_for(mesh, op, fs, p, remat=True), state, xs=sfs,
-                              checkpoint=False)
+            return scan_steps(body_for(mesh, op, fs, p, remat=True), state, sfs,
+                              rematerialize=False)
 
         self.run_chunk = run_chunk
         self.fwd_chunk = jax.jit(run_chunk)
@@ -1013,10 +1016,6 @@ def main():
                     help="reverse-accumulation chunk length in steps (default 48 = 1 day). "
                          "Device peak is ONE chunk regardless of window length; host cost is "
                          "~1.9 GB per saved boundary. Smaller = lower device peak, more host.")
-    ap.add_argument("--seg-mult", type=float, default=1.0,
-                    help="checkpoint segments INSIDE one chunk = seg_mult*sqrt(chunk_steps). "
-                         "⚠️ NOT a window-length knob: S+K/S is minimised at S=sqrt(K), so 1.0 "
-                         "is already the floor and BOTH directions cost more memory.")
     ap.add_argument("--results", type=Path, default=OUT_DEFAULT / "seam_gate.jsonl")
     args = ap.parse_args()
 

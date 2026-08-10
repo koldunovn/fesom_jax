@@ -55,11 +55,11 @@ if ROOT not in _got.parents:
     raise SystemExit(f"FATAL: fesom_jax imported from {_got}, not from {ROOT}")
 
 from fesom_jax import ssh, surface_forcing
+from fesom_jax.adjoint import scan_steps
 from fesom_jax.ale import AleConfig
 from fesom_jax.calibrate import build_params
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
-from fesom_jax.integrate import _run_steps
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
 from fesom_jax.phc_ic import cold_start_state
@@ -134,16 +134,17 @@ def build_model():
         return build_params({"k_gm": kgm0 * m_gm, "redi_kmax": kredi0 * m_redi})
 
     def body_for(p):
-        def body(carry, sf):
-            nxt = step(carry, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
-                       forcing_static=fs, ice_cfg=ICE_CFG, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
-                       ale_cfg=ALE_CFG, remat_blocks=False)
-            return nxt, None
-        return body
+        def one_step(s, sf):
+            return step(s, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
+                        forcing_static=fs, ice_cfg=ICE_CFG, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
+                        ale_cfg=ALE_CFG, remat_blocks=False)
+        return one_step
 
     @jax.jit
     def chunk(state0, sfs, m_gm, m_redi):        # MARK_STEPS steps, developed state
-        return _run_steps(body_for(params_for(m_gm, m_redi)), state0, xs=sfs, checkpoint=False)
+        # rematerialize=False: this is a FORWARD-only run. jax.checkpoint buys reverse-pass
+        # memory, and there is no reverse pass here, so it would be pure compile-time overhead.
+        return scan_steps(body_for(params_for(m_gm, m_redi)), state0, sfs, rematerialize=False)
 
     @jax.jit
     def first_chunk(state0, sfs, m_gm, m_redi):  # cold start: step 1 eager AB2 bootstrap
@@ -153,7 +154,7 @@ def build_model():
                    forcing_static=fs, ice_cfg=ICE_CFG, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
                    ale_cfg=ALE_CFG, remat_blocks=False)
         rest = jax.tree.map(lambda x: x[1:], sfs)
-        return _run_steps(body_for(p), st1, xs=rest, checkpoint=False)
+        return scan_steps(body_for(p), st1, rest, rematerialize=False)
 
     print(f"[setup] backend={jax.default_backend()} built in {time.time()-t0:.1f}s "
           f"kgm0={kgm0:g} config=zstar+TKE+mEVP(whichEVP=1)+GM coldstart=PHC+ice", flush=True)

@@ -60,7 +60,7 @@ from fesom_jax.ale import AleConfig
 from fesom_jax.calibrate import build_params
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
-from fesom_jax.integrate import _run_steps
+from fesom_jax.adjoint import scan_steps
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
 from fesom_jax.phc_ic import phc_initial_state
@@ -254,12 +254,13 @@ def main():
             nxt = step(s, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
                        forcing_static=fs, ice_cfg=ICE_FROZEN, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
                        ale_cfg=ALE_CFG)
-            return (nxt, acc + observable(nxt)), None
+            return nxt, acc + observable(nxt)
 
         # adjoint needs the √N-checkpointed tape for the backward; tlm (forward-mode) carries the
-        # tangent alongside the primal ⇒ no tape ⇒ a plain scan (checkpoint=False) is leaner.
-        _, acc = _run_steps(body, (state0, acc0), xs=sfs,
-                            checkpoint=(args.mode == "adjoint"), segments=segments)
+        # tangent alongside the primal ⇒ no tape ⇒ a plain scan is leaner. `scan_steps` derives
+        # √N from len(sfs) — the same max(2, round(√N)) computed above, kept for the row.
+        _, acc = scan_steps(body, (state0, acc0), sfs,
+                            rematerialize=(args.mode == "adjoint"))
         return acc / n
 
     if args.mode == "adjoint":

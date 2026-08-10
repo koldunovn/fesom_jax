@@ -27,7 +27,7 @@ timed here. The forward path of that runner is byte-unchanged when the flag is F
 partition, which makes the sharded code reduce to the dense model — so it is a good SPEEDUP
 baseline but a poor CORRECTNESS one, since a bug in the sharded machinery could sit in the
 halo exchange and be invisible at one device with no halo. The dense reference comes through
-``_run_steps``, the same path every recorded adjoint number in this project was produced with.
+``scan_steps``, the same path every recorded adjoint number in this project was produced with.
 
 Usage (one node, up to 4 A100s):  python scripts/nn_eddy/sharded_grad_ab.py --npes 1,2,4 --n 96
 """
@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import sys
 import time
 from pathlib import Path
@@ -55,7 +54,7 @@ if ROOT not in Path(fesom_jax.__file__).resolve().parents:
     raise SystemExit(f"FATAL: fesom_jax from {fesom_jax.__file__}, not {ROOT}")
 
 from fesom_jax import calibrate, integrate_sharded as ish, partit, shard_mesh, ssh  # noqa: E402
-from fesom_jax.integrate import _run_steps  # noqa: E402  (the dense reference path)
+from fesom_jax.adjoint import scan_steps  # noqa: E402  (the dense reference path)
 from fesom_jax.step import step as dense_step  # noqa: E402
 from fesom_jax import surface_forcing  # noqa: E402
 from fesom_jax.ale import AleConfig  # noqa: E402
@@ -146,16 +145,18 @@ def dense_reference(n_steps, mesh, dense, op, sf_seq, fs):
     wet = jnp.asarray(mesh.node_layer_mask, jnp.float64)
 
     def body_for(p):
-        def body(carry, sf):
-            return dense_step(carry, mesh, op, None, p, dt=DT, is_first_step=False,
+        def one_step(s, sf):
+            return dense_step(s, mesh, op, None, p, dt=DT, is_first_step=False,
                               step_forcing=sf, forcing_static=fs, remat_blocks=True,
-                              **cfg), None
-        return body
+                              **cfg)
+        return one_step
 
-    segs = max(2, int(round(math.sqrt(n_steps))))
+    # `segs = max(2, round(√n_steps))` used to be computed here and passed in. `scan_steps`
+    # derives exactly that from the length it is given, and this file writes no results row that
+    # reported it, so there is nothing left for the variable to do.
 
     def fwd_params(p):
-        return _run_steps(body_for(p), st0, xs=sf_seq, checkpoint=True, segments=segs)
+        return scan_steps(body_for(p), st0, sf_seq, rematerialize=True)
 
     # ⚠️ TWIN misfit, NOT a bulk sum(T^2). The bulk norm was the first thing I wrote and it is
     # NOT A MEASUREMENT: GM's effect on the domain-integrated T^2 over one day is a minute

@@ -80,6 +80,13 @@ def main():
             return step(carry, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
                         forcing_static=cf.static, ice_cfg=ICE_FROZEN, gm_cfg=GM_CFG,
                         tke_cfg=TKE_CFG, ale_cfg=ALE_CFG, remat_blocks=True), None
+        # ⚠️ DELIBERATELY still `_run_steps`, and specifically `segments=0` — per-step
+        # rematerialization with NO two-level scheme. `fesom_jax.adjoint.scan_steps` always
+        # derives √N, which is a different graph, and this probe's entire question is whether a
+        # SPECIFIC compiled executable reproduces itself bit for bit. Rewriting it onto a public
+        # API that builds a different one would change the number the probe exists to report, and
+        # ADJOINT_HORIZON.md cites that number. Private is the correct coupling here: this file
+        # stays in fesom_jax, so the import never crosses a repository boundary.
         return _run_steps(body, state, xs=forcing, checkpoint=True, segments=0)
 
     outs, secs = [], []

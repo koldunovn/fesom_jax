@@ -142,7 +142,7 @@ def vertical_derivative(mesh, field, Z3d=None):
     as :func:`fesom_jax.eos.pressure_bv` does when it builds N² — same operator, so
     ``-(g/ρ0)·∂σ/∂z`` from here and ``bvfreq`` differ only by the EOS linearisation and the N²
     smoother, which is a difference worth being able to measure (:func:`project` does)."""
-    from fesom_jax.eos import _shift_down
+    from fesom_jax.eos import shift_down as _shift_down
     if Z3d is None:
         Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
         z = Zp[None, :]

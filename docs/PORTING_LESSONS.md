@@ -6792,3 +6792,68 @@ Two habits. Keep the whole output when the whole point of the run is to find the
 cheaper than a repeated 35-minute job. And when a measurement returns a total with no
 decomposition, treat the missing decomposition as a defect in the harness rather than as a
 property of the thing measured.
+
+### 2026-08-10 (31) — the fix for a drifting registry grew a new registry one level up
+
+CI used to select its test files with a hand-maintained `--ignore` list. It named three of the
+seven sharded suites, so four ran on a 2-core runner. The fix was a cost manifest, one line per
+file, with a test asserting no file is unclassified and a second asserting the workflow reads the
+manifest instead of restating it. Good fix; it held.
+
+Then a sixth group, `ci`, was added. The manifest got it, `VALID_GROUPS` got it, `ci.yml` got it —
+and `run_suite_parallel.sbatch`, which had `SUITE_GROUPS=(unit core2 ice sharding scripts)`
+written out by hand, did not. That array would have run five of six groups, passed every task,
+printed a summary, and left 35 files untested. Nothing was checking it, because the thing that
+checks registries had itself been written as a registry.
+
+**Wherever you replace a hand-maintained list with a derived one, ask what else describes the same
+set.** The answer is rarely zero, and the copy that survives is the one nobody thought of as a
+list — a bash array, a `--array=0-4` range, a `for` loop. The derived version needs the same
+assertion the original got, or the bug simply moves.
+
+One residue is unavoidable and worth naming: a SLURM `--array` range is a static directive and
+cannot read a file. So it stays coupled, and the honest response is a runtime guard that refuses
+to run when `SLURM_ARRAY_TASK_COUNT` disagrees with the manifest, plus a test on the number
+itself. A coupling you cannot remove should be made loud, not left quiet.
+
+### 2026-08-10 (32) — `a[0:len(a)]` is `a`, and the trap only fires in the simplest case
+
+`fesom_jax.adjoint.chunked_grad` takes an `xs_fn(c)` that builds one chunk's forcing, and FREES
+what it returns. That is not tidiness: holding every chunk's forcing on the device is ~0.5 GB per
+simulated day of pure idle residency, and it is the whole reason the device peak used to grow with
+window length (43.1 GB at 1 day rising to 56.9 at 30) instead of staying flat.
+
+Its own test file then wrote the obvious `xs_fn`: slice a cached device array. Four chunks passed.
+Two chunks passed. **One chunk failed**, because a full-width slice of a JAX array is the array
+itself, so the library deleted the caller's buffer and the reverse walk read a deleted array.
+
+Two things generalise. **A function that frees what a callback returns has an aliasing contract,
+and the contract must be stated, not merely survivable** — the failure lands inside the caller's
+own slicing expression as `Array has been deleted`, with nothing pointing at who deleted it, so
+the library now catches that and re-raises a sentence naming the contract. And **the degenerate
+configuration is the one a user tries first**: one chunk, one segment, one rank, one step. A test
+matrix that starts at "a few" and works up will not find it, and neither will the author, who is
+thinking about the interesting case.
+
+### 2026-08-10 (33) — a directory name is not a partition
+
+A plan to split a research project out of a library said: move `scripts/nn_eddy/` and
+`scripts/tests/`. Both names say what is inside them. Reading the tree, three of the 19 files in
+`scripts/tests/` test `scripts/archive/`, `scripts/paper/` and `scripts/write_namelist.py` —
+library code that is not moving. Filtering by directory would have carried them off and left three
+library behaviours untested, and the plan's next step, "delete the `scripts` cost group", would
+have deleted a group that still had files in it.
+
+The same reading corrected two more counts the plan had taken from names: `_run_steps` is called
+14 times in 8 files rather than 8 times in 3, and half those files are library-side; and a
+proposed guard, "no file under `scripts/` imports a private symbol", could never pass, because an
+AST census found 23 such files of which 16 are in-repo library tools with nothing to do with the
+split.
+
+**A directory groups files by where somebody put them, which is a claim about history, not about
+what they depend on.** Before a move, derive the set from the imports and assert the derivation
+covers everything; `git ls-tree` piped into an explicit classification with a coverage assertion
+takes ten minutes and is the difference between a split and a guess. And when a census feeds a
+decision, parse rather than grep: the first pass here reported `from fesom_jax import gm as _gm`
+as a private import three times, because a regular expression cannot see that an alias is not a
+name.
