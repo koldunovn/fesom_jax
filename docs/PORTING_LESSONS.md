@@ -6902,3 +6902,29 @@ The first was fixed by asking `nn_data` for the directory. The second was fixed 
 into a passing run**; if a check cannot find what it is meant to check, that is a failure, not a
 skip. The reason this one survived a fix is that the earlier fix repaired the instance and left
 the shape — half the name was derived and half was spelled out, so the next suffix reopened it.
+
+### 2026-08-10 (36) — the mitigation that went green was the one to reject
+
+Four ways of running the same failing test group, all measured to the end on the resource that
+actually runs out (`/proc/self/maps` against `vm.max_map_count` = 65,530; job 26854740/26854953):
+
+| arm | result | mappings at end | wall |
+|---|---|---|---|
+| clear JAX caches per test module | 211 passed | 32,564 (50 %) | 2331 s |
+| `MALLOC_ARENA_MAX=4` | 211 passed | **63,883 (97.5 %)** | 2609 s |
+| unmodified | SIGABRT | 56,521 | — |
+| `--xla_cpu_parallel_codegen_split_count=8` | SIGABRT | 56,431 | — |
+
+Two arms went green and they are not equivalent. Capping glibc's per-thread arenas frees enough
+mappings that the run *just* finishes, at 97.5 % of a hard ceiling and 12 % slower — one large
+compile from aborting, and certain to break on the next test file anyone adds. Had it been tried
+first, and alone, it would have been adopted and the group would have gone red again a week later
+for a third apparent reason.
+
+**A mitigation is judged by the margin it leaves on the measured resource, not by whether the run
+went green.** That requires knowing which resource, which requires instrumenting before
+theorising: the failure says `Cannot allocate memory` at 17 GB resident of a 300 GB request, and
+every reading that starts from the word "memory" — a bigger `--mem`, a smaller working set, a leak
+hunt — is looking at a number that was never the constraint. Two real bugs were found and fixed on
+the way to this one and neither was the cause; **fixing a real bug is not evidence you fixed THE
+bug**, and both times the group stayed red and the reason was re-diagnosed from scratch.
