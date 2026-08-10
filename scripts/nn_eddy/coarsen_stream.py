@@ -494,6 +494,48 @@ def write_output(path, month, times, states, fluxes, weights, n_coarse, n_lev):
     print(f"[out] wrote {path}")
 
 
+CONTROL_BAR = 1e-5
+
+
+def _control_status(d: float) -> str:
+    if not np.isfinite(d):
+        return "UNEVALUATED (non-finite control residual)"
+    if abs(d) < CONTROL_BAR:
+        return "OK"
+    return f"SHORT by {-d:.3e} (~1/{int(round(-1 / d))})" if d else "SHORT"
+
+
+def usable_records(deficits, *, drop=False, allow=False):
+    """``(records_to_process, records_dropped, refusal_or_None)`` from the control residuals.
+
+    Separated from the I/O so the decision can be tested without writing netCDF, because it is
+    the decision and not the reading that keeps a ~7 % bias out of the target.
+
+    ⚠️ **A non-finite residual counts as BAD.** The obvious spelling of the test — ``abs(d) >=
+    BAR`` — passes NaN, because every comparison with NaN is False. ``record_sample_deficit``
+    returns NaN when no node has a usable reference value, so a record whose control could not be
+    evaluated at all would have been read as a clean one. Phrased as ``not (abs(d) < BAR)`` so
+    the unevaluated case falls on the refusing side.
+
+    `drop` beats `allow`: dropping is the strictly safer of the two, so a caller that passes both
+    gets the safe one rather than an error about its own flags."""
+    bad = [r for r in sorted(deficits) if not (abs(deficits[r]) < CONTROL_BAR)]
+    keep = [r for r in sorted(deficits) if r not in bad]
+    if not bad:
+        return keep, [], None
+    if drop:
+        if not keep:
+            return [], bad, ("every record of {month} fails the one-sample control; "
+                             "nothing to write")
+        return keep, bad, None
+    if allow:
+        return sorted(deficits), [], None
+    return sorted(deficits), [], (
+        f"records {bad} of {{month}} are short by one accumulator sample; drop them with "
+        f"--records or --drop-short-records, or pass --allow-short-records if you have decided "
+        f"the ~7 % bias on the eddy covariance is acceptable")
+
+
 def product_name(month: str, source: str = "snap", max_levels=None) -> str:
     """The file name this script writes, as a function of the arguments it was given.
 
@@ -535,6 +577,11 @@ def main():
     ap.add_argument("--allow-short-records", action="store_true",
                     help="process an accumulated record that fails the one-sample control. Only "
                          "the first record of a run segment does; see record_sample_deficit.")
+    ap.add_argument("--drop-short-records", action="store_true",
+                    help="exclude records that fail the one-sample control instead of refusing "
+                         "the month. Which records are dropped is printed and is visible "
+                         "afterwards in the product's time axis. Takes precedence over "
+                         "--allow-short-records.")
     ap.add_argument("--verify-conservation", action="store_true",
                     help="check the area integral is preserved on the REAL files, per level, "
                          "and exit; writes nothing")
@@ -563,20 +610,19 @@ def main():
         return rc
 
     if args.source == "accum":
-        # Refuse a short record rather than silently averaging a ~7 % bias into the target. The
-        # deficit is exactly one sample in N and is invisible in the amplitudes, so this identity
-        # is the only thing that catches it.
-        bad = []
+        deficits = {}
         for r in recs:
             d = record_sample_deficit(args.teacher, args.month, r)
-            status = "OK" if abs(d) < 1e-5 else f"SHORT by {-d:.3e} (~1/{int(round(-1/d))})"
-            print(f"[control rec {r}] median relative residual {d:+.4e}  {status}", flush=True)
-            if abs(d) >= 1e-5:
-                bad.append(r)
-        if bad and not args.allow_short_records:
-            raise SystemExit(f"records {bad} of {args.month} are short by one accumulator sample; "
-                             f"drop them with --records, or pass --allow-short-records if you "
-                             f"have decided the ~7 % bias on the eddy covariance is acceptable")
+            deficits[r] = d
+            print(f"[control rec {r}] median relative residual {d:+.4e}  "
+                  f"{_control_status(d)}", flush=True)
+        recs, dropped, refuse = usable_records(
+            deficits, drop=args.drop_short_records, allow=args.allow_short_records)
+        if refuse:
+            raise SystemExit(refuse.format(month=args.month))
+        if dropped:
+            print(f"[control] DROPPING records {dropped} of {args.month}; keeping {recs}",
+                  flush=True)
 
     times, states, fluxes, weights = [], [], [], []
     proc = process_record if args.source == "snap" else process_record_accum

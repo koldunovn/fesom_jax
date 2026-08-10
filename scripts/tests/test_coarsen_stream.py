@@ -503,3 +503,43 @@ def test_the_runner_asks_the_code_for_the_product_name(cs):
         "coarsen_stream.sbatch spells out the product name again; call product_name() instead"
     assert "product_name(" in body, \
         "coarsen_stream.sbatch no longer asks coarsen_stream for the product name"
+
+
+def test_the_control_decision_refuses_drops_and_never_passes_an_unevaluated_record(cs):
+    """What the one-sample control does with its residuals, without touching a file.
+
+    The refusal is the load-bearing default: a short record carries a ~7 % systematic bias on the
+    eddy covariance that sits inside the ±10 % record-to-record spread, so nothing downstream
+    would ever show it. `--drop-short-records` exists because the control costs ~2 min per record
+    and refusing a month means paying for that diagnosis and discarding it.
+
+    ⚠️ The NaN case is the one worth pinning. `record_sample_deficit` returns NaN when no node has
+    a usable reference, and the natural spelling `abs(d) >= BAR` is False for NaN — so a record
+    whose control could not be evaluated at all reads as a clean one."""
+    ok = {0: 0.0, 1: 1e-12, 2: -3e-6}
+    assert cs.usable_records(ok) == ([0, 1, 2], [], None)
+
+    short = {0: -5.5556e-04, 1: 0.0, 2: 0.0}
+    keep, dropped, refuse = cs.usable_records(short)
+    assert keep == [0, 1, 2] and dropped == [] and refuse is not None
+    assert "--drop-short-records" in refuse
+
+    keep, dropped, refuse = cs.usable_records(short, drop=True)
+    assert (keep, dropped, refuse) == ([1, 2], [0], None)
+
+    keep, dropped, refuse = cs.usable_records(short, allow=True)
+    assert (keep, dropped, refuse) == ([0, 1, 2], [], None)
+
+    # dropping is the safer of the two, so it wins when a caller passes both
+    assert cs.usable_records(short, drop=True, allow=True) == ([1, 2], [0], None)
+
+    nan = {0: float("nan"), 1: 0.0}
+    assert cs.usable_records(nan)[2] is not None, "an unevaluated control passed as clean"
+    assert cs.usable_records(nan, drop=True) == ([1], [0], None)
+
+    keep, dropped, refuse = cs.usable_records({0: float("nan")}, drop=True)
+    assert keep == [] and refuse is not None and "nothing to write" in refuse
+
+    assert cs._control_status(0.0) == "OK"
+    assert "UNEVALUATED" in cs._control_status(float("nan"))
+    assert "1/1800" in cs._control_status(-1.0 / 1800)
