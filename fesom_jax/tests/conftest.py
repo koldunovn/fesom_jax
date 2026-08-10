@@ -32,6 +32,9 @@ def _map_limit() -> int:
         return -1
 
 
+_PEAK_MAPS = 0
+
+
 @pytest.fixture(scope="module", autouse=True)
 def _bound_the_jit_footprint():
     """Drop JAX's compilation caches when a test MODULE finishes.
@@ -62,6 +65,14 @@ def _bound_the_jit_footprint():
     helper defeating that cache (also real, also not this). The count is now printed at the end
     of every run so the next approach to the ceiling is visible before it is a failure."""
     yield
+    # Sample BEFORE clearing: within a module the count only grows (compiles accumulate and
+    # nothing releases them), so a module's maximum is exactly here. Sampling only at exit — which
+    # is what this file did first — reads the count AFTER the last teardown has already cleared,
+    # and reported 5,518 for a run whose real peak was 32,564. An instrument that under-reads by
+    # 6x is worse than none: it is the reassuring number that would have to be wrong for anyone
+    # to look.
+    global _PEAK_MAPS
+    _PEAK_MAPS = max(_PEAK_MAPS, _map_count())
     import jax
     jax.clear_caches()
 
@@ -85,15 +96,21 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):
     read unpublished Fortran/C reference dumps and SKIP without them, so a green run off
     Levante must say what it did NOT verify — otherwise a newcomer reads 'green' as
     'numerics verified locally' when the gates never ran."""
-    used, limit = _map_count(), _map_limit()
-    if used > 0 and limit > 0:
+    exit_used, limit = _map_count(), _map_limit()
+    peak = max(_PEAK_MAPS, exit_used)
+    if peak > 0 and limit > 0:
         # The resource that actually ran out once (see _bound_the_jit_footprint). Printed on
         # every run, green or not, because the failure it produces names memory and LLVM and
         # gives no hint that a per-process mapping ceiling is what was hit.
+        #
+        # ⚠️ PEAK is the number to read, and it is not the number at exit. The peak is sampled
+        # per module just before the cache clear; `at exit` is measured here, after the last
+        # clear, and on a real run it read 5,518 against a true peak of 32,564.
         terminalreporter.write_sep("-", "process memory mappings")
         terminalreporter.write_line(
-            f"{used} of {limit} (vm.max_map_count), {100 * used / limit:.0f}% at exit.")
-        if used > limit // 2:
+            f"peak {peak} of {limit} (vm.max_map_count), {100 * peak / limit:.0f}%"
+            f"   [{exit_used} at exit, after the final cache clear — not the peak]")
+        if peak > limit // 2:
             terminalreporter.write_line(
                 "WARNING: past half the ceiling. XLA's CPU JIT costs several mappings per "
                 "compiled executable and they are never released; at ~85% the next large "
