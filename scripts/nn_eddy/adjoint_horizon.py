@@ -49,7 +49,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
-import math
 import os
 import pickle
 import sys
@@ -78,8 +77,8 @@ if Path(fesom_jax.__file__).resolve().parents[1] != _ROOT:
 
 from fesom_jax import (adjoint_stab, eos, gm, gm_redi, momentum, pgf, pp, ssh,  # noqa: E402
                        surface_forcing, tke, tracer_adv)
+from fesom_jax.adjoint import LegIncomplete, chunked_forward, chunked_grad, scan_steps
 from fesom_jax.calibrate import build_params
-from fesom_jax.integrate import _run_steps
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
 from fesom_jax.phc_ic import phc_initial_state
@@ -275,8 +274,11 @@ def check_fired(knobs):
 
 # ---------------------------------------------------------------------------
 
-def segments_for(length, seg_mult=1.0):
-    return max(2, int(round(seg_mult * math.sqrt(length))))
+# `segments_for(length, seg_mult=1.0)` used to live here — max(2, round(seg_mult*sqrt(length))).
+# It is gone because `fesom_jax.adjoint.scan_steps` derives sqrt(N) from the chunk it is given,
+# and deliberately does not take it as a parameter: the `seg_mult` knob was measured to be a trap
+# rather than a tuning dial (S=31 died at 69.24 GiB, job 26798871). Nothing outside this file
+# imported it.
 
 
 def _rss_gb():
@@ -579,40 +581,34 @@ def main():
               f"spacing (kappa_dt median {float(jnp.median(jnp.asarray(kdt))):.3e} m^2)", flush=True)
 
     def run_chunk(state, sfs, m):
+        """One chunk — this is :func:`fesom_jax.adjoint.chunked_grad`'s ``chunk_fn``.
+
+        Everything model-specific closes over here and the library knows none of it: the mesh,
+        the SSH operator, the ice/GM/ALE configuration, which mixing scheme, which terms the
+        ``--freeze`` monkeypatches have replaced, the adjoint stabilizer, and how the scalar
+        multiplier ``m`` becomes a :class:`Params`. That is the whole reason the seam is here and
+        not one function call further in."""
         p = params_for(m)
 
-        def body(carry, sf):
-            nxt = step(carry, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
+        def one_step(s, sf):
+            nxt = step(s, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
                        forcing_static=fs, ice_cfg=ice_cfg, gm_cfg=GM_CFG, ale_cfg=ALE_CFG,
                        remat_blocks=True, **mix_kw)
-            if stabilize is not None:
-                nxt = stabilize(nxt)
-            return nxt, None
+            return stabilize(nxt) if stabilize is not None else nxt
 
-        return _run_steps(body, state, xs=sfs, checkpoint=True, segments=segments_for(K))
-
-    @jax.jit
-    def fwd_chunk(state, sfs, m):
-        return run_chunk(state, sfs, m)
-
-    @jax.jit
-    def bwd_chunk(state, sfs, m, cot):
-        _, vjp = jax.vjp(lambda s, mm: run_chunk(s, sfs, mm), state, m)
-        return vjp(cot)
+        # `scan_steps` derives sqrt(len(sfs)) itself; this used to pass segments_for(K) by hand.
+        return scan_steps(one_step, state, sfs, rematerialize=True)
 
     # the truth run always uses the UNPATCHED model at one-day granularity — the twin's
     # reference trajectory must not depend on which backward knob is being tested.
     @jax.jit
     def one_day(state, sfs_day, m):
-        segs = segments_for(STEPS_PER_DAY)
+        def one_step(s, sf):
+            return step(s, mesh, op, None, params_for(m), dt=DT, is_first_step=False,
+                        step_forcing=sf, forcing_static=fs, ice_cfg=ice_cfg, gm_cfg=GM_CFG,
+                        ale_cfg=ALE_CFG, remat_blocks=True, **mix_kw)
 
-        def body(carry, sf):
-            nxt = step(carry, mesh, op, None, params_for(m), dt=DT, is_first_step=False,
-                       step_forcing=sf, forcing_static=fs, ice_cfg=ice_cfg, gm_cfg=GM_CFG,
-                       ale_cfg=ALE_CFG, remat_blocks=True, **mix_kw)
-            return nxt, None
-
-        return _run_steps(body, state, xs=sfs_day, checkpoint=True, segments=segs)
+        return scan_steps(one_step, state, sfs_day, rematerialize=True)
 
     print(f"[setup] built in {time.time()-t0:.1f}s; seed={args.season} date={yr}-{mo:02d}-{dy:02d} "
           f"N={ndays} d ({n} steps) in {n_chunks} x {K}-step chunks  m_true={args.truth_mult}  "
@@ -638,9 +634,6 @@ def main():
         return stage1_misfit(s.T, s.S, s.eta_n, T_hat, S_hat, e_hat,
                              w_T, w_S, w_eta, wet3d, area3d)
 
-    def _free(tree):
-        jax.tree.map(lambda x: x.delete() if hasattr(x, "delete") else None, tree)
-
     def chunk_sfs(c):
         """One chunk's forcing stack, built ON DEMAND and freed by the caller.
 
@@ -652,72 +645,20 @@ def main():
         like "the adjoint does not scale" when it is only a buffer lifetime. Same values, same
         order of operations, bit-identical results — only when the arrays exist changes. The
         re-stack costs ~0.1-0.3 s per chunk per pass against ~85 s per simulated day.
-        (Same lesson as horizon_scan.py's "⚠️ MEMORY" note about the whole-window stack.)"""
+        (Same lesson as horizon_scan.py's "⚠️ MEMORY" note about the whole-window stack.)
+
+        ⚠️ ``chunked_grad`` FREES what this returns and asks for the same chunk more than once
+        (the reverse walk re-asks; a boundary stride > 1 re-asks again per span). `cf.stack`
+        builds a new stack every call, which is what makes that safe."""
         return stack_steps(c * K, (c + 1) * K)
 
-    def forward(m, keep_boundaries=False, stride=1, ck=None):
-        """Run the window; optionally return chunk-boundary states, on the HOST.
-
-        ``stride > 1`` keeps only every ``stride``-th boundary (plus the window start), which
-        is the SECOND level of checkpointing — see :func:`rebuild_span`. Returned as a dict
-        keyed by chunk index, because it is no longer dense.
-
-        ``ck`` streams each kept boundary to disk AS IT IS PRODUCED and honours the leg's time
-        budget, which is what makes the forward itself resumable. Without it the forward is
-        all-or-nothing: a leg killed part way redoes the whole thing, which is 1.5 h at a
-        one-year window and is what put a 5-year rung out of reach (leg 1 would need 7.4 h of
-        truth plus 7.4 h of forward before the reverse could start, against a 12 h slot).
-        Only the MAIN forward passes ``ck`` — the FD evaluations and :func:`rebuild_span` must
-        not, or they would overwrite the checkpoint with their own trajectory."""
-        s, c0 = st0, 0
-        kept = {0: jax.device_get(s)} if keep_boundaries else None
-        if ck is not None and keep_boundaries:
-            st_r, c0 = ck.forward_resume(like=st0)
-            if st_r is not None:
-                kept = ck.load_boundaries(like=st0)
-                s = jax.device_put(st_r)
-            elif ck.put_boundary(0, kept[0]):
-                raise SystemExit(_ckpt.EXIT_INCOMPLETE)
-        for c in range(c0, n_chunks):
-            sfs_c = chunk_sfs(c)
-            nxt = jax.block_until_ready(fwd_chunk(s, sfs_c, m))
-            _free(sfs_c)                     # after block_until_ready: never free a live input
-            if s is not st0:
-                _free(s)
-            s = nxt
-            if keep_boundaries and ((c + 1) % stride == 0 or c == n_chunks - 1):
-                kept[c + 1] = jax.device_get(s)
-                if ck is not None and ck.put_boundary(c + 1, kept[c + 1]):
-                    raise SystemExit(_ckpt.EXIT_INCOMPLETE)
-        return s, kept
-
-    def rebuild_span(stored, lo, hi, m):
-        """Re-run chunks ``lo..hi-1`` from the stored boundary at ``lo``, returning their input
-        states on the HOST, keyed by chunk index.
-
-        This is the second level of checkpointing, and the reason a YEAR is reachable at all.
-        Level one already trades device memory for recompute inside each chunk. Level two does
-        the same to the HOST store: a CORE2 ``State`` is 1.93 GB, so keeping one boundary per
-        day costs 706 GB over 365 days against a 515 GB node — measured, not estimated (60 days
-        came in at 117.8 GB against 61 x 1.93 = 118). Keeping every ``stride``-th boundary and
-        recomputing the span in between costs ``n/stride + stride`` states, minimised near
-        ``stride = sqrt(n_chunks)``: **~74 GB for a year** at stride 19.
-
-        The price is exactly ONE extra forward pass over the window, because every chunk is
-        recomputed at most once across the whole reverse sweep. The gradient is UNCHANGED — the
-        recomputed states are the same states, so this is checkpointing, not approximation, and
-        `--boundary-stride 2` against `1` must agree to round-off (that is the validation run)."""
-        s = jax.device_put(stored[lo])
-        local = {lo: stored[lo]}
-        for c in range(lo, hi - 1):
-            sfs_c = chunk_sfs(c)
-            nxt = jax.block_until_ready(fwd_chunk(s, sfs_c, m))
-            _free(sfs_c)
-            _free(s)
-            s = nxt
-            local[c + 1] = jax.device_get(s)
-        _free(s)
-        return local
+    # ⚠️ `forward` and `rebuild_span` USED TO LIVE HERE, alongside `fwd_chunk`/`bwd_chunk` and a
+    # reverse loop, and they are now `fesom_jax.adjoint.chunked_grad` / `chunked_forward`. Nothing
+    # about the scheme changed — the extraction is asserted to agree with these closures to 3e-5
+    # on CORE2 and is exact on the pi mesh (job 26841658). What changed is that a second study
+    # does not have to re-derive the buffer lifetimes, the boundary stride or the order in which
+    # a VJP's inputs may be freed. The parts that could NOT move are the three arguments below:
+    # `run_chunk` (the model), `chunk_sfs` (the forcing) and `misfit_of` (the loss).
 
     m0 = jnp.asarray(1.0, jnp.float64)
     rec = {"season": args.season, "snap": Path(args.snap).name, "date": f"{yr}-{mo:02d}-{dy:02d}",
@@ -768,86 +709,38 @@ def main():
                 """One full forward + chunked reverse accumulation. Returns (loss, dL/dm,
                 cotangent-norm trace, host GB, fwd seconds, bwd seconds).
 
+                The loop is :func:`fesom_jax.adjoint.chunked_grad`. This function's job is to
+                hand it the three things it cannot know — the chunk advance, the per-chunk
+                forcing and the loss — and to translate its result into the row this script
+                writes.
+
                 ``ck`` (a :class:`adjoint_ckpt.Checkpoint`) makes the sweep RESUMABLE across
-                jobs. The forward's boundaries are written once and the reverse cotangent every
-                few chunks, so a window longer than the queue's wall clock stops being
-                impossible: a year is ~10 h against a 12 h limit and two years fit no slot at
-                all, but the carried state of the reverse loop is one 1.93 GB cotangent, a
-                scalar and an index. With ``ck`` the run stops on its own time budget, exits
-                ``EXIT_INCOMPLETE``, and the next job continues from the same chunk."""
-                ta = time.time()
-                stride = max(1, int(args.boundary_stride))
-                resuming_reverse = ck is not None and ck.state["phase"] == "reverse"
-                if ck is not None and ck.have_boundaries:
-                    boundaries = ck.load_boundaries(like=st0)
-                    loss_v, fwd_t = float(ck.loss), 0.0
-                    s_fin = None
-                else:
-                    s_fin, boundaries = forward(m0, keep_boundaries=True, stride=stride,
-                                                ck=ck)
-                    loss_v = float(misfit_of(s_fin))
-                    fwd_t = time.time() - ta
-                    if ck is not None:
-                        ck.finish_forward(loss_v)
-                hgb = sum(a.nbytes for a in jax.tree.leaves(boundaries)) / 1e9
-                if verbose:
-                    print(f"[fwd] loss(m=1)={loss_v:.6e}  {fwd_t:.1f}s  "
-                          f"boundaries on host: {hgb:.1f} GB", flush=True)
+                jobs, and satisfies the library's ``ReverseCheckpoint`` protocol without any
+                change: the protocol was read off this class. The forward's boundaries are
+                written once and the reverse cotangent every few chunks, so a window longer than
+                the queue's wall clock stops being impossible: a year is ~10 h against a 12 h
+                limit and two years fit no slot at all, but the carried state of the reverse loop
+                is one 1.93 GB cotangent, a scalar and an index. With ``ck`` the run stops on its
+                own time budget, exits ``EXIT_INCOMPLETE``, and the next job continues from the
+                same chunk."""
 
-                # The loss cotangent seeds the sweep. `forward` always keeps the LAST boundary
-                # whatever the stride, so it is available on a resume too and the final state
-                # never has to be recomputed.
-                if s_fin is None:
-                    s_fin = jax.device_put(boundaries[n_chunks])
-                _, vjp_L = jax.vjp(misfit_of, s_fin)
-                seed_cot = jax.block_until_ready(vjp_L(1.0)[0])
-                _free(s_fin)
-                del s_fin
+                def on_forward(loss_v, hgb, fwd_t):
+                    if verbose:
+                        print(f"[fwd] loss(m=1)={loss_v:.6e}  {fwd_t:.1f}s  "
+                              f"boundaries on host: {hgb:.1f} GB", flush=True)
 
-                if ck is None:
-                    c_t, g0, c_start = seed_cot, 0.0, n_chunks - 1
-                    tr = [float(adjoint_stab.cotangent_norm(c_t))]
-                else:
-                    c_t, g0, c_start, tr = ck.reverse_start(seed_cot, n_chunks, like=st0)
-                    if not resuming_reverse:
-                        tr = [float(adjoint_stab.cotangent_norm(c_t))]
-                    else:
-                        _free(seed_cot)
-                        c_t = jax.device_put(c_t)
-                tb = time.time()
-                g = jnp.asarray(g0, jnp.float64)
-                for sup_lo in reversed(range(0, n_chunks, stride)):
-                    sup_hi = min(sup_lo + stride, n_chunks)
-                    if sup_lo > c_start:          # this superchunk was done in an earlier leg
-                        continue
-                    # boundaries[] holds only every stride-th state; rebuild the span in
-                    # between from the nearest stored one. stride=1 => `span` IS boundaries.
-                    span = (boundaries if stride == 1
-                            else rebuild_span(boundaries, sup_lo, sup_hi, m0))
-                    for c in reversed(range(sup_lo, min(sup_hi, c_start + 1))):
-                        s_in = jax.device_put(span[c])
-                        sfs_c = chunk_sfs(c)             # on demand; see chunk_sfs's docstring
-                        g_s, g_c = bwd_chunk(s_in, sfs_c, m0, c_t)
-                        g = g + g_c
-                        # ⚠️ ORDER MATTERS: `s_in`, `sfs_c` and the OLD `c_t` are live inputs
-                        # to the VJP until it completes. Block on its output first, then free.
-                        g_s = jax.block_until_ready(g_s)
-                        _free(c_t)
-                        _free(sfs_c)
-                        _free(s_in)
-                        del s_in
-                        c_t = g_s
-                        tr.append(float(adjoint_stab.cotangent_norm(c_t)))
-                        if verbose:
-                            print(f"    [bwd] chunk {c:3d}  t=+{c*K*DT/86400:5.2f} d  "
-                                  f"|cot|={tr[-1]:.6e}  dL/dm so far={float(g):+.6e}", flush=True)
-                        # After chunk c the carried cotangent belongs to chunk c-1; -1 means
-                        # the sweep is complete. This is the only place a leg may end.
-                        if ck is not None and ck.tick(c - 1, c_t, float(g), tr):
-                            raise SystemExit(_ckpt.EXIT_INCOMPLETE)
-                    if stride > 1:
-                        span = None
-                return loss_v, float(g), tr, hgb, fwd_t, time.time() - tb
+                def on_chunk(c, cot_norm, g):
+                    if verbose:
+                        print(f"    [bwd] chunk {c:3d}  t=+{c*K*DT/86400:5.2f} d  "
+                              f"|cot|={cot_norm:.6e}  dL/dm so far={float(g):+.6e}", flush=True)
+
+                res = chunked_grad(run_chunk, m0, init_state=st0, n_chunks=n_chunks,
+                                   xs_fn=chunk_sfs, loss_fn=misfit_of, chunk_steps=K,
+                                   boundary_stride=max(1, int(args.boundary_stride)),
+                                   checkpoint=ck, on_forward=on_forward, on_chunk=on_chunk)
+                return (res.loss, float(res.grad), res.trace, res.host_gb,
+                        res.forward_seconds, res.reverse_seconds)
+
 
             l0, ad, trace, host_gb, fwd_s, bwd_s = one_pass(verbose=True, ck=ck)
             check_fired(knobs)
@@ -878,10 +771,18 @@ def main():
             amp_sus = _amp.sustained
 
             # --- FD sign check -------------------------------------------------------
+            # `chunked_forward`, not `chunked_grad`: these evaluations must park no boundaries
+            # and must NOT be handed `ck`, or they would overwrite the checkpoint with their own
+            # perturbed trajectory. Both jits are cached on `run_chunk`, so the six evaluations
+            # reuse the executable the main pass already compiled.
+            def fd_forward(m):
+                return chunked_forward(run_chunk, m, init_state=st0, n_chunks=n_chunks,
+                                       xs_fn=chunk_sfs)
+
             rows = []
             for h in [float(x) for x in args.fd_h.split(",") if x.strip()]:
-                lp, _ = forward(m0 * (1 + h))
-                lm, _ = forward(m0 * (1 - h))
+                lp = fd_forward(m0 * (1 + h))
+                lm = fd_forward(m0 * (1 - h))
                 rows.append((h, float((misfit_of(lp) - misfit_of(lm)) / (2 * h))))
             if rows:
                 best_fd = min(rows, key=lambda r: abs(ad - r[1]) / max(abs(r[1]), 1e-300))[1]
@@ -930,6 +831,17 @@ def main():
               f"log-spread <= {adjoint_stab.AMP_SPREAD_MAX:.3f})", flush=True)
         print(f"  peak device {pk:.1f} GB   host {host_gb:.1f} GB   fwd {fwd_s:.0f}s  bwd {bwd_s:.0f}s",
               flush=True)
+    except LegIncomplete as e:
+        # ⚠️ MUST come before the handler below, and this is not stylistic. The old code raised
+        # `SystemExit(EXIT_INCOMPLETE)` from inside the reverse loop, and SystemExit is a
+        # BaseException, so it flew straight past `except Exception`. `LegIncomplete` is an
+        # ordinary Exception: caught by that handler it would write a FAILED row for a leg that
+        # did exactly what it was told, and exit 0 — so the resubmit script would stop, and a
+        # year-long gradient would be silently abandoned two thirds of the way through with a
+        # consistent checkpoint sitting on disk.
+        print(f"\n  N={ndays} d: leg incomplete ({e}); checkpoint is consistent, "
+              f"resubmit with --resume. Exiting {_ckpt.EXIT_INCOMPLETE}.", flush=True)
+        raise SystemExit(_ckpt.EXIT_INCOMPLETE)
     except Exception as e:
         msg = type(e).__name__ + ": " + str(e)[:300]
         is_oom = ("RESOURCE" in str(e).upper() or "memory" in str(e).lower())

@@ -24,6 +24,9 @@ from fesom_jax import adjoint_stab, forcing, ic, ssh
 from fesom_jax.adjoint import (ChunkedGrad, LegIncomplete, chunked_forward, chunked_grad,
                                scan_steps)
 from fesom_jax.config import A_VER
+# the private function scan_steps replaces — imported HERE, in the test that proves the two build
+# the same graph, and nowhere else in the library or the scripts.
+from fesom_jax.integrate import _run_steps
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
 from fesom_jax.params import Params
 from fesom_jax.step import step
@@ -307,6 +310,56 @@ def test_rematerialize_is_forward_transparent(fixture, capsys):
 def test_scan_steps_requires_a_length_without_xs():
     with pytest.raises(ValueError, match="length"):
         scan_steps(lambda s, x: s, 0.0, None)
+
+
+@pytest.mark.parametrize("n", [6, 48, 50])
+def test_scan_steps_builds_the_same_graph_as_the_call_it_replaces(fixture, n, capsys):
+    """`scan_steps` must lower to what `_run_steps(checkpoint=True, segments=√N)` lowered to.
+
+    This is the real equivalence gate for the extraction, and it is exact where a numerical
+    comparison cannot be. Every migrated call site previously wrote
+
+        _run_steps(body, state, xs=sfs, checkpoint=True, segments=max(2, round(√len(sfs))))
+
+    with `body(carry, x) -> (carry, None)`; it now writes `scan_steps(one_step, state, sfs)` with
+    `one_step(state, x) -> state`. If those produce the same jaxpr, no run can differ for any
+    reason attributable to this change, at any window length, on any backend.
+
+    ⚠️ Written because the CORE2 A100 comparison could NOT settle it. Two processes recompile,
+    XLA picks kernels by timing them, and scatter-adds on an unstructured mesh are not
+    deterministic: the same unchanged code measured 2.9e-5 and 1.0e-4 apart across processes
+    (job 26844357), with the two versions' values INTERLEAVING. A difference that small cannot be
+    attributed by running more samples of a noisy thing; it has to be removed by comparing the
+    computation instead of its output.
+
+    ⚠️ The lengths matter and are not decoration. `_run_steps` splits the scan into S segments of
+    M = length // S and then runs `length - S*M` steps as a SEPARATE per-step-checkpointed tail —
+    a branch that only exists when S does not divide the length. 6 (S=2, M=3, no tail) takes the
+    first path; **48** is the real chunk length this project runs (S=7, M=6, tail of 6); 50 is
+    S=7, M=7, tail of 1, the narrowest tail there is. A check at 6 alone would have proven the
+    equivalence only for the branch that is never used in production."""
+    mesh, op, stress, st0 = fixture
+    p = _params(1e-4)
+    xs = jnp.asarray(1.0 + 0.05 * np.cos(np.arange(n)), jnp.float64)
+
+    def one_step(s, x):
+        return _advance(s, x, mesh, op, stress, p)
+
+    def old_body(carry, x):                       # the (carry, x) -> (carry, None) contract
+        return one_step(carry, x), None
+
+    segments = max(2, int(round(np.sqrt(n))))
+    tail = n - segments * (n // segments)
+    print(f"\nn={n}  segments={segments}  M={n // segments}  tail={tail}")
+    old = jax.make_jaxpr(lambda s, x: _run_steps(old_body, s, xs=x, checkpoint=True,
+                                                 segments=segments))(st0, xs)
+    new = jax.make_jaxpr(lambda s, x: scan_steps(one_step, s, x, rematerialize=True))(st0, xs)
+
+    so, sn = str(old), str(new)
+    print(f"old jaxpr {len(so)} chars, new {len(sn)} chars")
+    assert so == sn, (
+        "scan_steps does not lower to what _run_steps(checkpoint=True, segments=√N) lowered to; "
+        "the migrated call sites are NOT numerically equivalent to what they replaced")
 
 
 def test_the_jitted_chunk_is_reused_across_calls():

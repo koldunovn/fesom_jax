@@ -70,10 +70,31 @@ def _private_imports(path: Path) -> set[str]:
     return found
 
 
+def _tracked():
+    """Paths git tracks under the leaving directory.
+
+    ⚠️ TRACKED, not globbed. `adjoint_equivalence.sbatch` writes the pre-extraction copy of
+    `adjoint_horizon.py` into this directory while it runs — it has to live exactly there, because
+    the script derives the repo root as `Path(__file__).parents[2]` and resolves its siblings from
+    its own directory, and a copy anywhere else makes `fesom_jax` resolve to the main checkout
+    (the script's own guard catches that and refuses to report, which is how this was found). That
+    copy is untracked and temporary, it is BY CONSTRUCTION full of private imports, and a globbing
+    test reports it as a violation every time the gate runs. An untracked file is not a claim the
+    repository is making."""
+    import subprocess
+    out = subprocess.run(["git", "ls-files", "--", str(LEAVING)],
+                         cwd=ROOT, capture_output=True, text=True)
+    if out.returncode != 0:
+        pytest.skip("not a git checkout, so 'tracked' has no meaning here")
+    return {ROOT / line for line in out.stdout.split() if line.endswith(".py")}
+
+
 def _moving_files():
     if not LEAVING.is_dir():
         pytest.skip(f"{LEAVING} is gone — the split has happened and this test moved with it")
-    return sorted(p for p in LEAVING.glob("*.py") if p.name not in STAYS)
+    tracked = _tracked()
+    return sorted(p for p in LEAVING.glob("*.py")
+                  if p.name not in STAYS and p in tracked)
 
 
 def test_the_moving_research_code_uses_only_public_fesom_jax():

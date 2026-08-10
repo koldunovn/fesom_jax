@@ -345,6 +345,38 @@ manual checkpointing at a coarser granularity, not an approximation.
 
 ## 4. What is implemented
 
+### `fesom_jax.adjoint` — the chunked reverse sweep, promoted out of this script (2026-08-10)
+
+Everything below this section was measured with the sweep written as six closures inside
+`main()` of `scripts/nn_eddy/adjoint_horizon.py`. It is now `fesom_jax.adjoint`:
+`scan_steps` (the in-chunk runner), `chunked_forward`, `chunked_grad`, and a
+`ReverseCheckpoint` protocol that `adjoint_ckpt.Checkpoint` satisfies unchanged.
+
+**Every number in this document still stands, and the reason is exact rather than statistical.**
+The migrated call sites used to write `_run_steps(body, state, xs=sfs, checkpoint=True,
+segments=max(2, round(√N)))` with a `(carry, x) -> (carry, None)` body; they now write
+`scan_steps(one_step, state, sfs)` with a `(state, x) -> state` body. Those lower to a
+**byte-identical jaxpr** (job 26845302):
+
+| chunk length | segments | inner M | remainder tail | old jaxpr | new jaxpr |
+|---|---|---|---|---|---|
+| 6 | 2 | 3 | 0 | 463,237 chars | 463,237 chars |
+| **48** (production) | 7 | 6 | 6 | 290,955 | 290,955 |
+| 50 | 7 | 7 | 1 | 290,955 | 290,955 |
+
+All three shapes matter: `_run_steps` runs `length − S·M` leftover steps as a *separate*
+per-step-checkpointed tail, so a check only at 6 would have proven the equivalence for the branch
+production never takes.
+
+⚠️ **The CORE2 A100 comparison could not settle this, and the reason is a lasting caveat on every
+gradient number in this document.** `adjoint_equivalence.sbatch` compared old against new on the
+assembled model and reported differences of 1.4e-4 to 1.4e-3 — but the *unchanged* code compared
+against itself across two processes spreads by 2.9e-5 to 1.0e-4, with the two versions'
+values interleaving and occasional outliers (job 26844357). Two processes recompile, XLA picks
+kernels by timing them, and scatter-adds on an unstructured mesh are not deterministic. So a
+between-process difference below ~1e-4 on `dL/dm` here means nothing, and `--repeat`, which
+measures two passes through ONE compiled executable, is not the yardstick for it.
+
 ### `fesom_jax.adjoint_stab.AdjointConfig` — per-term, in the model
 
 One flag per term, passed to `step`/`integrate` as `adjoint_cfg`. All default off, and an

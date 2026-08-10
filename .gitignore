@@ -75,3 +75,6 @@ scripts/logs/
 /docs/plans/20260618-fesom-jax-longwindow-experiments.md
 /docs/plans/20260619-fesom-jax-model-paper.md
 /docs/plans/20260623-fesom-jax-model-paper-build.md
+
+# temporary pre-extraction copy written by the adjoint equivalence gates
+scripts/nn_eddy/adjoint_horizon_ref.py

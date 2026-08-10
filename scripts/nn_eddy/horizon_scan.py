@@ -54,7 +54,6 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
-import math
 import os
 import pickle
 import re
@@ -84,7 +83,7 @@ from fesom_jax.ale import AleConfig
 from fesom_jax.calibrate import build_params
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
-from fesom_jax.integrate import _run_steps
+from fesom_jax.adjoint import scan_steps
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
 from fesom_jax.phc_ic import phc_initial_state
@@ -222,19 +221,16 @@ def main():
         return build_params({"k_gm": kgm0 * m, "redi_kmax": kgm0 * m})
 
     def step_body_for(p):
-        def body(carry, sf):
-            nxt = step(carry, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
-                       forcing_static=fs, ice_cfg=ICE_FROZEN, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
-                       ale_cfg=ALE_CFG, remat_blocks=REMAT_BLOCKS)
-            return nxt, None
-        return body
+        def one_step(s, sf):
+            return step(s, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
+                        forcing_static=fs, ice_cfg=ICE_FROZEN, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
+                        ale_cfg=ALE_CFG, remat_blocks=REMAT_BLOCKS)
+        return one_step
 
     # jitted ONE-DAY forward (compiled once, host-looped for the truth marks)
     @jax.jit
     def one_day(state0, sfs_day, m):
-        segs = max(2, int(round(math.sqrt(STEPS_PER_DAY))))
-        return _run_steps(step_body_for(params_for(m)), state0, xs=sfs_day,
-                          checkpoint=True, segments=segs)
+        return scan_steps(step_body_for(params_for(m)), state0, sfs_day, rematerialize=True)
 
     print(f"[setup] built in {time.time()-t0:.1f}s; seed={args.season} ({Path(args.snap).name}) "
           f"date={yr}-{mo:02d}-{dy:02d}  N={ndays} d ({n} steps)  marks={args.marks}  "
@@ -291,30 +287,35 @@ def main():
     del truth_marks
     sfs_win = stack_steps(0, n)
 
-    # checkpoint segments: √N is the standard O(√N)-memory choice; SEG_MULT>1 stores
-    # fewer carries (more recompute) when the backward is tight on an 80 GB card.
+    # ⚠️ HORIZON_SEG_MULT used to scale the checkpoint segment count away from √N. It is now
+    # REFUSED rather than ignored: `scan_steps` derives √N and takes no such parameter, because
+    # S + N/S is minimised at S=√N and both directions cost more memory (S=31 died at 69.24 GiB,
+    # job 26798871). Nothing in this repository ever set it. An env var silently dropped is worse
+    # than one removed — a run would come back with numbers from a configuration nobody chose.
     seg_mult = float(os.environ.get("HORIZON_SEG_MULT", "1"))
-
-    def segments_for(length):
-        return max(2, int(round(seg_mult * math.sqrt(length))))
+    if seg_mult != 1.0:
+        raise SystemExit(
+            f"HORIZON_SEG_MULT={seg_mult} is no longer honoured. The segment count is √N, "
+            f"derived by fesom_jax.adjoint.scan_steps, and S+N/S is already minimised there. "
+            f"Unset it, or use --chunk-steps / adjoint_horizon.py --boundary-stride, which are "
+            f"the knobs that actually change the memory profile.")
 
     def loss(m):
         if args.marks == "end":
             # ONE rolled scan over all n steps -> final-state misfit: the sharpest
             # N-day-lag probe, and the smallest compile
-            s_fin = _run_steps(step_body_for(params_for(m)), st0, xs=sfs_win,
-                               checkpoint=True, segments=segments_for(n))
+            s_fin = scan_steps(step_body_for(params_for(m)), st0, sfs_win,
+                               rematerialize=True)
             T_hat, S_hat, e_hat = tgt[ndays - 1]
             return stage1_misfit(s_fin.T, s_fin.S, s_fin.eta_n, T_hat, S_hat, e_hat,
                                  w_T, w_S, w_eta, wet3d, area3d)
         # daily marks: in-graph day loop (unrolls ndays chunks — heavier compile)
         body = step_body_for(params_for(m))
-        segs = segments_for(STEPS_PER_DAY)
         L = jnp.asarray(0.0, jnp.float64)
         s_cur = st0
         for d in range(ndays):
             day_xs = jax.tree.map(lambda x: x[d * STEPS_PER_DAY:(d + 1) * STEPS_PER_DAY], sfs_win)
-            s_cur = _run_steps(body, s_cur, xs=day_xs, checkpoint=True, segments=segs)
+            s_cur = scan_steps(body, s_cur, day_xs, rematerialize=True)
             T_hat, S_hat, e_hat = tgt[d]
             L = L + stage1_misfit(s_cur.T, s_cur.S, s_cur.eta_n, T_hat, S_hat, e_hat,
                                   w_T, w_S, w_eta, wet3d, area3d)
