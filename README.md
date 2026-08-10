@@ -11,11 +11,15 @@ fluxes, and prognostic EVP sea ice — forced by real JRA55 atmosphere + PHC ini
 in **float64**, and it is differentiable end to end (including the CG solve and the 120-subcycle
 sea-ice EVP scan).
 
-> **Status:** multi-GPU + multi-node validated (`v1.2-multinode-scaling`). Forward is N-vs-1
-> correct vs single-device; gradients validated (1-step tight, multi-step mechanism). Runs
-> CORE2 / farc / dars / NG5 (up to 7.4 M nodes, 64 GPU) within ~4–16 % of hand-tuned
-> Kokkos-CUDA where compute-bound. See **[Performance](#performance)** and
+> **Status:** released as **`v1.0.0`** — the version archived for the model-description paper.
+> Forward is N-vs-1 correct vs single-device; gradients validated (1-step tight, multi-step
+> mechanism). Runs CORE2 / farc / dars / NG5 (up to 7.4 M nodes, 64 GPU) within ~4–16 % of
+> hand-tuned Kokkos-CUDA where compute-bound. See **[Performance](#performance)** and
 > **[Limitations](#limitations--what-it-can-and-cant-do)**.
+>
+> The earlier `v1.0-single-gpu` / `v1.1-multi-gpu` / `v1.2-multinode-scaling` tags are
+> **development milestones, not releases**; `v1.0.0` supersedes all three despite the lower
+> number.
 
 ---
 
@@ -27,9 +31,9 @@ sea-ice EVP scan).
   real-obs parameter calibration, and a learned (NN) TKE closure — see
   [Differentiable capabilities](#differentiable-capabilities).
 - **Scales**: `shard_map` over a 1-D device mesh, **halo-only point-to-point exchange**
-  (`ragged_all_to_all` on GPU; a slot-padded dense `all_to_all` on any backend — with correct
-  gradients), `jax.distributed` across nodes. Per-step communication is GPU↔GPU
-  halo + reductions only; the host↔GPU transfer is one-time.
+  (`ragged_all_to_all` on GPU; a slot-padded dense `all_to_all` or K coloured `ppermute` rounds on
+  any backend — both with correct gradients), `jax.distributed` across nodes. Per-step
+  communication is GPU↔GPU halo + reductions only; the host↔GPU transfer is one-time.
 - **Competitive**: within a few-to-~16 % of Kokkos-CUDA in SYPD across the mesh ladder
   (see `docs/figures/jax_vs_kokkos_sypd.png`).
 - **Gather-free output**: each GPU writes its own shard to Zarr in parallel — no rank-0 gather.
@@ -300,19 +304,19 @@ python scripts/bench/bench_forward_scaling.py \
 
 ### Which parallelisation option to use when
 
-Three halo transports (`all_gather` default / `use_ragged` / `use_padded`) × three launch
-topologies. The decision, by what you want to do — details, measurements, and launch recipes
-in **[docs/PARALLELISM.md](docs/PARALLELISM.md)**:
+Four halo transports (`all_gather` default / `use_ragged` / `use_padded` / `use_coloured`) ×
+three launch topologies. The decision, by what you want to do — details, measurements, and launch
+recipes in **[docs/PARALLELISM.md](docs/PARALLELISM.md)**:
 
 | you want | use | why |
 |---|---|---|
 | **Forward only, low-res (pi, CORE2), 1 GPU** | single device, no sharding | the default; nothing to configure |
 | **Forward only, CORE2-class, several GPUs** | **`use_padded`** | fastest measured: beats ragged AND all_gather at 4 and 8 GPUs, flat across the node boundary (PARALLELISM.md three-transport table) |
-| **Forward only, high-res (dars, NG5), multi-GPU / multi-node** | `use_padded` up to 16 GPUs; `use_ragged` + `JDIST=1` at ≥32 | padded ties ragged at dars-16 (+2.4 %); at dars-32 ragged is 9 % ahead (measured — the pad factor grows with P), so ragged stays the forward default at ≥32 GPUs. Ragged is GPU-only, **forward-only** |
+| **Forward only, high-res (dars, NG5), multi-GPU / multi-node** | `use_padded` ≤16 GPUs; **`use_coloured`** at the largest scale | padded ties ragged at dars-16 (+2.4 %) and wins below it. At **NG5-64 coloured is fastest** (543 ms vs ragged 592, padded 742): its volume is the true halo at *any* P, costing K = Δ ≈ 3–14 `ppermute` rounds, while padded's and ragged's traffic grows with the device count. Ragged is GPU-only, **forward-only** |
 | **Forward + adjoint, single GPU** | dense single-device (no sharding) | the standard gradient path; nothing sharded to worry about |
-| **Forward + adjoint, sharded (several GPUs / big mesh)** | **`use_padded`** | the only point-to-point transport with a **correct gradient** (ragged's is broken; all_gather's is correct but ~50–140× the traffic and OOMs at scale) |
+| **Forward + adjoint, sharded (several GPUs / big mesh)** | **`use_padded`**, or **`use_coloured`** at the largest scale | both have a **correct gradient** (ragged's is broken; all_gather's is correct but ~50–140× the traffic and OOMs at scale). Coloured makes the AD-correct choice also the *fastest* one at NG5-64 — at scale you no longer trade speed for a usable adjoint |
 | **Any sharded run on CPU** (no GPU, laptop, CI, gates) | **`use_padded`**, ≤16 in-process devices — or the multi-process gloo launch (`JDIST_CPU=1`, best: 8 procs × 16 cores/node) | ragged doesn't exist on XLA:CPU, and all_gather **crashes** at ≥32 in-process CPU devices; padded runs everywhere |
-| **CPU across nodes** | ❌ don't (jaxlib 0.10.1) | every variant crashes, hangs, or runs 6× slower than one node — see PARALLELISM.md |
+| **CPU across nodes** | **`use_coloured`** (superseded the old "don't") | the 2026-07-13 "CPU is single-node" verdict was about the *transport*, not the backend: padded's dense all-to-all is ruinous on TCP. Coloured is 2.9× faster than padded at CORE2 2 nodes and 11.8× at 16 ranks/node, and **dars scales 8→16 nodes at ~95 % efficiency**. Caveats: absolute throughput is low (dars 16 nodes = 0.057 SYPD), a gloo collective-permute defect kills certain (mesh, npes) pairs, and NG5-on-CPU is unreachable on Levante (per-rank host memory) |
 | **CPU production throughput** | ❌ wrong tool | best JAX-CPU ≈ 3.3 SYPD/node at CORE2 vs Fortran's ~22 — use GPUs (JAX ≈ Kokkos there) or Fortran |
 
 ---
@@ -391,9 +395,11 @@ $PY scripts/paper/fig_avgadj.py --maps scripts/lw_avgadj_mld_ck_adjoint_map.npz 
 **The `pi` mesh needs no data** — it ships in the package. Everything below is only for the realistic
 CORE2-and-larger setups.
 
-Everything needed to run **CORE2 for one year** is published on Zenodo
-([doi:10.5281/zenodo.21324319](https://doi.org/10.5281/zenodo.21324319)) as two archives — the mesh +
-initial state (~370 MB) and one year of JRA55-do forcing (~10.4 GB):
+Everything needed to run **CORE2 for one year** is published on Zenodo under the **concept DOI**
+([doi:10.5281/zenodo.21324318](https://doi.org/10.5281/zenodo.21324318)), which always resolves to
+the newest version — as two archives, the mesh + initial state (~370 MB) and one year of JRA55-do
+forcing (~10.4 GB). **Cite the concept DOI, not a version id:** the v1.0 record (21324319) predates
+the `dist_<NP>` partitions, so pinning it silently costs you every multi-device run.
 
 ```bash
 python scripts/fetch_data.py --dest ~/fesom-data          # ~11 GB; --mesh-only for just the 370 MB
@@ -490,6 +496,15 @@ Pattern: **compute-bound → JAX competitive-to-faster; comms-bound → Kokkos's
 (the gap widens as the per-GPU shard shrinks). The ragged halo is *necessary* multi-node — at
 dars-8 / NG5 the `all_gather` halo OOMs while ragged fits.
 
+**Lever: `CGPOLY`, a degree-k Chebyshev preconditioner for the SSH solve** (`ssh: {cheb_degree: k}`
+in the run YAML; absent or `0` ⇒ the byte-identical MITgcm default). The SSH conjugate gradient pays
+two all-reduces per iteration, so cutting iterations cuts collectives: degree 1 gives **−21 % at
+CORE2 8 GPU**, and on CPU — where JAX's all-reduce is O(P) while its neighbour exchange is O(1) —
+degree 6 gives **−29 % at CORE2 32 ranks** and erases the multi-node degradation entirely (4 nodes
+1293 → 716 ms). **The optimum degree is backend-specific** (1 on GPU, ≥6 on CPU) because the two have
+opposite collective economics; never inherit the tuning across backends. It is opt-in: the default
+path is unchanged.
+
 ⚠️ **These numbers have a hardware precondition: the GPU interconnect.** The halo exchange runs
 every timestep, so inter-GPU bandwidth is on the critical path, and the table was measured on
 NVLink (hundreds of GB/s between devices). On **PCIe**-attached A100s the same code measures
@@ -533,7 +548,8 @@ the next table):
 | Multi-GPU / multi-node, **ragged** halo | ✅ **GPU only** | the leanest way the GPUs swap their shared edges only exists on GPUs, not CPUs (#4) |
 | Multi-GPU, **all_gather** halo | ✅ CPU **and** GPU | works anywhere, but every device has to hold a copy of all the others' edge data, so the biggest meshes run out of memory — and on CPU it crashes past 32 in-process devices (#1) |
 | Multi-device, **padded** halo (`use_padded`) | ✅ CPU **and** GPU | the middle option: point-to-point like ragged (a few × its traffic), runs on every backend, and — unlike ragged — its gradient is correct. The CPU choice, and the sharded-gradient choice ([docs/PARALLELISM.md](docs/PARALLELISM.md)) |
-| Multi-**node** on **CPU** | ❌ (jaxlib 0.10.1) | every tested variant crashes, hangs, or runs slower than one node; CPU runs are single-node for now |
+| Multi-device, **coloured** halo (`use_coloured`) | ✅ CPU **and** GPU | K bipartite-coloured `ppermute` rounds: it sends only the true halo no matter how many devices you use, so it is the one transport whose traffic does *not* grow with device count. Correct gradient, and the **fastest** option at the largest scale (NG5-64) |
+| Multi-**node** on **CPU** | ✅ with `use_coloured` | it was declared dead in July, but that verdict was about the padded transport, not the CPU backend: dars now scales 8→16 nodes at ~95 % efficiency. Still slow in absolute terms (0.057 SYPD), and a gloo defect kills some (mesh, npes) pairs (#11) |
 | Big mesh on too few nodes | ❌ out of memory | the model needs more memory per node than the original C/Fortran, so the largest meshes only fit if spread over enough nodes: dars needs **≥ 2 nodes**, NG5 **≥ 8** (#3) |
 | Long **bit-for-bit repeatable** run | ❌ | the ocean is chaotic and tiny rounding differences (from adding numbers in a different order across GPUs) grow over time, so two runs never end up identical — exactly like the original models (#5, #7) |
 
@@ -553,7 +569,9 @@ above; these are the constraints on the *gradient* modes):
   float64; N-vs-1 correct vs single-device (field-appropriate; see below).
 - **End-to-end gradients** w.r.t. physics params, initial state, and forcing — through the CG
   solve and the EVP scan. 1-step gradient validated tight; multi-step mechanism validated.
-- **Multi-GPU + multi-node** (CORE2→NG5, up to 64 GPU), halo-only ragged comms, sharded Zarr output.
+- **Multi-GPU + multi-node** (CORE2→NG5, up to 64 GPU), halo-only comms in four transports
+  (all_gather / ragged / padded / coloured), sharded Zarr output. Multi-node **CPU** also works via
+  the coloured transport, within the limits in (#11).
 
 ### Can't (yet) / caveats
 1. **Ragged-halo gradients are broken** — JAX's `lax.ragged_all_to_all` has an incorrect
@@ -601,6 +619,15 @@ above; these are the constraints on the *gradient* modes):
     **EKI** ensemble (immune to the chaos/memory ceiling and the ice-adjoint instability); adjoint and
     EKI agree on the shared scalar and are each used where correct.
 
+11. **Multi-node CPU works, but two things still bite.** (a) A **gloo collective-permute defect**
+    kills certain `(mesh, npes)` pairs outright — CORE2 `dist_8`, CORE2 `dist_128`, farc `dist_32` —
+    while neighbouring rungs pass; the root cause is open and the obvious "gloo can't do partial
+    rounds" explanation is refuted (passing configs are *more* partial than failing ones). Reproducer:
+    CORE2 `dist_8` + `--halo coloured` on CPU. (b) **Per-rank host setup, not the shard, caps mesh
+    size on CPU:** every rank materialises the global state and the `[P, Lmax, …]` gather before
+    taking its shard, so dars needs ≤ 2 ranks/node and **NG5 is unreachable on Levante at any rank
+    count** until a shard-on-load path exists.
+
 ---
 
 ## Documentation map
@@ -612,7 +639,10 @@ above; these are the constraints on the *gradient* modes):
 | [`examples/03_how_the_model_works.ipynb`](examples/03_how_the_model_works.ipynb) | how the model is put together: `step` vs `integrate`, and how to run without sea ice / eddies / … |
 | [`docs/DATA.md`](docs/DATA.md) | the input datasets: what they are, how to get them, how to point at them |
 | [`docs/NEW_MESH.md`](docs/NEW_MESH.md) | **running on your own FESOM2 mesh** — the two one-off preparation steps |
-| [`docs/PARTITIONS.md`](docs/PARTITIONS.md) | **running on more than one device** — `dist_N`, halos, and why the sharded gradient is wrong |
+| [`docs/PARTITIONS.md`](docs/PARTITIONS.md) | **running on more than one device** — `dist_N` and halos |
+| [`docs/PARALLELISM.md`](docs/PARALLELISM.md) | **choosing a halo transport + launch topology** — the four-transport measurements and launch recipes |
+| [`docs/CPU_SCALING_FINDINGS.md`](docs/CPU_SCALING_FINDINGS.md) | the CPU strong-scaling campaign: multi-node CPU, the memory wall, the gloo defect |
+| [`docs/LIMITER_GRADIENTS.md`](docs/LIMITER_GRADIENTS.md) | what the FCT limiter does to gradients (subgradients, and when to `stop_gradient`) |
 | [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md) | driving runs from a single YAML: restarts, chaining, multi-GPU |
 | [`docs/ENV.md`](docs/ENV.md) | exact environment + GPU verification |
 | [`docs/JAX_RAGGED_A2A_BUG.md`](docs/JAX_RAGGED_A2A_BUG.md) | the ragged AD bug: record, repro, workaround |
@@ -657,4 +687,5 @@ underlying model and the datasets you ran it on:
   [doi:10.1016/j.ocemod.2018.07.002](https://doi.org/10.1016/j.ocemod.2018.07.002)
 - **The CORE2 one-year data package** (if you use it) — Koldunov, N.: *fesom-jax CORE2 one-year
   setup: mesh, initial state, and JRA55-do forcing (1958)*, Zenodo, 2026.
-  [doi:10.5281/zenodo.21324319](https://doi.org/10.5281/zenodo.21324319)
+  [doi:10.5281/zenodo.21324318](https://doi.org/10.5281/zenodo.21324318) (concept DOI — always the
+  newest version)

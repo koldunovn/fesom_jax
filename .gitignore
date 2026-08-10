@@ -67,6 +67,11 @@ scripts/logs/
 # Session handoffs, unpublished paper plans/memos and draft figures. These were pushed once by a
 # careless `git add docs/` (a directory add sweeps in UNTRACKED files too) and had to be purged.
 # Never blanket-add a directory; stage files explicitly.
+#
+# ⚠️ This is an exact-path denylist, so it CANNOT protect a paper plan that does not exist yet.
+# It has already failed once that way: the paper-3 plan below was written, committed on a branch
+# by a parallel session, and merged to main — reaching one `git push` of being public. When you
+# start a new paper plan, add it here in the same commit that creates it.
 /docs/memo/
 /docs/previews-*/
 /docs/CORE2_FORTRAN_SPEC.md
@@ -75,5 +80,7 @@ scripts/logs/
 /docs/plans/20260618-fesom-jax-longwindow-experiments.md
 /docs/plans/20260619-fesom-jax-model-paper.md
 /docs/plans/20260623-fesom-jax-model-paper-build.md
-
-# temporary pre-extraction copy written by the adjoint equivalence gates
+/docs/plans/20260806-fesom-jax-nn-eddy-param.md
+/docs/plans/20260808-nn-eddy-training-machinery.md
+/docs/plans/20260810-split-nn-eddy-and-promote-adjoint.md
+/docs/plans/20260810-inventory.md
