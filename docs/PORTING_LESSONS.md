@@ -6857,3 +6857,48 @@ takes ten minutes and is the difference between a split and a guess. And when a 
 decision, parse rather than grep: the first pass here reported `from fesom_jax import gm as _gm`
 as a private import three times, because a regular expression cannot see that an alias is not a
 name.
+
+### 2026-08-10 (34) — the fix that made the test cache its inputs also made the test share them
+
+A test file failed inside its group and passed standalone: XLA's `INTERNAL: Failed to materialize
+symbols`, the CPU JIT out of dylib space. Part of the diagnosis was right — the file's `_harness`
+helper built a fresh `chunk_fn` per call, so the library cache keyed on that object never hit and
+every call left a compiled executable resident. The fix memoised the helper.
+
+The helper returned five things and only one of them wanted memoising. It also handed out
+`xs_all`, and one test in the file deliberately passes an aliasing full-width slice of `xs_all` to
+a function documented to FREE what it is given — twice, expecting an intact array the second time,
+because the second call is the escape hatch. Memoising the tuple shared the freed array between
+the two calls, and the test died with `Array has been deleted` raised from inside its own slicing
+expression: exactly the error the test exists to stop a user having to interpret, arriving from
+the test's own bookkeeping instead of from the contract under test.
+
+**Memoise the object whose identity is load-bearing, not the tuple it arrives in.** A cache
+introduced for one member's identity silently gives every other member identity too, and shared
+identity is precisely what a test about resource ownership must not have. The tell was available
+before the run: the helper's own docstring said "fresh `xs_all` each time, because the violating
+call frees it", and the change that broke it did not read that sentence.
+
+And the surrounding trap, which cost the whole round trip: **the re-check job reported `COMPLETED`
+with exit code `0:0` while its log ended `2 failed, 209 passed ... rc=1`.** The script computed the
+return code and did not exit with it. A green scheduler state is a statement about the wrapper, not
+about the tests — the same shape as (a green verdict is not evidence the path ran), one level out.
+Read the log, not the state.
+
+### 2026-08-10 (35) — the in-job product check has now lost the product twice, both times to a literal
+
+`coarsen_stream.sbatch` runs a checker on what the job wrote, so that a contaminated product is a
+failed job rather than a file somebody trains on. It has been defeated twice, identically. First
+the DIRECTORY was written out in the runner; the data root moved and the checker kept looking at
+the old path. Then the NAME was written out; `--source accum` appended an `_accum` suffix in the
+Python and the runner went on building `coarse_ng5_${MONTH}.nc`. Both times the checker found
+nothing, printed "expected product not found; nothing checked", and **exited 0** — so every
+accumulated month ever produced ran with its only safety check switched off, and the runs looked
+exactly like passing runs.
+
+The first was fixed by asking `nn_data` for the directory. The second was fixed the same way, a
+`product_name()` the writer and the runner both call, plus a test asserting the runner contains no
+`coarse_ng5_` literal outside comments. **A "not found" branch that exits 0 converts a broken check
+into a passing run**; if a check cannot find what it is meant to check, that is a failure, not a
+skip. The reason this one survived a fix is that the earlier fix repaired the instance and left
+the shape — half the name was derived and half was spelled out, so the next suffix reopened it.

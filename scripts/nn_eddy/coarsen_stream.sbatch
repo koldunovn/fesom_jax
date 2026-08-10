@@ -72,7 +72,14 @@ import coarsen_stream; print(coarsen_stream.product_name('$MONTH', '$SOURCE'))")
             crc=$?
             [ "$crc" -ne 0 ] && { echo "PRODUCT CHECK FAILED — do not train on this file"; rc=$crc; }
         else
-            echo "WARNING: expected product $PROD not found; nothing checked"
+            # ⚠️ FAIL, do not warn. Both times this check lost the product it printed exactly this
+            # line and exited 0, which is how a broken check spends months looking like a passing
+            # run. A checker that cannot find what it is meant to check has failed; it has not
+            # skipped. The run above already returned 0, so if the product is missing the
+            # disagreement is real and somebody has to look at it.
+            echo "FATAL: the run reported success but $PROD does not exist — the product check"
+            echo "could not run. Do not treat any file from this job as checked."
+            rc=4
         fi
     fi
     ;;
