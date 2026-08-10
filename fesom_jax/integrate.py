@@ -52,7 +52,25 @@ def _run_steps(body, init, *, xs=None, length=None, checkpoint=True, segments=0)
     per-step body: the backward then stores only **S + M ≈ 2√N** carries (recomputing each
     segment on the fly) instead of N — the standard √N-memory adjoint. Forward value is identical
     (checkpoint is forward-transparent); only the backward's storage/recompute changes. The
-    remainder (``length mod S``) runs as a per-step-checkpointed tail."""
+    remainder (``length mod S``) runs as a per-step-checkpointed tail.
+
+    ⚠️ **This alone does NOT make a multi-day reverse pass fit one GPU, and no ``segments``
+    value makes it fit.** The scheme stores ``S + length/S`` carries, minimised at ``S=√N``,
+    and a CORE2 ``State`` is **1.93 GB**: a 5-day window (N=240) costs ≥ 2√240 × 1.93 ≈ 60 GB
+    of carries plus ~18 GB of per-step reverse working set ≈ 78 GB, against ~78 GB usable on
+    an 80 GB A100. Reaching for a larger ``segments`` makes it WORSE (more outer carries), and
+    a smaller one makes it worse too (more inner carries) — √N is already the floor. Measured:
+    S=31 died at 69.24 GiB (job 26798871).
+
+    **The pattern that does fit is chunked reverse accumulation**, not a bigger ``segments``:
+    run the window forward in K-step chunks (K=48=1 day) with ``_run_steps`` INSIDE each
+    chunk, park the chunk-boundary ``State``s on the HOST, then walk chunks in reverse calling
+    a jitted ``jax.vjp`` over one chunk at a time, carrying the cotangent and summing the
+    parameter cotangent. Device peak is then one chunk regardless of window length — measured
+    43.1 GB at 1 day and 56.9 GB at **30 days**. Exact, not an approximation. Reference
+    implementation: ``adjoint_horizon.py`` in the nn_eddy research repository
+    (``fwd_chunk``/``bwd_chunk`` and the reverse loop); rationale in
+    ``docs/ADJOINT_HORIZON.md``."""
     if length is None:
         length = int(jax.tree.leaves(xs)[0].shape[0])
     step_fn = jax.checkpoint(body) if checkpoint else body

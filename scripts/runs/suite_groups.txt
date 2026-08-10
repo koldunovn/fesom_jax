@@ -1,0 +1,138 @@
+# Which suite group each test file belongs to.  <group> <path-from-repo-root>
+#
+# Grouped by COST, not by subsystem. The old grouping was "ice", "sharding", and "everything
+# else" — and "everything else" is not a category, it is a default. It grew to 920 tests and
+# 3:28 of wall time without anyone deciding that, because nothing reported per-test cost and a
+# new file joined it by doing nothing. Cost is what the scheduler actually cares about.
+#
+#   ci        — the subset of `unit` that a 2-core GitHub runner can carry: measured at 30 s
+#               or less per file on exactly that shape (2 cores, 16 GB, job 26833514). 35 files,
+#               320 s total. This is what .github/workflows/ci.yml runs, selected FROM THIS FILE
+#               so the workflow cannot drift from it — the previous hand-maintained --ignore list
+#               named 3 of the 7 sharded files and put 4 of them on the runner.
+#   unit      — pi mesh, closures, algebra, pytrees, but too slow for a 2-core runner.
+#               ⚠️ test_adjoint_config.py alone is 1341 s of the group's 2378 s. A file can be
+#               data-free and still not be cheap; the two properties are separate and this
+#               grouping keeps them separate.
+#   core2     — anything that assembles a CORE2 step or loads the CORE2 mesh/IC/forcing.
+#               This is where the wall time is: a handful of tests, minutes each.
+#   ice       — the assembled sea-ice step. Kept separate for MEMORY, not for time: the jit
+#               cache of the whole suite plus the ice step exceeds a generous RAM budget in one
+#               process.
+#   sharding  — needs XLA_FLAGS=--xla_force_host_platform_device_count=4, and 300 GB: it OOM'd
+#               at 209 GB against a 200 GB request on 2026-08-07, which read as a sharding
+#               failure and was a scheduling one.
+#   scripts   — the tests that live next to their scripts under scripts/tests/. They are cheap;
+#               they are their own group because they need the repo ROOT on sys.path, not the
+#               package dir. ⚠️ These had NEVER run in the suite: every runner globbed
+#               fesom_jax/tests/ only, so they ran only when somebody invoked pytest by hand
+#               (found 2026-08-08).
+#               ⚠️ The group SHRANK from 20 files to 3 on 2026-08-10, when the NN-GM research
+#               project moved to its own repository and took 17 of its test files with it. The
+#               three survivors test LIBRARY-side scripts — scripts/archive/,
+#               scripts/paper/core2_lw_foundation_check.py and scripts/write_namelist.py — which
+#               is exactly why the group survives at all. The split plan's own text said "remove
+#               the scripts cost group"; reading the tree said otherwise. Do not delete it, and
+#               do not change the runner's --array range: the group COUNT is still 6.
+#
+# ⚠️ EVERY test_*.py under fesom_jax/tests/ AND scripts/tests/ must appear here exactly once.
+# fesom_jax/tests/test_suite_groups.py fails if one does not, so a new file cannot join the
+# largest group by accident. Put a new file in `core2` if it touches data/mesh_core2,
+# data/ic_core2* or build_surface_forcing; `unit` otherwise; `scripts` if it lives under
+# scripts/tests/.
+
+core2 fesom_jax/tests/test_adjoint_config_prod.py
+core2 fesom_jax/tests/test_adjoint_config_tke.py
+core2 fesom_jax/tests/test_ale_zstar.py
+core2 fesom_jax/tests/test_core2_step.py
+core2 fesom_jax/tests/test_forcing.py
+core2 fesom_jax/tests/test_gm_bolus.py
+core2 fesom_jax/tests/test_gm_bolus_adv.py
+core2 fesom_jax/tests/test_gm_coeffs.py
+core2 fesom_jax/tests/test_gm_nn_seam.py
+core2 fesom_jax/tests/test_gm_redi.py
+core2 fesom_jax/tests/test_gm_slopes.py
+core2 fesom_jax/tests/test_gm_step.py
+core2 fesom_jax/tests/test_gradient_core2.py
+core2 fesom_jax/tests/test_jra55.py
+core2 fesom_jax/tests/test_kpp_bldepth.py
+core2 fesom_jax/tests/test_kpp_blmix.py
+core2 fesom_jax/tests/test_kpp_enhance.py
+core2 fesom_jax/tests/test_kpp_ri_iwmix.py
+core2 fesom_jax/tests/test_kpp_step.py
+core2 fesom_jax/tests/test_mesh_core2.py
+core2 fesom_jax/tests/test_mevp.py
+core2 fesom_jax/tests/test_partition_state.py
+core2 fesom_jax/tests/test_paths.py
+core2 fesom_jax/tests/test_phc_ic.py
+core2 fesom_jax/tests/test_prepare_mesh.py
+core2 fesom_jax/tests/test_run_entry.py
+core2 fesom_jax/tests/test_shard_mesh.py
+core2 fesom_jax/tests/test_sss_runoff.py
+core2 fesom_jax/tests/test_step_core2.py
+core2 fesom_jax/tests/test_sw_alpha_beta.py
+core2 fesom_jax/tests/test_tke_replay.py
+core2 fesom_jax/tests/test_tke_step.py
+core2 fesom_jax/tests/test_ushow_output.py
+ice fesom_jax/tests/test_ice_adjoint_mode.py
+ice fesom_jax/tests/test_ice_adv.py
+ice fesom_jax/tests/test_ice_coupling.py
+ice fesom_jax/tests/test_ice_evp.py
+ice fesom_jax/tests/test_ice_ic.py
+ice fesom_jax/tests/test_ice_step.py
+ice fesom_jax/tests/test_ice_thermo.py
+scripts scripts/tests/test_lw_forward_seam.py
+scripts scripts/tests/test_lw_foundation_check.py
+scripts scripts/tests/test_write_namelist.py
+sharding fesom_jax/tests/test_forcing_sharded.py
+sharding fesom_jax/tests/test_gm_nn_sharded.py
+sharding fesom_jax/tests/test_gradient_sharded.py
+sharding fesom_jax/tests/test_halo.py
+sharding fesom_jax/tests/test_reductions_sharded.py
+sharding fesom_jax/tests/test_scatter_sharded.py
+sharding fesom_jax/tests/test_ssh_sharded.py
+sharding fesom_jax/tests/test_step_sharded.py
+unit fesom_jax/tests/test_adjoint_config.py
+ci fesom_jax/tests/test_adjoint_stab.py
+ci fesom_jax/tests/test_ale.py
+unit fesom_jax/tests/test_calib_twin.py
+ci fesom_jax/tests/test_calibrate.py
+ci fesom_jax/tests/test_canonical_redist.py
+ci fesom_jax/tests/test_coarsen.py
+ci fesom_jax/tests/test_coarsen_remap.py
+ci fesom_jax/tests/test_config.py
+ci fesom_jax/tests/test_diagnostics.py
+ci fesom_jax/tests/test_eki.py
+ci fesom_jax/tests/test_eos.py
+ci fesom_jax/tests/test_gm_eki.py
+ci fesom_jax/tests/test_gm_nn.py
+unit fesom_jax/tests/test_gradient.py
+ci fesom_jax/tests/test_identity_gates.py
+unit fesom_jax/tests/test_integrate.py
+ci fesom_jax/tests/test_kpp_wscale.py
+ci fesom_jax/tests/test_longwindow.py
+ci fesom_jax/tests/test_mesh.py
+unit fesom_jax/tests/test_momentum.py
+ci fesom_jax/tests/test_nn_twin.py
+ci fesom_jax/tests/test_obs_compare.py
+ci fesom_jax/tests/test_obs_ice.py
+ci fesom_jax/tests/test_ops.py
+ci fesom_jax/tests/test_partit.py
+ci fesom_jax/tests/test_pgf.py
+ci fesom_jax/tests/test_pi_demo.py
+ci fesom_jax/tests/test_pp.py
+ci fesom_jax/tests/test_reference_dump.py
+ci fesom_jax/tests/test_release.py
+ci fesom_jax/tests/test_restart.py
+ci fesom_jax/tests/test_run_config.py
+unit fesom_jax/tests/test_sensitivity.py
+ci fesom_jax/tests/test_ssh.py
+ci fesom_jax/tests/test_state.py
+unit fesom_jax/tests/test_step_pi.py
+ci fesom_jax/tests/test_stream_output.py
+ci fesom_jax/tests/test_suite_groups.py
+ci fesom_jax/tests/test_surface_bc.py
+ci fesom_jax/tests/test_tke_nn.py
+unit fesom_jax/tests/test_tracers.py
+ci fesom_jax/tests/test_verify.py
+unit fesom_jax/tests/test_adjoint_chunked.py

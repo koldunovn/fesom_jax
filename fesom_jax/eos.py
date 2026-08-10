@@ -96,11 +96,22 @@ def _insitu(bulk_0, bulk_pz, bulk_pz2, rhopot, z):
     return bulk * rhopot / (bulk + 0.1 * z * _STATE_EQ_INT)
 
 
-def _shift_down(x):
+def shift_down(x):
     """``x`` shifted one along the level axis with edge replication:
     ``out[..., k] = x[..., k-1]``, ``out[..., 0] = x[..., 0]`` (the replicated
-    surface keeps the unused ``k=0`` N² finite — and exactly 0 — for AD safety)."""
+    surface keeps the unused ``k=0`` N² finite — and exactly 0 — for AD safety).
+
+    PUBLIC because an analysis that computes ``∂X/∂z`` at interfaces and then compares it against
+    this module's ``bvfreq`` is only entitled to attribute the difference to the EOS
+    linearisation and the N² smoother if it used the SAME shift. A four-line copy in the caller
+    would make that claim unfalsifiable the first time either side changed — which is the whole
+    reason to export it rather than let it be duplicated."""
     return jnp.concatenate([x[..., :1], x[..., :-1]], axis=-1)
+
+
+# Kept so this module's own call sites (and any reader following an older traceback) still
+# resolve. Not deprecated in any hurry; it is the same object.
+_shift_down = shift_down
 
 
 def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None):

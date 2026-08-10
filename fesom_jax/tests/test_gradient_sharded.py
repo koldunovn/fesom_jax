@@ -132,6 +132,26 @@ def _mean_sst_dense(state, mesh):
     return jnp.sum(jnp.where(wet0, state.T[:, 0], 0.0)) / jnp.sum(wet0)
 
 
+# AREA-WEIGHTED variants. The two above divide by the NODE COUNT, which is fine for a
+# sharded-vs-dense identity (both sides compute the same number) but is not a mean SST:
+# CORE2 surface cell areas span a factor of **460** (5.0e7 to 2.3e10 m^2), so a node-count
+# mean silently reweights the ocean toward wherever the mesh is refined. It also conditions
+# WORSE for a gradient — small cells carry relatively more of the GPU's atomic-scatter noise
+# and get equal say. Kept separate rather than fixing the originals in place, because the
+# existing tests' tolerances were set against their exact values.
+def _wmean_sst_p(state_p, surf, sm):
+    """Area-weighted mean SST over OWNED wet-surface lanes of a [P, Lmax, nl] State."""
+    a = jnp.asarray(sm.fields["area"])[:, :, 0]
+    w = jnp.where(surf, a, 0.0)
+    return jnp.sum(w * state_p.T[:, :, 0]) / jnp.sum(w)
+
+
+def _wmean_sst_dense(state, mesh):
+    wet0 = jnp.asarray(mesh.node_layer_mask[:, 0])
+    w = jnp.where(wet0, jnp.asarray(mesh.area[:, 0]), 0.0)
+    return jnp.sum(w * state.T[:, 0]) / jnp.sum(w)
+
+
 def _reconstruct_global(g_p, part, n_global, nl):
     """``Bᵀ(g_p)``: scatter-add the sharded ``[P, Lmax, nl]`` cotangent over each global
     node's owner-interior + halo copies (the ``all_gather`` transpose) → dense
@@ -456,3 +476,93 @@ def test_grad_assembled_forced_backward(npes, core2_forced, capsys):
     kg_s, kg_d = float(g_sh.k_gm), float(g_de.k_gm)   # tiny FCT-floor gradient: same sign + abs floor
     assert np.sign(kg_s) == np.sign(kg_d) and abs(kg_s - kg_d) < 2e-9, \
         f"d/d(k_gm): sharded {kg_s:.3e} vs dense {kg_d:.3e} (climate flip floor)"
+
+
+# --------------------------------------------------------------------------
+# The FORCED sharded gradient (added 2026-08-08 with run_steps_sharded_forced's
+# return_grad_fn) — the path every NN-GM adjoint window actually needs
+# --------------------------------------------------------------------------
+@avail
+@pytest.mark.parametrize("npes", [2])
+def test_grad_forced_multistep_matches_dense(npes, capsys):
+    """``d(mean SST)/d(k_gm)`` over a MULTI-step window with genuine PER-STEP forcing,
+    sharded == dense.
+
+    This covers the gap that ``test_grad_ocean_param_matches_dense`` above leaves. That test
+    differentiates ONE step of the unforced ocean; the runner it exercises
+    (:func:`run_steps_sharded`) holds forcing CONSTANT across its scan. Every adjoint window in
+    the eddy-parameterization work is multi-step with a real seasonal cycle, so until
+    ``run_steps_sharded_forced`` grew a ``return_grad_fn`` there was no sharded gradient for the
+    configuration we run — the whole campaign was single-GPU by default rather than by choice.
+
+    Why the probe is a MEAN and not a sum of squares: three attempts at this comparison in
+    ``scripts/adjoint/sharded_grad_ab.py`` used bulk quadratic losses and every one was
+    noise-dominated — the dense reference alone moved by 17x, then by 105x WITH A SIGN FLIP,
+    between identical runs, because GM's effect on a domain-integrated square over a short
+    window is a minute difference of enormous numbers sitting under the GPU's atomic-scatter
+    nondeterminism. The owned-masked mean SST reused here is well-conditioned, which is why it
+    was chosen for the tests in the first place. Reuse the validated probe; do not invent one.
+
+    GM is ON here (unlike the test above, where ``d/d(k_gm)`` must be exactly 0) precisely
+    because ``k_gm`` is the parameter the NN-GM work differentiates.
+    """
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    from fesom_jax import surface_forcing
+    from fesom_jax.calibrate import build_params
+    from fesom_jax.integrate import _run_steps
+    from fesom_jax.phc_ic import phc_initial_state
+
+    n_steps = 3                       # enough to exercise the scan + its checkpoint, still fast
+    fx = _ocean_setup(npes)
+    mesh, op, state, part = fx["mesh"], fx["op"], fx["state"], fx["part"]
+    sm, state_p, sop, stress_p = fx["sm"], fx["state_p"], fx["sop"], fx["stress_p"]
+    surf = _surf_owned_mask(sm)
+    gm_cfg = GMConfig()
+
+    ic = ROOT / "data" / "ic_core2_dist864"
+    if not ic.is_dir():
+        pytest.skip("needs the CORE2 IC directory for the surface forcing SST seed")
+    sst0 = np.asarray(phc_initial_state(mesh, ic).T[:, 0])
+    cf = surface_forcing.build_surface_forcing(mesh, 1960, sst_ic=sst0)
+    seq = cf.stack(surface_forcing.dates_for_steps(1960, DT, n_steps,
+                                                   start_month=2, start_day=20))
+    seq_p = shard_mesh.partition_step_forcing(seq, part)
+    fs_p = shard_mesh.partition_forcing_static(cf.static, part)
+
+    run = ish.run_steps_sharded_forced(sm, state_p, sop, stress_p, seq_p, fs_p,
+                                       n_steps=n_steps, dt=DT, npes=npes, gm_cfg=gm_cfg,
+                                       use_ragged=False, use_padded=True,
+                                       return_grad_fn=True, bootstrap_ab2=True)
+
+    def loss_sh(kg):
+        # AREA-weighted: see _wmean_sst_p. Nodes are uniquely owned, so the area-weighted sum
+        # over owned lanes equals the dense one exactly — the identity the test rests on holds
+        # for the weighted mean just as it does for the unweighted one.
+        return _wmean_sst_p(run(build_params({"k_gm": kg, "redi_kmax": kg})), surf, sm)
+
+    def loss_de(kg):
+        p = build_params({"k_gm": kg, "redi_kmax": kg})
+
+        def body(carry, sf):
+            return stepmod.step(carry, mesh, op, None, p, dt=DT, is_first_step=False,
+                                step_forcing=sf, forcing_static=cf.static,
+                                gm_cfg=gm_cfg), None
+
+        return _wmean_sst_dense(_run_steps(body, state, xs=seq, checkpoint=True), mesh)
+
+    kg0 = jnp.asarray(float(Params.defaults().k_gm), jnp.float64)
+    a = float(jax.grad(loss_sh)(kg0))
+    b = float(jax.grad(loss_de)(kg0))
+
+    with capsys.disabled():
+        print(f"\n[grad-forced] npes={npes} n_steps={n_steps}  AREA-WEIGHTED mean SST\n"
+              f"   d/d(k_gm) sharded={a:+.8e}  dense={b:+.8e}  rel={_rel(a, b):.2e}")
+
+    assert np.isfinite(a) and a != 0.0, (
+        f"sharded forced gradient is {a} — a dead path would pass any agreement check, so "
+        f"this is asserted before the comparison")
+    assert _rel(a, b) < 5e-3, (
+        f"forced sharded d/d(k_gm) {a:.6e} vs dense {b:.6e}, rel {_rel(a, b):.2e}. Tol matches "
+        f"a_ver's above: k_gm routes through the FCT tracer advection, whose upwind-flip "
+        f"reassociation floor is the limit, not the sharding.")

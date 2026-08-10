@@ -692,7 +692,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              bootstrap_ab2: bool = True, state_is_folded: bool = False,
                              return_folded: bool = False, return_executable: bool = False,
                              reuse_executable: bool = False, sample_fn=None,
-                             forcing_tables=None, forcing_sched=None, forcing_const=None):
+                             forcing_tables=None, forcing_sched=None, forcing_const=None,
+                             return_grad_fn: bool = False):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     Like :func:`run_steps_sharded` but the surface forcing **changes every step** — the real
@@ -712,9 +713,15 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     hands back ``(jfn, const_args, npes)`` so the driver compiles ONCE and reuses the executable
     across chunks of equal length (a fresh forcing stack each call ⇒ same shapes ⇒ cache hit).
 
-    Forward-only (no ``return_grad_fn``): the model paper is forward at scale; the differentiable
-    path stays single-GPU dense (the sharded ragged-halo AD bug — lifted for ``use_padded``,
-    the Phase 8c AD-correct transport, in :func:`run_steps_sharded`).
+    **``return_grad_fn`` (added 2026-08-08, NN-GM).** Was forward-only. It is not any more,
+    because every adjoint window in the eddy-parameterization work runs REAL per-step JRA55-do
+    forcing, and the only differentiable sharded runner before this held forcing CONSTANT
+    across the scan (:func:`run_steps_sharded`) — adequate for scaling numbers, meaningless for
+    a window that has to see a seasonal cycle. With ``return_grad_fn=True`` ``params`` becomes a
+    replicated ``shard_map`` INPUT rather than a closure and the structural constants are
+    device-placed up front, so ``jax.grad`` never trips over the eager placement; the returned
+    ``run(params) -> State`` is differentiable. Refused with ``use_ragged=True`` (broken
+    transpose) and with ``sample_fn``. **The forward path is byte-unchanged when it is False.**
 
     **Folded I/O (multi-node, the A6 chunk/restart chaining).** ``state_is_folded`` ⇒ ``state_p`` is
     ALREADY a folded ``[P*Lmax]`` device-sharded State (a prior chunk's output / ``read_restart``);
@@ -824,6 +831,72 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             (st, acc), _ = lax.scan(jax.checkpoint(_accum), (st, acc),
                                     xs=rest, length=n_steps - 1)
         return st, acc
+
+    # ------------------------------------------------------------------ gradient path
+    # `return_grad_fn` mirrors run_steps_sharded's: `params` becomes a REPLICATED shard_map
+    # INPUT instead of a closure, and the structural constants are device-placed BEFORE the
+    # returned closure is called, so `jax.grad` tracing never reaches `_to_global_sharded`'s
+    # eager `np.asarray`. That placement, not the AD itself, is the whole reason the plain
+    # forward path cannot simply be wrapped in `jax.grad`.
+    #
+    # Why this exists: every adjoint window in the NN-GM work runs real per-step JRA55-do
+    # forcing, and until now the ONLY differentiable sharded runner held forcing constant
+    # across the scan — fine for scaling numbers, meaningless for a seasonal-cycle window.
+    # Single-GPU is the current wall: the CORE2 forward is 99.06 -> 43.97 ms/step from 1 to 4
+    # GPUs (2.25x, JUPITER_SCALING_FINDINGS), and the reverse pass costs ~4.7x the forward per
+    # step, so it dominates any long window.
+    #
+    # Forward is byte-unchanged when return_grad_fn=False: nothing below this block moved.
+    if return_grad_fn:
+        if use_ragged:
+            raise ValueError(
+                "return_grad_fn=True with use_ragged=True would differentiate through "
+                "lax.ragged_all_to_all, whose transpose is broken (docs/JAX_RAGGED_A2A_BUG.md). "
+                "Use use_ragged=False (all_gather), use_padded=True or use_coloured=True.")
+        if sample_fn is not None:
+            raise ValueError("return_grad_fn=True with sample_fn is not supported: the "
+                             "per-step accumulation changes out_specs and nothing needs the "
+                             "combination yet. Take the gradient of the final State.")
+
+        def bodyg(p, m, s, o, stress, h, seq, *ex):
+            ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max,
+                                 use_coloured, col_meta)
+            fs_ = ex[0]
+            bn_ = ex[1] if have_bn else None
+            if use_tables:
+                from .surface_forcing import combine_step_forcing
+                tab_ = ex[1 + have_bn]
+                con_ = ex[2 + have_bn]
+
+            def one(carry, is_first, sf_step):
+                if use_tables:
+                    sf_step = combine_step_forcing(tab_, sf_step.rdate, sf_step.fidx,
+                                                   sf_step.midx, con_)
+                return stepmod.step(carry, m, o, stress, p, dt=dt, is_first_step=is_first,
+                                    step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
+                                    gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
+                                    ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
+                                    halo_ctx=ctx, boundary_node=bn_)
+
+            sf0 = jax.tree.map(lambda x: x[0], seq)
+            st = one(s, bootstrap_ab2, sf0)
+            if n_steps > 1:
+                rest = jax.tree.map(lambda x: x[1:], seq)
+                st, _ = lax.scan(jax.checkpoint(lambda c, sf: (one(c, False, sf), None)),
+                                 st, xs=rest, length=n_steps - 1)
+            return st
+
+        gspecs = (_R, fm_spec, fs_spec, fop_spec, _P, ha_spec, seq_spec) + extras_spec
+        jfng = jax.jit(jax.shard_map(bodyg, mesh=jmesh, in_specs=gspecs, out_specs=fs_spec,
+                                     check_vma=False))
+        cargs = (fm, fs, fop, fstress, ha, seq_folded, *extras)
+        cspecs = (fm_spec, fs_spec, fop_spec, _P, ha_spec, seq_spec) + extras_spec
+        cargs = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(cargs, cspecs))
+
+        def run_g(p):
+            out = jfng(p, *cargs)
+            return out if return_folded else unfold_state(out, npes)
+        return run_g
 
     in_specs = (fm_spec, fs_spec, fop_spec, _P, ha_spec, seq_spec) + extras_spec
     # out_specs: the final State (fs_spec) alone; + the per-step accumulation sum (acc_spec) when

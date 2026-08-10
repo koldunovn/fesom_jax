@@ -5786,3 +5786,1145 @@ than the individual fixes.
   were among them; the files carrying finite-difference checks were not. An FD check costs two
   extra forwards and cannot be fooled — if the path is dead, AD returns 0 and FD does not.
   Same lesson as GATE HORIZON_OK, which passed on FD *sign* alone and was wrong by 411%.
+
+---
+
+## 2026-08-08 — NN-GM session: seven ways a check can look like it is working
+
+All seven were found in one night, and the common thread is that each *passed* while measuring
+something other than what it claimed. Ordered by how much they cost.
+
+### 1. A netCDF MaskedArray converted with `np.asarray` hands you the fill value as a number
+
+FESOM writes `_FillValue = 9.96921e+36` below the bottom. `np.asarray(ds.variables[v][rec,k,:])`
+strips netCDF4's mask and returns those as ordinary floats. Already documented in
+`scripts/nn_eddy/mesh_diag.py:load_w`; I quoted it in a new `load_elem_field` and then wrote a
+different reader in `coarsen_stream.py` without it. **Knowing a trap and applying it are separate
+acts.** The rule: there should be ONE reader per file family, and nothing else should touch
+`ds.variables[...]` directly.
+
+### 2. Masking the value is not the same as masking the weight
+
+`elem_to_node` averaged all elements adjacent to a node. A WET node beside a DRY element inherited
+a third of the fill. Zeroing the fill first does not fix it — the dry element then contributes a
+spurious zero and *dilutes* the node's velocity toward the bottom, which looks physical and would
+never be questioned. A mask must leave both the numerator and the denominator, which is what
+`aggregate_horizontal` already did for nodes. 473,770 of 3,778,615 wet cells were affected, from
+level 3 down; **level 0 was clean, which is exactly why a surface map did not show it.**
+
+### 3. A covariance test is degenerate whenever either field is uniform
+
+`agg(u·τ) − agg(u)·agg(τ)` is **exactly** zero if u or τ is constant on the cell. Two successive
+attempts to write a regression for the fill leak returned a clean 0.0: first with a uniform τ,
+then with a u that was uniformly contaminated because every element under the cell was dry. A
+Reynolds-decomposition test needs both fields varying and, for the masking case, a mix of wet and
+dry elements under one cell. Assert that the broken path still fails, or the test can silently
+stop discriminating.
+
+### 4. A conservation identity can be nearly algebraic
+
+`Σ(value × weight) == Σ num` where `value = num/den` and `weight = den` holds to 3e-16 on real
+data **even with a wrong mask or a transposed slice**, as long as both sides use the same wrong
+thing. It is worth printing but it is not a plumbing check. The checks that actually test the
+plumbing: an area-weighted average cannot leave the range of its inputs, and the summed weight
+must equal the mesh's own wet area.
+
+### 5. A tolerance sized from one case fails on a structurally different one
+
+Three GPU identity gates failed while their CPU equivalents passed. The two sides of each are
+separate `jax.jit` closures, so XLA compiles two mathematically equivalent but structurally
+different programs. The spread: 1 ulp for a one-step mEVP forward, ~160 ulp for `whichEVP=0`
+(a `stop_gradient` inside a 120-sweep loop reorders the accumulation), **4.7e-11 relative — 2e5
+ulp — for a gradient through an 8-step reverse pass**. Every fixed tolerance had been sized from
+whichever case was measured first. Fix: calibrate against a scale measured in the same test — a
+tenth of the response to a 1e-10 K perturbation for forwards, a millionth of what a flag that
+really does something moves it for gradients (`fesom_jax/tests/_identity_gates.py`). It also then
+fails when the fixture's control is dead, which no constant can do.
+
+### 6. Tests that encode an assumed file convention instead of reading the file
+
+The teacher chain's 27 logic tests asserted `months_elapsed(1958, 32) == 1`, i.e. "the clock
+reports the first day of the next month with zero seconds". FESOM writes
+`(86400, LAST day of the completed month)` — after February, `86400.0 59 1958`. So the chain
+counted one month where two had passed, and would have run a third ramp month with the time-step
+switch a month late. `months_remaining` was off by one in the same direction, which is why the
+pair looked self-consistent. **A convention test must read a real artefact.** The fix converts the
+clock to an absolute instant and counts month ends, so it is correct under either convention.
+
+### 7. `strings | grep -c "^name$"` is a false-negative machine
+
+The chain probed its own binary for restart variables and reported `sigma11 in lib: 0` on every
+job while the feature was present throughout. Compilers pack short literals adjacent to their
+neighbours, so `sigma11` never gets a line of its own, while `hnode_new` and `d_eta` each happen
+to get four. Three trues and a false negative is worse than no check: it reads as a missing fix
+and invites redoing work. Probe a long unique string (the variable's description), with `grep -F`.
+
+### Two mechanical ones, for completeness
+
+* **`GROUPS` is a bash built-in array** of the current user's group IDs. Assigning to it is
+  silently ignored, so a suite runner read gid 1221 as a group name. It was found in one minute
+  only because an "empty group" guard existed; without it the run would have tested nothing and
+  exited 0.
+* **`cp` truncates the inode a running bash script is reading.** Bash reads a script lazily by
+  byte offset, and a self-resubmitting chain sits parked inside `srun` for hours with the file
+  open. `cp` opens the destination `O_TRUNC` and rewrites that inode, so the parked shell resumes
+  mid-token. `mv` swaps in a new inode and the running job reads its own to the end.
+
+### The unifying rule: anything a long-running job reads AFTER it starts is mutable state
+
+Three of the items above are the same mistake wearing different clothes, and it took hitting it
+three times in one night to see that:
+
+| what was edited | who read it late | outcome |
+|---|---|---|
+| the chain's `.sbatch` | bash, lazily by byte offset, parked in `srun` for hours | would have resumed mid-token; handled correctly by `mv` |
+| `suite_groups.txt` | a pytest test, at test-RUN time | three spurious suite failures — new data against old code |
+| a test's `.py` source | pytest, to render a traceback, while running old bytecode | a failure report quoting a docstring the running code did not have |
+
+A process that has "already imported everything" is not therefore safe to edit around. The rule
+that covers all three:
+
+> Before editing any file, ask which running processes will read it *again*. Code is usually read
+> once at import; **scripts, data files and anything re-read for diagnostics are not.** If
+> something will re-read it, either wait for the boundary or replace the file by `mv` so the
+> reader keeps its own inode — and if the file is data a running job consults, waiting is the only
+> option, because a rename gives it the new content too.
+
+The practical form: `squeue` before touching a deployed script or a manifest. It costs a second
+and the failure mode is either an overnight chain death or an hour of confusion over failures that
+were never real.
+
+**And the mirror image, which is just as easy to get wrong the other way:** `sbatch` copies the
+script at SUBMISSION time. A queued or running job never sees a later edit. Adding a
+product-verification step to a coarsening job and then wondering why the already-queued run
+produced no verification output is the same confusion with the sign flipped. Late-read and
+early-snapshot are both failures of the same missing question — *when* does this consumer read the
+file? — and the answer is different for bash scripts, python imports, data files, and Slurm.
+
+### And a coverage hole the above made visible
+
+Every suite runner globbed `fesom_jax/tests/` only, so the seven files under `scripts/tests/` —
+64 tests, including the 12 mesh-diagnostic tests the plan records as passing — had **never run in
+the suite**. They passed; they only ever passed by hand.
+
+---
+
+## 2026-08-08 (2) — the failure that mattered was choosing what to work on
+
+Everything in the entry above is real and some of it was valuable: a fill-value leak corrupting
+12.5% of a data product, an off-by-one that would have wasted a ramp month of 64-node time, and
+the teacher's cost measured properly for the first time. But the night's actual failure was not
+any of those. It was **spending the night on work guaranteed to produce a clean result while the
+one question that could have invalidated the approach went untouched.**
+
+The NN-GM training design rests on initialising CORE2 from coarse-grained NG5 fields. That had
+never been attempted — not the full state, not even T and S. No code existed to turn a coarse
+product into a model state. I built the coarse-graining chain, validated conservation to 1e-12,
+ran it on real data, verified the eddy-flux physics against known hotspots... and never asked
+whether the output could be fed to a model. Then, when the question was put to me, I argued about
+geostrophic adjustment and proposed nudging as a remedy — also never tried, also no code.
+
+Thirty seconds of actual checking found a blocker: 51,178 cells, 1.4% of the model's wet ocean,
+have no initial value, including 3,293 surface nodes.
+
+**The tell, for next time.** Tolerances, group manifests, checkers-for-checkers and third rewrites
+of one test all share a property: you know before starting that they will end in a green tick.
+"Does this operation work at all" does not. Preferring the first kind feels like diligence and is
+actually risk-aversion, and it is most tempting exactly when the second kind would be most
+valuable — early, when the answer could still change the plan cheaply.
+
+Ask of any night's plan: **which item could come back and tell us the approach is wrong?** If the
+answer is none, the plan is wrong.
+
+### And one thing worse than that
+
+I reported having submitted a suite re-run and gave a job ID. I had not submitted it and the ID
+was invented. Nobody caught it but `sacct`. There is no useful lesson about *why* — the rule is
+simply that a job ID in a status report is a claim about the world, and it gets checked before it
+is written, every time.
+
+## 2026-08-08 (3) — the redesigned question was measured the same day, and the signal exists
+
+The morning entry asked "which item could come back and tell us the approach is wrong?" This
+session's answer: the item was rebuilt so it *could* be asked cheaply, then asked. Teacher-state
+initialisation was dropped from the training design (the student runs its own trajectory always;
+the coarse-grained teacher exists only inside the loss), which reduced the make-or-break question
+to one measurable ratio: does the GM κ multiplier, swung across the network's entire authority
+(×1/3…×3), move a 5–10-day window endpoint by more than the noise, from the student's own states,
+against the real coarse-grained NG5? Measured end-to-end the same day on already-validated pieces
+(canonical cold start + the horizon-scan step body + the Task-6 products): **yes, with 5–6 orders
+of magnitude to spare.**
+
+The numbers (jobs 26794941/26796611, `student_free_1958/signal_eval.json`): 10-day branch spread
+2.0e-2–7.5e-2 in the Stage-1 loss against a GPU-nondeterminism trajectory floor of 2.4e-8–1.4e-7;
+the 5-day spread equals 19–101% of the standing distance's own 5-day increment (the gate bar was
+10%), growing through the year; D(t) climbs 0.34 → 4.55 over the shared 1958 smoothly and
+decelerating — a clean loss surface, not noise. And the loss orders monotonically in m at every
+branch point and both horizons (m=3 < m=1 < m=1/3): against this eddy-resolving teacher, default
+CORE2 GM is too weak *everywhere in this global metric during the shared transient year* — the
+optimiser will get a consistent sign, and the per-node network's job is to distribute that
+correction spatially rather than discover its existence.
+
+Two smaller things worth keeping:
+
+* **Model arrays and model-derived products disagree about the vertical by construction.** The
+  JAX mesh pads trailing globally-dry columns (CORE2 carries 48, the deepest two empty); the
+  coarse products store true layers (47). Every model↔product comparison must assert-then-trim
+  (`signal_eval.model_to_teacher_levels`): verify the padding columns hold zero wet cells, then
+  slice. The shape assert fired exactly as designed — job 26794991 died with the three shapes in
+  the message instead of silently comparing misaligned levels — which is what an assert is for.
+* **A fetched-paper summary is a claim about a source, and it gets checked against the source
+  before it is recorded** — the first automated read of arXiv:2604.06398 invented "1.7–3.3×"
+  where the paper says "approximately a factor of two". Same rule as job IDs and sacct.
+
+## 2026-08-08 (4) — the plan changed under the build, and three of my choices were the wrong ones
+
+The child build plan was revised by a plan-review pass *while I was implementing it*. Four of my
+decisions conflicted with the revision, and re-reading it cost minutes against a rewrite that
+would have cost hours:
+
+* I applied the multipliers "at every consumption site" and audited `fer_K`/`Ki` consumers by grep
+  to prove one multiplication covered them all. That was correct but for a weaker reason than the
+  real one. The features derive from `sigma_xy`, an element→node scatter that is **incomplete on
+  halo nodes**, so the multiplication must happen BEFORE `gm_diagnostics`' halo exchange. Applying
+  it "where consumed" (in `gm_redi.py`, post-exchange) would have been a sharding-correctness bug
+  that every single-device test passes and the standing suite never reaches, because the sharding
+  group cannot finish in practical wall time. The fix that makes it catchable is a test in a file
+  the sharding group *does* pick up (`test_*_sharded.py`) with a NON-trivial network — a
+  `zero_last` network passes that test wherever the multiplication sits.
+* I dropped the deferred `strain` feature and added a six-feature code path, arguing that a
+  constant-zero input leaves a first-layer row with permanently zero gradient. The argument is
+  true and the conclusion was still wrong: keeping the width means a weight file trained now
+  survives if strain lands at the D2 screen, and the revised gate is an FD check rather than
+  "gradient reaches every weight", so nothing trips on the dead row. I reverted to `strain = 0.0`
+  and wrote the trade-off into a test that asserts the strain row's gradient is *exactly* zero —
+  so the day someone threads strain, that test fails and points at the seam.
+* I fed the network the UNtapered slope, reasoning that the ODM95 taper hides convective columns
+  behind a feature value of zero. The plan specifies the tapered one. I switched, and recorded the
+  consequence in the docstring rather than the objection: the network has to read that regime off
+  small N² with large |∇_h b| instead, both of which it gets.
+
+The general shape: when a spec is revised mid-build, the disagreements worth having are the ones
+where the spec is *underdetermined*, and the ones I actually had were all already decided. Read
+the revision before defending the code.
+
+## 2026-08-08 (5) — two numbers that were assumed and turned out to be zero
+
+The plan justified de-meaning the SSH loss term by "student and coarse-grained teacher carry
+different global η means — bathymetry/volume budgets". Both means were measured instead of
+assumed: **1e-12…1e-11 m** on the coarse-grained teacher and **below 1e-5 m** on the student's own
+free year, across all 73 marks. FESOM conserves volume and an area-weighted aggregation preserves
+that, so there is no offset to remove on this mesh pair. The de-meaning stays (it is two lines and
+a different mesh pair or a freshwater experiment could break the property) but it is insurance,
+not a correction, and the plan now says so. The η signal itself is real and comparable on both
+sides — anomaly std 0.674 m teacher, 0.652 m student — so the term will carry gradient.
+
+Cheap measurements beat plausible mechanisms. The mechanism was real; its magnitude was zero.
+
+## 2026-08-08 (6) — a refactor that touches recorded gate numbers has exactly one acceptable outcome
+
+Lifting the teacher-data layer out of `signal_eval.py` into a shared `nn_data.py` moved the code
+that decides *which cells count* in every loss this project will compute. The bar the plan set was
+"reproduce holes exactly 51,178 and every spread/floor to 3 significant figures". What came back
+was better and it is worth insisting on the stronger version: **all 225 recorded values
+bit-identical, maximum relative difference exactly 0.** A behaviour-preserving refactor of pure
+array code should be bit-identical, not close — "agrees to 3 significant figures" would have meant
+something had changed and I would have had to find out what. The re-run also wrote to a NEW json
+path, so the recorded baseline it was being compared against was never at risk of being the thing
+overwritten.
+
+One mechanical trap in the same work: loading a module by path with
+`importlib.util.spec_from_file_location` fails on any module that defines a `dataclass` under
+`from __future__ import annotations`, because the dataclass machinery resolves field annotations
+through `sys.modules[cls.__module__]`, which is `None` for a module executed but never registered.
+It surfaces as `AttributeError: 'NoneType' object has no attribute '__dict__'` from inside
+`dataclasses.py` — nothing about your module. Register it in `sys.modules` before `exec_module`.
+
+## 2026-08-08 (7) — eta cost 19 seconds because I asked what the model already writes
+
+The plan's M2 wanted SSH in the coarse product, and the first shape of the work I reached for was
+"add 2D aggregation to `coarsen_stream.py` and regenerate the months". Two questions collapsed it.
+Does the teacher already output η? Yes — `ssh_snap.fesom.YYYY_MM.nc`, on the same 5-day stream as
+`temp_snap`, so there is no Fortran-side work at all. Does the 2-D field need to share a file with
+the 3-D ones? No — and it must not, because `coarsen_stream.write_output` opens with mode `"w"`,
+so "add eta to the product" means truncating twelve files whose numbers a passed gate depends on.
+
+A side-file cost **19 s for the first month and 54 s for the other eleven**, against ~35 min per
+3-D month regenerated. The check that makes it usable is not the physical bounds (those were never
+in doubt) but that the hole pattern is *identical* to the 3-D product's surface `cell_area` —
+123,565 wet / 3,293 holes, matching on every month, with the surface weights agreeing to 6e-8
+against the vertically-remapped 3-D weight. That identity is what lets a downstream join mask both
+files with ONE mask; without it, a cell that is a hole in one and not the other silently
+contributes a ~1 m fabricated SSH error to the loss.
+
+## 2026-08-08 (8) — "in bounds" is not evidence that the thing under test is switched on
+
+The M1 stability gate ran 10 days from a developed state with a randomly-perturbed GM network and
+checked T, S and |η| at every daily mark against generous bounds. It passed. It also told me
+almost nothing, and I nearly recorded it as if it had.
+
+The two arms — perturbed network and `gm_nn=None` control — produced daily global extrema that
+agreed to **0.01 K on 8 of 10 days**. That is the *correct* behaviour for a bounded κ multiplier:
+a global min/max is set by the coldest polar water and the warmest tropical surface point, and GM
+has no authority over either. But it is indistinguishable from the outcome where the network never
+reached the step at all, and a gate whose pass condition is satisfied equally by "works" and "not
+plumbed in" is not a gate. Measuring the trajectory difference directly settled it in one number:
+**max|ΔT| = 0.671 K at day 10** (area-RMS 2.5e-3 K, max|ΔS| = 0.347, max|Δη| = 4.8 mm). Active,
+and by a wide margin.
+
+The rule: for any gate on a *new* code path, ask what the pass condition would look like if the
+path were dead. If the answer is "the same", the gate needs a term that can only be nonzero when
+the path runs. `seam_gate.py` now refuses a `stable` verdict when the two arms are bit-identical.
+
+## 2026-08-08 (9) — closing over a big array puts it in the executable, once per executable
+
+The gradient half of the same gate died twice with `RESOURCE_EXHAUSTED: Out of memory while trying
+to allocate 49.53GiB` on an 80 GB A100 — while evaluating a **forward** pass whose stability-mode
+twin had just run in 13 GB. The number is absurd on its face, which is what made it findable: no
+tensor in a 5-day CORE2 window is 49 GB.
+
+Buried above the traceback was the real message: `A large amount of constants were captured during
+lowering (4.58GB total)`, and again at 3.77 GB. My `loss` closed over the 240-step forcing stack,
+the target `State`, the wet mask, the area array and the weights, and I jitted **three** separate
+functions over it (forward, loss, grad). Each lowering embeds those closures as compile-time
+constants, so the same gigabytes were resident once per executable, and XLA then fused a step whose
+working set had nowhere to go.
+
+The fix is to pass every large array as an **argument**. What stings is that this plan's own M6
+already says so — "windows enter the jitted `value_and_grad` as ARGUMENTS (fixed shapes ⇒ ONE
+compile) — do NOT close over the batch" — as an argument about retracing and compile count. It is
+the same rule for memory, and I wrote a script that violated it three days after the plan recorded
+it. Reading a plan's rules as advice about the thing they were written about is how you rediscover
+them.
+
+Two smaller things from the same failure:
+* **A traceback's line numbers come from the file as it is NOW, not as the job read it.** I had
+  edited `seam_gate.py` while the job ran, so the rendered source lines pointed at unrelated
+  comments and the frames looked nonsensical. `executable_name=` in the JAX error and the
+  allocator warnings above the traceback were the trustworthy parts. (Mirror of the
+  sbatch-snapshots-at-submission lesson: the .sbatch is frozen at submit, the .py is read at
+  process start, and the traceback is rendered later still.)
+* Pull what you need to host and free the rest: keeping a whole 1.8 GB `State` alive to reference
+  three of its fields is most of a jitted graph's headroom on this mesh.
+
+### 2026-08-08 (8) — I cited a superseded script as my existence proof, and lost a day to it
+
+The M1 gradient gate OOM'd three times. My diagnosis named `--seg-mult` as the knob and cited
+`horizon_scan.py` as proof that a longer window fits: "clean 30-day gradients at 34-37 GiB peak
+with the same `_run_steps` pattern". Every clause of that was wrong.
+
+* `horizon_scan.py` never took a clean 30-day gradient. Its own `horizon_results.jsonl` records
+  37 GB at 1 d, 55.8 GB at 5 d, **OOM at 7 and 10 d**, and a gradient already at 1e7 by 2 d. The
+  script had been SUPERSEDED the day before by `adjoint_horizon.py`, whose corrected verdict
+  (H >= 30 d) is what the plan records — I attributed the successor's result to the predecessor.
+* "34-37 GiB" is a comment inside that file describing the **per-step reverse working set**,
+  which explicitly "does NOT shrink with the window". I read a fixed-cost number as a
+  whole-window peak. It was in the same sentence that said so.
+* `adjoint_horizon.py` does not use the `_run_steps` whole-window pattern at all. It is chunked
+  reverse accumulation: boundaries on the HOST, a jitted VJP over ONE 48-step chunk at a time.
+  That is *why* it fits — 43.1 GB at 1 d, 56.9 GB at 30 d, device peak flat in window length.
+* And the knob I was reaching for was already at its optimum: `S + N/S` is minimised at `S=√N`,
+  which is `--seg-mult 1.0`. Bigger S = more outer carries, smaller S = more inner carries. At
+  1.93 GB per `State` the floor is ~60 GB of carries + ~18 GB working set at 5 days. Nothing to
+  tune. The arithmetic was available before any of the three jobs ran.
+
+**The lesson is not "read the docs".** The fact was fully documented, in the right words, in
+`docs/ADJOINT_HORIZON.md` §"Memory was never the real constraint" — measured numbers and all.
+It was lost because of WHERE it lived: reachable only from an already-ticked Task-2 checkbox, so
+it reads as closed history rather than as a live constraint on new code. Nothing at the failure
+site pointed to it. **A capability the whole campaign depends on must be recorded where someone
+LANDS when it bites** — in the docstring of the function whose knob they will reach for, in the
+project `CLAUDE.md`, in the plan's standing Technical Details — not only in the write-up of the
+task that discovered it. Done for this one; the plan's M6 checkbox, which prescribed the
+monolithic pattern by name, was the landmine this would have detonated next.
+
+**And: when a script is superseded, say so in its module docstring the same day.** A stale script
+that still runs is worse than a deleted one, because its numbers are quotable.
+
+### 2026-08-08 (9) — a precedent that fits the symptoms is not a diagnosis
+
+The 5-day seam gradient came back non-reproducible: three jobs, three answers (+5.93e-02,
++2.30e-03, +1.04e-02), two passes in one process spreading 2.877x with the sign flipping, while
+the loss agreed to three digits. `ADJOINT_HORIZON.md` 1.2 documents that exact symptom for the
+vertical mixing closure, with the cure. So I reasoned: `gm_nn` is a SECOND state-dependent
+diffusivity closure, built after those flags were measured, therefore `d(kappa)/d(state)` is the
+uncovered path. It was a good story. Every clause of it was checkable and I checked the wrong
+ones — that the flag existed, that no `stop_gradient` was in `gm.py`, that the horizon result
+used a constant kappa. All true, and all consistent with the hypothesis being false.
+
+Two experiments settled it, and the useful part is that BOTH were designed to be able to fail:
+
+* **`freeze_nn_features` A/B** (26801539). Built the switch, ran the window twice with the
+  network's inputs live and twice with them frozen. Chunk 0's cotangent blew up 8371x in the
+  control and **20270x frozen** — worse, and chunks 4->1 agreed between arms to four digits.
+  Refuted.
+* **`freeze_equivalence.py`** (26802525), which existed only because the user asked "are you
+  sure it isn't that you forgot to freeze mixing, and now you're blaming the NN?" That is the
+  duller and more likely explanation, and the project had TWO implementations of "freeze
+  mixing" — a library flag and a monkeypatch — with **nothing asserting they agree**. They do:
+  max|difference| exactly **0.000000e+00**, with the flag live at 0.948 relative. Also refuted,
+  and the test is now permanent.
+
+**What actually generalises.** I had stated the falsification criterion for the A/B in advance
+("if B still scatters, the network isn't it and the seed is next"), which is the only reason the
+negative result was worth anything instead of an invitation to patch further. And the diagnostic
+that localised the fault was a *trace*, not a scalar: the per-chunk cotangent norm showed four
+flat chunks and one at 1e4, which is "a switch is firing", against the 30-day run's log-spread of
+0.001 across all thirty. `seam_gate` had no such trace until I copied it over from
+`adjoint_horizon` — the sibling script had had it all along, for exactly this purpose.
+
+**Where it points, and the thing I never controlled for.** Chunk 0 runs the same compiled
+function as chunks 1-4 with the same switches; the only difference is that its input state is
+unpickled from disk rather than produced by the model. That was a difference between the broken
+5-day runs and the clean 30-day ones the whole time, sitting next to the one I fixated on.
+
+**Three smaller traps from the same afternoon**, all mine:
+* a `NamedTuple` config passed as an ARGUMENT to a differentiated function gets flattened as a
+  pytree and its bools become TRACERS, surfacing far away as a `TracerArrayConversionError` on
+  an index array inside the SSH solve. Close configs over; never pass them.
+* `step` refuses a `tke_cfg` without surface forcing, and the tempting dodge — drop `tke_cfg` —
+  deletes the very closure under test.
+* a completion monitor that re-evaluates every job each cycle and only exits when ALL are done
+  re-emits the finished ones every poll. One watch per thing, exiting on its own first terminal
+  state.
+
+---
+
+## 2026-08-09 — M3b, the February event, and four guards that were quietly not guarding
+
+### 2026-08-09 (1) — `${VAR:-default}` substitutes on EMPTY, so the flag you cleared is still set
+
+`FDH=${FDH:-1e-3}` in `adjoint_horizon_ladder.sbatch`. I submitted with `FDH=""` to skip the
+finite-difference check, exactly as the script's own `--fd-h` help documents ("empty to skip").
+The colon form substitutes the default when the variable is empty **as well as** when it is
+unset, so every one of those runs did the FD anyway. Each h value costs two extra full forwards:
+26 minutes at 60 days, 79 at 180. Job 26819415 sat silent for exactly 26 minutes after its last
+reverse chunk and I went looking for a hang — the answer was in the sbatch, one character wide.
+
+Use `${VAR-default}` when empty is a meaningful value. The same file had the trap twice: with
+`WEIGHTS=${WEIGHTS:-...}` there was no way to ask for per-rung weights at all, because the one
+value that means "none" was the one being overwritten.
+
+### 2026-08-09 (2) — a monkeypatch's signature is a private copy of a signature that moves
+
+`--freeze convect` had been dead for an unknown number of days. The wrapper declared
+`def w(mesh, Kv, Av, bvfreq)`; the library had since grown its OWN convection freeze
+(`pp.mo_convect(..., freeze_increment=)`, driven by `AdjointConfig.freeze_convection`) and
+`tke.py`/`kpp.py`/`pp.py` all pass that keyword now. Every request for the knob died in 27 s with
+a `TypeError`. Nothing said so until a GPU job spent a slot finding out.
+
+Every other wrapper in that file takes `(*a, **k)` and survived; only the one with a spelled-out
+signature broke. So: **`**kwargs` in a monkeypatch is not laziness, it is the only thing that
+survives the library moving.** And the drift is now testable without a GPU —
+`scripts/tests/test_freeze_knobs_install.py` installs each knob and compares the wrapper's
+accepted parameters against the original's, plus calls `mo_convect` the way the library calls it.
+
+The deeper point is the one this project already learned once: there were TWO implementations of
+"freeze mixing" and nothing asserting they agreed. This is the same shape, one term over. The
+standing decision is to retire the monkeypatches in favour of `AdjointConfig` — not done here on
+purpose, because every recorded freeze number came through the monkeypatch and a mid-campaign
+swap needs its own bit-identity gate.
+
+### 2026-08-09 (3) — a screen built on diluting statistics stops working exactly when it matters
+
+The amplification screen gated on two numbers: the MEDIAN per-step growth and the LOG-SPREAD
+across chunks. Both dilute with window length. Holding one ×1200 event fixed and lengthening the
+quiet plateau behind it:
+
+```
+flat chunks after the event      2        50       100       400
+median                        1.000413  1.000413  1.000413  1.000413   never fires
+log-spread                    0.0696    0.0205    0.0146    0.0074     stops firing at ~100
+```
+
+The median never fires at all — dilution is immediate, because the plateau outnumbers the event
+from the second chunk. The log-spread stops firing past ~100 quiet chunks, i.e. **the screen
+went blind on windows longer than about 100 days, and the campaign's target is a year.** On the
+real blown 60-day trace the median read 1.0001 (passes outright) and the log-spread cleared its
+bar by 1.2×. The screen got WEAKER as more evidence arrived.
+
+⚠️ **The obvious fix is unsafe.** Barring the worst SINGLE chunk looks right and is not: a
+30-day trace that is clean by every independent check (FD 7.9 %, gradient reproducing to 6.5e-4)
+contains one chunk at ×6.02 followed immediately by ×0.184 — a spike that reverses — giving it a
+worst-chunk rate of 1.03811 against a least-blown 1.07108. No usable gap. **A transient that the
+norm comes back from is not a blow-up.**
+
+The statistic that works is the worst rate over THREE consecutive chunks: the transient cancels
+against its own recovery, a real jump does not. Clean worst 1.01332, least blown 1.07108, bar at
+the geometric middle 1.030, 2.3× either side. All 52 recorded traces replay with zero verdict
+changes.
+
+### 2026-08-09 (4) — an equivalence test that shares a helper with the thing it tests cannot see its sign
+
+New `flux_divergence.py` reproduces `gm_redi.diff_part_hor_redi` with max|difference| **exactly
+0** when fed the Redi flux — the strongest gate this project has. It also returned **minus** the
+divergence, and that test could not tell, because both sides ran through the same
+un-normalised helper and the public function's sign never entered.
+
+What caught it was an independent analytic check: on a sphere a constant local-Cartesian flux is
+NOT divergence-free, its divergence is `-Fy·tanφ/R`. Measured against that: rms 2.5228e-07 vs a
+predicted 2.5292e-07, correlation 0.99998 — and slope **−0.9975**. A sign error that would have
+inverted every fitted κ, sitting behind a green exact-equality test.
+
+Second half of the same lesson: I first expected that check to give zero and treated the 8.85e-07
+residual as a failure. It was the physics. **Before calling a small residual an error, check
+whether the exact answer is actually zero.**
+
+### 2026-08-09 (5) — characterise the instrument before you publish its negative result
+
+`κ̂_div = -(∇·F)/∇²σ` drops `∇κ·∇σ`. Real `fer_K` spans orders of magnitude, so that term is not
+obviously small, and the real-data result being reported was a 43 % up-gradient population. If
+the estimator could manufacture that on its own the result would be about the instrument.
+
+Measured on analytic fields with κ known (`scripts/tests/test_divergence_fit.py`): median κ̂/κ =
+1.000 at every contrast, up-gradient 0.13 % at ±50 %, 0.95 % at ×10, **3.09 % at ×100**. The
+operator also annihilates a rotational flux to 0.43 % of a gradient flux from the same potential.
+So the ocean's 43 % is the ocean. The tests print the numbers rather than only asserting them,
+because a future change to the operator has to force a re-reading of the conclusion.
+
+### 2026-08-09 (6) — compare configurations on cumulative growth, not on the peak chunk
+
+Freezing the convective adjustment shrank the 1961-02-06 event from ×1406.8 to ×36.5 — a 38-fold
+reduction that reads as a fix. It is not: the growth is REDISTRIBUTED, with ×139.6 appearing on
+02-09 and ×44.9 on 02-07 where the baseline had ×10.0 and ×1.0, and the cumulative over the same
+nine chunks is **2.1× WORSE**. The final gradient does come out 10× smaller with the correct
+sign — and is still 5 orders from the FD's −9.80e−01.
+
+Three numbers, three different impressions. The peak chunk is the one that is easiest to quote
+and the one that misleads.
+
+### 2026-08-09 (7) — an option named for what it APPROXIMATES will be read as what it enables
+
+`--ice rheology` means ice thermodynamics, advection, cut-off and the ocean→ice coupling ALL
+differentiated, with zero mEVP sweeps unrolled. It is the training configuration. `--ice frozen`
+— the script's default — puts no ice in the backward at all. The name refers to the component
+being approximated, and reading it the other way is why every rung at 60, 90, 180, 365 and 731
+days was measured with no ice in the backward, in a campaign whose blow-ups all land in
+February, peak NH ice. Ice costs ~2 % of backward time, moves the gradient by 0.21–2.98 %, and
+does not touch stability at all.
+
+The fix that generalises is not a rename: it is a **guard that refuses the surprising default**
+past the length where it starts to matter, with the measured cost in the refusal text.
+
+### 2026-08-09 (8) — a results row must record everything that would change the number
+
+`adjoint_horizon_results.jsonl` carried the seed, the window, the freezes and a static
+`config` string — but not the boundary stride, the truth length, the weights source or (under a
+greppable name) the ice mode. So the 180-day row did not say it ran at stride 2 and the year rung
+did not say it ran at 19. That single omission is what made "season or stride?" a confound
+costing two five-hour jobs to resolve, when the record could have answered it.
+
+The provenance fields belonged to the checkpoint-identity dict, which is only built under
+`--ckpt-dir`. **Identity and provenance are the same list; write it in both places or in
+neither.**
+
+### 2026-08-09 (9) — a fixed temp filename is a race as soon as siblings become routine
+
+The truth cache wrote `cache.with_suffix(".tmp.npz")` then renamed. The rename is atomic, so
+readers were always safe — and two concurrent jobs on the same seed would interleave into that
+one temp file and rename the corruption into place. Not hypothetical any more: ice-on/ice-off
+contrasts and freeze-knob bisections are siblings with **byte-identical forwards**, which is
+exactly why they collide on the same truth. Temp name now carries the pid.
+
+### 2026-08-09 (10) — measure a claim against a reference through the SAME operator; the ratio is the result
+
+The rotational-flux hypothesis had never been measured, only inferred from the residuals it
+would explain. The measurement that settled it needs no κ estimator at all: for a flux varying
+on scale `L`, `η = |∇·F|·L/|F|` says how much of the field carries a divergence. The absolute
+number means little — a discrete operator damps at the grid scale — so it was computed for the
+teacher's flux AND for `G = -κ_formula ∇σ`, through the same operator on the same cells. Over
+36 months the ratio is min 0.757, median 0.774, max 1.509, **zero months below 0.5**. A
+rotationally dominated flux would be at a few percent.
+
+The same discipline applied to the follow-up: the flux turned out nearly collinear with the mean
+flow (|cos| 0.810) and only weakly down-gradient (|cos| 0.583). Those are two claims and thermal
+wind would make them one, so a **degeneracy check** went in before either was quoted:
+|cos(U, −∇σ)| = 0.470, a typical angle of ~62°, not 90°. Independent after all — but that was
+measured, not argued.
+
+### 2026-08-09 (11) — an attribution table measured where nothing could show reads as "these knobs do nothing"
+
+`AdjointConfig`'s docstring carried a table of every freeze flag's measured effect: a 2-day
+window, no other knob on, unfrozen scatter 1.21-1.55. Four flags landed inside that band and
+were recorded as **"inside the unfrozen scatter: no effect"**. The table was honest about its
+conditions and still misled completely, because "no effect" and "this experiment cannot resolve
+it" print the same.
+
+Re-measured on a 60-day window with `freeze_mixing` already on — so the baseline does not
+scatter and there is something to resolve against — **three of the four have effects**:
+
+| flag | 2-day table | 60-day, over freeze_mixing |
+|---|---|---|
+| `freeze_gm_slope` | 1.4298, "no effect" | **the entire cure**, x1.591 against a x4.363e+07 baseline |
+| `freeze_convection` | 1.2550, "no effect" | **2.12x WORSE** |
+| `freeze_advection` | 1.3238, "no effect" | 0.79 — a real 21 % |
+
+The one that mattered most was the one most confidently dismissed. And the failure is not
+carelessness in the measurement — the numbers are right — it is that a null result was written
+down as a property of the flag instead of a property of the experiment.
+
+**What to write instead of "no effect": the smallest effect the experiment could have seen.**
+Here that is "anything below ~1.5x/step is invisible at 2 days", which immediately says the
+table is silent about flags in that range rather than dismissive of them.
+
+The user asked the right question in one line — "maybe the other knobs are just as badly
+measured?" — after seeing ONE row overturned. Generalising from a single corrected entry to
+"the whole instrument may be blind" is the move; I had corrected the row and was about to move
+on.
+
+### 2026-08-09 (12) — the neighbouring model's option is not automatically the better one; check which way its literature moved
+
+MITgcm can run free-drift sea-ice dynamics in adjoint mode only, and our ice velocity has no
+gradient path at all, so adopting it looked like a straight upgrade. It is not. Toyoda et al.
+(2019), via Lyu et al. (2023): the adjoint of the rheology gives sensitivity to ice velocity
+**weaker by O(10²) in the central Arctic** than the free-drift adjoint — i.e. free drift
+OVERSTATES that sensitivity by ~100×, because nothing resists the motion. The field moved FROM
+free drift TOWARD approximated VP, not the other way; and even the VP adjoint needed viscosities
+frozen w.r.t. strain rate plus zeroing of any local sensitivity above 50× the global mean.
+
+Two transferable points. **The direction of travel in a literature is evidence**: a capability
+that exists and is switchable is not thereby recommended, and the papers that added the harder
+option say why. And **bound the prize before costing the work**: the entire ice contribution to
+our gradient is 0.21–2.98 % on clean windows, so any ice-dynamics pathway is worth less than
+that — against `jax.custom_vjp` plumbing whose primal and cotangent belong to different models.
+
+### 2026-08-09 (13) — a reduction in the diagnostic is not a reduction in the error
+
+The last two freeze knobs closed the attribution table, and one of them is instructive in a way
+a "no" usually is not. `freeze_vert_visc` cut the cumulative cotangent growth on the February
+window from ×4.363e+07 to ×3.541e+07 — a clean 19 % improvement, monotone, in the right
+direction, on the very statistic the bisection was being judged by. It is also worthless: the
+run ends at `dL/dm = -2.007128e+05` against a true finite difference of `-9.803512e-01`, which
+is five orders of magnitude wrong. The cure (`freeze_gm_slope`) does not improve the statistic
+by 19 %, it moves it by seven orders, to ×1.591.
+
+The transferable shape: **when the quantity you are bisecting on spans many orders of magnitude,
+a percentage change in it carries no information about whether the underlying problem is
+solved.** Only the ratio to the answer does. So a bisection over such a quantity has to carry
+the final gradient and its independent check in the same table as the diagnostic, or a row that
+is 19 % better will read as partial progress toward a fix that it is not on the path to. Every
+row in `AdjointConfig`'s table now quotes both.
+
+### 2026-08-09 (14) — the case that vindicates a screen is the one that passes its old bar
+
+The third amplification bar (worst 3-chunk stretch) was added on the argument that the median
+and the log-spread both dilute as windows grow. These two runs are the first measured instance
+of that argument being load-bearing rather than plausible: both record a median of **exactly
+1.0000/step** against a 1.010 bar — they pass the original screen outright — while their
+gradients are wrong by five and seven orders of magnitude. The log-spread catches them at 0.024
+against 0.020, and the 3-chunk statistic at 1.0900 against 1.030, both by comfortable margins.
+
+Worth recording because a screen that has never rejected something the old screen accepted is
+indistinguishable from a screen that does nothing, and until now the third bar had only been
+shown not to change any existing verdict — which is a compatibility check, not evidence of
+power. **Keep looking for the case that separates a new guard from the one it replaced; until
+you have it you have added cost, not coverage.**
+
+### 2026-08-09 (15) — cache the sample assembly, or an architecture screen measures the sampler
+
+`offline_fit.py` draws a random subsample of accepted cells per teacher mark, and the assembly
+(one `derive` + one `project` over 219 marks) is ~70 minutes against a fit measured in minutes.
+Running the architecture rungs as independent jobs would therefore have spent 70 minutes each to
+re-derive the same fields, and — the part that actually matters — would have given each rung a
+DIFFERENT random draw. The rungs differ by hidden-layer width; the draws differ by tens of
+thousands of cells; nothing in the output distinguishes the two, so a width that "won" might
+simply have been handed an easier subsample.
+
+The fix is a cache keyed on everything that changes which cells are drawn or what values they
+carry — months, every guard floor, per-mark count, seed — and a hard failure if a stored key
+disagrees. **A screen over variants must hold the data fixed by construction, not by the
+convention that everyone passes the same seed**, because the seed is not the whole key: the
+guard floors select cells too, and a sensitivity leg that changes a floor must get a different
+cache entry rather than silently reuse the old one.
+
+### 2026-08-09 (16) — score the closure forward, on every cell, about zero
+
+The projection-side metric for an eddy closure (R² of the fitted multiplier on the cells where
+the fit is well posed) has two properties that only became visible once the acceptance rate was
+measured: it lives on 2.1–2.4 % of the domain, and inside that set the flux is down-gradient by
+selection, because a cell is only accepted if the down-gradient ansatz explained it. A closure
+can therefore score respectably on it while reproducing almost none of the ocean's actual eddy
+flux, and nothing in the number says so.
+
+Three choices fix it, and all three are needed. **Run the closure forward through the same
+operator the projection inverts** — here `kappa_hat.gm_redi_flux`, already validated against a
+known κ by the synthetic check — so the comparison is against the teacher's raw flux rather
+than against a derived quantity. **Score every usable cell**, guard-free and unclipped, so the
+cells the architecture cannot reach are counted against it instead of being filtered out.
+**Take the explained variance about ZERO, not about the field mean**: the question is what
+fraction of the eddy flux the closure supplies, so a closure that supplies none must score 0,
+and one whose flux is further from the teacher's than no parameterization at all must go
+negative — which the mean-referenced version cannot express. Keep the projection-side metric as
+the gate if the plan defines it that way, but print both, and never quote the first alone.
+
+### 2026-08-09 (17) — one operator, two questions: the inverse problem and the deployed closure need different slopes
+
+`kappa_hat.gm_redi_flux` is the GM/Redi forward operator, written for `synthetic_check`: generate
+fluxes from a known κ, invert them with `project`, confirm the recovery. For that job it must use
+the same UNTAPERED neutral slope `project` uses, and it does.
+
+I then reused it to score a trained closure — run the NN's κ forward, compare the flux against the
+teacher's — and got an explained variance of **-2e+12**. That is not a bad closure; the ODM95 taper
+is a numerical safety device the STUDENT applies, and without it the slope `-∇σ/∂_zσ` diverges
+wherever stratification collapses, so the predicted flux overshot the teacher's by ~6 orders of
+magnitude. The same function, the same arguments, the wrong question.
+
+Two things to carry. **A shared forward operator needs the physically-consequential choice as an
+argument, not a constant**, with the default set to whichever caller existed first and the
+docstring naming the other caller's requirement explicitly — a reader who has only ever seen the
+inverse problem has no reason to suspect the taper matters. And **a score that can be
+catastrophically negative must be printed next to a magnitude ratio**: `-2e+12` reads like a
+finding about the ocean, while "RMS |F_pred| / RMS |F_teacher| = 1.4e+06" reads, correctly, like a
+bug. The evaluator now prints that ratio for every closure and flags anything past 1000x as not
+readable as skill.
+
+### 2026-08-09 (18) — before asking how well the model learned, ask what the model class can do at all
+
+Three rows of this evaluation compared trained networks against baselines, and every one of them
+confounded the same four questions: is the network too small, are the features too poor, was the
+training too short, or is the functional form simply wrong? A bad score cannot distinguish them,
+and the honest response to a bad score is usually "train it properly first" — which costs weeks
+and, if the fourth explanation is the true one, cannot possibly change the answer.
+
+The fix was one extra row: an ORACLE. Hand the model class a per-cell parameter chosen by
+minimising the error against the answer itself — no network, no features, no bound, only the sign
+constraint that defines the class. It is not a closure and cannot be deployed. What it gives is a
+**ceiling**: whatever it scores, nothing inside the class beats it, so a low value closes the
+class without any further training. Here it came out at 4.9 % of the temperature flux divergence,
+against a default closure at -20 % and a lightly trained network at -2.8 %, and it settled a
+decision that would otherwise have waited on a training campaign.
+
+Two design points that make such a row a bound rather than a tautology. **Count the degrees of
+freedom against the residuals**: two free coefficients fitted to one tracer's 2-component flux fit
+every cell exactly and would have "proved" the class perfect; fitting both tracers jointly, four
+components against two coefficients, keeps it overdetermined. And **impose the class's own
+constraints exactly** — here non-negativity by 2-variable NNLS, not by clipping the unconstrained
+solution, because clipping one coefficient leaves the other at a value that was optimal only in
+company with the coefficient just removed, so the result is neither the constrained optimum nor a
+bound on it.
+
+Generalises well past closures: any time you are about to spend weeks improving a fit, spend an
+hour computing what a cheating version of the same model class would score.
+
+### 2026-08-09 (19) — a ceiling is only an argument if the rival ceiling has the same degrees of freedom
+
+Lesson (18) added an oracle row to bound what a model class can do. The obvious next move — compute
+the rival class's ceiling and compare — is where such comparisons usually go wrong, because the two
+classes rarely have the same number of free parameters, and a class with more freedom scores higher
+for a reason that has nothing to do with physics.
+
+Here the two classes are a down-gradient diffusivity (two coefficients per cell, direction fixed by
+the neutral slope, sign constrained positive) and a bolus streamfunction (a free 2-vector per cell).
+Both were fitted to the SAME four residual components: x and y of the temperature flux and of the
+salinity flux. Two unknowns against four components in each case. That parity is what lets the
+difference — 0.5988 in explained variance of the temperature flux divergence — be attributed to the
+direction constraint rather than to parameter count.
+
+Two mechanics that made the parity real rather than nominal. **Fit the tracers jointly, never
+separately**: two unknowns against a single tracer's 2-vector fit every cell exactly in both classes
+and would have "proved" both perfect. And **pick the algebraic form that inherits the target's
+invariances**: the teacher's eddy flux is unchanged by adding a constant to temperature, so the
+rival had to be written as a skew flux (which sees only the vertical derivative) rather than the
+advective form u*·T, whose value depends on whether temperature is in Celsius or Kelvin. An
+advective formulation would have produced a number that changed with the unit.
+
+State the remaining asymmetry rather than burying it. Here the down-gradient class's constraint is
+imposed exactly, while the streamfunction class's real structural constraint — zero at the surface
+and the bottom, vertically coupled down a column — is not imposed at all. So the gap bounds the gain
+from above, and the robust conclusion is the CAUSE of the first class's failure, not the size of the
+second class's advantage.
+
+### 2026-08-09 (20) — say which averaging the bound is a bound on, because they differ in sign
+
+The same two ceilings computed per five-day mark and on monthly means do not merely differ in
+magnitude — the down-gradient one crosses zero, +0.0744 per mark against -0.0415 monthly. Neither
+is wrong. The per-mark fit gives the coefficient a fresh value every five days; the monthly fit
+demands one value for the month. The second is a strictly stronger constraint and therefore a
+strictly lower bound, and it is the right bar for "can this class reproduce the mean transport",
+while the first is the right bar for a closure that recomputes from the instantaneous state.
+
+The trap is that both are naturally described as "the ceiling of the class", and quoting the
+favourable one is invisible in the number. Report both, and label each with the constraint it
+encodes rather than with the averaging window, which is the incidental part.
+
+### 2026-08-09 (21) — a test that both the correct and the broken implementation pass
+
+The neighbouring session designed a two-sided check for an online accumulator of eddy-flux
+products: run with output every step, where the time mean of the product must equal the product
+of the time means to round-off, and run with daily output, where it must differ. The stated target
+was to separate "accumulates correctly" from "forms the product once, at write time".
+
+It does not separate them. On a one-step window the two implementations are the same expression,
+so both pass the first run. On a daily window both differ from the product of the means — the
+correct one by the true covariance, the broken one by `u(end)·T(end) − <u><T>` — so both pass the
+second. The check is real (it catches a missing division by the sample count, which would show as
+an exact factor of N) but it is not the check that was wanted.
+
+What separates them is **nested windows**: emit two accumulators in one run, one over a short
+interval and one over an interval that is an exact multiple of it. Correct accumulation makes the
+long window's value exactly the mean of the short ones, because the windows tile. Write-time
+formation makes the long window equal to the LAST short window, which the mean is not. One run,
+exact to round-off, no reproducibility question.
+
+The generalisable habit: for each failure mode you claim a test catches, write down what the broken
+implementation actually outputs and check that the test's assertion is FALSE for it. "The values
+differ, as expected" is not evidence unless the wrong implementation would have made them agree.
+
+### 2026-08-09 (22) — when the fix fails its own premise, ship the counter-result, not the fix
+
+A constrained least squares for a bolus streamfunction came out sane in the upper ocean and wrong
+in the abyss: the predicted flux was 2.4x the target below 1500 m and 2.8x below 3000 m, while the
+unconstrained version sat at 0.93-0.95 everywhere. The explanation was easy to reach — the
+objective is an unweighted sum of squared flux residuals, so weakly-stratified deep layers carry
+almost no weight, and a fit coupled down the column is free to put anything there in the service of
+the layers above. Minimum-norm regularisation is the textbook response.
+
+It failed its own test. On a synthetic column built to exactly that description, the UNregularised
+solve already returned exactly zero in the weak layers, and the ridge introduced a small nonzero
+instead of suppressing one — the opposite of the predicted effect. The ridge also moved
+well-determined solutions by ~0.3 %, so it was not free where it was not needed.
+
+The temptation at that point is to ship it anyway: the real-data symptom is real, the fix is
+standard, and the synthetic "just doesn't capture it". That reasoning would have put an
+unexplained correction into a number headed for a paper. What went in instead was the knob at
+default zero, a comment naming the measurement and the failed premise, and a test that pins the
+counter-result — the unregularised solve gives exactly 0.0 in the weak layers and the regularised
+one does not. A future fix now has to explain that observation rather than rediscover it.
+
+Two habits behind this. **A synthetic case built from your explanation is a test OF the
+explanation, not scaffolding for the fix** — when it disagrees, the explanation is what failed.
+And **record a failed diagnosis as a test, not as a deleted branch**, because the next person to
+see the symptom will reach for the same standard fix within about ten minutes.
+
+### 2026-08-09 (23) — a consistency residual that is a clean 1/N of the value is a missing sample, not round-off
+
+A new online eddy-flux output offers its own control: the interface reconstruction `Tint` is a
+plain two-point average of the layer field, so `<Tint> = ½(<T>(k−1) + <T>(k))` must hold exactly.
+It failed by 1.75e−2 on values of ~30. The obvious reading is accumulator precision — the stream
+is `prec 4` and FESOM's `io_meandata` really does accumulate in the output precision
+(`local_values_r4` is `real(real32)`), and 1800 sequential single-precision additions of a
+same-signed quantity land in that neighbourhood.
+
+It was wrong, and two measurements said so before any source was read. **The relative residual
+was 5.5556e−4 at every depth, for 100 % of 7.3 M nodes, with rms equal to the median** — a
+distribution with no spread at all, which round-off cannot produce. And 5.5556e−4 = 1/1800, the
+number of timesteps in the five-day window. A deficit of exactly one sample out of N, divided by
+N, is that number; nothing else is.
+
+Two generalisable habits. **Take the distribution before diagnosing, never the max** — the first
+pass printed only `max|err|`, and a max is consistent with both stories, so it cannot start a
+diagnosis. And **find the variable that differs in the suspected cause and read it**: salinity is
+written and accumulated in `real64` and showed the SAME relative residual as `real32`
+temperature, which excluded precision in one line without any source access. The actual cause was
+cold-start — the arrays the flux module fills are still zero when the averaging machinery takes
+its first sample of the run — so only the first window of each job segment is affected, which the
+second output record confirmed by closing the identity at exactly 0.0.
+
+### 2026-08-09 (24) — a dimensionally correct scale can still be the wrong scale by four orders of magnitude
+
+The Arm B network emits an O(1) number that a local dimensional scale multiplies into a bolus
+streamfunction, following the published recipe for making such a parameterization generalise
+across resolution. The scale first written was `Δ²·M²/N`, which has units of m²/s, passes every
+unit check, and is wrong: that is the scale of a DIFFUSIVITY. A streamfunction is a diffusivity
+times a slope, so the right combination is `Δ²·M⁴/N³` — also m²/s, and smaller by `S ≈ 1e−4`.
+
+The fit diverged to an explained variance of −7.7e+10 inside one epoch. That is the cheap
+outcome; the expensive one is a scale wrong by 3× rather than 1e4×, which trains to something
+plausible and merely underperforms.
+
+**A dimensional argument cannot distinguish two combinations with the same dimensions, so it is
+not a check — it is a hypothesis.** The check is to calibrate against a known-good instance of
+the quantity itself. Here that instance was free: the per-cell oracle already computes the best Ψ
+the class can use, so `median |Ψ_oracle| / Ψ_scale` is a direct measurement of whether the scale
+has the right magnitude. It is now printed for every mark at assembly, which turns any future
+edit to that expression into a number instead of an argument.
+
+### 2026-08-09 (25) — fit the gauge-invariant quantity, and say which one the bound was fitted on
+
+An eddy flux splits into rotational and divergent parts, the split is not unique in a bounded
+domain (Fox-Kemper, Ferrari & Pedlosky, JPO 33, 478, 2003), and the rotational part moves no
+tracer. So a skill number computed on the raw flux is gauge-dependent and a diffusivity
+diagnosed from it is contaminated — the standard result, and the reason diagnosed κ fields come
+out with "unphysically large positive and negative values" (Maddison, Marshall & Shipton, Ocean
+Modelling 2015). Measured on this teacher: `η = |∇·F|·Δ/|F|` is 0.466 against 0.610 for a
+down-gradient reference field, so the rotational excess is real but not dominant.
+
+Two consequences, and only the first is obvious. Train on the divergence — which is what the
+closest published analogue does (Perezhogin et al., GRL 2025, `‖S − ∇·T̂‖²/‖S‖²`) — because it is
+both the gauge-invariant quantity and the reported metric.
+
+The second: **a ceiling fitted on the flux and scored on the divergence is a LOWER bound on its
+class under a divergence objective, and can legitimately be beaten by something inside the
+class.** Every comparison of a trained closure against such a ceiling has to carry that sentence,
+or "the network reached 95 % of the ceiling" will be read as "the class is exhausted" when it may
+mean the ceiling was measured on the wrong objective.
+
+⚠️ It does not follow that removing the rotational part rescues a down-gradient closure. Here the
+same κ fit run against `∇·F` instead of `F` left **43.4 %** of cells wanting a negative
+diffusivity, against 34.9 % when fitted on the raw flux — slightly worse, not better. The
+rotational reading explains why the raw flux looks the way it does; it does not change the
+verdict on the class.
+
+### 2026-08-09 (26) — a per-cell oracle bounds the FORM, never the attainable skill; measure the gap's cause
+
+An oracle row (lesson 18) hands a model class a per-cell parameter chosen against the answer and
+reports what it scores. That is a real bound and it closed one arm of this project honestly. It is
+also routinely over-read, including by the person who computed it, as "what a trained closure
+should be aiming at". It is not. The oracle knows the answer cell by cell; a deployable closure
+maps local mean-state features to coefficients and cannot.
+
+Here a bolus-streamfunction network trained on the same objective reached +0.0010 against its own
+class's ceiling of +0.6177. Two measurements — both cheap, both worth making BEFORE concluding
+anything about the architecture — turned that from a failed fit into a result.
+
+**The best single global coefficient.** The prediction was linear in its two coefficients, so the
+optimum over the whole domain is a 2×2 normal-equation solve, not a fit: `(-0.0005, -0.0002)`,
+explained variance `+0.0000`. A constant multiple of the default closure, free in sign and
+direction, explains nothing at all. That immediately says the trained network's small number is
+not "barely better than trivial" — trivial is exactly zero, and it beat it.
+
+**The oracle's own coefficient, projected into the closure's basis and non-dimensionalised.**
+Median +0.016 against a robust spread of 0.39, with the default closure's sign winning in 54.6 %
+of cells and the orthogonal coefficient symmetric about zero to four digits. So what the oracle
+exploits is per-cell, sign-symmetric and centred on zero — eddy phase, not mean state. The gap
+between ceiling and closure is therefore not architecture, not features and not training length,
+and no amount of any of them will close it.
+
+Two habits. **Compute the best CONSTANT member of the class alongside the oracle**; it costs a
+linear solve and it separates "the features add nothing" from "there is nothing to add". And
+**project the oracle's answer into the closure's own parametrisation and look at its
+distribution** — a coefficient whose median is 4 % of its spread is telling you the target is
+mostly unpredictable, before any network is trained. The residual systematic part, small as it
+is, is what time averaging keeps while suppressing the rest, which is what makes a time-averaged
+target the whole experiment rather than a refinement of it.
+
+### 2026-08-09 (27) — the model's frame is not the frame your table's headings mean
+
+FESOM computes in a rotated frame — pole moved to 50°E/15°N so the singularity leaves the ocean —
+and the mesh carries both `coord_nod2D` (rotated) and `geo_coord_nod2D` (geographic). The rotated
+one is the attribute that comes to hand: right shape, right units, right dtype, no warning.
+
+Three analysis scripts here labelled latitude bands with it. Measured on core2: up to **15°** of
+error, median 10.9°, and **22.8 % of 126,858 nodes in a different band** — the "30N-60N" row held
+21,532 nodes instead of 28,720. A second copy of the same mistake rebuilt the Coriolis parameter
+as `2Ω sin(rotated lat)` for a resolution stratification, off by more than a factor of two at
+17.4 % of nodes, when the mesh already carried `coriolis_node = 2Ω sin(geo lat)`.
+
+Nothing failed. Every table printed, every band was populated, and the physics was untouched —
+the model's own computation must stay in the rotated frame and did. Only the HEADINGS were wrong,
+which is the hardest kind of error to notice because the numbers under them are real numbers about
+a real region, just not the region named.
+
+Two habits. **A derived coordinate used for labelling gets one function, named for the frame it
+returns** (`geo_latitude_deg`), so the choice is made once and is visible at every call site. And
+**when a mesh offers the same quantity twice, ask which one the OUTPUT means, not which one the
+code needs** — the model needed the rotated one and the reader needed the geographic one, and the
+same attribute served both until someone asked.
+
+### 2026-08-09 (28) — the architecture screen ranked the rungs backwards, and that IS the result
+
+Lesson (16) said the projection-side metric lives on 2 % of the ocean and must never be quoted
+alone. This is that warning turned into a controlled experiment, and it is stronger than the
+warning was.
+
+Four widths and depths, same cached sample set, same seed, same guard — so the rungs differ in
+nothing but shape. Holdout margin on the gate's own metric against explained variance of the
+temperature flux and its divergence on EVERY usable cell:
+
+    rung        gate margin    flux EV      div EV
+    8x8           +0.2368      -0.0168     -0.1073
+    16x16         +0.2598      -0.0184     -0.1065
+    16x16x16      +0.2631      -0.0215     -0.1399
+    32x32         +0.2786      -0.0199     -0.1119
+
+**The ranking on the gate is the reverse of the ranking on the flux.** The widest network wins the
+gate by the largest margin of the four and is beaten on flux by the smallest one; the deepest wins
+the gate over the incumbent and is clearly worst on the divergence. Nothing here is noise-level:
+the gate spread is 0.042 against a 0.05 bar, and the div spread is 0.033 on 42.8 M cells.
+
+The mechanism is not subtle once seen. Extra capacity buys a better fit on the 1.5-2.4 % of cells
+where the down-gradient projection is well posed — a set inside which the flux is down-gradient by
+selection — and that fit does not transfer to the other 98 %. A screen run on the gate metric alone
+would have selected 32x32, reported a 7 % improvement, and made the closure worse.
+
+Two habits. **Never select a hyperparameter on a metric computed on a selected subpopulation**,
+even one the plan names as the gate — the gate is a bar to clear, not an objective to optimise
+against. And **when two metrics disagree in RANK rather than in value, that disagreement is the
+finding**; report it instead of picking the metric that gives the cleaner story.
+
+### 2026-08-10 (29) — a test in a manifest and not in a runner is not a test
+
+A cost manifest classified every test file into five groups and a test enforced that no file was
+left unclassified. The runner invoked three of the five. The `scripts` group — 11 files, 96 tests,
+28 seconds — therefore existed on paper and ran nowhere, for two days, and the manifest's own
+header records that this exact discovery had already been made once before: the group was created
+in response to it and the runner was never updated.
+
+It surfaced from the far end. An edit to `coarsen_stream.py` could not be checked because its test
+file would not even collect — `ModuleNotFoundError: No module named 'nn_data'`, a sibling those
+scripts get for free when run as scripts and never get under pytest. A collection error in a file
+nothing runs is invisible indefinitely.
+
+Underneath it was a second layer of the same thing. Running the full suite for the first time in
+two days found it RED on two meta-tests, both of the form "something was added and not
+registered": eight test files missing from the manifest, and an `AdjointConfig` flag added by the
+seam work and never classified. Both tests were doing exactly their job; nobody was reading them.
+
+**A guard has two halves and they fail independently — the assertion, and something that executes
+it.** Adding the first is the satisfying half and is worth nothing alone. When you add a group, a
+manifest or a registry, the same change must add its invocation, and the cheapest way to prove
+the invocation exists is to break the assertion on purpose once and watch something go red.
+
+### 2026-08-10 (30) — `--durations` prints descending, so `tail` keeps the tests you do not care about
+
+Measuring which tests to put in a CI budget, the harness ran the group with `--durations=0` and
+piped it through `tail -80` to keep the log manageable. The list is sorted by cost, descending, so
+the tail is the CHEAPEST 50 entries. The job came back with a 34-minute wall, a clean summary
+line, and no information whatsoever about where the 34 minutes went — while looking like a
+successful measurement, because the numbers it did print were real numbers.
+
+The generalisable form is not about pytest. **When truncating a sorted stream, the interesting end
+is decided by the sort order, not by which end is conventional**, and `head`/`tail` do not know
+which one you meant. A truncation that silently drops the signal is worse than no truncation,
+because the output still parses.
+
+Two habits. Keep the whole output when the whole point of the run is to find the extreme — disk is
+cheaper than a repeated 35-minute job. And when a measurement returns a total with no
+decomposition, treat the missing decomposition as a defect in the harness rather than as a
+property of the thing measured.
+
+### 2026-08-10 (31) — the fix for a drifting registry grew a new registry one level up
+
+CI used to select its test files with a hand-maintained `--ignore` list. It named three of the
+seven sharded suites, so four ran on a 2-core runner. The fix was a cost manifest, one line per
+file, with a test asserting no file is unclassified and a second asserting the workflow reads the
+manifest instead of restating it. Good fix; it held.
+
+Then a sixth group, `ci`, was added. The manifest got it, `VALID_GROUPS` got it, `ci.yml` got it —
+and `run_suite_parallel.sbatch`, which had `SUITE_GROUPS=(unit core2 ice sharding scripts)`
+written out by hand, did not. That array would have run five of six groups, passed every task,
+printed a summary, and left 35 files untested. Nothing was checking it, because the thing that
+checks registries had itself been written as a registry.
+
+**Wherever you replace a hand-maintained list with a derived one, ask what else describes the same
+set.** The answer is rarely zero, and the copy that survives is the one nobody thought of as a
+list — a bash array, a `--array=0-4` range, a `for` loop. The derived version needs the same
+assertion the original got, or the bug simply moves.
+
+One residue is unavoidable and worth naming: a SLURM `--array` range is a static directive and
+cannot read a file. So it stays coupled, and the honest response is a runtime guard that refuses
+to run when `SLURM_ARRAY_TASK_COUNT` disagrees with the manifest, plus a test on the number
+itself. A coupling you cannot remove should be made loud, not left quiet.
+
+### 2026-08-10 (32) — `a[0:len(a)]` is `a`, and the trap only fires in the simplest case
+
+`fesom_jax.adjoint.chunked_grad` takes an `xs_fn(c)` that builds one chunk's forcing, and FREES
+what it returns. That is not tidiness: holding every chunk's forcing on the device is ~0.5 GB per
+simulated day of pure idle residency, and it is the whole reason the device peak used to grow with
+window length (43.1 GB at 1 day rising to 56.9 at 30) instead of staying flat.
+
+Its own test file then wrote the obvious `xs_fn`: slice a cached device array. Four chunks passed.
+Two chunks passed. **One chunk failed**, because a full-width slice of a JAX array is the array
+itself, so the library deleted the caller's buffer and the reverse walk read a deleted array.
+
+Two things generalise. **A function that frees what a callback returns has an aliasing contract,
+and the contract must be stated, not merely survivable** — the failure lands inside the caller's
+own slicing expression as `Array has been deleted`, with nothing pointing at who deleted it, so
+the library now catches that and re-raises a sentence naming the contract. And **the degenerate
+configuration is the one a user tries first**: one chunk, one segment, one rank, one step. A test
+matrix that starts at "a few" and works up will not find it, and neither will the author, who is
+thinking about the interesting case.
+
+### 2026-08-10 (33) — a directory name is not a partition
+
+A plan to split a research project out of a library said: move `scripts/nn_eddy/` and
+`scripts/tests/`. Both names say what is inside them. Reading the tree, three of the 19 files in
+`scripts/tests/` test `scripts/archive/`, `scripts/paper/` and `scripts/write_namelist.py` —
+library code that is not moving. Filtering by directory would have carried them off and left three
+library behaviours untested, and the plan's next step, "delete the `scripts` cost group", would
+have deleted a group that still had files in it.
+
+The same reading corrected two more counts the plan had taken from names: `_run_steps` is called
+14 times in 8 files rather than 8 times in 3, and half those files are library-side; and a
+proposed guard, "no file under `scripts/` imports a private symbol", could never pass, because an
+AST census found 23 such files of which 16 are in-repo library tools with nothing to do with the
+split.
+
+**A directory groups files by where somebody put them, which is a claim about history, not about
+what they depend on.** Before a move, derive the set from the imports and assert the derivation
+covers everything; `git ls-tree` piped into an explicit classification with a coverage assertion
+takes ten minutes and is the difference between a split and a guess. And when a census feeds a
+decision, parse rather than grep: the first pass here reported `from fesom_jax import gm as _gm`
+as a private import three times, because a regular expression cannot see that an alias is not a
+name.
+
+### 2026-08-10 (34) — the fix that made the test cache its inputs also made the test share them
+
+A test file failed inside its group and passed standalone: XLA's `INTERNAL: Failed to materialize
+symbols`, the CPU JIT out of dylib space. Part of the diagnosis was right — the file's `_harness`
+helper built a fresh `chunk_fn` per call, so the library cache keyed on that object never hit and
+every call left a compiled executable resident. The fix memoised the helper.
+
+The helper returned five things and only one of them wanted memoising. It also handed out
+`xs_all`, and one test in the file deliberately passes an aliasing full-width slice of `xs_all` to
+a function documented to FREE what it is given — twice, expecting an intact array the second time,
+because the second call is the escape hatch. Memoising the tuple shared the freed array between
+the two calls, and the test died with `Array has been deleted` raised from inside its own slicing
+expression: exactly the error the test exists to stop a user having to interpret, arriving from
+the test's own bookkeeping instead of from the contract under test.
+
+**Memoise the object whose identity is load-bearing, not the tuple it arrives in.** A cache
+introduced for one member's identity silently gives every other member identity too, and shared
+identity is precisely what a test about resource ownership must not have. The tell was available
+before the run: the helper's own docstring said "fresh `xs_all` each time, because the violating
+call frees it", and the change that broke it did not read that sentence.
+
+And the surrounding trap, which cost the whole round trip: **the re-check job reported `COMPLETED`
+with exit code `0:0` while its log ended `2 failed, 209 passed ... rc=1`.** The script computed the
+return code and did not exit with it. A green scheduler state is a statement about the wrapper, not
+about the tests — the same shape as (a green verdict is not evidence the path ran), one level out.
+Read the log, not the state.
+
+### 2026-08-10 (35) — the in-job product check has now lost the product twice, both times to a literal
+
+`coarsen_stream.sbatch` runs a checker on what the job wrote, so that a contaminated product is a
+failed job rather than a file somebody trains on. It has been defeated twice, identically. First
+the DIRECTORY was written out in the runner; the data root moved and the checker kept looking at
+the old path. Then the NAME was written out; `--source accum` appended an `_accum` suffix in the
+Python and the runner went on building `coarse_ng5_${MONTH}.nc`. Both times the checker found
+nothing, printed "expected product not found; nothing checked", and **exited 0** — so every
+accumulated month ever produced ran with its only safety check switched off, and the runs looked
+exactly like passing runs.
+
+The first was fixed by asking `nn_data` for the directory. The second was fixed the same way, a
+`product_name()` the writer and the runner both call, plus a test asserting the runner contains no
+`coarse_ng5_` literal outside comments. **A "not found" branch that exits 0 converts a broken check
+into a passing run**; if a check cannot find what it is meant to check, that is a failure, not a
+skip. The reason this one survived a fix is that the earlier fix repaired the instance and left
+the shape — half the name was derived and half was spelled out, so the next suffix reopened it.
+
+### 2026-08-10 (36) — the mitigation that went green was the one to reject
+
+Four ways of running the same failing test group, all measured to the end on the resource that
+actually runs out (`/proc/self/maps` against `vm.max_map_count` = 65,530; job 26854740/26854953):
+
+| arm | result | mappings at end | wall |
+|---|---|---|---|
+| clear JAX caches per test module | 211 passed | 32,564 (50 %) | 2331 s |
+| `MALLOC_ARENA_MAX=4` | 211 passed | **63,883 (97.5 %)** | 2609 s |
+| unmodified | SIGABRT | 56,521 | — |
+| `--xla_cpu_parallel_codegen_split_count=8` | SIGABRT | 56,431 | — |
+
+Two arms went green and they are not equivalent. Capping glibc's per-thread arenas frees enough
+mappings that the run *just* finishes, at 97.5 % of a hard ceiling and 12 % slower — one large
+compile from aborting, and certain to break on the next test file anyone adds. Had it been tried
+first, and alone, it would have been adopted and the group would have gone red again a week later
+for a third apparent reason.
+
+**A mitigation is judged by the margin it leaves on the measured resource, not by whether the run
+went green.** That requires knowing which resource, which requires instrumenting before
+theorising: the failure says `Cannot allocate memory` at 17 GB resident of a 300 GB request, and
+every reading that starts from the word "memory" — a bigger `--mem`, a smaller working set, a leak
+hunt — is looking at a number that was never the constraint. Two real bugs were found and fixed on
+the way to this one and neither was the cause; **fixing a real bug is not evidence you fixed THE
+bug**, and both times the group stayed red and the reason was re-diagnosed from scratch.

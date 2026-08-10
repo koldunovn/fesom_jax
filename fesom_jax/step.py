@@ -259,7 +259,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         _bv_gm = jax.lax.stop_gradient(bvfreq) if _adj.freeze_gm_slope else bvfreq
         gm_diag = _ckpt(lambda: gm.gm_diagnostics(mesh, st.T, st.S, _bv_gm, hnode_new, st.helem,
                                                   params, gm_cfg, exch=_exch,
-                                                  Z3d=Z3d_live, zbar3=zbar3_live))()
+                                                  Z3d=Z3d_live, zbar3=zbar3_live,
+                                                  freeze_nn_features=_adj.freeze_nn_features))()
 
     # 3 — pressure-gradient force. zstar ⇒ the shchepetkin density-Jacobian on live geometry
     #     (NO hpressure under zstar — the C uses none); linfs ⇒ the hpressure gradient (byte-identical).

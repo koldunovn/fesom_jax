@@ -99,6 +99,160 @@ Their remedies are all backward-only:
 5. **Configure the forward to be tame** — ECCO's decadal adjoint owes something to a coarse,
    viscous configuration. We inherit this: the student is CORE2, not eddy-resolving.
 
+### 2b. FOR THE PAPER — three freezes, and every one of them is documented ECCO practice
+
+By 2026-08-09 the study carries exactly **three** backward-only freezes. None is an invention
+of ours; each has a direct antecedent in the ocean state-estimation literature, and the two
+GM/Redi-relevant ones come from the SAME paragraph of the ECCO v4 description. This is the
+framing for the methods section: we did not stabilise the adjoint with ad-hoc tricks, we
+adopted the field's standing practice, and we then MEASURED what each cut costs the gradient.
+
+| # | what is frozen | our switch | antecedent |
+|---|---|---|---|
+| 1 | sea-ice **dynamics** — the mEVP momentum solve; thermodynamics, advection, cut-off and the ocean→ice coupling stay differentiated | `IceConfig.adjoint_mode="rheology"` (`--ice rheology`) | Toyoda et al. (2019) approximation, used by Lyu et al. (2023) to build a usable viscous-plastic sea-ice adjoint |
+| 2 | the **mixing coefficients'** dependence on the ocean state — the closure's `Kv`, `Av` are used, their state-derivative is not | `AdjointConfig.freeze_mixing` (`--freeze mix`) | Forget et al. (2015): *"It is only the parametric dependency of these diffusivities and viscosities on the ocean state that is omitted."* |
+| 3 | the **neutral/isopycnal slope's** dependence on the density field — the `1/N²` factor inside the GM block | `AdjointConfig.freeze_gm_slope` (`--freeze slope`) | Forget et al. (2015), same paragraph: *"...by omitting only the parametric dependency of isopycnal slopes on the ocean density field in the adjoint, following a reasoning similar to that of Jiang et al. (2002)."* |
+
+**The quotation that carries (3) is worth giving in full, because it also states the scale of
+the problem and the property that makes the whole NN-GM idea possible:**
+
+> "Until 2008, applications of the MITgcm adjoint were also omitting the Redi (1982) and Gent
+> and Mcwilliams (1990) components, which precluded optimal control of their parameters. This
+> situation was resolved by using a simple clipping scheme for large isopycnal slopes, and by
+> omitting only the parametric dependency of isopycnal slopes on the ocean density field in the
+> adjoint, following a reasoning similar to that of Jiang et al. (2002). Thus, the parametric
+> dependency of turbulent transports on Kgm, Kσ and Kd is **retained** in the adjoint, so that
+> these parameters can be optimally controlled."
+> — Forget et al. (2015), GMD 8, 3071, §"Adjoint modeling"
+
+Two things to draw out in the paper:
+
+* **This blocked GM/Redi in the MITgcm adjoint for two decades**, so an eddy-parameterization
+  adjoint failing exactly here is not a curiosity of our port — it is the known obstacle, and
+  the cure is the known cure. Our contribution is not the cure but the *diagnosis at window
+  scale*: a seven-way bisection localising it to one term on one model day.
+* **The dependency on `Kgm` is RETAINED.** That is the sentence that makes online learning of a
+  GM closure possible at all: the slope's dependence on density is cut, the transport's
+  dependence on the diffusivity is not — and the NN's output IS that diffusivity. Freeze (3)
+  therefore costs us nothing on the path we are training, which is why it is the right cut and
+  not merely a working one.
+
+**And it is cheap, measured, not assumed.** On the 60-day window ending 1961-02-14, freeze (3)
+takes cumulative reverse-pass growth from ×4.363e+07 to ×1.591 and returns dL/dm = −9.41e−01
+against the full model's finite difference of −9.80e−01 — a **3.98 %** residual, ordinary for
+this protocol. Freeze (1) costs ~2 % of backward time and moves the 60-day gradient by 2.98 %.
+Freeze (2) is the one without which nothing beyond two days runs at all.
+
+The forward half of ECCO's recipe — slope clipping, after Cox (1987) — we already have as the
+ODM95 taper, which is what bounds the slope's VALUE. The freeze bounds its DERIVATIVE, and the
+distinction matters: our forward is healthy through the event (its finite difference is a
+perfectly ordinary −0.98) and only the linearisation diverges. That is consistent with the
+well-posedness analysis of the GM–Redi primitive equations, which needs a density
+regularisation precisely because `N` — the denominator of the density slopes — is non-smooth
+(arXiv:2304.03242).
+
+⚠️ Provenance caveat to keep with these numbers: the older per-flag attribution table in
+`AdjointConfig`'s docstring was measured on a 2-day window with no other knob on, where the
+unfrozen scatter is 1.21–1.55/step. It recorded `freeze_gm_slope` as "no effect". It had no
+resolving power there; three of its four "no effect" verdicts are overturned on a window where
+the baseline does not scatter. Quote the 60-day numbers, not the 2-day ones.
+
+### 2c. What else ECCO does that we have NOT taken — three open options
+
+Read from the same §"Adjoint modeling" of Forget et al. (2015). Listed because each is a live
+choice for us, not because any is obviously right.
+
+**(a) ECCO has NO sea-ice adjoint at all — and we are currently doing MORE than they do.**
+
+> "Despite successful adjoint simulations with particular versions of the sea-ice model
+> (Heimbach et al., 2010; Fenty and Heimbach, 2013), the sea-ice adjoint is omitted in ECCO v4
+> due to persisting issues. A pseudo-sea-ice adjoint is introduced instead to account at least
+> for the most basic effect of sea ice — the shielding of seawater from the atmosphere. […] The
+> forward pseudo-component merely tapers air–sea fluxes to zero according to (1−a), where a is
+> the sea-ice fraction computed by the actual forward sea-ice model. This gross, local
+> approximation omits the thermodynamics and dynamics of sea ice, and is never used in forward
+> mode. In the adjoint, it masks out open ocean adjoint sensitivities that do not apply where
+> ice cover is present. A fraction of open ocean sensitivity is preserved at the ice edge, which
+> is physically reasonable and avoids a discontinuity in adjoint fields."
+
+⚠️ **The ice DYNAMICS is already dark on our side too — "just cut the dynamics" is not an
+available further step, it is what we already do.** `ice_step.py:102`:
+`_evp_kw = {"adjoint_subcycles": 0} if cfg.adjoint_mode == "rheology" else {}` — the forward
+runs all 120 mEVP subcycles, the backward unrolls none, so the ice velocity has no gradient path
+at all. (The forward is full mEVP, `whichEVP=1`, not free drift.) The one published alternative
+that keeps EVP rheology in the adjoint — Newtonian damping of the subcycle carry, the
+Kauker-line `eps_N·sigma` term — was implemented, measured and rejected here: amplification
+1.1795 per sweep means that over 120 sweeps the result swings from annihilated at `T_N=6`
+(1e-44) to blown at `T_N=7` (1e+27), cancelling exactly at 6.57, so no single global constant
+is right anywhere.
+
+So the gap to ECCO is NARROWER than "we differentiate the rheology and they do not": dynamics is
+dark in both. What we keep beyond them is ice **thermodynamics, advection, cut-off and the
+ocean→ice coupling**; their pseudo-ice keeps only the flux shielding `(1−a)`.
+
+**Consequence worth stating in the paper:** the two ice-only events on the February window
+(×84.5 on 02-11, ×955 on 02-07) therefore come from the THERMODYNAMICS / advection / coupling
+path, not from the rheology — the rheology has no gradient path in those runs. Our own
+measurement says why ECCO stopped where it did: on
+the 1961-02-14 window ice adds two events of its own (×84.5 on 02-11, ×955 on 02-07) and takes
+the final gradient from +5.69e+06 to −3.26e+14. On CLEAN windows it is worth 0.21–2.98 % of the
+gradient, FD-confirmed, for ~2 % of backward time — so it is not free to drop either.
+**Decision to put to the user, not to settle here:** full ice adjoint (current), ECCO's
+pseudo-ice mask, or no ice (the old default). The pseudo-ice option does not exist in this
+codebase yet; it is a small forward-only component that is never run forward.
+
+**(a2) Free drift in the backward — CONSIDERED AND DECLINED, with the reason.** MITgcm can run
+free-drift ice dynamics (`SEAICE_ALLOW_FREEDRIFT` at compile time, `SEAICEuseFREEDRIFT` at run
+time, with a run-time switch to enable it in adjoint mode only, added in checkpoint 63p, 2012;
+`seaice_dynsolver.F` also uses the free-drift velocity as the LSR initial guess). It looks like
+the obvious way to give our ice velocity a gradient path, since ours currently has none.
+
+**The literature says it is the LESS accurate option, not a stabilisation.** Toyoda et al.
+(2019), quoted by Lyu et al. (2023): including the adjoint of the rheology yields a sensitivity
+to sea-ice velocity *"weaker by O(10²) in the central Arctic Ocean than the adjoint of
+free-drift sea ice dynamics"*. Free drift therefore OVERSTATES the ice-velocity sensitivity by
+about two orders of magnitude — there is no internal stress resisting the motion — and Lyu et
+al. add that *"adjoint-FD shows much stronger sensitivities to wind than adjoint-VP does … in
+the central Arctic Ocean"*. Even their VP adjoint needed extra taming on top: viscosities made
+independent of the strain rate, plus zeroing any local ice-velocity sensitivity more than 50×
+the global mean.
+
+**Cost to build here.** The free-drift solve itself is easy — the ice momentum balance without
+the internal stress term, quadratic ocean drag, a small non-linear 2×2 system per node; ~70
+lines of JAX, differentiable, no 120-sweep scan. The hard part is having free drift in the
+BACKWARD while mEVP runs in the FORWARD: that needs `jax.custom_vjp` around the dynamics, with
+the primal from mEVP and the cotangent from the free-drift Jacobian, which is a day or two plus
+its own correctness story because the value and the gradient then belong to different models.
+Running free drift in both directions instead would change the forward and forfeit the
+bit-identity gate against the Fortran model and the C dumps.
+
+**Verdict: not worth it here.** Our loss is T, S and SSH with no velocities, so the GM
+coefficient's influence on ice drift is remote; the entire ice contribution to the gradient is
+measured at 0.21–2.98 % on clean windows, of which the dynamics share is currently zero and
+would be a fraction; and the pathway it would add is one the literature measures as ~100× too
+strong in the central Arctic in winter — precisely where the February event lives. If it is ever
+wanted, the honest cheap version is free drift in BOTH forward and backward as a standalone
+sensitivity experiment, never as the production configuration.
+
+**(b) Raise the viscosity in the adjoint run.** *"it is common practice to increase viscosity
+parameters to add stability to MITgcm adjoint simulations (Hoteit et al., 2005)"*. We have
+`freeze_vert_visc` — which omits Av's state-dependence — but no knob that raises Av's VALUE for
+a gradient run. Different lever, not implemented.
+
+**(c) Choose forward numerics that are gentler on the adjoint.** ECCO v4 added AB-3 time
+stepping and implicit vertical advection, which *"have a minor impact on the forward model
+solution but provide additional stability also in adjoint mode."* We run AB-2.
+
+⚠️ **(b) and (c) change the FORWARD**, and this project's entire validation rests on the forward
+being bit-for-bit the trajectory gated against the Fortran model and the C dumps. Adopting
+either means re-gating everything and giving up "the forward is untouched", which is what makes
+the three freezes cheap. (a) does not: ECCO's pseudo-component is never used in forward mode.
+
+Also noted, not actionable for us: ECCO's checkpointing is 1458 hand-placed storage directives,
+where we have chunked reverse accumulation with a flat device peak; and they regard including
+the non-linear free surface with a real freshwater flux in the adjoint as a major improvement in
+physical realism, which we already have.
+
 Two results outside the ocean literature are worth keeping:
 
 - **Added viscosity in the adjoint is a closure, not a hack.** In a chaotic flow every
@@ -190,6 +344,38 @@ manual checkpointing at a coarser granularity, not an approximation.
 ---
 
 ## 4. What is implemented
+
+### `fesom_jax.adjoint` — the chunked reverse sweep, promoted out of this script (2026-08-10)
+
+Everything below this section was measured with the sweep written as six closures inside
+`main()` of `scripts/nn_eddy/adjoint_horizon.py`. It is now `fesom_jax.adjoint`:
+`scan_steps` (the in-chunk runner), `chunked_forward`, `chunked_grad`, and a
+`ReverseCheckpoint` protocol that `adjoint_ckpt.Checkpoint` satisfies unchanged.
+
+**Every number in this document still stands, and the reason is exact rather than statistical.**
+The migrated call sites used to write `_run_steps(body, state, xs=sfs, checkpoint=True,
+segments=max(2, round(√N)))` with a `(carry, x) -> (carry, None)` body; they now write
+`scan_steps(one_step, state, sfs)` with a `(state, x) -> state` body. Those lower to a
+**byte-identical jaxpr** (job 26845302):
+
+| chunk length | segments | inner M | remainder tail | old jaxpr | new jaxpr |
+|---|---|---|---|---|---|
+| 6 | 2 | 3 | 0 | 463,237 chars | 463,237 chars |
+| **48** (production) | 7 | 6 | 6 | 290,955 | 290,955 |
+| 50 | 7 | 7 | 1 | 290,955 | 290,955 |
+
+All three shapes matter: `_run_steps` runs `length − S·M` leftover steps as a *separate*
+per-step-checkpointed tail, so a check only at 6 would have proven the equivalence for the branch
+production never takes.
+
+⚠️ **The CORE2 A100 comparison could not settle this, and the reason is a lasting caveat on every
+gradient number in this document.** `adjoint_equivalence.sbatch` compared old against new on the
+assembled model and reported differences of 1.4e-4 to 1.4e-3 — but the *unchanged* code compared
+against itself across two processes spreads by 2.9e-5 to 1.0e-4, with the two versions'
+values interleaving and occasional outliers (job 26844357). Two processes recompile, XLA picks
+kernels by timing them, and scatter-adds on an unstructured mesh are not deterministic. So a
+between-process difference below ~1e-4 on `dL/dm` here means nothing, and `--repeat`, which
+measures two passes through ONE compiled executable, is not the yardstick for it.
 
 ### `fesom_jax.adjoint_stab.AdjointConfig` — per-term, in the model
 

@@ -9,7 +9,7 @@ or a summer one) and measure, as the window length ``N`` grows:
   (a) ``d(window-mean MLD)/d(c_k)`` — its **value and SIGN** (window-mean = the time-average of
       the area-weighted mean MLD over the N-step burst — the climate-relevant observable D1 averages);
   (b) the gradient norm + FD↔AD agreement (the "is the gradient still clean / not yet chaotic" probe);
-  (c) peak backward memory (O(√N) two-level checkpointing via integrate's ``_run_steps`` past N≈20).
+  (c) peak backward memory (O(√N) two-level checkpointing via ``fesom_jax.adjoint.scan_steps`` past N≈20).
 
 **The decisive question.** Does the gradient flip from the FAST (negative / wrong — §3's "less
 mixing") sign to the SLOW (positive / right — D2a's validated "more mixing DEEPENS MLD") sign
@@ -53,7 +53,7 @@ from fesom_jax.ale import AleConfig
 from fesom_jax.calibrate import build_params
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
-from fesom_jax.integrate import _run_steps
+from fesom_jax.adjoint import scan_steps
 from fesom_jax.mesh import load_mesh
 from fesom_jax.params import Params
 from fesom_jax.phc_ic import phc_initial_state
@@ -155,10 +155,12 @@ def main():
             nxt = step(s, mesh, op, None, p, dt=DT, is_first_step=False, step_forcing=sf,
                        forcing_static=fs, ice_cfg=ICE_FROZEN, gm_cfg=GM_CFG, tke_cfg=TKE_CFG,
                        ale_cfg=ALE_CFG)
-            return (nxt, acc + mld_mean(nxt)), None
+            return nxt, acc + mld_mean(nxt)
 
-        fin, acc = _run_steps(body, (state0, jnp.asarray(0.0, jnp.float64)), xs=sfs,
-                              checkpoint=True, segments=segments)
+        # `scan_steps` derives √N from len(sfs) — the same max(2, round(√N)) computed above,
+        # which is now kept only for the results row.
+        fin, acc = scan_steps(body, (state0, jnp.asarray(0.0, jnp.float64)), sfs,
+                              rematerialize=True)
         return acc / n
 
     ck0 = jnp.asarray(float(Params.defaults().tke_c_k), jnp.float64)      # 0.1

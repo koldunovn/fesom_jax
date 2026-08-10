@@ -61,5 +61,17 @@ XLA_FLAGS=--xla_force_host_platform_device_count=4 \
 SHARD=$?
 
 echo ""
-echo "=== SUMMARY: ocean rc=$OCEAN  ice rc=$ICE  shard rc=$SHARD ==="
-[ $OCEAN -eq 0 ] && [ $ICE -eq 0 ] && [ $SHARD -eq 0 ] && echo "ALL GREEN" || echo "FAILURES (see above)"
+# ⚠️ The manifest defines FIVE cost groups and this runner invoked three. The `scripts` group —
+# 11 files, 96 tests, 28 s — had no invocation anywhere, so it never ran; the manifest's own
+# header records the same discovery on 2026-08-08, when the group was created but the runner was
+# not updated to run it. Found again 2026-08-10 from the other end: an edit to coarsen_stream.py
+# could not be checked because its test file would not collect (see scripts/tests/conftest.py).
+echo "=== SCRIPTS group (repo root on sys.path, see scripts/tests/conftest.py) ==="
+SCRIPT_FILES=$(awk 'NF && $1 !~ /^#/ && $1=="scripts" {print $2}' scripts/runs/suite_groups.txt)
+$PY -m pytest $SCRIPT_FILES -q -p no:cacheprovider
+SCRIPTS=$?
+
+echo ""
+echo "=== SUMMARY: ocean rc=$OCEAN  ice rc=$ICE  shard rc=$SHARD  scripts rc=$SCRIPTS ==="
+[ $OCEAN -eq 0 ] && [ $ICE -eq 0 ] && [ $SHARD -eq 0 ] && [ $SCRIPTS -eq 0 ] \
+    && echo "ALL GREEN" || echo "FAILURES (see above)"

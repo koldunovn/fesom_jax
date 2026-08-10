@@ -33,7 +33,9 @@ from __future__ import annotations
 from typing import NamedTuple, Optional
 
 import jax.numpy as jnp
+from jax import lax
 
+from . import gm_nn as _gm_nn
 from . import ops
 from .config import DENSITY_0, G, K_GM_MAX, REDI_KMAX
 from .mesh import Mesh
@@ -233,6 +235,112 @@ def init_redi_gm(mesh: Mesh, bvfreq, hnode_new, fer_tapfac, params, cfg: GMConfi
 
 
 # ============================================================================
+# G.3b — gm_nn_multipliers: the NN seam on the GM/Redi coefficients (NN-GM plan Task 7)
+# ============================================================================
+def gm_nn_multipliers(mesh: Mesh, nn, slope_tapered, sigma_xy, bvfreq, cfg: GMConfig,
+                      Z3d=None, freeze_features: bool = False):
+    """Bounded per-node/level multipliers ``(m_GM, m_Redi)``, each ``(N, nl)``, for the GM and
+    Redi diffusivities — the Arm-A network evaluated on the live state.
+
+    **Where this sits, and why here.** Called from :func:`gm_diagnostics` between
+    :func:`init_redi_gm` and :func:`fer_solve_gamma`, i.e. after the slopes exist and BEFORE the
+    halo exchanges. That placement is a correctness requirement, not a convenience: the features
+    derive from ``sigma_xy``, which is an element→node scatter and therefore INCOMPLETE on halo
+    nodes, so a multiplier computed after the exchange would be wrong exactly on the halo. Doing
+    it pre-exchange means the owner's multiplied ``Ki`` is what gets broadcast, and the halo is
+    right for free. It also sits inside ``step.py``'s ``_ckpt`` block, so the feature tensor and
+    the MLP activations are recomputed in the backward rather than held (a tensor of this size
+    outside the checkpoint would add ~0.3–0.8 GB to a reverse working set already near 35 GiB).
+
+    :func:`init_redi_gm` is left exactly as it is — resolution scaling, depth exponential,
+    ODM95 taper, floors, the ``Redi_Kmin`` additive term — and the network multiplies its
+    OUTPUT. Two consequences worth being explicit about:
+
+    * the multiplier scales through the ``K_GM_min`` floor, so ``m < 1`` can put ``fer_K``
+      below it. That is intended: the floor is a namelist choice about the default closure, not
+      a stability bound, and clamping the NN's output would create exactly the pinned-at-a-bound
+      zero-gradient failure that :func:`fesom_jax.gm_nn.multiplier` exists to avoid;
+    * the GM term stays an APE sink for any weights, because ``m > 0`` always.
+
+    **Staggering.** ``slope_tapered`` is ``(N, nl-1, …)`` on LAYERS while ``bvfreq``/``fer_K``
+    are ``(N, nl)`` on INTERFACES, and there is no single feature array without an explicit
+    rule. The rule here follows this file's own precedent (``fer_tapfac``, gm.py:164): features
+    live on layers, interface quantities are averaged to layer centres, and the below-bottom
+    column is padded. ``Ki`` is layer-centred, so ``m_Redi`` lines up exactly; ``fer_K`` is on
+    interfaces, so ``m_GM[:, k]`` scales the interface above layer ``k`` — a deliberate
+    half-cell offset, far below the closure error given that ``fer_K``'s depth dependence is a
+    500 m-scale exponential, and cheaper than a second network evaluation on interface features.
+
+    The slope feature is ``slope_tapered[..., 2]``, the same tapered slope the operator uses.
+    Note the consequence: where the ODM95 taper saturates (|s| ≫ 2e-3) the feature goes to zero,
+    so the network cannot tell a steep column from a flat one by slope alone — it has to read
+    that regime off small N² together with large |∇_h b|, both of which it gets.
+
+    Returns 1.0 outside the true layer range, so multiplying a masked coefficient is a no-op
+    and the dry lanes contribute no gradient (``d/dm`` there is the coefficient, which is 0).
+
+    The feature assembly itself lives in :func:`gm_nn_features` so that the offline fit can
+    produce the SAME features from a coarse product without a second copy of the list.
+    """
+    feats, lay = gm_nn_features(mesh, slope_tapered, sigma_xy, bvfreq, cfg, Z3d=Z3d)
+    # `freeze_features` (AdjointConfig.freeze_nn_features) — the ECCO "omit the parametric
+    # dependency" move applied to the LEARNED closure: keep the multipliers the network
+    # computes, but stop the backward tracing how the features depended on the ocean state.
+    # `stop_gradient` is the identity forward, so the trajectory is bit-for-bit unchanged and
+    # `nn` still enters `multiplier` below untouched — dL/d(weights), the derivative training
+    # needs, is fully preserved. What is cut is the state feedback that re-injects the GPU's
+    # atomic-scatter nondeterminism at every step (docs/ADJOINT_HORIZON.md 1.2).
+    if freeze_features:
+        feats = lax.stop_gradient(feats)
+    m = _gm_nn.multiplier(nn, feats)                         # (N,nl-1,2) ∈ [1/m_max, m_max]
+    m = jnp.where(lay[..., None], m, 1.0)
+    # pad the below-bottom column with 1.0 (a no-op multiplier), matching Ki's own padding
+    m = jnp.pad(m, ((0, 0), (0, 1), (0, 0)), constant_values=1.0)      # (N,nl,2)
+    return m[..., 0], m[..., 1]
+
+
+def gm_nn_features(mesh: Mesh, slope_tapered, sigma_xy, bvfreq, cfg: GMConfig, Z3d=None):
+    """The Arm-A network's INPUT tensor ``(N, nl-1, n_features)`` and the layer mask.
+
+    Split out of :func:`gm_nn_multipliers` so there is exactly ONE assembly of the feature
+    list — the seam calls it on the live state inside a differentiated step, and the offline
+    fit (``features_from_product.py``, nn_eddy research repository) calls it on fields derived from a
+    coarse teacher product. A second copy would be a train/deploy skew that no test on either
+    side alone could see, which is why :func:`fesom_jax.gm_nn.column_features` says every
+    producer must come through it; this function is the layer above that, holding the
+    staggering, the masking and the choice of source field for each entry.
+
+    Everything about WHICH fields and WHY is documented on :func:`gm_nn_multipliers`.
+    """
+    nl, N = mesh.nl, mesh.nod2D
+    lay = mesh.node_layer_mask[:, : nl - 1]                  # (N,nl-1) true layer range
+
+    # --- features, all layer-collocated (N, nl-1) ----------------------------
+    slope = slope_tapered[..., 2]                            # |s|·√c1, the operator's own slope
+    n2 = 0.5 * (bvfreq[:, : nl - 1] + bvfreq[:, 1:nl])       # interfaces → layer centre
+    sig = sigma_xy[:, : nl - 1, :]
+    # |∇_h b| = (g/ρ0)·|∇_h σ|: reuses sigma_xy — no second gradient computation.
+    grad_b = (cfg.g / cfg.rho_ref) * _safe_sqrt(sig[..., 0] ** 2 + sig[..., 1] ** 2)
+    f = jnp.broadcast_to(mesh.coriolis_node[:, None], (N, nl - 1))   # signed: hemisphere matters
+    zmid = mesh.Z[None, :] if Z3d is None else Z3d[:, : nl - 1]
+    depth = jnp.abs(jnp.broadcast_to(zmid, (N, nl - 1)))
+    bot = jnp.abs(mesh.depth)[:, None]                       # bathymetry magnitude (N,1)
+    safe_bot = jnp.where(bot > 0.0, bot, 1.0)                # double-where: no ∞ in the backward
+    depth_frac = jnp.where(bot > 0.0, depth / safe_bot, 0.0)
+    # strain: 0.0 for now — the invariant needs the element velocities, which this block does
+    # not receive. The column stays in the layout so weights trained now survive if strain
+    # lands at the D2 screen; see gm_nn.column_features.
+    strain = jnp.zeros((N, nl - 1), jnp.float64)
+
+    # Mask the PHYSICAL fields, not the assembled features: a dry lane holds whatever the
+    # masked kernels left there, and while `multiplier` is bounded for any finite input, a NaN
+    # in one lane poisons the entire reverse pass (the masked-NaN rule).
+    feats = _gm_nn.column_features(
+        *[jnp.where(lay, x, 0.0) for x in (slope, n2, grad_b, f, depth, depth_frac, strain)])
+    return feats, lay
+
+
+# ============================================================================
 # G.4 — fer_solve_gamma (fesom_gm.c:492-612)
 # ============================================================================
 def fer_solve_gamma(mesh: Mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg: GMConfig,
@@ -334,7 +442,8 @@ class GMDiag(NamedTuple):
 
 
 def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
-                   cfg: GMConfig, exch=None, Z3d=None, zbar3=None) -> GMDiag:
+                   cfg: GMConfig, exch=None, Z3d=None, zbar3=None,
+                   freeze_nn_features: bool = False) -> GMDiag:
     """Run the full GM/Redi diagnostic chain (G.2-G.4) from the ocean state:
     ``sw_alpha_beta → sigma_xy → neutral_slope → init_redi_gm → fer_solve_gamma →
     fer_gamma2vel``. Returns the fields the bolus advection (G.5) and Redi terms
@@ -376,6 +485,26 @@ def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
     _, slope_tapered, fer_tapfac = compute_neutral_slope(mesh, sigma_xy, bvfreq, cfg)
     fer_K, Ki, fer_C, _ = init_redi_gm(mesh, bvfreq, hnode_new, fer_tapfac, params, cfg,
                                        zbar3=zbar3)
+
+    # --- the Arm-A NN seam (NN-GM plan Task 7). ``params.gm_nn is None`` ⇒ a PYTHON-level
+    # branch, so the default path has no trace change whatsoever and stays byte-identical to the
+    # pre-seam model (the `gm_cfg is None` precedent below). A zero-last-layer NN ⇒ multipliers
+    # ≡ 1 ⇒ still bit-identical (`fer_K·1 == fer_K`) — a separate, weaker claim: it says the
+    # arithmetic is a no-op, not that the graph is untouched. Both are tested.
+    #
+    # Placed HERE, between the builder and the consumers, and BEFORE the halo exchanges below:
+    # the features derive from `sigma_xy` (incomplete on halo nodes), so multiplying after the
+    # exchange would corrupt the halo. `fer_K`'s only consumer is `fer_solve_gamma` just below;
+    # every `Ki` consumer (`gm_redi.diff_ver_part_redi_expl` / `diff_part_hor_redi` /
+    # `k33_augmentation`, all via `step.py`) reads it from the `GMDiag` returned here, so one
+    # multiplication covers them all. Audited by grep — list in tests/test_gm_nn_seam.py. ---
+    nn = getattr(params, "gm_nn", None)
+    if nn is not None:
+        m_gm, m_redi = gm_nn_multipliers(mesh, nn, slope_tapered, sigma_xy, bvfreq, cfg,
+                                        Z3d=Z3d, freeze_features=freeze_nn_features)
+        fer_K = fer_K * m_gm
+        Ki = Ki * m_redi
+
     fer_gamma = fer_solve_gamma(mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg,
                                 zbar3=zbar3, Z3d=Z3d)
     fer_gamma = exch(fer_gamma, "nod")                 # INTRA: gathered at HALO vertices below
