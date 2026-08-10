@@ -494,6 +494,27 @@ def write_output(path, month, times, states, fluxes, weights, n_coarse, n_lev):
     print(f"[out] wrote {path}")
 
 
+def product_name(month: str, source: str = "snap", max_levels=None) -> str:
+    """The file name this script writes, as a function of the arguments it was given.
+
+    ⚠️ Exists so that NOTHING ELSE spells it out. `coarsen_stream.sbatch` runs
+    `check_coarse_product.py` on what the run produced, which is the only reason a contaminated
+    product is a failed job rather than a file somebody trusts — and it has now lost track of the
+    name twice, the same way both times. First when the data root moved to `ba1583` and the
+    checker kept looking under `ab0995` (fixed by asking `nn_data` for the directory). Then when
+    `--source accum` added an `_accum` suffix here and the runner went on building
+    `coarse_ng5_${MONTH}.nc`, so every accumulated month printed "expected product not found;
+    nothing checked" and exited 0. The two months on disk at `coarse_accum/` were produced under
+    that hole.
+
+    The runner now calls this function instead of reconstructing the name, so a third suffix
+    cannot reopen it."""
+    tag = f"_SMOKE{max_levels}lev" if max_levels else ""
+    if source == "accum":
+        tag += "_accum"
+    return f"coarse_ng5_{month}{tag}.nc"
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--month", required=True, help="e.g. 1958_01")
@@ -575,11 +596,8 @@ def main():
     # transpose: per-variable list over records
     states_t = [[s[i] for s in states] for i in range(len(STATE_NAMES))]
     fluxes_t = [[f[i] for f in fluxes] for i in range(len(FLUX_NAMES))]
-    tag = f"_SMOKE{args.max_levels}lev" if args.max_levels else ""
-    if args.source == "accum":
-        tag += "_accum"
-    write_output(args.out / f"coarse_ng5_{args.month}{tag}.nc", args.month, times,
-                 states_t, fluxes_t, weights, rmap.n_coarse,
+    write_output(args.out / product_name(args.month, args.source, args.max_levels),
+                 args.month, times, states_t, fluxes_t, weights, rmap.n_coarse,
                  int(rmap.coarse_depth.shape[0]) - 1)
     return 0
 

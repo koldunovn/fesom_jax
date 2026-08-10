@@ -39,22 +39,33 @@ case " $* " in
   *" --verify-conservation "*|*" --max-levels "*) ;;
   *)
     if [ "$rc" -eq 0 ]; then
-        # ⚠️ ASK THE CODE where it writes; never hardcode it here. This line used to read
-        # /work/ab0995/a270088/nn_eddy/coarse. After the data root moved to ba1583 (behind
-        # nn_data.DATA_ROOT) the products went to the new path while the checker kept looking
-        # at the old one, found nothing, printed "WARNING: ... nothing checked" and exited 0 —
-        # so the whole point of running the checker in-job, that a contaminated product is a
-        # FAILED JOB rather than a file somebody trusts, was silently off. Jobs
-        # 26807590-26807598 ran with that hole and were checked by hand afterwards.
+        # ⚠️ ASK THE CODE where it writes AND what it calls the file; never spell either out
+        # here. Both halves have already been got wrong, the same way:
+        #
+        #   * the DIRECTORY was hardcoded as /work/ab0995/a270088/nn_eddy/coarse. After the data
+        #     root moved to ba1583 (behind nn_data.DATA_ROOT) the products went to the new path
+        #     while the checker kept looking at the old one. Jobs 26807590-26807598.
+        #   * the NAME was hardcoded as coarse_ng5_${MONTH}.nc. `--source accum` appends an
+        #     `_accum` suffix, so every accumulated month checked nothing. The two months at
+        #     coarse_accum/ were produced under that hole.
+        #
+        # Both printed "WARNING: ... nothing checked" and exited 0, so the whole point of running
+        # the checker in-job — that a contaminated product is a FAILED JOB rather than a file
+        # somebody trusts — was silently off, and looked exactly like a passing run.
         OUTDIR=$("$PY" -c "import sys; sys.path.insert(0, 'scripts/nn_eddy'); \
 import nn_data; print(nn_data.COARSE_DIR)")
         [ -z "$OUTDIR" ] && { echo "FATAL: could not resolve nn_data.COARSE_DIR"; exit 3; }
+        SOURCE=snap
         for i in $(seq 1 $#); do
             eval "a=\${$i}"; eval "b=\${$((i+1))}"
             [ "$a" = "--out" ] && OUTDIR="$b"
             [ "$a" = "--month" ] && MONTH="$b"
+            [ "$a" = "--source" ] && SOURCE="$b"
         done
-        PROD="$OUTDIR/coarse_ng5_${MONTH}.nc"
+        NAME=$("$PY" -c "import sys; sys.path.insert(0, 'scripts/nn_eddy'); \
+import coarsen_stream; print(coarsen_stream.product_name('$MONTH', '$SOURCE'))")
+        [ -z "$NAME" ] && { echo "FATAL: could not resolve coarsen_stream.product_name"; exit 3; }
+        PROD="$OUTDIR/$NAME"
         if [ -f "$PROD" ]; then
             echo "=== checking $PROD ==="
             "$PY" scripts/nn_eddy/check_coarse_product.py "$PROD"

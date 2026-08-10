@@ -478,3 +478,28 @@ def test_a_short_record_is_detected_by_the_control_identity(cs, tmp_path):
     good = cs.record_sample_deficit(teacher, "1961_01", 1, k=2)
     assert short == pytest.approx(-1.0 / N, rel=1e-6), short
     assert abs(good) < 1e-12, good
+
+
+def test_the_runner_asks_the_code_for_the_product_name(cs):
+    """The in-job check must look for the file the run actually wrote, for EVERY `--source`.
+
+    This is a registry-drift test, not a naming test. `coarsen_stream.sbatch` runs
+    `check_coarse_product.py` on the product, which is the only reason a contaminated file is a
+    failed job rather than something someone trains on. It has lost the path twice, both times by
+    spelling out something the Python owns: once the directory (data root moved to `ba1583`), once
+    the name (`--source accum` appends `_accum`). Both failures printed
+    "expected product not found; nothing checked" and exited 0, so the run looked green with the
+    check switched off.
+
+    So: the suffix logic lives in ONE function, and the runner may not contain the stem at all."""
+    assert cs.product_name("1961_03") == "coarse_ng5_1961_03.nc"
+    assert cs.product_name("1961_03", "snap") == "coarse_ng5_1961_03.nc"
+    assert cs.product_name("1961_03", "accum") == "coarse_ng5_1961_03_accum.nc"
+    assert cs.product_name("1961_03", "accum", 5) == "coarse_ng5_1961_03_SMOKE5lev_accum.nc"
+
+    sbatch = (_ROOT / "scripts" / "nn_eddy" / "coarsen_stream.sbatch").read_text()
+    body = "\n".join(ln for ln in sbatch.splitlines() if not ln.lstrip().startswith("#"))
+    assert "coarse_ng5_" not in body, \
+        "coarsen_stream.sbatch spells out the product name again; call product_name() instead"
+    assert "product_name(" in body, \
+        "coarsen_stream.sbatch no longer asks coarsen_stream for the product name"
