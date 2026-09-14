@@ -21,8 +21,10 @@ the **prognostic** post-thermo ``a_ice`` and the EVP ``u_ice`` (Phase 5 used the
 
 from __future__ import annotations
 
+import dataclasses
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 
 from . import forcing as _forcing
@@ -31,6 +33,13 @@ from .config import VCPW
 from .ice import IceConfig
 from .mesh import Mesh
 from .state import State
+
+
+# The prognostic ice state a step carries (State's sea-ice block, state.py) — what
+# adjoint_mode="prescribed" cuts at entry and exit. Kept next to IceStepOut so the two lists
+# cannot drift apart unnoticed: every name here is also an IceStepOut field.
+_ICE_PROGNOSTIC = ("a_ice", "m_ice", "m_snow", "u_ice", "v_ice", "t_skin",
+                   "sigma11", "sigma12", "sigma22")
 
 
 class IceStepOut(NamedTuple):
@@ -77,6 +86,25 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     # runs at the wrong timestep ⇒ the ice evolves 3.6× too slowly ⇒ a high-lat climate bias.
     # Deriving it from dt here makes the desync impossible regardless of the passed cfg.
     cfg = cfg._replace(ice_dt=cfg.ice_ave_steps * dt)
+
+    # IceConfig.adjoint_mode="prescribed": the ice TRAJECTORY is taken as given. The nine
+    # prognostic ice fields carry no tangent into this step (below) and none out of it (at the
+    # exit, before the stress blend and the shortwave gate), so the ice-state recurrence — whose
+    # gain at an advancing ice edge is unbounded (a x462 jump in the a_ice tangent in one day,
+    # mhw_optimals PAPER_NUMBERS 4.6) — is cut, while every flux the ocean receives stays
+    # differentiable in the ocean state and the atmosphere: the open-water bulk formulae, the
+    # under-ice basal flux, the ice-ocean stress at the prescribed ice velocity, the shortwave
+    # gate at the prescribed cover. This is the sea-ice treatment of the ECCO adjoint when the
+    # ice package's adjoint is disabled: the ice MODEL is not differentiated, the fluxes are.
+    # Contrast "frozen", which stop_gradients the whole IceStepOut — fluxes included — and so
+    # zeroes dJ/d(atmosphere) identically and removes the SST -> flux damping (measured: the
+    # forcing gradient 2.4e-03 -> 0.0 exactly, the T gradient +16 % over 30 d). The forward is
+    # untouched: stop_gradient is the identity.
+    prescribed = cfg.adjoint_mode == "prescribed"
+    if prescribed:
+        _sg = jax.lax.stop_gradient
+        state = dataclasses.replace(
+            state, **{f: _sg(getattr(state, f)) for f in _ICE_PROGNOSTIC})
     open_water = fs.open_water
     geo_lat = jnp.asarray(mesh.geo_coord_nod2D)[:, 1]
 
@@ -99,7 +127,9 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     # of them in the backward, so ice thermodynamics, advection, cut-off and the ocean-to-ice
     # coupling stay differentiated while only the ice VELOCITY is dark. Measured: this alone is
     # what tames the ice adjoint (docs/ADJOINT_HORIZON.md).
-    _evp_kw = {"adjoint_subcycles": 0} if cfg.adjoint_mode == "rheology" else {}
+    # "prescribed" takes the same cut: its u_ice/v_ice leave the step without a tangent anyway,
+    # so unrolling the subcycles in the backward would only cost memory.
+    _evp_kw = {"adjoint_subcycles": 0} if cfg.adjoint_mode in ("rheology", "prescribed") else {}
     u_ice, v_ice, s11, s12, s22 = _evp(
         cfg, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow,
         u_ice=state.u_ice, v_ice=state.v_ice,
@@ -134,6 +164,14 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     a_out = _exch(th.a_ice, "nod")
     m_out = _exch(th.m_ice, "nod")
     ms_out = _exch(th.m_snow, "nod")
+    t_skin_out = th.t_skin
+    if prescribed:
+        # The exit half of "prescribed": the updated ice state leaves without a tangent, so the
+        # stress blend and the shortwave gate below see the prescribed cover, and the next step's
+        # entry cut has nothing to cut. th's FLUX outputs (flx_h, flx_fw, evaporation, ...) are
+        # deliberately not touched — they are what "the fluxes stay differentiable" means.
+        a_out, m_out, ms_out, u_ice, v_ice, t_skin_out, s11, s12, s22 = (
+            _sg(x) for x in (a_out, m_out, ms_out, u_ice, v_ice, t_skin_out, s11, s12, s22))
 
     icef = ice_coupling.ice_oce_fluxes(
         srf.salt, th.flx_fw, th.flx_h, sf.Ssurf_month, fs.runoff_node,
@@ -184,5 +222,5 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         virtual_salt=icef.virtual_salt, relax_salt=icef.relax_salt,
         real_salt_flux=icef.real_salt_flux,
         a_ice=a_out, m_ice=m_out, m_snow=ms_out,
-        u_ice=u_ice, v_ice=v_ice, t_skin=th.t_skin,
+        u_ice=u_ice, v_ice=v_ice, t_skin=t_skin_out,
         sigma11=s11, sigma12=s12, sigma22=s22)

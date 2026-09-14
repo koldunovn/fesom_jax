@@ -121,10 +121,25 @@ class IceConfig(NamedTuple):
     #                 changes ice growth, which changes the surface heat and salt fluxes back
     #                 into the ocean.
     #
+    #   "prescribed": the ice TRAJECTORY is given. The nine prognostic ice fields carry no
+    #                 tangent into a step and none out of it, so the ice-state recurrence is
+    #                 cut — including its unbounded gain at an advancing ice edge, which
+    #                 "rheology" keeps (a x462 jump in the a_ice tangent in one day at the
+    #                 Okhotsk edge, 2014-01-04, mhw_optimals) — while every flux the ocean
+    #                 receives stays differentiable in the ocean state and the atmosphere. What
+    #                 the ECCO adjoint does when the sea-ice package's adjoint is disabled. Use
+    #                 this, not "frozen", when the ice must be excluded but dJ/d(forcing) and
+    #                 the SST -> flux feedback are wanted.
+    #
     #   "frozen"    : stop_gradient the WHOLE ice update, so no gradient flows through ice at
-    #                 all. Heavier-handed than needed but the most conservative option, and the
-    #                 one every published adjoint sea-ice study fell back to before free-drift
-    #                 approximations existed.
+    #                 all. ⚠️ "The whole ice update" is IceStepOut, and that carries the surface
+    #                 fluxes: under "frozen" the gradient with respect to the ATMOSPHERE is
+    #                 identically zero and the SST -> flux damping is gone from the adjoint
+    #                 (measured over 30 d: the forcing gradient 2.4e-03 -> 0.0 exactly, the
+    #                 temperature gradient +16 %). A calibration whose controls are ocean
+    #                 parameters can live with that; a forcing sensitivity cannot. The most
+    #                 conservative option, and the one every published adjoint sea-ice study
+    #                 fell back to before free-drift approximations existed.
     #
     #   "exact"     : differentiate everything. **Returns NaN on realistic configurations.** The
     #                 subcycled EVP/mEVP momentum solve is a fixed-point iteration whose reverse

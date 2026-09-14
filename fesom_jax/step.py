@@ -204,15 +204,21 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             # values are bit-identical to "exact"; only the gradient skips the ice. Tames the
             # rheology adjoint blow-up for ocean-parameter calibration (drops the ice-mediated
             # sensitivity). See IceConfig.adjoint_mode; "free_drift" is the planned upgrade.
+            # ⚠️ "frozen" cuts the FLUXES too: IceStepOut carries stress_surf/bc_T/bc_S/
+            # heat_flux, so under it dJ/d(atmosphere) is identically zero and the SST -> flux
+            # feedback is gone from the adjoint. For "the ice is given, the fluxes are live"
+            # use "prescribed" (handled inside ice_surface_step, at the ice state's entry and
+            # exit).
             if ice_cfg.adjoint_mode == "frozen":
                 ice_out = jax.tree.map(jax.lax.stop_gradient, ice_out)
-            elif ice_cfg.adjoint_mode not in ("exact", "rheology"):
-                # "rheology" is handled inside ice_surface_step (it unrolls zero rheology
-                # subcycles in the backward); nothing to do to the ice output here.
+            elif ice_cfg.adjoint_mode not in ("exact", "rheology", "prescribed"):
+                # "rheology" and "prescribed" are handled inside ice_surface_step; nothing to
+                # do to the ice output here.
                 raise NotImplementedError(
                     f"IceConfig.adjoint_mode={ice_cfg.adjoint_mode!r} not implemented; use "
-                    "'exact', 'rheology' (freeze only the momentum solve — recommended) or "
-                    "'frozen' (freeze the whole ice update).")
+                    "'exact', 'rheology' (freeze only the momentum solve — recommended), "
+                    "'prescribed' (ice state given, fluxes differentiated) or 'frozen' "
+                    "(freeze the whole ice update, fluxes included).")
             stress_surf = ice_out.stress_surf
             bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
             heat_flux, water_flux = ice_out.heat_flux, ice_out.water_flux
