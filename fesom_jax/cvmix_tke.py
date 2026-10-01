@@ -277,7 +277,8 @@ def mixing_length(tke_old, Nsqr, dzw, *, is_surf, is_bot, is_interior, is_wet_if
 def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
                          *, c_k, c_eps, cd, alpha_tke, mxl_min, tke_min, kappaM_max,
                          dt, with_diags=False, cuts=frozenset(), adj=None, n2_raw=None,
-                         ice_conc=None, lat=None, turner=None):
+                         ice_conc=None, lat=None, turner=None,
+                         iw_diss=None, alpha_c=None, E_iw=None):
     """The classical-TKE column solver, vectorized over nodes. Mirrors
     ``fesom_cvmix_integrate_tke`` (``fesom_cvmix_tke.c:141-404``) for the reference config
     (``only_tke``, Neumann BCs, ``mxl_choice=2``; the gate-only IDEMIX/Langmuir/Dirichlet
@@ -329,9 +330,44 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
     ``AdjointConfig.tke_pr_lat_cut``). ``turner`` (``[N, nl]`` degrees or ``None``): the Turner
     angle at the interfaces, read only by the diffusive-regime Prandtl cut (``adj.pr_tu``,
     ``AdjointConfig.tke_pr_tu_cut``).
+
+    IDEMIX coupling (``.not.only_tke``, keyword-only, ``[N, nl]`` each): ``iw_diss`` (the
+    internal-wave dissipation, m²/s³, ≥0), ``alpha_c`` (s/m²) and ``E_iw`` (the CURRENT wave
+    energy, m²/s²). All three ``None`` ⇒ the ``only_tke`` path above, unchanged; all three
+    given ⇒ the three Fortran insertions: the Rinum cap (``cvmix_tke.F90:710-712``), the
+    forcing ``forc += iw_diss`` (``:741-744``) and the ``only_tke``-gated ``tke_min`` floor
+    NOT applied (``:866-869``), with ``Tiwf = iw_diss`` under ``with_diags`` (``:898``).
+    Exactly one or two given raises ``ValueError``. The surface buoyancy production stays the
+    constant zero of ``:733`` (the host has no ``forc_rho_surf``). Mirrors
+    ``idemix_jax.fesom_adapter.tke_step_with_idemix`` operation for operation.
+
+    The derivative cuts act on the coupled path at the same terms: the Rinum cap
+    ``KappaM·N²/max(1e-12, alpha_c·E_iw²)`` reads the same ``KappaM`` (after the ``tke.km_e`` /
+    ``tke_kme_*`` cuts) and the same ``N²`` (after ``tke.n2`` and the ``tke_n2_cut`` /
+    ``tke_n2_band`` buoyancy-N² cut) as the rest of Part 2, and every
+    Prandtl cut (``tke.pr``, ``tke_pr_cut`` / ``_ratio`` / ``_raw_cut`` / ``_ice_cut`` /
+    ``_lat_cut`` / ``_tu_cut``) wraps the Prandtl number computed from the capped Rinum.
+    ``tke_pr_mode="at"`` is REFUSED with the IDEMIX inputs (``ValueError``): it differentiates
+    the uncapped :func:`_prandtl_fn`, so its backward would silently be the uncapped model's. The
+    mixing-length cuts are unchanged (IDEMIX does not enter the mixing length). ``iw_diss`` has
+    no cut of its own. The near-floor cut ``tke_floor_cut`` masks ``tke_old`` as without IDEMIX;
+    the coupled path has no ``tke_min`` floor, so it is a plain derivative mask there.
     """
     if cuts:
         cuts = AdjointConfig(diag_cuts=cuts).validate().diag_cuts   # coerce + reject unknown
+    n_idemix = sum(x is not None for x in (iw_diss, alpha_c, E_iw))
+    if n_idemix not in (0, 3):
+        raise ValueError(
+            "IDEMIX coupling needs ALL of iw_diss, alpha_c, E_iw (or none of them); "
+            f"got {n_idemix} of 3")
+    coupled = n_idemix == 3
+    if coupled and adj is not None and adj.pr_n2_star is not None and adj.pr_mode == "at":
+        # _prandtl_fn has no IDEMIX Rinum cap: its straight-through derivative would be the
+        # uncapped model's in every cell, silently
+        raise ValueError(
+            "tke_pr_mode='at' is not supported with IDEMIX coupling (iw_diss/alpha_c/E_iw): "
+            "its derivative is that of the uncapped Prandtl function. Use tke_pr_mode='cut' "
+            "(or None) with tke_pr_cut, or drop the IDEMIX inputs.")
     nl = tke_old.shape[-1]
     k = jnp.arange(nl, dtype=jnp.int32)[None, :]            # [1, nl]
     nlev_c = jnp.asarray(nlev).astype(jnp.int32)[:, None]   # [N, 1]
@@ -390,6 +426,9 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
         else:                                                           # "ke_diff"
             KappaM_ke = KappaM_cut
     Rinum = Nsqr_b / jnp.maximum(Ssqr_p, 1.0e-12)                       # :705
+    if coupled:   # IDEMIX Rinum cap (:710-712): wave-dissipation estimate alpha_c*E_iw^2
+        Rinum = jnp.minimum(
+            Rinum, KappaM * Nsqr_b / jnp.maximum(1.0e-12, alpha_c * E_iw**2))
     prandtl = jnp.maximum(1.0, jnp.minimum(10.0, TKE_C66 * Rinum))      # :717
     n2_star = None if adj is None else adj.pr_n2_star
     pr_ratio = None if adj is None else adj.pr_ratio
@@ -420,6 +459,8 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
     P_diss_v = dcut(cuts, "tke.buoy", Nsqr_b * KappaH)                   # :731-732
     P_diss_v = jnp.where(is_surf, 0.0, P_diss_v)   # :733 = −forc_rho_surf·g/ρ (≡0 here)
     forc = K_diss_v - P_diss_v                                          # :734
+    if coupled:   # IDEMIX: internal-wave dissipation forces TKE on every wet interface (:741-744)
+        forc = forc + iw_diss
     # surface Neumann flux cd·forc_surf^{3/2}/dzt[0] added to forc[0] (:793). The `dzt>0` guard
     # (mirroring `dzt_s` in Part 4) keeps the denom finite on a degenerate/padding column whose
     # dzt[0]=0. The driver only sets dz_trr[0]=hnode/2 where its `is_surf=(k==nzmin)` fires, but a
@@ -480,7 +521,10 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
 
     # ---- Part 5: floor (:856-869) ----
     tke_unrest = tke_solve                                              # :860 pre-floor save
-    tke_new = jnp.maximum(tke_solve, tke_min)                          # :867-869 only_tke
+    if coupled:   # IDEMIX on: no tke_min floor (guarded by `if (only_tke)`, :866-869)
+        tke_new = tke_solve
+    else:
+        tke_new = jnp.maximum(tke_solve, tke_min)                      # :867-869 only_tke
     tke_new = jnp.where(is_wet_iface, tke_new, 0.0)                     # dry stays 0
 
     KappaM = jnp.where(is_wet_iface, KappaM, 0.0)
@@ -506,6 +550,8 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
         tke_old, tke_solve, tke_new, tke_unrest, K_diss_v, P_diss_v,
         a_dif, b_dif, c_dif, mxl, prandtl, surf_flux, sqrttke, c_eps, mxl_s, dt,
         is_surf=is_surf, is_bot=is_bot, is_interior=is_interior, is_wet_iface=is_wet_iface)
+    if coupled:   # :898 tke_Tiwf = iw_diss (the placeholder 0 above is the only_tke value)
+        diags["Tiwf"] = jnp.where(is_wet_iface, iw_diss, 0.0)
     return tke_new, KappaM, KappaH, diags
 
 
