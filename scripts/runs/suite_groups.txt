@@ -260,3 +260,4 @@ sharding_slow scripts/tests/test_cbar_ice_sharded_fd.py
 # Classified 2026-10-28 (idemix-jax host patches, the IDEMIX coupling): one line per patch test file.
 # Ported onto d7e4e5d 2026-11-26: the files land in `unit` unmeasured (the header rule above), not in `ci`.
 unit fesom_jax/tests/test_tke_idemix_cuts.py
+unit fesom_jax/tests/test_idemix_refusals.py

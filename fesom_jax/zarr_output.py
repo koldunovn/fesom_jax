@@ -353,7 +353,11 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     Returns ``(State, meta)`` where ``State`` has folded sharded leaves ready for
     ``run_steps_sharded`` and ``meta`` carries ``step`` / ``calendar_date`` / ``dt_stage``
     (+ the global counts). ``devices`` overrides the placement devices (default: the first
-    ``new_part.npes`` of :func:`jax.devices`)."""
+    ``new_part.npes`` of :func:`jax.devices`).
+
+    A restart written before the IDEMIX ``iwe`` leaf existed (the pinned host) has no ``iwe``
+    dataset: it loads with ``iwe = 0`` — the IDEMIX cold start, Fortran ``iwe_n(:,:) = 0``.
+    Every OTHER leaf stays mandatory (a missing one raises ``KeyError``)."""
     import zarr
     from . import halo
     from .integrate_sharded import _fold
@@ -393,7 +397,10 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
             # writes them
             out[name] = None
             continue
-        g = reconstruct_global(out_dir, name)            # [n_global, …] host numpy
+        if name == "iwe" and name not in root:          # pre-IDEMIX restart ⇒ cold-start iwe
+            g = np.zeros_like(reconstruct_global(out_dir, "tke"))
+        else:
+            g = reconstruct_global(out_dir, name)        # [n_global, …] host numpy
         n0 = g.shape[0]
         if n0 == new_part.nod2D:
             ml, L = new_part.myList_nod2D, Lmax["nod"]

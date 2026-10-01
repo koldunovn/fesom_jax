@@ -231,6 +231,9 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         raise NotImplementedError("the coupled ocean uses the CG SSH solve (ssh.split_explicit is not wired)")
     if cfg.dt_ramp:
         raise NotImplementedError("dt_ramp is not supported by the coupled ocean")
+    if getattr(cfg, "idemix", None) is not None:
+        raise ValueError("idemix is not wired into the coupled ocean (no Params.idemix, IDEMIX "
+                         "forcing or lateral operator reach its runner); set idemix to null")
     _env_setup(cfg, sss_restoring)
     if cpl_cavity is None:
         cpl_cavity = getattr(cfg, "cavity", None) is not None

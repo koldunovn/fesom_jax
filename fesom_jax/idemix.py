@@ -46,7 +46,9 @@ the wet bottom interface ``nln+1`` — the layer ABOVE it, ``areasvol(nz-1)`` (1
 ``area_if[:, k] = areasvol[:, max(k-1, uln0)]`` on the wet range, 0 elsewhere. So the wet
 bottom interface, where the bottom tidal forcing is deposited, has volume and exchanges energy
 laterally. The neighbor arrays index the GLOBAL mesh, so the lateral step is dense/1-device
-only (``sharded=True`` raises).
+only (``sharded=True`` raises). The sharded runners take the per-device form
+(:func:`partition_idemix_inputs`, neighbors mapped to local lanes), which is exact on ONE shard
+and refused on more (halo lanes would go stale between the lateral sub-iterations).
 """
 
 from __future__ import annotations
@@ -112,6 +114,28 @@ def _great_circle(lon1, lat1, lon2, lat2):
     return 2.0 * np.arcsin(np.sqrt(np.clip(s, 0.0, 1.0)))
 
 
+def check_no_cavity_mesh(mesh) -> None:
+    """Raise ``ValueError`` if ``mesh`` has ice-shelf cavities (a node with
+    ``ulevels_nod2D > 1``), whatever the run's ``cavity`` config says: upstream accepts a cavity
+    mesh with ``cavity: null``, and IDEMIX is wired and verified for meshes without cavities only
+    (no IDEMIX + cavity reference, and the TKE cavity column shift does not move the IDEMIX
+    fields). Host-side NumPy on the static mesh levels, wherever the mesh is concrete on the
+    IDEMIX path: :func:`build_lateral_operator`, the run config's ``idemix_inputs``, the run
+    entry, and the column step when its mesh is not traced (:func:`_is_traced`)."""
+    n = int(np.count_nonzero(np.asarray(mesh.ulevels_nod2D) > 1))
+    if n:
+        raise ValueError(
+            f"IDEMIX is not supported on a mesh with ice-shelf cavities: {n} node(s) have "
+            "ulevels_nod2D > 1 (IDEMIX is wired and verified for meshes without cavities only)")
+
+
+def _is_traced(mesh) -> bool:
+    """Whether ``mesh``'s levels or areas are tracers (``mesh`` an argument of a jitted function
+    or a ``shard_map`` body), so that no host-side check can read them."""
+    return any(isinstance(x, jax.core.Tracer)
+               for x in (mesh.areasvol, mesh.ulevels_nod2D, mesh.nlevels_nod2D))
+
+
 def build_lateral_operator(mesh) -> LateralOperator:
     """The lateral-propagation connectivity of ``mesh`` (host-side NumPy, once per mesh).
 
@@ -120,7 +144,8 @@ def build_lateral_operator(mesh) -> LateralOperator:
     ``mesh.edge_cross_dxdy`` (the two edge-midpoint→element-centroid segments, m; one is
     zero on a boundary edge), ``node_dist`` = the great-circle distance between the edge's
     two nodes (``geo_coord_nod2D``, radius ``R_EARTH``). ``resolution`` =
-    ``mesh.mesh_resolution``."""
+    ``mesh.mesh_resolution``. Raises on a cavity mesh (:func:`check_no_cavity_mesh`)."""
+    check_no_cavity_mesh(mesh)
     edges = np.asarray(mesh.edges)
     cross = np.asarray(mesh.edge_cross_dxdy, dtype=np.float64)
     cross_len = np.hypot(cross[:, 0], cross[:, 1]) + np.hypot(cross[:, 2], cross[:, 3])
@@ -162,8 +187,11 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
     1-3). ``iwe``/``bvfreq``/``hnode`` are the ``[nod2D, nl]`` host fields; ``forcing`` the
     per-node surface/bottom energy fluxes [m^3/s^3]; ``Z3d`` the live zstar layer centers
     (``None`` ⇒ static mesh, as :func:`fesom_jax.tke.interface_spacing`). ``sharded=True``
-    with ``cfg.lateral`` raises: the neighbor arrays index the global mesh."""
+    with ``cfg.lateral`` raises: the neighbor arrays index the global mesh. A concrete cavity
+    mesh raises (:func:`check_no_cavity_mesh`); a traced one cannot be read."""
     cfg.validate()
+    if not _is_traced(mesh):
+        check_no_cavity_mesh(mesh)
     if cfg.lateral and sharded:
         raise NotImplementedError(
             "IDEMIX lateral propagation is dense/1-device only: neighbor arrays index the "
@@ -198,15 +226,60 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
                      E_iw=res.E_iw, KappaH=res.KappaH, KappaM=res.KappaM)
 
 
-def osborn_kv_av(mesh, out: IdemixOut, bvfreq, *, exch=None, freeze_convection=False):
+def osborn_kv_av(mesh, out: IdemixOut, bvfreq, *, exch=None, freeze_convection=False,
+                 conv_surrogate=None):
     """IDEMIX-only mixing (FESOM mix_scheme_nmb==6): KappaH->Kv, KappaM->Av via
     tke._wire_kv_av + pp.mo_convect (SPEC_STAGE3 §6.5). Returns (Kv, Av).
 
     ``exch`` is the node halo exchange required before the node→elem ``Av`` gather
     (``None`` ⇒ identity, the dense/1-device path); ``freeze_convection`` is
-    ``pp.mo_convect``'s ``freeze_increment``."""
+    ``pp.mo_convect``'s ``freeze_increment``, ``conv_surrogate`` its ``surrogate_dn2``
+    (``AdjointConfig.conv_surrogate``, the backward-only ramp, as on the PP/KPP/TKE paths).
+    The convective adjustment is FESOM2's switch (``TkeConfig.convection`` is TKE-only)."""
     k = jnp.arange(mesh.nl)[None, :]
     is_surf = k == (mesh.ulevels_nod2D - 1)[:, None]
     is_bot = k == (mesh.nlevels_nod2D - 1)[:, None]
     Kv, Av = tke._wire_kv_av(mesh, out.KappaM, out.KappaH, is_surf, is_bot, exch)
-    return pp.mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection)
+    return pp.mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection,
+                         surrogate_dn2=conv_surrogate)
+
+
+def partition_idemix_inputs(forcing: IdemixForcing | None, lateral: LateralOperator | None,
+                            part):
+    """Gather the global IDEMIX forcing / lateral operator to the per-device padded
+    ``[P, Lmax_nod, …]`` host form the sharded runners fold (the
+    ``shard_mesh.partition_forcing_static`` precedent; pad lanes get the safe float pad 1.0).
+
+    The lateral neighbor indices are mapped from global node ids to each device's LOCAL lanes
+    (``myList_nod2D`` order); a neighbor absent from the device — possible only for halo nodes
+    when ``P > 1`` — and every pad lane point at the lane itself with weight 0. On one device
+    (``synth_serial``: identity list, no pad) the result equals the global operator. Either
+    argument may be ``None`` (returned as ``None``)."""
+    from .shard_mesh import _default_pad, _shard_along_axis, local_sizes
+
+    _, Lmax = local_sizes(part)
+    L = Lmax["nod"]
+    lists = [np.asarray(ml) for ml in part.myList_nod2D]
+
+    def _nodes(x):
+        a = np.asarray(x, dtype=np.float64)
+        return _shard_along_axis(a, lists, L, 0, _default_pad(a.dtype))
+
+    forcing_p = None if forcing is None else IdemixForcing(*(_nodes(x) for x in forcing))
+    lateral_p = None
+    if lateral is not None:
+        nbr = np.asarray(lateral.nbr_idx)
+        w = np.asarray(lateral.nbr_weight, dtype=np.float64)
+        deg = nbr.shape[1]
+        idx_p = np.tile(np.arange(L, dtype=np.int32)[None, :, None], (len(lists), 1, deg))
+        w_p = np.zeros((len(lists), L, deg))
+        for d, ml in enumerate(lists):
+            g2l = np.full(int(part.nod2D), -1, dtype=np.int64)
+            g2l[ml] = np.arange(ml.size)
+            loc = g2l[nbr[ml]]                                    # [n_local, deg]
+            ok = loc >= 0
+            idx_p[d, :ml.size] = np.where(ok, loc, np.arange(ml.size)[:, None])
+            w_p[d, :ml.size] = np.where(ok, w[ml], 0.0)
+        lateral_p = LateralOperator(nbr_idx=idx_p, nbr_weight=w_p,
+                                    resolution=_nodes(lateral.resolution))
+    return forcing_p, lateral_p
