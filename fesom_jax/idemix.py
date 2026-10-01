@@ -38,10 +38,14 @@ Lateral operator (:func:`build_lateral_operator`, host-side NumPy, once per mesh
 two-point flux weight of edge ``(a, b)`` is ``w = cross_len / node_dist`` — the cross-edge
 length (the two ``edge_cross_dxdy`` segments, m; one is zero on a boundary edge) over the
 great-circle distance between the edge's nodes (``geo_coord_nod2D``, radius
-:data:`fesom_jax.config.R_EARTH`). Cell volumes are ``area * dzt`` with ``area =
-mesh.areasvol`` passed as-is, ``[nod2D, nl]`` per interface: its zero rows (every column's
-bottom interface) are volume-less and exchange nothing, per ``horizontal_propagation``'s
-contract. The neighbor arrays index the GLOBAL mesh, so the lateral step is dense/1-device
+:data:`fesom_jax.config.R_EARTH`). Cell volumes are ``area_if * dzt`` with the PER-INTERFACE
+area :func:`interface_area` built from the per-LAYER ``mesh.areasvol`` exactly as the Fortran
+``vol_wcelli`` (``gen_modules_cvmix_idemix.F90:524-530``): the surface interface ``uln`` takes
+the top wet layer's area ``areasvol(uln)``, every deeper wet interface ``nz`` — interior and
+the wet bottom interface ``nln+1`` — the layer ABOVE it, ``areasvol(nz-1)`` (1-based). 0-based:
+``area_if[:, k] = areasvol[:, max(k-1, uln0)]`` on the wet range, 0 elsewhere. So the wet
+bottom interface, where the bottom tidal forcing is deposited, has volume and exchanges energy
+laterally. The neighbor arrays index the GLOBAL mesh, so the lateral step is dense/1-device
 only (``sharded=True`` raises).
 """
 
@@ -137,6 +141,18 @@ def _wet_interfaces(mesh):
     return masks_from_levels(mesh.ulevels_nod2D - 1, mesh.nlevels_nod2D - 1, mesh.nl - 1)
 
 
+def interface_area(mesh):
+    """Per-interface cell area ``[nod2D, nl]`` [m^2] — the Fortran ``vol_wcelli`` area
+    (``gen_modules_cvmix_idemix.F90:524-530``) from the per-LAYER ``mesh.areasvol``: interface
+    ``k`` (0-based) takes layer ``max(k-1, uln0)`` (surface → top wet layer; interior and wet
+    bottom interface → the layer above), 0 outside the wet interfaces."""
+    k = jnp.arange(mesh.nl)[None, :]
+    uln0 = (mesh.ulevels_nod2D - 1)[:, None]
+    layer = jnp.minimum(jnp.maximum(k - 1, uln0), mesh.nl - 1)
+    area_if = jnp.take_along_axis(mesh.areasvol, layer, axis=1)
+    return jnp.where(_wet_interfaces(mesh), area_if, 0.0)
+
+
 def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
                   params_idemix: IdemixParams, cfg: IdemixConfig,
                   lateral_op: LateralOperator | None, *, dt: float, Z3d=None,
@@ -172,7 +188,7 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
                               / (params_idemix.tau_h * sub_dt))
             v0 = jnp.minimum(v0, v0_cap)
         tend = horizontal_propagation(
-            res.E_iw, v0, dzt, mesh.areasvol, lateral_op.nbr_idx, lateral_op.nbr_weight,
+            res.E_iw, v0, dzt, interface_area(mesh), lateral_op.nbr_idx, lateral_op.nbr_weight,
             dt, params_idemix, n_iter=cfg.n_hor_iter, is_wet=is_wet)   # [m^2/s^3]
         iwe_new = res.E_iw + dt * tend
     else:
