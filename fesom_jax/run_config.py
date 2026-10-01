@@ -198,11 +198,22 @@ class RunConfig:
 
     def idemix_config(self):
         """The static :class:`~fesom_jax.idemix.IdemixConfig` of the ``idemix:`` block, or
-        ``None`` when IDEMIX is off."""
+        ``None`` when IDEMIX is off.
+
+        Built ONCE per ``RunConfig`` and returned as the SAME object on every call: the forced
+        runner's executable cache (``integrate_sharded._FORCED_JIT_CACHE``) keys on the
+        IDENTITY of each physics config, relying on every one being a single persistent object
+        per run (the sub-config fields are; this derived one is memoized to match). A fresh
+        object per :meth:`physics_kwargs` call would recompile every chunk and grow the cache."""
         if self.idemix is None:
             return None
-        from .idemix import IdemixConfig
-        return IdemixConfig(**{k: self.idemix[k] for k in _IDEMIX_CFG_KEYS if k in self.idemix})
+        cached = self.__dict__.get("_idemix_cfg")
+        if cached is None:
+            from .idemix import IdemixConfig
+            cached = IdemixConfig(**{k: self.idemix[k] for k in _IDEMIX_CFG_KEYS
+                                     if k in self.idemix})
+            object.__setattr__(self, "_idemix_cfg", cached)   # frozen dataclass: memo only
+        return cached
 
     def idemix_params(self):
         """The :class:`idemix_jax.IdemixParams` named by ``idemix.params`` (default
