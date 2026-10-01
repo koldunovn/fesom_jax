@@ -54,7 +54,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
          kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
          halo_ctx=None, boundary_node=None, adjoint_cfg=None,
-         remat_blocks: bool = False, bulk_uvnode_lag: bool = False) -> State:
+         remat_blocks: bool = False, bulk_uvnode_lag: bool = False, idemix_cfg=None,
+         idemix_forcing=None, idemix_lateral=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -122,7 +123,21 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     layer thicknesses (``hnode``/``helem``/``zbar_3d_n``/``Z_3d_n``) become time-varying and the
     forcing flips to real freshwater/salt fluxes. ``ale_cfg=None`` ⇒ the linfs path
     (``dh/dt=0``), **byte-identical** to the pre-Phase-9 model (a dead branch — no trace).
-    Validated at the seam (the C ``fesom_ale_mode_init`` abort parity)."""
+    Validated at the seam (the C ``fesom_ale_mode_init`` abort parity).
+
+    **IDEMIX (idemix-jax).** ``idemix_cfg`` (a :class:`fesom_jax.idemix.IdemixConfig`,
+    static/hashable — the ``tke_cfg`` precedent) turns on the IDEMIX internal-wave closure at
+    the mixing seam (substep 4, before the 3-way branch): :func:`fesom_jax.idemix.mixing_idemix`
+    advances the prognostic ``State.iwe`` (column step + lateral propagation) from the
+    per-node energy fluxes ``idemix_forcing`` (an :class:`idemix_jax.IdemixForcing`; build it
+    with ``idemix_jax.load_idemix_forcing``) and the lateral connectivity ``idemix_lateral``
+    (:func:`fesom_jax.idemix.build_lateral_operator`; required when ``idemix_cfg.lateral``), with
+    the tunables in ``params.idemix`` (an :class:`idemix_jax.IdemixParams`). With ``tke_cfg``
+    (which must then be ``TkeConfig(only_tke=False)``) the wave dissipation feeds the TKE
+    (FESOM ``mix_scheme='cvmix_TKE+cvmix_IDEMIX'``); without it, IDEMIX alone supplies
+    ``Kv``/``Av`` through the Osborn shortcut (``mix_scheme_nmb==6``). Never with ``kpp_cfg``.
+    Inconsistent combinations raise ``ValueError`` before any physics runs. ``idemix_cfg=None``
+    ⇒ dead branches, ``state.iwe`` untouched ⇒ **byte-identical** to the unpatched host."""
     st = state
     if params is None:
         params = Params.defaults()
@@ -142,6 +157,33 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # ``None`` ⇒ the implemented path, unchanged. The advection calls below are unaffected.
     if tracer_cfg is not None:
         tracer_cfg.validate()
+    # IDEMIX seam guards (static args ⇒ trace-time Python checks). They run BEFORE any physics
+    # — in particular before the TKE/KPP "needs surface forcing" checks of substep 4 — so an
+    # inconsistent configuration reports itself on every path, forced or not.
+    if idemix_cfg is not None:
+        idemix_cfg.validate()
+        if kpp_cfg is not None:
+            raise ValueError(
+                "idemix_cfg and kpp_cfg are both set: IDEMIX couples to TKE or runs alone "
+                "(Osborn shortcut), never with KPP. Drop kpp_cfg.")
+        if params.idemix is None:
+            raise ValueError(
+                "idemix_cfg requires params.idemix (e.g. IdemixParams.fesom_operational()); "
+                "set it with dataclasses.replace(params, idemix=...).")
+        if idemix_forcing is None:
+            raise ValueError(
+                "idemix_cfg requires idemix_forcing (idemix_jax.load_idemix_forcing on the "
+                "mesh nodes): the surface near-inertial and bottom tidal energy fluxes.")
+        if idemix_cfg.lateral and idemix_lateral is None:
+            raise ValueError(
+                "idemix_cfg.lateral=True requires idemix_lateral — build it once with "
+                "fesom_jax.idemix.build_lateral_operator(mesh) — or set lateral=False.")
+    if tke_cfg is not None and (not tke_cfg.only_tke) != (idemix_cfg is not None):
+        raise ValueError(
+            "TkeConfig.only_tke=False requires idemix_cfg, and idemix_cfg with TKE requires "
+            "only_tke=False (the TKE consumes the IDEMIX wave dissipation exactly when "
+            "IDEMIX runs).")
+
     # zstar ⇒ real freshwater/salt fluxes (use_virt_salt=False, is_nonlinfs=1); linfs ⇒
     # virtual salt (use_virt_salt=True, is_nonlinfs=0). Drives the forcing flip + the bc terms.
     use_virt_salt = True if ale_cfg is None else ale_cfg.use_virt_salt
@@ -316,6 +358,20 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     forced-path features (need ustar/Bo resp. |stress|) ⇒ they require CORE2 surface
     #     forcing (locked decision 7); and the C runs ONE scheme per process ⇒ both-set is an
     #     error. tke_new=None on the non-TKE branches (the conditional replace below skips it).
+    #     IDEMIX (idemix_cfg) runs first: its wave dissipation feeds the TKE branch, or — no
+    #     TKE — its Osborn KappaH/KappaM become Kv/Av (a 4th branch, after KPP, before PP).
+    #     idemix_out=None ⇒ the three original branches, byte-identical.
+    idemix_out = None
+    if idemix_cfg is not None:
+        from . import idemix as _idemix        # lazy: keep idemix_jax off the default path
+        # The lateral neighbour arrays address this device's node lanes only when there is
+        # one shard (the dense path, or a 1-device shard_map whose runner localized them);
+        # with >1 shard the halo lanes would go stale between sub-iterations.
+        _idemix_sharded = (halo_ctx is not None
+                           and jax.lax.axis_size(halo_ctx.axis_name) > 1)
+        idemix_out = _ckpt(lambda: _idemix.mixing_idemix(
+            mesh, st.iwe, bvfreq, st.hnode, idemix_forcing, params.idemix, idemix_cfg,
+            idemix_lateral, dt=dt, Z3d=Z3d_live, sharded=_idemix_sharded))()
     tke_new = None
     if tke_cfg is not None:
         if kpp_cfg is not None:
@@ -329,10 +385,12 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 "cd·|stress_node_surf|^{3/2} needs the ice-blended nodal wind stress. Build it "
                 "with fesom_jax.surface_forcing.build_surface_forcing, or keep tke_cfg=None "
                 "for an unforced run.")
+        _iw = (None if idemix_out is None
+               else (idemix_out.iw_diss, idemix_out.alpha_c, idemix_out.E_iw))
         Kv, Av, uvnode, tke_new = _ckpt(lambda: tke.mixing_tke(
             mesh, st.uv, bvfreq, st.tke, stress_node_surf, st.hnode, tke_cfg, params,
             freeze_convection=_adj.freeze_convection,
-            dt=dt, exch=_exch, Z3d=Z3d_live))()
+            dt=dt, exch=_exch, Z3d=Z3d_live, idemix=_iw))()
     elif kpp_cfg is not None:
         if heat_flux is None:
             raise ValueError(
@@ -348,6 +406,12 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             heat_flux, water_flux, stress_node_surf, sw_3d, st.hnode, kpp_cfg, exch=_exch,
             freeze_convection=_adj.freeze_convection,
             Z3d=Z3d_live, zbar3=zbar3_live))()
+    elif idemix_cfg is not None:
+        # IDEMIX-only mixing (FESOM mix_scheme_nmb==6): the Osborn shortcut, node KappaH→Kv,
+        # KappaM→(halo-exchanged, node→elem mean)→Av, then the shared mo_convect.
+        Kv, Av = _idemix.osborn_kv_av(mesh, idemix_out, bvfreq, exch=_exch,
+                                      freeze_convection=_adj.freeze_convection)
+        uvnode = pp.compute_vel_nodes(mesh, st.uv)
     else:
         Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq, k_ver=params.k_ver,
                                       a_ver=params.a_ver, Z3d=Z3d_live,
@@ -551,6 +615,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # the ice precedent — so the tke_cfg=None path never touches state.tke ⇒ byte-identical).
     if tke_cfg is not None:
         new = dataclasses.replace(new, tke=tke_new)
+    # IDEMIX: carry the advanced internal-wave energy (same conditional-replace contract).
+    if idemix_cfg is not None:
+        new = dataclasses.replace(new, iwe=idemix_out.iwe_new)
     # Phase 6: carry the updated prognostic ice state (the ice step ran before the ocean step).
     if ice_out is not None:
         new = dataclasses.replace(
@@ -615,13 +682,14 @@ def _apply_surface_adj(mesh, adj, *, bc_T, heat_flux, stress_surf, stress_node_s
 step_jit = jax.jit(step,
                    static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg", "kpp_cfg",
                                     "tke_cfg", "ale_cfg", "visc_cfg", "tracer_cfg",
-                                    "remat_blocks"))
+                                    "remat_blocks", "idemix_cfg"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
         params: Params = None, *, dt: float = DT_DEFAULT,
         step_forcings=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
-        kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None) -> State:
+        kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
+        idemix_cfg=None, idemix_forcing=None, idemix_lateral=None) -> State:
     """Run ``n_steps`` jitted forward steps from ``state`` (a plain Python loop;
     Phase 3 adds :func:`fesom_jax.integrate.integrate`, a checkpointed ``lax.scan``,
     for the differentiable path). ``is_first_step`` is set on the first iteration
@@ -629,12 +697,14 @@ def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,
 
     For CORE2, pass ``step_forcings`` (a :class:`~fesom_jax.surface_forcing.StepForcing`
     with leading axis ``[n_steps]``) + ``forcing_static``; step ``i`` consumes
-    ``step_forcings[i]``. ``None`` ⇒ the pi analytical path."""
+    ``step_forcings[i]``. ``None`` ⇒ the pi analytical path. ``idemix_cfg`` /
+    ``idemix_forcing`` / ``idemix_lateral`` are forwarded to every step (see :func:`step`)."""
     for i in range(n_steps):
         sf = None if step_forcings is None else jax.tree.map(lambda x: x[i], step_forcings)
         state = step_jit(state, mesh, op, stress_surf, params, dt=dt,
                          is_first_step=(i == 0), step_forcing=sf,
                          forcing_static=forcing_static, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
                          kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
-                         visc_cfg=visc_cfg, tracer_cfg=tracer_cfg)
+                         visc_cfg=visc_cfg, tracer_cfg=tracer_cfg, idemix_cfg=idemix_cfg,
+                         idemix_forcing=idemix_forcing, idemix_lateral=idemix_lateral)
     return state

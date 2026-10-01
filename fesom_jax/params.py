@@ -58,6 +58,11 @@ The adjoint foundation adds a forcing-direction seam (not a physics parameter):
   wind-stress direction. ``heat`` is in W/m², POSITIVE INTO the ocean (warming); the stresses
   are in N/m² in the model (rotated) frame. ``None`` (default) ⇒ nothing is traced.
 
+The IDEMIX integration (idemix-jax) adds the internal-wave closure constants:
+
+* ``idemix`` — an :class:`idemix_jax.IdemixParams` (``tau_v``, ``tau_h``, ``gamma``,
+  ``jstar``, ``mu0``) or ``None``; read only when ``step`` runs with an ``idemix_cfg``.
+
 :meth:`Params.defaults` reproduces the config constants exactly (so passing
 ``Params.defaults()`` is numerically identical to the un-parameterised path).
 """
@@ -115,6 +120,14 @@ class Params:
     # (default) ⇒ no leaves, nothing traced, byte-identical. Dense runs only (step() raises
     # under a halo context). See ``step._apply_surface_adj`` for the sign convention.
     surface_adj: object = None
+    # IDEMIX internal-wave closure constants (idemix-jax host patch C). Same contract as
+    # ``tke_nn``: ``None`` (default) ⇒ unused, no leaves, byte-identical; an
+    # :class:`idemix_jax.IdemixParams` (``tau_v``/``tau_h``/``gamma``/``jstar``/``mu0``, five
+    # float64 leaves — e.g. ``IdemixParams.fesom_operational()``) ⇒ read by
+    # :func:`fesom_jax.idemix.mixing_idemix` when ``step`` gets an ``idemix_cfg``, and
+    # differentiable like ``tke_c_k``. Un-annotated so building a ``Params`` never imports
+    # idemix_jax.
+    idemix: object = None
 
     @staticmethod
     def defaults() -> "Params":
@@ -136,6 +149,6 @@ tree_util.register_dataclass(
     Params,
     data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
                  "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn", "gm_nn",
-                 "surface_adj"],
+                 "surface_adj", "idemix"],
     meta_fields=[],
 )

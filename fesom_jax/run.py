@@ -296,7 +296,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     restart_archive_length=1,
                     daily_out=None, daily_start_step=0,
                     monthly_out=None, monthly_start_step=0, chunk_diagnostics=False,
-                    output_layout="global"):
+                    output_layout="global", idemix_forcing=None, idemix_lateral=None):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -314,6 +314,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     ``params`` (a :class:`~fesom_jax.params.Params`) may be injected; otherwise it comes from
     ``cfg.params_file`` (trained ``gm_nn`` weights), and is ``None`` when there is no file — the
     pre-existing default-parameter path, byte for byte.
+
+    ``cfg.idemix`` (the yaml ``idemix:`` block) turns on IDEMIX: ``Params.idemix`` is set from
+    ``cfg.idemix_params()`` (unless the injected ``params`` already carries IDEMIX constants),
+    and the GLOBAL per-node forcing + lateral operator — ``cfg.idemix_inputs(mesh)``, or the
+    injected ``idemix_forcing``/``idemix_lateral`` — are partitioned like ``forcing_static``
+    and handed to the runner with ``idemix_cfg`` (via :meth:`RunConfig.physics_kwargs`). The
+    lateral propagation needs a single device (``part.npes == 1``). No ``idemix:`` ⇒ nothing
+    changes.
 
     ``restart_archive_out`` (if set) additionally writes ARCHIVAL restarts: an immutable,
     uniquely-named directory (``_archive_tag`` — mirrors FESOM3's ``fesom.<YYYY>.<DDD>.<SSSSS>``)
@@ -342,6 +350,35 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         print(f"[run] params: gm_nn="
               f"{'set' if getattr(params, 'gm_nn', None) is not None else 'none'} "
               f"({_params_src})", flush=True)
+    # IDEMIX (cfg.idemix): Params.idemix + the per-node forcing / lateral operator, built ONCE on
+    # the global mesh and partitioned like forcing_static. cfg.idemix=None ⇒ _iw_kw={} ⇒ the
+    # runners trace exactly the pre-IDEMIX step.
+    _iw_kw = {}
+    if cfg.idemix is not None:
+        import dataclasses as _dc
+        import jax.numpy as _jnp
+        from . import idemix as _idemix
+        from .params import Params
+        _iw_cfg = cfg.idemix_config()
+        if _iw_cfg.lateral and npes > 1:
+            raise NotImplementedError(
+                f"idemix lateral propagation runs on one device only (partition has npes={npes}); "
+                "use a serial partition or set idemix: {lateral: false}.")
+        if params is None:
+            params = Params.defaults()
+        if params.idemix is None:
+            params = _dc.replace(params, idemix=jax.tree.map(
+                lambda v: _jnp.asarray(v, _jnp.float64), cfg.idemix_params()))
+        if idemix_forcing is None:
+            idemix_forcing, _lat = cfg.idemix_inputs(mesh)
+            idemix_lateral = _lat if idemix_lateral is None else idemix_lateral
+        elif idemix_lateral is None and _iw_cfg.lateral:
+            idemix_lateral = _idemix.build_lateral_operator(mesh)
+        _f_p, _l_p = _idemix.partition_idemix_inputs(idemix_forcing, idemix_lateral, part)
+        _iw_kw = dict(idemix_forcing=_f_p, idemix_lateral=_l_p)
+        if jax.process_index() == 0:
+            print(f"[run] idemix: {_iw_cfg} params={tuple(float(v) for v in params.idemix)}",
+                  flush=True)
     # Output / restart on-disk layout. 'global' (default) = partition-INDEPENDENT canonical node
     # order (xarray/ushow read it directly; byte-identical at any device count) — it host-gathers
     # owned lanes on ONE process. 'folded' = the gather-free sharded [P*Lmax] write. A multi-node
@@ -666,7 +703,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 sm, state_p, _sop_for(ch.dt), stress_p, ch.count, dt=ch.dt, npes=npes,
                 params=params, use_ragged=use_ragged, use_padded=use_padded,
                 use_coloured=use_coloured,
-                boundary_node_p=boundary_node_p, **cfg.physics_kwargs())
+                boundary_node_p=boundary_node_p, **_iw_kw, **cfg.physics_kwargs())
             state_p, acc_sum = folded_state(_out)[0], None
         else:
             _fkw = (dict(forcing_tables=tab_p, forcing_sched=sched, forcing_const=fdc_p)
@@ -677,7 +714,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
                 use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
                 boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
-                sample_fn=out_sample_fn, **_fkw, **cfg.physics_kwargs())
+                sample_fn=out_sample_fn, **_fkw, **_iw_kw, **cfg.physics_kwargs())
             # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else the final state.
             state_p, acc_sum = _chunk_out if out_sample_fn is not None else (_chunk_out, None)
         folded_in = True                                     # the scan output is folded [P*Lmax]

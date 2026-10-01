@@ -40,6 +40,8 @@ def _expected_shapes(mesh):
         "Av": (e, nl), "pgf_x": (e, nl), "pgf_y": (e, nl),
         # TKE prognostic mixing state (Phase 9b)
         "tke": (n, nl),
+        # IDEMIX prognostic internal-wave energy (idemix-jax integration)
+        "iwe": (n, nl),
         # sea ice (Phase 6, surface-only 2-D)
         "a_ice": (n,), "m_ice": (n,), "m_snow": (n,), "u_ice": (n,), "v_ice": (n,),
         "t_skin": (n,), "sigma11": (e,), "sigma12": (e,), "sigma22": (e,),

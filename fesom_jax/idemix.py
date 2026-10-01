@@ -46,7 +46,9 @@ the wet bottom interface ``nln+1`` — the layer ABOVE it, ``areasvol(nz-1)`` (1
 ``area_if[:, k] = areasvol[:, max(k-1, uln0)]`` on the wet range, 0 elsewhere. So the wet
 bottom interface, where the bottom tidal forcing is deposited, has volume and exchanges energy
 laterally. The neighbor arrays index the GLOBAL mesh, so the lateral step is dense/1-device
-only (``sharded=True`` raises).
+only (``sharded=True`` raises). The sharded runners take the per-device form
+(:func:`partition_idemix_inputs`, neighbors mapped to local lanes), which is exact on ONE shard
+and refused on more (halo lanes would go stale between the lateral sub-iterations).
 """
 
 from __future__ import annotations
@@ -210,3 +212,44 @@ def osborn_kv_av(mesh, out: IdemixOut, bvfreq, *, exch=None, freeze_convection=F
     is_bot = k == (mesh.nlevels_nod2D - 1)[:, None]
     Kv, Av = tke._wire_kv_av(mesh, out.KappaM, out.KappaH, is_surf, is_bot, exch)
     return pp.mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection)
+
+
+def partition_idemix_inputs(forcing: IdemixForcing | None, lateral: LateralOperator | None,
+                            part):
+    """Gather the global IDEMIX forcing / lateral operator to the per-device padded
+    ``[P, Lmax_nod, …]`` host form the sharded runners fold (the
+    ``shard_mesh.partition_forcing_static`` precedent; pad lanes get the safe float pad 1.0).
+
+    The lateral neighbor indices are mapped from global node ids to each device's LOCAL lanes
+    (``myList_nod2D`` order); a neighbor absent from the device — possible only for halo nodes
+    when ``P > 1`` — and every pad lane point at the lane itself with weight 0. On one device
+    (``synth_serial``: identity list, no pad) the result equals the global operator. Either
+    argument may be ``None`` (returned as ``None``)."""
+    from .shard_mesh import _default_pad, _shard_along_axis, local_sizes
+
+    _, Lmax = local_sizes(part)
+    L = Lmax["nod"]
+    lists = [np.asarray(ml) for ml in part.myList_nod2D]
+
+    def _nodes(x):
+        a = np.asarray(x, dtype=np.float64)
+        return _shard_along_axis(a, lists, L, 0, _default_pad(a.dtype))
+
+    forcing_p = None if forcing is None else IdemixForcing(*(_nodes(x) for x in forcing))
+    lateral_p = None
+    if lateral is not None:
+        nbr = np.asarray(lateral.nbr_idx)
+        w = np.asarray(lateral.nbr_weight, dtype=np.float64)
+        deg = nbr.shape[1]
+        idx_p = np.tile(np.arange(L, dtype=np.int32)[None, :, None], (len(lists), 1, deg))
+        w_p = np.zeros((len(lists), L, deg))
+        for d, ml in enumerate(lists):
+            g2l = np.full(int(part.nod2D), -1, dtype=np.int64)
+            g2l[ml] = np.arange(ml.size)
+            loc = g2l[nbr[ml]]                                    # [n_local, deg]
+            ok = loc >= 0
+            idx_p[d, :ml.size] = np.where(ok, loc, np.arange(ml.size)[:, None])
+            w_p[d, :ml.size] = np.where(ok, w[ml], 0.0)
+        lateral_p = LateralOperator(nbr_idx=idx_p, nbr_weight=w_p,
+                                    resolution=_nodes(lateral.resolution))
+    return forcing_p, lateral_p

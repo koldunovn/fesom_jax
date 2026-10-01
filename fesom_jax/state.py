@@ -83,6 +83,14 @@ class State:
     # 0 forever outside the wet slice (masked-inert). Unused while tke_cfg is None.
     tke: jax.Array          # (nod2D,nl) turbulent kinetic energy (interface)
 
+    # --- IDEMIX internal-wave energy (PROGNOSTIC) — gen_modules_cvmix_idemix ---
+    # The second prognostic mixing field, the `tke` precedent: IDEMIX carries the internal-wave
+    # energy `iwe` at interfaces across steps (column step + lateral propagation), so it joins
+    # both State and the lax.scan carry. IC = 0 (cold start, the Fortran `iwe_n(:,:) = 0`; a
+    # restart written without it loads as 0). Stays 0 outside the wet interfaces. Unused — and
+    # never written — while idemix_cfg is None (the off path is byte-identical).
+    iwe: jax.Array          # (nod2D,nl) internal-wave energy (interface)
+
     # --- sea ice (Phase 6, surface-only 2-D) — fesom_ice ---
     # Prognostic ice state carried across steps. All default-zero ⇒ the ocean-only
     # (pi / Phase-5 no-ice) path is bit-identical (nothing reads these until Phase 6).
@@ -121,7 +129,7 @@ class State:
             hnode=Z(n, nl), hnode_new=Z(n, nl), helem=Z(e, nl), hbar=Z(n), hbar_old=Z(n),
             density=Z(n, nl), hpressure=Z(n, nl), bvfreq=Z(n, nl), Kv=Z(n, nl),
             Av=Z(e, nl), pgf_x=Z(e, nl), pgf_y=Z(e, nl),
-            tke=Z(n, nl),
+            tke=Z(n, nl), iwe=Z(n, nl),
             a_ice=Z(n), m_ice=Z(n), m_snow=Z(n), u_ice=Z(n), v_ice=Z(n), t_skin=Z(n),
             sigma11=Z(e), sigma12=Z(e), sigma22=Z(e),
         )
