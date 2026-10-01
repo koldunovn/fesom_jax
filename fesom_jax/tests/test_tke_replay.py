@@ -56,7 +56,6 @@ def test_tkeconfig_default_valid():
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"only_tke": False},        # IDEMIX coupling (.not.only_tke) — gate-only
     {"l_lc": True},             # Langmuir (tke_dolangmuir) — gate-only
     {"use_dirichlet": True},    # Dirichlet surface+bottom BCs — Neumann is executed
     {"mxl_choice": 1},          # only Blanke–Delecluse choice 2 is ported
@@ -67,6 +66,13 @@ def test_tkeconfig_unported_combos_raise(kwargs):
     un-ported physics) — the C abort parity."""
     with pytest.raises(ValueError, match="classical-TKE reference config"):
         TkeConfig(**kwargs).validate()
+
+
+def test_tkeconfig_only_tke_false_is_idemix_coupling_not_rejected():
+    """``only_tke=False`` (IDEMIX coupling) is ported (host patch A); it is enforced to have an
+    ``idemix_cfg`` at the step seam, not rejected by validate()."""
+    cfg = TkeConfig(only_tke=False)
+    assert cfg.validate() is cfg
 
 
 def test_tkeconfig_is_hashable_static():
