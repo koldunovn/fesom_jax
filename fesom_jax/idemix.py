@@ -155,6 +155,41 @@ def interface_area(mesh):
     return jnp.where(_wet_interfaces(mesh), area_if, 0.0)
 
 
+def _v0_cap(params_idemix: IdemixParams, cfg: IdemixConfig, lateral_op: LateralOperator,
+            dt: float):
+    """``[nod2D, 1]`` cap ``sqrt(cap * res**2 / (tau_h * dt / n_hor_iter))`` (ruling 3)."""
+    sub_dt = dt / cfg.n_hor_iter
+    return jnp.sqrt(cfg.lateral_cfl_cap * lateral_op.resolution[:, None] ** 2
+                    / (params_idemix.tau_h * sub_dt))
+
+
+def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_op, dt, Z3d):
+    """The step's IDEMIX evaluation: ``(res, iwe_new, dzt, is_wet)`` — the column result
+    (:class:`idemix_jax.mesh` ``idemix_step_columns``) and the energy after the lateral step.
+    Shared by :func:`mixing_idemix` and :func:`budget_terms` so the budget re-evaluates exactly
+    the step's arithmetic."""
+    nl = mesh.nl
+    is_wet = _wet_interfaces(mesh)
+    dzw = hnode[:, :nl - 1]
+    dzt = tke.interface_spacing(mesh, hnode, Z3d)
+    res = idemix_step_columns(
+        iwe, bvfreq, dzw, dzt, mesh.coriolis_node,
+        jnp.asarray(forcing.fsrf), jnp.asarray(forcing.fbot), dt, params_idemix,
+        forc=None, is_wet=is_wet)
+
+    if cfg.lateral:
+        v0 = res.v0
+        if cfg.lateral_cfl_cap > 0.0:
+            v0 = jnp.minimum(v0, _v0_cap(params_idemix, cfg, lateral_op, dt))
+        tend = horizontal_propagation(
+            res.E_iw, v0, dzt, interface_area(mesh), lateral_op.nbr_idx, lateral_op.nbr_weight,
+            dt, params_idemix, n_iter=cfg.n_hor_iter, is_wet=is_wet)   # [m^2/s^3]
+        iwe_new = res.E_iw + dt * tend
+    else:
+        iwe_new = res.E_iw
+    return res, iwe_new, dzt, is_wet
+
+
 def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
                   params_idemix: IdemixParams, cfg: IdemixConfig,
                   lateral_op: LateralOperator | None, *, dt: float, Z3d=None,
@@ -173,31 +208,71 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
     if cfg.lateral and lateral_op is None:
         raise ValueError("IdemixConfig.lateral=True needs a LateralOperator "
                          "(build_lateral_operator(mesh))")
-    nl = mesh.nl
-    is_wet = _wet_interfaces(mesh)
-    dzw = hnode[:, :nl - 1]
-    dzt = tke.interface_spacing(mesh, hnode, Z3d)
-    res = idemix_step_columns(
-        iwe, bvfreq, dzw, dzt, mesh.coriolis_node,
-        jnp.asarray(forcing.fsrf), jnp.asarray(forcing.fbot), dt, params_idemix,
-        forc=None, is_wet=is_wet)
-
-    if cfg.lateral:
-        v0 = res.v0
-        if cfg.lateral_cfl_cap > 0.0:
-            sub_dt = dt / cfg.n_hor_iter
-            v0_cap = jnp.sqrt(cfg.lateral_cfl_cap * lateral_op.resolution[:, None] ** 2
-                              / (params_idemix.tau_h * sub_dt))
-            v0 = jnp.minimum(v0, v0_cap)
-        tend = horizontal_propagation(
-            res.E_iw, v0, dzt, interface_area(mesh), lateral_op.nbr_idx, lateral_op.nbr_weight,
-            dt, params_idemix, n_iter=cfg.n_hor_iter, is_wet=is_wet)   # [m^2/s^3]
-        iwe_new = res.E_iw + dt * tend
-    else:
-        iwe_new = res.E_iw
-
+    res, iwe_new, _, _ = _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg,
+                                      lateral_op, dt, Z3d)
     return IdemixOut(iwe_new=iwe_new, iw_diss=res.iw_diss, alpha_c=res.alpha_c,
                      E_iw=res.E_iw, KappaH=res.KappaH, KappaM=res.KappaM)
+
+
+#: keys of :func:`budget_terms` (the run entry's ``idemix_budget_out`` files)
+BUDGET_TERMS = ("dEdt", "P_surf", "P_bot", "D", "Dif", "Lat", "E", "abs_resid",
+                "n_wet", "n_capped", "cfl_max")
+
+
+def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixParams,
+                 cfg: IdemixConfig, lateral_op: LateralOperator | None, *, dt: float,
+                 Z3d=None) -> dict:
+    """Per-node (column-summed) wave-energy budget of the model step ``s0 -> s1`` [m^5/s^3]
+    (multiply by ``rho0`` for W). A diagnostic only — the step never calls it.
+
+    Re-evaluates the step's IDEMIX call (:func:`_idemix_core`, the code
+    :func:`mixing_idemix` runs) on the step's exact inputs: ``s0.iwe``, ``s1.bvfreq`` (the
+    step computes N^2 from the start-of-step T/S and carries it), ``s0.hnode`` and ``Z3d`` =
+    the live zstar layer centres of ``s0.hnode`` (``None`` = static). Volumes
+    ``V = interface_area * dzt``. Each entry is a ``[nod2D]`` sum over the column's wet
+    interfaces (sum over nodes for the global budget):
+
+    * ``dEdt = sum V (s1.iwe - s0.iwe) / dt`` — from the CARRIED new energy;
+    * ``P_surf``/``P_bot`` = ``sum V Tsur`` / ``sum V Tbot`` (forcing power);
+    * ``D = sum V iw_diss`` (dissipation, >= 0 for physical states);
+    * ``Dif = sum V Tdif`` (vertical diffusion: zero per column in the ``dzt`` metric, not in
+      ``V``, because the node area changes with depth);
+    * ``Lat = sum V (iwe_new - E_iw) / dt`` (lateral propagation; sums to ~0 over the mesh);
+    * ``E = sum V s1.iwe``; ``abs_resid = |dEdt - (P_surf + P_bot - D + Dif + Lat)|``;
+    * ``n_wet`` wet interfaces; ``n_capped`` those where the v0 CFL cap binds
+      (``v0 > v0_cap``; 0 without ``cfg.lateral`` or with ``lateral_cfl_cap = 0``);
+      ``cfl_max`` the column max of the UNCAPPED lateral CFL number
+      ``v0^2 tau_h (dt / n_hor_iter) / res^2`` (0 without ``cfg.lateral``).
+
+    If ``s1`` is the step's output, ``dEdt = P_surf + P_bot - D + Dif + Lat`` per node and
+    globally, to roundoff (the column solve's budget identity plus the lateral composition)."""
+    res, iwe_new, dzt, is_wet = _idemix_core(mesh, s0.iwe, s1.bvfreq, s0.hnode, forcing,
+                                             params_idemix, cfg, lateral_op, dt, Z3d)
+    V = interface_area(mesh) * dzt
+
+    def col(x):
+        return jnp.sum(jnp.where(is_wet, x, 0.0), axis=1)
+
+    t = dict(dEdt=col(V * (s1.iwe - s0.iwe)) / dt, P_surf=col(V * res.Tsur),
+             P_bot=col(V * res.Tbot), D=col(V * res.iw_diss), Dif=col(V * res.Tdif),
+             Lat=col(V * (iwe_new - res.E_iw)) / dt, E=col(V * s1.iwe))
+    t["abs_resid"] = jnp.abs(t["dEdt"] - (t["P_surf"] + t["P_bot"] - t["D"] + t["Dif"]
+                                          + t["Lat"]))
+    t["n_wet"] = jnp.sum(is_wet, axis=1).astype(s0.iwe.dtype)
+    zero = jnp.zeros_like(t["n_wet"])
+    if cfg.lateral:
+        r2 = lateral_op.resolution[:, None] ** 2
+        cfl = res.v0 ** 2 * params_idemix.tau_h * (dt / cfg.n_hor_iter) / r2
+        t["cfl_max"] = jnp.max(jnp.where(is_wet, cfl, 0.0), axis=1)
+        if cfg.lateral_cfl_cap > 0.0:
+            capped = is_wet & (res.v0 > _v0_cap(params_idemix, cfg, lateral_op, dt))
+            t["n_capped"] = jnp.sum(capped, axis=1).astype(s0.iwe.dtype)
+        else:
+            t["n_capped"] = zero
+    else:
+        t["n_capped"] = zero
+        t["cfl_max"] = zero
+    return {k: t[k] for k in BUDGET_TERMS}
 
 
 def osborn_kv_av(mesh, out: IdemixOut, bvfreq, *, exch=None, freeze_convection=False):
