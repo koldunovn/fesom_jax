@@ -876,7 +876,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              return_grad_fn: bool = False, ssh_gather=None,
                              mevp_wide=None, precision: str = "double", se_wide=None, ice_phase=None,
                              recom_cfg=None, cavity_cfg=None, idemix_cfg=None, idemix_forcing=None,
-                             idemix_lateral=None):
+                             idemix_lateral=None, sample_prev: bool = False):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     ``ice_phase`` (an int, the ``ice_steps_since_upd`` the State carries into this chunk; ``ice_ave_steps > 1``
@@ -942,11 +942,21 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     ``idemix_forcing`` / ``idemix_lateral`` device constants, appended to the ``shard_map`` extras
     after every other one (so the extras' fixed offsets ``i_gather`` / ``i_wide`` / ``i_se_wide``
     are unchanged) and placed every call (not in ``_PLACED_CACHE``); ``None`` ⇒ unchanged. IDEMIX is
-    double precision only (``precision="single"`` with ``idemix_cfg`` raises)."""
+    double precision only (``precision="single"`` with ``idemix_cfg`` raises).
+
+    **``sample_prev`` (per-step budget hook).** ``False`` (default) ⇒ ``sample_fn(new_state)``,
+    byte-unchanged. ``True`` ⇒ ``sample_fn(prev_state, new_state, aux)`` for every step, with
+    ``aux = dict(mesh=<this shard's mesh>, params=params, dt=dt, ale_cfg=ale_cfg, idemix_cfg=…,
+    idemix_forcing=…, idemix_lateral=…)`` — the step's own inputs, so a diagnostic can
+    re-evaluate a term of the step it follows (the IDEMIX wave-energy budget,
+    :func:`fesom_jax.idemix.budget_terms`). The returned leaves are summed over the steps as
+    with the plain form (in real64, ``PR.full_tree``), on the plain and the ``ice_phase`` scan alike."""
     if idemix_cfg is not None and precision != "double":
         raise NotImplementedError("IDEMIX (idemix_cfg) runs in double precision only")
     if idemix_cfg is not None and cavity_cfg is not None:
         raise ValueError("IDEMIX (idemix_cfg) with ice-shelf cavities (cavity_cfg) is not supported")
+    if sample_prev and sample_fn is None:
+        raise ValueError("sample_prev=True needs a sample_fn(prev_state, new_state, aux)")
     if state_is_folded:
         fs = state_p                                      # already folded [P*Lmax] device-sharded
         fs_spec = jax.tree.map(lambda _: _P, fs)
@@ -1092,6 +1102,9 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                 ex[i_se_wide], se_wide.K, ctx.axis_name))
         return ctx
 
+    def _sample_aux(m, ex):
+        return dict(mesh=m, params=params, dt=dt, ale_cfg=ale_cfg, **_iw_kw(ex))
+
     def body(m, s, o, stress, h, seq, *ex):
         ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max,
                              use_coloured, col_meta)
@@ -1120,24 +1133,32 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                                 **_iw_kw(ex))
 
         sf0 = jax.tree.map(lambda x: x[0], seq)             # this chunk's first-step forcing
+        # the per-step output sample: sample_fn(new) (plain) or sample_fn(prev, new, aux) (sample_prev,
+        # the budget hook); single precision: the output means accumulate in real64 (FESOM2 #1032),
+        # identity in double
+        if sample_prev:
+            _aux = _sample_aux(m, ex)
+            _sample = lambda c0, c1: PR.full_tree(sample_fn(c0, c1, _aux))    # noqa: E731
+        else:
+            _sample = lambda c0, c1: PR.full_tree(sample_fn(c1))              # noqa: E731
         if ice_phase is not None:
             # gpu.ice_static: the ice branch of every step fixed at trace time. A bootstrap step stays first and
             # alone; the rest scan over whole ice cycles (the flags of one cycle are those of any other).
             j0 = 1 if bootstrap_ab2 else 0
             if j0:
                 st = one(s, True, sf0, _ice_flag(0))
-                acc = None if sample_fn is None else PR.full_tree(sample_fn(st))
+                acc = None if sample_fn is None else _sample(s, st)
             else:
                 st = s
                 acc = (None if sample_fn is None
-                       else jax.tree.map(jnp.zeros_like, PR.full_tree(sample_fn(s))))
+                       else jax.tree.map(jnp.zeros_like, _sample(s, s)))
             flags = tuple(_ice_flag(j0 + i) for i in range(_nave))
 
             def adv(c, a, sf, upd):
-                c = one(c, False, sf, upd)
+                c1 = one(c, False, sf, upd)
                 if a is not None:
-                    a = jax.tree.map(lambda u, v: u + v, a, PR.full_tree(sample_fn(c)))
-                return c, a
+                    a = jax.tree.map(lambda u, v: u + v, a, _sample(c, c1))
+                return c1, a
 
             ncyc, nrest = divmod(n_steps - j0, _nave)
             if ncyc:
@@ -1167,15 +1188,14 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                 st, _ = lax.scan(jax.checkpoint(lambda c, sf: (one(c, False, sf), None)),
                                  st, xs=rest, length=n_steps - 1, unroll=min(step_unroll(), n_steps - 1))
             return st
-        # single precision: the output means accumulate in real64 (FESOM2 #1032); identity in double
-        acc = PR.full_tree(sample_fn(st))                   # running sum, seeded by step-1's output
+        acc = _sample(s, st)                                # running sum, seeded by step-1's output
         if n_steps > 1:
             rest = jax.tree.map(lambda x: x[1:], seq)
             def _accum(carry, sf):
                 c, a = carry
-                c = one(c, False, sf)
-                a = jax.tree.map(lambda u, v: u + v, a, PR.full_tree(sample_fn(c)))
-                return (c, a), None
+                c1 = one(c, False, sf)
+                a = jax.tree.map(lambda u, v: u + v, a, _sample(c, c1))
+                return (c1, a), None
             (st, acc), _ = lax.scan(jax.checkpoint(_accum), (st, acc),
                                     xs=rest, length=n_steps - 1, unroll=min(step_unroll(), n_steps - 1))
         return st, acc
@@ -1260,7 +1280,12 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     if sample_fn is None:
         out_specs = fs_spec
     else:
-        acc_spec = jax.tree.map(lambda _: _P, jax.eval_shape(sample_fn, fs))
+        if sample_prev:                     # only the tree structure matters for the spec
+            _probe = jax.eval_shape(lambda m_, s_, *ex_: sample_fn(s_, s_, _sample_aux(m_, ex_)),
+                                    fm, fs, *extras)
+        else:
+            _probe = jax.eval_shape(sample_fn, fs)
+        acc_spec = jax.tree.map(lambda _: _P, _probe)
         out_specs = (fs_spec, acc_spec)
     # EXECUTABLE REUSE across chunks (the A6 driver's multi-chunk contract). `body` is a FRESH
     # closure every call, so a bare `jax.jit(shard_map(body))` is a NEW jitted object ⇒ XLA RE-
@@ -1279,6 +1304,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                id(ice_cfg), id(gm_cfg), id(kpp_cfg), id(tke_cfg),
                id(ale_cfg), id(visc_cfg), id(tracer_cfg), id(sample_fn), id(ssh_gather),
                id(mevp_wide), _trace_env())
+        if sample_prev:                               # the plain-sample key is unchanged
+            key = key + ("sample_prev",)
         if precision != "double":                     # the double key is unchanged
             key = key + (precision,)
         if have_se_wide:

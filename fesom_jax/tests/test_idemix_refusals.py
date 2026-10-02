@@ -5,7 +5,7 @@ onto d7e4e5d): each unsupported combination raises ``ValueError`` before any phy
   ``run_steps_sharded_forced`` (``cavity_cfg``);
 * ice-shelf cavities, by mesh (``ulevels_nod2D > 1`` with ``cavity: null``, which upstream accepts):
   ``RunConfig.idemix_inputs``, ``build_lateral_operator``, the run entry and the column step
-  (``mixing_idemix``) on a concrete mesh;
+  (``mixing_idemix``, and ``budget_terms``, patch 0006) on a concrete mesh;
 * the coupled ocean (``init_ocean``), the sharded chunk program (IDEMIX ``step_kw``), and several
   JAX processes at the run entry;
 * ``Params.idemix`` (a pytree of five constants) as one log-normal scalar control.
@@ -118,8 +118,9 @@ def test_cavity_mesh_check(pi):
 
 def test_cavity_mesh_is_refused_on_every_concrete_idemix_path(pi, monkeypatch):
     """With ``cavity: null`` (upstream accepts a cavity mesh so): the run config's inputs, the
-    lateral operator, the run entry and the column step all refuse the mesh, before anything is
-    read or built; a traced mesh (a jit argument) cannot be read and is left to those checks."""
+    lateral operator, the run entry, the column step and the budget re-evaluation all refuse the
+    mesh, before anything is read or built; a traced mesh (a jit argument) cannot be read and is
+    left to those checks."""
     pytest.importorskip("idemix_jax")
     from idemix_jax import IdemixForcing, IdemixParams
     from fesom_jax import idemix as I
@@ -148,6 +149,16 @@ def test_cavity_mesh_is_refused_on_every_concrete_idemix_path(pi, monkeypatch):
     params = jax.tree.map(jnp.asarray, IdemixParams.fesom_operational())
     with pytest.raises(ValueError, match=msg):
         I.mixing_idemix(bad, z, z, z, f, params, I.IdemixConfig(lateral=False), None, dt=DT)
+
+    class S:
+        pass
+    s0, s1 = S(), S()
+    s0.iwe, s0.hnode, s1.iwe, s1.bvfreq = z, z, z, z
+    lat = I.build_lateral_operator(pi["mesh"])
+    for lateral in (False, True):                       # the budget re-evaluation (patch 0006)
+        with pytest.raises(ValueError, match=msg):
+            I.budget_terms(bad, s0, s1, f, params, I.IdemixConfig(lateral=lateral),
+                           lat if lateral else None, dt=DT)
     with pytest.raises(ValueError, match=msg):         # a jit that closes over the mesh
         jax.jit(lambda e: I.mixing_idemix(bad, e, z, z, f, params, I.IdemixConfig(lateral=False),
                                           None, dt=DT).iwe_new)(z)

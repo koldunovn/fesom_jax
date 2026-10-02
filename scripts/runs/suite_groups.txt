@@ -261,3 +261,4 @@ sharding_slow scripts/tests/test_cbar_ice_sharded_fd.py
 # Ported onto d7e4e5d 2026-11-26: the files land in `unit` unmeasured (the header rule above), not in `ci`.
 unit fesom_jax/tests/test_tke_idemix_cuts.py
 unit fesom_jax/tests/test_idemix_refusals.py
+unit fesom_jax/tests/test_run_snapshot.py
