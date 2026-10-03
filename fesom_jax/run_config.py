@@ -228,8 +228,11 @@ class RunConfig:
             return IdemixParams()
         if isinstance(spec, dict):
             if set(spec) != set(_IDEMIX_PARAM_FIELDS):
-                raise KeyError(f"idemix.params mapping needs exactly {list(_IDEMIX_PARAM_FIELDS)}, "
-                               f"got {sorted(spec)}")
+                missing = sorted(set(_IDEMIX_PARAM_FIELDS) - set(spec))
+                extra = sorted(set(spec) - set(_IDEMIX_PARAM_FIELDS))
+                raise ValueError(
+                    f"idemix.params mapping needs exactly the keys {list(_IDEMIX_PARAM_FIELDS)}"
+                    f" (missing {missing}, unexpected {extra})")
             return IdemixParams(**{k: float(spec[k]) for k in _IDEMIX_PARAM_FIELDS})
         raise ValueError(f"idemix.params must be one of {list(_IDEMIX_PARAM_PRESETS)} or a "
                          f"mapping of {list(_IDEMIX_PARAM_FIELDS)}, got {spec!r}")
@@ -244,7 +247,8 @@ class RunConfig:
             return None, None
         import numpy as np
         from idemix_jax import load_idemix_forcing
-        from .idemix import build_lateral_operator
+        from .idemix import build_lateral_operator, check_wet_columns
+        check_wet_columns(mesh)
         kw = {k: self.idemix[k] for k in _IDEMIX_FORCING_KEYS if k in self.idemix}
         if kw.get("botforc_Etot", 0.0) != 0.0:
             top = np.asarray(mesh.ulevels_nod2D) - 1

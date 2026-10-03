@@ -174,9 +174,11 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
                          dt, with_diags=False, iw_diss=None, alpha_c=None, E_iw=None):
     """The classical-TKE column solver, vectorized over nodes. Mirrors
     ``fesom_cvmix_integrate_tke`` (``fesom_cvmix_tke.c:141-404``) for the reference config
-    (``only_tke``, Neumann BCs, ``mxl_choice=2``; the gate-only IDEMIX/Langmuir/Dirichlet
-    branches are absent). Returns ``(tke_new, KappaM, KappaH)`` ``[N, nl]`` and, when
-    ``with_diags``, a dict of the 10 budget/aux diagnostics (the JT.1 replay tags).
+    (``only_tke``, Neumann BCs, ``mxl_choice=2``) and, through the keyword-only ``iw_diss`` /
+    ``alpha_c`` / ``E_iw`` below, its IDEMIX-coupled branch (``.not.only_tke``); the
+    Langmuir and Dirichlet branches are absent. Returns ``(tke_new, KappaM, KappaH)``
+    ``[N, nl]`` and, when ``with_diags``, a dict of the 10 budget/aux diagnostics (the JT.1
+    replay tags).
 
     Inputs (``[N, nl]`` unless noted), the seam from the driver:
       * ``tke_old`` — previous TKE at interfaces (the recurrent state; 0 at cold start);

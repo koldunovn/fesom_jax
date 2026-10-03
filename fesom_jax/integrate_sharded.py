@@ -477,7 +477,8 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None,
                      tracer_cfg=None, boundary_node_p=None,
                      use_ragged: bool = False, use_padded: bool = False,
-                     use_coloured: bool = False) -> State:
+                     use_coloured: bool = False, idemix_cfg=None, idemix_forcing=None,
+                     idemix_lateral=None) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
     return the ``[P, Lmax, …]`` next State.
 
@@ -491,7 +492,12 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     ``check_vma=False`` is required (the kernels' tridiagonal-solve / FCT ``lax.scan``s
     carry CONSTANT initial carries — non-"varying" under ``shard_map``'s varying-manual-axes
     typing — while their bodies produce per-device-varying outputs; relaxing it treats every
-    value conservatively as per-device-varying, always correct here, so the kernels lower)."""
+    value conservatively as per-device-varying, always correct here, so the kernels lower).
+
+    **IDEMIX.** As in :func:`run_steps_sharded`: ``idemix_cfg`` (static) + ``idemix_forcing``
+    / ``idemix_lateral`` PARTITIONED by :func:`fesom_jax.idemix.partition_idemix_inputs`
+    (device constants); the lateral step needs ``npes == 1``. ``idemix_cfg=None`` ⇒ the step
+    traces exactly as before."""
     fm, fm_spec = folded_mesh(sm)
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
@@ -516,6 +522,8 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     if have_bn:
         extras.append(_fold(boundary_node_p))
         extras_spec.append(_P)
+    _iw_kw = _idemix_extras(idemix_cfg, idemix_forcing, idemix_lateral, npes,
+                            extras, extras_spec)
     extras, extras_spec = tuple(extras), tuple(extras_spec)
 
     def _run(m, s, o, stress, ctx, ex):
@@ -530,7 +538,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                             forcing_static=fs_, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
                             kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
                             visc_cfg=visc_cfg, tracer_cfg=tracer_cfg, halo_ctx=ctx,
-                            boundary_node=bn_)
+                            boundary_node=bn_, **_iw_kw(ex))
 
     if not wire_halo:
         def body0(m, s, o, stress, *ex):

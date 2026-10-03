@@ -53,6 +53,7 @@ and refused on more (halo lanes would go stale between the lateral sub-iteration
 
 from __future__ import annotations
 
+import numbers
 from typing import NamedTuple
 
 import jax
@@ -78,8 +79,10 @@ class IdemixConfig(NamedTuple):
     lateral_cfl_cap: float = 0.1    # v0 <= sqrt(cap*res^2/(tau_h*dt/n_hor_iter)); 0.0 disables
 
     def validate(self) -> "IdemixConfig":
-        """Raise on an invalid combination; returns ``self``."""
-        if not isinstance(self.n_hor_iter, int) or self.n_hor_iter < 1:
+        """Raise on an invalid combination; returns ``self``. ``n_hor_iter`` may be any
+        integral number (Python or NumPy int, not bool)."""
+        if (not isinstance(self.n_hor_iter, numbers.Integral) or isinstance(self.n_hor_iter, bool)
+                or self.n_hor_iter < 1):
             raise ValueError(f"IdemixConfig.n_hor_iter must be an int >= 1, got {self.n_hor_iter!r}")
         if not self.lateral_cfl_cap >= 0.0:
             raise ValueError(
@@ -114,6 +117,21 @@ def _great_circle(lon1, lat1, lon2, lat2):
     return 2.0 * np.arcsin(np.sqrt(np.clip(s, 0.0, 1.0)))
 
 
+def check_wet_columns(mesh) -> None:
+    """Raise ``ValueError`` unless every node column has at least one wet layer
+    (``nlevels_nod2D - ulevels_nod2D >= 1``, i.e. >= 2 wet interfaces). IDEMIX's column solve
+    and its end-cap interface spacing assume it; a column without a wet layer would be all
+    "dry" interfaces, its forcing silently dropped. Host-side NumPy on the static mesh
+    levels, run once per mesh (:func:`build_lateral_operator`, the run config's
+    ``idemix_inputs`` and the run entry) -- never inside a traced step."""
+    n_layers = np.asarray(mesh.nlevels_nod2D) - np.asarray(mesh.ulevels_nod2D)
+    bad = np.flatnonzero(n_layers < 1)
+    if bad.size:
+        raise ValueError(
+            f"IDEMIX needs >= 1 wet layer in every node column; {bad.size} node(s) have none "
+            f"(nlevels_nod2D - ulevels_nod2D < 1), e.g. node(s) {bad[:5].tolist()}")
+
+
 def build_lateral_operator(mesh) -> LateralOperator:
     """The lateral-propagation connectivity of ``mesh`` (host-side NumPy, once per mesh).
 
@@ -122,7 +140,9 @@ def build_lateral_operator(mesh) -> LateralOperator:
     ``mesh.edge_cross_dxdy`` (the two edge-midpoint→element-centroid segments, m; one is
     zero on a boundary edge), ``node_dist`` = the great-circle distance between the edge's
     two nodes (``geo_coord_nod2D``, radius ``R_EARTH``). ``resolution`` =
-    ``mesh.mesh_resolution``."""
+    ``mesh.mesh_resolution``. Raises if a node column has no wet layer
+    (:func:`check_wet_columns`)."""
+    check_wet_columns(mesh)
     edges = np.asarray(mesh.edges)
     cross = np.asarray(mesh.edge_cross_dxdy, dtype=np.float64)
     cross_len = np.hypot(cross[:, 0], cross[:, 1]) + np.hypot(cross[:, 2], cross[:, 3])
@@ -183,7 +203,7 @@ def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_
             v0 = jnp.minimum(v0, _v0_cap(params_idemix, cfg, lateral_op, dt))
         tend = horizontal_propagation(
             res.E_iw, v0, dzt, interface_area(mesh), lateral_op.nbr_idx, lateral_op.nbr_weight,
-            dt, params_idemix, n_iter=cfg.n_hor_iter, is_wet=is_wet)   # [m^2/s^3]
+            dt, params_idemix, n_iter=int(cfg.n_hor_iter), is_wet=is_wet)   # [m^2/s^3]
         iwe_new = res.E_iw + dt * tend
     else:
         iwe_new = res.E_iw

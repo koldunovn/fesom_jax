@@ -355,11 +355,16 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
 
     out = {}
     on_disk = set(root.array_keys())
+    seen = {}                                            # name -> (global shape, dtype) read
     for name in _all_state_fields():
         if name == "iwe" and name not in on_disk:        # pre-IDEMIX restart ⇒ cold-start iwe
-            g = np.zeros_like(reconstruct_global(out_dir, "tke"))
+            if "tke" not in seen:                        # State field order: tke precedes iwe
+                raise RuntimeError("read_restart: the iwe fallback takes tke's shape, but tke "
+                                   "was not read before iwe")
+            g = np.zeros(*seen["tke"])                   # tke's shape/dtype, no second read
         else:
             g = reconstruct_global(out_dir, name)        # [n_global, …] host numpy
+        seen[name] = (g.shape, g.dtype)
         n0 = g.shape[0]
         if n0 == new_part.nod2D:
             ml, L = new_part.myList_nod2D, Lmax["nod"]
