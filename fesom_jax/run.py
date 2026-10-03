@@ -503,6 +503,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         from .params import Params
         _idemix.check_no_cavity_mesh(mesh)       # host-side, whatever cfg.cavity says
         _iw_cfg = cfg.idemix_config()
+        _idemix.check_wet_columns(mesh)          # host-side, before any forcing is built
         if _iw_cfg.lateral and npes > 1:
             raise NotImplementedError(
                 f"idemix lateral propagation runs on one device only (partition has npes={npes}); "

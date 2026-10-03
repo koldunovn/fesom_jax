@@ -388,6 +388,7 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     from .precision import CARRY_FIELDS
     from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
     out = {}
+    seen = {}                                            # name -> (global shape, dtype) read
     for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS:
         if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS and name not in root:
             # written by single-precision runs only (the carry), or an ice_ave_steps field the writer did not
@@ -398,9 +399,13 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
             out[name] = None
             continue
         if name == "iwe" and name not in root:          # pre-IDEMIX restart ⇒ cold-start iwe
-            g = np.zeros_like(reconstruct_global(out_dir, "tke"))
+            if "tke" not in seen:                        # State field order: tke precedes iwe
+                raise RuntimeError("read_restart: the iwe fallback takes tke's shape, but tke "
+                                   "was not read before iwe")
+            g = np.zeros(*seen["tke"])                   # tke's shape/dtype, no second read
         else:
             g = reconstruct_global(out_dir, name)        # [n_global, …] host numpy
+        seen[name] = (g.shape, g.dtype)
         n0 = g.shape[0]
         if n0 == new_part.nod2D:
             ml, L = new_part.myList_nod2D, Lmax["nod"]
