@@ -477,3 +477,382 @@ def test_xs_fn_must_build_fresh_and_says_so(fixture, capsys):
     res = aliasing_call(free_xs=False)
     assert np.isfinite(float(res.grad.k_ver))
     assert res.n_chunks == 1
+
+
+# ---------------------------------------------------------------------------
+# 8. the linearity guard
+# ---------------------------------------------------------------------------
+# A chunk VJP must be a linear map of the cotangent. The guard evaluates it on the first reverse
+# chunk: "zero" asserts vjp(0) == 0 exactly, "full" also asserts vjp(2c) == 2·vjp(c) within a
+# measured repeat spread. The planted defects are custom derivative rules that break linearity
+# in the two ways the modes are built to see: adding a constant (caught by "zero") and squaring
+# (homogeneous at zero, so only "full" sees it). They sit on a tiny synthetic model: the guard's
+# algebra does not depend on the ocean, and the pi chunk runs separately to show a real model
+# passes.
+
+_W_SYN = np.random.default_rng(7).normal(size=(12, 12)) / 4.0
+
+
+_NOISE_CALLS = [0]
+
+
+def _call_counter():
+    """Host side of the ``"noisy"`` plant: a new value on every call of the compiled VJP."""
+    _NOISE_CALLS[0] += 1
+    return np.float64(_NOISE_CALLS[0])
+
+
+def _planted(kind):
+    """Identity forward; the backward breaks linearity (``"add"``: g + 1, ``"square"``: g²),
+    or (``"noisy"``) stays linear in ``g`` but changes from call to call, ``g·(1 + 1e-3·k)``
+    with ``k`` a host call counter — a stand-in for a GPU chunk VJP whose rematerialised
+    forward is not reproducible."""
+    @jax.custom_vjp
+    def f(x):
+        return x
+
+    def fwd(x):
+        return x, None
+
+    def bwd(_, g):
+        if kind == "noisy":
+            from jax.experimental import io_callback
+            k = io_callback(_call_counter, jax.ShapeDtypeStruct((), jnp.float64))
+            return (g * (1.0 + 1e-3 * k),)
+        return ((g + 1.0) if kind == "add" else (g * g),)
+
+    f.defvjp(fwd, bwd)
+    return f
+
+
+_SYN_FN: dict = {}
+
+
+def _syn_chunk_fn(kind=None):
+    """``(state, xs, params) -> state`` of a small nonlinear map, memoised per ``kind`` so the
+    compiled chunk is reused (``chunked_grad`` caches on the object). ``state`` carries an
+    integer counter so its cotangent has a float0 leaf; ``params`` may carry one too."""
+    if kind not in _SYN_FN:
+        plant = _planted(kind) if kind else (lambda x: x)
+        W = jnp.asarray(_W_SYN)
+
+        def chunk_fn(state, xs, params):
+            def one(st, x):
+                return {"x": jnp.tanh(params["a"] * (W @ st["x"]) + x), "n": st["n"] + 1}
+            out = scan_steps(one, state, xs)
+            return {"x": plant(out["x"]), "n": out["n"]}
+        _SYN_FN[kind] = chunk_fn
+    return _SYN_FN[kind]
+
+
+def _syn(kind=None, check_linear=True, n_chunks=3, **kw):
+    s0 = {"x": jnp.asarray(np.linspace(-1.0, 1.0, 12)), "n": jnp.asarray(0, jnp.int32)}
+    params = {"a": jnp.asarray(0.9, jnp.float64), "k": jnp.asarray(2, jnp.int32)}
+    return chunked_grad(_syn_chunk_fn(kind), params, init_state=s0, n_chunks=n_chunks,
+                        xs_fn=lambda c: jnp.asarray(np.full(4, 0.1 * (c + 1))),
+                        loss_fn=lambda s: jnp.sum(s["x"] ** 3), chunk_steps=4,
+                        check_linear=check_linear, **kw)
+
+
+@pytest.mark.parametrize("mode", [True, "zero", "full"])
+def test_linearity_guard_passes_on_the_pi_chunk(fixture, baseline, mode, capsys):
+    """A real model passes both modes, on CPU exactly (spread 0 ⇒ the 1e-9 floor), and the
+    guard changes no gradient bit. ``True`` is ``"zero"``."""
+    res = baseline if mode is True else _chunked(fixture, KVER, check_linear=mode)
+    info = res.linear_check
+    print(f"\ncheck_linear={mode!r}: {info}")
+    assert info is not None and info["mode"] == ("zero" if mode is True else mode)
+    assert info["chunk"] == res.n_chunks - 1, "the guard must run on the first reverse chunk"
+    assert info["zero_max"] == 0.0
+    if mode == "full":
+        assert info["spread"] == {"state": 0.0, "params": 0.0}, "CPU repeats are bitwise"
+        assert info["err"]["state"] <= 1e-9 and info["err"]["params"] <= 1e-9
+        assert info["informative"] is True and info["informative_bar"] == 1e-6
+    else:
+        assert "informative" not in info
+    off = _chunked(fixture, KVER, check_linear=False)
+    assert off.linear_check is None
+    assert float(off.grad.k_ver) == float(res.grad.k_ver)
+    assert off.trace == res.trace
+
+
+def test_linearity_guard_zero_catches_an_added_constant(capsys):
+    with pytest.raises(RuntimeError, match="ZERO cotangent") as exc:
+        _syn("add", check_linear="zero")
+    print(f"\n{exc.value}")
+    assert "miscompiled" in str(exc.value) and "non-determinism" in str(exc.value)
+    _syn("add", check_linear=False)          # the guard, not the sweep, raised
+
+
+def test_linearity_guard_full_catches_a_squared_cotangent(capsys):
+    """Squaring maps 0 to 0, so ``"zero"`` passes; ``"full"`` sees vjp(2c) = 4·(…) ≠ 2·vjp(c)."""
+    res = _syn("square", check_linear="zero")
+    assert res.linear_check["zero_max"] == 0.0
+    with pytest.raises(RuntimeError, match=r"vjp\(2c\)") as exc:
+        _syn("square", check_linear="full")
+    print(f"\n{exc.value}")
+
+
+def test_linearity_guard_full_says_when_it_proves_nothing(capsys):
+    """A chunk VJP that is linear but not reproducible (relative repeat spread ~2e-3, far above
+    INFORMATIVE_SPREAD) passes "full" — the bound 10·s admits it — so the result must say the
+    check was not informative, and a RuntimeWarning must say it at run time. The reproducible
+    synthetic chunk is informative and warns about nothing (negative control)."""
+    import warnings
+    from fesom_jax.adjoint import INFORMATIVE_SPREAD
+    with pytest.warns(RuntimeWarning, match="NOT informative") as rec:
+        res = _syn("noisy", check_linear="full")
+    info = res.linear_check
+    print(f"\nnoisy: {info}\n{rec[0].message}")
+    assert info["informative"] is False and info["informative_bar"] == INFORMATIVE_SPREAD
+    assert info["spread"]["state"] > INFORMATIVE_SPREAD, "the plant must make repeats differ"
+    assert info["err"]["state"] <= 10.0 * info["spread"]["state"], "and still pass the bound"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")      # any warning from the clean chunk fails the test
+        clean = _syn(None, check_linear="full").linear_check
+    print(f"clean: {clean}")
+    assert clean["informative"] is True
+    assert clean["spread"] == {"state": 0.0, "params": 0.0}
+
+
+def test_linearity_guard_float0_leaves_and_options(capsys):
+    """Integer leaves in the state and in params (float0 cotangents) do not break the guard or
+    the accumulation over several chunks; ``False`` skips; a bad value raises before any work."""
+    for mode in ("zero", "full"):
+        res = _syn(None, check_linear=mode)
+        print(f"\n{mode}: grad a={float(res.grad['a']):+.6e}  k dtype={res.grad['k'].dtype}  "
+              f"{res.linear_check}")
+        assert res.grad["k"].dtype == jax.dtypes.float0
+        assert res.linear_check["zero_max"] == 0.0 and res.linear_check["chunk"] == 2
+    assert _syn(None, check_linear=False).linear_check is None
+    with pytest.raises(ValueError, match="check_linear"):
+        _syn(None, check_linear="yes")
+
+
+def test_linearity_guard_runs_once_per_leg(fixture, baseline, monkeypatch, capsys):
+    """A resumed sweep checks once in each leg, on that leg's first chunk."""
+    from fesom_jax import adjoint as A
+    calls = []
+    real = A._check_linear
+
+    def counting(*a, **k):
+        calls.append(a[-1])                   # the chunk index
+        return real(*a, **k)
+
+    monkeypatch.setattr(A, "_check_linear", counting)
+    ck = _FakeCheckpoint(stop_after=2)
+    with pytest.raises(LegIncomplete):
+        _chunked(fixture, KVER, checkpoint=ck)
+    first_leg = list(calls)
+    ck.stop_after = None
+    res = _chunked(fixture, KVER, checkpoint=ck)
+    print(f"\nguard chunks: leg 1 {first_leg}, leg 2 {calls[len(first_leg):]}")
+    assert first_leg == [res.n_chunks - 1], first_leg
+    assert calls[len(first_leg):] == [res.n_chunks - 3], calls
+    assert res.linear_check["chunk"] == res.n_chunks - 3
+    g, g_ref = float(res.grad.k_ver), float(baseline.grad.k_ver)
+    assert abs(g - g_ref) <= 1e-12 * abs(g_ref)
+
+
+# ---------------------------------------------------------------------------
+# 9. per-field traces, the cotangent hook and the initial-state cotangent
+# ---------------------------------------------------------------------------
+def test_field_trace_decomposes_the_trace(baseline, capsys):
+    """One ``{leaf: norm}`` per boundary, aligned with ``trace``; the squares add up to it."""
+    res = baseline
+    assert res.field_trace is not None and len(res.field_trace) == len(res.trace)
+    for i, (tot, fields) in enumerate(zip(res.trace, res.field_trace)):
+        s2 = sum(v * v for v in fields.values())
+        assert abs(s2 - tot * tot) <= 1e-12 * tot * tot, (i, s2, tot * tot)
+    names = list(res.field_trace[0])
+    assert "T" in names and "uv" in names and all("." not in n for n in names)
+    amp = adjoint_stab.amplification_by_field(res.field_trace, res.chunk_steps)
+    assert set(amp) == set(names)
+    top = sorted(res.field_trace[-1].items(), key=lambda kv: -kv[1])[:4]
+    print(f"\nfields {len(names)}; largest at the initial state: "
+          + ", ".join(f"{k}={v:.3e}" for k, v in top))
+    print("median per-step rate: " + ", ".join(
+        f"{k}={amp[k].median:.4f}" for k, _ in top))
+    assert np.isfinite(amp["T"].median)
+
+
+def test_on_cot_hook_and_state_cot(fixture, baseline, single_chunk, capsys):
+    """The hook sees every boundary once, seed first, walking back to the initial state; it
+    changes nothing; ``state_cot`` is d loss / d initial state of the monolithic window."""
+    mesh, op, stress, st0 = fixture
+    seen = []
+
+    def hook(c, cot):
+        seen.append((c, float(adjoint_stab.cotangent_norm(cot))))
+
+    res = _chunked(fixture, KVER, on_cot=hook, field_trace=False)
+    print(f"\non_cot boundaries {[c for c, _ in seen]}")
+    assert [c for c, _ in seen] == list(range(res.n_chunks, -1, -1))
+    assert [n for _, n in seen] == res.trace
+    assert res.field_trace is None
+    # the hook and the traces change no bit
+    assert float(res.grad.k_ver) == float(baseline.grad.k_ver)
+    assert res.trace == baseline.trace
+    for a, b in zip(jax.tree.leaves(res.state_cot), jax.tree.leaves(baseline.state_cot)):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+
+    # state_cot == d loss / d s0 of the monolithic window. Exact for ONE chunk (the same
+    # segmentation, so the same program up to the host round trip). For four chunks the reverse
+    # program re-runs each chunk's forward in a different fusion, and the early-stopped SSH
+    # solve turns that round-off into a ~1e-8 difference in the T cotangent (job 27735668:
+    # 8.4e-9 relative) — the same size as rematerialisation on/off moves the monolithic
+    # gradient (8.7e-9). So four chunks are held to that measured spread, not to 1e-12.
+    _, _, loss_fn, _, xs_all = _harness(fixture, K)
+    p = _params(KVER)
+
+    def loss(s, remat=True):
+        return loss_fn(scan_steps(lambda c, x: _advance(c, x, mesh, op, stress, p),
+                                  s, xs_all, rematerialize=remat))
+
+    ref = jax.jit(jax.grad(loss))(st0)
+    ref_nr = jax.jit(jax.grad(lambda s: loss(s, False)))(st0)
+
+    def rel(a, b):
+        la = [np.asarray(x) for x in jax.tree.leaves(a)]
+        lb = [np.asarray(x) for x in jax.tree.leaves(b)]
+        num = sum(float(np.sum((x - y) ** 2)) for x, y in zip(la, lb))
+        den = sum(float(np.sum(y ** 2)) for y in lb)
+        assert den > 0.0
+        return (num / den) ** 0.5
+
+    r1, r4, spread = rel(single_chunk.state_cot, ref), rel(res.state_cot, ref), rel(ref, ref_nr)
+    print(f"state_cot vs monolithic d loss / d s0: 1 chunk {r1:.3e}, {res.n_chunks} chunks "
+          f"{r4:.3e}; monolithic remat vs no remat {spread:.3e}")
+    assert r1 <= 1e-12, r1
+    assert r4 <= max(10.0 * spread, 1e-12), (r4, spread)
+
+
+def test_field_trace_and_hook_across_a_resume(fixture, baseline, capsys):
+    """A resumed leg pads the boundaries of the earlier leg with ``None`` so ``field_trace``
+    stays aligned with ``trace``, and its hook reports only its own boundaries."""
+    ck = _FakeCheckpoint(stop_after=2)
+    seen1, seen2 = [], []
+    with pytest.raises(LegIncomplete):
+        _chunked(fixture, KVER, checkpoint=ck, on_cot=lambda c, _: seen1.append(c))
+    ck.stop_after = None
+    res = _chunked(fixture, KVER, checkpoint=ck, on_cot=lambda c, _: seen2.append(c))
+    print(f"\nleg 1 hook {seen1}, leg 2 hook {seen2}")
+    assert seen1 + seen2 == list(range(res.n_chunks, -1, -1))
+    assert len(res.field_trace) == len(res.trace)
+    n_prev = len(seen1)
+    assert all(f is None for f in res.field_trace[:n_prev])
+    for got, ref in zip(res.field_trace[n_prev:], baseline.field_trace[n_prev:]):
+        for k in ref:
+            assert abs(got[k] - ref[k]) <= 1e-12 * max(ref[k], 1e-300)
+    amp = adjoint_stab.amplification_by_field(res.field_trace, res.chunk_steps)
+    assert "T" in amp
+
+
+# ---------------------------------------------------------------------------
+# 10. several costs in one sweep
+# ---------------------------------------------------------------------------
+def _loss_fns(mesh):
+    """Three costs of the final state: mean SST, mean surface salinity, mean surface height."""
+    wet0 = jnp.asarray(mesh.node_layer_mask[:, 0])
+
+    def sss(s):
+        return jnp.sum(jnp.where(wet0, s.S[:, 0], 0.0)) / jnp.sum(wet0)
+
+    def ssh_(s):
+        return jnp.sum(jnp.where(wet0, s.eta_n, 0.0)) / jnp.sum(wet0)
+    return [lambda s: _mean_sst(s, mesh), sss, ssh_]
+
+
+def _multi(fixture, stride=1, **kw):
+    from fesom_jax.adjoint import chunked_grad_multi
+    mesh, _, _, st0 = fixture
+    chunk_fn, xs_fn, _, n_chunks, _ = _harness(fixture, K)
+    return chunked_grad_multi(chunk_fn, _params(KVER), init_state=st0, n_chunks=n_chunks,
+                              xs_fn=xs_fn, loss_fns=_loss_fns(mesh), chunk_steps=K,
+                              boundary_stride=stride, **kw)
+
+
+def _same_tree(a, b):
+    la, lb = jax.tree.leaves(a), jax.tree.leaves(b)
+    return len(la) == len(lb) and all(np.array_equal(np.asarray(x), np.asarray(y))
+                                      for x, y in zip(la, lb))
+
+
+@pytest.fixture(scope="module")
+def multi_run(fixture):
+    from fesom_jax import adjoint as A
+    calls, order = [], []
+    real = A._check_linear
+
+    def counting(*a, **k):
+        calls.append(a[-1])
+        return real(*a, **k)
+
+    A._check_linear = counting
+    try:
+        res = _multi(fixture, on_cot=lambda k, c, cot: order.append((k, c)))
+    finally:
+        A._check_linear = real
+    return res, calls, order
+
+
+def test_multi_cost_equals_single_cost_sweeps(fixture, multi_run, capsys):
+    """K = 3 costs in one sweep == three chunked_grad runs, bit for bit (CPU), through the host
+    round trips of the parked cotangents and gradients."""
+    mesh, _, _, st0 = fixture
+    res, _, _ = multi_run
+    chunk_fn, xs_fn, _, n_chunks, _ = _harness(fixture, K)
+    for k, lf in enumerate(_loss_fns(mesh)):
+        one = chunked_grad(chunk_fn, _params(KVER), init_state=st0, n_chunks=n_chunks,
+                           xs_fn=xs_fn, loss_fn=lf, chunk_steps=K)
+        print(f"\ncost {k}: loss {res.losses[k]:+.6e}  dL/dk_ver multi "
+              f"{float(res.grads[k].k_ver):+.17e} single {float(one.grad.k_ver):+.17e}")
+        assert res.losses[k] == one.loss
+        assert _same_tree(res.grads[k], one.grad), f"cost {k}: params gradient differs"
+        assert res.traces[k] == one.trace, f"cost {k}: trace differs"
+        assert res.field_traces[k] == one.field_trace, f"cost {k}: field trace differs"
+        assert _same_tree(res.state_cots[k], one.state_cot), f"cost {k}: state cotangent differs"
+        assert float(one.grad.k_ver) != 0.0
+    assert len({float(g.k_ver) for g in res.grads}) == 3, "the three costs must differ"
+
+
+def test_multi_cost_stride_and_guard(fixture, multi_run, capsys):
+    """Strides 1 and 2 agree; the linearity guard runs once (first chunk, cost 0)."""
+    res, calls, _ = multi_run
+    res2 = _multi(fixture, stride=2)
+    for k in range(3):
+        g1, g2 = float(res.grads[k].k_ver), float(res2.grads[k].k_ver)
+        assert abs(g1 - g2) <= 1e-12 * abs(g1), (k, g1, g2)
+    print(f"\nguard ran on chunks {calls}; linear_check {res.linear_check}")
+    assert calls == [res.n_chunks - 1]
+    assert res.linear_check["chunk"] == res.n_chunks - 1
+
+
+def test_multi_cost_hook_order(multi_run, capsys):
+    """The contract track D depends on: once per cost per boundary, boundaries from the seed
+    (c = n_chunks) down to 0, costs ascending within a boundary."""
+    res, _, order = multi_run
+    expect = [(k, c) for c in range(res.n_chunks, -1, -1) for k in range(3)]
+    print(f"\non_cot calls {len(order)}: {order[:6]} ...")
+    assert len(order) == 3 * (res.n_chunks + 1)
+    assert order == expect
+
+
+def test_multi_cost_rejects_a_checkpoint_and_handles_float0(capsys):
+    from fesom_jax.adjoint import chunked_grad_multi
+    s0 = {"x": jnp.asarray(np.linspace(-1.0, 1.0, 12)), "n": jnp.asarray(0, jnp.int32)}
+    params = {"a": jnp.asarray(0.9, jnp.float64), "k": jnp.asarray(2, jnp.int32)}
+    kw = dict(init_state=s0, n_chunks=3, xs_fn=lambda c: jnp.asarray(np.full(4, 0.1 * (c + 1))),
+              chunk_steps=4)
+    with pytest.raises(ValueError, match="ReverseCheckpoint"):
+        chunked_grad_multi(_syn_chunk_fn(None), params, loss_fns=[lambda s: s["x"][0]],
+                           checkpoint=_FakeCheckpoint(), **kw)
+    lfs = [lambda s: jnp.sum(s["x"] ** 3), lambda s: jnp.sum(jnp.sin(s["x"]))]
+    res = chunked_grad_multi(_syn_chunk_fn(None), params, loss_fns=lfs,
+                             check_linear="full", **kw)
+    for k, lf in enumerate(lfs):
+        one = chunked_grad(_syn_chunk_fn(None), params, loss_fn=lf, **kw)
+        assert float(res.grads[k]["a"]) == float(one.grad["a"])
+        assert res.grads[k]["k"].dtype == jax.dtypes.float0
+        assert np.array_equal(np.asarray(res.state_cots[k]["x"]), np.asarray(one.state_cot["x"]))
+    print(f"\nsynthetic K=2: grads a {[float(g['a']) for g in res.grads]}")

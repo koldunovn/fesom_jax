@@ -112,7 +112,7 @@ def build(year):
     cfgs = dict(gm_cfg=GMConfig(), tke_cfg=TkeConfig(),
                 ice_cfg=IceConfig(whichEVP=1), ale_cfg=AleConfig())   # exact ice (forward-only)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, year, dt=DT, sst_ic=np.asarray(base.T[:, 0]))
     return mesh, state, op, cf, cfgs
 
 

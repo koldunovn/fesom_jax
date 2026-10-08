@@ -504,7 +504,9 @@ def test_forcing_dump_gate_zstar_diagnostic(capsys):
     state0 = ice.seed_ice(state, mesh, sst)
     cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
     sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
-    out = ice_step.ice_surface_step(IceConfig(), mesh, state0, sf0, cf.static,
+    # The C dumps predate the drift fixes (2026-09-18): the ice FCT used the 2.0e8 module default
+    # for scale_area, not the 5.8e9 namelist value; replay it so the gate stays a C comparison.
+    out = ice_step.ice_surface_step(IceConfig(scale_area=2.0e8), mesh, state0, sf0, cf.static,
                                     dt=DT_ZSTAR, use_virt_salt=False)
     f, _ = io_dump.load_ale_dump(ZSTAR_ORACLE, ["forcing"], step=1, n_nod=NG5_NOD2D)
     jx = {"water_flux": np.asarray(out.water_flux), "virtual_salt": np.asarray(out.virtual_salt),
@@ -935,10 +937,13 @@ def test_jz7_assembled_zstar_step1(capsys):
     op = ssh.build_ssh_operator(mesh, dt=DT_ZSTAR)
     cf = surface_forcing.build_surface_forcing(mesh, ZSTAR_YEAR, sst_ic=sst)
     sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(ZSTAR_YEAR, DT_ZSTAR, 1)[0])
+    # The C dumps predate the drift fixes (2026-09-18): legacy ice FCT scale_area and the bulk
+    # tap on the previous step's uvnode, replayed so the gate stays a C comparison.
     st1 = stepmod.step(state0, mesh, op, None, dt=DT_ZSTAR, is_first_step=True,
                        step_forcing=sf0, forcing_static=cf.static,
-                       kpp_cfg=KppConfig(), gm_cfg=GMConfig(), ice_cfg=IceConfig(),
-                       ale_cfg=AleConfig())
+                       kpp_cfg=KppConfig(), gm_cfg=GMConfig(),
+                       ice_cfg=IceConfig(scale_area=2.0e8), ale_cfg=AleConfig(),
+                       bulk_uvnode_lag=True)
     # (a) integration smoke — the full model assembles + every output field is finite.
     for fld in ("T", "S", "uv", "hbar", "hbar_old", "hnode", "hnode_new", "pgf_x", "pgf_y",
                 "d_eta", "w", "eta_n", "ssh_rhs", "a_ice"):
@@ -1115,7 +1120,10 @@ def test_jz7_assembled_zstar_steps123(capsys):
                   f"p99={np.percentile(d, 99):.2e} p99.9={np.percentile(d, 99.9):.2e} max={d.max():.2e}")
         return d
 
-    cfgs = dict(kpp_cfg=KppConfig(), gm_cfg=GMConfig(), ice_cfg=IceConfig(), ale_cfg=AleConfig())
+    # The C dumps predate the drift fixes (2026-09-18): legacy ice FCT scale_area and the bulk
+    # tap on the previous step's uvnode, replayed so the gate stays a C comparison.
+    cfgs = dict(kpp_cfg=KppConfig(), gm_cfg=GMConfig(), ice_cfg=IceConfig(scale_area=2.0e8),
+                ale_cfg=AleConfig(), bulk_uvnode_lag=True)
     st = state0
     R = {}                                   # (step, tag) → |Δ| array, for the deferred gates
     for i in range(3):

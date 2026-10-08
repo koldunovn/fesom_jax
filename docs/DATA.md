@@ -144,7 +144,7 @@ Python (explicit argument; wins over everything):
 
 ```python
 from fesom_jax import surface_forcing
-forcing = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=sst0,
+forcing = surface_forcing.build_surface_forcing(mesh, 1958, dt=1800.0, sst_ic=sst0,
                                            jra_dir="/data/JRA55-do-v1.4.0")
 ```
 

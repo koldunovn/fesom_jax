@@ -57,6 +57,13 @@ class IceConfig(NamedTuple):
     # --- FCT advection (fesom_ice.c:61-64) ---
     ice_gamma_fct: float = 0.5    # CORE2 namelist value (NOT the 0.25 module default)
     ice_diff: float = 10.0        # stabilising diffusion
+    # scale_area is a &oce_dyn NAMELIST parameter (oce_modules.F90:193), 5.8e9 in every
+    # CORE2 reference run; the ice FCT diffusion ice_diff*sqrt(elem_area/scale_area)
+    # (ice_fct.F90:175) is its only live consumer. The C, Kokkos and JAX ports carried the
+    # module default 2.0e8 until 2026-09-18 = 5.4x too much ice diffusion at every ice
+    # edge — the systematic ice loss behind the 63-yr deep-ocean drift (fesom2_port_zstar
+    # docs/plans/20260918-longrun-drift-strategy.md; fix fesom2_port_drift@21da79e).
+    scale_area: float = 5.8e9     # CORE2 namelist.oce value (NOT the 2.0e8 module default)
     # --- timestep (fesom_ice.c:69, 231 ice_setup) ---
     ice_ave_steps: int = 1
     ice_dt: float = 500.0         # = ice_ave_steps * ocean dt (CORE2 dt=500)
@@ -121,10 +128,25 @@ class IceConfig(NamedTuple):
     #                 changes ice growth, which changes the surface heat and salt fluxes back
     #                 into the ocean.
     #
+    #   "prescribed": the ice TRAJECTORY is given. The nine prognostic ice fields carry no
+    #                 tangent into a step and none out of it, so the ice-state recurrence is
+    #                 cut — including its unbounded gain at an advancing ice edge, which
+    #                 "rheology" keeps (a x462 jump in the a_ice tangent in one day at the
+    #                 Okhotsk edge, 2014-01-04) — while every flux the ocean
+    #                 receives stays differentiable in the ocean state and the atmosphere. What
+    #                 the ECCO adjoint does when the sea-ice package's adjoint is disabled. Use
+    #                 this, not "frozen", when the ice must be excluded but dJ/d(forcing) and
+    #                 the SST -> flux feedback are wanted.
+    #
     #   "frozen"    : stop_gradient the WHOLE ice update, so no gradient flows through ice at
-    #                 all. Heavier-handed than needed but the most conservative option, and the
-    #                 one every published adjoint sea-ice study fell back to before free-drift
-    #                 approximations existed.
+    #                 all. ⚠️ "The whole ice update" is IceStepOut, and that carries the surface
+    #                 fluxes: under "frozen" the gradient with respect to the ATMOSPHERE is
+    #                 identically zero and the SST -> flux damping is gone from the adjoint
+    #                 (measured over 30 d: the forcing gradient 2.4e-03 -> 0.0 exactly, the
+    #                 temperature gradient +16 %). A calibration whose controls are ocean
+    #                 parameters can live with that; a forcing sensitivity cannot. The most
+    #                 conservative option, and the one every published adjoint sea-ice study
+    #                 fell back to before free-drift approximations existed.
     #
     #   "exact"     : differentiate everything. **Returns NaN on realistic configurations.** The
     #                 subcycled EVP/mEVP momentum solve is a fixed-point iteration whose reverse

@@ -353,7 +353,7 @@ def main():
     with open(SNAP, "rb") as f:
         dense = pickle.load(f)
     sst0 = np.asarray(phc_initial_state(mesh, IC_DIR).T[:, 0])
-    cf = surface_forcing.build_surface_forcing(mesh, 1960, sst_ic=sst0)
+    cf = surface_forcing.build_surface_forcing(mesh, 1960, dt=DT, sst_ic=sst0)
     dates = surface_forcing.dates_for_steps(1960, DT, args.n, start_month=2, start_day=20)
     sf_seq = cf.stack(dates)                 # [n_steps] REAL per-step JRA55-do, not a constant
     print(f"[setup] N={args.n} steps ({args.n * DT / 86400:.2f} d) with per-step JRA55-do "

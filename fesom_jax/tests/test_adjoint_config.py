@@ -33,7 +33,7 @@ import numpy as np
 import pytest
 
 from fesom_jax import ssh
-from fesom_jax.adjoint_stab import AdjointConfig
+from fesom_jax.adjoint_stab import FREEZE_FLAGS, AdjointConfig
 from fesom_jax.config import A_VER
 from fesom_jax import forcing, ic
 from fesom_jax.integrate import integrate
@@ -92,7 +92,10 @@ K0 = jnp.asarray(0.0, jnp.float64)        # control point: the unperturbed initi
 # Every flag, and whether the pi/PP configuration actually exercises it. The TKE-only and
 # GM-only flags are wired through the same seam but their code path is inactive here, so
 # they are checked for "does not break anything" rather than "changes the gradient".
-ALL_FLAGS = [f for f in AdjointConfig._fields]
+ALL_FLAGS = list(FREEZE_FLAGS)
+# AdjointConfig fields that are NOT boolean freeze flags, classified explicitly so that a new
+# non-flag field cannot slip past the registries below (diag_cuts: test_adjoint_diag_cuts.py).
+NON_FLAG_FIELDS = ["diag_cuts"]
 ACTIVE_ON_PI = ["freeze_mixing", "freeze_convection", "freeze_vert_visc",
                 "freeze_advection"]
 # ⚠️ freeze_pgf is INACTIVE here, not active. Its stop_gradient sits inside
@@ -116,6 +119,7 @@ def test_every_flag_is_covered():
     """If someone adds a flag, this test fails until they classify it — otherwise a new knob
     can be added and silently never tested."""
     assert sorted(ACTIVE_ON_PI + INACTIVE_ON_PI) == sorted(ALL_FLAGS)
+    assert sorted(ALL_FLAGS + NON_FLAG_FIELDS) == sorted(AdjointConfig._fields)
 
 
 def test_default_config_is_a_dead_branch(setup):

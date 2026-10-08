@@ -48,7 +48,7 @@ def main():
     state = cold_start_state(mesh, IC_DIR)                 # PHC IC + seeded sea-ice IC (canonical)
     sst = np.asarray(state.T[:, 0])
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst)
+    cf = surface_forcing.build_surface_forcing(mesh, args.year, dt=DT, sst_ic=sst)
     dates = surface_forcing.dates_for_steps(args.year, DT, args.steps)
     cfgs = dict(gm_cfg=GMConfig(), tke_cfg=TkeConfig(), ice_cfg=IceConfig(whichEVP=1),
                 ale_cfg=AleConfig())     # zstar + TKE + mEVP + GM, all live

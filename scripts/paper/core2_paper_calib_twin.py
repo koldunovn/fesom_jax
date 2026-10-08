@@ -120,7 +120,7 @@ def build(year, n, config):
     else:
         raise ValueError(f"unknown --config {config!r}")
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, year, dt=DT, sst_ic=np.asarray(base.T[:, 0]))
     sfs = cf.stack(surface_forcing.dates_for_steps(year, DT, n))
     return mesh, state, op, cf.static, sfs, cfgs
 

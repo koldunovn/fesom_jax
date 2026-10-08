@@ -184,10 +184,10 @@ sst0   = state0.T[:, 0]
 # Where does the forcing come from? Each input path resolves as
 #     explicit argument  >  $FESOM_* environment variable  >  DKRZ/Levante default
 # so with $FESOM_JRA_DIR exported (above) this reads YOUR copy of JRA55-do. To be explicit:
-#     build_surface_forcing(mesh, 1958, sst_ic=sst0, jra_dir="/path/to/JRA55-do-v1.4.0")
+#     build_surface_forcing(mesh, 1958, dt=1800.0, sst_ic=sst0, jra_dir="/path/to/JRA55-do-v1.4.0")
 # Same for sss_path / runoff_path / chl_path. If a file is missing you get an error naming the
 # variable to set — nothing is silently skipped. See docs/DATA.md.
-cf     = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=sst0)
+cf     = surface_forcing.build_surface_forcing(mesh, 1958, dt=1800.0, sst_ic=sst0)
 
 sf, fs = cf.step_forcing(*surface_forcing.dates_for_steps(1958, 1800.0, 1)[0]), cf.static
 state_1 = step(state0, mesh, op, stress, dt=1800.0, is_first_step=True,

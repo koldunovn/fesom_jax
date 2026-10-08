@@ -102,7 +102,7 @@ def build(year, config):
     else:
         raise ValueError(f"unknown --config {config!r}")
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, year, dt=DT, sst_ic=np.asarray(base.T[:, 0]))
     return mesh, state, op, cf, cfgs        # return cf so spin/window forcing stack separately
 
 

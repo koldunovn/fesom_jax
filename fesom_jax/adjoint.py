@@ -35,6 +35,7 @@ from __future__ import annotations
 import functools
 import math
 import time
+import warnings
 from typing import Any, Callable, NamedTuple, Protocol
 
 import jax
@@ -43,8 +44,8 @@ import jax.numpy as jnp
 from . import adjoint_stab
 from .integrate import _run_steps
 
-__all__ = ["scan_steps", "chunked_forward", "chunked_grad", "ChunkedGrad", "ReverseCheckpoint",
-           "LegIncomplete"]
+__all__ = ["scan_steps", "chunked_forward", "chunked_grad", "ChunkedGrad", "chunked_grad_multi",
+           "ChunkedGradMulti", "ReverseCheckpoint", "LegIncomplete", "INFORMATIVE_SPREAD"]
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +61,8 @@ def _segments_for(length: int) -> int:
 
 
 def scan_steps(step_fn: Callable[[Any, Any], Any], state, xs=None, *,
-               length: int | None = None, rematerialize: bool = True):
+               length: int | None = None, rematerialize: bool = True,
+               save_names: tuple[str, ...] = ()):
     """Run ``length`` (or ``len(xs)``) steps of ``step_fn`` and return the final state.
 
     ``step_fn(state, x) -> state``. ``xs`` is a pytree stacked on a leading axis, one slice per
@@ -74,6 +76,14 @@ def scan_steps(step_fn: Callable[[Any, Any], Any], state, xs=None, *,
     **forward mode**: a JVP has no reverse pass and stores no tape, so :func:`jax.checkpoint`
     there is semantically the identity and pure overhead — measured as minutes of constant-folding
     scatter-adds inside ``jit(jvp_chunk)/jvp()/while/body/closed_call/checkpoint/checkpoint``.
+
+    ``save_names`` (default ``()``) keeps the values labelled with these
+    :func:`jax.ad_checkpoint.checkpoint_name` names as residuals of the per-step checkpoint
+    instead of recomputing them in the reverse sweep. ``("ssh_delta",)`` keeps the SSH solution
+    (one ``[nod2D]`` float64 per stored step), so the reverse sweep does not re-run the forward
+    CG of every step. ``()`` traces exactly the policy-free program. It changes no value, only
+    what the reverse pass stores versus recomputes; it has no effect with
+    ``rematerialize=False``. Pass it as a tuple (hashable), not a list.
 
     ⚠️ This deliberately has no ``segments`` parameter. See the module docstring: it reads like
     the knob you reach for when a window will not fit, and reaching for it makes things worse.
@@ -89,7 +99,8 @@ def scan_steps(step_fn: Callable[[Any, Any], Any], state, xs=None, *,
 
     return _run_steps(body, state, xs=xs, length=length,
                       checkpoint=bool(rematerialize),
-                      segments=_segments_for(length) if rematerialize else 0)
+                      segments=_segments_for(length) if rematerialize else 0,
+                      save_names=tuple(save_names))
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +123,19 @@ class ChunkedGrad(NamedTuple):
     n_chunks: int
     chunk_steps: int
     boundary_stride: int
+    #: what the linearity guard measured (``None`` with ``check_linear=False``): ``mode``,
+    #: ``chunk``, ``zero_max`` and, for ``"full"``, the repeat ``spread`` and the linearity
+    #: error ``err`` per part (``state``/``params``), ``informative`` (every part's spread
+    #: ``<= INFORMATIVE_SPREAD``; if not, the scaling test proved nothing and a
+    #: ``RuntimeWarning`` was issued) and ``informative_bar``, and ``seconds
+    linear_check: dict | None = None
+    #: per chunk boundary, in the order of ``trace``: ``{state leaf path: norm}`` of the state
+    #: cotangent (:func:`fesom_jax.adjoint_stab.field_norms`); ``None`` entries for boundaries
+    #: reported by an earlier leg of a resumed sweep; ``None`` with ``field_trace=False``
+    field_trace: list | None = None
+    #: the cotangent w.r.t. ``init_state`` (on the HOST), i.e. d loss / d initial state;
+    #: ``None`` only if the sweep did not finish
+    state_cot: Any = None
 
 
 class ReverseCheckpoint(Protocol):
@@ -201,13 +225,137 @@ def _free(tree) -> None:
     jax.tree.map(lambda x: x.delete() if hasattr(x, "delete") else None, tree)
 
 
+def _add_grads(a, b):
+    """``a + b`` leaf by leaf; ``float0`` leaves (the cotangent of an integer parameter, which
+    supports no arithmetic) pass through."""
+    def one(x, y):
+        if getattr(x, "dtype", None) == jax.dtypes.float0:
+            return x
+        return jnp.add(x, y)
+    return jax.tree.map(one, a, b)
+
+
+def _linear_mode(check_linear) -> str | None:
+    """Normalise ``check_linear``: ``True``/``"zero"`` ⇒ ``"zero"``, ``"full"``, ``False`` ⇒
+    ``None``."""
+    if check_linear is True or check_linear == "zero":
+        return "zero"
+    if check_linear == "full":
+        return "full"
+    if check_linear is False or check_linear is None:
+        return None
+    raise ValueError(f"check_linear must be True, False, 'zero' or 'full', got {check_linear!r}")
+
+
+def _tree_sq(leaves) -> float:
+    return float(sum(jnp.sum(jnp.square(x)) for x in leaves)) if leaves else 0.0
+
+
+def _tree_diff_norm(a, b) -> float:
+    la, lb = adjoint_stab._real_leaves(a), adjoint_stab._real_leaves(b)
+    return math.sqrt(sum(float(jnp.sum(jnp.square(x - y))) for x, y in zip(la, lb)))
+
+
+#: the largest relative repeat spread ``s`` of the chunk VJP at which ``check_linear="full"`` still
+#: tests linearity. Its bound is ``10·s`` relative: with ``s`` of order 1 (``exact()`` on a GPU
+#: with 48-step chunks measured 0.06-4.5) any VJP, linear or not, passes, so the check is void.
+#: At ``<= 1e-6`` a wrong transpose or a non-homogeneous rule (errors of O(1e-2) and more) is
+#: still far outside the bound.
+INFORMATIVE_SPREAD = 1e-6
+
+
+def _check_linear(bwd_chunk, s_in, xs_c, params, cot, g_s, g_p, mode: str, chunk: int) -> dict:
+    """The linearity guard: the chunk VJP must be a LINEAR map of the cotangent.
+
+    ``g_s, g_p`` is the VJP of ``cot`` already computed by the caller from the same inputs,
+    which must still be alive. ``"zero"``: one extra VJP of a zero cotangent; every real
+    leaf of its state and params outputs must be exactly 0 (exact on any platform: a linear
+    map sends 0 to 0 whatever the rounding). ``"full"``: two more VJPs, ``cot`` again (the
+    repeat spread ``s`` per part, relative) and ``2·cot`` (exact scaling); require
+    ``‖vjp(2cot) − 2·vjp(cot)‖ ≤ max(1e-9, 10·s)·‖2·vjp(cot)‖`` for the state and the params
+    part. The spread is measured rather than assumed because on a GPU every call re-runs the
+    rematerialised chunk forward, whose scatter-adds are not deterministic. When a part's
+    spread exceeds :data:`INFORMATIVE_SPREAD` the bound admits everything: the result records
+    ``informative=False`` and a ``RuntimeWarning`` says so (the pass/fail rule is unchanged)."""
+    t0 = time.time()
+    real = adjoint_stab._real_leaves
+
+    def fail(what):
+        raise RuntimeError(
+            f"linearity guard ({mode!r}) failed at reverse chunk {chunk}: {what}. Either the "
+            f"chunk VJP is not a linear map of the cotangent (a miscompiled program, or a "
+            f"custom derivative rule that is not linear in its cotangent), or, for 'full', "
+            f"the platform's run-to-run non-determinism is larger than the measured repeat "
+            f"spread. Re-run with check_linear='full' to see both numbers; "
+            f"check_linear=False skips the guard.")
+
+    zero = adjoint_stab._map_real(jnp.zeros_like, cot)
+    z_s, z_p = jax.block_until_ready(bwd_chunk(s_in, xs_c, params, zero))
+    zmax = 0.0
+    for x in real((z_s, z_p)):
+        if x.size:
+            zmax = max(zmax, float(jnp.max(jnp.abs(x))))
+    finite = all(bool(jnp.all(jnp.isfinite(x))) for x in real((z_s, z_p)))
+    _free((z_s, z_p))
+    _free(zero)
+    info = {"mode": mode, "chunk": chunk, "zero_max": zmax}
+    if zmax != 0.0 or not finite:
+        fail(f"a ZERO cotangent maps to a non-zero result (max |vjp(0)| = {zmax:.3e}, "
+             f"finite={finite})")
+
+    if mode == "full":
+        parts = {"state": g_s, "params": g_p}
+        r_s, r_p = jax.block_until_ready(bwd_chunk(s_in, xs_c, params, cot))
+        rep = {"state": r_s, "params": r_p}
+        spread = {}
+        for k, g in parts.items():
+            n = math.sqrt(_tree_sq(real(g)))
+            spread[k] = _tree_diff_norm(rep[k], g) / n if n > 0.0 else _tree_diff_norm(rep[k], g)
+        _free((r_s, r_p))
+        cot2 = adjoint_stab._map_real(lambda x: 2.0 * x, cot)
+        d_s, d_p = jax.block_until_ready(bwd_chunk(s_in, xs_c, params, cot2))
+        _free(cot2)
+        dbl = {"state": d_s, "params": d_p}
+        err, bad = {}, []
+        for k, g in parts.items():
+            g2 = adjoint_stab._map_real(lambda x: 2.0 * x, g)
+            n2 = math.sqrt(_tree_sq(real(g2)))
+            e = _tree_diff_norm(dbl[k], g2)
+            err[k] = e / n2 if n2 > 0.0 else e
+            tol = max(1e-9, 10.0 * spread[k])
+            if not (e <= tol * n2) or not math.isfinite(e):
+                bad.append(f"{k}: ‖vjp(2c) − 2·vjp(c)‖/‖2·vjp(c)‖ = {err[k]:.3e} > "
+                           f"max(1e-9, 10 × repeat spread {spread[k]:.3e}) = {tol:.3e}")
+        _free((d_s, d_p))
+        informative = all(spread[k] <= INFORMATIVE_SPREAD for k in parts)
+        info.update(spread=spread, err=err, informative=informative,
+                    informative_bar=INFORMATIVE_SPREAD)
+        if not informative:
+            warnings.warn(
+                f"linearity guard ('full') at reverse chunk {chunk} is NOT informative: the "
+                f"chunk VJP's repeat spread (state {spread['state']:.3e}, params "
+                f"{spread['params']:.3e}, relative) exceeds {INFORMATIVE_SPREAD:.0e}, so the "
+                f"bound 10 × spread admits a non-linear VJP too and the check proves nothing. "
+                f"The run-to-run non-determinism of the chunk VJP is that large (e.g. the "
+                f"all-on model's exact() adjoint with multi-step chunks on a GPU); use "
+                f"1-step chunks or a CPU for a meaningful 'full' check, or the default 'zero'.",
+                RuntimeWarning, stacklevel=3)
+        if bad:
+            fail("; ".join(bad))
+    info["seconds"] = time.time() - t0
+    return info
+
+
 def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
                  init_state, n_chunks: int, xs_fn: Callable[[int], Any],
                  loss_fn: Callable[[Any], Any], chunk_steps: int,
                  boundary_stride: int = 1, free_xs: bool = True,
                  checkpoint: ReverseCheckpoint | None = None,
                  on_forward: Callable[[float, float, float], None] | None = None,
-                 on_chunk: Callable[[int, float, Any], None] | None = None) -> ChunkedGrad:
+                 on_chunk: Callable[[int, float, Any], None] | None = None,
+                 check_linear: bool | str = True,
+                 on_cot: Callable[[int, Any], None] | None = None,
+                 field_trace: bool = True) -> ChunkedGrad:
     """``d(loss_fn(final_state)) / d(params)`` over ``n_chunks`` chunks, one chunk on the device.
 
     :param chunk_fn: ``(state, xs, params) -> state``, advancing the state by one chunk. Every
@@ -246,11 +394,46 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         "the forward finished and parked N GB" is the line that says the run is worth waiting for.
     :param on_chunk: ``(chunk_index, cotangent_norm, grad_so_far)`` after each reverse chunk. The
         same reason. It is a reporting hook and must not mutate anything it is handed.
+    :param check_linear: the linearity guard, run on the FIRST reverse chunk of every call
+        (so once per leg of a resumed sweep) with that chunk's inputs. ``True`` (default) ≡
+        ``"zero"``: one extra chunk VJP with a zero cotangent, whose state and params outputs
+        must be exactly 0 — exact on every platform, and it catches a program that maps 0 to
+        something else (a miscompiled VJP, a derivative rule that adds a constant). ``"full"``:
+        additionally the VJP of the same cotangent a second time (the measured repeat spread
+        ``s``) and of twice the cotangent, requiring ``‖vjp(2c) − 2·vjp(c)‖ ≤ max(1e-9,
+        10·s)·‖2·vjp(c)‖`` for the state and the params part (catches a VJP that is not
+        homogeneous, e.g. one that squares its cotangent). The spread is MEASURED because a GPU
+        re-runs the rematerialised chunk forward non-deterministically in every call, so a
+        fixed tolerance between two calls would not be a linearity test; on CPU it is 0 and
+        the bound is 1e-9. If the measured spread exceeds :data:`INFORMATIVE_SPREAD` (1e-6,
+        relative) the bound admits everything: ``linear_check["informative"]`` is then
+        ``False`` and a ``RuntimeWarning`` is issued, and the check proves nothing (the
+        all-on ``exact()`` adjoint with 48-step chunks on an A100 repeats only to O(1)).
+        Three extra chunk VJPs: run ``"full"`` once per new compiled
+        program at the start of a campaign and the default elsewhere. ``False`` skips. The
+        guard's cost is included in ``reverse_seconds``; what it measured is
+        :attr:`ChunkedGrad.linear_check`. A failure raises :class:`RuntimeError` with the
+        numbers.
+    :param on_cot: ``(c, cot_state)`` at every chunk boundary: first the seed at ``c =
+        n_chunks`` (the cotangent of the loss w.r.t. the final state), then after each reverse
+        chunk ``c`` the cotangent at boundary ``c`` (w.r.t. the state entering chunk ``c``;
+        ``c = 0`` is the initial state). ``cot_state`` is the live DEVICE pytree the sweep
+        carries on: the hook must treat it as READ-ONLY (copy with :func:`jax.device_get` to
+        keep it; never delete or donate it), and it is freed after the next chunk. A resumed
+        leg does not repeat boundaries an earlier leg reported.
+    :param field_trace: record :attr:`ChunkedGrad.field_trace` (``{leaf: norm}`` per
+        boundary; one small reduction per leaf). ``False`` ⇒ ``None``.
+
+    :attr:`ChunkedGrad.state_cot` is the cotangent w.r.t. ``init_state`` at the end of the
+    sweep, copied to the host.
 
     :raises LegIncomplete: if ``checkpoint`` stopped the leg before the sweep finished.
+    :raises RuntimeError: if the linearity guard fails.
     """
     if n_chunks < 1:
         raise ValueError(f"n_chunks must be >= 1, got {n_chunks}")
+    lin_mode = _linear_mode(check_linear)
+    lin_info = None
     stride = max(1, int(boundary_stride))
 
     def get_xs(c):
@@ -309,12 +492,20 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     if checkpoint is None:
         grad, c_start = None, n_chunks - 1
         trace = [float(adjoint_stab.cotangent_norm(cot))]
+        fresh = True
     else:
         resumed, grad, c_start, trace = checkpoint.reverse_start(cot, n_chunks, like=init_state)
         if resumed is not cot:
             _free(cot)
             cot = jax.device_put(resumed)
+        fresh = not trace
         trace = list(trace) if trace else [float(adjoint_stab.cotangent_norm(cot))]
+    # boundaries reported by an earlier leg are placeholders, so field_trace aligns with trace
+    ftrace = None
+    if field_trace:
+        ftrace = ([adjoint_stab.field_norms(cot)] if fresh else [None] * len(trace))
+    if on_cot is not None and fresh:
+        on_cot(n_chunks, cot)
 
     # --- reverse walk -------------------------------------------------------
     tb = time.time()
@@ -333,13 +524,22 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
             # ⚠️ ORDER MATTERS: `s_in`, `xs_c` and the OLD `cot` are live inputs to the VJP until
             # it completes. Block on its outputs first, then free.
             g_s, g_p = jax.block_until_ready((g_s, g_p))
-            grad = g_p if grad is None else jax.tree.map(jnp.add, grad, g_p)
+            if lin_mode is not None and lin_info is None:
+                # the first chunk of this call (of this leg, on a resume): the inputs are
+                # still alive, and this chunk's VJP is the reference the guard compares with
+                lin_info = _check_linear(bwd_chunk, s_in, xs_c, params, cot, g_s, g_p,
+                                         lin_mode, c)
+            grad = g_p if grad is None else _add_grads(grad, g_p)
             _free(cot)
             free(xs_c)
             _free(s_in)
             del s_in
             cot = g_s
             trace.append(float(adjoint_stab.cotangent_norm(cot)))
+            if ftrace is not None:
+                ftrace.append(adjoint_stab.field_norms(cot))
+            if on_cot is not None:
+                on_cot(c, cot)
             if on_chunk is not None:
                 on_chunk(c, trace[-1], grad)
             # After chunk c the carried cotangent belongs to chunk c-1; -1 means the sweep is
@@ -350,7 +550,149 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
 
     return ChunkedGrad(loss=loss_v, grad=grad, trace=trace, host_gb=host_gb,
                        forward_seconds=fwd_t, reverse_seconds=time.time() - tb,
-                       n_chunks=n_chunks, chunk_steps=chunk_steps, boundary_stride=stride)
+                       n_chunks=n_chunks, chunk_steps=chunk_steps, boundary_stride=stride,
+                       linear_check=lin_info, field_trace=ftrace,
+                       state_cot=jax.device_get(cot))
+
+
+class ChunkedGradMulti(NamedTuple):
+    """What :func:`chunked_grad_multi` returns: one entry per cost ``k`` in each list."""
+
+    losses: list
+    grads: list                     #: per cost, a pytree matching ``params`` (host arrays)
+    traces: list                    #: per cost, ``n_chunks + 1`` boundary norms (seed first)
+    field_traces: list | None       #: per cost, ``{leaf: norm}`` per boundary; ``None`` if off
+    state_cots: list                #: per cost, d loss_k / d init_state (host arrays)
+    host_gb: float                  #: forward boundaries parked on the host
+    forward_seconds: float
+    reverse_seconds: float
+    n_chunks: int
+    chunk_steps: int
+    boundary_stride: int
+    linear_check: dict | None = None
+
+
+def chunked_grad_multi(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
+                       init_state, n_chunks: int, xs_fn: Callable[[int], Any],
+                       loss_fns, chunk_steps: int, boundary_stride: int = 1,
+                       free_xs: bool = True, check_linear: bool | str = True,
+                       on_forward: Callable[[list, float, float], None] | None = None,
+                       on_chunk: Callable[[int, int, float, Any], None] | None = None,
+                       on_cot: Callable[[int, int, Any], None] | None = None,
+                       field_trace: bool = True, checkpoint=None) -> ChunkedGradMulti:
+    """The gradients of K costs of the same window in ONE forward and one reverse walk.
+
+    Same arguments as :func:`chunked_grad` except ``loss_fns``, a sequence of K
+    ``final_state -> scalar`` functions. The forward runs once and parks its boundaries on the
+    host; each cost is seeded from the same final state; in the reverse walk every chunk's
+    state and inputs are put on the device once and the cached chunk VJP is applied K times in
+    sequence, once per cost. Every result equals K separate :func:`chunked_grad` calls bit for
+    bit (CPU); the saving is the K−1 forwards and the K−1 re-reads of the boundaries and inputs.
+
+    **Memory.** Between applications the K−1 inactive state cotangents and params gradients
+    are PARKED ON THE HOST (``block_until_ready``, ``device_get``; ``device_put`` before use),
+    so the device holds about one cost's working set plus one ``State``, as in a single-cost
+    sweep; the host holds K cotangent ``State``s on top of the boundaries. **Cost.** The
+    reverse pass is ≈ K × a single-cost reverse sweep (plus the host round trips); the forward
+    is paid once.
+
+    **Hooks.** ``on_cot(k, c, cot_state)`` is called once per cost ``k`` per boundary ``c``,
+    boundaries in reverse order starting with the seed boundary ``c = n_chunks`` and ending
+    with ``c = 0`` (the initial state), ``k`` ascending within a boundary; ``cot_state`` is the
+    live device pytree and is READ-ONLY (copy it to keep it; it is parked and freed right
+    after the call). ``on_chunk(k, c, cotangent_norm, grad_so_far)`` after each cost's VJP of
+    chunk ``c``; ``on_forward(losses, host_gb, seconds)`` once the forward completes.
+
+    ``check_linear`` runs once, on the first reverse chunk with cost 0 (see
+    :func:`chunked_grad`). A :class:`ReverseCheckpoint` is not supported: ``checkpoint`` must be
+    ``None`` (a resumable multi-cost sweep would have to park K cotangents per leg)."""
+    if checkpoint is not None:
+        raise ValueError("chunked_grad_multi does not support a ReverseCheckpoint; run the "
+                         "costs through chunked_grad one at a time to resume across jobs")
+    loss_fns = list(loss_fns)
+    if not loss_fns:
+        raise ValueError("loss_fns is empty")
+    if n_chunks < 1:
+        raise ValueError(f"n_chunks must be >= 1, got {n_chunks}")
+    K = len(loss_fns)
+    stride = max(1, int(boundary_stride))
+    lin_mode = _linear_mode(check_linear)
+    lin_info = None
+    free = _free if free_xs else (lambda _t: None)
+    fwd_chunk = _jitted_forward(chunk_fn)
+    bwd_chunk = _jitted_backward(chunk_fn)
+
+    # --- forward, boundaries to the host (once for all costs) ------------------
+    ta = time.time()
+    s_fin, boundaries = _forward(fwd_chunk, params, init_state, n_chunks, xs_fn, stride, free,
+                                 None)
+    losses = [float(f(s_fin)) for f in loss_fns]
+    fwd_t = time.time() - ta
+    host_gb = sum(a.nbytes for a in jax.tree.leaves(boundaries)) / 1e9
+    if on_forward is not None:
+        on_forward(losses, host_gb, fwd_t)
+
+    # --- K seeds from the same final state, parked on the host -----------------
+    cots, traces = [None] * K, [None] * K
+    ftraces = [None] * K if field_trace else None
+    for k, lf in enumerate(loss_fns):
+        _, vjp_loss = jax.vjp(lf, s_fin)
+        cot = jax.block_until_ready(vjp_loss(1.0)[0])
+        traces[k] = [float(adjoint_stab.cotangent_norm(cot))]
+        if ftraces is not None:
+            ftraces[k] = [adjoint_stab.field_norms(cot)]
+        if on_cot is not None:
+            on_cot(k, n_chunks, cot)
+        cots[k] = jax.device_get(cot)
+        _free(cot)
+    _free(s_fin)
+    del s_fin
+    grads = [None] * K
+
+    # --- reverse walk: per chunk, the cached VJP applied once per cost ---------
+    tb = time.time()
+    for sup_lo in reversed(range(0, n_chunks, stride)):
+        sup_hi = min(sup_lo + stride, n_chunks)
+        span = (boundaries if stride == 1
+                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, xs_fn, free))
+        for c in reversed(range(sup_lo, sup_hi)):
+            s_in = jax.device_put(span[c])
+            xs_c = xs_fn(c)
+            for k in range(K):
+                cot = jax.device_put(cots[k])
+                g_s, g_p = jax.block_until_ready(bwd_chunk(s_in, xs_c, params, cot))
+                if lin_mode is not None and lin_info is None:
+                    lin_info = _check_linear(bwd_chunk, s_in, xs_c, params, cot, g_s, g_p,
+                                             lin_mode, c)
+                if grads[k] is None:
+                    grad = g_p
+                else:
+                    prev = jax.device_put(grads[k])
+                    grad = jax.block_until_ready(_add_grads(prev, g_p))
+                    _free(prev)
+                    _free(g_p)
+                _free(cot)
+                traces[k].append(float(adjoint_stab.cotangent_norm(g_s)))
+                if ftraces is not None:
+                    ftraces[k].append(adjoint_stab.field_norms(g_s))
+                if on_cot is not None:
+                    on_cot(k, c, g_s)
+                if on_chunk is not None:
+                    on_chunk(k, c, traces[k][-1], grad)
+                cots[k] = jax.device_get(g_s)
+                grads[k] = jax.device_get(grad)
+                _free(g_s)
+                _free(grad)
+            free(xs_c)
+            _free(s_in)
+            del s_in
+        span = None
+
+    return ChunkedGradMulti(losses=losses, grads=grads, traces=traces, field_traces=ftraces,
+                            state_cots=cots, host_gb=host_gb, forward_seconds=fwd_t,
+                            reverse_seconds=time.time() - tb, n_chunks=n_chunks,
+                            chunk_steps=chunk_steps, boundary_stride=stride,
+                            linear_check=lin_info)
 
 
 def chunked_forward(chunk_fn: Callable[[Any, Any, Any], Any], params, *,

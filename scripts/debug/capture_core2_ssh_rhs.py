@@ -108,7 +108,7 @@ def main():
     sst0 = np.asarray(phc_initial_state(mesh, IC_DIR).T[:, 0])
     state = ice.seed_ice(phc_initial_state(mesh, IC_DIR), mesh, sst0)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, dt=DT, sst_ic=sst0)
     dates = surface_forcing.dates_for_steps(YEAR, DT, 2)
     ice_cfg, gm_cfg, kpp_cfg = IceConfig(), GMConfig(), KppConfig()
     print(f"[setup] built in {time.time()-t0:.1f}s; assembled KPP+GM+ice, dt={DT:.0f}", flush=True)

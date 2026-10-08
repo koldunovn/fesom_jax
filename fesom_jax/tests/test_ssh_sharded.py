@@ -12,7 +12,10 @@ KPP+GM+ice** ``ssh_rhs`` (captured by ``scripts/debug/capture_core2_ssh_rhs.py``
 * the forward PCG iteration count is **identical** N-device vs 1-device (cold start
   ``x0=0`` and warm start ``x0=d_eta_step1``),
 * the zero-rhs short-circuit still holds,
-* the serial ``NP=1`` sharded operator + identity halo == the dense solve (no-op).
+* the serial ``NP=1`` sharded operator + identity halo == the dense solve (no-op),
+* the derivatives: a lane-space dot test of the sharded solve (alone and between the
+  model's two halo exchanges), and sharded-vs-dense tangent and cotangent with exactly
+  zero cotangent on halo and padding lanes.
 
 The multi-device parts need CPU fake-devices and SKIP otherwise; the ``NP=1`` no-op
 runs on a single device.
@@ -327,3 +330,177 @@ def test_cheb_sharded_matches_single_device(npes):
         f"cheb npes={npes}: owned d_eta max|Δ|={worst:.3e} (scale {scale:.3e}) "
         f"exceeds the 1e-9 reassociation budget")
     print(f"CHEB_SHARDED_OK npes={npes} iters={iters_N}")
+
+
+# --------------------------------------------------------------------------
+# 6. Tangent-linear / adjoint of the sharded solve (lane space)
+# --------------------------------------------------------------------------
+# In the model the sharded solve sits between two node halo exchanges
+# (``ssh_rhs = exch(ssh_rhs)``; solve; ``d_eta = exch(d_eta)``, fesom_jax/step.py). Its
+# early-stopped PCG leaves INCOMPLETE values on halo lanes (halo rows of the local operator
+# are partial sums) and the next exchange overwrites them. A derivative solve that leaves the
+# same kind of values on halo lanes is harmless in the tangent, but in reverse mode the
+# input exchange's transpose scatter-adds every halo-lane cotangent onto its owner: the
+# owner's cotangent is then wrong. The tight derivative solve must return zero on halo and
+# padding lanes.
+def _sharded_map(mesh, part, x0_global, npes, solver, sandwich=True):
+    """``F(rhs_folded) -> d_eta_folded`` for the sharded ``solver`` (``ssh.solve_ssh`` or a
+    reference with its signature), optionally between two node halo exchanges as in the
+    model step. Also returns the per-lane owned mask and a global→lanes gather."""
+    sop, sdev, slane, omask, _rhs_PL, x0_PL = _shard_inputs(
+        mesh, part, np.zeros(mesh.nod2D), x0_global)
+    P, Lmax, Ng = sop.P, sop.Lmax_nod, int(mesh.nod2D)
+    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    spec = PartitionSpec("p")
+
+    def fold(a):
+        a = jnp.asarray(a)
+        return a.reshape((a.shape[0] * a.shape[1],) + a.shape[2:])
+
+    consts = (fold(sop.rows), fold(sop.cols), fold(sop.stiff_vals), fold(sop.precond_vals),
+              fold(sop.diag), fold(sdev).astype(jnp.int32), fold(slane).astype(jnp.int32),
+              fold(omask), fold(x0_PL))
+
+    def body(rows, cols, sv, pv, diagv, sd, sl, om, x0, rhs):
+        op_l = ssh.SSHOperator(rows=rows, cols=cols, stiff_vals=sv, precond_vals=pv,
+                               diag=diagv, n_nodes=Lmax, cheb=sop.cheb)
+        h = ssh.SSHHalo(src_dev=sd, src_lane=sl, owned_mask=om, n_global=Ng,
+                        axis_name="p")
+        if sandwich:
+            rhs = halo.halo_exchange(rhs, sd, sl, "p")
+        out = solver(op_l, rhs, x0=x0, halo=h)
+        return halo.halo_exchange(out, sd, sl, "p") if sandwich else out
+
+    smap = jax.shard_map(body, mesh=jmesh, in_specs=(spec,) * 10, out_specs=spec)
+
+    def gather(g):
+        return fold(np.stack([_gather_pad(g, part.myList_nod2D[d], Lmax)
+                              for d in range(P)]))
+
+    return (jax.jit(lambda rhs: smap(*consts, rhs)), np.asarray(fold(omask)), gather,
+            P, Lmax)
+
+
+def _warm_case(mesh):
+    return (np.load(SSH_RHS_DIR / "ssh_rhs_step2.npy"),
+            np.load(SSH_RHS_DIR / "d_eta_step1.npy"))
+
+
+def _lane_dot_test(F, rhs, x, y, amps):
+    ct = np.asarray(jax.vjp(F, rhs)[1](y)[0])
+    rows = []
+    for a in amps:
+        mx = np.asarray(jax.jvp(F, (rhs,), (a * x,))[1])
+        lhs = float(np.dot(np.asarray(y), mx))
+        rhs_ = float(np.dot(ct, a * np.asarray(x)))
+        rows.append((a, lhs, rhs_, abs(lhs - rhs_) / max(abs(lhs), abs(rhs_), 1e-300)))
+    return rows
+
+
+def _dot_vectors(mesh, rhs_g, gather):
+    rng = np.random.default_rng(7)
+    lanes = gather(rhs_g).shape[0]
+    x = gather(float(np.std(rhs_g)) * np.cos(np.arange(mesh.nod2D) * 0.013)) \
+        + 1e-3 * float(np.std(rhs_g)) * jnp.asarray(rng.standard_normal(lanes))
+    y = gather(np.sin(np.arange(mesh.nod2D) * 0.007)) \
+        + 1e-3 * jnp.asarray(rng.standard_normal(lanes))
+    return x, y
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+@pytest.mark.parametrize("sandwich", [False, True])
+def test_sharded_dot_test(npes, sandwich, capsys):
+    """Dot test of the sharded solve in LANE space (every lane of x and y non-zero,
+    padding included), alone and between the model's two halo exchanges, warm-started
+    from the captured CORE2 state: ≤ 1e-10 at amplitudes 1 and 1e-8. Lane space is the
+    strict version: it fails if any halo or padding lane of the derivative solve carries
+    a value."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    part = partit.read_partition(CORE2_DIST, npes)
+    rhs_g, x0_g = _warm_case(mesh)
+    F, _own, gather, _P, _L = _sharded_map(mesh, part, x0_g, npes, ssh.solve_ssh, sandwich)
+    x, y = _dot_vectors(mesh, rhs_g, gather)
+    rows = _lane_dot_test(F, gather(rhs_g), x, y, (1.0, 1e-8))
+    with capsys.disabled():
+        for a, lhs, r, rel in rows:
+            print(f"\n  sharded dot npes={npes} sandwich={sandwich} amp={a:.0e} "
+                  f"<y,Mx>={lhs:+.12e} <MTy,x>={r:+.12e} rel={rel:.2e}")
+    for a, _l, _r, rel in rows:
+        assert rel <= 1e-10, f"sharded dot test amp={a:.0e}: rel {rel:.2e}"
+
+
+@avail
+def test_sharded_dot_test_negative_control(capsys):
+    """The same lane-space dot test (2 devices, between the exchanges) FAILS with the
+    reference solve, whose transpose leaves values on halo lanes."""
+    npes = 2
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    from fesom_jax.tests._ssh_implicit_common import solve_ssh_reference
+    mesh = load_mesh(CORE2_MESH)
+    part = partit.read_partition(CORE2_DIST, npes)
+    rhs_g, x0_g = _warm_case(mesh)
+    F, _own, gather, _P, _L = _sharded_map(mesh, part, x0_g, npes, solve_ssh_reference)
+    x, y = _dot_vectors(mesh, rhs_g, gather)
+    rows = _lane_dot_test(F, gather(rhs_g), x, y, (1.0,))
+    with capsys.disabled():
+        print(f"\n  sharded dot, reference solve, amp=1: rel {rows[0][3]:.2e}")
+    assert rows[0][3] > 1e-6, "the reference solve passed the lane-space dot test"
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+def test_sharded_tangent_and_cotangent_match_dense(npes, capsys):
+    """Sharded vs dense, warm-started CORE2 solve between the model's halo exchanges:
+    the tangent on owned lanes equals the dense tangent, and the cotangent of an
+    owned-lane functional equals the dense cotangent on owned lanes (≤ 1e-12 relative)
+    with exactly zero on halo and padding lanes. The reference solve (tangent through
+    the early-stopped forward, derivative solve with values on halo lanes) is the
+    negative control: its tangent is wrong at small amplitude and its cotangent gets the
+    halo-lane values added to the owners."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    part = partit.read_partition(CORE2_DIST, npes)
+    rhs_g, x0_g = _warm_case(mesh)
+    dx_g = float(np.std(rhs_g)) * np.cos(np.arange(mesh.nod2D) * 0.013)
+    w_g = np.sin(np.arange(mesh.nod2D) * 0.007)
+    x0d = jnp.asarray(x0_g)
+    tl_de = np.asarray(jax.jvp(lambda r: ssh.solve_ssh(op, r, x0=x0d),
+                               (jnp.asarray(rhs_g),), (jnp.asarray(1e-8 * dx_g),))[1])
+    ct_de = np.asarray(jax.vjp(lambda r: ssh.solve_ssh(op, r, x0=x0d),
+                               jnp.asarray(rhs_g))[1](jnp.asarray(w_g))[0])
+
+    def errors(solver):
+        F, own, gather, P, Lmax = _sharded_map(mesh, part, x0_g, npes, solver)
+        rhs, dx = gather(rhs_g), gather(1e-8 * dx_g)
+        y = jnp.where(own, gather(w_g), 0.0)
+        tl = np.asarray(jax.jvp(F, (rhs,), (dx,))[1]).reshape(P, Lmax)
+        ct = np.asarray(jax.vjp(F, rhs)[1](y)[0]).reshape(P, Lmax)
+        e_tl = e_ct = off = 0.0
+        for d in range(P):
+            md = int(part.myDim_nod2D[d])
+            g = part.myList_nod2D[d][:md]
+            e_tl = max(e_tl, float(np.max(np.abs(tl[d, :md] - tl_de[g]))))
+            e_ct = max(e_ct, float(np.max(np.abs(ct[d, :md] - ct_de[g]))))
+            off = max(off, float(np.max(np.abs(ct[d, md:]))))
+        return (e_tl / float(np.max(np.abs(tl_de))), e_ct / float(np.max(np.abs(ct_de))),
+                off)
+
+    from fesom_jax.tests._ssh_implicit_common import solve_ssh_reference
+    new, ref = errors(ssh.solve_ssh), errors(solve_ssh_reference)
+    with capsys.disabled():
+        print(f"\n  npes={npes} solve_ssh: TL rel {new[0]:.2e}  ADJ rel {new[1]:.2e}  "
+              f"max|cot off-owned| {new[2]:.2e}")
+        print(f"  npes={npes} reference: TL rel {ref[0]:.2e}  ADJ rel {ref[1]:.2e}  "
+              f"max|cot off-owned| {ref[2]:.2e}")
+    assert new[0] <= 1e-12, f"sharded tangent vs dense: rel {new[0]:.2e}"
+    assert new[1] <= 1e-12, f"sharded cotangent vs dense: rel {new[1]:.2e}"
+    assert new[2] == 0.0, f"cotangent on halo/padding lanes: {new[2]:.2e}"
+    assert ref[0] > 1e-6 and ref[1] > 1e-6, (
+        f"negative control: the reference solve matched dense ({ref[0]:.2e}, {ref[1]:.2e})"
+        " — the test cannot see either defect")

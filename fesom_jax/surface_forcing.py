@@ -212,6 +212,7 @@ def compute_surface_fluxes(mesh: Mesh, state: State, sf: StepForcing,
     blend) → cal_shortwave_rad. The static ``a_ice`` mask (0.9 where the IC SST<0; ice
     physics off ⇒ never updated) gates BOTH the stress blend and the shortwave penetration —
     the only two ``a_ice`` couplings in the no-ice path."""
+    # state.uvnode is refreshed from state.uv at the top of step() (drift fix 1).
     u_w = state.uvnode[:, 0, 0]
     v_w = state.uvnode[:, 0, 1]
 
@@ -375,12 +376,25 @@ class SurfaceForcing:
         return self
 
 
+def _midstep_days(dt, forcing_midstep: bool) -> float:
+    """Drift fix 2: the forcing instant is the MIDDLE of the step (Fortran sbc_do,
+    ``timenew - dt/2``). Needs ``dt``; ``dt=None`` or ``forcing_midstep=False`` keeps the
+    legacy step-start evaluation (a uniform dt/2 lag of every forcing field) and says so."""
+    if not forcing_midstep or dt is None:
+        print("[fesom_jax] forcing evaluated at the step START (legacy); pass dt= to "
+              "build_surface_forcing for the Fortran mid-step instant", flush=True)
+        return 0.0
+    return 0.5 * float(dt) / 86400.0
+
+
 def build_surface_forcing(mesh: Mesh, year: int, *, sst_ic=None,
                        jra_dir: str | None = None,
                        sss_path: str | None = None,
                        runoff_path: str | None = None,
                        chl_path: str | None = None,
-                       chl_const: float | None = None) -> SurfaceForcing:
+                       chl_const: float | None = None,
+                       dt: float | None = None,
+                       forcing_midstep: bool = True) -> SurfaceForcing:
     """Build the surface-forcing driver for a JRA55-do ``year`` (host setup, ~seconds).
     Mesh-agnostic: works on any :class:`~fesom_jax.mesh.Mesh` (pi, farc, dars, CORE2, NG5).
 
@@ -396,8 +410,14 @@ def build_surface_forcing(mesh: Mesh, year: int, *, sst_ic=None,
 
     ``chl_const`` (default ``None``) selects the chl source: ``None`` ⇒ the Sweeney
     monthly climatology (the C default / production config); a float ⇒ a constant chl
-    everywhere (the ``FESOM_CHL_SOURCE=None`` alternative, ``FESOM_PHASE1_CHL_CONST``)."""
+    everywhere (the ``FESOM_CHL_SOURCE=None`` alternative, ``FESOM_PHASE1_CHL_CONST``).
+
+    ``dt`` (the ocean timestep, s) places the JRA55 interpolation instant at the MIDDLE of
+    each step, as the Fortran's ``sbc_do`` does (drift fix 2). ``dt=None`` or
+    ``forcing_midstep=False`` ⇒ the legacy step-start instant (a uniform ``dt/2`` lag; what
+    the pre-2026-09-18 C dumps and fesom-jax ≤ v1.0.2 use), announced with a printed line."""
     jra = jra55.JRA55Reader(mesh, year, jra_dir)
+    jra.midstep_days = _midstep_days(dt, forcing_midstep)
     sss = sss_runoff.build_reader(mesh, sss_path, runoff_path)
     if chl_const is None:
         chl_clim = sss_runoff.build_chl_clim(mesh, chl_path)

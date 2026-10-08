@@ -50,6 +50,14 @@ The NN-GM project (paper 3) adds the NN form of the 2nd hook:
   ``k_gm``/``redi_kmax`` ceilings into state-dependent fields. The scalars remain the base
   the network multiplies, so both stay live and both stay differentiable.
 
+The adjoint foundation adds a forcing-direction seam (not a physics parameter):
+
+* ``surface_adj`` — an optional dict of surface-flux ADJUSTMENTS ``{"heat", "stress_x",
+  "stress_y"}`` (each ``[nod2D]``, every key optional) added to the model's own fluxes in
+  :func:`fesom_jax.step.step`, so that a gradient or tangent can be taken along a heat or
+  wind-stress direction. ``heat`` is in W/m², POSITIVE INTO the ocean (warming); the stresses
+  are in N/m² in the model (rotated) frame. ``None`` (default) ⇒ nothing is traced.
+
 :meth:`Params.defaults` reproduces the config constants exactly (so passing
 ``Params.defaults()`` is numerically identical to the un-parameterised path).
 """
@@ -101,6 +109,12 @@ class Params:
     # ``gm.gm_diagnostics`` scales ``fer_K`` by m_GM and ``Ki`` by m_Redi. A zero-last-layer NN
     # ⇒ multipliers ≡ 1 ⇒ STILL bit-identical. Un-annotated for the same import-cycle reason.
     gm_nn: object = None
+    # Surface-flux adjustment seam (forcing directions for sensitivities and tangents): a dict
+    # with optional [nod2D] entries "heat" (W/m², POSITIVE = INTO the ocean), "stress_x",
+    # "stress_y" (N/m², model frame), applied in step() after the surface branches. ``None``
+    # (default) ⇒ no leaves, nothing traced, byte-identical. Dense runs only (step() raises
+    # under a halo context). See ``step._apply_surface_adj`` for the sign convention.
+    surface_adj: object = None
 
     @staticmethod
     def defaults() -> "Params":
@@ -121,6 +135,7 @@ class Params:
 tree_util.register_dataclass(
     Params,
     data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
-                 "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn", "gm_nn"],
+                 "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn", "gm_nn",
+                 "surface_adj"],
     meta_fields=[],
 )

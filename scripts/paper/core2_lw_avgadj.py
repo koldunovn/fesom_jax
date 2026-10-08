@@ -281,7 +281,7 @@ def main():
 
     def forcing_for(yr, mo, dy):
         if yr not in cf_cache:
-            cf_cache[yr] = surface_forcing.build_surface_forcing(mesh, yr, sst_ic=sst0)
+            cf_cache[yr] = surface_forcing.build_surface_forcing(mesh, yr, dt=DT, sst_ic=sst0)
         cf = cf_cache[yr]
         return cf.static, cf.stack(surface_forcing.dates_for_steps(yr, DT, n, start_month=mo, start_day=dy))
 

@@ -24,10 +24,11 @@ Literal vectorized port of ``fesom_ssh.c`` for the Phase-2 pi config (linfs ALE,
   800``), so the dumped ``d_eta`` is the **early-stopped** iterate — it matches the
   3-iteration PCG to ~1e-18 but the *exact* solve only to ~2e-10. We therefore
   **replicate the C PCG exactly** (same static ``S``, same MITgcm preconditioner,
-  same ``x0``, same ``‖r‖<soltol·‖b‖`` stop) for the forward value, and wrap it in
-  :func:`jax.lax.custom_linear_solve` so the *gradient* is the clean implicit-diff
-  ``S⁻¹`` (the transpose solve converges tightly). Forward = dump-matching
-  early-stop; backward = exact-solve implicit gradient. The residual trajectory
+  same ``x0``, same ``‖r‖<soltol·‖b‖`` stop) for the forward value, and give it an
+  implicit-derivative rule (:func:`jax.custom_jvp`) so the *derivative* is the clean
+  ``S⁻¹`` in both directions (tangent and transpose solves converge tightly). Forward =
+  dump-matching early-stop; tangent-linear and adjoint = exact-solve implicit derivative,
+  exact transposes of each other. The residual trajectory
   ``[65, 1.0, 0.015]`` vs ``rtol=0.197`` makes the 3-iteration stop unambiguous, so
   ``segment_sum`` reassociation cannot change the iteration count.
 """
@@ -41,7 +42,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import scipy.sparse as sp
+from functools import partial
+
 from jax import lax, tree_util
+from jax.ad_checkpoint import checkpoint_name
+from jax.custom_derivatives import SymbolicZero
 
 from .config import DT_DEFAULT, G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
 from .halo import (halo_exchange, halo_exchange_coloured, halo_exchange_padded,
@@ -636,46 +641,11 @@ def stiff_increment_matvec(mesh: Mesh, hbar, x, *, dt: float = DT_DEFAULT,
         vals.reshape(-1), mesh.edges.reshape(-1), num_segments=mesh.nod2D)
 
 
-def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = None,
-              mesh: "Mesh | None" = None, hbar=None, dt: float = DT_DEFAULT,
-              alpha: float = SSH_ALPHA, theta: float = SSH_THETA,
-              forward_tol: float = SOLTOL, grad_tol: float = GRAD_SOLTOL,
-              maxiter: int = MAXITER):
-    """Solve ``S·d_eta = ssh_rhs`` (substep 9), returning ``d_eta`` ``[nod2D]``.
-
-    Forward: PCG to the loose ``forward_tol`` (``=soltol`` ⇒ matches the dump's
-    early-stopped iterate). Gradient: :func:`jax.lax.custom_linear_solve` provides
-    the implicit-diff cotangent ``S⁻¹·x̄`` via a *tight* transpose solve
-    (``grad_tol``), so ``d(d_eta)/d(ssh_rhs)`` is the accurate ``S⁻¹`` regardless of
-    the loose forward stop.
-
-    ``x0`` is the warm-start guess (the C reuses the previous step's ``d_eta``;
-    ``None`` ⇒ 0, the step-1 case). It is ``stop_gradient``-ed (the solution is
-    mathematically independent of ``x0``) and folded into the rhs so the inner
-    solve is a *linear* map of its argument — required by ``custom_linear_solve``.
-
-    Distributed (Phase 8, S.6): pass a :class:`SSHHalo` (with ``op`` a per-device
-    :func:`partition_ssh_operator` slice) and call inside ``shard_map``. The matvec/
-    precond then broadcast-exchange their input, the CG dots become global
-    (``psum``) reductions, and the residual RMS divides by the global node count —
-    so the early-stop iteration count is device-identical to single device (the
-    load-bearing determinism). ``halo=None`` is the dense single-device path,
-    byte-identical to ``v1.0`` (the gate stays the exact same graph). The
-    ``custom_linear_solve`` transpose runs sharded too (gradient checked in S.8).
-
-    zstar (Phase 9a, JZ.3): pass ``mesh`` + ``hbar`` (the start-of-step ``st.hbar``) to
-    add the D2 stiffness increment ``ΔA(mean₃(hbar))`` (:func:`stiff_increment_matvec`)
-    to the matvec — the operator becomes a differentiable function of state. ``hbar=None``
-    (linfs) ⇒ the static operator, byte-identical. At cold start (``hbar=0``) the
-    increment is 0, so the step-1 solve is the linfs solve exactly."""
-    n = op.n_nodes
-    x0 = jnp.zeros((n,), ssh_rhs.dtype) if x0 is None else x0
-    x0 = lax.stop_gradient(x0)
-
-    # zstar (Phase 9a, JZ.3): the live operator is A_base + ΔA(mean₃(hbar)) (D2). The
-    # increment is recomputed inside the matvec from the (start-of-step) ``hbar``, so the
-    # implicit-diff cotangent propagates into A via ``hbar`` (the closure), not just b.
-    # ``hbar=None`` ⇒ the static linfs operator (byte-identical; no extra trace).
+def _ssh_solver_parts(op: SSHOperator, mesh, halo, cfg, hbar):
+    """The pieces every SSH solve shares: the live operator ``A(hbar)`` as a matvec, the
+    preconditioner and the (global, under ``halo``) reductions. ``cfg`` is the static
+    ``(dt, alpha, theta, forward_tol, grad_tol, maxiter)``."""
+    dt, alpha, theta = cfg[0], cfg[1], cfg[2]
     if hbar is None:
         matvec = lambda x: ssh_matvec(op, x, halo)    # noqa: E731
     else:
@@ -686,6 +656,141 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = Non
     # the stop criterion measures the UNpreconditioned residual either way, so the
     # two preconds solve to the same tolerance (only the iteration count changes).
     precond = ssh_precond_for(op, halo)
+    if halo is None:
+        reduce_fn, reduce_pair_fn, n_global = None, None, None
+    else:
+        reduce_fn = lambda u, v: global_dot(u, v, halo.owned_mask, halo.axis_name)  # noqa: E731
+        # the (r·z, r·r) pair in ONE psum — same locals, half the loop's collectives
+        reduce_pair_fn = lambda r, z: global_dot_pair(                             # noqa: E731
+            r, z, r, r, halo.owned_mask, halo.axis_name)
+        n_global = halo.n_global
+    return matvec, precond, reduce_fn, reduce_pair_fn, n_global
+
+
+def _ssh_forward_solve(cfg, op, mesh, halo, b_eff, hbar, rtol_fwd):
+    """The early-stopped forward PCG from zero on ``b_eff`` (stop at the absolute RMS
+    residual ``rtol_fwd``) — the dump-matching iterate."""
+    matvec, precond, reduce_fn, reduce_pair_fn, n_global = _ssh_solver_parts(
+        op, mesh, halo, cfg, hbar)
+    return _pcg(matvec, precond, b_eff, jnp.zeros_like(b_eff), cfg[3], cfg[5],
+                rtol_abs=rtol_fwd, reduce=reduce_fn, reduce_pair=reduce_pair_fn,
+                n_global=n_global)
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _ssh_implicit(cfg, op, mesh, halo, b_eff, hbar, rtol_fwd):
+    """``δ ≈ A(hbar)⁻¹·b_eff`` by the early-stopped PCG, with the implicit derivative.
+
+    Value: :func:`_ssh_forward_solve` (unchanged arithmetic ⇒ forward bitwise). Tangent:
+    ``dδ = A⁻¹·(d b_eff − dA·δ)`` with ``A⁻¹`` a TIGHT PCG (relative tolerance
+    ``grad_tol``, from zero) in both the tangent and its transpose, so the tangent-linear
+    model and the adjoint are exact transposes. The forward's stop threshold is an ABSOLUTE
+    number derived from the primal right-hand side; reusing that solve for a tangent would
+    stop a small tangent after zero iterations. ``rtol_fwd`` is therefore an argument whose
+    tangent is ignored (the caller also ``stop_gradient``-s it).
+
+    Only the static Python ``cfg`` ``(dt, alpha, theta, forward_tol, grad_tol, maxiter)`` is
+    a non-differentiated argument. Every array — operator, mesh, halo maps included — is an
+    explicit argument: the rule is traced lazily, possibly after the caller's trace has
+    finished (e.g. ``jax.jvp`` of an already-jitted step), and an array it closed over (or
+    received through ``nondiff_argnums``) would then be a stale tracer of that trace. The
+    operator, mesh and halo are treated as constants: their tangents are ignored.
+
+    The value is named ``"ssh_delta"`` (:func:`jax.ad_checkpoint.checkpoint_name`) here and
+    in the rule, so the output a differentiated program sees carries the name."""
+    return checkpoint_name(_ssh_forward_solve(cfg, op, mesh, halo, b_eff, hbar, rtol_fwd),
+                           "ssh_delta")
+
+
+def _ssh_implicit_jvp(cfg, primals, tangents):
+    op, mesh, halo, b_eff, hbar, rtol_fwd = primals
+    _dop, _dmesh, _dhalo, db, dhbar, _drtol = tangents
+    # The name sits HERE (and in the primal function), not on the caller's copy of the
+    # output. Under differentiation this rule computes the primal itself, its δ IS the
+    # solve's output, and under zstar the tangent needs δ once more (dA·δ below). Named only
+    # at the caller, a policy saving "ssh_delta" kept the caller's copy and still re-ran the
+    # forward CG to rebuild this δ in every reverse step; named in both places, it stored
+    # the same [nod2D] vector twice.
+    delta = checkpoint_name(_ssh_forward_solve(cfg, op, mesh, halo, b_eff, hbar, rtol_fwd),
+                            "ssh_delta")
+    rhs = jnp.zeros_like(b_eff) if isinstance(db, SymbolicZero) else db
+    if hbar is not None and not isinstance(dhbar, SymbolicZero):
+        # A(hbar) = A_base + ΔA(hbar), ΔA bilinear in (hbar, x) ⇒ dA·δ = ΔA(dhbar)·δ.
+        rhs = rhs - stiff_increment_matvec(mesh, dhbar, delta, dt=cfg[0], alpha=cfg[1],
+                                           theta=cfg[2], halo=halo)
+    matvec, precond, reduce_fn, reduce_pair_fn, n_global = _ssh_solver_parts(
+        op, mesh, halo, cfg, hbar)
+
+    def tight(mv, b):
+        x = _pcg(mv, precond, b, jnp.zeros_like(b), cfg[4], cfg[5],
+                 reduce=reduce_fn, reduce_pair=reduce_pair_fn, n_global=n_global)
+        if halo is None:
+            return x
+        # Sharded: the PCG leaves incomplete partial sums on halo lanes (the local
+        # operator's halo rows). Harmless in a forward value (the caller's next exchange
+        # overwrites them), but in reverse mode the caller's INPUT exchange transposes to
+        # a scatter-add of every halo-lane cotangent onto its owner. Returning zero off the
+        # owned lanes makes the derivative solve E·S⁻¹·Eᵀ in lane space (E = owned-lane
+        # embedding): symmetric, so tangent and transpose stay exact transposes, and no
+        # halo or padding value reaches an owner.
+        return jnp.where(halo.owned_mask, x, jnp.zeros_like(x))
+
+    ddelta = jax.lax.custom_linear_solve(matvec, rhs, tight, tight, symmetric=True)
+    return delta, ddelta
+
+
+_ssh_implicit.defjvp(_ssh_implicit_jvp, symbolic_zeros=True)
+
+
+def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = None,
+              mesh: "Mesh | None" = None, hbar=None, dt: float = DT_DEFAULT,
+              alpha: float = SSH_ALPHA, theta: float = SSH_THETA,
+              forward_tol: float = SOLTOL, grad_tol: float = GRAD_SOLTOL,
+              maxiter: int = MAXITER):
+    """Solve ``S·d_eta = ssh_rhs`` (substep 9), returning ``d_eta`` ``[nod2D]``.
+
+    Forward: PCG to the loose ``forward_tol`` (``=soltol`` ⇒ matches the dump's
+    early-stopped iterate). Derivatives: the implicit derivative of the solve
+    (:func:`_ssh_implicit`, a :func:`jax.custom_jvp`): the tangent is
+    ``A⁻¹·(d b − dA·δ)`` with a *tight* solve (``grad_tol``, relative, from zero), and
+    reverse mode transposes that tangent with the same tight solve. So
+    ``d(d_eta)/d(ssh_rhs)`` is the accurate ``S⁻¹`` regardless of the loose forward stop,
+    and the tangent-linear model and the adjoint pass a dot test to round-off at any
+    tangent amplitude. The derivative is that of the exact solution of ``A δ = b_eff``,
+    taken at the early-stopped iterate.
+
+    The correction ``δ`` is named ``"ssh_delta"`` (:func:`jax.ad_checkpoint.checkpoint_name`,
+    inside :func:`_ssh_implicit` and its rule), so a remat policy
+    ``save_only_these_names("ssh_delta")`` can keep it (one ``[nod2D]`` per step) instead of
+    re-running the forward CG in the reverse sweep.
+
+    ``x0`` is the warm-start guess (the C reuses the previous step's ``d_eta``;
+    ``None`` ⇒ 0, the step-1 case). It is ``stop_gradient``-ed (the solution is
+    mathematically independent of ``x0``) and folded into the rhs so the inner
+    solve is a *linear* map of its argument.
+
+    Distributed (Phase 8, S.6): pass a :class:`SSHHalo` (with ``op`` a per-device
+    :func:`partition_ssh_operator` slice) and call inside ``shard_map``. The matvec/
+    precond then broadcast-exchange their input, the CG dots become global
+    (``psum``) reductions, and the residual RMS divides by the global node count —
+    so the early-stop iteration count is device-identical to single device (the
+    load-bearing determinism). ``halo=None`` is the dense single-device path. The
+    derivative solves return zero on halo and padding lanes (the forward leaves partial
+    sums there, which the caller's next exchange overwrites); this keeps the lane-space
+    derivative symmetric, so the transpose of the caller's input exchange adds nothing
+    to the owners.
+
+    zstar (Phase 9a, JZ.3): pass ``mesh`` + ``hbar`` (the start-of-step ``st.hbar``) to
+    add the D2 stiffness increment ``ΔA(mean₃(hbar))`` (:func:`stiff_increment_matvec`)
+    to the matvec — the operator becomes a differentiable function of state. ``hbar=None``
+    (linfs) ⇒ the static operator, no increment traced. At cold start (``hbar=0``) the
+    increment is 0, so the step-1 solve is the linfs solve exactly."""
+    n = op.n_nodes
+    x0 = jnp.zeros((n,), ssh_rhs.dtype) if x0 is None else x0
+    x0 = lax.stop_gradient(x0)
+    cfg = (float(dt), float(alpha), float(theta), forward_tol, grad_tol, int(maxiter))
+    matvec, _precond, reduce_fn, _pair, n_global = _ssh_solver_parts(op, mesh, halo, cfg,
+                                                                     hbar)
 
     # Solve for the correction δ = S⁻¹·b_eff from δ0=0 (linear), then d_eta = x0+δ.
     # For x0=0 (step 1) b_eff = ssh_rhs and this is exactly the C's solve-from-zero.
@@ -697,30 +802,16 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = Non
     # the inner solve at ``soltol·‖ssh_rhs‖`` replicates the C's warm-started
     # early-stop exactly (a good warm start ⇒ b_eff already below threshold ⇒ 0
     # iters ⇒ d_eta = x0). Deriving rtol from ‖b_eff‖ instead would over-converge.
+    # The threshold is a property of the forward iteration only: no derivative flows
+    # through it.
     if halo is None:
         nrhs = ssh_rhs.shape[0]
         rtol_fwd = forward_tol * jnp.sqrt(jnp.sum(ssh_rhs * ssh_rhs) / nrhs)
-        reduce_fn, reduce_pair_fn, n_global = None, None, None
     else:
-        reduce_fn = lambda u, v: global_dot(u, v, halo.owned_mask, halo.axis_name)
-        # the (r·z, r·r) pair in ONE psum — same locals, half the loop's collectives
-        reduce_pair_fn = lambda r, z: global_dot_pair(
-            r, z, r, r, halo.owned_mask, halo.axis_name)
-        n_global = halo.n_global
         rtol_fwd = forward_tol * jnp.sqrt(reduce_fn(ssh_rhs, ssh_rhs) / n_global)
+    rtol_fwd = lax.stop_gradient(rtol_fwd)
 
-    def solve(mv, b):           # forward: early-stopped (dump-matching)
-        return _pcg(mv, precond, b, jnp.zeros_like(b), forward_tol, maxiter,
-                    rtol_abs=rtol_fwd, reduce=reduce_fn, reduce_pair=reduce_pair_fn,
-                    n_global=n_global)
-
-    def transpose_solve(mv, b):  # reverse cotangent: tight (accurate gradient)
-        return _pcg(mv, precond, b, jnp.zeros_like(b), grad_tol, maxiter,
-                    reduce=reduce_fn, reduce_pair=reduce_pair_fn, n_global=n_global)
-
-    delta = jax.lax.custom_linear_solve(
-        matvec, b_eff, solve, transpose_solve, symmetric=True
-    )
+    delta = _ssh_implicit(cfg, op, mesh, halo, b_eff, hbar, rtol_fwd)   # named "ssh_delta"
     return x0 + delta
 
 

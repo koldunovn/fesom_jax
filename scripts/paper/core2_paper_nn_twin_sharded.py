@@ -119,7 +119,7 @@ def main():
         dense = ice.seed_ice(base, mesh, np.asarray(base.T[:, 0])) if args.config == "all3" else base
     sst0 = np.asarray(base.T[:, 0])
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, dt=DT, sst_ic=sst0)
     sf = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
     fs = cf.static
     if args.config == "all3":

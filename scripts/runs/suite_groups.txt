@@ -34,6 +34,9 @@
 #               is exactly why the group survives at all. The split plan's own text said "remove
 #               the scripts cost group"; reading the tree said otherwise. Do not delete it, and
 #               do not change the runner's --array range: the group COUNT is still 6.
+#               ⚠️ NOT cheap any more: scripts/tests/test_core2_adj.py (2026-09-27) runs the
+#               shared CORE2 adjoint driver on two production steps — five compiled CORE2
+#               programs, ~1 h and >= 200 GB on a CPU node. Give the group --mem=200G.
 #
 # ⚠️ EVERY test_*.py under fesom_jax/tests/ AND scripts/tests/ must appear here exactly once.
 # fesom_jax/tests/test_suite_groups.py fails if one does not, so a new file cannot join the
@@ -84,6 +87,7 @@ ice fesom_jax/tests/test_ice_thermo.py
 scripts scripts/tests/test_lw_forward_seam.py
 scripts scripts/tests/test_lw_foundation_check.py
 scripts scripts/tests/test_write_namelist.py
+scripts scripts/tests/test_core2_adj.py
 sharding fesom_jax/tests/test_forcing_sharded.py
 sharding fesom_jax/tests/test_gm_nn_sharded.py
 sharding fesom_jax/tests/test_gradient_sharded.py
@@ -127,6 +131,8 @@ ci fesom_jax/tests/test_restart.py
 ci fesom_jax/tests/test_run_config.py
 unit fesom_jax/tests/test_sensitivity.py
 ci fesom_jax/tests/test_ssh.py
+unit fesom_jax/tests/test_ssh_implicit.py
+core2 fesom_jax/tests/test_ssh_implicit_core2.py
 ci fesom_jax/tests/test_state.py
 unit fesom_jax/tests/test_step_pi.py
 ci fesom_jax/tests/test_stream_output.py
@@ -136,3 +142,10 @@ ci fesom_jax/tests/test_tke_nn.py
 unit fesom_jax/tests/test_tracers.py
 ci fesom_jax/tests/test_verify.py
 unit fesom_jax/tests/test_adjoint_chunked.py
+unit fesom_jax/tests/test_adjoint_save_names.py
+unit fesom_jax/tests/test_adjoint_diag_cuts.py
+core2 fesom_jax/tests/test_surface_adj.py
+ci fesom_jax/tests/test_surface_adj_unit.py
+unit fesom_jax/tests/test_adjoint_check.py
+core2 fesom_jax/tests/test_adjoint_costs.py
+ci fesom_jax/tests/test_adjoint_check_unit.py

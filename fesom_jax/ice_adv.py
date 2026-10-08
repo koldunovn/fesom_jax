@@ -29,7 +29,7 @@ from . import ops
 from .ice import IceConfig
 from .mesh import Mesh
 
-_ICE_SCALE_AREA = 2.0e8        # fesom_ice_fct.c:37 (oce_modules.F90:29)
+# scale_area lives in IceConfig (namelist value 5.8e9; was the 2.0e8 module default here until 2026-09-18)
 _ICE_FLUX_EPS = 1.0e-12        # fesom_ice_fct.c:458,466 (the C floor — match it, not 1e-16)
 
 
@@ -53,7 +53,7 @@ def _tg_rhs(cfg: IceConfig, mesh: Mesh, u_ice, v_ice, a_ice, m_ice, m_snow):
     dt = cfg.ice_dt
     U = u_ice[en]; V = v_ice[en]                            # [elem,3]
     um = U.sum(axis=1); vm = V.sum(axis=1)                  # [elem]  (NOT /3 — C line 189)
-    diff = cfg.ice_diff * jnp.sqrt(vol / _ICE_SCALE_AREA)   # [elem]  (vol>0)
+    diff = cfg.ice_diff * jnp.sqrt(vol / cfg.scale_area)    # [elem]  (vol>0); ice_fct.F90:175
     # a/b/c[n,q] (C lines 198-203)
     a = (dx[:, :, None] * (um[:, None, None] + U[:, None, :])
          + dy[:, :, None] * (vm[:, None, None] + V[:, None, :])) / 12.0

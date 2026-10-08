@@ -22,7 +22,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import jra55, sss_runoff
-from .surface_forcing import SurfaceForcing, StepForcing
+from .surface_forcing import _midstep_days, SurfaceForcing, StepForcing
 from .shard_mesh import _default_pad, local_sizes
 
 
@@ -137,7 +137,8 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
                         sss_path=None,
                         runoff_path=None,
                         chl_path=None,
-                        chl_const=None, static=None) -> LocalForcing:
+                        chl_const=None, static=None,
+                        dt=None, forcing_midstep: bool = True) -> LocalForcing:
     """Build a :class:`LocalForcing` for this process's local partitions.
 
     The four input-path kwargs default to ``None`` ⇒ resolved by the readers through
@@ -156,7 +157,9 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
     sub = _SubMesh(mesh, local_nodes)
     chl = (np.full((12, int(len(local_nodes))), float(chl_const), dtype=np.float64)
            if chl_const is not None else sss_runoff.build_chl_clim(sub, chl_path))
-    cf = SurfaceForcing(jra=jra55.JRA55Reader(sub, int(year), jra_dir),
+    jra = jra55.JRA55Reader(sub, int(year), jra_dir)
+    jra.midstep_days = _midstep_days(dt, forcing_midstep)        # drift fix 2 (see surface_forcing)
+    cf = SurfaceForcing(jra=jra,
                      sss=sss_runoff.build_reader(sub, sss_path, runoff_path),
                      chl_clim=chl, static=static)
     return LocalForcing(cf, part, npes, local_parts, local_nodes)

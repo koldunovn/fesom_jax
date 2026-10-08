@@ -44,7 +44,7 @@ import pytest
 from fesom_jax import ssh, surface_forcing
 from fesom_jax import ice as icemod
 from fesom_jax import step as stepmod
-from fesom_jax.adjoint_stab import AdjointConfig
+from fesom_jax.adjoint_stab import FREEZE_FLAGS, AdjointConfig
 from fesom_jax.ale import AleConfig
 from fesom_jax.gm import GMConfig
 from fesom_jax.ice import IceConfig
@@ -270,7 +270,7 @@ def test_every_production_only_flag_is_listed_here():
 
     from fesom_jax import step as _step
     src = inspect.getsource(_step.step)
-    guarded = {f for f in AdjointConfig._fields if f in src}
+    guarded = {f for f in FREEZE_FLAGS if f in src}
     covered = set(PROD_ONLY_FLAGS)
     # the pi and TKE files cover these; listed explicitly so a new flag lands in neither set
     # and fails this test rather than disappearing

@@ -38,7 +38,7 @@ import jax.numpy as jnp
 
 from . import (adjoint_stab, ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh,
                tke, tracer_adv, tracer_diff)
-from .config import DT_DEFAULT
+from .config import DT_DEFAULT, VCPW
 from .mesh import Mesh
 from .params import Params
 from .ssh import SSHOperator
@@ -54,7 +54,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
          kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
          halo_ctx=None, boundary_node=None, adjoint_cfg=None,
-         remat_blocks: bool = False) -> State:
+         remat_blocks: bool = False, bulk_uvnode_lag: bool = False) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -74,7 +74,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     start-of-step ``state.T[:,0]`` (SST) and ``state.uvnode[:,0]`` (surface current), so
     the SST→flux / current→stress feedback is differentiable. ``step_forcing=None`` ⇒ the
     pi analytical path (static ``stress_surf``, zero surface BCs) — **bit-identical** to
-    Phase 2 (the 313 pi gates must not move).
+    Phase 2 (the 313 pi gates must not move). Drift fix 1 (2026-09-18): on the forcing
+    path ``uvnode`` is recomputed from the carried ``state.uv`` at the top of the step (the
+    Fortran's top-of-step ``compute_vel_nodes``), so the bulk and ``ocean2ice`` see the
+    current surface velocity, not the previous step's ``state.uvnode``;
+    ``bulk_uvnode_lag=True`` restores the legacy tap (the pre-fix C dumps).
 
     **GM/Redi (Phase 6B).** ``gm_cfg`` (a :class:`fesom_jax.gm.GMConfig`, static/hashable —
     the ``ice_cfg`` precedent) turns on the mesoscale eddy parameterization: after EOS the
@@ -125,6 +129,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # Backward-only simplifications, one flag per term. None ⇒ all off ⇒ every `if _adj.x`
     # below is a dead branch and the traced graph is exactly the pre-existing one.
     _adj = adjoint_cfg if adjoint_cfg is not None else adjoint_stab.AdjointConfig()
+    # diag_cuts: coerce to a frozenset and reject unknown cut names (trace-time Python guard).
+    _adj = _adj.validate()
     # zstar seam (Phase 9a): None ⇒ linfs (the byte-identical dead branch). A non-None
     # AleConfig means zstar — validate the mode here (the C's fesom_ale_mode_init exit(1)
     # parity; static arg ⇒ this is a trace-time Python guard, no runtime cost).
@@ -192,6 +198,16 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     heat_flux = water_flux = stress_node_surf = None
     ice_out = None
     if step_forcing is not None:
+        # Drift fix 1 (2026-09-18, = fesom2_port_drift@c4881f3): the Fortran runloop calls
+        # compute_vel_nodes at the top of EVERY step, so everything in the surface block (the
+        # bulk formulae AND ocean2ice's ice-ocean drag) sees the surface current of the
+        # velocity carried into this step. The carried state.uvnode is what the previous
+        # step's mixing substep computed from the velocity carried into THAT step, i.e. one
+        # step older. Refresh it here; the mixing substep below recomputes the same value
+        # and is what the step returns. ``bulk_uvnode_lag=True`` keeps the legacy (one step
+        # old) uvnode — the pre-fix C dumps / byte gates. Pi path (no forcing): untouched.
+        if not bulk_uvnode_lag:
+            st = dataclasses.replace(st, uvnode=_exch(pp.compute_vel_nodes(mesh, st.uv), "nod"))
         if ice_cfg is not None:
             from . import ice_step as _ice_step       # lazy: keep ice deps off the pi path
             ice_out = _ice_step.ice_surface_step(
@@ -204,15 +220,21 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             # values are bit-identical to "exact"; only the gradient skips the ice. Tames the
             # rheology adjoint blow-up for ocean-parameter calibration (drops the ice-mediated
             # sensitivity). See IceConfig.adjoint_mode; "free_drift" is the planned upgrade.
+            # ⚠️ "frozen" cuts the FLUXES too: IceStepOut carries stress_surf/bc_T/bc_S/
+            # heat_flux, so under it dJ/d(atmosphere) is identically zero and the SST -> flux
+            # feedback is gone from the adjoint. For "the ice is given, the fluxes are live"
+            # use "prescribed" (handled inside ice_surface_step, at the ice state's entry and
+            # exit).
             if ice_cfg.adjoint_mode == "frozen":
                 ice_out = jax.tree.map(jax.lax.stop_gradient, ice_out)
-            elif ice_cfg.adjoint_mode not in ("exact", "rheology"):
-                # "rheology" is handled inside ice_surface_step (it unrolls zero rheology
-                # subcycles in the backward); nothing to do to the ice output here.
+            elif ice_cfg.adjoint_mode not in ("exact", "rheology", "prescribed"):
+                # "rheology" and "prescribed" are handled inside ice_surface_step; nothing to
+                # do to the ice output here.
                 raise NotImplementedError(
                     f"IceConfig.adjoint_mode={ice_cfg.adjoint_mode!r} not implemented; use "
-                    "'exact', 'rheology' (freeze only the momentum solve — recommended) or "
-                    "'frozen' (freeze the whole ice update).")
+                    "'exact', 'rheology' (freeze only the momentum solve — recommended), "
+                    "'prescribed' (ice state given, fluxes differentiated) or 'frozen' "
+                    "(freeze the whole ice update, fluxes included).")
             stress_surf = ice_out.stress_surf
             bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
             heat_flux, water_flux = ice_out.heat_flux, ice_out.water_flux
@@ -227,6 +249,15 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             bc_T, bc_S, sw_3d = sfx.bc_T, sfx.bc_S, sfx.sw_3d
             heat_flux, water_flux = sfx.heat_flux, sfx.water_flux
             stress_node_surf = sfx.stress_node_surf
+
+    # Surface-flux adjustment seam (Params.surface_adj): ONE place after the ice / no-ice
+    # branches join, before EOS, mixing (TKE reads stress_node_surf, KPP heat_flux) and the
+    # momentum/tracer consumers. None ⇒ a dead branch (nothing traced).
+    _sadj = getattr(params, "surface_adj", None)
+    if _sadj is not None:
+        bc_T, heat_flux, stress_surf, stress_node_surf = _apply_surface_adj(
+            mesh, _sadj, bc_T=bc_T, heat_flux=heat_flux, stress_surf=stress_surf,
+            stress_node_surf=stress_node_surf, dt=dt, halo_ctx=halo_ctx)
 
     # 1 — EOS / hydrostatic pressure / N² (zstar: density compressibility + N² spacing on
     #     live geometry; hpressure unused under zstar). Z3d_live=None ⇒ static (byte-identical).
@@ -324,6 +355,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     uvnode = _exch(uvnode, "nod")
     Kv = _exch(Kv, "nod")
     Av = _exch(Av, "elem")
+    # Named diagnostic derivative cuts (AdjointConfig.diag_cuts): a Python-level decision, so
+    # an inactive cut traces nothing. Both together equal freeze_mixing below.
+    Kv = adjoint_stab.dcut(_adj, "mix.kv_out", Kv)
+    Av = adjoint_stab.dcut(_adj, "mix.av_out", Av)
 
     # adjoint_cfg.freeze_mixing — use the coefficients the closure just computed but omit their
     # dependence on the ocean state in the backward (the ECCO practice). Placed AFTER the
@@ -526,6 +561,55 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
 
 # Jitted entry point (the Task-2.11 deliverable; also what Phase 3's lax.scan wraps).
+SURFACE_ADJ_KEYS = ("heat", "stress_x", "stress_y")
+
+
+def _apply_surface_adj(mesh, adj, *, bc_T, heat_flux, stress_surf, stress_node_surf, dt,
+                       halo_ctx):
+    """Add ``Params.surface_adj`` to the surface fluxes of one step.
+
+    ``adj`` is a dict with optional ``[nod2D]`` entries:
+
+    * ``heat`` — W/m², **positive INTO the ocean** (warming). The model's ``heat_flux`` is
+      positive for ocean heat LOSS and temperature is forced only through
+      ``bc_T = -dt·heat_flux/VCPW``, so the adjustment is applied as
+      ``bc_T += dt·heat/VCPW`` (the tracer forcing) and ``heat_flux -= heat`` (what KPP's
+      surface buoyancy flux reads), keeping the two consistent. It is added wherever it is
+      non-zero, under sea ice too.
+    * ``stress_x``, ``stress_y`` — N/m² in the model (rotated) frame, added to the nodal
+      surface stress ``stress_node_surf`` (which the TKE surface forcing and KPP read) and,
+      as the mean over each element's three nodes, to the element stress ``stress_surf``
+      that forces momentum.
+
+    Requires the forced path (``step_forcing``); dense only (raises under a halo context,
+    where the node arrays are lane-local). Unknown keys raise, so a misspelt key cannot be a
+    silent no-op."""
+    if halo_ctx is not None:
+        raise NotImplementedError("Params.surface_adj is supported on the dense (single-"
+                                  "device) path only; halo_ctx is set")
+    if not isinstance(adj, dict):
+        raise TypeError(f"Params.surface_adj must be a dict, got {type(adj).__name__}")
+    unknown = sorted(set(adj) - set(SURFACE_ADJ_KEYS))
+    if unknown:
+        raise ValueError(f"Params.surface_adj: unknown keys {unknown}; allowed "
+                         f"{list(SURFACE_ADJ_KEYS)}")
+    if bc_T is None or stress_node_surf is None:
+        raise ValueError("Params.surface_adj needs the forced path (step_forcing): the pi "
+                         "path has no surface heat flux or nodal stress to adjust")
+    heat = adj.get("heat")
+    if heat is not None:
+        bc_T = bc_T + dt * heat / VCPW
+        heat_flux = heat_flux - heat
+    sx, sy = adj.get("stress_x"), adj.get("stress_y")
+    if sx is not None or sy is not None:
+        zero = jnp.zeros_like(stress_node_surf[:, 0])
+        dsn = jnp.stack([zero if sx is None else sx, zero if sy is None else sy], axis=-1)
+        stress_node_surf = stress_node_surf + dsn
+        ev = mesh.elem_nodes
+        stress_surf = stress_surf + (dsn[ev[:, 0]] + dsn[ev[:, 1]] + dsn[ev[:, 2]]) / 3.0
+    return bc_T, heat_flux, stress_surf, stress_node_surf
+
+
 # ``mesh``/``op``/``state``/``stress_surf`` are pytree args; ``dt``/``is_first_step``
 # are static (the latter ⇒ two compiled variants: the step-1 AB2 branch and the rest).
 step_jit = jax.jit(step,

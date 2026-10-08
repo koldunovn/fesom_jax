@@ -138,7 +138,7 @@ def main():
                 pairs = [pairs[i] for i in idx]
             K = len(pairs)
             base = phc_initial_state(mesh, twin.IC_DIR)
-            cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=np.asarray(base.T[:, 0]))
+            cf = surface_forcing.build_surface_forcing(mesh, args.year, dt=DT, sst_ic=np.asarray(base.T[:, 0]))
             for s, f in pairs:
                 with open(f, "rb") as fp:
                     starts_host.append(pickle.load(fp))  # host State (saved via device_get)

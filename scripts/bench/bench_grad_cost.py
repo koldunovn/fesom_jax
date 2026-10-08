@@ -65,7 +65,7 @@ def main():
     if args.ice:
         st0 = ice.seed_ice(st0, mesh, sst0)
     op = ssh.build_ssh_operator(mesh, dt=args.dt)
-    cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0)
+    cf = surface_forcing.build_surface_forcing(mesh, args.year, dt=args.dt, sst_ic=sst0)
     sfs = cf.stack(surface_forcing.dates_for_steps(args.year, args.dt, args.n))
     fs = cf.static
     cfgs = dict(ice_cfg=IceConfig() if args.ice else None,

@@ -40,7 +40,8 @@ from .state import State
 from .step import step
 
 
-def _run_steps(body, init, *, xs=None, length=None, checkpoint=True, segments=0):
+def _run_steps(body, init, *, xs=None, length=None, checkpoint=True, segments=0,
+               save_names=()):
     """Run ``length`` (or ``len(xs)``) steps of ``body`` via ``lax.scan``, optionally with
     **O(√N) two-level rematerialization** (``segments>0``).
 
@@ -70,10 +71,25 @@ def _run_steps(body, init, *, xs=None, length=None, checkpoint=True, segments=0)
     43.1 GB at 1 day and 56.9 GB at **30 days**. Exact, not an approximation. Reference
     implementation: ``adjoint_horizon.py`` in the nn_eddy research repository
     (``fwd_chunk``/``bwd_chunk`` and the reverse loop); rationale in
-    ``docs/ADJOINT_HORIZON.md``."""
+    ``docs/ADJOINT_HORIZON.md``.
+
+    ``save_names`` (default ``()``): names given with :func:`jax.ad_checkpoint.checkpoint_name`
+    inside ``body`` whose values the PER-STEP checkpoint keeps as residuals instead of
+    recomputing them in the reverse sweep (policy
+    ``jax.checkpoint_policies.save_only_these_names``). ``("ssh_delta",)`` keeps the SSH
+    solution, so the reverse sweep does not re-run the forward CG of every step. The outer
+    segment checkpoint stays policy-free (no name lives at that level). Empty ⇒ the call is
+    exactly the policy-free one (identical jaxpr). Ignored when ``checkpoint=False`` (nothing
+    is rematerialised then)."""
     if length is None:
         length = int(jax.tree.leaves(xs)[0].shape[0])
-    step_fn = jax.checkpoint(body) if checkpoint else body
+    if not checkpoint:
+        step_fn = body
+    elif save_names:
+        step_fn = jax.checkpoint(
+            body, policy=jax.checkpoint_policies.save_only_these_names(*save_names))
+    else:
+        step_fn = jax.checkpoint(body)
     if checkpoint and segments and segments > 1 and length >= 2 * segments:
         S = int(segments)
         M = length // S
@@ -107,7 +123,8 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
               checkpoint: bool = True, step_forcings=None, forcing_static=None,
               ice_cfg=None, gm_cfg=None, kpp_cfg=None, tke_cfg=None,
               ale_cfg=None, visc_cfg=None, tracer_cfg=None, adjoint_cfg=None,
-              remat_blocks: bool = False, remat_segments: int = 0) -> State:
+              remat_blocks: bool = False, remat_segments: int = 0,
+              save_names: tuple = ()) -> State:
     """Integrate ``n_steps`` ocean timesteps from ``state`` via a checkpointed scan.
 
     Returns the final :class:`~fesom_jax.state.State`. Differentiable end-to-end
@@ -131,7 +148,14 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
     ``N×|State|`` stack that OOMs long CORE2 adjoints. ``remat_segments=-1`` switches to O(√N)
     two-level checkpointing (auto S≈√N segments; see :func:`_run_steps`) ⇒ only ~2√N carries, so
     a *continuous* backward over a much longer window fits one GPU. ``>1`` sets S explicitly;
-    ``0`` (default) keeps the per-step path (byte-identical). Forward value is unchanged."""
+    ``0`` (default) keeps the per-step path (byte-identical). Forward value is unchanged.
+
+    **Saved names (``save_names``).** A tuple of :func:`jax.ad_checkpoint.checkpoint_name`
+    labels the per-step checkpoint keeps instead of recomputing (see :func:`_run_steps`);
+    ``("ssh_delta",)`` keeps the SSH solution (one ``[nod2D]`` float64 per stored step), so the
+    reverse sweep does not re-run the forward CG. Static (a tuple of strings); ``()`` (default)
+    traces the identical program. Only the scanned steps are checkpointed: step 1 runs eagerly
+    and keeps all of its residuals anyway."""
     if params is None:
         params = Params.defaults()
     _seg = remat_segments
@@ -165,7 +189,8 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
                        adjoint_cfg=adjoint_cfg, remat_blocks=remat_blocks)
             return nxt, None
 
-        return _run_steps(body, state, length=n_steps - 1, checkpoint=checkpoint, segments=_seg)
+        return _run_steps(body, state, length=n_steps - 1, checkpoint=checkpoint, segments=_seg,
+                      save_names=tuple(save_names))
 
     # CORE2 path: step 1 eager with step_forcings[0]; scan the rest as xs.
     # ``ice_cfg`` (an IceConfig) ⇒ the prognostic sea-ice step runs each step (Phase 6).
@@ -188,7 +213,8 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
                        adjoint_cfg=adjoint_cfg, remat_blocks=remat_blocks)
         return nxt, None
 
-    return _run_steps(body_core, state, xs=rest, checkpoint=checkpoint, segments=_seg)
+    return _run_steps(body_core, state, xs=rest, checkpoint=checkpoint, segments=_seg,
+                      save_names=tuple(save_names))
 
 
 # Jitted entry point (what the gradient harness and the memory-sanity gate call).
@@ -198,4 +224,4 @@ integrate_jit = jax.jit(
     integrate,
     static_argnames=("n_steps", "dt", "checkpoint", "ice_cfg", "gm_cfg", "kpp_cfg",
                      "tke_cfg", "ale_cfg", "visc_cfg", "tracer_cfg",
-                     "remat_blocks", "remat_segments"))
+                     "remat_blocks", "remat_segments", "save_names"))

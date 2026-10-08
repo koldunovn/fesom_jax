@@ -445,6 +445,27 @@ reverse accumulation that keeps it inside one GPU and a finite-difference sanity
 Run the tests with `scripts/nn_eddy/adjoint_tests.sbatch` (CPU group) and
 `scripts/nn_eddy/adjoint_tests_gpu.sbatch` (the CORE2 gates).
 
+### The 2026-09 tools: an exact tangent-linear model and checks of a derivative
+
+Documented in `ADJOINT_API.md`, "Additions of 2026-09". In short: the SSH solve has an exact
+tangent-linear model (implicit derivative; the one-step dot test at amplitude 1e-8 went from
+3.4e-2 to 3.1e-12 on CORE2, and a pre-existing sharded adjoint error at partition boundaries was
+fixed); `chunked_grad` gained a linearity guard, per-field traces, a cotangent hook and the
+initial-state cotangent; `chunked_grad_multi` runs several costs over one forward;
+`AdjointConfig` gained named diagnostic cuts (`diag_cuts`) and the presets `exact()` /
+`long_window()`; `adjoint_stab.differentiate_at` linearises a term about another state;
+`Params.surface_adj` is a surface heat/stress control; `fesom_jax.adjoint_check` holds dot tests,
+FD sweeps, pinned-state window maps and power iteration; `fesom_jax.adjoint_costs` holds weighted
+costs and running (window-mean) accumulators; `scripts/adjoint/core2_adj.py` is the shared CORE2
+driver, and monthly 2013 States from one forward are in
+`/work/ab0995/a270088/fesom_jax_dev/states_2013/`.
+
+Two measurements there bear on this document. On the A100, two runs of the same all-on chunk
+program over one day differ by switch flips (convective Kv/Av at thousands of points, the ice
+skin temperature by several K), and the `exact()` 1-day adjoint is not reproducible (five sweeps
+gave `dJ/d ln_tke_c_k` of both signs) while `long_window()` repeats to 2e-10. The dot test with
+every step pinned holds to ≤ 5.8e-9, so what varies is the trajectory, not the transpose.
+
 ---
 
 ## 5. Open items

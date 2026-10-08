@@ -102,7 +102,7 @@ def main():
         st0 = jax.device_put(pickle.load(f))
     yr, mo, dy = seed_date(args.snap, args.run_start_year)
     sst0 = np.asarray(phc_initial_state(mesh, IC_DIR).T[:, 0])
-    cf = surface_forcing.build_surface_forcing(mesh, yr, sst_ic=sst0)
+    cf = surface_forcing.build_surface_forcing(mesh, yr, dt=DT, sst_ic=sst0)
     dates = surface_forcing.dates_for_steps(yr, DT, STEPS_PER_DAY, start_month=mo, start_day=dy)
     sfs = cf.stack(dates[:args.steps])
     p = Params.defaults()

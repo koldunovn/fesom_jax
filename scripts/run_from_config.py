@@ -221,7 +221,7 @@ def main():
         # (fesom_jax/paths.py, docs/DATA.md) — the historical behaviour.
         fpaths = cfg.forcing_paths()
         forcing = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0,
-                                                   **fpaths); _lap("forcing_setup")
+                                                   dt=cfg.dt, **fpaths); _lap("forcing_setup")
 
     # The NG5 host-forcing fix: build a LOCAL-node forcing (interp only this process's owned
     # partitions, ~npes× less). forcing.static is reused for the (cheap, once) static path.
@@ -229,7 +229,7 @@ def main():
     if args.local_forcing:
         from fesom_jax.forcing_local import build_local_forcing
         local_forcing = build_local_forcing(mesh, args.year, part, part.npes,
-                                             static=forcing.static, sst_ic=sst0, **fpaths)
+                                             static=forcing.static, sst_ic=sst0, dt=cfg.dt, **fpaths)
         _lap("local_forcing_setup")
 
     if _IS_LEAD:

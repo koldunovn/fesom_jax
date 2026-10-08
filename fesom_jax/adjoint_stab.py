@@ -66,8 +66,8 @@ from .mesh import Mesh
 __all__ = [
     "cotangent_op", "freeze", "freeze_increment", "cotangent_norm",
     "make_nodal_smoother", "make_discounter", "make_clipper", "make_state_stabilizer",
-    "StabConfig", "AdjointConfig",
-    "Amplification", "amplification", "AMP_CLEAN_MAX", "AMP_SPREAD_MAX", "AMP_SUSTAINED_MAX", "AMP_SUSTAINED_W",
+    "StabConfig", "AdjointConfig", "FREEZE_FLAGS", "KNOWN_CUTS", "dcut", "differentiate_at",
+    "Amplification", "amplification", "amplification_by_field", "field_norms", "AMP_CLEAN_MAX", "AMP_SPREAD_MAX", "AMP_SUSTAINED_MAX", "AMP_SUSTAINED_W",
 ]
 
 
@@ -252,13 +252,155 @@ class AdjointConfig(NamedTuple):
     """The baroclinic pressure-gradient force. Cuts the tracer-to-momentum coupling
     entirely. **Diagnostic only** — the resulting gradient is not usable for training."""
 
+    diag_cuts: frozenset = frozenset()
+    """Named DIAGNOSTIC derivative cuts: a set of cut-point names from :data:`KNOWN_CUTS`.
+    At each named point of :func:`fesom_jax.step.step` the value is passed through
+    :func:`dcut`, i.e. ``stop_gradient`` on every floating leaf — the forward is unchanged,
+    the backward stops there. Unlike the ``freeze_*`` flags, which are recommended
+    simplifications with a measured effect, a cut is an instrument for locating where a
+    reverse-pass amplification enters; the set of points grows with the diagnosis. The
+    existing flags are not duplicated as cut names.
+
+    **Why a static field and not a trace-time context.** Each cut set is part of the
+    config, so it is part of whatever closure (``chunk_fn``) a caller builds around
+    ``step``; the lru-cached executables of :func:`fesom_jax.adjoint.chunked_grad` are keyed
+    by that closure and can never silently reuse a program traced WITHOUT the cut. A
+    context manager active only around a primal trace would have that failure mode, and it
+    would also miss custom-derivative rules, which JAX traces lazily (later than the primal).
+
+    A NamedTuple has no constructor hook (and ``_replace`` bypasses constructors), so the
+    set is checked by :meth:`validate`, which ``step`` calls: a plain ``set``/``list``/
+    ``tuple`` is coerced to a ``frozenset`` (hashable), and an unknown name raises
+    ``ValueError``."""
+
     @property
     def active(self) -> bool:
-        return any(self)
+        return any(bool(getattr(self, f)) for f in FREEZE_FLAGS) or bool(self.diag_cuts)
 
     def describe(self) -> str:
-        on = [f.removeprefix("freeze_") for f, v in zip(self._fields, self) if v]
+        on = [f.removeprefix("freeze_") for f in FREEZE_FLAGS if getattr(self, f)]
+        if self.diag_cuts:
+            on.append("cuts=" + ",".join(sorted(self.diag_cuts)))
         return "+".join(on) if on else "none"
+
+    def validate(self) -> "AdjointConfig":
+        """Return this config with ``diag_cuts`` as a ``frozenset`` of known names.
+
+        Raises ``TypeError`` for a bare string or a non-collection (a string would be read
+        as a set of characters) and ``ValueError`` for a name not in :data:`KNOWN_CUTS`.
+        Returns ``self`` unchanged when there is nothing to coerce, so the default config
+        stays the same object."""
+        cuts = self.diag_cuts
+        if isinstance(cuts, (str, bytes)) or not isinstance(cuts, (set, frozenset, list, tuple)):
+            raise TypeError(f"AdjointConfig.diag_cuts must be a set of cut names, got "
+                            f"{type(cuts).__name__} {cuts!r}")
+        names = frozenset(cuts)
+        bad = sorted(repr(n) for n in names if not isinstance(n, str))
+        if bad:
+            raise TypeError(f"AdjointConfig.diag_cuts names must be strings: {', '.join(bad)}")
+        unknown = sorted(names - KNOWN_CUTS.keys())
+        if unknown:
+            raise ValueError(f"unknown AdjointConfig.diag_cuts {unknown}; known cut points: "
+                             f"{sorted(KNOWN_CUTS)}")
+        if type(cuts) is frozenset:
+            return self
+        return self._replace(diag_cuts=names)
+
+    @classmethod
+    def exact(cls) -> "AdjointConfig":
+        """Preset: every term differentiated as written (all flags off, no cuts)."""
+        return cls()
+
+    @classmethod
+    def long_window(cls) -> "AdjointConfig":
+        """Preset: ``freeze_mixing`` + ``freeze_gm_slope``, the combination measured to give a
+        usable 60-day gradient (see the table above and ``examples/06_long_window_adjoint``).
+        It is today's recommendation for windows beyond about a day; the TKE-adjoint work
+        may replace it with a narrower preset."""
+        return cls(freeze_mixing=True, freeze_gm_slope=True)
+
+
+FREEZE_FLAGS: tuple = tuple(f for f in AdjointConfig._fields if f.startswith("freeze_"))
+"""The boolean ``freeze_*`` fields of :class:`AdjointConfig`, in declaration order. Enumerate
+these (not ``AdjointConfig._fields``) when iterating over flags: ``diag_cuts`` is a set."""
+
+KNOWN_CUTS: dict = {
+    "mix.kv_out": "Kv after the mixing closure and its halo exchange, before freeze_mixing "
+                  "and before the GM/Redi K33 augmentation (step.py)",
+    "mix.av_out": "Av after the mixing closure and its halo exchange, before freeze_mixing "
+                  "(step.py)",
+}
+"""Registry of the derivative cut points that :func:`dcut` call sites in the model use,
+``{name: where it sits}``. A new cut point is added here and at its call site together;
+``{"mix.kv_out", "mix.av_out"}`` together equal ``freeze_mixing``."""
+
+
+def dcut(cfg, name: str, x):
+    """Named derivative cut: ``stop_gradient`` on every floating leaf of ``x`` when ``name``
+    is in ``cfg.diag_cuts``, else ``x`` itself.
+
+    The decision is made in Python at trace time, so an inactive cut adds nothing to the
+    traced program. ``cfg`` may be ``None``. ``name`` must be registered in
+    :data:`KNOWN_CUTS` (a misspelled call site would otherwise be a cut that can never
+    fire)."""
+    if name not in KNOWN_CUTS:
+        raise ValueError(f"cut point {name!r} is not registered in adjoint_stab.KNOWN_CUTS")
+    if cfg is None or name not in cfg.diag_cuts:
+        return x
+
+    def one(leaf):
+        dt = getattr(leaf, "dtype", None)
+        if dt is not None and jnp.issubdtype(dt, jnp.floating):
+            return lax.stop_gradient(leaf)
+        return leaf
+    return jax.tree.map(one, x)
+
+
+# ---------------------------------------------------------------------------
+# linearise at another point
+
+def differentiate_at(fn, args, alt):
+    """``fn(*args)`` in the forward, with the derivative of ``fn`` taken at ``alt``.
+
+    The value is exactly ``fn(*args)``. The tangent (and, by transposition, the cotangent)
+    is ``d fn(alt) · d args``: the Jacobian of ``fn`` evaluated at ``alt`` applied to the
+    tangent of ``args``. ``alt`` is a pytree with the same structure, shapes and dtypes as
+    ``args`` and gets no tangent of its own (its derivative is zero). With ``alt`` equal to
+    ``args`` this is plain autodiff.
+
+    Use it to linearise a term about a smoother or reference state (for example the previous
+    step's state, a time mean, or a clipped value) while the forward keeps the model's own
+    value — the backward-only analogue of evaluating a coefficient's derivative elsewhere.
+
+    Built on ``jax.custom_jvp`` (not ``custom_vjp``) so that forward mode keeps working;
+    reverse mode transposes the linear tangent rule. ``fn`` is a static (hashable) callable,
+    ideally a module-level function: every array it depends on must come in through
+    ``args`` — an array captured by a closure is invisible to the rule and would be treated
+    as a constant. The rule evaluates ``fn`` at both ``args`` (value) and ``alt`` (tangent),
+    so a derivative costs one extra primal evaluation."""
+    args, alt = tuple(args), tuple(alt)
+    s_args, s_alt = jax.tree.structure(args), jax.tree.structure(alt)
+    if s_args != s_alt:
+        raise ValueError(f"differentiate_at: alt has structure {s_alt}, args has {s_args}")
+    for a, b in zip(jax.tree.leaves(args), jax.tree.leaves(alt)):
+        if jnp.shape(a) != jnp.shape(b) or jnp.result_type(a) != jnp.result_type(b):
+            raise ValueError(f"differentiate_at: alt leaf {jnp.shape(b)} {jnp.result_type(b)} "
+                             f"does not match args leaf {jnp.shape(a)} {jnp.result_type(a)}")
+    return _differentiate_at(fn, args, alt)
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def _differentiate_at(fn, args, alt):
+    return fn(*args)
+
+
+@_differentiate_at.defjvp
+def _differentiate_at_jvp(fn, primals, tangents):
+    args, alt = primals
+    dargs, _dalt = tangents                  # alt has no tangent of its own
+    y = fn(*args)
+    _, dy = jax.jvp(fn, alt, dargs)
+    return y, dy
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +485,24 @@ def _map_real(fn, tree):
             return leaf
         return fn(leaf)
     return jax.tree.map(one, tree)
+
+
+def field_norms(tree) -> dict:
+    """``{leaf path: Euclidean norm}`` of a cotangent pytree, floating leaves only.
+
+    Paths are :func:`jax.tree_util.keystr` with ``simple=True, separator="."`` (``"T"``,
+    ``"uv"``, ``"tke"`` for a :class:`~fesom_jax.state.State`; ``"a.b"`` for nested dicts).
+    ``float0`` and integer leaves are skipped. The sum of the squares equals
+    ``cotangent_norm(tree)**2`` up to round-off. One device→host transfer for all leaves."""
+    names, vals = [], []
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        dt = getattr(leaf, "dtype", None)
+        if dt is None or dt == jax.dtypes.float0 or not jnp.issubdtype(dt, jnp.floating):
+            continue
+        names.append(jax.tree_util.keystr(path, simple=True, separator="."))
+        vals.append(jnp.sqrt(jnp.sum(jnp.square(leaf))))
+    got = jax.device_get(vals)
+    return {n: float(v) for n, v in zip(names, got)}
 
 
 # ---------------------------------------------------------------------------
@@ -651,3 +811,22 @@ def amplification(trace, steps_per_chunk) -> Amplification:
                    f"the window grows")
     return Amplification(med, mx, sustained, spread, worst, tuple(rates), not why,
                          "; ".join(why))
+
+
+def amplification_by_field(field_trace, steps_per_chunk) -> dict:
+    """Per-field :class:`Amplification` from :attr:`fesom_jax.adjoint.ChunkedGrad.field_trace`.
+
+    ``field_trace`` is a list of ``{field: norm}`` dicts, one per chunk boundary in the order of
+    ``trace`` (seed first). Entries that are ``None`` (boundaries reported by an earlier leg of
+    a resumed sweep) are skipped from the front; the result covers the recorded boundaries.
+    Returns ``{field: amplification(trace_of_that_field, steps_per_chunk)}``. Which field grows
+    fastest in the reverse pass is where a blow-up lives; the total norm alone mixes fields
+    whose magnitudes differ by orders of magnitude."""
+    rows = list(field_trace or [])
+    while rows and rows[0] is None:
+        rows.pop(0)
+    if any(r is None for r in rows):
+        raise ValueError("field_trace has a missing entry after the first recorded boundary")
+    if not rows:
+        return {}
+    return {name: amplification([r[name] for r in rows], steps_per_chunk) for name in rows[0]}

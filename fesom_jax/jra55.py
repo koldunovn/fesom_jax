@@ -308,6 +308,14 @@ class JRA55Reader:
     """Host-numpy JRA55-do reader. Build once per (mesh, year), then call
     :meth:`step` per model date. Output is a :class:`JRAFields` of ``[nod2D]`` numpy
     arrays (convert to ``jnp`` at the device boundary in the step driver)."""
+    # Drift fix 2 (2026-09-18, = fesom2_port_drift@c4881f3): the Fortran's sbc_do
+    # interpolates the forcing to timenew - dt/2 = the MIDDLE of the step (timenew is the
+    # clock after `call clock`, i.e. the step end). The model calendar handed to step() /
+    # bracket_schedule() is the step START (dates_for_steps), so the same instant is
+    # start + dt/2. ``midstep_days`` (= 0.5*dt/86400, set by build_surface_forcing /
+    # build_local_forcing when dt is given) is added to every rdate; 0.0 = the legacy
+    # step-start evaluation (a uniform 15-minute lag of every forcing field at dt=1800).
+    midstep_days: float = 0.0
 
     def __init__(self, mesh, year: int, jra_dir: str | Path | None = None):
         """``jra_dir=None`` ⇒ resolved from ``$FESOM_JRA_DIR``, else the Levante default
@@ -541,7 +549,8 @@ class JRA55Reader:
         time-interpolate, distribute to physics units, rotate the wind. ``day`` is
         1-based day-of-year, ``sec`` is seconds-into-day."""
         cal0 = self.fields[0].calendar
-        rdate = float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
+        rdate = (float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
+                 + float(self.midstep_days))
 
         vals = []
         for f in self.fields:
@@ -595,7 +604,8 @@ class JRA55Reader:
         for i, d in enumerate(dates):
             year, day, sec = d[0], d[1], d[2]
             # the exact step() expression (same op order ⇒ same f64 value)
-            rdates[i] = float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
+            rdates[i] = (float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
+                         + float(self.midstep_days))
 
         coef_a = np.zeros((N_FLD, nb, self.N), dtype=np.float64)
         coef_b = np.zeros((N_FLD, nb, self.N), dtype=np.float64)

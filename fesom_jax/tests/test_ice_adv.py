@@ -34,7 +34,9 @@ def fct():
     from fesom_jax import ice_adv
     from fesom_jax.mesh import load_mesh
     mesh = load_mesh(MESH_DIR)
-    cfg = IceConfig()
+    # The C FCT dumps predate drift fix 3 (2026-09-18: scale_area is the namelist 5.8e9,
+    # not the 2.0e8 module default) — replay the value the dumps were made with.
+    cfg = IceConfig(scale_area=2.0e8)
     with open(FCTD) as f:
         names = f.readline().split("var=")[1].split()[0].split(",")
     d = np.loadtxt(FCTD)
@@ -84,7 +86,9 @@ def test_fct_ad_finite(fct):
     from fesom_jax.ice import IceConfig
     from fesom_jax import ice_adv
     mesh, col, _outs = fct
-    cfg = IceConfig()
+    # The C FCT dumps predate drift fix 3 (2026-09-18: scale_area is the namelist 5.8e9,
+    # not the 2.0e8 module default) — replay the value the dumps were made with.
+    cfg = IceConfig(scale_area=2.0e8)
     a_in = jnp.asarray(col["a_in"]); m_in = jnp.asarray(col["m_in"])
     ms_in = jnp.asarray(col["ms_in"]); u = jnp.asarray(col["u_ice"]); v = jnp.asarray(col["v_ice"])
 

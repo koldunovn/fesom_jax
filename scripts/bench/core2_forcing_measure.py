@@ -38,7 +38,7 @@ mesh = load_mesh("data/mesh_core2")
 part = partit.read_partition(Path(POOL), 4)
 state0 = cold_start_state(mesh, "data/ic_core2", xp=np)
 sst0 = np.asarray(state0.T[:, 0])
-forcing = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=sst0)
+forcing = surface_forcing.build_surface_forcing(mesh, YEAR, dt=cfg.dt, sst_ic=sst0)
 dates = _chunk_dates(YEAR, cfg.dt, 0, NS, cfg.dt_ramp)
 print(f"[meas] nod2D={mesh.nod2D} npes=4 NS={NS}", flush=True)
 

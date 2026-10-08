@@ -73,8 +73,10 @@ def run3():
     for n in range(NSTEPS):
         sf = cf.step_forcing(*dates[n])
         sfx = surface_forcing.compute_surface_fluxes(mesh, st, sf, fs, dt=DT)
+        # The C dumps predate drift fix 1 (2026-09-18: the bulk taps the carried uv, not the
+        # previous step's uvnode) — replay the legacy tap so the gate stays a C comparison.
         st = stepmod.step(st, mesh, op, None, dt=DT, is_first_step=(n == 0),
-                          step_forcing=sf, forcing_static=fs)
+                          step_forcing=sf, forcing_static=fs, bulk_uvnode_lag=True)
         steps.append((sfx, st))
     return dict(mesh=mesh, fs=fs, recs=recs, steps=steps)
 

@@ -31,7 +31,7 @@ import pytest
 
 from fesom_jax import ale, ssh, surface_forcing
 from fesom_jax import step as stepmod
-from fesom_jax.adjoint_stab import AdjointConfig
+from fesom_jax.adjoint_stab import FREEZE_FLAGS, AdjointConfig
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
 from fesom_jax.params import Params
 from fesom_jax.phc_ic import phc_initial_state
@@ -202,7 +202,7 @@ def test_core2_tke_default_is_a_dead_branch(core2_tke):
 
 
 @core2_only
-@pytest.mark.parametrize("flag", AdjointConfig._fields)
+@pytest.mark.parametrize("flag", FREEZE_FLAGS)
 def test_core2_tke_forward_bit_identical(core2_tke, flag):
     """The production configuration's forward must not move under any flag.
 

@@ -1,6 +1,6 @@
-"""``IceConfig.adjoint_mode`` — the three ways the backward pass can treat sea ice.
+"""``IceConfig.adjoint_mode`` — the four ways the backward pass can treat sea ice.
 
-The forward must be bit-for-bit identical in all three, because `stop_gradient` is the
+The forward must be bit-for-bit identical in all four, because `stop_gradient` is the
 identity: whichever mode you pick, the ice trajectory is the validated model and only the
 gradient changes. That property is what makes "rheology" safe to switch on by default, so it
 is tested per mode rather than assumed.
@@ -8,6 +8,15 @@ is tested per mode rather than assumed.
 "frozen" cuts the whole ice update; "rheology" cuts only the momentum solver's subcycles and
 keeps thermodynamics, advection, cut-off and the ocean-to-ice coupling differentiated. Those two
 must differ, and through a full step they do — 1.85% apart.
+
+"prescribed" cuts the ice STATE at the step's entry and exit and nothing else, so it is defined
+by two structural zeros and one structural non-zero, all tested below at the level where they
+are exact: no gradient reaches the entering ice state; none leaves through the updated ice
+state; and the gradient with respect to the atmosphere is kept. The last is the one "frozen"
+loses — its cut is the whole ``IceStepOut``, fluxes included, so under "frozen"
+dJ/d(atmosphere) is identically zero. That was found the expensive way (a 30-day production
+gradient with a forcing sensitivity of exactly 0.0), and it is
+pinned here so it cannot be mistaken for a feature again.
 
 ⚠️ "rheology" vs "exact" is NOT checked through a step, and the file used to try. The only thing
 between those two modes is the momentum solve, whose contribution to a one-step
@@ -52,11 +61,27 @@ pytestmark = pytest.mark.skipif(
     not (MESH_DIR.is_dir() and (IC_DIR / "T_ic.npy").is_file()),
     reason="CORE2 mesh / PHC IC missing (sea ice needs the forced path)")
 
-MODES = ("exact", "rheology", "frozen")
+MODES = ("exact", "rheology", "prescribed", "frozen")
 
 
 @pytest.fixture(scope="module")
-def core2():
+def core2_setup():
+    """The one CORE2 step's ingredients, loaded once for every builder in this module."""
+    mesh = load_mesh(MESH_DIR)
+    _bare = phc_initial_state(mesh, IC_DIR)
+    state = icemod.seed_ice(_bare, mesh, _bare.T[:, 0])
+    assert int(jnp.count_nonzero(state.a_ice)) > 1000, \
+        "seed_ice produced no ice — every gradient in this file would be ice-free"
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+    fs = cf.static
+    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
+    wet0 = jnp.asarray(mesh.node_layer_mask[:, 0])
+    return mesh, state, op, fs, sf0, wet0
+
+
+@pytest.fixture(scope="module")
+def core2(core2_setup):
     """One CORE2 step WITH SEA ICE PRESENT, as a function of a surface-temperature perturbation.
 
     ⚠️ ``seed_ice`` is not optional and ``k_ver`` is not a usable control. Both were wrong here
@@ -77,16 +102,7 @@ def core2():
     XLA rounding, and it flipped between pass and fail with the evaluation point. A surface
     perturbation reaches the ice through ``ocean2ice`` → thermodynamics: seeded, ``frozen`` gives
     +8.80388483606558e−01 against +8.64085668842909e−01 for the other two, a real 1.85%."""
-    mesh = load_mesh(MESH_DIR)
-    _bare = phc_initial_state(mesh, IC_DIR)
-    state = icemod.seed_ice(_bare, mesh, _bare.T[:, 0])
-    assert int(jnp.count_nonzero(state.a_ice)) > 1000, \
-        "seed_ice produced no ice — every gradient in this file would be ice-free"
-    op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
-    fs = cf.static
-    sf0 = cf.step_forcing(*surface_forcing.dates_for_steps(YEAR, DT, 1)[0])
-    wet0 = jnp.asarray(mesh.node_layer_mask[:, 0])
+    mesh, state, op, fs, sf0, wet0 = core2_setup
 
     def make(mode, whichEVP=1):
         cfg = IceConfig(whichEVP=whichEVP, adjoint_mode=mode)
@@ -98,6 +114,45 @@ def core2():
             return jnp.sum(jnp.where(wet0, fin.T[:, 0], 0.0)) / jnp.sum(wet0)
 
         return jax.jit(loss), jax.jit(jax.grad(loss))
+
+    return make, jnp.asarray(0.0, jnp.float64)
+
+
+@pytest.fixture(scope="module")
+def core2_ctl(core2_setup):
+    """The same step as a scalar function of a chosen CONTROL, measured on a chosen OUTPUT.
+
+    ``control``: ``"sst"`` (surface T, as in ``core2``), ``"longwave"`` (this step's downward
+    longwave — the atmosphere), or ``"a_ice"`` (the entering ice concentration, added only where
+    ice exists so the clamp to [0, 1] is not crossed). ``output``: the wet-mean surface T
+    (``"sst"``) or the ice-mean updated concentration (``"a_ice"``). Every combination is a
+    single step, so each gradient here is a one-step statement — enough, because the properties
+    tested are structural zeros and non-zeros, not magnitudes."""
+    mesh, state, op, fs, sf0, wet0 = core2_setup
+    icy = state.a_ice > 0.0
+
+    def make(mode, control, output):
+        cfg = IceConfig(whichEVP=1, adjoint_mode=mode)
+
+        def loss(eps):
+            st, sf = state, sf0
+            if control == "sst":
+                st = dataclasses.replace(st, T=st.T.at[:, 0].add(jnp.where(wet0, eps, 0.0)))
+            elif control == "longwave":
+                sf = sf._replace(longwave=sf.longwave + eps)
+            elif control == "a_ice":
+                st = dataclasses.replace(st, a_ice=st.a_ice + jnp.where(icy, 0.01 * eps, 0.0))
+            else:
+                raise ValueError(control)
+            fin = stepmod.step(st, mesh, op, None, Params.defaults(), dt=DT, is_first_step=True,
+                               step_forcing=sf, forcing_static=fs, ice_cfg=cfg)
+            if output == "sst":
+                return jnp.sum(jnp.where(wet0, fin.T[:, 0], 0.0)) / jnp.sum(wet0)
+            if output == "a_ice":
+                return jnp.sum(jnp.where(icy, fin.a_ice, 0.0)) / jnp.sum(icy)
+            raise ValueError(output)
+
+        return jax.jit(jax.grad(loss))
 
     return make, jnp.asarray(0.0, jnp.float64)
 
@@ -202,6 +257,58 @@ def test_adjoint_subcycles_zero_cuts_the_momentum_gradient(whichEVP):
     assert g_none == 0.0, \
         f"whichEVP={whichEVP}: adjoint_subcycles=0 left a gradient of {g_none!r}; the carry " \
         f"is supposed to be stop_gradient'd entirely, so this must be exactly zero"
+
+
+def test_prescribed_keeps_the_atmosphere_gradient_that_frozen_zeroes(core2_ctl):
+    """The defining non-zero of "prescribed", and the defining defect of "frozen".
+
+    The surface fluxes leave ``ice_surface_step`` inside ``IceStepOut``. "frozen" stop_gradients
+    that whole tuple, so the downward longwave — which reaches the ocean ONLY through those
+    fluxes — has a gradient of exactly 0.0 under it: a structural zero, not a small number.
+    "prescribed" cuts the ice state instead and must keep it; "rheology" keeps it too, and the
+    two differ only by the ice-mediated part (longwave -> ice growth -> under-ice flux), which
+    is real but small. Both are asserted: "prescribed" non-zero, and within 10 % of "rheology"
+    — if it ever matched "frozen" the exit cut would have swallowed a flux."""
+    make, k0 = core2_ctl
+    g_pr = float(make("prescribed", "longwave", "sst")(k0))
+    g_rh = float(make("rheology", "longwave", "sst")(k0))
+    g_fr = float(make("frozen", "longwave", "sst")(k0))
+    assert g_fr == 0.0, \
+        f"frozen kept a longwave gradient of {g_fr!r} — the whole-IceStepOut cut has moved"
+    assert np.isfinite(g_pr) and g_pr != 0.0, \
+        f"prescribed zeroed the longwave gradient ({g_pr!r}): the exit cut swallowed a flux"
+    assert np.isfinite(g_rh) and g_rh != 0.0
+    assert abs(g_pr - g_rh) <= 0.10 * abs(g_rh), \
+        f"prescribed {g_pr:.6e} vs rheology {g_rh:.6e}: the flux path should carry nearly " \
+        f"all of the longwave sensitivity through one step"
+
+
+def test_prescribed_has_no_gradient_through_the_entering_ice_state(core2_ctl):
+    """The entry cut. A perturbation of the ice concentration the step receives changes the
+    surface temperature it produces (through the open-water fraction of every flux), and
+    "rheology" sees that: measured non-zero. "prescribed" must return exactly 0.0, because the
+    nine prognostic ice fields are stop_gradient'd before anything reads them."""
+    make, k0 = core2_ctl
+    g_rh = float(make("rheology", "a_ice", "sst")(k0))
+    g_pr = float(make("prescribed", "a_ice", "sst")(k0))
+    assert np.isfinite(g_rh) and g_rh != 0.0, \
+        f"rheology has no SST sensitivity to the entering a_ice ({g_rh!r}) — is the ice seeded?"
+    assert g_pr == 0.0, \
+        f"prescribed let {g_pr!r} through the entering ice state; the entry cut is incomplete"
+
+
+def test_prescribed_has_no_gradient_into_the_updated_ice_state(core2_ctl):
+    """The exit cut. A surface-temperature perturbation changes the ice the step hands to the
+    next one (thermodynamic growth and melt), and "rheology" sees that: measured non-zero.
+    "prescribed" must return exactly 0.0 on the updated ``a_ice`` — this is the cut that stops
+    the recurrence whose gain at an ice edge is the reason the mode exists."""
+    make, k0 = core2_ctl
+    g_rh = float(make("rheology", "sst", "a_ice")(k0))
+    g_pr = float(make("prescribed", "sst", "a_ice")(k0))
+    assert np.isfinite(g_rh) and g_rh != 0.0, \
+        f"rheology's updated a_ice does not depend on SST ({g_rh!r}) — is the ice seeded?"
+    assert g_pr == 0.0, \
+        f"prescribed let {g_pr!r} into the updated ice state; the exit cut is incomplete"
 
 
 def test_rheology_forward_is_identical_on_standard_evp_too(core2):

@@ -205,7 +205,7 @@ def main():
     mesh = load_mesh(CORE2_MESH)
     state = phc_initial_state(mesh, IC_DIR)
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, YEAR,
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, dt=DT,
                                                sst_ic=np.asarray(state.T[:, 0]))
     fx = dict(mesh=mesh, state=state, op=op, fs=cf.static)
 

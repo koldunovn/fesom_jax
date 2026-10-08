@@ -158,7 +158,7 @@ def main():
         state = phc_state(mesh, args.ic_dir)
         sst0 = np.asarray(state.T[:, 0])
         state = ice.seed_ice(state, mesh, sst0)                        # seed BEFORE partition
-        cf = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0)
+        cf = surface_forcing.build_surface_forcing(mesh, args.year, dt=DT, sst_ic=sst0)
         y, d, s, mo = surface_forcing.dates_for_steps(args.year, DT, 1)[0]
         sf, fs = cf.step_forcing(y, d, s, mo), cf.static               # real JRA, run start date
         bn = np.asarray(ice_evp.boundary_node_mask(mesh))

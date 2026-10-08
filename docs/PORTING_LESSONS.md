@@ -6928,3 +6928,520 @@ every reading that starts from the word "memory" — a bigger `--mem`, a smaller
 hunt — is looking at a number that was never the constraint. Two real bugs were found and fixed on
 the way to this one and neither was the cause; **fixing a real bug is not evidence you fixed THE
 bug**, and both times the group stayed red and the reason was re-diagnosed from scratch.
+
+### 2026-09-27 (adjoint foundation, task 0) — a fresh worktree tests nothing and says it passed
+
+A `git worktree add` checks out neither the gitignored `data/` link nor anything behind it, and
+`fesom_jax/tests/test_core2_step.py:51` turns a missing CORE2 mesh into a module-level `skipif`:
+`pytest -q` in the new tree printed "6 skipped" and exit code 0. Every CORE2 gate run from such a
+tree is green by construction. The link has to be made right after the worktree, and gates are
+run with `-rs` and judged by the skip count as well as the exit code.
+
+The second trap is the import. `fesom_jax` is an editable install that resolves to a different
+checkout; `python -m pytest` from the tree's root is safe only because pytest prepends the
+rootdir, and `python scripts/...` silently runs the other checkout's library. From
+`scripts/` with PYTHONPATH unset the import guard in `scripts/adjoint/job_cpu.sbatch` resolved
+`fesom_jax` to the other checkout and failed, which is the failure it exists to catch; the job
+scripts therefore export `PYTHONPATH=$WT` and assert `fesom_jax.__file__` lies inside `$WT`
+before running anything.
+
+### 2026-09-27 (adjoint foundation, task 1) — `custom_linear_solve` differentiates forward mode with the FORWARD solve
+
+`lax.custom_linear_solve(matvec, b, solve, transpose_solve)` looks like a complete derivative
+specification, and for reverse mode it is: the cotangent goes through `transpose_solve`. But
+its JVP rule computes the tangent `A⁻¹(ḃ − Ȧx)` with **`solve` itself, closed-over constants
+included**. The SSH forward solve stops at an ABSOLUTE residual `soltol·‖ssh_rhs‖` computed
+from the primal right-hand side, so a tangent whose right-hand side is small next to the
+primal stops after zero iterations and comes out as 0. The adjoint was correct all along;
+the tangent-linear model was not, and nothing that only uses `jax.grad` could see it.
+
+Measured with a one-step dot test on pi (linfs, non-rest state after two steps,
+`fesom_jax/tests/test_ssh_implicit.py`): relative mismatch 2.3e-6 at tangent amplitude 1,
+7.6e-4 at 1e-4, 7.6e-3 at 1e-8 — a dot test at amplitude 1 alone would have looked like
+round-off plus a slightly loose solver. After replacing the wrapper by a `jax.custom_jvp`
+whose primal is the unchanged early-stopped PCG and whose tangent is a TIGHT solve (relative
+tolerance, from zero; `fesom_jax/ssh.py:680-715`): 1.3e-14 / 6.6e-14 / 4.3e-14. The forward
+is bit-identical and the adjoint cotangent is unchanged (the transpose of the new tangent
+runs the same tight transpose solve the old path ran).
+
+Three details that matter. (1) A dot test must be run at several amplitudes and from a
+non-rest state: from rest `ssh_rhs = 0` makes the threshold 0, the old tangent solve runs to
+convergence and the defect disappears. (2) The rule gets every differentiated value as an
+explicit argument (`b_eff`, `hbar`, the stop threshold) and the operator, mesh and halo as
+`nondiff_argnums`: a rule runs under the caller's trace, so a differentiated value it closed
+over would escape it. (3) The zstar increment `ΔA(hbar)·x` is bilinear, so `dA·δ` is the
+increment evaluated at the tangent `dhbar` (checked against `jax.jvp` to 1e-14), no nested
+JVP needed. The pre-change solve is kept in `fesom_jax/tests/_ssh_implicit_common.py` as the
+oracle and as the dot test's permanent negative control.
+
+On CORE2 (zstar + TKE + GM + mEVP with the prescribed-ice adjoint, JRA55-do, third step;
+`fesom_jax/tests/test_ssh_implicit_core2.py`) the same dot test gives 3.2e-12 / 3.0e-12 /
+3.1e-12 after the change and 8.0e-8 / 3.0e-2 / 3.4e-2 before it. The forward CG takes 131
+iterations, the tight tangent solve 345 and the tight transpose 351 — the price of an exact
+tangent is about 2.6 forward solves per tangent solve, and it applies only in derivative
+programs.
+
+A fourth detail, found only in the sharded work: the first version passed
+the operator, mesh and halo through `nondiff_argnums`. Everything passed as long as `jax.jvp`
+was called INSIDE the jit. Called outside an already-jitted function (`jax.jvp(jit(f))`, or any
+shard_map program), the rule is traced lazily after the jit trace has finished, the
+nondiff arrays are stale tracers of that finished trace, and lowering fails with "No constant
+handler for type: DynamicJaxprTracer". Only static Python values may be nondiff; every array
+is an explicit argument whose tangent the rule ignores (`symbolic_zeros=True` keeps those
+tangents free). `test_differentiate_an_already_jitted_solve` is the regression test.
+
+### 2026-09-27 (adjoint foundation, task 2) — a symmetric solve is not symmetric in lane space
+
+The sharded SSH solve runs between two node halo exchanges (`fesom_jax/step.py`: `ssh_rhs =
+_exch(ssh_rhs)`, solve, `d_eta = _exch(d_eta)`). Its PCG returns exact values on owned lanes
+and incomplete partial sums on halo lanes, because the local operator keeps the halo rows it
+can only partly assemble (`partition_ssh_operator`). In the forward that is harmless — the
+next exchange overwrites the halo lanes. `custom_linear_solve(..., symmetric=True)` then
+declares the derivative solve its own transpose, which is true of `S⁻¹` on the global mesh
+but not of the lane-space map "exact on owned lanes, partial sums on halo lanes". In reverse
+mode the INPUT exchange transposes to a scatter-add of every halo-lane cotangent onto its
+owner, so each owner next to a partition boundary received its correct cotangent plus
+the partial sums from its halo copies.
+
+Measured on the CORE2 warm-started step-2 solve on 4 CPU devices (solve-level, between the two
+exchanges, cotangent of an owned-lane functional): the pre-existing derivative gave owned
+cotangents off by 48 % (max-norm, relative to the dense cotangent) and a lane-space dot-test
+mismatch of 3.7e-3; the halo lanes of the transpose solve carried values up to half the
+largest dense cotangent. Returning zero off the owned lanes from the derivative solve
+(`fesom_jax/ssh.py`, `tight` in `_ssh_implicit_jvp`) makes it `E·S⁻¹·Eᵀ` (E the owned-lane
+embedding), which IS symmetric: dot test 1.4e-14, owned cotangent equal to dense to 1.1e-15,
+tangent equal to dense to 1.5e-15, forward untouched. The existing sharded gradient gate
+could not see this: its parameter gradients reach the SSH solve through one step of a
+mean-SST loss, with a 5e-3 tolerance on `a_ver`.
+
+The general rule: a derivative rule that asserts a symmetry must hold it on the arrays JAX
+actually transposes — lanes, padding and halos included — not on the mathematical operator.
+Test it with a dot test in lane space, with every lane of both vectors non-zero.
+
+### 2026-09-27 (adjoint foundation, task 3) — a checkpoint name on a custom_jvp output names the wrong copy
+
+`save_names=("ssh_delta",)` on `scan_steps` / `integrate` gives the per-step `jax.checkpoint`
+the policy `save_only_these_names` (`fesom_jax/integrate.py:88`), so the reverse sweep can keep
+the SSH solution instead of re-running the early-stopped forward CG. With the name on the
+caller's copy of the solve output (`checkpoint_name(_ssh_implicit(...))` in `solve_ssh`, as
+Task 1 left it), the policy removed the CG under linfs but NOT under zstar: counted in the
+jaxpr of the vjp function (pi, 8 steps through `scan_steps`), CG `while` loops were 9 without a
+policy and 7 with it under linfs, 9 and 9 under zstar.
+
+The reason is where a custom_jvp's primal comes from under differentiation. JAX does not run
+the primal function there; it runs the rule, and the rule computes its own δ
+(`fesom_jax/ssh.py:705`). Under zstar the tangent needs that δ again (`dA·δ` =
+`stiff_increment_matvec(mesh, dhbar, δ)`), so the residual the reverse pass depends on is the
+rule's internal δ, an unnamed `while` output, and the policy recomputes it with the whole CG.
+The caller's named copy was saved too, uselessly. Naming it in both places fixed the count but
+stored the same `[nod2D]` vector twice per step (two residuals in `saved_residuals`). The name
+now sits inside the custom_jvp, in the primal function (`ssh.py:702`) and in the rule
+(`ssh.py:715`), and nowhere else: one residual per step, 7 loops in both modes, gradients
+bitwise equal. `saved_residuals` labels the saved value "output of reduce_precision" (JAX
+inserts one after every remat residual, `jax/_src/ad_checkpoint.py:_insert_reduce_precision`),
+not with the name, so a test must identify it by shape and source line, not by label.
+
+Second finding: the gradient is NOT bitwise equal with and without the policy, although both
+are deterministic on CPU (a repeat of either is bitwise). They are different compiled programs;
+without the policy the reverse program recomputes the early-stopped CG in its own fusion, and
+the absolute early-stop threshold turns a round-off difference into an iterate difference of up
+to the solver tolerance. The same mechanism already separates remat from no-remat gradients.
+Measured on pi, 8 steps, relative norm over all state + params cotangents (job 27735534):
+policy vs none 1.4e-15 (linfs) / 3.6e-8 (zstar) through `scan_steps`, 1.3e-10 / 4.7e-7
+through `integrate`'s per-step path; remat vs no remat 6.2e-10 / 2.1e-6. So the gate
+(`fesom_jax/tests/test_adjoint_save_names.py`) is "the policy moves the gradient by less than
+remat on/off does", not equality. A test that compares gradients of two different programs of
+this model at 1e-12 is testing the early stop, not the change.
+
+The general rule: to make a remat policy keep a value produced by a custom derivative, name it
+where the RULE produces it, and check the count of the expensive primitive in the reverse
+program rather than trusting the name.
+
+### 2026-09-27 (adjoint foundation, task 4) — a linearity test between two GPU calls is not a linearity test
+
+`chunked_grad(check_linear=...)` (`fesom_jax/adjoint.py`, `_check_linear`) checks, on the
+first reverse chunk of every call (so once per leg of a resumed sweep), that the chunk VJP is a
+linear map of its cotangent. `"zero"` (the default, `True`) is one extra chunk VJP with a zero
+cotangent whose state and params outputs must be exactly 0: exact on every platform, because a
+linear map sends 0 to 0 whatever the rounding, and it catches a derivative rule that adds a
+constant. It does not catch a rule that squares its cotangent (0² = 0), so `"full"` also runs
+the VJP of the same cotangent again and of twice it, and requires `‖vjp(2c) − 2·vjp(c)‖ ≤
+max(1e-9, 10·s)·‖2·vjp(c)‖` per part, with `s` the measured repeat spread. The spread must be
+measured: each call re-runs the rematerialised chunk forward, which on a GPU is not
+deterministic, so two calls differ even for a perfectly linear VJP; on CPU `s = 0` and scaling
+by 2 is exact, so the error is exactly 0 on the pi chunk. Both planted defects are caught by
+the mode meant for them (custom_vjp adding 1 → "zero"; squaring → only "full").
+
+The guard runs AFTER the chunk's own VJP, reusing its inputs before they are freed, so "zero"
+costs one chunk VJP and "full" three. Found on the way: `chunked_grad` crashed on any params
+pytree with an integer leaf once the window had two chunks — `jax.tree.map(jnp.add, ...)` over
+the accumulated gradient hits the leaf's `float0` cotangent, which supports no arithmetic
+(`TypeError: Called add with a float0 array`). The accumulation now passes `float0` leaves
+through (`_add_grads`).
+
+### 2026-09-27 (adjoint foundation, task 5) — the chunk length is part of the program
+
+`ChunkedGrad` now carries `field_trace` (per boundary, `{state leaf: norm}`, from
+`adjoint_stab.field_norms`, aligned with `trace`), `state_cot` (d loss / d init_state, on the
+host) and `chunked_grad` takes `on_cot(c, cot_state)` (seed at `c = n_chunks` first, then the
+boundary after each reverse chunk, down to `c = 0`); `adjoint_stab.amplification_by_field`
+turns the field trace into per-field `Amplification`s. A resumed leg does not repeat the
+boundaries an earlier leg reported, so its `field_trace` starts with `None` placeholders to stay
+aligned with the restored `trace`.
+
+The non-obvious part was the reference for `state_cot`. Against `jax.grad` of the monolithic
+24-step pi window (the same √N `scan_steps`), the ONE-chunk sweep agrees to 1.3e-15, but the
+four-chunk sweep differs by 8.4e-9 relative, all of it in the `T` cotangent (job 27735668).
+That is not a plumbing error: splitting the window changes the compiled programs (each chunk
+has its own segmentation), their round-off differs, and the early-stopped SSH solve turns that
+into a small difference in the linearisation point. The monolithic gradient itself moves by
+8.7e-9 between remat on and off. The existing `k_ver` checks at 1e-12 pass because that
+scalar sums many contributions; a full state cotangent does not hide it. So the test demands
+1e-12 for one chunk and "within 10× the remat on/off spread" for four.
+
+### 2026-09-27 (adjoint foundation, task 6) — several costs, one forward, parked cotangents
+
+`chunked_grad_multi` (`fesom_jax/adjoint.py`) runs one forward to the host boundaries, seeds K
+costs from the same final state, and in the reverse walk puts each chunk's state and inputs on
+the device once and applies the cached chunk VJP K times. Between applications the inactive
+cotangents and params gradients are parked on the host (`device_get`, `device_put` before use),
+so the device holds one cost's working set plus one State. The result equals K separate
+`chunked_grad` runs bit for bit on CPU (losses, grads, traces, field traces, state cotangents),
+because the arithmetic is the same and a host round trip preserves every bit; strides 1 and 2
+agree to 1e-12. Hook contract for callers that walk the cotangents (a burst search):
+`on_cot(k, c, cot_state)` once per cost per boundary, boundaries from `c = n_chunks` (the seed)
+down to 0, costs ascending within a boundary; the single-cost `chunked_grad` keeps
+`on_cot(c, cot_state)`. The linearity guard runs once (first chunk, cost 0).
+
+Two small points. `jax.device_put` of a pytree with `float0` leaves (the cotangent of an integer
+state or params leaf) works and returns them unchanged, so the parking needs no special case.
+A `ReverseCheckpoint` is refused rather than half-supported: resuming would have to park K
+cotangents and K partial gradients per leg, and no caller needs it yet.
+
+### 2026-09-27 (adjoint foundation, task 7) — a set-valued field in a tuple of flags
+
+`AdjointConfig` gained `diag_cuts`, a set of named derivative cut points (`mix.kv_out`,
+`mix.av_out` in `fesom_jax/step.py`, right after the Kv/Av halo exchanges and before
+`freeze_mixing`). Three things were not obvious.
+
+First, every registry that enumerated `AdjointConfig._fields` assumed each field is a boolean
+flag: `AdjointConfig(**{flag: True})` over all fields would have built `diag_cuts=True`. The
+registries (`test_adjoint_config.py`, `_tke.py`, `_prod.py`, `examples/04`) now enumerate
+`adjoint_stab.FREEZE_FLAGS`, and `test_every_flag_is_covered` also classifies the non-flag
+fields explicitly, so a future non-flag field fails loudly instead of being passed `True`.
+
+Second, a NamedTuple has no constructor hook, and `_replace` bypasses constructors anyway, so
+validation is a method: `AdjointConfig.validate()` coerces a set/list/tuple to a `frozenset`
+(hashable, so the config can be a static argument or a cache key) and rejects unknown names.
+`step()` calls it next to `ale_cfg.validate()`; for the default config it returns the same
+object, and the empty-set program is jaxpr-identical to `adjoint_cfg=None`. A bare string is
+refused (it would otherwise become a set of characters).
+
+Third, a static field was chosen over a trace-time context on purpose: each cut set becomes part
+of the caller's `chunk_fn` closure, so `chunked_grad`'s lru-cached executables (keyed by the
+closure) cannot reuse a program traced without the cut, and custom-derivative rules that JAX
+traces lazily see the same configuration as the primal. `dcut()` also refuses a call-site name
+that is not in `KNOWN_CUTS`, even when the cut is off: a misspelled cut point would otherwise
+be a cut that can never fire. The pair `{mix.kv_out, mix.av_out}` gives the one-step VJP of
+`freeze_mixing` bit for bit (state and params), and the traced program with one cut has exactly
+one more `stop_gradient` than the default.
+
+### 2026-09-27 (adjoint foundation, task 8) — linearise somewhere else with a custom_jvp
+
+`adjoint_stab.differentiate_at(fn, args, alt)` returns `fn(*args)` and takes the derivative of
+`fn` at `alt`. It is a `jax.custom_jvp`, not a `custom_vjp`, so forward mode keeps working (the
+tangent-linear window maps need it); reverse mode is JAX transposing the rule's tangent
+`jax.jvp(fn, alt, dargs)`, which is linear in `dargs`, so the JVP and the VJP are exact
+transposes of each other by construction (dot test 1e-14 in the tests, and a VJP taken at
+`args` instead fails the same test). `fn` is the only `nondiff_argnums` entry and must be a
+static callable; every array goes through `args` — the Task 1 lesson (arrays held in
+`nondiff_argnums` or in a closure escape their trace under `jit`/`shard_map`) applies here too.
+`alt` is a primal argument whose tangent is ignored, so its gradient is exactly zero. Structure,
+shape and dtype of `alt` are checked against `args` before the call: a mismatch would otherwise
+surface only inside the rule, at differentiation time. With `alt = args` the VJP is bitwise the
+plain autodiff one on CPU (the rule's `jvp` at the same point is the same arithmetic). Inside a
+`jax.checkpoint`-ed `lax.scan` body the gradient equals the product of Jacobians at the `alt`
+points to 1e-14, forward and reverse.
+
+### 2026-09-27 (adjoint foundation, task 9) — adding 0.0 is exact, the program around it is not
+
+`Params.surface_adj` is an optional dict leaf (`heat` W/m² positive INTO the ocean,
+`stress_x`/`stress_y` N/m² model frame) applied at one seam in `fesom_jax/step.py`
+(`_apply_surface_adj`, called after the ice / no-ice surface branches join, before EOS and the
+mixing closures). The model's `heat_flux` is positive for ocean heat LOSS and T is forced only
+through `bc_T = -dt·heat_flux/VCPW`, so the seam does `bc_T += dt·heat/VCPW` and
+`heat_flux -= heat` (KPP reads the latter); stress goes to `stress_node_surf` (TKE, KPP) and,
+averaged over each element's three nodes, to the element stress. `None` traces nothing: the
+jaxpr text and the one-step State of both branches have the same sha256 as the parent commit.
+
+The plan asked for "zeros ⇒ values equal (np.array_equal)". That does not hold on CPU, and not
+because of the seam: with all-zero adjustments T differs from the `None` run at ~500-650 nodes by
+at most 3.6e-15 K (one ulp at 30 °C) and tke at ~9500 values by at most 1.7e-18; every other
+field is bitwise. Three algebraically different seam forms (plain add; recomputing `bc_T` from the
+adjusted heat flux with the model's own expression; an `optimization_barrier` before the add) give
+identical differences, while two equivalent programs WITHOUT a seam (params passed vs closed over)
+are bitwise. So the unchanged producers of `bc_T` and of the nodal stress are rounded differently
+once their consumer changes: XLA:CPU fuses them into different kernels and LLVM contracts
+multiply-adds into FMAs per kernel (there is no XLA:CPU flag to turn contraction off; only
+fast-math flags exist). The test therefore bounds the zero-adjustment difference by 16 ulp of
+each field's maximum and prints the counts, and the None-path bitwise identity is checked
+against the parent commit instead. A positive 200 W/m² box warms the box SST by 0.81 ×
+`dt·Q/(VCPW·h₁)` in one step (the rest mixes down), and the gradient of the box-mean SST w.r.t.
+`heat` is exactly zero outside the box after one step.
+
+### 2026-09-27 (adjoint foundation, task 10) — the tangent sweep's primal is not the forward's
+
+`fesom_jax/adjoint_check.py` adds the checks a derivative study needs: `dot_test` (several
+amplitudes, plain and normalised mismatch), `fd_sweep` + `plateau`, `forward_states` /
+`window_jvp` / `window_vjp` (chunked window maps on pinned chunk-entry states),
+`power_iteration` in weighted norms (`volume_weights`), and `fdlin`.
+
+Pinning is not a GPU-only concern. On pi (8 steps, 2 chunks of 4, CPU) the primal that the
+jitted JVP program computes for chunk 0 differs from the jitted forward program's output by
+8.6e-17 relative: `jax.jvp` of a chunk is a different compiled program, and its primal half is
+not bit-identical to `jax.jit(chunk_fn)`. A tangent sweep pinned on `forward_states` therefore
+differs from the unpinned sweep by 3e-17 (state tangent) and 2e-16 (params tangent), while one
+pinned on the sweep's OWN chunk-0 primal is bitwise equal to it
+(`fesom_jax/tests/test_adjoint_check.py`, `test_window_jvp_pinned_and_unpinned`). The adjoint
+side is exact: `window_vjp` on pinned states is bitwise equal to `chunked_grad`'s own forward,
+because both use the same cached `jit(chunk_fn)`. So M and Mᵀ share a trajectory only when the
+tangent sweep is told which one; on a GPU the unpinned difference grows with the window.
+
+Three points that were not obvious. (1) `window_vjp` needed no change to `adjoint.py`: a
+`ReverseCheckpoint` whose `have_boundaries` is true and whose `load_boundaries` returns the
+stored states makes `chunked_grad` skip its forward and walk back over exactly those states
+(`_Pinned` in `adjoint_check.py`); the seed of the linear loss `<w, s_end>` is `w` itself. (2) A
+`None` tangent and an explicit zero tangent trace different programs; the tests pass explicit
+zeros so the state-tangent and params-tangent sweeps share one compiled JVP. (3) The VJP is the
+Euclidean transpose; in a weighted norm the adjoint is `W_in⁺ Mᵀ W_out`, and a leaf with no
+weight (e.g. everything but `tke` in a TKE-only norm) is outside the input space, so the seed
+and every iterate are projected onto it. Measured against the monolithic maps: the 2-chunk
+tangent equals `jax.jvp` of the 8-step window bit for bit (no remat on either side); the
+2-chunk adjoint differs from the monolithic `jax.vjp` by 4.9e-16 (state) and 1.4e-16 (k_ver),
+inside the monolithic remat on/off spread (5.7e-16 / 2.8e-16); the pinned window dot test
+(state + params tangent) gives 7e-15..4e-14 at amplitudes 1, 1e-4, 1e-8.
+
+### 2026-09-27 (adjoint foundation, task 11) — a running cost is a carry, and its reference must be the same program
+
+`fesom_jax/adjoint_costs.py` adds volume-weighted box means with the LIVE zstar thickness
+(`hnode·areasvol` on wet layers), area-weighted SST/SSH means, the density-threshold MLD on the
+live geometry (`mld_field`), and running accumulators: `with_running_costs(step_fn, accs)`
+turns `step(state, x)` into a step on `(state, acc)` that adds every accumulator's value
+(scalar or `[nod2D]` field) on the post-step state, so `scan_steps` inside a chunk function
+sees every step; `init_accumulators`, `terminal(cost)` (a loss on the carry that ignores the
+sums) and `running_mean(name, n)` complete it.
+
+The MLD routine returns 0 with `valid=False` where the density threshold is never crossed,
+i.e. where the column is mixed to the BOTTOM — the deepest mixing possible is scored as the
+shallowest. `mld_field(invalid="column")` (default) puts the column's bottom depth there
+(`column_bottom_depth`: the bottom interface of `ale.live_geometry`, in the same z = 0 datum
+as the valid values; below the deepest wet mid-layer, where the deepest valid crossing can
+lie), `invalid="zero"` is bit-identical to the routine for comparisons with earlier MLD
+calibrations.
+
+The test that needed care was "the accumulator equals the manual sum, bitwise"
+(`fesom_jax/tests/test_adjoint_costs.py`, CORE2 2013-01-01 restart, two production-physics
+steps). Against the manual sum over two SEPARATELY jitted steps it failed: after two steps
+the states of the two programs differ by 4e-7 °C in T, and a scan of the same two steps
+differs from the unrolled program by 3.1e-6 °C in T, 1.9e-13 relative in the box mean and
+1.0e-2 m in the worst MLD node (a crossing moving between levels). A different compiled
+program of this model is a different trajectory at round-off level, amplified by the
+early-stopped SSH solve. So the bitwise claim is tested inside ONE program (the wrapped step
+applied twice next to the manual sum of the same post-step states: equal to the bit), the
+scan path against the unrolled one within 10× the spread of an equivalent pair (a scan of the
+plain step vs the unrolled program: the scan sums are at 9.6e-14 box / 1.0e-2 m MLD, the
+spread 1.9e-13 / 1.0e-2 m), and the wrapped scan's trajectory is bitwise the plain scan's —
+the sums ride along without touching the model.
+
+Registering the core2 test file tripped `test_the_cost_split_is_still_worth_having`
+(`fesom_jax/tests/test_suite_groups.py`: the cheap `ci` group must hold more files than
+`core2`; it was 35 against 35). The model-free half of the Task 10 tests (dot test, FD sweep,
+power iteration, fdlin: 5 s on a login node) moved to `test_adjoint_check_unit.py` in `ci`,
+where it belongs by cost; the pi window maps stay in `unit`.
+
+### 2026-09-27 (adjoint foundation, task 12) — one chunk program per process, and a tangent program that spent 13 minutes folding constants
+
+`scripts/adjoint/core2_adj.py` is the shared CORE2 adjoint driver (importable + CLI): the
+reference model from `configs/core2_full.yaml` of its OWN checkout (resolved from `__file__`;
+an import guard refuses any other `fesom_jax`, found with `importlib.util.find_spec` so the
+wrong tree's code is never executed), dense on one device, from a hindcast restart or a State
+the `states` action saved; costs on named boxes, named tangent directions, and the actions
+`fwd grad screen fd tl dot states restartcheck`, each appending JSONL rows with provenance
+(git HEAD, job, device, XLA flags, adjoint mode + sorted cuts, ice mode, window, chunk,
+stride, direction, h, compile seconds from JAX's own `backend_compile_duration` events, run
+seconds). Tests: `scripts/tests/test_core2_adj.py` (two production steps, 1-step chunks).
+
+What had to be designed rather than written:
+
+- ONE `chunk_fn` per model (`_make_chunk_fn`, core2_adj.py): everything that changes between
+  windows — the start state, the dates and their forcing, the cost — enters through
+  `init_state`, `xs_fn` and `loss_fn`, and the controls are strong float64 host arrays. A second
+  window in the same process (new start date, new start state, two costs instead of one)
+  compiled nothing: 0 backend compiles, the chunk programs' jit caches still at one entry.
+- The carry `(State, acc)` of the running accumulators renames every traced leaf: field traces
+  read `0.T`, `1.mld`, not `T` (the first run of the screen test looked up `T`).
+- `xs_fn` rolls the JRA reader across a year boundary per DATE (`reopen_year`), so windows may
+  start anywhere; the chunk count must divide the window (a shorter last chunk would be a
+  second compiled program), which `build_model` enforces.
+- A resumable sweep (`DiskCheckpoint`, a `ReverseCheckpoint` on disk; files written to a
+  temporary name and renamed, nothing overwritten): with a zero budget a 2-chunk window takes 5
+  legs (forward@0, @1, @2, reverse@0, done) and ends bit-identical to the uninterrupted sweep.
+
+The tangent program of one CORE2 step took **761 s to compile** on a CPU node (forward 63 s,
+its VJP 118 s), all of it in XLA's constant-folding pass: `slow_operation_alarm` reported
+`scatter-add f64[126858,48]` of broadcast operands with the mesh's constant index arrays
+(`jit(tl)/jvp()/while/body/closed_call`) at > 32 s each — zero tangents of mesh-only terms,
+instantiated inside the loop, and the mesh closed over as constants. The pass is only an
+optimisation here: with `compiler_options={"xla_disable_hlo_passes": "constant_folding"}` the
+same program compiles in **27 s** and runs one step in 17.9 s against 17.1-19.2 s (probe jobs
+27737173, 27737293). `adjoint_check.window_jvp` takes that as an optional `compiler_options`
+(`NO_CONSTANT_FOLDING`; default None = the unchanged program, its own jit-cache entry); the
+driver uses it for `tl`/`dot` (`--tl-constant-folding` restores the old compile).
+
+Different compiled programs of the all-on model are not "round-off apart" after even one step.
+The tangent program's primal against the forward chunk program, one step from 2013-01-01: ice
+skin temperature 1.06 K apart at one node, S 1.6e-3 psu and a_ice 1.6e-4 at the same node, and
+then the SSH solve spreads it everywhere (d_eta 6e-6 m at all nodes, `ssh_rhs` 7.5e-4 relative)
+— a switch in the ice thermodynamics flipped by round-off. Pinning fixes the chunk ENTRY
+states, not the trajectory inside a chunk, where each program linearises about its own. The
+2-step dot test therefore holds `rel_norm` (divided by `‖Mx‖·‖y‖`) at 1e-19..5e-19, but the
+plain relative mismatch along `ln_tke_c_k` is 1.3e-8 with the no-folding tangent program
+(the TL-vs-adjoint `dJ` along a T point inside the box agrees to < 1e-9; FD along it agrees
+with the adjoint to 2.1e-8 at h = 0.1 K). The test bounds `rel_norm` ≤ 1e-9 and the plain
+mismatch only ≤ 1e-6: a wrong transpose is O(1).
+
+### 2026-09-27 (adjoint foundation, task 13) — on the GPU the all-on model is not one trajectory, so the chunk length is part of every dot test
+
+Task 13 measured the Phase-0 toolkit on an A100 (`scripts/adjoint/p0_acceptance.py`: `dot`,
+`guard`, `timing`, `vjprep`; numbers and job ids in `docs/ADJOINT_API.md`, "Measured on the
+A100") and wrote the shared 2013 States (`core2_adj.py states`, 16 GB,
+`/work/ab0995/a270088/fesom_jax_dev/states_2013/`).
+
+What was not obvious:
+
+- **Round-off flips switches within a step or two, in one and the same program.** A forward
+  chunk program run twice over one day from the same State differs by Kv/Av = 0.1 m²/s (the
+  convective value) at ~7600 points, by 3.9 K in the ice skin temperature (the warm start of the
+  ice surface-temperature solve, at nodes of almost closed ice) and by 1e4 in the EVP stresses.
+  The tangent program's primal is no further from the forward than that. "Different compiled
+  programs differ by round-off" is false for this model on a GPU after one step.
+- **So the dot test has to be read against the chunk length.** With every step pinned (1-step
+  chunks) the tangent and adjoint agree to ≤ 5.8e-9 (plain relative, every direction and
+  preset), which rules out a transposition error. With 48-step chunks along `ln_tke_c_k` under
+  `exact()` they disagree at O(1) — and so does the tangent program with ITSELF on the same pins
+  (0.95-50 of its norm). The measured spread of each side, not a fixed tolerance, is the scale.
+- **`rel_norm` hides everything on a CORE2 State.** `‖Mx‖` is dominated by `ssh_rhs` and the EVP
+  stresses (units, not physics), so `|lhs − rhs|/(‖Mx‖·‖y‖)` was ≤ 3.3e-10 even where the plain
+  mismatch was 1.07. The acceptance script also reports `rel_abs = |lhs − rhs| / Σ|y_i (Mx)_i|`.
+- **A "full" linearity guard needs a stable spread, and the GPU does not give one.** The same
+  48-step chunk VJP repeated to 1.8e-7 in one pair of calls and 4.5e-6 in another; one 1-day
+  `long_window()` sweep raised a false alarm (scaling error 4.5e-6 > 10 × 1.8e-7). Under
+  `exact()` the repeat spread is O(1) and the check is void. With 1-step chunks the spread is
+  ~3e-12 and the check means something. `"zero"` stayed exact everywhere.
+- **The exact 1-day TKE gradient is not reproducible on the GPU**: `dJ/d ln_tke_c_k` from five
+  sweeps +4.4e-4, −7.1e-5, −6.9e-5, +1.0e-4, −6.5e-5. `long_window()` repeats to 2e-10.
+- **The remat policy does not pay on the A100**: `save_names=("ssh_delta",)` saves 1.3-2.0 % of
+  the reverse time (timing noise ~1 %), no memory cost; below the 5 % bar, default stays off.
+- **Measurement cost**: the 1-step-chunk dot test of one day costs ~30 min per (direction,
+  repeat) on the A100, mostly host work (a 1.93 GB State `device_put`/`device_get` per step and
+  the per-field comparison); the 48-step one ~5 min. The tangent chunk program compiles in ~30 s
+  on the A100 with `NO_CONSTANT_FOLDING`, the chunk VJP in ~100-180 s.
+- The restart check on a GPU compares a restarted day with the continuous run against the spread
+  of repeated restarted days. With 3 repeats the surface speed of the restarted day exceeded that
+  spread by 1.4e-5 relative (a tie at one node) and the strict `<=` reported a failure:
+  with 5 repeats the surface speed was well inside but the column-minimum N² exceeded its spread
+  by 3 %. The one-day spread of a restarted day is itself a random sample of switch flips, so the
+  verdict is "differences of the size of the repeat spread" (they are, for every field, within a
+  factor 1.03), and the restart path is bitwise on a CPU.
+
+### 2026-09-27 (adjoint foundation, summary) — Phase 0 before and after
+
+Phase 0 (branch `adjoint-foundation`, tasks 0-14) made the tangent-linear model exact and added
+the tools to check a derivative before trusting it; `docs/ADJOINT_API.md` ("Additions of
+2026-09") is the reference. Before and after:
+
+| quantity | before | after |
+|---|---|---|
+| one-step dot test, amplitude 1e-8, pi (linfs) | 7.6e-3 | 4.3e-14 |
+| one-step dot test, amplitude 1e-8, CORE2 all-on (zstar, 3rd step) | 3.4e-2 | 3.1e-12 |
+| sharded SSH solve, lane dot test (2/4 devices) | 3.7e-3 | 4e-14 |
+| sharded owner cotangents next to partition boundaries (one solve) | 48-63 % wrong | exact to 1e-15 |
+| 1-day window dot test on the A100, every step pinned, worst over presets/directions | — | 5.8e-9 |
+| reverse s/step on the A100, CORE2, 48-step chunks (1 day / 10 days) | 1.209 / 1.209 (no policy) | 1.193 / 1.185 (`save_names=("ssh_delta",)`) |
+| device peak, same runs | 49.68 GB | 49.63 GB |
+| forward s/step on the A100 (same runs) | 0.292 / 0.271 | 0.284 / 0.270 |
+| CORE2 tangent-chunk compile (CPU, one step) | 761 s | 27 s (`NO_CONSTANT_FOLDING`) |
+
+The policy row is not a recommendation (below the 5 % bar; the default stays off). The
+forward of every default program is bit-for-bit the old one; the SSH tangent is the only
+intended change of a default program.
+
+What carries over to the tracks that build on it: pin the chunk entries AND keep chunks short
+when a dot test must isolate the transpose on a GPU; read the plain relative mismatch next to
+`rel_norm`; use `check_linear="zero"` on the GPU and `"full"` only with 1-step chunks or on a
+CPU; expect the `exact()` adjoint of the all-on model to differ between identical GPU runs
+already over one day, and repeat any number that matters.
+
+### 2026-09-27 (adjoint foundation, follow-up) — the fill value of an invalid MLD is part of the cost's smoothness
+
+Task 11 filled columns mixed to the bottom (`valid=False`) with the depth of the column's bottom
+INTERFACE. The threshold routine can never return that depth: `obs_compare.
+mld_density_threshold` (`fesom_jax/obs_compare.py:249-265`) takes `kc` = the shallowest WET level
+below `ref_depth` whose σ-excess is `>= 0` and interpolates between the MID-layer depths
+`Z_3d_n[kc-1]` and `Z_3d_n[kc]` with a weight clipped to [0, 1], so a valid MLD is at most
+`-Z_3d_n[kd]`, `kd = nlevels_nod2D - 2` (the last True of `node_layer_mask`), and tends to it as
+the excess at `kd` falls to 0⁺. The old fill therefore made the MLD jump by half the bottom layer
+(`hnode[kd]/2`, hundreds of metres at depth) the moment a column became fully mixed, and the
+calibration track measured it as an O(1) finite-difference bias for `tke_c_k`. The fill is now
+`deepest_wet_mid_depth` = `-Z_3d_n[kd]` from `ale.live_geometry`, the same array the routine
+interpolates on (`fesom_jax/adjoint_costs.py`, `mld_field`); `invalid="zero"` stays bitwise the
+routine. It removes this one jump only: an excess that is non-monotone in depth (the last
+crossing disappearing at a shallower level) and the crossing hopping between levels still jump —
+those belong to the threshold criterion.
+
+The test (`fesom_jax/tests/test_adjoint_costs.py`, the continuity sweep) builds one CORE2 column
+that is uniform except for the salinity of its deepest wet layer, finds by bisection the salinity
+offset `s0` where the σ-excess there crosses 0, and sweeps `(s - s0)/s0` from 0.5 down to 1e-8
+and across to -0.5: the gap to the fill value shrinks like `d/(1+d)·Δz` and the invalid side
+equals the fill exactly. The same sweep under the old fill must fail the check (the negative
+control) and shows the jump equal to `hnode[kd]/2`. σ is referenced to the surface, so the root
+is one number for every column; the smallest offset (1e-8, an excess of 3e-10 kg/m³) is still a
+thousand ulps of σ.
+
+Also corrected: `adjoint_check` said the cotangent of the incoming `uvnode` is identically zero.
+Only below the surface: the forced step's bulk formulae and the ice-ocean stress read the
+previous step's surface current `state.uvnode[:, 0]` before the mixing scheme recomputes it (a
+one-step box-T VJP on CORE2 gives 2.1e-7 there against 2.6e-4 for `uv`). Norms still use `uv`.
+
+### 2026-09-27 (adjoint foundation, closing) — a tolerance measured from the data can make a check vacuous, so the check must say so
+
+`check_linear="full"` bounds the scaling error by 10 × the measured repeat spread `s` of the
+chunk VJP. That is the right tolerance while `s` is small, but on the A100 the all-on `exact()`
+adjoint with 48-step chunks repeats only to `s` = 0.06-4.5: the bound then admits any VJP, linear
+or not, and the guard "passed" while proving nothing. The result now records `informative`
+(every part's `s` ≤ `INFORMATIVE_SPREAD` = 1e-6 relative, `fesom_jax/adjoint.py:264,330`) and
+issues a `RuntimeWarning` when it is not; the pass/fail rule is unchanged. General rule: a gate
+whose tolerance is derived from a measured noise level must report when that noise level makes
+the gate void, or a green result is indistinguishable from no test.
+
+Planting the non-determinism for the test: a Python counter inside a `custom_vjp` backward is
+read once, at trace time, and then baked into the compiled VJP, so every call returns the same
+value. The test (`fesom_jax/tests/test_adjoint_chunked.py:499,520`) reads the counter through
+`jax.experimental.io_callback`, which runs on every call of the compiled program, and scales the
+cotangent by `1 + 1e-3·k`: the VJP stays exactly linear in each call (so "zero" passes and the
+scaling error stays within 10·s) but differs between calls by ~2e-3, as a non-reproducible GPU
+chunk would. Negative control: with the bar raised to 1.0 the same run is reported informative.
+
+### 2026-09-27 (adjoint foundation, closing) — "within the repeat spread" needs a tie margin when the spread is a sample
+
+The restart check compares a restarted day with the continuous run and accepts the difference
+if it is within the spread of repeated restarted days. On a GPU that spread is the maximum over
+two to four sampled differences, so a restart that is exactly as good as a repeat lands above it
+about as often as below: the A100 checks of 2013-07-01 put surface speed at 1.000015 × its spread
+(3 repeats, job 27737934) and column-minimum N² at 1.032 × (5 repeats, job 27739111), with every
+other field well inside, and the strict `<=` reported `pass: false` (the 5-repeat job exited 1).
+`run_restartcheck` now passes a field at ≤ `RESTART_TIE_MARGIN` = 1.05 × the spread
+(`scripts/adjoint/core2_adj.py:1275-1289`) and records `tie_margin` and `over_margin` in the row;
+a zero spread (CPU) still needs a bitwise match, and a NaN difference never passes
+(`not diff <= bound`). `scripts/tests/test_core2_adj.py::test_restartcheck_tie_margin` pins the
+two measured ties (pass at 1.05, flagged at 1.0) and a planted field 6 % over (fails).

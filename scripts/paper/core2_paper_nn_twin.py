@@ -96,7 +96,7 @@ def build(year, n, config):
     else:
         raise ValueError(f"unknown --config {config!r} (use all3 / tkegm)")
     op = ssh.build_ssh_operator(mesh, dt=DT)
-    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(base.T[:, 0]))
+    cf = surface_forcing.build_surface_forcing(mesh, year, dt=DT, sst_ic=np.asarray(base.T[:, 0]))
     dates = surface_forcing.dates_for_steps(year, DT, n)
     sfs = cf.stack(dates)
     sf_last = jax.tree.map(lambda x: x[n - 1], sfs)              # last step's forcing (for diagnostics)
