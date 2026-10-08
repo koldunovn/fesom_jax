@@ -439,6 +439,37 @@ def run_gm_diag_sharded(sm: ShardedMesh, T_p, S_p, bvfreq_p, hnode_new_p, helem_
     return tuple(_unfold(o, npes) for o in out)
 
 
+def _idemix_extras(idemix_cfg, idemix_forcing, idemix_lateral, npes, extras, extras_spec):
+    """Append the PARTITIONED IDEMIX inputs (``[P, Lmax_nod, …]`` leaves from
+    :func:`fesom_jax.idemix.partition_idemix_inputs`) to a runner's ``shard_map`` extras, the
+    ``forcing_static`` way (folded, sharded ``'p'``, device-constant). Returns ``kw(ex)`` →
+    the ``step`` kwargs for the body's positional extras ``ex``. ``idemix_cfg=None`` ⇒ appends
+    nothing and ``kw`` returns ``{}`` ⇒ the traced step is exactly the pre-IDEMIX one.
+
+    The lateral propagation sub-iterates without halo refreshes, so it is exact only on ONE
+    shard (no halo lanes; the localized neighbour indices address the whole mesh): ``P > 1``
+    with ``idemix_cfg.lateral`` is refused here, at entry."""
+    if idemix_cfg is None:
+        return lambda ex: {}
+    if idemix_cfg.lateral and npes > 1:
+        raise NotImplementedError(
+            f"IDEMIX lateral propagation on {npes} shards is not implemented (its sub-iterations "
+            "would read stale halo lanes): run on one device, or set idemix lateral=False.")
+    pos = {}
+    for name, val in (("idemix_forcing", idemix_forcing), ("idemix_lateral", idemix_lateral)):
+        if val is not None:
+            folded, spec = _fold_forcing(val)
+            pos[name] = len(extras)
+            extras.append(folded)
+            extras_spec.append(spec)
+
+    def kw(ex):
+        out = dict(idemix_cfg=idemix_cfg, idemix_forcing=None, idemix_lateral=None)
+        out.update({name: ex[i] for name, i in pos.items()})
+        return out
+    return kw
+
+
 def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      stress_p, *, dt: float, is_first_step: bool, npes: int,
                      wire_halo: bool = True, params=None, step_forcing=None,
@@ -446,7 +477,8 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None,
                      tracer_cfg=None, boundary_node_p=None,
                      use_ragged: bool = False, use_padded: bool = False,
-                     use_coloured: bool = False) -> State:
+                     use_coloured: bool = False, idemix_cfg=None, idemix_forcing=None,
+                     idemix_lateral=None) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
     return the ``[P, Lmax, …]`` next State.
 
@@ -460,7 +492,12 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     ``check_vma=False`` is required (the kernels' tridiagonal-solve / FCT ``lax.scan``s
     carry CONSTANT initial carries — non-"varying" under ``shard_map``'s varying-manual-axes
     typing — while their bodies produce per-device-varying outputs; relaxing it treats every
-    value conservatively as per-device-varying, always correct here, so the kernels lower)."""
+    value conservatively as per-device-varying, always correct here, so the kernels lower).
+
+    **IDEMIX.** As in :func:`run_steps_sharded`: ``idemix_cfg`` (static) + ``idemix_forcing``
+    / ``idemix_lateral`` PARTITIONED by :func:`fesom_jax.idemix.partition_idemix_inputs`
+    (device constants); the lateral step needs ``npes == 1``. ``idemix_cfg=None`` ⇒ the step
+    traces exactly as before."""
     fm, fm_spec = folded_mesh(sm)
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
@@ -485,6 +522,8 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     if have_bn:
         extras.append(_fold(boundary_node_p))
         extras_spec.append(_P)
+    _iw_kw = _idemix_extras(idemix_cfg, idemix_forcing, idemix_lateral, npes,
+                            extras, extras_spec)
     extras, extras_spec = tuple(extras), tuple(extras_spec)
 
     def _run(m, s, o, stress, ctx, ex):
@@ -499,7 +538,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                             forcing_static=fs_, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
                             kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
                             visc_cfg=visc_cfg, tracer_cfg=tracer_cfg, halo_ctx=ctx,
-                            boundary_node=bn_)
+                            boundary_node=bn_, **_iw_kw(ex))
 
     if not wire_halo:
         def body0(m, s, o, stress, *ex):
@@ -534,7 +573,8 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       use_coloured: bool = False,
                       ice_cfg=None, step_forcing=None, forcing_static=None,
                       boundary_node_p=None, return_executable: bool = False,
-                      return_grad_fn: bool = False):
+                      return_grad_fn: bool = False, idemix_cfg=None, idemix_forcing=None,
+                      idemix_lateral=None):
     """Multi-step (S.7 part 3): step-1 eager (``is_first_step=True``) + ``lax.scan`` of steps
     2..N under ONE ``shard_map`` — the :func:`fesom_jax.integrate.integrate` pattern, sharded.
     Returns the ``[P, Lmax, …]`` final State after ``n_steps``.
@@ -547,7 +587,12 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     built ONCE inside the body and closed over by every step. **No-forcing path** (pi/GM ocean,
     ``stress_p`` static); the forced multi-step (per-step forcing as the scan ``xs``, a
     ``[n_steps, P*Lmax]`` ``PartitionSpec(None,'p')`` fold) is the follow-up for the PRIMARY
-    KPP+GM+ice few-step gate."""
+    KPP+GM+ice few-step gate.
+
+    **IDEMIX.** ``idemix_cfg`` (static) + ``idemix_forcing`` / ``idemix_lateral`` PARTITIONED
+    to ``[P, Lmax_nod, …]`` by :func:`fesom_jax.idemix.partition_idemix_inputs` (device
+    constants, like ``forcing_static``); the lateral step needs ``npes == 1`` (see
+    :func:`_idemix_extras`). ``idemix_cfg=None`` ⇒ unchanged."""
     _check_halo_mode(use_ragged, use_padded, use_coloured)
     if return_grad_fn and use_ragged:
         # lax.ragged_all_to_all has a WRONG reverse-mode transpose (over-counts ~axis_size×,
@@ -587,6 +632,8 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     have_bn = boundary_node_p is not None
     if have_bn:
         extras.append(_fold(boundary_node_p)); extras_spec.append(_P)
+    _iw_kw = _idemix_extras(idemix_cfg, idemix_forcing, idemix_lateral, npes,
+                            extras, extras_spec)
     extras, extras_spec = tuple(extras), tuple(extras_spec)
 
     def body(m, s, o, stress, h, *ex):
@@ -600,7 +647,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                                 step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
                                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                 ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                halo_ctx=ctx, boundary_node=bn_)
+                                halo_ctx=ctx, boundary_node=bn_, **_iw_kw(ex))
 
         st = one(s, True)                            # step 1 eager (AB2 first-step branch)
         if n_steps > 1:
@@ -626,7 +673,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                                     step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
                                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                     ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                    halo_ctx=ctx, boundary_node=bn_)
+                                    halo_ctx=ctx, boundary_node=bn_, **_iw_kw(ex))
 
             st = one(s, True)
             if n_steps > 1:
@@ -693,7 +740,9 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              return_folded: bool = False, return_executable: bool = False,
                              reuse_executable: bool = False, sample_fn=None,
                              forcing_tables=None, forcing_sched=None, forcing_const=None,
-                             return_grad_fn: bool = False):
+                             return_grad_fn: bool = False, idemix_cfg=None,
+                             idemix_forcing=None, idemix_lateral=None,
+                             sample_prev: bool = False):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     Like :func:`run_steps_sharded` but the surface forcing **changes every step** — the real
@@ -728,7 +777,20 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     skip ``folded_state`` (whose ``[P,Lmax]→[P*Lmax]`` reshape MATERIALIZES the global array on one
     device under multi-node ⇒ OOM). ``return_folded`` ⇒ return the folded ``[P*Lmax]`` scan output
     directly (no ``unfold_state`` reshape). Cold start passes a HOST ``[P,Lmax]`` (``state_is_folded
-    =False``); the driver chains the folded output between chunks and to ``write_restart``."""
+    =False``); the driver chains the folded output between chunks and to ``write_restart``.
+
+    **IDEMIX.** As in :func:`run_steps_sharded`: ``idemix_cfg`` + the partitioned
+    ``idemix_forcing`` / ``idemix_lateral`` device constants; ``None`` ⇒ unchanged.
+
+    **``sample_prev`` (per-step budget hook).** ``False`` (default) ⇒ ``sample_fn(new_state)``,
+    byte-unchanged. ``True`` ⇒ ``sample_fn(prev_state, new_state, aux)`` for every step, with
+    ``aux = dict(mesh=<this shard's mesh>, params=params, dt=dt, ale_cfg=ale_cfg, idemix_cfg=…,
+    idemix_forcing=…, idemix_lateral=…)`` — the step's own inputs, so a diagnostic can
+    re-evaluate a term of the step it follows (the IDEMIX wave-energy budget,
+    :func:`fesom_jax.idemix.budget_terms`). The returned leaves are summed over the steps as
+    with the plain form."""
+    if sample_prev and sample_fn is None:
+        raise ValueError("sample_prev=True needs a sample_fn(prev_state, new_state, aux)")
     fm, fm_spec = folded_mesh(sm)
     if state_is_folded:
         fs = state_p                                      # already folded [P*Lmax] device-sharded
@@ -782,7 +844,12 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     if use_tables:
         extras.extend([tab_folded, con_folded])
         extras_spec.extend([tab_spec, con_spec])
+    _iw_kw = _idemix_extras(idemix_cfg, idemix_forcing, idemix_lateral, npes,
+                            extras, extras_spec)
     extras, extras_spec = tuple(extras), tuple(extras_spec)
+
+    def _sample_aux(m, ex):
+        return dict(mesh=m, params=params, dt=dt, ale_cfg=ale_cfg, **_iw_kw(ex))
 
     def body(m, s, o, stress, h, seq, *ex):
         ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max,
@@ -802,7 +869,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                                 step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                 ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                halo_ctx=ctx, boundary_node=bn_)
+                                halo_ctx=ctx, boundary_node=bn_, **_iw_kw(ex))
 
         sf0 = jax.tree.map(lambda x: x[0], seq)             # this chunk's first-step forcing
         # bootstrap_ab2: True ⇒ cold start / post-dt-ramp (AB2 first-step branch); False ⇒ a
@@ -820,14 +887,19 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                 st, _ = lax.scan(jax.checkpoint(lambda c, sf: (one(c, False, sf), None)),
                                  st, xs=rest, length=n_steps - 1)
             return st
-        acc = sample_fn(st)                                 # running sum, seeded by step-1's output
+        if sample_prev:                                     # the per-step budget hook (prev, new, aux)
+            _aux = _sample_aux(m, ex)
+            _sample = lambda c0, c1: sample_fn(c0, c1, _aux)    # noqa: E731
+        else:
+            _sample = lambda c0, c1: sample_fn(c1)              # noqa: E731
+        acc = _sample(s, st)                                # running sum, seeded by step-1's output
         if n_steps > 1:
             rest = jax.tree.map(lambda x: x[1:], seq)
             def _accum(carry, sf):
                 c, a = carry
-                c = one(c, False, sf)
-                a = jax.tree.map(lambda u, v: u + v, a, sample_fn(c))
-                return (c, a), None
+                c1 = one(c, False, sf)
+                a = jax.tree.map(lambda u, v: u + v, a, _sample(c, c1))
+                return (c1, a), None
             (st, acc), _ = lax.scan(jax.checkpoint(_accum), (st, acc),
                                     xs=rest, length=n_steps - 1)
         return st, acc
@@ -876,7 +948,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                                     step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                     ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                    halo_ctx=ctx, boundary_node=bn_)
+                                    halo_ctx=ctx, boundary_node=bn_, **_iw_kw(ex))
 
             sf0 = jax.tree.map(lambda x: x[0], seq)
             st = one(s, bootstrap_ab2, sf0)
@@ -904,7 +976,12 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     if sample_fn is None:
         out_specs = fs_spec
     else:
-        acc_spec = jax.tree.map(lambda _: _P, jax.eval_shape(sample_fn, fs))
+        if sample_prev:                     # only the tree structure matters for the spec
+            _probe = jax.eval_shape(lambda m_, s_, *ex_: sample_fn(s_, s_, _sample_aux(m_, ex_)),
+                                    fm, fs, *extras)
+        else:
+            _probe = jax.eval_shape(sample_fn, fs)
+        acc_spec = jax.tree.map(lambda _: _P, _probe)
         out_specs = (fs_spec, acc_spec)
     # EXECUTABLE REUSE across chunks (the A6 driver's multi-chunk contract). `body` is a FRESH
     # closure every call, so a bare `jax.jit(shard_map(body))` is a NEW jitted object ⇒ XLA RE-
@@ -921,7 +998,9 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                bool(state_is_folded), bool(use_ragged), bool(use_padded), bool(use_coloured),
                int(npes), bool(have_bn), bool(use_tables),
                id(ice_cfg), id(gm_cfg), id(kpp_cfg), id(tke_cfg),
-               id(ale_cfg), id(visc_cfg), id(tracer_cfg), id(sample_fn))
+               id(ale_cfg), id(visc_cfg), id(tracer_cfg), id(sample_fn),
+               id(idemix_cfg), idemix_forcing is not None, idemix_lateral is not None,
+               bool(sample_prev))
         jfn = _FORCED_JIT_CACHE.get(key)
         if jfn is None:
             jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,

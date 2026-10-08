@@ -40,6 +40,10 @@ import numpy as np
 from . import shard_mesh, ssh, ushow_output, zarr_output
 from .integrate_sharded import folded_state, run_steps_sharded, run_steps_sharded_forced
 from .run_config import RunConfig
+from .state import _STATE_FIELDS
+
+# Default State leaves of the opt-in instantaneous snapshot stream (run_from_config snapshot_out).
+SNAPSHOT_FIELDS = ("T", "S", "hnode", "eta_n", "Kv", "bvfreq", "tke", "iwe")
 
 _SECONDS = {"s": 1.0, "h": 3600.0, "d": 86400.0, "mo": 30 * 86400.0, "yr": 365 * 86400.0}
 
@@ -296,7 +300,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     restart_archive_length=1,
                     daily_out=None, daily_start_step=0,
                     monthly_out=None, monthly_start_step=0, chunk_diagnostics=False,
-                    output_layout="global"):
+                    output_layout="global", idemix_forcing=None, idemix_lateral=None,
+                    snapshot_out=None, snapshot_every=None, snapshot_fields=SNAPSHOT_FIELDS,
+                    idemix_budget_out=None):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -315,6 +321,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     ``cfg.params_file`` (trained ``gm_nn`` weights), and is ``None`` when there is no file — the
     pre-existing default-parameter path, byte for byte.
 
+    ``cfg.idemix`` (the yaml ``idemix:`` block) turns on IDEMIX: ``Params.idemix`` is set from
+    ``cfg.idemix_params()`` (unless the injected ``params`` already carries IDEMIX constants),
+    and the GLOBAL per-node forcing + lateral operator — ``cfg.idemix_inputs(mesh)``, or the
+    injected ``idemix_forcing``/``idemix_lateral`` — are partitioned like ``forcing_static``
+    and handed to the runner with ``idemix_cfg`` (via :meth:`RunConfig.physics_kwargs`). The
+    lateral propagation needs a single device (``part.npes == 1``). No ``idemix:`` ⇒ nothing
+    changes.
+
     ``restart_archive_out`` (if set) additionally writes ARCHIVAL restarts: an immutable,
     uniquely-named directory (``_archive_tag`` — mirrors FESOM3's ``fesom.<YYYY>.<DDD>.<SSSSS>``)
     at every ``restart_archive_length``-th ``restart_archive_period`` ('year'/'month'/'day')
@@ -324,7 +338,15 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     overwritten or auto-deleted (resume any of them directly via ``restart_in``); a
     ``restart.latest`` pointer (:func:`zarr_output.write_restart_latest`) always names the
     newest one. This is a SEPARATE, additive stream — the plain rolling ``checkpoint_every``
-    restart (if also set) is unaffected."""
+    restart (if also set) is unaffected.
+
+    ``snapshot_out`` (opt-in; ``None`` ⇒ inert) writes INSTANTANEOUS snapshots of the State
+    leaves ``snapshot_fields`` every ``snapshot_every`` steps (and of the start state when the
+    start step is a multiple) as ``snap_<step>.npz`` in canonical global node order (single
+    process). ``idemix_budget_out`` (opt-in; needs ``cfg.idemix``, one device) writes the
+    per-calendar-day mean of the per-step IDEMIX wave-energy budget
+    (:func:`fesom_jax.idemix.budget_terms`, re-evaluated in-scan through the runner's
+    ``sample_prev`` hook) as ``day_<YYYY>_<DOY>.npz`` of ``[nod2D]`` column sums."""
     cfg.validate()
     _t_entry = time.perf_counter()          # progress prints are relative to entry, not node uptime
     npes = part.npes
@@ -342,6 +364,36 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         print(f"[run] params: gm_nn="
               f"{'set' if getattr(params, 'gm_nn', None) is not None else 'none'} "
               f"({_params_src})", flush=True)
+    # IDEMIX (cfg.idemix): Params.idemix + the per-node forcing / lateral operator, built ONCE on
+    # the global mesh and partitioned like forcing_static. cfg.idemix=None ⇒ _iw_kw={} ⇒ the
+    # runners trace exactly the pre-IDEMIX step.
+    _iw_kw = {}
+    if cfg.idemix is not None:
+        import dataclasses as _dc
+        import jax.numpy as _jnp
+        from . import idemix as _idemix
+        from .params import Params
+        _iw_cfg = cfg.idemix_config()
+        _idemix.check_wet_columns(mesh)          # host-side, before any forcing is built
+        if _iw_cfg.lateral and npes > 1:
+            raise NotImplementedError(
+                f"idemix lateral propagation runs on one device only (partition has npes={npes}); "
+                "use a serial partition or set idemix: {lateral: false}.")
+        if params is None:
+            params = Params.defaults()
+        if params.idemix is None:
+            params = _dc.replace(params, idemix=jax.tree.map(
+                lambda v: _jnp.asarray(v, _jnp.float64), cfg.idemix_params()))
+        if idemix_forcing is None:
+            idemix_forcing, _lat = cfg.idemix_inputs(mesh)
+            idemix_lateral = _lat if idemix_lateral is None else idemix_lateral
+        elif idemix_lateral is None and _iw_cfg.lateral:
+            idemix_lateral = _idemix.build_lateral_operator(mesh)
+        _f_p, _l_p = _idemix.partition_idemix_inputs(idemix_forcing, idemix_lateral, part)
+        _iw_kw = dict(idemix_forcing=_f_p, idemix_lateral=_l_p)
+        if jax.process_index() == 0:
+            print(f"[run] idemix: {_iw_cfg} params={tuple(float(v) for v in params.idemix)}",
+                  flush=True)
     # Output / restart on-disk layout. 'global' (default) = partition-INDEPENDENT canonical node
     # order (xarray/ushow read it directly; byte-identical at any device count) — it host-gathers
     # owned lanes on ONE process. 'folded' = the gather-free sharded [P*Lmax] write. A multi-node
@@ -367,6 +419,21 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # 0 psu) — silently wrong physics (usability review P2). Unforced routes to the bare
     # sharded runner (no surface-flux application at all), demo-scale, with explicit gates:
     unforced = forcing is None and forcing_stack is None
+    if snapshot_out is not None:
+        if not snapshot_every or int(snapshot_every) <= 0:
+            raise ValueError("snapshot_out needs snapshot_every > 0 (steps)")
+        if jax.process_count() > 1:
+            raise NotImplementedError("snapshot_out host-gathers: single process only")
+        unknown = set(snapshot_fields) - set(_STATE_FIELDS)
+        if unknown:
+            raise ValueError(f"snapshot_fields: unknown State field(s) {sorted(unknown)}")
+    if idemix_budget_out is not None:
+        if cfg.idemix is None:
+            raise ValueError("idemix_budget_out needs an idemix: block in the config")
+        if npes != 1:
+            raise NotImplementedError("idemix_budget_out runs on one device (npes == 1)")
+    if unforced and (snapshot_out is not None or idemix_budget_out is not None):
+        raise ValueError("forcing: null does not support snapshot_out / idemix_budget_out")
     if unforced:
         if cfg.ice is not None:
             raise ValueError("forcing: null cannot run sea ice — ice thermodynamics needs "
@@ -439,12 +506,15 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         # so no chunk straddles a period and its every-step sum belongs to exactly one period.
         # dt-independent, so the true-time-mean output (the diurnal-aliasing fix) works at any
         # mesh/dt. See :class:`_MeanStream`.
-        _out_period = ("day" if daily_out is not None
+        _out_period = ("day" if (daily_out is not None or idemix_budget_out is not None)
                        else ("month" if monthly_out is not None else None))
         _split = list(_year_boundaries(year, cfg.dt, start_step, n_steps, cfg.dt_ramp))
         if _out_period is not None:
             _split += _period_boundaries(year, cfg.dt, start_step, n_steps,
                                          period=_out_period, dt_ramp=cfg.dt_ramp)
+        if snapshot_out is not None:
+            _every = int(snapshot_every)
+            _split += list(range((start_step // _every + 1) * _every, start_step + n_steps, _every))
         if restart_archive_out is not None and restart_archive_period is not None:
             _archive_targets = set(_archive_boundaries(
                 year, cfg.dt, start_step, n_steps, period=restart_archive_period,
@@ -578,11 +648,63 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                                    _monthly_key, _write_monthly, monthly_start_step))
         out_sample_specs.append(_monthly_fields)
 
+    # IDEMIX wave-energy budget (idemix_budget_out): per-step terms re-evaluated in-scan through the
+    # runner's sample_prev hook (prev, new, aux), daily-meaned per node like the daily stream.
+    def _to_global_nod(folded):
+        """Folded ``[P*Lmax, …]`` node field → host ``[nod2D, …]`` in canonical global order
+        (owned lanes only; single process — snapshot_out / idemix_budget_out)."""
+        from .ushow_output import _folded_gid_owned_nod
+        gid, owned = _folded_gid_owned_nod(part, sm)
+        host = np.asarray(folded)
+        g = np.zeros((mesh.nod2D,) + host.shape[1:], dtype=host.dtype)
+        g[gid[owned]] = host[owned]
+        return g
+
+    pair_specs = []
+    if idemix_budget_out is not None:
+        from . import ale as _ale
+        from . import idemix as _idemix_b
+        _bkeys = tuple(f"iwb_{k}" for k in _idemix_b.BUDGET_TERMS)
+
+        def _budget_fields(s0, s1, aux):
+            m = aux["mesh"]
+            z3d = (_ale.live_geometry(m, s0.hnode)[1] if aux["ale_cfg"] is not None else None)
+            t = _idemix_b.budget_terms(m, s0, s1, aux["idemix_forcing"], aux["params"].idemix,
+                                       aux["idemix_cfg"], aux["idemix_lateral"], dt=aux["dt"],
+                                       Z3d=z3d)
+            return {f"iwb_{k}": v for k, v in t.items()}
+
+        def _write_budget(day, mean, count):
+            yr, doy = day
+            os.makedirs(idemix_budget_out, exist_ok=True)
+            np.savez(f"{idemix_budget_out}/day_{yr:04d}_{doy:03d}.npz",
+                     **{k[4:]: _to_global_nod(v) for k, v in mean.items()},
+                     n_samples=int(count), calendar_date=f"{yr:04d}-doy{doy:03d}",
+                     dt=float(cfg.dt))
+
+        def _budget_key(step):
+            yr, doy, _, _ = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
+            return (int(yr), int(doy))
+
+        streams.append(_MeanStream(_bkeys, _budget_key, _write_budget, 0))
+        pair_specs.append(_budget_fields)
+
     # The ONE sample_fn threaded into the chunk scan = union of active streams' fields, summed each step.
     # Built ONCE (stable id ⇒ the reuse-executable cache stays warm). None ⇒ no output ⇒ the scan returns
     # just the State (byte-identical). Split period = DAY if daily output is active (finest; months align
     # to day boundaries) else MONTH — dt-independent, so each chunk lands in exactly one output period.
-    if out_sample_specs:
+    sample_prev = bool(pair_specs)
+    if sample_prev:
+        # per-step (prev, new, aux) form (integrate_sharded sample_prev): the plain streams read `new`
+        def out_sample_fn(s0, s1, aux, _specs=tuple(out_sample_specs),
+                          _pspecs=tuple(pair_specs)):
+            d = {}
+            for f in _specs:
+                d.update(f(s1))
+            for f in _pspecs:
+                d.update(f(s0, s1, aux))
+            return d
+    elif out_sample_specs:
         def out_sample_fn(s, _specs=tuple(out_sample_specs)):
             d = {}
             for f in _specs:
@@ -590,6 +712,24 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             return d
     else:
         out_sample_fn = None
+
+    # INSTANTANEOUS snapshots (snapshot_out): canonical global node order, one npz per firing.
+    def _write_snapshot(fields_global, step):
+        yr, doy, sec, _ = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
+        os.makedirs(snapshot_out, exist_ok=True)
+        np.savez(f"{snapshot_out}/snap_{step:07d}.npz", **fields_global, step=int(step),
+                 calendar_date=f"{yr:04d}-doy{doy:03d}", seconds=float(sec), dt=float(cfg.dt))
+
+    def _snapshot_folded(sp, step):
+        _write_snapshot({name: _to_global_nod(getattr(sp, name)) for name in snapshot_fields},
+                        step)
+
+    if snapshot_out is not None and start_step % int(snapshot_every) == 0:
+        if folded_in:
+            _snapshot_folded(state_p, start_step)
+        else:                                   # cold start: the GLOBAL host state0
+            _write_snapshot({n: np.asarray(getattr(state0, n)) for n in snapshot_fields},
+                            start_step)
 
     # ON-DEVICE forcing interpolation (docs/plans/20260715-fesom-jax-ondevice-forcing.md),
     # opt-in via the YAML `forcing: {on_device: true}` (default OFF ⇒ byte-identical path).
@@ -666,7 +806,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 sm, state_p, _sop_for(ch.dt), stress_p, ch.count, dt=ch.dt, npes=npes,
                 params=params, use_ragged=use_ragged, use_padded=use_padded,
                 use_coloured=use_coloured,
-                boundary_node_p=boundary_node_p, **cfg.physics_kwargs())
+                boundary_node_p=boundary_node_p, **_iw_kw, **cfg.physics_kwargs())
             state_p, acc_sum = folded_state(_out)[0], None
         else:
             _fkw = (dict(forcing_tables=tab_p, forcing_sched=sched, forcing_const=fdc_p)
@@ -677,7 +817,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
                 use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
                 boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
-                sample_fn=out_sample_fn, **_fkw, **cfg.physics_kwargs())
+                sample_fn=out_sample_fn, sample_prev=sample_prev,
+                **_fkw, **_iw_kw, **cfg.physics_kwargs())
             # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else the final state.
             state_p, acc_sum = _chunk_out if out_sample_fn is not None else (_chunk_out, None)
         folded_in = True                                     # the scan output is folded [P*Lmax]
@@ -723,6 +864,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if acc_sum is not None:
             for _stream in streams:
                 _stream.add(step_now, ch.start, acc_sum, ch.count)
+
+        if snapshot_out is not None and step_now % int(snapshot_every) == 0:
+            _snapshot_folded(state_p, step_now)
 
         # rolling intermediate checkpoint: when this chunk crossed a `checkpoint_every` step
         # boundary (and it's not the last chunk — the final restart covers that), overwrite the

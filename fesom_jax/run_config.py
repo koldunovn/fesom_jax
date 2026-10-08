@@ -47,6 +47,27 @@ YAML schema (every key optional; absent ⇒ the bit-identical default)::
     n_steps: 1440           # OR a duration string the A6 driver parses
     duration: 2yr
     params_file: /work/.../gm_nn_stage0.npz   # trained gm_nn weights; absent/null = default GM
+    idemix: null            # IDEMIX internal-wave mixing; null = off, {} = on (defaults)
+
+``idemix`` turns on the IDEMIX internal-wave closure (the idemix-jax integration; physics in
+:mod:`fesom_jax.idemix`). ``null``/absent ⇒ off, byte-identical. A mapping ⇒ on; every key
+optional::
+
+    idemix:
+      n_hor_iter: 5            # lateral sub-steps         } fesom_jax.idemix.IdemixConfig
+      lateral: true            # horizontal propagation    }   (defaults when absent)
+      lateral_cfl_cap: 0.1     # v0 CFL cap (0 = off)      }
+      params: fesom_operational   # | oe13 | {tau_v, tau_h, gamma, jstar, mu0} (all five)
+      surf_file: /pool/.../fourier_smooth_2005_cfsr_inert_rgrid.nc   # } idemix_jax.
+      bot_file:  /pool/.../tidal_energy_gx1v6_20090205_rgrid.nc      # } load_idemix_forcing
+      sforcusage: 0.2                                                # } (its defaults
+      botforc_Etot: 0.0                                              # }  when absent)
+
+``params`` defaults to ``fesom_operational`` (FESOM2's namelist.cvmix, Pollmann et al. 2017);
+``oe13`` is the Olbers & Eden (2013) set (``IdemixParams()``). The run driver loads the forcing
+onto the mesh nodes, builds the lateral operator and sets ``Params.idemix``. IDEMIX runs alone
+(Osborn ``Kv``/``Av``) or coupled to TKE, which then needs ``tke: {only_tke: false}``; never with
+``kpp``. Inconsistent combinations raise at config load (:meth:`RunConfig.validate`).
 
 ``params_file`` is the **deployment path for a trained closure** (NN-GM plan Task 7): the ``.npz``
 :func:`fesom_jax.gm_nn.save_gm_nn` writes, re-read on every leg of a restart chain, so which
@@ -106,6 +127,13 @@ _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 # MITgcm M⁻¹ — a many-node comm lever (fewer CG iterations ⇒ fewer psums); absent/0 ⇒ the
 # byte-identical default. `cheb_kappa` tunes the assumed condition number (default 30).
 _SSH_KEYS = ("cheb_degree", "cheb_kappa")
+# The `idemix:` mapping (see the module docstring). Kept as plain names here so importing
+# run_config never imports idemix_jax; the config/params objects are built lazily.
+_IDEMIX_CFG_KEYS = ("n_hor_iter", "lateral", "lateral_cfl_cap")      # IdemixConfig._fields
+_IDEMIX_FORCING_KEYS = ("surf_file", "bot_file", "sforcusage", "botforc_Etot")
+_IDEMIX_KEYS = _IDEMIX_CFG_KEYS + ("params",) + _IDEMIX_FORCING_KEYS
+_IDEMIX_PARAM_PRESETS = ("fesom_operational", "oe13")
+_IDEMIX_PARAM_FIELDS = ("tau_v", "tau_h", "gamma", "jstar", "mu0")  # IdemixParams._fields
 
 
 @dataclasses.dataclass(frozen=True)
@@ -137,6 +165,7 @@ class RunConfig:
     n_steps: Optional[int] = None
     duration: Optional[str] = None
     params_file: Optional[str] = None   # .npz of trained gm_nn weights; None ⇒ default GM
+    idemix: Optional[dict] = None       # the `idemix:` mapping; None ⇒ IDEMIX off
 
     # ----------------------------------------------------------------------
     @classmethod
@@ -167,6 +196,68 @@ class RunConfig:
         from .params import Params
         return dataclasses.replace(Params.defaults(), gm_nn=load_gm_nn(self.params_file))
 
+    def idemix_config(self):
+        """The static :class:`~fesom_jax.idemix.IdemixConfig` of the ``idemix:`` block, or
+        ``None`` when IDEMIX is off.
+
+        Built ONCE per ``RunConfig`` and returned as the SAME object on every call: the forced
+        runner's executable cache (``integrate_sharded._FORCED_JIT_CACHE``) keys on the
+        IDENTITY of each physics config, relying on every one being a single persistent object
+        per run (the sub-config fields are; this derived one is memoized to match). A fresh
+        object per :meth:`physics_kwargs` call would recompile every chunk and grow the cache."""
+        if self.idemix is None:
+            return None
+        cached = self.__dict__.get("_idemix_cfg")
+        if cached is None:
+            from .idemix import IdemixConfig
+            cached = IdemixConfig(**{k: self.idemix[k] for k in _IDEMIX_CFG_KEYS
+                                     if k in self.idemix})
+            object.__setattr__(self, "_idemix_cfg", cached)   # frozen dataclass: memo only
+        return cached
+
+    def idemix_params(self):
+        """The :class:`idemix_jax.IdemixParams` named by ``idemix.params`` (default
+        ``fesom_operational``), or ``None`` when IDEMIX is off."""
+        if self.idemix is None:
+            return None
+        from idemix_jax import IdemixParams
+        spec = self.idemix.get("params", "fesom_operational")
+        if spec == "fesom_operational":
+            return IdemixParams.fesom_operational()
+        if spec == "oe13":
+            return IdemixParams()
+        if isinstance(spec, dict):
+            if set(spec) != set(_IDEMIX_PARAM_FIELDS):
+                missing = sorted(set(_IDEMIX_PARAM_FIELDS) - set(spec))
+                extra = sorted(set(spec) - set(_IDEMIX_PARAM_FIELDS))
+                raise ValueError(
+                    f"idemix.params mapping needs exactly the keys {list(_IDEMIX_PARAM_FIELDS)}"
+                    f" (missing {missing}, unexpected {extra})")
+            return IdemixParams(**{k: float(spec[k]) for k in _IDEMIX_PARAM_FIELDS})
+        raise ValueError(f"idemix.params must be one of {list(_IDEMIX_PARAM_PRESETS)} or a "
+                         f"mapping of {list(_IDEMIX_PARAM_FIELDS)}, got {spec!r}")
+
+    def idemix_inputs(self, mesh):
+        """``(IdemixForcing, LateralOperator | None)`` for ``mesh`` — the GLOBAL per-node
+        energy fluxes from ``idemix_jax.load_idemix_forcing`` on ``geo_coord_nod2D`` (degrees,
+        with the block's ``surf_file``/``bot_file``/``sforcusage``/``botforc_Etot``; the
+        ``botforc_Etot`` normalization area is each node's top-wet-layer ``areasvol``) and the
+        lateral operator (``None`` when ``lateral: false``). Host NumPy, built once per run."""
+        if self.idemix is None:
+            return None, None
+        import numpy as np
+        from idemix_jax import load_idemix_forcing
+        from .idemix import build_lateral_operator, check_wet_columns
+        check_wet_columns(mesh)
+        kw = {k: self.idemix[k] for k in _IDEMIX_FORCING_KEYS if k in self.idemix}
+        if kw.get("botforc_Etot", 0.0) != 0.0:
+            top = np.asarray(mesh.ulevels_nod2D) - 1
+            kw["node_area"] = np.take_along_axis(np.asarray(mesh.areasvol), top[:, None], 1)[:, 0]
+        geo = np.degrees(np.asarray(mesh.geo_coord_nod2D, dtype=np.float64))
+        forcing = load_idemix_forcing(geo[:, 0], geo[:, 1], **kw)
+        lateral = build_lateral_operator(mesh) if self.idemix_config().lateral else None
+        return forcing, lateral
+
     def ssh_cheb(self) -> tuple:
         """The CGPOLY knobs from the ``ssh:`` block as ``(degree, kappa_guess)``;
         ``degree == 0`` ⇒ the lever is OFF (the byte-identical MITgcm default)."""
@@ -190,6 +281,25 @@ class RunConfig:
             raise ValueError(
                 "kpp and tke are both set — the model runs exactly one vertical-mixing scheme "
                 "(KPP xor classical-TKE); set one of them to null.")
+        if self.idemix is not None:
+            if not isinstance(self.idemix, dict):
+                raise TypeError(f"idemix must be a mapping or null, "
+                                f"got {type(self.idemix).__name__}")
+            _check_keys(self.idemix, _IDEMIX_KEYS, "idemix")
+            if self.kpp is not None:
+                raise ValueError(
+                    "idemix and kpp are both set: IDEMIX couples to TKE or runs alone (Osborn "
+                    "shortcut), never with KPP; set kpp to null.")
+            self.idemix_config().validate()
+            self.idemix_params()
+        if self.tke is not None and (not self.tke.only_tke) != (self.idemix is not None):
+            if self.idemix is None:
+                raise ValueError(
+                    "tke.only_tke: false requires an idemix: block (the TKE then consumes the "
+                    "IDEMIX wave dissipation); set only_tke: true or add idemix.")
+            raise ValueError(
+                "idemix with tke requires tke.only_tke: false (FESOM's coupled "
+                "cvmix_TKE+cvmix_IDEMIX); or drop tke for IDEMIX-only (Osborn) mixing.")
         if self.ale is not None:
             self.ale.validate()
         if self.tke is not None:
@@ -210,9 +320,14 @@ class RunConfig:
     def physics_kwargs(self) -> dict:
         """The per-step physics config kwargs for :func:`fesom_jax.step.step` /
         :func:`fesom_jax.integrate.integrate` / ``run_steps_sharded`` (everything but ``dt``,
-        which the driver ramps via :meth:`dt_at`)."""
-        return dict(ice_cfg=self.ice, gm_cfg=self.gm, kpp_cfg=self.kpp, tke_cfg=self.tke,
-                    ale_cfg=self.ale, visc_cfg=self.visc, tracer_cfg=self.tracer)
+        which the driver ramps via :meth:`dt_at`). With an ``idemix:`` block it also carries
+        ``idemix_cfg`` (the data — forcing, lateral operator, ``Params.idemix`` — comes from
+        :meth:`idemix_inputs` / :meth:`idemix_params`); without one the dict is unchanged."""
+        kw = dict(ice_cfg=self.ice, gm_cfg=self.gm, kpp_cfg=self.kpp, tke_cfg=self.tke,
+                  ale_cfg=self.ale, visc_cfg=self.visc, tracer_cfg=self.tracer)
+        if self.idemix is not None:
+            kw["idemix_cfg"] = self.idemix_config()
+        return kw
 
     def dt_at(self, step: int) -> float:
         """The timestep at absolute ``step`` index, honoring :attr:`dt_ramp`."""
@@ -236,6 +351,8 @@ class RunConfig:
         d["visc"] = _overrides(self.visc, ViscConfig())
         d["tracer"] = _overrides(self.tracer, TracerConfig())
         d["dt_ramp"] = None if self.dt_ramp is None else dict(self.dt_ramp._asdict())
+        if self.idemix is not None:             # absent when off ⇒ pre-IDEMIX yaml unchanged
+            d["idemix"] = dict(self.idemix)
         for f in _SPEC_FIELDS:
             d[f] = getattr(self, f)
         return d
@@ -243,7 +360,7 @@ class RunConfig:
     @classmethod
     def from_dict(cls, d: dict) -> "RunConfig":
         """Reconstruct from a (YAML-parsed) dict; raises ``KeyError`` on any unknown key."""
-        known = set(_SUBCONFIGS) | {"visc", "tracer", "dt_ramp"} | set(_SPEC_FIELDS)
+        known = set(_SUBCONFIGS) | {"visc", "tracer", "dt_ramp", "idemix"} | set(_SPEC_FIELDS)
         unknown = set(d) - known
         if unknown:
             raise KeyError(f"unknown RunConfig key(s): {sorted(unknown)} "
@@ -259,6 +376,12 @@ class RunConfig:
         if dr is not None:
             _check_keys(dr, DtRamp._fields, "dt_ramp")
             kw["dt_ramp"] = DtRamp(**dr)
+        iw = d.get("idemix")
+        if iw is not None:                      # strict keys inside `idemix:` (no silent typos)
+            if not isinstance(iw, dict):
+                raise TypeError(f"idemix must be a mapping or null, got {type(iw).__name__}")
+            _check_keys(iw, _IDEMIX_KEYS, "idemix")
+            kw["idemix"] = dict(iw)
         for f in _SPEC_FIELDS:
             if f in d:
                 kw[f] = d[f]

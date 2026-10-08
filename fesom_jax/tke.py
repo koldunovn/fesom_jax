@@ -51,9 +51,13 @@ class TkeConfig(NamedTuple):
     static double in :mod:`fesom_jax.cvmix_tke` (``TKE_C66``).
 
     **Un-ported combinations raise** (:meth:`validate`, the C ``fesom_tke_alloc:247-253``
-    init-abort parity): IDEMIX (``not only_tke``), Langmuir (``l_lc``), Dirichlet BCs
-    (``use_dirichlet``), ``mxl_choice != 2``. The port covers exactly the reference config;
-    a future edit flipping one of these fails loudly rather than running un-ported physics.
+    init-abort parity): Langmuir (``l_lc``), Dirichlet BCs (``use_dirichlet``),
+    ``mxl_choice != 2``. ``only_tke=False`` is IDEMIX coupling: the column core
+    (:func:`~fesom_jax.cvmix_tke.integrate_tke_column`) accepts ``iw_diss``/``alpha_c``/
+    ``E_iw``, but the config alone supplies none — IDEMIX coupling REQUIRES ``idemix_cfg`` at
+    the step seam (enforced there), else the TKE runs the ``only_tke`` physics. The port covers
+    exactly the reference config plus that coupling; a future edit flipping one of the other
+    gates fails loudly rather than running un-ported physics.
     """
 
     # --- structural statics (the column-core bounds, fesom_tke.c:231-240) ---
@@ -63,7 +67,7 @@ class TkeConfig(NamedTuple):
 
     # --- master gates (the C runs exactly the reference branch; else validate raises) ---
     mxl_choice: int = 2           # Blanke–Delecluse wall constraints (choice 2 only)
-    only_tke: bool = True         # IDEMIX coupling OFF (.not.only_tke is gate-only)
+    only_tke: bool = True         # IDEMIX coupling OFF (False = IDEMIX; needs idemix_cfg at the step seam)
     use_dirichlet: bool = False   # Dirichlet surface+bottom BCs (Neumann is executed)
     l_lc: bool = False            # Langmuir (tke_dolangmuir=F; gate-only)
 
@@ -80,14 +84,14 @@ class TkeConfig(NamedTuple):
         parity). Called at the step seam whenever ``tke_cfg is not None``; returns ``self``
         so it can wrap an expression. ``tke_cfg=None`` is the KPP/PP path and never reaches
         here."""
-        if (not self.only_tke or self.l_lc or self.use_dirichlet
-                or self.mxl_choice != 2):
+        if self.l_lc or self.use_dirichlet or self.mxl_choice != 2:
             raise ValueError(
                 "TkeConfig only supports the classical-TKE reference config "
-                "(only_tke=True, l_lc=False, use_dirichlet=False, mxl_choice=2). "
-                "IDEMIX / Langmuir / Dirichlet BCs / mxl_choice!=2 are gate-only, not "
-                "ported (no C reference run ⇒ no oracle). Use tke_cfg=None for the "
-                "KPP/PP path. (fesom_tke.c:247-253 abort parity)")
+                "(l_lc=False, use_dirichlet=False, mxl_choice=2). "
+                "Langmuir / Dirichlet BCs / mxl_choice!=2 are gate-only, not "
+                "ported (no C reference run ⇒ no oracle). only_tke=False selects IDEMIX "
+                "coupling, which requires idemix_cfg at the step seam. Use tke_cfg=None "
+                "for the KPP/PP path. (fesom_tke.c:247-253 abort parity)")
         return self
 
 
@@ -133,9 +137,31 @@ def _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch):
     return Kv, Av
 
 
+def interface_spacing(mesh, hnode, Z3d):
+    """The tracer-point interface spacing ``dz_trr`` ``[N, nl]`` the TKE column core takes as
+    ``dzt`` (and the IDEMIX column as its ``dzt``): interior ``|ΔZ|`` + ``hnode/2`` surface &
+    bottom end caps. Factored out of :func:`mixing_tke` verbatim (no numerical change)."""
+    nl = mesh.nl
+    k = jnp.arange(nl)[None, :]
+    nzmin = (mesh.ulevels_nod2D - 1)[:, None]                   # surface interface (0, no cavity)
+    nlev = (mesh.nlevels_nod2D - 1)                             # per-node layer count (bottom = nlev)
+    nzmax = nlev[:, None]                                       # bottom interface
+    is_surf = (k == nzmin)
+    is_bot = (k == nzmax)
+    is_interior = (k >= nzmin + 1) & (k <= nzmax - 1)           # interfaces [uln0+1, nln0]
+    Z = _layer_center_Z(mesh, Z3d)                             # (N|1, nl) layer centers
+    dZ = _shift_down(Z) - Z                                    # Z[nz-1]-Z[nz] (>0 interior; 0 at k=0)
+    # dz_trr: interior |ΔZ| (tracer-point spacing) + hnode/2 surface & bottom end caps
+    dz_trr = jnp.where(is_interior, jnp.abs(dZ), 0.0)
+    dz_trr = jnp.where(is_surf, hnode[:, :1] / 2.0, dz_trr)    # dz_trr[uln0]=hnode[uln0]/2
+    hnode_bot = jnp.take_along_axis(hnode, (nlev - 1)[:, None], axis=-1)   # hnode[nln0]
+    dz_trr = jnp.where(is_bot, hnode_bot / 2.0, dz_trr)        # dz_trr[nln0+1]=hnode[nln0]/2
+    return dz_trr
+
+
 def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
                params, *, dt: float = DT_DEFAULT, exch=None, Z3d=None,
-               freeze_convection: bool = False):
+               freeze_convection: bool = False, idemix=None):
     """Assembled classical-TKE vertical-mixing driver — the mirror of ``fesom_tke_mixing``
     (``fesom_tke.c:270-505``) followed by the shared ``mo_convect`` (``fesom_step.c:264``).
     Returns ``(Kv, Av, uvnode, tke_new)`` — the ``(Kv, Av, uvnode)`` triple PP/KPP return
@@ -146,7 +172,10 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
     ``mo_convect`` — a drop-in at the ``step.py`` mixing seam. ``exch`` is REQUIRED for the
     internal node-``Av`` exchange (see :func:`_wire_kv_av`); ``Z3d`` is the live zstar
     layer-center geometry (``None`` ⇒ the static mesh, byte-identical under linfs).
+    ``idemix`` is ``None`` (``only_tke``) or a tuple ``(iw_diss, alpha_c, E_iw)`` of ``[N, nl]``
+    arrays forwarded to the column core (IDEMIX coupling; see ``integrate_tke_column``).
     """
+    iw_diss, alpha_c, E_iw = idemix if idemix is not None else (None, None, None)
     nl = mesh.nl
     k = jnp.arange(nl)[None, :]
     nzmin = (mesh.ulevels_nod2D - 1)[:, None]                   # surface interface (0, no cavity)
@@ -171,11 +200,7 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
     # bvfreq2 = the shared smoothed N², ZEROED at surface+bottom (nonzero only interior) —
     # ⚠️ a naive slice leaks the nonzero surface value (fesom_tke.c:362-364).
     bvfreq2 = jnp.where(is_interior, bvfreq, 0.0)
-    # dz_trr: interior |ΔZ| (tracer-point spacing) + hnode/2 surface & bottom end caps
-    dz_trr = jnp.where(is_interior, jnp.abs(dZ), 0.0)
-    dz_trr = jnp.where(is_surf, hnode[:, :1] / 2.0, dz_trr)    # dz_trr[uln0]=hnode[uln0]/2
-    hnode_bot = jnp.take_along_axis(hnode, (nlev - 1)[:, None], axis=-1)   # hnode[nln0]
-    dz_trr = jnp.where(is_bot, hnode_bot / 2.0, dz_trr)        # dz_trr[nln0+1]=hnode[nln0]/2
+    dz_trr = interface_spacing(mesh, hnode, Z3d)
 
     # --- optional structure-preserving NN multiplier on c_k/c_eps/c_d (the §3 hybrid-ML hook,
     # Phase A5). ``params.tke_nn is None`` ⇒ the scalar constants pass through UNCHANGED
@@ -199,7 +224,8 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
         tke, vshear2, bvfreq2, hnode, dz_trr, forc_tke_surf, nlev,
         c_k=c_k, c_eps=c_eps, cd=cd,
         alpha_tke=params.tke_alpha, mxl_min=cfg.mxl_min, tke_min=cfg.tke_min,
-        kappaM_max=cfg.kappaM_max, dt=dt, with_diags=False)
+        kappaM_max=cfg.kappaM_max, dt=dt, with_diags=False,
+        iw_diss=iw_diss, alpha_c=alpha_c, E_iw=E_iw)
 
     # --- Kv/Av wiring (fesom_tke.c:484-505, pre-mo_convect) + the shared mo_convect ---
     Kv, Av = _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch)

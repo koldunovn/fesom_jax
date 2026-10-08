@@ -212,19 +212,31 @@ def reconstruct_global(out_dir, field: str):
     Auto-detects the on-disk layout: a ``layout='canonical_global'`` store (the partition-independent
     default) is ALREADY dense global ⇒ returned as-is; a folded store scatters the OWNED lanes by
     their global id. Inverse of :func:`write_state_zarr` for one field — for analysis / the restart
-    reload, not the hot path."""
+    reload, not the hot path.
+
+    ``iwe`` (the IDEMIX wave energy) is absent from a restart written before IDEMIX joined
+    ``State``; it then comes back as zeros (the IDEMIX cold start) shaped like ``tke``, the other
+    ``[nod2D, nl]`` interface field, from metadata only."""
     import zarr
     root = zarr.open_group(str(Path(out_dir)), mode="r")
+    canonical = root.attrs.get("layout") == "canonical_global"
+
+    def n_global(kind):
+        return {"nod": int(root.attrs["nod2D"]), "elem": int(root.attrs["elem2D"]),
+                "edge": int(root.attrs["edge2D"])}[kind]
+
+    if field == "iwe" and field not in root:
+        tke = root["tke"]
+        shape = tke.shape if canonical else (n_global(tke.attrs["kind"]),) + tke.shape[1:]
+        return np.zeros(shape, dtype=tke.dtype)
     z = root[field]
-    if root.attrs.get("layout") == "canonical_global":
+    if canonical:
         return z[:]                                           # already dense global [n_global, …]
     kind = z.attrs["kind"]
     data = z[:]                                            # [P*Lmax, …]
     gid = root[f"gid_{kind}"][:]
     owned = root[f"owned_{kind}"][:]
-    n_global = {"nod": int(root.attrs["nod2D"]), "elem": int(root.attrs["elem2D"]),
-                "edge": int(root.attrs["edge2D"])}[kind]
-    out = np.zeros((n_global,) + data.shape[1:], dtype=data.dtype)
+    out = np.zeros((n_global(kind),) + data.shape[1:], dtype=data.dtype)
     out[gid[owned]] = data[owned]
     return out
 
@@ -321,7 +333,11 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     Returns ``(State, meta)`` where ``State`` has folded sharded leaves ready for
     ``run_steps_sharded`` and ``meta`` carries ``step`` / ``calendar_date`` / ``dt_stage``
     (+ the global counts). ``devices`` overrides the placement devices (default: the first
-    ``new_part.npes`` of :func:`jax.devices`)."""
+    ``new_part.npes`` of :func:`jax.devices`).
+
+    A restart written before the IDEMIX ``iwe`` leaf existed has no ``iwe`` dataset: it loads
+    with ``iwe = 0`` (see :func:`reconstruct_global`) — the IDEMIX cold start, Fortran
+    ``iwe_n(:,:) = 0``. Every OTHER leaf stays mandatory (a missing one raises ``KeyError``)."""
     import zarr
     from . import halo
     from .integrate_sharded import _fold

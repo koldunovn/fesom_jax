@@ -49,6 +49,19 @@ def _build_partition(mesh, partition_spec, dist_dir):
     return partit.read_partition(Path(dist_dir), npes)
 
 
+def _snapshot_kw(args, cfg):
+    """The opt-in snapshot / IDEMIX-budget output kwargs of run_from_config (empty ⇒ inert)."""
+    kw = {}
+    if args.snapshot_out is not None:
+        kw["snapshot_out"] = args.snapshot_out
+        kw["snapshot_every"] = args.snapshot_every or cfg.snapshot_every
+        if args.snapshot_fields:
+            kw["snapshot_fields"] = tuple(f.strip() for f in args.snapshot_fields.split(","))
+    if args.idemix_budget_out is not None:
+        kw["idemix_budget_out"] = args.idemix_budget_out
+    return kw
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("config", help="RunConfig YAML")
@@ -137,6 +150,20 @@ def main():
                          "multi-process OUTPUT uses all_gather (the restart auto-folds). DEFAULT: "
                          "'global' everywhere. Pass 'folded' for the gather-free fastest write, or if "
                          "all_gather output would OOM on a huge multi-node mesh.")
+    ap.add_argument("--snapshot-out", default=None,
+                    help="write INSTANTANEOUS State snapshots (snap_<step>.npz, canonical global "
+                         "node order, single process) to this dir every --snapshot-every steps")
+    ap.add_argument("--snapshot-every", type=int, default=None,
+                    help="snapshot cadence in steps (default: the config's snapshot_every)")
+    ap.add_argument("--snapshot-fields", default=None,
+                    help="comma-separated State leaves to snapshot (default: "
+                         "fesom_jax.run.SNAPSHOT_FIELDS)")
+    ap.add_argument("--idemix-budget-out", default=None,
+                    help="write the per-day mean of the per-step IDEMIX wave-energy budget "
+                         "(day_<YYYY>_<DOY>.npz, [nod2D] column sums) to this dir; needs idemix: "
+                         "and one device")
+    ap.add_argument("--memory-stats", action="store_true",
+                    help="print the device memory stats (peak bytes in use) at the end")
     args = ap.parse_args()
     # Default to the partition-independent 'global' canonical layout EVERYWHERE: single-process
     # host-gathers, multi-process output uses all_gather (and the restart auto-folds, since the
@@ -248,10 +275,17 @@ def main():
                           restart_archive_length=args.restart_archive_length,
                           daily_out=args.daily_out, daily_start_step=args.daily_start_step,
                           monthly_out=args.monthly_out, monthly_start_step=args.monthly_start_step,
-                          chunk_diagnostics=args.chunk_diagnostics, output_layout=args.output_layout)
+                          chunk_diagnostics=args.chunk_diagnostics, output_layout=args.output_layout,
+                          **_snapshot_kw(args, cfg))
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")
+    if args.memory_stats and _IS_LEAD:
+        for d in jax.local_devices():
+            ms = d.memory_stats() or {}
+            print(f"[run] memory {d}: peak_bytes_in_use={ms.get('peak_bytes_in_use')} "
+                  f"bytes_in_use={ms.get('bytes_in_use')} bytes_limit={ms.get('bytes_limit')}",
+                  flush=True)
 
     if cfg.ice is None and cfg.forcing is not None:
         # `ice: null` on a FORCED run is a diagnostic setting, not supported physics: without ice
