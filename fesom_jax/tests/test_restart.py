@@ -203,6 +203,33 @@ def test_restart_folded_layout_roundtrip(tmp_path):
 
 
 @avail
+@pytest.mark.parametrize("layout", ["global", "folded"])
+def test_restart_without_iwe_loads_iwe_as_zero(tmp_path, layout):
+    """A restart written before the IDEMIX ``iwe`` leaf existed (no ``iwe`` dataset) still loads:
+    ``reconstruct_global`` (what ``core2_adj.load_state`` uses) and ``read_restart`` return
+    ``iwe = 0`` shaped like ``tke``, and every other leaf exactly as written."""
+    mesh = load_mesh(PI_MESH)
+    g0 = _signature_state(mesh)
+    p = min(2, NDEV)
+    saved, sm, part = _to_folded_sharded(g0, mesh, p)
+    d = tmp_path / f"no_iwe_{layout}"
+    fields = tuple(f for f in zo._all_state_fields() if f != "iwe")
+    zo.write_restart(d, saved, sm, part, step=7, calendar_date="1958-01-02", dt_stage=1800.0,
+                     fields=fields, layout=layout)
+    full = State(**{f: zo.reconstruct_global(d, f) for f in zo._all_state_fields()})
+    tke = np.asarray(g0.tke)
+    assert full.iwe.shape == tke.shape and full.iwe.dtype == tke.dtype
+    assert not np.any(full.iwe)
+    for f in fields:
+        assert np.array_equal(getattr(full, f), np.asarray(getattr(g0, f))), f
+    loaded, _ = zo.read_restart(d, mesh, part)
+    got = _unfold_host(loaded, p)
+    ref = shard_mesh.partition_state(dataclasses.replace(g0, iwe=jnp.zeros_like(g0.iwe)), part)
+    for f in dataclasses.fields(State):
+        assert np.array_equal(np.asarray(getattr(ref, f.name)), got[f.name]), f.name
+
+
+@avail
 @need4
 def test_restart_canonical_partition_independent(tmp_path):
     """The DEFAULT (canonical 'global') restart is partition-INDEPENDENT: the same global State saved
