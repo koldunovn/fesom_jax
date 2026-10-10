@@ -27,6 +27,10 @@ def fortran_day(d: Path, var: str, year: int, k: int, n: int) -> np.ndarray:
         v = ds.variables[var]
         v.set_auto_mask(False)
         a = np.asarray(v[k], np.float64)
+        fill = getattr(v, "_FillValue", None)
+    # FESOM writes _FillValue where a field is undefined (the ice fields where there is no ice)
+    if fill is not None:
+        a = np.where(np.abs(a) >= 0.5 * abs(float(fill)), 0.0 if var in ("a_ice", "m_ice") else np.nan, a)
     if a.shape[-1] != n:
         a = np.moveaxis(a, [i for i, s in enumerate(a.shape) if s == n][0], -1)
     return a.reshape(n)
