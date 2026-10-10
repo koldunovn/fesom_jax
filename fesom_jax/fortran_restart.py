@@ -39,6 +39,36 @@ ICE_MAP = {"a_ice": "area", "m_ice": "hice", "m_snow": "hsnow", "u_ice": "uice",
 LAYER_FIELDS = ("T", "S", "T_old", "S_old", "hnode", "uv", "uv_rhsAB")
 INTERFACE_FIELDS = ("w", "w_e", "w_i", "tke")
 
+#: Where every State field of a converted restart comes from, and whether one fesom-jax step
+#: reads it (measured on CORE2 by ``scripts/fortran_restart/carried_fields.py``, 2026-10-10:
+#: each field perturbed, one step, outputs compared). Every field the step reads is either
+#: restarted, rebuilt like FESOM rebuilds it, or set to the value FESOM itself restarts with.
+SOURCES = {
+    # read by the step, from the Fortran restart
+    "T": "restart", "S": "restart", "T_old": "restart", "S_old": "restart", "uv": "restart",
+    "uv_rhsAB": "restart", "w_e": "restart", "eta_n": "restart", "hnode": "restart",
+    "hbar": "restart", "tke": "restart", "a_ice": "restart", "m_ice": "restart",
+    "m_snow": "restart", "u_ice": "restart", "v_ice": "restart",
+    # read, rebuilt as FESOM's restart_thickness_ale / ale.commit_thickness do
+    "helem": "derived",
+    # read, at the value FESOM restarts with: the CG warm start (FESOM's d_eta starts at 0), the
+    # ice skin temperature (not in the restart; FESOM keeps its initial value), the mEVP stresses
+    "d_eta": "reference", "t_skin": "reference", "sigma11": "zero", "sigma12": "zero",
+    "sigma22": "zero",
+    # read only into themselves (accumulators with no effect on the other outputs)
+    "del_ttf": "reference", "uvnode_rhs": "reference",
+    # not read: the step recomputes them (restarted or rebuilt anyway where FESOM has them)
+    "w": "restart", "w_i": "restart", "ssh_rhs_old": "restart", "hnode_new": "derived",
+    "hbar_old": "derived", "uv_rhs": "reference", "uvnode": "reference", "cfl_z": "reference",
+    "ssh_rhs": "reference", "density": "reference", "hpressure": "reference",
+    "bvfreq": "reference", "Kv": "reference", "Av": "reference", "pgf_x": "reference",
+    "pgf_y": "reference",
+}
+#: the fields one step reads (the same measurement)
+STEP_READS = ("T", "S", "T_old", "S_old", "del_ttf", "uv", "uv_rhsAB", "uvnode_rhs", "w_e",
+              "eta_n", "d_eta", "hnode", "helem", "hbar", "tke", "a_ice", "m_ice", "m_snow",
+              "u_ice", "v_ice", "t_skin", "sigma11", "sigma12", "sigma22")
+
 
 class FortranRestart:
     """One restart group (``oce`` or ``ice``): a NetCDF file, or a directory of per-variable
@@ -81,7 +111,11 @@ class FortranRestart:
         if tdim:
             a = np.take(a, -1, axis=tdim[0])
             dims.pop(tdim[0])
-        ent = [i for i, s in enumerate(a.shape) if s == n_entities]
+        # the entity axis by its name (FESOM2: node / elem), by its size only as a fallback
+        ent = [i for i, d in enumerate(dims) if d.lower().startswith(("node", "nod", "elem"))
+               and a.shape[i] == n_entities]
+        if not ent:
+            ent = [i for i, s in enumerate(a.shape) if s == n_entities]
         if len(ent) != 1:
             raise ValueError(f"{name}: no unique axis of size {n_entities} in shape {a.shape} "
                              f"(dims {dims})")
