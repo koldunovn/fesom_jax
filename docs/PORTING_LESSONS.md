@@ -9942,3 +9942,58 @@ one-GPU reproduction did not reproduce it (XLA chose tracer-major there by itsel
 away: each updated column as its own kernel behind `lax.optimization_barrier`, then a plain stack (14.0 -> 6.2 ms;
 DP 65.7 -> 60.1, SP 36.3 -> 32.6 ms on 4 GH200, job 28473598). Rule (d): a layout constraint fixes the layout of
 its own result, not of what feeds it; to change how a producer is laid out, change what it is fused with.
+
+### 2026-10-10 (Fortran restart converter, CORE2) — a FESOM2 restart becomes a fesom-jax restart
+
+Why: farc needs a spun-up state. JAX-farc runs 0.62 s/step on one GH200 and 0.38 s/step on a node, i.e. one to
+1.5 days for five years. Fortran FESOM2 on CPU does the same in hours. The missing piece was the restart conversion.
+
+What FESOM2 restarts (fesom27 `io_restart.F90`):
+* Format: a directory per group, `fesom.<YYYY>.oce.restart/` and `fesom.<YYYY>.ice.restart/`, with one NetCDF per
+  variable. Dimensions are (time, nz_1 or nz, node or elem).
+* Ocean: ssh, hbar, ssh_rhs_old, hnode, u, v, urhs_AB, vrhs_AB, temp, salt, temp_AB, salt_AB, temp_M1, salt_M1,
+  w, w_expl, w_impl, tke.
+* Ice: area, hice, hsnow, uice, vice. `ice_temp` is optional and is not written by this build.
+* Not stored: the mEVP stresses, Kv/Av, and the per-step diagnostics.
+
+Which State fields one fesom-jax step reads (`scripts/fortran_restart/carried_fields.py`; each field perturbed,
+one CORE2 step, outputs compared): 24 of 40.
+* From the restart: T, S, T_old, S_old, uv, uv_rhsAB, w_e, eta_n, hnode, hbar, tke and the ice state.
+* Rebuilt as the JAX commit does: helem, the element mean of hnode.
+* Set to the value FESOM itself restarts with:
+  * d_eta = 0. It is only the CG warm start.
+  * t_skin from the initial state. It is not in the restart.
+  * The mEVP stresses = 0.
+* del_ttf and uvnode_rhs feed only their own outputs.
+* The other 16 fields the step recomputes, ssh_rhs_old and hbar_old among them.
+
+`fesom_jax.fortran_restart.SOURCES` records this table, and a test fails when a State field is added without an
+entry.
+
+Validation on CORE2:
+* Setup:
+  * The Fortran run uses the JAX's pre-2026-07-03 levels; the mesh copy is
+    `fesom_jax_dev/fortran/meshes/core2_prefix`.
+  * Fortran January 1958 from the PHC cold start, then the Feb-1 restart.
+  * Fortran February continued with daily means.
+  * JAX February started (a) from the converted restart and (b) from its own cold start in January.
+* The conversion takes 17-37 s on CPU. The wet lanes match the Fortran files bitwise (test).
+* The JAX start shows no shock: first-day cfl_z 0.63, then 0.4-0.5; the cold start has 1.07.
+* RMS difference to the Fortran daily means (area-weighted), converted / cold:
+
+| day | SST °C | SSS | SSH mm | a_ice | m_ice mm | NH ice area 10^6 km² (Fortran) |
+|---|---|---|---|---|---|---|
+| Feb 1 | 0.004 / 0.033 | 0.0014 / 0.050 | 0.44 / 1.5 | 0.0011 / 0.010 | 1.3 / 15 | 15.450 / 15.463 (15.453) |
+| Feb 7 | 0.015 / 0.030 | 0.006 / 0.040 | 0.10 / 1.4 | 0.0035 / 0.010 | 5.1 / 15 | 15.722 / 15.740 (15.734) |
+| Feb 28 | 0.016 / 0.026 | 0.007 / 0.019 | 0.10 / 1.0 | 0.0070 / 0.011 | 10 / 14 | 16.443 / 16.466 (16.459) |
+
+Lesson: restarting from the converted Fortran state puts fesom-jax 9-35× closer to Fortran on the first day than its
+own spin-up does. What remains, growing over days, is the difference between the two codes, not the conversion.
+* The axis order of a restart variable is decided by the dimension NAME (node/elem): with as many levels as nodes
+  the size is ambiguous, which the synthetic test caught.
+* FESOM writes `_FillValue` (~1e37) in the ice fields wherever there is no ice (69 % of the CORE2 nodes in
+  February). Any comparison has to read it as 0.
+* The Fortran mesh must carry the same levels as the JAX export; /pool's CORE2 changed on 2026-07-03.
+
+Code: branch fortran-restart (fesom_jax/fortran_restart.py, scripts/fortran_restart/{convert,carried_fields,
+compare_daily}.py, fesom_jax/tests/test_fortran_restart.py).
