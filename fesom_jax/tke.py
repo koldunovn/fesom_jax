@@ -87,6 +87,14 @@ class TkeConfig(NamedTuple):
     #                               "ramp_kv" (Kv ramp, Av switch), "off"
     conv_ramp_dn2: float = 1.0e-6  # "ramp"/"ramp_kv": N² width (s⁻²) of the one-sided ramp (pp.mo_convect)
 
+    # --- research knob (NOT in the FESOM namelist; default = the C/Fortran literal) ---
+    # the N² floor of the unconstrained mixing length √2·√tke/√max(floor, N²)
+    # (cvmix_tke.F90:671 ``max(1d-12,Nsqr)``). The default 1e-12 is bitwise the program
+    # before this field existed; a larger floor caps the mixing length in weakly stratified
+    # water and CHANGES THE FORWARD (it departs from FESOM). Kept last so positional
+    # construction of the fields above is unchanged.
+    mxl_nsqr_floor: float = 1.0e-12
+
     # NOTE: how the BACKWARD pass treats this closure is NOT set here — it is one flag of
     # :class:`fesom_jax.adjoint_stab.AdjointConfig` (``freeze_mixing=True``), passed to ``step`` as
     # ``adjoint_cfg``, so that every backward-only simplification lives in one object rather
@@ -97,6 +105,9 @@ class TkeConfig(NamedTuple):
         parity). Called at the step seam whenever ``tke_cfg is not None``; returns ``self``
         so it can wrap an expression. ``tke_cfg=None`` is the KPP/PP path and never reaches
         here."""
+        if not (math.isfinite(self.mxl_nsqr_floor) and self.mxl_nsqr_floor > 0.0):
+            raise ValueError(f"TkeConfig.mxl_nsqr_floor must be finite and > 0 (the N^2 floor "
+                             f"of the mixing length; default 1e-12), got {self.mxl_nsqr_floor!r}")
         if self.l_lc or self.use_dirichlet or self.mxl_choice != 2:
             raise ValueError(
                 "TkeConfig only supports the classical-TKE reference config "
@@ -361,7 +372,8 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
         n2_raw=_f_opt(inp.get("Nsqr_raw")), ice_conc=_f_opt(ice_conc),
         lat=(None if tke_adj is None or tke_adj.pr_lat is None
              else _f(mesh.geo_coord_nod2D[:, 1])), turner=turner,
-        iw_diss=_f_opt(iw_diss), alpha_c=_f_opt(alpha_c), E_iw=_f_opt(E_iw))
+        iw_diss=_f_opt(iw_diss), alpha_c=_f_opt(alpha_c), E_iw=_f_opt(E_iw),
+        mxl_nsqr_floor=cfg.mxl_nsqr_floor)
     tke_new, KappaM, KappaH = PR.wp(tke_new), PR.wp(KappaM), PR.wp(KappaH)
     if cavity:
         tke_new, KappaM, KappaH = _down(tke_new), _down(KappaM), _down(KappaH)

@@ -230,7 +230,7 @@ def pr_region_masks(adj, *, ice_conc=None, lat=None, turner=None) -> dict:
 
 def mixing_length(tke_old, Nsqr, dzw, *, is_surf, is_bot, is_interior, is_wet_iface,
                   mxl_min, cuts=frozenset(), ml_n2_star=None, ml_ratio=None, ml_raw_cut=None,
-                  n2_raw=None):
+                  n2_raw=None, mxl_nsqr_floor=1.0e-12):
     """Part 1 — the Blanke–Delecluse mixing length ``mxl`` (``fesom_cvmix_tke.c:222-237``).
     Returns ``(mxl, sqrttke)`` ``[N, nl]``. ``alpha_tke`` does NOT enter here (it is only
     the TKE-diffusivity multiplier). All level info via the boolean masks (per-node
@@ -238,7 +238,11 @@ def mixing_length(tke_old, Nsqr, dzw, *, is_surf, is_bot, is_interior, is_wet_if
     ``tke.ml_wall`` (see :func:`integrate_tke_column`). ``ml_n2_star``: no N² derivative of
     the free length where N² < ``ml_n2_star`` (``AdjointConfig.tke_ml_cut``); ``ml_ratio`` /
     ``ml_raw_cut``: nor where ``|n2_raw| > ml_ratio·|N²|`` or ``n2_raw < ml_raw_cut``
-    (``AdjointConfig.tke_ml_ratio`` / ``tke_ml_raw_cut``; ``n2_raw`` the unsmoothed N²)."""
+    (``AdjointConfig.tke_ml_ratio`` / ``tke_ml_raw_cut``; ``n2_raw`` the unsmoothed N²).
+    ``mxl_nsqr_floor`` is the N² floor of the unconstrained length
+    ``√2·sqrttke/√max(floor, N²)``; the default ``1e-12`` is the C/Fortran literal (bitwise
+    the pre-floor-knob program), anything else departs from FESOM (``TkeConfig``). The
+    mixing-length cuts act on the N² inside the floor, as before."""
     sqrttke = _safe_sqrt(tke_old)                                        # :668
     n2_ml = dcut(cuts, "tke.ml_n2", Nsqr)
     if ml_n2_star is not None or ml_ratio is not None or ml_raw_cut is not None:
@@ -247,10 +251,11 @@ def mixing_length(tke_old, Nsqr, dzw, *, is_surf, is_bot, is_interior, is_wet_if
         n2_ml = cut_where(n2_ml, union_mask(n2_cut_masks(
             Nsqr, n2_raw, n2_star=ml_n2_star, ratio=ml_ratio, raw_cut=ml_raw_cut,
             what="tke_ml_ratio / tke_ml_raw_cut")))
-    # unconstrained length √2·sqrttke/√max(1e-12,N²) (:671). At the surface+bottom the
+    # unconstrained length √2·sqrttke/√max(1e-12,N²) (:671; the floor is the static
+    # mxl_nsqr_floor, default that 1e-12). At the surface+bottom the
     # driver zeroes N² ⇒ this blows up there, but the C overrides those endpoints to 0:
     mxl0 = (jnp.sqrt(2.0) * dcut(cuts, "tke.ml_e", sqrttke)
-            / jnp.sqrt(jnp.maximum(1.0e-12, n2_ml)))
+            / jnp.sqrt(jnp.maximum(mxl_nsqr_floor, n2_ml)))
     mxl = jnp.where(is_surf | is_bot, 0.0, mxl0)                         # :676-677
 
     # forward + backward Blanke–Delecluse wall constraints. dzw padded to a finite value
@@ -278,7 +283,7 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
                          *, c_k, c_eps, cd, alpha_tke, mxl_min, tke_min, kappaM_max,
                          dt, with_diags=False, cuts=frozenset(), adj=None, n2_raw=None,
                          ice_conc=None, lat=None, turner=None,
-                         iw_diss=None, alpha_c=None, E_iw=None):
+                         iw_diss=None, alpha_c=None, E_iw=None, mxl_nsqr_floor=1.0e-12):
     """The classical-TKE column solver, vectorized over nodes. Mirrors
     ``fesom_cvmix_integrate_tke`` (``fesom_cvmix_tke.c:141-404``) for the reference config
     (``only_tke``, Neumann BCs, ``mxl_choice=2``) and, through the keyword-only ``iw_diss`` /
@@ -296,7 +301,9 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
       * ``forc_tke_surf`` ``[N]`` — surface TKE flux ``|stress|/ρ₀`` (≥0);
       * ``nlev`` ``[N]`` int — per-node layer count (bottom interface at ``k=nlev``).
     The trainable constants ``c_k``/``c_eps``/``cd``/``alpha_tke`` are scalars (``Params``
-    leaves); the structural statics ``mxl_min``/``tke_min``/``kappaM_max`` from ``TkeConfig``.
+    leaves); the structural statics ``mxl_min``/``tke_min``/``kappaM_max`` from ``TkeConfig``,
+    and ``mxl_nsqr_floor`` (``TkeConfig.mxl_nsqr_floor``): the N² floor of the mixing length
+    (default ``1e-12``, the C literal; :func:`mixing_length`).
 
     ``cuts`` (static set of names from :data:`fesom_jax.adjoint_stab.KNOWN_CUTS`,
     ``AdjointConfig.diag_cuts``): diagnostic derivative cuts inside the closure, each a
@@ -390,7 +397,8 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
         is_wet_iface=is_wet_iface, mxl_min=mxl_min, cuts=cuts,
         ml_n2_star=None if adj is None else adj.ml_n2_star,
         ml_ratio=None if adj is None else adj.ml_ratio,
-        ml_raw_cut=None if adj is None else adj.ml_raw_cut, n2_raw=n2_raw)
+        ml_raw_cut=None if adj is None else adj.ml_raw_cut, n2_raw=n2_raw,
+        mxl_nsqr_floor=mxl_nsqr_floor)
 
     # the S² / N² the production, buoyancy and Ri terms see (the mixing length's N² is cut
     # separately, as tke.ml_n2). With no cut these are the inputs themselves.

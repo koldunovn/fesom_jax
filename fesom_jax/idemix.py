@@ -62,7 +62,7 @@ import numpy as np
 
 from idemix_jax.forcing import IdemixForcing
 from idemix_jax.mesh import (horizontal_propagation, idemix_step_columns, masks_from_levels,
-                             neighbors_from_edges)
+                             neighbors_from_edges, validate_lateral_inputs)
 from idemix_jax.params import IdemixParams
 
 from . import pp, tke
@@ -162,10 +162,15 @@ def build_lateral_operator(mesh) -> LateralOperator:
     ``mesh.edge_cross_dxdy`` (the two edge-midpoint→element-centroid segments, m; one is
     zero on a boundary edge), ``node_dist`` = the great-circle distance between the edge's
     two nodes (``geo_coord_nod2D``, radius ``R_EARTH``). ``resolution`` =
-    ``mesh.mesh_resolution``. Raises on a cavity mesh (:func:`check_no_cavity_mesh`), or if a
-    node column has no wet layer (:func:`check_wet_columns`)."""
+    ``mesh.mesh_resolution``. Raises on a cavity mesh (:func:`check_no_cavity_mesh`), if a node
+    column has no wet layer (:func:`check_wet_columns`), or if the per-interface area
+    :func:`interface_area` the lateral step will use is not finite and > 0 on every wet interface
+    (``idemix_jax.mesh.validate_lateral_inputs``: ``horizontal_propagation`` silently
+    exchanges nothing at such an interface, which hid the per-layer ``areasvol`` bug of
+    patch 0003 for a whole campaign). All checks are host-side NumPy and change no number."""
     check_no_cavity_mesh(mesh)
     check_wet_columns(mesh)
+    validate_lateral_inputs(np.asarray(interface_area(mesh)), np.asarray(_wet_interfaces(mesh)))
     edges = np.asarray(mesh.edges)
     cross = np.asarray(mesh.edge_cross_dxdy, dtype=np.float64)
     cross_len = np.hypot(cross[:, 0], cross[:, 1]) + np.hypot(cross[:, 2], cross[:, 3])
