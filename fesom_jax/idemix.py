@@ -60,6 +60,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from idemix_jax.core import idemix_step
 from idemix_jax.forcing import IdemixForcing
 from idemix_jax.mesh import (horizontal_propagation, idemix_step_columns, masks_from_levels,
                              neighbors_from_edges, validate_lateral_inputs)
@@ -96,6 +97,35 @@ class LateralOperator(NamedTuple):
     nbr_idx: jax.Array      # [N, max_deg] int32; pad slots hold the own index
     nbr_weight: jax.Array   # [N, max_deg] float64, symmetric, >= 0; 0 on pad slots
     resolution: jax.Array   # [N] m (mesh.mesh_resolution), for the v0 CFL cap
+
+
+class IdemixParamsField(NamedTuple):
+    """Per-node LOG multipliers of IDEMIX constants (``Params.idemix_field``; idemix-jax patch
+    0010): node ``i`` runs with ``mu0 * exp(log_mu0[i])`` and the bottom energy flux
+    ``fbot[i] * exp(log_fbot[i])``. Each entry is a ``[nod2D]`` float array or ``None`` (that
+    constant stays the scalar / the forcing as given). The gradient w.r.t. a field at 0 is the
+    sensitivity map ``dJ/d log mu0(x)`` (``dJ/d log fbot(x)``), one reverse pass for every node;
+    its sum over the nodes is the gradient w.r.t. the scalar ``log mu0`` (``log`` of a uniform
+    scaling of ``fbot``). A pytree: ``None`` entries carry no leaves. Dense (unsharded) runs
+    only — the arrays index the global mesh."""
+
+    log_mu0: jax.Array | None = None    # [nod2D] log multiplier of params.mu0
+    log_fbot: jax.Array | None = None   # [nod2D] log multiplier of forcing.fbot
+
+
+def _field_active(params_field) -> bool:
+    return params_field is not None and (params_field.log_mu0 is not None
+                                         or params_field.log_fbot is not None)
+
+
+def _check_field(mesh, params_field) -> None:
+    """Static shape check (trace time) of an active :class:`IdemixParamsField`."""
+    n = int(mesh.nod2D)
+    for name in IdemixParamsField._fields:
+        x = getattr(params_field, name)
+        if x is not None and tuple(jnp.shape(x)) != (n,):
+            raise ValueError(f"IdemixParamsField.{name} must have shape ({n},) (one value per "
+                             f"node), got {tuple(jnp.shape(x))}")
 
 
 class IdemixOut(NamedTuple):
@@ -211,19 +241,51 @@ def _v0_cap(params_idemix: IdemixParams, cfg: IdemixConfig, lateral_op: LateralO
                     / (params_idemix.tau_h * sub_dt))
 
 
-def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_op, dt, Z3d):
+def _columns_per_node_mu0(iwe, bvfreq, dzw, dzt, coriolis, fsrf, fbot, dt, params_idemix,
+                          mu0_node, is_wet):
+    """``idemix_step_columns``'s masked column step with ``mu0`` per column (``mu0_node``
+    ``[nod2D]``): ``idemix_jax.core.idemix_step`` vmapped over the columns with the parameters'
+    ``mu0`` batched and the other four shared (the library's column map closes over one
+    ``IdemixParams``)."""
+    def one(E, N2, dw, dz, f, fs, fb, w, m):
+        return idemix_step(E, N2, dw, dz, f, fs, fb, dt, params=params_idemix._replace(mu0=m),
+                           forc=jnp.zeros_like(E), is_wet=w)
+
+    return jax.vmap(one)(iwe, bvfreq, dzw, dzt, coriolis, fsrf, fbot,
+                         jnp.asarray(is_wet, dtype=bool), mu0_node)
+
+
+def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_op, dt, Z3d,
+                 params_field=None):
     """The step's IDEMIX evaluation: ``(res, iwe_new, dzt, is_wet)`` — the column result
     (:class:`idemix_jax.mesh` ``idemix_step_columns``) and the energy after the lateral step.
     Shared by :func:`mixing_idemix` and :func:`budget_terms` so the budget re-evaluates exactly
-    the step's arithmetic."""
+    the step's arithmetic. ``params_field`` (:class:`IdemixParamsField`): per-node log
+    multipliers of ``mu0`` and of the bottom forcing; ``None`` (or all entries ``None``) is the
+    scalar path, unchanged."""
     nl = mesh.nl
     is_wet = _wet_interfaces(mesh)
     dzw = hnode[:, :nl - 1]
     dzt = tke.interface_spacing(mesh, hnode, Z3d)
-    res = idemix_step_columns(
-        iwe, bvfreq, dzw, dzt, mesh.coriolis_node,
-        jnp.asarray(forcing.fsrf), jnp.asarray(forcing.fbot), dt, params_idemix,
-        forc=None, is_wet=is_wet)
+    if not _field_active(params_field):
+        res = idemix_step_columns(
+            iwe, bvfreq, dzw, dzt, mesh.coriolis_node,
+            jnp.asarray(forcing.fsrf), jnp.asarray(forcing.fbot), dt, params_idemix,
+            forc=None, is_wet=is_wet)
+    else:
+        _check_field(mesh, params_field)
+        fbot = jnp.asarray(forcing.fbot)
+        if params_field.log_fbot is not None:
+            fbot = fbot * jnp.exp(params_field.log_fbot)
+        if params_field.log_mu0 is None:
+            res = idemix_step_columns(
+                iwe, bvfreq, dzw, dzt, mesh.coriolis_node, jnp.asarray(forcing.fsrf), fbot,
+                dt, params_idemix, forc=None, is_wet=is_wet)
+        else:
+            mu0_node = params_idemix.mu0 * jnp.exp(params_field.log_mu0)
+            res = _columns_per_node_mu0(iwe, bvfreq, dzw, dzt, mesh.coriolis_node,
+                                        jnp.asarray(forcing.fsrf), fbot, dt, params_idemix,
+                                        mu0_node, is_wet)
 
     if cfg.lateral:
         v0 = res.v0
@@ -241,17 +303,25 @@ def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_
 def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
                   params_idemix: IdemixParams, cfg: IdemixConfig,
                   lateral_op: LateralOperator | None, *, dt: float, Z3d=None,
-                  sharded: bool = False) -> IdemixOut:
+                  sharded: bool = False,
+                  params_field: IdemixParamsField | None = None) -> IdemixOut:
     """One IDEMIX step on the nodes: the masked implicit column step, then (``cfg.lateral``)
     the explicit lateral propagation of the column-step energy (module docstring, rulings
     1-3). ``iwe``/``bvfreq``/``hnode`` are the ``[nod2D, nl]`` host fields; ``forcing`` the
     per-node surface/bottom energy fluxes [m^3/s^3]; ``Z3d`` the live zstar layer centers
     (``None`` ⇒ static mesh, as :func:`fesom_jax.tke.interface_spacing`). ``sharded=True``
-    with ``cfg.lateral`` raises: the neighbor arrays index the global mesh. A concrete cavity
-    mesh raises (:func:`check_no_cavity_mesh`); a traced one cannot be read."""
+    with ``cfg.lateral`` raises: the neighbor arrays index the global mesh.
+    ``params_field`` (:class:`IdemixParamsField`, ``Params.idemix_field``): per-node log
+    multipliers of ``mu0`` and of the bottom forcing ``fbot``; ``None`` (default) ⇒ the scalar
+    path, bitwise unchanged; refused with ``sharded=True``. A concrete cavity mesh raises
+    (:func:`check_no_cavity_mesh`); a traced one cannot be read."""
     cfg.validate()
     if not _is_traced(mesh):
         check_no_cavity_mesh(mesh)
+    if sharded and _field_active(params_field):
+        raise NotImplementedError(
+            "Params.idemix_field (per-node IDEMIX multipliers) is dense/1-device only: its "
+            "arrays index the global mesh")
     if cfg.lateral and sharded:
         raise NotImplementedError(
             "IDEMIX lateral propagation is dense/1-device only: neighbor arrays index the "
@@ -260,7 +330,7 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
         raise ValueError("IdemixConfig.lateral=True needs a LateralOperator "
                          "(build_lateral_operator(mesh))")
     res, iwe_new, _, _ = _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg,
-                                      lateral_op, dt, Z3d)
+                                      lateral_op, dt, Z3d, params_field)
     return IdemixOut(iwe_new=iwe_new, iw_diss=res.iw_diss, alpha_c=res.alpha_c,
                      E_iw=res.E_iw, KappaH=res.KappaH, KappaM=res.KappaM)
 
@@ -272,14 +342,15 @@ BUDGET_TERMS = ("dEdt", "P_surf", "P_bot", "D", "Dif", "Lat", "E", "abs_resid",
 
 def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixParams,
                  cfg: IdemixConfig, lateral_op: LateralOperator | None, *, dt: float,
-                 Z3d=None) -> dict:
+                 Z3d=None, params_field: IdemixParamsField | None = None) -> dict:
     """Per-node (column-summed) wave-energy budget of the model step ``s0 -> s1`` [m^5/s^3]
     (multiply by ``rho0`` for W). A diagnostic only — the step never calls it.
 
     Re-evaluates the step's IDEMIX call (:func:`_idemix_core`, the code
     :func:`mixing_idemix` runs) on the step's exact inputs: ``s0.iwe``, ``s1.bvfreq`` (the
     step computes N^2 from the start-of-step T/S and carries it), ``s0.hnode`` and ``Z3d`` =
-    the live zstar layer centres of ``s0.hnode`` (``None`` = static). Volumes
+    the live zstar layer centres of ``s0.hnode`` (``None`` = static), and the step's
+    ``params_field`` (``Params.idemix_field``; ``None`` = the scalar path). Volumes
     ``V = interface_area * dzt``. Each entry is a ``[nod2D]`` sum over the column's wet
     interfaces (sum over nodes for the global budget):
 
@@ -302,7 +373,8 @@ def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixPara
     if not _is_traced(mesh):
         check_no_cavity_mesh(mesh)
     res, iwe_new, dzt, is_wet = _idemix_core(mesh, s0.iwe, s1.bvfreq, s0.hnode, forcing,
-                                             params_idemix, cfg, lateral_op, dt, Z3d)
+                                             params_idemix, cfg, lateral_op, dt, Z3d,
+                                             params_field)
     V = interface_area(mesh) * dzt
 
     def col(x):

@@ -50,7 +50,10 @@ from .params import Params
 _NON_SCALAR_FIELDS = frozenset({"tke_nn", "gm_nn", "surface_adj", "ice_ctrl",
                                 # IDEMIX constants (an idemix_jax.IdemixParams of five scalars,
                                 # idemix-jax host patch 0004): a pytree, not one scalar.
-                                "idemix"})
+                                "idemix",
+                                # IDEMIX per-node log-multiplier field (an IdemixParamsField of
+                                # [nod2D] arrays, idemix-jax host patch 0010): not a scalar.
+                                "idemix_field"})
 _SCALAR_FIELDS = tuple(f.name for f in dataclasses.fields(Params)
                        if f.name not in _NON_SCALAR_FIELDS)
 

@@ -8,7 +8,8 @@ onto d7e4e5d): each unsupported combination raises ``ValueError`` before any phy
   (``mixing_idemix``, and ``budget_terms``, patch 0006) on a concrete mesh;
 * the coupled ocean (``init_ocean``), the sharded chunk program (IDEMIX ``step_kw``), and several
   JAX processes at the run entry;
-* ``Params.idemix`` (a pytree of five constants) as one log-normal scalar control.
+* ``Params.idemix`` (a pytree of five constants) and ``Params.idemix_field`` (per-node arrays,
+  patch 0010) as one log-normal scalar control.
 
 The checks only test whether an IDEMIX argument is set, so the refusals that fire before
 ``idemix_jax`` is imported run without it, on a stand-in config object; the others skip without
@@ -177,10 +178,11 @@ def test_run_entry_refuses_idemix_under_several_processes(pi, monkeypatch):
 
 
 # --- controls --------------------------------------------------------------------------------------
-@pytest.mark.parametrize("name", ["idemix"])
+@pytest.mark.parametrize("name", ["idemix", "idemix_field"])
 def test_idemix_params_are_not_a_scalar_control(name):
     # upstream's log-normal scalar controls (fesom_jax.controls, 4c921ca) would replace the
-    # IDEMIX pytree by one 0-d array; the name is refused at construction instead
+    # IDEMIX pytree (Params.idemix, patch 0004) or the per-node field (Params.idemix_field,
+    # patch 0010) by one 0-d array; the name is refused at construction instead
     from fesom_jax.controls import LogNormalControl
     with pytest.raises(ValueError, match="not a scalar Params field"):
         LogNormalControl(name, 1.0, 0.5)

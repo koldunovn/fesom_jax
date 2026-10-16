@@ -153,6 +153,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     (which must then be ``TkeConfig(only_tke=False)``) the wave dissipation feeds the TKE
     (FESOM ``mix_scheme='cvmix_TKE+cvmix_IDEMIX'``); without it, IDEMIX alone supplies
     ``Kv``/``Av`` through the Osborn shortcut (``mix_scheme_nmb==6``). Never with ``kpp_cfg``.
+    ``params.idemix_field`` (an optional :class:`fesom_jax.idemix.IdemixParamsField`, idemix-jax
+    patch 0010) gives IDEMIX per-node log multipliers of ``mu0`` and of the bottom forcing (the
+    adjoint sensitivity map); ``None`` ⇒ the scalar path; set without ``idemix_cfg`` or under a
+    halo context it raises.
     Inconsistent combinations raise ``ValueError`` before any physics runs. ``idemix_cfg=None``
     ⇒ dead branches, ``state.iwe`` untouched ⇒ **byte-identical** to the unpatched host."""
     st = state
@@ -202,6 +206,14 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             raise ValueError(
                 "idemix_cfg.lateral=True requires idemix_lateral — build it once with "
                 "fesom_jax.idemix.build_lateral_operator(mesh) — or set lateral=False.")
+    if getattr(params, "idemix_field", None) is not None:
+        if idemix_cfg is None:
+            raise ValueError(
+                "params.idemix_field (per-node IDEMIX multipliers) is set but idemix_cfg is "
+                "None: the field would be silently unused. Pass an idemix_cfg or drop it.")
+        if halo_ctx is not None:
+            raise NotImplementedError(
+                "params.idemix_field is dense-only: its [nod2D] arrays index the global mesh")
     if tke_cfg is not None and (not tke_cfg.only_tke) != (idemix_cfg is not None):
         raise ValueError(
             "TkeConfig.only_tke=False requires idemix_cfg, and idemix_cfg with TKE requires "
@@ -477,7 +489,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             _Z_iw = None if Z3d_live is None else jax.lax.stop_gradient(Z3d_live)
         idemix_out = _ckpt(lambda: _idemix.mixing_idemix(
             mesh, st.iwe, _bv_iw, _h_iw, idemix_forcing, params.idemix, idemix_cfg,
-            idemix_lateral, dt=dt, Z3d=_Z_iw, sharded=_idemix_sharded))()
+            idemix_lateral, dt=dt, Z3d=_Z_iw, sharded=_idemix_sharded,
+            params_field=params.idemix_field))()
     tke_new = None
     if tke_cfg is not None:
         if kpp_cfg is not None:
