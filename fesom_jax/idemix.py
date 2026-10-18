@@ -38,7 +38,18 @@ Lateral operator (:func:`build_lateral_operator`, host-side NumPy, once per mesh
 two-point flux weight of edge ``(a, b)`` is ``w = cross_len / node_dist`` — the cross-edge
 length (the two ``edge_cross_dxdy`` segments, m; one is zero on a boundary edge) over the
 great-circle distance between the edge's nodes (``geo_coord_nod2D``, radius
-:data:`fesom_jax.config.R_EARTH`). Cell volumes are ``area_if * dzt`` with the PER-INTERFACE
+:data:`fesom_jax.config.R_EARTH`). **Depth-masked face** (patch 0011, ``IdemixConfig.
+lateral_face_mask``, default on): at interface ``k`` only the segments of the elements WET at
+``k`` count (element interfaces ``ulevels-1 .. nlevels-1``, 0-based — the Fortran's loops
+C/D/E, and for the no-cavity case the elements of the layer ``k-1`` whose ``areasvol`` is
+interface ``k``'s area, see below), :func:`lateral_face_weight`. Without it every level of an
+edge used the full face while the cell volume shrinks with depth to the wet elements' share; on
+the deep interfaces of a node whose elements end at different depths that inflated the explicit
+sub-step's Jacobi diagonal past the stability limit the ``v0`` cap (ruling 3) assumes, and the
+CORE2 EKI members with large ``tau_h * gamma^2 / jstar^2`` blew up (idemix-jax
+``examples/output/lateral_face_mask_report.txt``). ``lateral_face_mask=False`` is the full face,
+bitwise patches 0001-0010. :func:`lateral_stability` is the matching preflight (``s * mu_max``
+of the sub-step, <= 2 needed). Cell volumes are ``area_if * dzt`` with the PER-INTERFACE
 area :func:`interface_area` built from the per-LAYER ``mesh.areasvol`` exactly as the Fortran
 ``vol_wcelli`` (``gen_modules_cvmix_idemix.F90:524-530``): the surface interface ``uln`` takes
 the top wet layer's area ``areasvol(uln)``, every deeper wet interface ``nz`` — interior and
@@ -62,8 +73,9 @@ import numpy as np
 
 from idemix_jax.core import idemix_step
 from idemix_jax.forcing import IdemixForcing
-from idemix_jax.mesh import (horizontal_propagation, idemix_step_columns, masks_from_levels,
-                             neighbors_from_edges, validate_lateral_inputs)
+from idemix_jax.mesh import (horizontal_propagation, idemix_step_columns,
+                             lateral_step_stability, masks_from_levels, neighbors_from_edges,
+                             validate_lateral_inputs)
 from idemix_jax.params import IdemixParams
 
 from . import pp, tke
@@ -78,6 +90,8 @@ class IdemixConfig(NamedTuple):
     n_hor_iter: int = 5             # lateral explicit sub-steps (idemix_n_hor_iwe_prop_iter)
     lateral: bool = True            # horizontal propagation on/off
     lateral_cfl_cap: float = 0.1    # v0 <= sqrt(cap*res^2/(tau_h*dt/n_hor_iter)); 0.0 disables
+    lateral_face_mask: bool = True  # face at k = wet elements' segments only (patch 0011);
+    #                                 False = full face at every level (patches 0001-0010)
 
     def validate(self) -> "IdemixConfig":
         """Raise on an invalid combination; returns ``self``. ``n_hor_iter`` may be any
@@ -88,15 +102,28 @@ class IdemixConfig(NamedTuple):
         if not self.lateral_cfl_cap >= 0.0:
             raise ValueError(
                 f"IdemixConfig.lateral_cfl_cap must be >= 0 (0 disables), got {self.lateral_cfl_cap!r}")
+        if not isinstance(self.lateral_face_mask, bool):
+            raise ValueError(
+                f"IdemixConfig.lateral_face_mask must be a bool, got {self.lateral_face_mask!r}")
         return self
 
 
 class LateralOperator(NamedTuple):
-    """Static per-mesh connectivity of the lateral propagation (a pytree of arrays)."""
+    """Static per-mesh connectivity of the lateral propagation (a pytree of arrays).
+
+    ``face_seg``/``face_top``/``face_bot`` describe the dual face of each slot's edge per
+    adjacent element (``[..., 0]`` = ``edge_tri[:, 0]``, ``[..., 1]`` = ``edge_tri[:, 1]``):
+    the element's cross segment over the node distance and its first/last wet interface
+    (0-based; the empty range ``nl``/``-1`` for a missing element and on pad slots). They are
+    the compact form of the per-level weight :func:`lateral_face_weight` expands in the step
+    (``[N, max_deg, nl]`` float64 would be ~0.4 GB on CORE2)."""
 
     nbr_idx: jax.Array      # [N, max_deg] int32; pad slots hold the own index
-    nbr_weight: jax.Array   # [N, max_deg] float64, symmetric, >= 0; 0 on pad slots
+    nbr_weight: jax.Array   # [N, max_deg] float64, symmetric, >= 0; 0 on pad slots (full face)
     resolution: jax.Array   # [N] m (mesh.mesh_resolution), for the v0 CFL cap
+    face_seg: jax.Array     # [N, max_deg, 2] float64, element cross segment / node distance
+    face_top: jax.Array     # [N, max_deg, 2] int32, element's first wet interface (0-based)
+    face_bot: jax.Array     # [N, max_deg, 2] int32, element's last wet interface (0-based)
 
 
 class IdemixParamsField(NamedTuple):
@@ -197,13 +224,24 @@ def build_lateral_operator(mesh) -> LateralOperator:
     :func:`interface_area` the lateral step will use is not finite and > 0 on every wet interface
     (``idemix_jax.mesh.validate_lateral_inputs``: ``horizontal_propagation`` silently
     exchanges nothing at such an interface, which hid the per-layer ``areasvol`` bug of
-    patch 0003 for a whole campaign). All checks are host-side NumPy and change no number."""
+    patch 0003 for a whole campaign). All checks are host-side NumPy and change no number.
+
+    The face fields (patch 0011): per slot and adjacent element (``mesh.edge_tri``, ``-1`` =
+    none) the segment ``hypot(cross[2e], cross[2e+1]) / node_dist`` and the element's wet
+    interfaces ``ulevels-1 .. nlevels-1`` (0-based), from which :func:`lateral_face_weight`
+    builds the depth-masked face. The 2-D weight is checked to be symmetric, finite, >= 0 and
+    0 on pads (``validate_lateral_inputs``)."""
     check_no_cavity_mesh(mesh)
     check_wet_columns(mesh)
-    validate_lateral_inputs(np.asarray(interface_area(mesh)), np.asarray(_wet_interfaces(mesh)))
+    wet = np.asarray(_wet_interfaces(mesh))
+    area_if = np.asarray(interface_area(mesh))
+    validate_lateral_inputs(area_if, wet)
+    nl = int(mesh.nl)
     edges = np.asarray(mesh.edges)
     cross = np.asarray(mesh.edge_cross_dxdy, dtype=np.float64)
-    cross_len = np.hypot(cross[:, 0], cross[:, 1]) + np.hypot(cross[:, 2], cross[:, 3])
+    seg1 = np.hypot(cross[:, 0], cross[:, 1])
+    seg2 = np.hypot(cross[:, 2], cross[:, 3])
+    cross_len = seg1 + seg2
     geo = np.asarray(mesh.geo_coord_nod2D, dtype=np.float64)          # (lon, lat) radians
     a, b = edges[:, 0], edges[:, 1]
     node_dist = R_EARTH * _great_circle(geo[a, 0], geo[a, 1], geo[b, 0], geo[b, 1])
@@ -211,9 +249,50 @@ def build_lateral_operator(mesh) -> LateralOperator:
         raise ValueError("build_lateral_operator: an edge joins two coincident nodes")
     w = cross_len / node_dist
     nbr_idx, nbr_weight = neighbors_from_edges(int(mesh.nod2D), edges, w)
+    # per-element face data, slot-aligned exactly like the weight (same edge loop)
+    et = np.asarray(mesh.edge_tri, dtype=np.int64)
+    if et.shape != edges.shape or np.any(et[:, 0] < 0):
+        raise ValueError("build_lateral_operator: mesh.edge_tri must be [edge2D, 2] with an "
+                         "el1 on every edge (-1 only for a missing el2)")
+    has = et >= 0
+    el = np.where(has, et, 0)
+    top = np.where(has, np.asarray(mesh.ulevels)[el] - 1, nl)
+    bot = np.where(has, np.asarray(mesh.nlevels)[el] - 1, -1)
+    seg = np.stack([seg1, seg2], axis=1) / node_dist[:, None]
+    _, packed = neighbors_from_edges(int(mesh.nod2D), edges,
+                                     np.concatenate([seg, top, bot], axis=1))
+    packed = np.asarray(packed)
+    nbr_np = np.asarray(nbr_idx)
+    pad = (nbr_np == np.arange(nbr_np.shape[0])[:, None])[:, :, None]
+    face_top = np.where(pad, nl, packed[:, :, 2:4]).astype(np.int32)
+    face_bot = np.where(pad, -1, packed[:, :, 4:6]).astype(np.int32)
+    validate_lateral_inputs(area_if, wet, nbr_idx=nbr_np, nbr_weight=np.asarray(nbr_weight))
     return LateralOperator(nbr_idx=jnp.asarray(nbr_idx, dtype=jnp.int32),
                            nbr_weight=jnp.asarray(nbr_weight, dtype=jnp.float64),
-                           resolution=jnp.asarray(mesh.mesh_resolution, dtype=jnp.float64))
+                           resolution=jnp.asarray(mesh.mesh_resolution, dtype=jnp.float64),
+                           face_seg=jnp.asarray(packed[:, :, 0:2], dtype=jnp.float64),
+                           face_top=jnp.asarray(face_top), face_bot=jnp.asarray(face_bot))
+
+
+def lateral_face_weight(lateral_op: LateralOperator, nl: int, cfg: IdemixConfig):
+    """The face weight the lateral step passes to ``horizontal_propagation``.
+
+    ``cfg.lateral_face_mask=False``: ``lateral_op.nbr_weight`` itself (``[N, max_deg]``, the
+    full face at every level — bitwise patches 0001-0010). ``True`` (default): the per-level
+    ``[N, max_deg, nl]`` weight of the elements wet at each interface ``k``: the full
+    ``nbr_weight`` (bitwise) where both adjacent elements are wet, one element's
+    ``face_seg`` where only it is, 0 where neither is. Symmetric (both slots of an edge carry
+    the same face data). Traceable (``jnp``); built inside the step from the compact fields."""
+    if not cfg.lateral_face_mask:
+        return lateral_op.nbr_weight
+    k = jnp.arange(nl)
+    wet_e = ((k >= jnp.asarray(lateral_op.face_top)[..., None])
+             & (k <= jnp.asarray(lateral_op.face_bot)[..., None]))      # [N, D, 2, nl]
+    m1, m2 = wet_e[:, :, 0], wet_e[:, :, 1]
+    seg = jnp.asarray(lateral_op.face_seg)
+    return jnp.where(m1 & m2, jnp.asarray(lateral_op.nbr_weight)[:, :, None],
+                     jnp.where(m1, seg[:, :, 0, None],
+                               jnp.where(m2, seg[:, :, 1, None], 0.0)))
 
 
 def _wet_interfaces(mesh):
@@ -241,6 +320,14 @@ def _v0_cap(params_idemix: IdemixParams, cfg: IdemixConfig, lateral_op: LateralO
                     / (params_idemix.tau_h * sub_dt))
 
 
+def _lateral_v0(v0, params_idemix: IdemixParams, cfg: IdemixConfig,
+                lateral_op: LateralOperator, dt: float):
+    """The group velocity the lateral step uses: the column step's ``v0``, capped (ruling 3)."""
+    if cfg.lateral_cfl_cap > 0.0:
+        v0 = jnp.minimum(v0, _v0_cap(params_idemix, cfg, lateral_op, dt))
+    return v0
+
+
 def _columns_per_node_mu0(iwe, bvfreq, dzw, dzt, coriolis, fsrf, fbot, dt, params_idemix,
                           mu0_node, is_wet):
     """``idemix_step_columns``'s masked column step with ``mu0`` per column (``mu0_node``
@@ -255,14 +342,8 @@ def _columns_per_node_mu0(iwe, bvfreq, dzw, dzt, coriolis, fsrf, fbot, dt, param
                          jnp.asarray(is_wet, dtype=bool), mu0_node)
 
 
-def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_op, dt, Z3d,
-                 params_field=None):
-    """The step's IDEMIX evaluation: ``(res, iwe_new, dzt, is_wet)`` — the column result
-    (:class:`idemix_jax.mesh` ``idemix_step_columns``) and the energy after the lateral step.
-    Shared by :func:`mixing_idemix` and :func:`budget_terms` so the budget re-evaluates exactly
-    the step's arithmetic. ``params_field`` (:class:`IdemixParamsField`): per-node log
-    multipliers of ``mu0`` and of the bottom forcing; ``None`` (or all entries ``None``) is the
-    scalar path, unchanged."""
+def _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d, params_field=None):
+    """The step's column evaluation: ``(res, dzt, is_wet)`` (:func:`_idemix_core`)."""
     nl = mesh.nl
     is_wet = _wet_interfaces(mesh)
     dzw = hnode[:, :nl - 1]
@@ -286,18 +367,60 @@ def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_
             res = _columns_per_node_mu0(iwe, bvfreq, dzw, dzt, mesh.coriolis_node,
                                         jnp.asarray(forcing.fsrf), fbot, dt, params_idemix,
                                         mu0_node, is_wet)
+    return res, dzt, is_wet
 
+
+def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_op, dt, Z3d,
+                 params_field=None):
+    """The step's IDEMIX evaluation: ``(res, iwe_new, dzt, is_wet)`` — the column result
+    (:class:`idemix_jax.mesh` ``idemix_step_columns``) and the energy after the lateral step.
+    Shared by :func:`mixing_idemix` and :func:`budget_terms` so the budget re-evaluates exactly
+    the step's arithmetic. ``params_field`` (:class:`IdemixParamsField`): per-node log
+    multipliers of ``mu0`` and of the bottom forcing; ``None`` (or all entries ``None``) is the
+    scalar path, unchanged. The lateral face is :func:`lateral_face_weight` (``cfg.
+    lateral_face_mask``)."""
+    res, dzt, is_wet = _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d,
+                                    params_field)
     if cfg.lateral:
-        v0 = res.v0
-        if cfg.lateral_cfl_cap > 0.0:
-            v0 = jnp.minimum(v0, _v0_cap(params_idemix, cfg, lateral_op, dt))
+        v0 = _lateral_v0(res.v0, params_idemix, cfg, lateral_op, dt)
         tend = horizontal_propagation(
-            res.E_iw, v0, dzt, interface_area(mesh), lateral_op.nbr_idx, lateral_op.nbr_weight,
+            res.E_iw, v0, dzt, interface_area(mesh), lateral_op.nbr_idx,
+            lateral_face_weight(lateral_op, mesh.nl, cfg),
             dt, params_idemix, n_iter=int(cfg.n_hor_iter), is_wet=is_wet)   # [m^2/s^3]
         iwe_new = res.E_iw + dt * tend
     else:
         iwe_new = res.E_iw
     return res, iwe_new, dzt, is_wet
+
+
+def lateral_stability(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
+                      params_idemix: IdemixParams, cfg: IdemixConfig,
+                      lateral_op: LateralOperator, *, dt: float, Z3d=None,
+                      params_field: IdemixParamsField | None = None, **kw):
+    """Preflight: ``s * mu_max`` of the step's explicit lateral sub-step (host-side, not
+    traced) — ``idemix_jax.mesh.lateral_step_stability`` on exactly what
+    :func:`mixing_idemix` would pass to ``horizontal_propagation`` for these inputs: the
+    column step's ``v0`` with the cap (ruling 3), the face :func:`lateral_face_weight`, the
+    per-interface area, ``dzt`` and ``s = dt * tau_h / n_hor_iter``. A value above 2 means the
+    sub-step amplifies a lateral mode (the column step that follows can damp a little of it;
+    well above 2 is an instability). For screening parameter sets (e.g. ensemble members) on
+    the state they start from. ``kw`` goes to ``lateral_step_stability`` (``dense_max``,
+    ``tol``). Returns its ``LateralStability`` (``s_mu_max``, ``level``, ``column``,
+    ``by_level``, ``s_diag_max``, ...). A concrete cavity mesh raises
+    (:func:`check_no_cavity_mesh`, as in :func:`mixing_idemix`); a traced one cannot be read."""
+    cfg.validate()
+    if not cfg.lateral or lateral_op is None:
+        raise ValueError("lateral_stability needs cfg.lateral=True and a LateralOperator")
+    if not _is_traced(mesh):
+        check_no_cavity_mesh(mesh)
+    res, dzt, is_wet = _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d,
+                                    params_field)
+    v0 = _lateral_v0(res.v0, params_idemix, cfg, lateral_op, dt)
+    w = lateral_face_weight(lateral_op, mesh.nl, cfg)
+    return lateral_step_stability(
+        np.asarray(v0), np.asarray(dzt), np.asarray(interface_area(mesh)),
+        np.asarray(lateral_op.nbr_idx), np.asarray(w), dt, params_idemix,
+        n_iter=int(cfg.n_hor_iter), is_wet=np.asarray(is_wet), **kw)
 
 
 def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
@@ -364,7 +487,9 @@ def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixPara
     * ``n_wet`` wet interfaces; ``n_capped`` those where the v0 CFL cap binds
       (``v0 > v0_cap``; 0 without ``cfg.lateral`` or with ``lateral_cfl_cap = 0``);
       ``cfl_max`` the column max of the UNCAPPED lateral CFL number
-      ``v0^2 tau_h (dt / n_hor_iter) / res^2`` (0 without ``cfg.lateral``).
+      ``v0^2 tau_h (dt / n_hor_iter) / res^2`` (0 without ``cfg.lateral``) — the cap's
+      res-based number, not the sub-step's stability (that depends on the face and the volume,
+      :func:`lateral_stability`).
 
     If ``s1`` is the step's output, ``dEdt = P_surf + P_bot - D + Dif + Lat`` per node and
     globally, to roundoff (the column solve's budget identity plus the lateral composition).
@@ -446,9 +571,17 @@ def partition_idemix_inputs(forcing: IdemixForcing | None, lateral: LateralOpera
     if lateral is not None:
         nbr = np.asarray(lateral.nbr_idx)
         w = np.asarray(lateral.nbr_weight, dtype=np.float64)
+        seg = np.asarray(lateral.face_seg, dtype=np.float64)
+        top = np.asarray(lateral.face_top, dtype=np.int32)
+        bot = np.asarray(lateral.face_bot, dtype=np.int32)
+        empty_top = int(top.max()) if top.size else 0       # >= nl on pads / missing elements
         deg = nbr.shape[1]
-        idx_p = np.tile(np.arange(L, dtype=np.int32)[None, :, None], (len(lists), 1, deg))
-        w_p = np.zeros((len(lists), L, deg))
+        P = len(lists)
+        idx_p = np.tile(np.arange(L, dtype=np.int32)[None, :, None], (P, 1, deg))
+        w_p = np.zeros((P, L, deg))
+        seg_p = np.zeros((P, L, deg, 2))
+        top_p = np.full((P, L, deg, 2), empty_top, dtype=np.int32)
+        bot_p = np.full((P, L, deg, 2), -1, dtype=np.int32)
         for d, ml in enumerate(lists):
             g2l = np.full(int(part.nod2D), -1, dtype=np.int64)
             g2l[ml] = np.arange(ml.size)
@@ -456,6 +589,10 @@ def partition_idemix_inputs(forcing: IdemixForcing | None, lateral: LateralOpera
             ok = loc >= 0
             idx_p[d, :ml.size] = np.where(ok, loc, np.arange(ml.size)[:, None])
             w_p[d, :ml.size] = np.where(ok, w[ml], 0.0)
+            seg_p[d, :ml.size] = np.where(ok[:, :, None], seg[ml], 0.0)
+            top_p[d, :ml.size] = np.where(ok[:, :, None], top[ml], empty_top)
+            bot_p[d, :ml.size] = np.where(ok[:, :, None], bot[ml], -1)
         lateral_p = LateralOperator(nbr_idx=idx_p, nbr_weight=w_p,
-                                    resolution=_nodes(lateral.resolution))
+                                    resolution=_nodes(lateral.resolution), face_seg=seg_p,
+                                    face_top=top_p, face_bot=bot_p)
     return forcing_p, lateral_p
