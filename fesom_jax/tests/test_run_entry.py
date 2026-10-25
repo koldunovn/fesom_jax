@@ -62,6 +62,9 @@ def test_plan_chunks_cold_and_continuation():
         [(0, 4, True), (4, 4, False), (8, 2, False)]
     # restart-continuation (start>0): the first chunk CONTINUES AB2 (no cold bootstrap)
     assert plan_chunks(4, 4, start_step=8, dt=180.0)[0].bootstrap_ab2 is False
+    # an OMIP cycle start (a restart's state at step 0): no chunk bootstraps
+    assert [c.bootstrap_ab2 for c in plan_chunks(10, 4, start_step=0, dt=180.0, restarted=True)] == \
+        [False, False, False]
 
 
 def test_plan_chunks_dt_ramp():
@@ -429,3 +432,74 @@ def test_monthly_output(core2_setup, tmp_path):
     assert not list(monthly2.glob("[0-9]*_[0-9]*")), "monthly_start_step gate must suppress output"
     print(f"MONTHLY_OUTPUT_OK ({months}; fields {sorted(keys - {'lon', 'lat'})}, "
           f"n_samples={int(g.attrs['n_samples'])})")
+
+
+@have_forcing
+def test_cycle_start(core2_setup, tmp_path):
+    """An OMIP cycle start (``cycle_start=True``, fesom3-jax's tools/run_cycles.py protocol): the restart's state with
+    the clock at step 0 and AB2 carried on. With the forcing injected, the clock only names the steps, so the cycle
+    start must be BITWISE the plain continuation of the same restart over the same forcing; a restart whose step is
+    rewritten to 0 without ``cycle_start`` cold-bootstraps AB2 instead and must differ. The run counts its steps from
+    0 (``res.step``) and names its archival restart by the cycle's calendar."""
+    import json
+    import shutil
+    from fesom_jax import zarr_output
+    from fesom_jax.integrate_sharded import unfold_state
+    fx = core2_setup
+    common = dict(mesh=fx["mesh"], part=fx["part"], sm=fx["sm"], sop=fx["sop"], year=YEAR)
+    kw = dict(kpp=KppConfig(), dt=DT)
+    n, m = 4, 4
+    r = tmp_path / "r"
+    run_from_config(RunConfig(n_steps=n, restart_out=str(r), **kw), state0=fx["state"], forcing=fx["cf"],
+                    forcing_stack=jax.tree.map(lambda x: x[:n], fx["stack"]), **common)
+    stack0 = fx["cf"].stack(_chunk_dates(YEAR, DT, 0, m, None))     # the cycle's first steps: 1 January 1958
+    archive = tmp_path / "archive"
+    cyc = run_from_config(RunConfig(n_steps=m, restart_in=str(r), **kw), forcing=fx["cf"], forcing_stack=stack0,
+                          cycle_start=True, restart_archive_out=str(archive), **common)
+    cont = run_from_config(RunConfig(n_steps=m, restart_in=str(r), **kw), forcing=fx["cf"], forcing_stack=stack0,
+                           **common)
+    assert cyc.step == m and cont.step == n + m, (cyc.step, cont.step)
+    a, b = (unfold_state(x.state_p, 1) for x in (cyc, cont))
+    assert _owned_worst(a, b, fx["part"], fx["sm"], 1) == 0.0, "cycle start != the plain continuation"
+    last = zarr_output.resolve_latest_restart(str(archive))
+    assert Path(last).name == "fesom.1958.001.%05d" % round(m * DT), Path(last).name
+
+    r0 = tmp_path / "r0"                                   # the same restart, its step rewritten to 0
+    shutil.copytree(r, r0)
+    meta = json.loads((r0 / ".zattrs").read_text())
+    meta["step"] = 0
+    (r0 / ".zattrs").write_text(json.dumps(meta))
+    boot = run_from_config(RunConfig(n_steps=m, restart_in=str(r0), **kw), forcing=fx["cf"], forcing_stack=stack0,
+                           **common)
+    worst_boot = _owned_worst(a, unfold_state(boot.state_p, 1), fx["part"], fx["sm"], 1)
+    assert worst_boot > 0.0, "a step-0 restart without cycle_start must re-bootstrap AB2"
+
+    with pytest.raises(ValueError, match="dt"):           # AB2 history of another dt
+        run_from_config(RunConfig(n_steps=m, restart_in=str(r), kpp=KppConfig(), dt=2 * DT), forcing=fx["cf"],
+                        forcing_stack=stack0, cycle_start=True, **common)
+    print(f"CYCLE_START_OK (bitwise the continuation; the bootstrap differs by {worst_boot:.2e})")
+
+
+@have_forcing
+def test_yearly_output(core2_setup, tmp_path):
+    """Yearly-mean output (the OMIP cycles, fesom3-jax's 11 fields): a 60-step run in January 1958 flushes one
+    store ``1958`` with temp/salt/u/v/w (3-D) and ssh/sst/sss/a_ice/m_ice/m_snow (2-D); sst is temp's top level."""
+    import zarr
+    fx = core2_setup
+    n = 60
+    stack = fx["cf"].stack(_chunk_dates(YEAR, DT, 0, n, None))
+    yearly = tmp_path / "yearly"
+    run_from_config(RunConfig(n_steps=n, kpp=KppConfig(), dt=DT), state0=fx["state"], forcing=fx["cf"],
+                    forcing_stack=stack, mesh=fx["mesh"], part=fx["part"], sm=fx["sm"], sop=fx["sop"], year=YEAR,
+                    chunk_steps=12, yearly_out=str(yearly))
+    years = sorted(p.name for p in yearly.iterdir() if p.is_dir())
+    assert years == ["1958"], years
+    g = zarr.open_group(str(yearly / "1958"), "r")
+    keys = set(g.array_keys())
+    want = {"temp", "salt", "u", "v", "w", "ssh", "sst", "sss", "a_ice", "m_ice", "m_snow"}
+    assert want <= keys, f"fields {keys}"
+    assert g["temp"].ndim == 3 and g["sst"].ndim == 2 and int(g.attrs["n_samples"]) == n
+    owned = np.asarray(g["lat"]) > -89.0
+    temp, sst = np.asarray(g["temp"])[0], np.asarray(g["sst"])[0]
+    assert np.all(np.isfinite(temp[:, owned])) and np.array_equal(sst[owned], temp[0, owned])
+    print(f"YEARLY_OUTPUT_OK ({sorted(keys - {'lon', 'lat', 'time'})})")

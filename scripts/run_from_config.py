@@ -119,6 +119,14 @@ def main():
                          "1958-2020 hindcast climatology output)")
     ap.add_argument("--monthly-start-step", type=int, default=0,
                     help="begin monthly output only after this absolute step")
+    ap.add_argument("--yearly-out", default=None,
+                    help="write yearly-mean ushow zarrs (temp/salt/u/v/w + ssh/sst/sss/a_ice/m_ice/m_snow, "
+                         "fesom3-jax's OMIP list) to this dir, one <YYYY> per calendar year")
+    ap.add_argument("--yearly-start-step", type=int, default=0,
+                    help="begin yearly output only after this absolute step")
+    ap.add_argument("--cycle-start", action="store_true",
+                    help="OMIP forcing cycle: the state of --restart-in with the clock at step 0 "
+                         "(1 January of --year), AB2 carried on (not a cold start)")
     ap.add_argument("--chunk-diagnostics", action="store_true",
                     help="print gather-free max|uv|/max|eta| health after EACH chunk (a blow-up "
                          "trajectory probe — pair with a small --chunk-steps; lead process only)")
@@ -302,6 +310,8 @@ def main():
                           restart_archive_length=args.restart_archive_length,
                           daily_out=args.daily_out, daily_start_step=args.daily_start_step,
                           monthly_out=args.monthly_out, monthly_start_step=args.monthly_start_step,
+                          yearly_out=args.yearly_out, yearly_start_step=args.yearly_start_step,
+                          cycle_start=args.cycle_start,
                           chunk_diagnostics=args.chunk_diagnostics, output_layout=args.output_layout,
                           budget=args.budget)
     if _IS_LEAD:

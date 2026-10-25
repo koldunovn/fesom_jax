@@ -97,7 +97,8 @@ def plan_chunks(n_steps: int, chunk_steps: int, *, start_step: int = 0, dt_ramp=
     ``split_at`` (year) boundary is forcing-only — same dt, AB2 continuous ⇒ it does NOT bootstrap.
 
     ``restarted``: the run starts from a restart, which carries the AB2 history even at step 0 (a converted FESOM2
-    restart dated at the forcing start, e.g. jaxcpl's 1855 ocean as 1958-01-01): its step 0 does not bootstrap.
+    restart dated at the forcing start, e.g. jaxcpl's 1855 ocean as 1958-01-01, or an OMIP forcing cycle,
+    ``run_from_config(cycle_start=True)``, whose clock is set back to step 0): its step 0 does not bootstrap.
     ``False`` (a cold start, the default) keeps the rule above."""
     if chunk_steps <= 0:
         raise ValueError("chunk_steps must be > 0")
@@ -352,8 +353,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     restart_archive_out=None, restart_archive_period=None,
                     restart_archive_length=1,
                     daily_out=None, daily_start_step=0,
-                    monthly_out=None, monthly_start_step=0, chunk_diagnostics=False,
-                    output_layout="global", budget=False):
+                    monthly_out=None, monthly_start_step=0,
+                    yearly_out=None, yearly_start_step=0, cycle_start=False,
+                    chunk_diagnostics=False, output_layout="global", budget=False):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -381,7 +383,12 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     overwritten or auto-deleted (resume any of them directly via ``restart_in``); a
     ``restart.latest`` pointer (:func:`zarr_output.write_restart_latest`) always names the
     newest one. This is a SEPARATE, additive stream — the plain rolling ``checkpoint_every``
-    restart (if also set) is unaffected."""
+    restart (if also set) is unaffected.
+
+    ``cycle_start`` (OMIP forcing cycles, as fesom3-jax's tools/run_cycles.py): the state of
+    ``cfg.restart_in`` with the clock set back to step 0 (1 January of ``year``), the AB2 history,
+    the ice counters and the split-explicit rings carried on as in any restart. The restart must
+    have been written at ``cfg.dt``; a ``dt_ramp`` is refused (its step would restart the ramp)."""
     cfg.validate()
     _t_entry = time.perf_counter()          # progress prints are relative to entry, not node uptime
     # Working precision (fesom_jax.precision): "double" leaves every program as it was; "single" repeats FESOM2's
@@ -440,9 +447,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if cfg.ice is not None:
             raise ValueError("forcing: null cannot run sea ice — ice thermodynamics needs "
                              "atmospheric fluxes. Set `ice: null` too, or configure `forcing:`.")
-        if daily_out is not None or monthly_out is not None:
-            raise ValueError("forcing: null does not support daily/monthly mean-output "
-                             "streams; drop daily_out/monthly_out.")
+        if daily_out is not None or monthly_out is not None or yearly_out is not None:
+            raise ValueError("forcing: null does not support daily/monthly/yearly mean-output "
+                             "streams; drop daily_out/monthly_out/yearly_out.")
         if restart_archive_out is not None:
             raise ValueError("forcing: null does not support archival restarts; use the "
                              "plain restart_out.")
@@ -523,8 +530,21 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             state_p = drop_carry(state_p)
         folded_in = True                                     # read_restart returns folded [P*Lmax]
         start_step = int(meta.get("step", start_step))
+        if cycle_start:
+            if cfg.dt_ramp:
+                raise ValueError("cycle_start with a dt_ramp: the ramp's step would count from the cycle start")
+            if float(meta.get("dt_stage", cfg.dt)) != float(cfg.dt):
+                raise ValueError(f"cycle_start: the restart was written at dt {meta.get('dt_stage')}, the run "
+                                 f"has dt {cfg.dt}; its AB2 history belongs to the other dt")
+            if jax.process_index() == 0:
+                print(f"[run] cycle_start: the state of {cfg.restart_in} (step {start_step}, "
+                      f"{meta.get('calendar_date')}) with the clock at 1 January {year}, AB2 carried on",
+                      flush=True)
+            start_step = 0
     else:
         raise ValueError("run_from_config: provide state0 (cold IC) or cfg.restart_in")
+    if cycle_start and state0 is not None:
+        raise ValueError("cycle_start needs cfg.restart_in, not a cold state0")
     # ice_ave_steps > 1: the ice counter, running means and held fluxes — from the restart when it
     # carries them (resume mid-cycle), else the upstream init values; None when ice_ave_steps == 1
     from .ice_step import init_ice_avg
@@ -859,6 +879,27 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         streams.append(_MeanStream(("temp", "salt", "u", "v", "ssh", "a_ice", "m_ice") + _diag_names + _bgc_names,
                                    _monthly_key, _write_monthly, monthly_start_step))
         out_sample_specs.append(_monthly_fields)
+
+    if yearly_out is not None:
+        # the OMIP cycles' output (fesom3-jax experiments/omip_core2/namelist.io.yearly: the same 11 fields).
+        # Chunks never straddle a year (the forcing split), so no extra boundaries are needed.
+        def _yearly_fields(s):
+            return {"temp": s.T, "salt": s.S, "u": s.uvnode[:, :, 0], "v": s.uvnode[:, :, 1], "w": s.w,
+                    "ssh": s.eta_n, "sst": s.T[:, 0], "sss": s.S[:, 0],
+                    "a_ice": s.a_ice, "m_ice": s.m_ice, "m_snow": s.m_snow}
+
+        def _write_yearly(key, mean, count):
+            (yr,) = key
+            _emit_ushow(f"{yearly_out}/{yr:04d}", mean,
+                        {"calendar_year": f"{yr:04d}", "n_samples": int(count)},
+                        time_days=ushow_output.cf_days(datetime.date(yr, 7, 2)))   # mid-year stamp
+
+        def _yearly_key(step):
+            return (int(_chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0][0]),)
+
+        streams.append(_MeanStream(("temp", "salt", "u", "v", "w", "ssh", "sst", "sss", "a_ice", "m_ice", "m_snow"),
+                                   _yearly_key, _write_yearly, yearly_start_step))
+        out_sample_specs.append(_yearly_fields)
 
     # The ONE sample_fn threaded into the chunk scan = union of active streams' fields, summed each step.
     # Built ONCE (stable id ⇒ the reuse-executable cache stays warm). None ⇒ no output ⇒ the scan returns

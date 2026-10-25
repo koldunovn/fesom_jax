@@ -1,0 +1,19 @@
+# OMIP-style forcing cycles on CORE2: JRA55-do 1958-2019, again and again from the previous cycle's end state
+# (fesom3-jax's fesom3_jax_experiments/experiments/omip_core2, adapted to fesom-jax's run_from_config.py).
+# scripts/omip/submit.py copies this file into the run root; every job of the chain reads that copy at its start,
+# so a change there (more cycles) takes effect with the next job.
+
+name = "omip_core2"
+description = "OMIP-style JRA55-do cycles (1958-2019, repeated) on CORE2 with the fesom-jax GPU fast set"
+
+# The model configuration, relative to the frozen snapshot: CORE2 physics (zstar, TKE, mEVP, GM/Redi) with the
+# accepted speed set (single precision, split-explicit SSH M 60, ice every second step, dt 2700).
+config = "configs/core2_gpu_fast.yaml"
+partition = "dist_4"          # 4 GPUs of one node
+devices = 4
+first_year = 1958
+last_year = 2019
+cycles = 6
+
+restart_years = 20            # an archival restart in every year divisible by 20 (and at the end of each segment)
+run_options = []              # further run_from_config.py flags of every segment
