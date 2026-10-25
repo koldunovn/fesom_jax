@@ -70,3 +70,14 @@ def test_tracer_range_warning():
     ok, warns = verdict(d)
     assert ok is True
     assert any("S_max" in w for w in warns)
+
+
+def test_tracer_ranges_over_the_water_only():
+    """``wet`` (the water layers, e.g. ``hnode > 0``) restricts the T/S ranges: the zeros below the bottom no longer
+    set S_min = 0."""
+    st = _zero_state()
+    wet = jnp.zeros(st.S.shape, bool).at[:, :2].set(True)          # two water layers, the rest below the bottom
+    st = dataclasses.replace(st, S=jnp.where(wet, 34.5, 0.0), T=jnp.where(wet, -1.5, 0.0))
+    d = state_diagnostics(st, wet=wet)
+    assert (d["S_min"], d["S_max"], d["T_min"], d["T_max"]) == (34.5, 34.5, -1.5, -1.5)
+    assert state_diagnostics(st)["S_min"] == 0.0                     # without the mask the sub-bottom zeros count

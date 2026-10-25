@@ -423,7 +423,9 @@ def test_monthly_output(core2_setup, tmp_path):
     assert int(g.attrs["n_samples"]) > 0, "init().update() must fold samples (count>0, not zeros)"
     lat, temp = np.asarray(g["lat"]), np.asarray(g["temp"])[0]
     owned = lat > -89.0                                   # non-sentinel (real-owner) lanes
-    assert owned.any() and np.all(np.isfinite(temp[:, owned])), "owned monthly temp means finite"
+    wet = np.asarray(fx["mesh"].node_layer_mask).T                # [nz, nod2]: the water layers
+    assert owned.any() and np.all(np.isfinite(temp[:, owned][wet[:, owned]])), "owned monthly temp means finite"
+    assert np.all(np.isnan(temp[~wet])), "NaN below the bottom"
 
     # the start-step gate: with monthly_start_step past the run, NOTHING is written
     monthly2 = tmp_path / "monthly2"
@@ -500,6 +502,15 @@ def test_yearly_output(core2_setup, tmp_path):
     assert want <= keys, f"fields {keys}"
     assert g["temp"].ndim == 3 and g["sst"].ndim == 2 and int(g.attrs["n_samples"]) == n
     owned = np.asarray(g["lat"]) > -89.0
-    temp, sst = np.asarray(g["temp"])[0], np.asarray(g["sst"])[0]
-    assert np.all(np.isfinite(temp[:, owned])) and np.array_equal(sst[owned], temp[0, owned])
-    print(f"YEARLY_OUTPUT_OK ({sorted(keys - {'lon', 'lat', 'time'})})")
+    temp, sst, w = (np.asarray(g[k])[0] for k in ("temp", "sst", "w"))
+    assert np.array_equal(sst[owned], temp[0, owned])
+    # NaN below the bottom (layer mask for temp, interface mask for w), finite in the water, NaN the stores' fill
+    # value; the 2-D ice fields keep their zeros (open water is 0, not missing)
+    for x, mask in ((temp, fx["mesh"].node_layer_mask), (w, fx["mesh"].node_iface_mask)):
+        wet = np.asarray(mask).T
+        assert np.all(np.isfinite(x[wet])) and np.all(np.isnan(x[~wet])), "finite in the water, NaN below"
+    assert np.isnan(g["temp"].fill_value) and np.isnan(g["a_ice"].fill_value)
+    a_ice = np.asarray(g["a_ice"])[0]
+    assert np.all(np.isfinite(a_ice)) and (a_ice == 0).any(), "open-water a_ice stays 0"
+    print(f"YEARLY_OUTPUT_OK ({sorted(keys - {'lon', 'lat', 'time'})}; NaN below the bottom: "
+          f"{int(np.isnan(temp).sum())} of {temp.size})")

@@ -111,8 +111,10 @@ def write_ushow_zarr(out_dir, lon, lat, *, fields2d=None, fields3d=None,
         if has_time and time_varying:
             data = data[np.newaxis]                # [N,...] -> [1, N,...]
             dims = [TIME_DIM] + list(dims)
+        # fill value NaN (zarr's default 0 makes xarray read every exact zero, open-water ice too, as missing)
         a = root.create_dataset(name, data=data, shape=data.shape, dtype=data.dtype,
-                                chunks=_chunks(dims, data.shape), overwrite=True)
+                                chunks=_chunks(dims, data.shape), overwrite=True,
+                                fill_value=np.nan if np.issubdtype(data.dtype, np.floating) else 0)
         a.attrs["_ARRAY_DIMENSIONS"] = list(dims)
         if name in units:
             a.attrs["units"] = units[name]

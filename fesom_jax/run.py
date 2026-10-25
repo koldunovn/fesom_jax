@@ -796,7 +796,47 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     _out_q = _WriteQueue() if _output_async else None
     _rst_q = _WriteQueue() if _restart_async else None
 
+    # NaN below the bottom (and above the top in ice-shelf cavities) in the mean output, as fesom3-jax's stores (its
+    # fill value below the bottom). Not FESOM2's rule (b63573d3: the fill value wherever a period sum is zero, which
+    # also blanks open-water ice). Each 3-D node field takes the sharded mesh's layer or interface mask, a level slice
+    # that level of it; the 2-D surface fields (ssh, ice) keep every value.
+    def _wet_spec(name):
+        if name in ("temp", "salt", "u", "v"):
+            return "layer", None
+        if name == "w":
+            return "iface", None
+        if name in ("sst", "sss", "usurf", "vsurf"):
+            return "layer", 0
+        if name in ("temp100", "u100", "v100"):
+            return "layer", k100
+        if name in ("u500", "v500"):
+            return "layer", k500
+        return None
+
+    _wet_masks = {}
+
+    def _nan_below_bottom(fields_dict):
+        import jax.numpy as jnp
+        from .integrate_sharded import _fold
+        out = {}
+        for name, v in fields_dict.items():
+            spec = _wet_spec(name)
+            if spec is None:
+                out[name] = v
+                continue
+            if spec not in _wet_masks:
+                host = _fold(np.asarray(sm.fields[f"node_{spec[0]}_mask"]))      # [P*Lmax_nod, nl] bool
+                host = np.ascontiguousarray(host if spec[1] is None else host[:, spec[1]])
+                if host.shape != tuple(v.shape):
+                    raise ValueError(f"output {name}: wet mask {host.shape} != field {tuple(v.shape)}")
+                _wet_masks[spec] = (jax.make_array_from_callback(host.shape, v.sharding, lambda i, h=host: h[i])
+                                    if isinstance(v, jax.Array) else host)
+            m = _wet_masks[spec]
+            out[name] = jnp.where(m, v, jnp.nan) if isinstance(v, jax.Array) else np.where(m, v, np.nan)
+        return out
+
     def _emit_ushow(path, fields_dict, attrs, time_days=None):
+        fields_dict = _nan_below_bottom(fields_dict)
         if _out_q is None:
             return _emit_now(path, fields_dict, attrs, time_days)
         _out_q.submit(_emit_now, path, fields_dict, attrs, time_days)
@@ -1052,7 +1092,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if chunk_diagnostics:
             import jax.numpy as jnp
             from .diagnostics import state_diagnostics
-            d = state_diagnostics(state_p)               # COLLECTIVE (all ranks must call) ...
+            d = state_diagnostics(state_p, wet=state_p.hnode > 0)   # COLLECTIVE (all ranks must call) ...
             # per-level max|T| (gather-free: reduce the sharded node axis, keep the vertical axis ⇒
             # a replicated (nl,) vector) ⇒ WHICH level the tracer overshoot lives on (surface k≈0 ⇒
             # forcing/KPP-BL/advection; deep ⇒ convection or a zstar layer-thickness collapse). Plus

@@ -35,7 +35,7 @@ T_RANGE = (-5.0, 45.0)   # potential temperature [°C]
 S_RANGE = (0.0, 60.0)    # salinity [psu]
 
 
-def state_diagnostics(state: State, *, fields=None) -> dict:
+def state_diagnostics(state: State, *, fields=None, wet=None) -> dict:
     """Reduce a ``State`` to scalar health numbers via gather-free global reductions.
 
     Returns a dict with: ``n_nonfinite`` (total NaN/Inf count across the requested leaves)
@@ -44,7 +44,9 @@ def state_diagnostics(state: State, *, fields=None) -> dict:
     physical indicators ``max_abs_uv`` / ``max_abs_uvnode`` / ``max_abs_w`` / ``max_abs_eta``
     and the tracer ranges ``T_min`` / ``T_max`` / ``S_min`` / ``S_max`` plus ``a_ice_max`` /
     ``m_ice_max``. All values are HOST python scalars (each reduction blocks on a single
-    replicated all-reduce). ``fields`` restricts the leaf scan (default: every State leaf)."""
+    replicated all-reduce). ``fields`` restricts the leaf scan (default: every State leaf). ``wet``: a bool array
+    shaped like ``state.T`` (the water layers, e.g. ``state.hnode > 0``) to which the tracer ranges are restricted;
+    None takes every entry, so the zeros below the bottom and in the padding lanes enter them."""
     names = fields if fields is not None else [f.name for f in dataclasses.fields(State)
                                                if getattr(state, f.name) is not None]
 
@@ -64,6 +66,13 @@ def state_diagnostics(state: State, *, fields=None) -> dict:
     def _maxabs(a):
         return float(jnp.max(jnp.abs(a)))
 
+    def _range(a):
+        if wet is None:
+            return float(jnp.min(a)), float(jnp.max(a))
+        return float(jnp.min(jnp.where(wet, a, jnp.inf))), float(jnp.max(jnp.where(wet, a, -jnp.inf)))
+
+    (t_min, t_max), (s_min, s_max) = _range(state.T), _range(state.S)
+
     return {
         "n_nonfinite": n_nonfinite,
         "nonfinite_by_field": nonfinite_by_field,
@@ -72,8 +81,8 @@ def state_diagnostics(state: State, *, fields=None) -> dict:
         "max_abs_uvnode": _maxabs(state.uvnode),
         "max_abs_w": _maxabs(state.w),
         "max_abs_eta": _maxabs(state.eta_n),
-        "T_min": float(jnp.min(state.T)), "T_max": float(jnp.max(state.T)),
-        "S_min": float(jnp.min(state.S)), "S_max": float(jnp.max(state.S)),
+        "T_min": t_min, "T_max": t_max,
+        "S_min": s_min, "S_max": s_max,
         "a_ice_max": float(jnp.max(state.a_ice)),
         "m_ice_max": float(jnp.max(state.m_ice)),
     }

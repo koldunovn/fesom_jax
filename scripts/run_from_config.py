@@ -324,7 +324,7 @@ def main():
         # (inherited FESOM behaviour — usability review P8 measured −24.6 °C over 22 % of ocean
         # nodes with no warning at all). Collective (all ranks call), like --diagnostics below.
         from fesom_jax.diagnostics import state_diagnostics as _sd
-        _tmin = float(_sd(res.state_p)["T_min"])
+        _tmin = float(_sd(res.state_p, wet=res.state_p.hnode > 0)["T_min"])      # water layers only
         if _IS_LEAD and _tmin < -2.5:
             print(f"WARNING: T_min={_tmin:.1f} degC is below seawater freezing and this run has "
                   f"`ice: null` under forcing. Sub-freezing water is EXPECTED without ice "
@@ -336,7 +336,7 @@ def main():
         # global gathered to one device) — runs on EVERY process (each global reduction is a
         # replicated all-reduce ⇒ same scalars everywhere); only the lead prints + emits the token.
         from fesom_jax.diagnostics import format_diagnostics, state_diagnostics, verdict
-        diags = state_diagnostics(res.state_p)
+        diags = state_diagnostics(res.state_p, wet=res.state_p.hnode > 0)   # T/S ranges over the water layers
         ok, _ = verdict(diags)
         if _IS_LEAD:
             print(format_diagnostics(diags, label=f"step{res.step}"))

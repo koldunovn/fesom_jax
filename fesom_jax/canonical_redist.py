@@ -216,7 +216,8 @@ def _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, m
             shape = (1,) + shape
             chunks = (1,) + chunks
             dims = [TIME_DIM] + dims
-        z = root.create_dataset(name, shape=shape, chunks=chunks, dtype="f4", overwrite=True)
+        z = root.create_dataset(name, shape=shape, chunks=chunks, dtype="f4", overwrite=True,
+                                fill_value=np.nan)   # as ushow_output.write_ushow_zarr (NaN below the bottom)
         z.attrs["_ARRAY_DIMENSIONS"] = dims
         z.attrs["long_name"] = name
     _put_time(root, time_days)
