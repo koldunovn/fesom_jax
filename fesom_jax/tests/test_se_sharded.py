@@ -50,17 +50,19 @@ def core2_dist4():
 
 @avail
 def test_shard_tables_match_dense(core2_dist4):
-    """Owned node rows list the same global elements with the same coefficients in the same order as the dense
-    rows; owned elements have the dense neighbours (in global ids) and kappa."""
+    """Owned node rows list the same edges (global elements, coefficients, signs, areasvol) in the same order as the
+    dense rows; owned elements have the dense neighbours (in global ids) and kappa."""
     mesh, part, sm = core2_dist4
     g = {k: np.asarray(getattr(mesh, k)) for k in ssh_se.TABLE_FIELDS}
     for d in range(part.npes):
         ml_n, ml_e = np.asarray(part.myList_nod2D[d]), np.asarray(part.myList_elem2D[d])
         md_n, md_e = int(part.myDim_nod2D[d]), int(part.myDim_elem2D[d])
         el = sm.fields["se_div_elem"][d, :md_n]
-        c = sm.fields["se_div_c"][d, :md_n]
-        np.testing.assert_array_equal(c, g["se_div_c"][ml_n[:md_n]])
-        live = (c != 0.0).any(axis=-1)
+        sg = sm.fields["se_div_sign"][d, :md_n]
+        np.testing.assert_array_equal(sm.fields["se_div_c"][d, :md_n], g["se_div_c"][ml_n[:md_n]])
+        np.testing.assert_array_equal(sg, g["se_div_sign"][ml_n[:md_n]])
+        np.testing.assert_array_equal(sm.fields["se_av"][d, :md_n], g["se_av"][ml_n[:md_n]])
+        live = sg != 0.0
         np.testing.assert_array_equal(ml_e[el][live], g["se_div_elem"][ml_n[:md_n]][live])
         nb = sm.fields["se_elem_nb"][d, :md_e]
         gnb = g["se_elem_nb"][ml_e[:md_e]]
@@ -196,7 +198,7 @@ def test_se_lanes_core2(core2_dist4, K):
     host = se_wide.build_se_wide(mesh, part, sm, K)
     A = host.arrays
     en_g = np.asarray(mesh.elem_nodes)
-    g_el, g_c = np.asarray(mesh.se_div_elem), np.asarray(mesh.se_div_c)
+    g_el, g_sg = np.asarray(mesh.se_div_elem), np.asarray(mesh.se_div_sign)
     for r in range(part.npes):
         rg = host.rings[r]
         ml_n, ml_e = np.asarray(part.myList_nod2D[r]), np.asarray(part.myList_elem2D[r])
@@ -204,11 +206,13 @@ def test_se_lanes_core2(core2_dist4, K):
         np.testing.assert_array_equal(rg["elem"][: ml_e.size], ml_e)
         ne, nn = rg["elem"].size, rg["nod"].size
         np.testing.assert_array_equal(rg["nod"][A["en"][r, :ne]], en_g[rg["elem"]])
-        live = (A["div_c"][r, :nn] != 0.0).any(axis=-1)
-        full = (live.sum(axis=1) == (g_c[rg["nod"]] != 0.0).any(axis=-1).sum(axis=1))
+        live = A["div_sign"][r, :nn] != 0.0
+        glive = g_sg[rg["nod"]] != 0.0
+        full = live.sum(axis=1) == glive.sum(axis=1)
         assert full[: int(part.myDim_nod2D[r])].all()
-        np.testing.assert_array_equal(np.where(live, rg["elem"][A["div_elem"][r, :nn]], -1)[full],
-                                      np.where((g_c[rg["nod"]] != 0.0).any(axis=-1), g_el[rg["nod"]], -1)[full])
+        np.testing.assert_array_equal(np.where(live[..., None], rg["elem"][A["div_elem"][r, :nn]], -1)[full],
+                                      np.where(glive[..., None], g_el[rg["nod"]], -1)[full])
+        np.testing.assert_array_equal(A["av"][r, :nn], np.asarray(mesh.se_av)[rg["nod"]])
 
     def apply(field, send, read):
         gathered = np.concatenate([field[d][send[d]] for d in range(part.npes)])

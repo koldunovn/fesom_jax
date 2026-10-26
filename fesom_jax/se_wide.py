@@ -59,9 +59,10 @@ def se_wide_from_env() -> int:
 class SeWideHost:
     """The host-built SE-lane arrays of every device (``[P, …]`` numpy) + the width ``K``: geometry by global id
     (``en`` SE-node lanes of each SE element's vertices, ``gs``, ``cor``, ``earea``, ``ule``, ``uln``), the SE tables
-    on the lanes (``div_elem``/``div_c``, ``nb``, ``kappa``), the compact maps (``sn``/``ren``/``rrn`` node send,
-    entry read, refresh read; ``se``/``ree``/``rre`` element; ``xsn``/``xrn``/``xse``/``xre`` the standard exit
-    exchange) and ``Lsn``/``Lse`` (the standard widths). ``rings`` keeps the per-device id lists for tests."""
+    on the lanes (``div_elem``/``div_c``/``div_sign``, ``av``, ``nb``, ``kappa``), the compact maps
+    (``sn``/``ren``/``rrn`` node send, entry read, refresh read; ``se``/``ree``/``rre`` element;
+    ``xsn``/``xrn``/``xse``/``xre`` the standard exit exchange) and ``Lsn``/``Lse`` (the standard widths). ``rings``
+    keeps the per-device id lists for tests."""
 
     K: int
     arrays: dict
@@ -106,7 +107,8 @@ def build_se_wide(mesh, partition, sm, K: int) -> SeWideHost | None:
     gs, cor, earea = (np.asarray(mesh.gradient_sca), np.asarray(mesh.coriolis), np.asarray(mesh.elem_area))
     ule, uln = np.asarray(mesh.ulevels), np.asarray(mesh.ulevels_nod2D)
     D = t["se_div_elem"].shape[1]
-    A = {name: [] for name in ("en", "gs", "cor", "earea", "ule", "uln", "div_elem", "div_c", "nb", "kappa")}
+    A = {name: [] for name in ("en", "gs", "cor", "earea", "ule", "uln", "div_elem", "div_c", "div_sign", "av", "nb",
+                               "kappa")}
     sd_n = np.zeros((P, Ln), np.int32)
     sl_n = np.zeros((P, Ln), np.int32)
     sd_e = np.zeros((P, Le), np.int32)
@@ -131,12 +133,19 @@ def build_se_wide(mesh, partition, sm, K: int) -> SeWideHost | None:
         A["earea"].append(earea[ide])
         A["ule"].append(ule[ide].astype(np.int32))
         A["uln"].append(uln[idn].astype(np.int32))
-        el, c = t["se_div_elem"][idn], t["se_div_c"][idn]
+        el = t["se_div_elem"][idn]
         loc = g2l_e[el]
-        c = np.where((loc < 0)[..., None], 0.0, c)
+        miss = (loc < 0).any(axis=-1)
+        c = np.where(miss[..., None], 0.0, t["se_div_c"][idn])
+        sg = np.where(miss, 0.0, t["se_div_sign"][idn])
+        av = t["se_av"][idn].copy()
         c[nod.size:] = 0.0
+        sg[nod.size:] = 0.0
+        av[nod.size:] = 1.0
         A["div_elem"].append(np.where(loc >= 0, loc, 0).astype(np.int32))
         A["div_c"].append(c)
+        A["div_sign"].append(sg)
+        A["av"].append(av)
         nb = t["se_elem_nb"][ide]
         lnb = np.where(nb >= 0, g2l_e[np.maximum(nb, 0)], -1)
         lnb[elem.size:] = -1
@@ -165,7 +174,7 @@ def build_se_wide(mesh, partition, sm, K: int) -> SeWideHost | None:
     return SeWideHost(K=K, arrays=arrays, rings=rg)
 
 
-WIDE_KEYS = ("en", "gs", "cor", "earea", "ule", "uln", "div_elem", "div_c", "nb", "kappa",
+WIDE_KEYS = ("en", "gs", "cor", "earea", "ule", "uln", "div_elem", "div_c", "div_sign", "av", "nb", "kappa",
              "sn", "ren", "rrn", "se", "ree", "rre", "xsn", "xrn", "xse", "xre")
 
 
@@ -190,7 +199,8 @@ class SeWide:
         a = self.a
         return types.SimpleNamespace(elem_nodes=a["en"], gradient_sca=PR.wp(a["gs"]), coriolis=PR.wp(a["cor"]),
                                      elem_area=PR.wp(a["earea"]), ulevels=a["ule"], ulevels_nod2D=a["uln"],
-                                     se_div_elem=a["div_elem"], se_div_c=PR.wp(a["div_c"]), se_elem_nb=a["nb"],
+                                     se_div_elem=a["div_elem"], se_div_c=PR.wp(a["div_c"]),
+                                     se_div_sign=PR.wp(a["div_sign"]), se_av=PR.wp(a["av"]), se_elem_nb=a["nb"],
                                      se_kappa=PR.wp(a["kappa"]))
 
     def _x(self, nod, elem, s_n, r_n, s_e, r_e):
@@ -198,17 +208,17 @@ class SeWide:
 
     def subcycle(self, init, consts, cfg, tauM, invM, w):
         """The ``cfg.M`` substeps from ``init`` (standard layout: eta^n, the rings, <<U>> = 0) with the per-step
-        ``consts = (Fx, Fy, H0e, He, kdrag | None, wf)`` (standard layout, owned lanes valid): entry to the SE
+        ``consts = (Fx, Fy, H0e, He, kdrag | None, fw)`` (standard layout, owned lanes valid): entry to the SE
         lanes, windows of K substeps with a refresh of the rings before each window after the first, exit (slice
         to the standard prefix + the standard exchange). Returns the final carry in the standard layout."""
         from .ssh_se import _Consts, _scan
-        Fx, Fy, H0e, He, kdrag, wf = consts
+        Fx, Fy, H0e, He, kdrag, fw = consts
         etan, eta1, eta2, U0, U1, U2, _um = init
         Lsn, Lse = etan.shape[0], U0.shape[0]
         ecols = [U0, U1, U2, Fx[:, None], Fy[:, None], H0e[:, None], He[:, None]]
         if kdrag is not None:
             ecols.append(kdrag[:, None])
-        xn, xe = self._x(jnp.stack([etan, eta1, eta2, wf], axis=-1), jnp.concatenate(ecols, axis=-1),
+        xn, xe = self._x(jnp.stack([etan, eta1, eta2, fw], axis=-1), jnp.concatenate(ecols, axis=-1),
                          "sn", "ren", "se", "ree")
         k = _Consts(xe[:, 6], xe[:, 7], xe[:, 8], xe[:, 9], xe[:, 0:2], xe[:, 10] if kdrag is not None else None,
                     xn[:, 3])

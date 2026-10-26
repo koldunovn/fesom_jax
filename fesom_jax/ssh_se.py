@@ -18,7 +18,7 @@ Per baroclinic step tau = dt, after the full momentum predictor (substeps 5-7 un
     M substeps, dtbt = tau/M, m = 0..M-1:
       U*      = (3/2+beta) U^m - (1/2+2 beta) U^{m-1} + beta U^{m-2}                                (AB3)
       <<U>>  += U* (1/M)
-      eta^{m+1} = eta^m + dtbt (T(U*) - W)            (T: the divergence as a per-node gather, W the water flux)
+      eta^{m+1} = eta^m + (I(U*) - W areasvol) dtbt / areasvol      (I: FESOM_F's edge inflow, W the water flux)
       eta^A   = delta eta^{m+1} + (1-delta-gamma-zeta) eta^m + gamma eta^{m-1} + zeta eta^{m-2}     (AM4)
       U^{m+1} = U^m + dtbt (f e_z x U* ... = (f V*, -f U*) - g H^A grad(eta^A) + F + V[U^m] - V[U^n])
                 H^A = H0_e + mean_3(eta^A),  V the live two-term harmonic viscosity of the Zenodo closure
@@ -27,11 +27,15 @@ Per baroclinic step tau = dt, after the full momentum predictor (substeps 5-7 un
 
 ``beta = 0.281105`` and ``zeta, gamma, delta`` from the dissipation parameter ``chi`` (the notes' eq. 4_7). Both rings
 carry across steps (``State.se_eta``, ``se_ubt``, ``se_sbar_old`` = U^{n-1}_now), flat at a cold start
-(:func:`cold_start`). Every expression keeps the Kokkos kernels' operation order; the per-node divergence is the
-Kokkos port's gather CSR (rows sorted by global element id, the coefficient of a (node, element) pair the sum of its
-two edge terms, pre-multiplied by 1/areasvol), and the viscosity visits an element's edge neighbours in ascending
-global edge id (the Kokkos port's single-rank order). So the substeps are partition-independent: a shard's owned
-lanes get the dense run's bits.
+(:func:`cold_start`). Every expression keeps the Kokkos kernels' operation order except the eta update, which is
+FESOM_F's (``se_subcycle``/``se_inflow``, fesom3-jax ``oce/ssh_se.py``): the inflow I is compute_hbar_ale's edge
+scatter (per edge ``c1 + c2`` from its two elements, ``+`` at its first node and ``-`` at its second), gathered per node
+in ascending global edge id, and divided by areasvol only after the sum; the viscosity visits an element's edge
+neighbours in ascending global edge id (the Kokkos port's single-rank order). So the substeps are
+partition-independent: a shard's owned lanes get the dense run's bits. (The Kokkos port's gather CSR, a coefficient
+per (node, element) pair pre-multiplied by 1/areasvol, does not conserve the volume in single precision: rounded,
+the coefficients of an edge's two nodes are no longer opposite, and with the steady barotropic transport the fixed
+errors add up, +7 µm a year of mean SSH on CORE2; 2026-10-26, ``runs/omip/ssh_drift``.)
 
 Switches (each a stated deviation from the Kokkos oracle, off in the oracle-gate configuration):
 
@@ -116,9 +120,9 @@ def _weights(chi):
 
 
 # --------------------------------------------------------------------------
-# Host tables (numpy, once per mesh): the divergence CSR, the edge neighbours, the linear-viscosity kappa
+# Host tables (numpy, once per mesh): the inflow rows, the edge neighbours, the linear-viscosity kappa
 # --------------------------------------------------------------------------
-TABLE_FIELDS = ("se_div_elem", "se_div_c", "se_elem_nb", "se_kappa", "se_div_inv")
+TABLE_FIELDS = ("se_div_elem", "se_div_c", "se_div_sign", "se_av", "se_elem_nb", "se_kappa", "se_div_inv")
 
 
 def _trim_cyclic(x):
@@ -130,59 +134,51 @@ def _trim_cyclic(x):
 def build_tables(mesh) -> dict:
     """The global SE tables (host numpy) of a dense :class:`~fesom_jax.mesh.Mesh`:
 
-    * ``se_div_elem`` ``[nod2D, D]`` int32 / ``se_div_c`` ``[nod2D, D, 2]``: node n's divergence row
-      ``T_n = sum_k c_k . U[el_k]`` (``se_build_operators``): every edge (n1, n2; el1, el2; cross vectors
-      (dx1, dy1), (dx2, dy2)) adds (-dy1, dx1) to (n1, el1), (dy1, -dx1) to (n2, el1), (dy2, -dx2) to (n1, el2) and
-      (-dy2, dx2) to (n2, el2); a (node, element) pair gets exactly two such terms; the row is sorted by element id
-      and multiplied by 1/areasvol[n, top]; cavity rows empty. Pads: element 0, coefficient 0.
+    * ``se_div_elem`` ``[nod2D, D, 2]`` int32 / ``se_div_c`` ``[nod2D, D, 4]`` / ``se_div_sign`` ``[nod2D, D]``: node
+      n's inflow row (:func:`inflow`), its edges in ascending global edge id: the edge's elements (el1, el2; el1 again
+      on a coast edge), its cross vectors (dx1, dy1, dx2, dy2; the second pair 0 on a coast edge) and +1 at the
+      edge's first node, -1 at its second; cavity rows empty. Pads: element 0, coefficients 0, sign 0.
+    * ``se_av`` ``[nod2D]``: areasvol[n, top], the inflow's divisor.
     * ``se_elem_nb`` ``[elem2D, 3]`` int32: an element's edge neighbours in ascending edge id (``-1`` = coast).
     * ``se_kappa`` ``[elem2D, 3]``: FESOM_F's ``l*l/(d*A_e)`` per neighbour slot (``se_kappa_build`` without the
       ``visc_ah`` factor; ``l`` the edge length, ``d`` the centroid distance, the longitude metric the mean
       ``elem_cos`` of the two elements; 0 on a coast slot).
-    * ``se_div_inv`` ``[elem2D, Dinv]`` int32: the divergence rows' inverse (:func:`div_inverse`), for the explicit
-      transpose of :func:`divergence` (``FESOM_SE_DIV_VJP``)."""
+    * ``se_div_inv`` ``[elem2D, Dinv]`` int32: the inflow rows' inverse (:func:`div_inverse`), for the explicit
+      transpose of :func:`inflow` (``FESOM_SE_DIV_VJP``)."""
     edges = np.asarray(mesh.edges).astype(np.int64)
     et = np.asarray(mesh.edge_tri).astype(np.int64)
     cr = np.asarray(mesh.edge_cross_dxdy).astype(np.float64)
     nod2D, elem2D = int(mesh.nod2D), int(mesh.elem2D)
     ulev_n = np.asarray(mesh.ulevels_nod2D)
     n1, n2, el1, el2 = edges[:, 0], edges[:, 1], et[:, 0], et[:, 1]
-    dx1, dy1, dx2, dy2 = cr[:, 0], cr[:, 1], cr[:, 2], cr[:, 3]
-    # the four adds per edge, in the Kokkos port's order (add() skips a missing element)
-    nn = np.concatenate([n1, n2, n1, n2])
-    ee = np.concatenate([el1, el1, el2, el2])
-    cx = np.concatenate([-dy1, dy1, dy2, -dy2])
-    cy = np.concatenate([dx1, -dx1, -dx2, dx2])
-    ok = ee >= 0
-    nn, ee, cx, cy = nn[ok], ee[ok], cx[ok], cy[ok]
-    key = nn * elem2D + ee
-    uk, inv = np.unique(key, return_inverse=True)        # sorted by (node, element id)
-    sx = np.zeros(uk.size)
-    sy = np.zeros(uk.size)
-    np.add.at(sx, inv, cx)                               # 0 + a + b = a + b: the two terms, order-free
-    np.add.at(sy, inv, cy)
-    cnt = np.bincount(inv, minlength=uk.size)
-    if (cnt != 2).any():
-        raise ValueError(f"ssh_se tables: {int((cnt != 2).sum())} (node, element) pairs without exactly two edge "
-                         "terms (a node of a triangle lies on two of its edges)")
-    rn, re_ = uk // elem2D, uk % elem2D
-    keep = ulev_n[rn] == 1                               # cavity rows empty (T = 0, the hbar guard)
-    rn, re_, sx, sy = rn[keep], re_[keep], sx[keep], sy[keep]
-    top = ulev_n - 1
-    av = np.asarray(mesh.areasvol)[np.arange(nod2D), top].astype(np.float64)
-    inv_a = 1.0 / av[rn]
+    if (el1 < 0).any():
+        raise ValueError("ssh_se tables: an edge without its first element")
+    # the inflow rows: each node's edges in ascending edge id, +1 at the edge's first node and -1 at its second
+    eid = np.arange(edges.shape[0])
+    rn = np.concatenate([n1, n2])
+    re_ = np.concatenate([eid, eid])
+    sg = np.concatenate([np.ones(eid.size), -np.ones(eid.size)])
+    o = np.lexsort((re_, rn))
+    rn, re_, sg = rn[o], re_[o], sg[o]
+    keep = ulev_n[rn] == 1                               # cavity rows empty (I = 0, the hbar guard)
+    rn, re_, sg = rn[keep], re_[keep], sg[keep]
     deg = np.bincount(rn, minlength=nod2D)
     D = max(int(deg.max()), 1)
     start = np.cumsum(deg) - deg
     slot = np.arange(rn.size) - start[rn]
-    div_elem = np.zeros((nod2D, D), np.int32)
-    div_c = np.zeros((nod2D, D, 2), np.float64)
-    div_elem[rn, slot] = re_
-    div_c[rn, slot, 0] = sx * inv_a
-    div_c[rn, slot, 1] = sy * inv_a
+    coast = el2[re_] < 0
+    div_elem = np.zeros((nod2D, D, 2), np.int32)
+    div_elem[rn, slot, 0] = el1[re_]
+    div_elem[rn, slot, 1] = np.where(coast, el1[re_], el2[re_])
+    div_c = np.zeros((nod2D, D, 4), np.float64)
+    div_c[rn, slot, 0:2] = cr[re_, 0:2]
+    div_c[rn, slot, 2:4] = np.where(coast[:, None], 0.0, cr[re_, 2:4])
+    div_sign = np.zeros((nod2D, D), np.float64)
+    div_sign[rn, slot] = sg
+    top = ulev_n - 1
+    av = np.asarray(mesh.areasvol)[np.arange(nod2D), top].astype(np.float64)
 
     # edge neighbours: each element's three edges in ascending edge id
-    eid = np.arange(edges.shape[0])
     own = np.concatenate([el1, el2])
     oth = np.concatenate([el2, el1])
     ed = np.concatenate([eid, eid])
@@ -213,17 +209,19 @@ def build_tables(mesh) -> dict:
     area = np.asarray(mesh.elem_area).astype(np.float64)[:, None]
     coast = elem_nb < 0
     kappa = np.where(coast, 0.0, ln * ln / (np.where(coast, 1.0, d) * area))
-    return dict(se_div_elem=div_elem, se_div_c=div_c, se_elem_nb=elem_nb, se_kappa=kappa,
-                se_div_inv=div_inverse(div_elem, div_c, elem2D))
+    return dict(se_div_elem=div_elem, se_div_c=div_c, se_div_sign=div_sign, se_av=av, se_elem_nb=elem_nb,
+                se_kappa=kappa, se_div_inv=div_inverse(div_elem, div_c, div_sign, elem2D))
 
 
-def div_inverse(div_elem, div_c, n_elem: int, width: int | None = None):
-    """The inverse of the divergence rows (host numpy, ``ops.inverse_map``): row ``e`` lists the flattened
-    ``(node, slot)`` positions ``n*D + k`` whose entry is element ``e`` with a nonzero coefficient, ascending — at
-    most the element's three vertices; the pad slots (element 0, coefficient 0) are left out."""
+def div_inverse(div_elem, div_c, div_sign, n_elem: int, width: int | None = None):
+    """The inverse of the inflow rows (host numpy, ``ops.inverse_map``), for :func:`_inflow_t`: row ``e`` lists the
+    flattened ``(node, slot, side)`` positions ``(n*D + k)*2 + j`` whose element ``div_elem[n, k, j]`` is ``e``, in
+    ascending order: each of the element's three edges sits in two node rows, so at most six. A pad slot (sign 0) and
+    the absent second side of a coast edge (its coefficients 0) are left out."""
     from .ops import inverse_map
-    el = np.asarray(div_elem)
-    live = (np.asarray(div_c) != 0.0).any(axis=-1)
+    el = np.asarray(div_elem)                                   # [N, D, 2]
+    c = np.asarray(div_c).reshape(el.shape + (2,))             # [N, D, side, (dx, dy)]
+    live = (np.asarray(div_sign) != 0.0)[..., None] & (c != 0.0).any(axis=-1)
     return inverse_map(np.where(live, el, -1), int(n_elem), width)
 
 
@@ -238,10 +236,10 @@ def with_tables(mesh):
 
 def shard_tables(mesh, partition, Lmax: dict) -> dict:
     """Per-device SE tables ``{name: [P, Lmax_kind, ...]}`` on the shards' LOCAL lanes (for
-    :func:`fesom_jax.shard_mesh.with_se_tables`): a node row keeps the elements present on the device (complete for
-    an owned node), an element's neighbours map to local lanes (``-1`` when absent: only halo lanes, which the
-    per-substep exchange overwrites; an owned element with an absent neighbour raises). Same global order as the
-    dense tables, so owned lanes compute the dense bits."""
+    :func:`fesom_jax.shard_mesh.with_se_tables`): a node row keeps the edges whose elements are present on the device
+    (all of them for an owned node; areasvol 1 on a pad lane), an element's neighbours map to local lanes (``-1``
+    when absent: only halo lanes, which the per-substep exchange overwrites; an owned element with an absent neighbour
+    raises). Same global order as the dense tables, so owned lanes compute the dense bits."""
     g = build_tables(mesh)
     P = int(partition.npes)
     ml_n = [np.asarray(x) for x in partition.myList_nod2D]
@@ -249,23 +247,25 @@ def shard_tables(mesh, partition, Lmax: dict) -> dict:
     myd_n = np.asarray(partition.myDim_nod2D)
     myd_e = np.asarray(partition.myDim_elem2D)
     D = g["se_div_elem"].shape[1]
-    out = {"se_div_elem": np.zeros((P, Lmax["nod"], D), np.int32),
-           "se_div_c": np.zeros((P, Lmax["nod"], D, 2), g["se_div_c"].dtype),
+    out = {"se_div_elem": np.zeros((P, Lmax["nod"], D, 2), np.int32),
+           "se_div_c": np.zeros((P, Lmax["nod"], D, 4), g["se_div_c"].dtype),
+           "se_div_sign": np.zeros((P, Lmax["nod"], D), g["se_div_sign"].dtype),
+           "se_av": np.ones((P, Lmax["nod"]), g["se_av"].dtype),
            "se_elem_nb": np.full((P, Lmax["elem"], 3), -1, np.int32),
            "se_kappa": np.zeros((P, Lmax["elem"], 3), g["se_kappa"].dtype)}
     for d in range(P):
         g2l = np.full(int(mesh.elem2D), -1, np.int64)
         g2l[ml_e[d]] = np.arange(ml_e[d].size)
         el = g["se_div_elem"][ml_n[d]]
-        c = g["se_div_c"][ml_n[d]]
         loc = g2l[el]
-        live = (c != 0.0).any(axis=-1)
-        miss = live & (loc < 0)
+        sg = g["se_div_sign"][ml_n[d]]
+        miss = (sg != 0.0) & (loc < 0).any(axis=-1)
         if miss[: myd_n[d]].any():
             raise ValueError(f"ssh_se shard tables: device {d} lacks an element of an owned node's row")
-        c = np.where(miss[..., None], 0.0, c)
         out["se_div_elem"][d, : ml_n[d].size] = np.where(loc >= 0, loc, 0)
-        out["se_div_c"][d, : ml_n[d].size] = c
+        out["se_div_c"][d, : ml_n[d].size] = np.where(miss[..., None], 0.0, g["se_div_c"][ml_n[d]])
+        out["se_div_sign"][d, : ml_n[d].size] = np.where(miss, 0.0, sg)
+        out["se_av"][d, : ml_n[d].size] = g["se_av"][ml_n[d]]
         nb = g["se_elem_nb"][ml_e[d]]
         lnb = np.where(nb >= 0, g2l[np.maximum(nb, 0)], -1)
         if ((nb >= 0) & (lnb < 0))[: myd_e[d]].any():
@@ -273,10 +273,11 @@ def shard_tables(mesh, partition, Lmax: dict) -> dict:
         out["se_elem_nb"][d, : ml_e[d].size] = lnb
         out["se_kappa"][d, : ml_e[d].size] = np.where(lnb >= 0, g["se_kappa"][ml_e[d]], 0.0)
     # the local rows' inverse, one width over the devices (a shard's pad rows and absent elements are left out)
-    invs = [div_inverse(out["se_div_elem"][d], out["se_div_c"][d], Lmax["elem"]) for d in range(P)]
+    invs = [div_inverse(out["se_div_elem"][d], out["se_div_c"][d], out["se_div_sign"][d], Lmax["elem"])
+            for d in range(P)]
     W = max(i.shape[1] for i in invs)
-    out["se_div_inv"] = np.stack([div_inverse(out["se_div_elem"][d], out["se_div_c"][d], Lmax["elem"], W)
-                                  for d in range(P)])
+    out["se_div_inv"] = np.stack([div_inverse(out["se_div_elem"][d], out["se_div_c"][d], out["se_div_sign"][d],
+                                              Lmax["elem"], W) for d in range(P)])
     return out
 
 
@@ -354,54 +355,76 @@ def _grad3(gs, v0, v1, v2):
 
 
 def div_vjp_enabled() -> bool:
-    """``FESOM_SE_DIV_VJP=1`` (read at trace time): :func:`divergence` with its explicit transpose."""
+    """``FESOM_SE_DIV_VJP=1`` (read at trace time): :func:`inflow` with its explicit transpose."""
     return os.environ.get("FESOM_SE_DIV_VJP", "0").strip() not in ("", "0")
 
 
-def divergence(U, mesh):
-    """``T_n = sum_k (c_k,x U_x[el_k] + c_k,y U_y[el_k])`` in row order from 0 (``se_div_gather``): ``[elem, 2]`` →
-    ``[nod]``, ``T = +d eta/dt``. With :func:`div_vjp_enabled` and the inverse table (``se_div_inv``; the wide-halo
-    lanes have none) the reverse pass is :func:`_divergence_t` — ordered gathers through the inverse — instead of
-    the default transpose of the gathers, a scatter-add (atomic on a GPU, the largest compute item of the
-    sharded adjoint's reverse pass: 24 ms of 229 per step, job 28357325). The forward is the same."""
-    el, c = mesh.se_div_elem, PR.wp(mesh.se_div_c)
-    inv = getattr(mesh, "se_div_inv", None)
-    if inv is not None and div_vjp_enabled():
-        return _divergence_vjp(U, el, c, inv)
-    return _divergence(U, el, c)
-
-
-def _divergence(U, el, c):
+def _inflow_terms(U, el, c, sg):
+    e1, e2 = el[..., 0], el[..., 1]
     Ux, Uy = U[:, 0], U[:, 1]
-    s = jnp.zeros(el.shape[:1], U.dtype)
-    for k in range(el.shape[1]):
-        s = s + (c[:, k, 0] * Ux[el[:, k]] + c[:, k, 1] * Uy[el[:, k]])
+    c1 = Uy[e1] * c[..., 0] - Ux[e1] * c[..., 1]
+    c2 = -(Uy[e2] * c[..., 2] - Ux[e2] * c[..., 3])
+    return sg * (c1 + c2)
+
+
+def inflow_terms(U, mesh):
+    """The slots of :func:`inflow`, ``[nod, D]``: per (node, edge) ``+-(c1 + c2)``, ``c1 = U_y(el1) dx1 - U_x(el1)
+    dy1``, ``c2 = -(U_y(el2) dx2 - U_x(el2) dy2)`` (0 on a coast), + at the edge's first node. One elementwise
+    expression over all slots, so an edge's two nodes get ``+s`` and ``-s`` of the same bits."""
+    return _inflow_terms(U, mesh.se_div_elem, PR.wp(mesh.se_div_c), PR.wp(mesh.se_div_sign))
+
+
+def _inflow(U, el, c, sg):
+    t = _inflow_terms(U, el, c, sg)
+    s = jnp.zeros(t.shape[:1], U.dtype)
+    for k in range(t.shape[1]):
+        s = s + t[:, k]
     return s
 
 
-def _divergence_t(tbar, c, inv):
-    """The transpose of :func:`_divergence` (it is linear in U): ``Ubar_e = sum over the rows' entries (n, k) of
-    element e of c[n, k] tbar[n]``, as ``ops.ordered_sum`` over the inverse (ascending positions; no atomics)."""
+def inflow(U, mesh):
+    """FESOM_F's ``se_inflow`` I(U), compute_hbar_ale's edge scatter of a 2-D transport (positive = convergence),
+    gathered: every node sums its edges' :func:`inflow_terms` in ascending global edge id from 0, the scatter's order.
+    ``[elem, 2]`` → ``[nod]`` (m^3/s; ``I / areasvol = +d eta/dt``). ``sum_n I_n = 0`` up to the rounding of the node
+    sums, in single precision too.
+
+    With :func:`div_vjp_enabled` and the inverse table (``se_div_inv``; the wide-halo lanes have none) the reverse
+    pass is :func:`_inflow_t`, ordered gathers through the inverse, instead of the default transpose of the gathers,
+    a scatter-add (atomic on a GPU; on the earlier divergence form it was the largest compute item of the sharded
+    adjoint's reverse pass, 24 ms of 229 per step, job 28357325). The forward is the same."""
+    el, c, sg = mesh.se_div_elem, PR.wp(mesh.se_div_c), PR.wp(mesh.se_div_sign)
+    inv = getattr(mesh, "se_div_inv", None)
+    if inv is not None and div_vjp_enabled():
+        return _inflow_vjp(U, el, c, sg, inv)
+    return _inflow(U, el, c, sg)
+
+
+def _inflow_t(tbar, c, sg, inv):
+    """The transpose of :func:`_inflow` (it is linear in U). Side j of slot (n, k), with cross vector (dx_j, dy_j)
+    and sign +1 for the first element, -1 for the second, gives its element ``side_j sg[n, k] tbar[n] (-dy_j, dx_j)``;
+    ``Ubar_e`` sums them as ``ops.ordered_sum`` over the inverse (ascending positions, no atomics)."""
     from .ops import ordered_sum
-    vals = (c * tbar[:, None, None]).reshape((-1, 2))
-    return ordered_sum(vals, inv)
+    cc = c.reshape(c.shape[:-1] + (2, 2))                       # [N, D, side, (dx, dy)]
+    w = (sg * tbar[:, None])[..., None] * jnp.asarray([1.0, -1.0], c.dtype)   # [N, D, side]
+    vals = jnp.stack([-cc[..., 1] * w, cc[..., 0] * w], axis=-1)            # [N, D, side, (x, y)]
+    return ordered_sum(vals.reshape((-1, 2)), inv)
 
 
 @jax.custom_vjp
-def _divergence_vjp(U, el, c, inv):
-    return _divergence(U, el, c)
+def _inflow_vjp(U, el, c, sg, inv):
+    return _inflow(U, el, c, sg)
 
 
-def _divergence_vjp_fwd(U, el, c, inv):
-    return _divergence(U, el, c), (c, inv)
+def _inflow_vjp_fwd(U, el, c, sg, inv):
+    return _inflow(U, el, c, sg), (c, sg, inv)
 
 
-def _divergence_vjp_bwd(res, tbar):
-    c, inv = res
-    return _divergence_t(tbar, c, inv), None, None, None
+def _inflow_vjp_bwd(res, tbar):
+    c, sg, inv = res
+    return _inflow_t(tbar, c, sg, inv), None, None, None, None
 
 
-_divergence_vjp.defvjp(_divergence_vjp_fwd, _divergence_vjp_bwd)
+_inflow_vjp.defvjp(_inflow_vjp_fwd, _inflow_vjp_bwd)
 
 
 def _sqrt0(x):
@@ -483,14 +506,14 @@ class SeOut(NamedTuple):
 
 class _Consts(NamedTuple):
     """The per-step constants of the substeps: element ``Fx, Fy, H0e, He, Un (elem, 2), kdrag`` (None without the
-    drag) and the node water flux ``wf``."""
+    drag) and the node freshwater ``fw = W areasvol`` (FESOM_F's ``freshwater(water_flux)``, m^3/s)."""
     Fx: object
     Fy: object
     H0e: object
     He: object
     Un: object
     kdrag: object
-    wf: object
+    fw: object
 
 
 def _substep(c, k, lmesh, cfg, tauM, invM, w, exch):
@@ -502,7 +525,8 @@ def _substep(c, k, lmesh, cfg, tauM, invM, w, exch):
     etam, eta1, eta2, U0, U1, U2, um = c
     ustar = a0 * U0 + a1 * U1 + a2 * U2                                    # k1: AB3 + the mean
     um = um + ustar * invM
-    etanew = jnp.where(nocav_n, etam + tauM * (divergence(ustar, lmesh) - k.wf), etam)     # k2
+    flow = inflow(ustar, lmesh) - k.fw                                     # k2: FESOM_F se_subcycle
+    etanew = jnp.where(nocav_n, etam + flow * tauM / PR.wp(lmesh.se_av), etam)
     etanew = exch(etanew, "nod")
     h0 = d3 * etanew[en[:, 0]] + d0 * etam[en[:, 0]] + d1 * eta1[en[:, 0]] + d2 * eta2[en[:, 0]]   # k3: AM4
     h1 = d3 * etanew[en[:, 1]] + d0 * etam[en[:, 1]] + d1 * eta1[en[:, 1]] + d2 * eta2[en[:, 1]]
@@ -598,16 +622,16 @@ def se_block(mesh, st, du, water_flux, cfg: SeConfig, *, dt, is_first_step, exch
         ubx = jnp.take_along_axis(uv[:, :, 0], kb[:, None], axis=1)[:, 0]
         uby = jnp.take_along_axis(uv[:, :, 1], kb[:, None], axis=1)[:, 0]
         kdrag = C_D * _sqrt0(ubx * ubx + uby * uby) / jnp.where(He > 0.0, He, 1.0)
-    wf = jnp.zeros_like(st.eta_n) if water_flux is None else water_flux
+    fw = jnp.zeros_like(st.eta_n) if water_flux is None else water_flux * PR.wp(mesh.se_av)   # W areasvol
     init = (st.eta_n, st.se_eta[:, 0], st.se_eta[:, 1], st.se_ubt[:, 0], st.se_ubt[:, 1], st.se_ubt[:, 2],
             jnp.zeros_like(st.se_ubt[:, 0]))
 
     # ---- the M substeps ----
     if wide is None:
-        k = _Consts(Fx, Fy, _exch(H0e, "elem"), He, st.se_ubt[:, 0], kdrag, wf)
+        k = _Consts(Fx, Fy, _exch(H0e, "elem"), He, st.se_ubt[:, 0], kdrag, fw)
         etaM, eta1, eta2, U0, U1, U2, umean = _scan(init, M, k, mesh, cfg, tauM, invM, w, _exch)
     else:
-        etaM, eta1, eta2, U0, U1, U2, umean = wide.subcycle(init, (Fx, Fy, H0e, He, kdrag, wf), cfg, tauM, invM, w)
+        etaM, eta1, eta2, U0, U1, U2, umean = wide.subcycle(init, (Fx, Fy, H0e, He, kdrag, fw), cfg, tauM, invM, w)
 
     # ---- finalize: hbar_old = hbar, hbar = eta_n = eta^M ----
     hbar_old = st.hbar
@@ -682,9 +706,9 @@ def cfl_acrit(chi):
 
 def cfl_omega_max(mesh, helem=None):
     """``omega_max = sqrt(lambda_max(A))`` of the substeps' gravity-wave operator ``A v = -T(H (-g grad v))``
-    (``T`` the substeps' divergence, ``H = sum_k helem``, the rest depth when ``helem`` is None) by ``CFL_NIT`` power
-    iterations from Knuth's hash of the 1-based node id, in the areasvol-weighted norm (a lower bound of omega_max;
-    the safety factor covers it). Needs the SE tables (:func:`build_tables` is called if absent). Returns
+    (``T = I / areasvol`` the substeps' divergence, ``H = sum_k helem``, the rest depth when ``helem`` is None) by
+    ``CFL_NIT`` power iterations from Knuth's hash of the 1-based node id, in the areasvol-weighted norm (a lower bound
+    of omega_max; the safety factor covers it). Needs the SE tables (:func:`build_tables` is called if absent). Returns
     ``(omega, the last relative change of lambda)``."""
     t = build_tables(mesh) if getattr(mesh, "se_div_elem", None) is None else \
         {k: np.asarray(getattr(mesh, k)) for k in TABLE_FIELDS}
@@ -696,7 +720,8 @@ def cfl_omega_max(mesh, helem=None):
         lm = np.asarray(mesh.elem_layer_mask)
         H = np.where(lm, np.asarray(helem, np.float64), 0.0).sum(axis=1)
     H = np.where(np.asarray(mesh.ulevels) == 1, H, 0.0)
-    el, c = t["se_div_elem"], t["se_div_c"].astype(np.float64)
+    el, c, sg = t["se_div_elem"], t["se_div_c"].astype(np.float64), t["se_div_sign"].astype(np.float64)
+    av_t = t["se_av"].astype(np.float64)
     av = np.asarray(mesh.areasvol)[:, 0].astype(np.float64)
     gid = np.arange(1, av.shape[0] + 1, dtype=np.int64)
     v = ((gid * 2654435761) % 4294967296).astype(np.float64) / 4294967296.0 - 0.5
@@ -705,8 +730,9 @@ def cfl_omega_max(mesh, helem=None):
     def apply_a(v):
         pre = -(G * v[en])
         U = np.stack([H * (gs[:, 0:3] * pre).sum(axis=1), H * (gs[:, 3:6] * pre).sum(axis=1)], axis=-1)
-        T = (c[:, :, 0] * U[el, 0] + c[:, :, 1] * U[el, 1]).sum(axis=1)
-        return -T
+        c1 = U[el[..., 0], 1] * c[..., 0] - U[el[..., 0], 0] * c[..., 1]
+        c2 = -(U[el[..., 1], 1] * c[..., 2] - U[el[..., 1], 0] * c[..., 3])
+        return -(sg * (c1 + c2)).sum(axis=1) / av_t
 
     lam = lam_old = 0.0
     for _ in range(CFL_NIT):

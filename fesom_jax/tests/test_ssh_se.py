@@ -90,7 +90,7 @@ def test_se_requires_rings_and_tables(pi):
     cg_state = dataclasses.replace(st0, se_eta=None, se_ubt=None, se_sbar_old=None)
     with pytest.raises(ValueError, match="cold_start"):
         stepmod.step(cg_state, mesh, op, stress, dt=DT, is_first_step=True, ale_cfg=ale)
-    bare = dataclasses.replace(mesh, se_div_elem=None, se_div_c=None, se_elem_nb=None, se_kappa=None)
+    bare = dataclasses.replace(mesh, **{k: None for k in ssh_se.TABLE_FIELDS})
     with pytest.raises(ValueError, match="with_tables"):
         stepmod.step(st0, bare, op, stress, dt=DT, is_first_step=True, ale_cfg=ale)
 
@@ -111,9 +111,9 @@ def _hash11(x):
 
 
 @pi_missing
-def test_divergence_gather_equals_the_edge_scatter(pi):
-    """The Kokkos operator self-test (se_selftest): a hashed element field's divergence by the gather CSR equals the
-    literal edge scatter of compute_hbar (h = 1, / areasvol) to 1e-14 of its scale."""
+def test_inflow_gather_equals_the_edge_scatter(pi):
+    """The Kokkos operator self-test (se_selftest), for FESOM_F's inflow: a hashed element field's inflow by the
+    per-node gather equals the literal edge scatter of compute_hbar (h = 1) to 1e-14 of its scale."""
     mesh = pi[0]
     E = mesh.elem2D
     e = np.arange(E, dtype=np.uint64)
@@ -129,27 +129,33 @@ def test_divergence_gather_equals_the_edge_scatter(pi):
             c2 = -(U[el2, 1] * cr[ed, 2] - U[el2, 0] * cr[ed, 3])
         ref[edges[ed, 0]] += c1 + c2
         ref[edges[ed, 1]] -= c1 + c2
-    ref = ref / np.asarray(mesh.areasvol)[:, 0]
-    got = np.asarray(ssh_se.divergence(jnp.asarray(U), mesh))
+    got = np.asarray(ssh_se.inflow(jnp.asarray(U), mesh))
     scale = np.abs(ref).max()
     assert np.abs(got - ref).max() <= 1e-14 * scale, np.abs(got - ref).max() / scale
 
 
 @pi_missing
 def test_tables_structure(pi):
-    """Rows sorted by element id, every (node, element) incidence present once, the neighbours symmetric with the
-    coasts at -1 and ascending edge order, kappa symmetric in A_e kappa (FESOM_F's sum_e A_e V_e = 0 property)."""
+    """Inflow rows = a node's edges in ascending edge id with the edge's elements and cross vectors (the second side 0
+    on a coast) and +1 / -1 at its first / second node; the neighbours symmetric with the coasts at -1 and ascending
+    edge order, kappa symmetric in A_e kappa (FESOM_F's sum_e A_e V_e = 0 property)."""
     mesh = pi[0]
     t = ssh_se.build_tables(mesh)
-    el, c = t["se_div_elem"], t["se_div_c"]
-    live = (c != 0.0).any(axis=-1)
-    en = np.asarray(mesh.elem_nodes)
-    deg = np.bincount(en.ravel(), minlength=mesh.nod2D)
-    np.testing.assert_array_equal(live.sum(axis=1), deg)
+    el, c, sg = t["se_div_elem"], t["se_div_c"], t["se_div_sign"]
+    edges, et, cr = (np.asarray(mesh.edges), np.asarray(mesh.edge_tri), np.asarray(mesh.edge_cross_dxdy))
+    live = sg != 0.0
+    np.testing.assert_array_equal(live.sum(axis=1), np.bincount(edges.ravel(), minlength=mesh.nod2D))
+    np.testing.assert_array_equal(t["se_av"], np.asarray(mesh.areasvol)[:, 0])
     for n in range(0, mesh.nod2D, 97):
-        row = el[n][live[n]]
-        assert np.all(np.diff(row) > 0)
-        assert set(row.tolist()) == set(np.nonzero((en == n).any(axis=1))[0].tolist())
+        ed = np.nonzero((edges == n).any(axis=1))[0]                  # ascending edge id
+        k = ed.size
+        np.testing.assert_array_equal(sg[n, :k], np.where(edges[ed, 0] == n, 1.0, -1.0))
+        coast = et[ed, 1] < 0
+        np.testing.assert_array_equal(el[n, :k, 0], et[ed, 0])
+        np.testing.assert_array_equal(el[n, :k, 1], np.where(coast, et[ed, 0], et[ed, 1]))
+        np.testing.assert_array_equal(c[n, :k, :2], cr[ed, :2])
+        np.testing.assert_array_equal(c[n, :k, 2:], np.where(coast[:, None], 0.0, cr[ed, 2:]))
+        assert not live[n, k:].any() and not c[n, k:].any()
     nb = t["se_elem_nb"]
     for e_ in range(0, mesh.elem2D, 53):
         for s in range(3):
@@ -163,6 +169,36 @@ def test_tables_structure(pi):
             if j >= 0:
                 s2 = int(np.nonzero(nb[j] == e_)[0][0])
                 assert abs(A[e_] * k[e_, s] - A[j] * k[j, s2]) <= 1e-12 * A[e_] * k[e_, s]
+
+
+@pi_missing
+def test_inflow_conserves_in_single_precision(pi):
+    """The volume bug of the Kokkos gather (2026-10-26): in float32 an edge's two slots are exact negatives (the same
+    c1 + c2 bits), so ``sum_n I_n`` is the rounding of the node sums only. The pre-divided Kokkos coefficients
+    (c / areasvol per node, rounded) broke that: a steady flow gained volume every substep."""
+    from fesom_jax import precision as PR
+    mesh = pi[0]
+    E = mesh.elem2D
+    e = np.arange(E, dtype=np.uint64)
+    U = np.stack([_hash11(2 * e), _hash11(2 * e + 1)], axis=-1) * 400.0
+    m32, U32 = PR.cast_tree((mesh, jnp.asarray(U)))
+    with PR.scope("single"):
+        terms = np.asarray(jax.jit(ssh_se.inflow_terms)(U32, m32))
+    assert terms.dtype == np.float32
+    edges = np.asarray(mesh.edges)
+    # an edge's slot at a node = its rank among the node's edges in ascending edge id (the row order)
+    nodes = edges.ravel()
+    eids = np.repeat(np.arange(edges.shape[0]), 2)
+    o = np.lexsort((eids, nodes))
+    deg = np.bincount(nodes, minlength=mesh.nod2D)
+    slot = np.empty(nodes.size, np.int64)
+    slot[o] = np.arange(nodes.size) - (np.cumsum(deg) - deg)[nodes[o]]
+    slot = slot.reshape(-1, 2)
+    first = terms[edges[:, 0], slot[:, 0]]
+    second = terms[edges[:, 1], slot[:, 1]]
+    bad = np.nonzero(first != -second)[0]
+    assert bad.size == 0, f"{bad.size} edges whose two slots are not exact negatives, e.g. {bad[:3]}"
+    assert np.abs(first).max() > 0.0
 
 
 # --------------------------------------------------------------------------
@@ -189,12 +225,12 @@ def _synthetic(mesh, st0, seed=0, amp_u=0.2, amp_eta=0.3):
 @pytest.mark.parametrize("cfg", [SeConfig(M=30), SeConfig(M=30, bt_drag=True), SeConfig(M=30, visc="linear"),
                                  SeConfig(M=30, visc="off")])
 def test_se_block_compatibility_and_trim(pi, cfg):
-    """eta^{n+1} - eta^n = tau (T(<<U>>) - W) and sum_k h^n_k u^{n+1}_k = <<U>>, to round-off, on random inputs
-    (the Kokkos G1a / G1b invariants), for every switch."""
+    """eta^{n+1} - eta^n = tau (I(<<U>>) / areasvol - W) and sum_k h^n_k u^{n+1}_k = <<U>>, to round-off, on random
+    inputs (the Kokkos G1a / G1b invariants), for every switch."""
     mesh, _op, _s, st0 = pi
     st, du, wf = _synthetic(mesh, st0)
     out = jax.jit(lambda s, d, w: ssh_se.se_block(mesh, s, d, w, cfg, dt=DT, is_first_step=False))(st, du, wf)
-    T = ssh_se.divergence(out.umean, mesh)
+    T = ssh_se.inflow(out.umean, mesh) / mesh.se_av
     r_eta = np.asarray(out.eta_n - st.eta_n - DT * (T - wf))
     d_eta = float(np.abs(np.asarray(out.eta_n - st.eta_n)).max())
     U = ssh_se.transport(out.uv, st.helem, mesh)
@@ -262,7 +298,7 @@ def test_invariants_100_pi_steps(pi, pi_run, capsys):
     prev = st0
     r_c = r_l = 0.0
     for st in pi_run:
-        T = np.asarray(ssh_se.divergence(ssh_se.transport(st.uv, prev.helem, mesh), mesh))
+        T = np.asarray(ssh_se.inflow(ssh_se.transport(st.uv, prev.helem, mesh), mesh) / mesh.se_av)
         de = np.asarray(st.eta_n) - np.asarray(prev.eta_n)
         r_c = max(r_c, float(np.abs((de - DT * T)[nocav]).max()))
         sumh = np.where(nlm, np.asarray(st.hnode), 0.0).sum(axis=1)
@@ -303,7 +339,7 @@ def test_cg_path_unchanged_by_se_seam(pi):
     step's jaxpr with ale_cfg=AleConfig() contains no SE op and equals the one of AleConfig(split_explicit=None)."""
     mesh, op, stress, st0 = pi
     cg = dataclasses.replace(st0, se_eta=None, se_ubt=None, se_sbar_old=None)
-    bare = dataclasses.replace(mesh, se_div_elem=None, se_div_c=None, se_elem_nb=None, se_kappa=None)
+    bare = dataclasses.replace(mesh, **{k: None for k in ssh_se.TABLE_FIELDS})
     j1 = jax.make_jaxpr(lambda s: stepmod.step(s, bare, op, stress, dt=DT, is_first_step=True,
                                                ale_cfg=AleConfig()))(cg)
     j2 = jax.make_jaxpr(lambda s: stepmod.step(s, bare, op, stress, dt=DT, is_first_step=True,

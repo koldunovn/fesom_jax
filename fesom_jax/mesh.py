@@ -130,11 +130,13 @@ class Mesh:
     inv_edge_tri: Optional[jax.Array] = None      # (elem2D, D3) i4 flattened (edge,side) positions
     # --- optional split-explicit SSH tables (fesom_jax.ssh_se.build_tables; AleConfig.split_explicit). None unless
     #     built (ssh_se.with_tables, or per device by shard_mesh.with_se_tables), so the CG program never sees them. ---
-    se_div_elem: Optional[jax.Array] = None       # (nod2D, D) i4 elements of a node's divergence row (id order)
-    se_div_c: Optional[jax.Array] = None          # (nod2D, D, 2) f8 their coefficients / areasvol (0 = pad)
+    se_div_elem: Optional[jax.Array] = None       # (nod2D, D, 2) i4 a node's edges' two elements (edge id order)
+    se_div_c: Optional[jax.Array] = None          # (nod2D, D, 4) f8 their cross vectors dx1, dy1, dx2, dy2 (0 = pad)
+    se_div_sign: Optional[jax.Array] = None       # (nod2D, D) f8 +1 at the edge's first node, -1 at its second
+    se_av: Optional[jax.Array] = None             # (nod2D,) f8 areasvol at the top level (the inflow's divisor)
     se_elem_nb: Optional[jax.Array] = None        # (elem2D, 3) i4 edge neighbours, ascending edge id; -1 = coast
     se_kappa: Optional[jax.Array] = None          # (elem2D, 3) f8 FESOM_F's l^2/(d A_e) per neighbour slot
-    se_div_inv: Optional[jax.Array] = None        # (elem2D, Dinv) i4 the divergence rows' inverse (ssh_se.div_inverse)
+    se_div_inv: Optional[jax.Array] = None        # (elem2D, Dinv) i4 the inflow rows' inverse (ssh_se.div_inverse)
 
 
 INVERSE_MAP_FIELDS = (("inv_elem_nodes", "elem_nodes", "nod"),

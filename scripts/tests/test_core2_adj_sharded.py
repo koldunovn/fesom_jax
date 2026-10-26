@@ -9,7 +9,7 @@ Two steps in one chunk from the 2013-01-01 hindcast restart, the padded halo tra
 * with the fast pieces ice2 + se (no CG: every solver explicit or fixed-count) the forward — the unfolded State and
   the MLD running sum — and d J_MLD / d (c_k, c_eps, cd, alpha, k_gm) equal the dense ones to round-off;
 * the SE wide halo (FESOM_SE_WIDE=10: one exchange every 10 substeps on 11-ring lanes) keeps forward and gradient
-  equal to the dense ones to round-off, and so does the SE divergence's explicit transpose (FESOM_SE_DIV_VJP=1);
+  equal to the dense ones to round-off, and so does the SE inflow's explicit transpose (FESOM_SE_DIV_VJP=1);
 * with ice2 + se the chunk's forward also equals the production sharded forward
   (``integrate_sharded.run_steps_sharded_forced``, same partition and transport) to round-off;
 * single precision (fast piece sp, ice2 + se + sp): the carry's dtypes are the production runner's (float32, hnode
@@ -250,7 +250,7 @@ def test_se_wide_halo_chunk(models, monkeypatch):
 
 
 def test_se_div_vjp_chunk(models, monkeypatch):
-    """FESOM_SE_DIV_VJP=1 (the divergence's explicit transpose, ordered gathers): the gradient == dense to round-off."""
+    """FESOM_SE_DIV_VJP=1 (the inflow's explicit transpose, ordered gathers): the gradient == dense to round-off."""
     md, _ = models
     monkeypatch.setenv("FESOM_SE_DIV_VJP", "1")
     m = _model(NDEV, "ice2+se")
