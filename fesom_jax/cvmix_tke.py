@@ -8,10 +8,12 @@ per water column, solved implicitly. It mirrors ``fesom_cvmix_integrate_tke``
 ``Kv``/``Av``. Same split the C chose for dump traceability.
 
 Layout convention (the seam from the driver): every array is ``[N, nl]`` with the
-**column-local interface index ``k`` == the global interface index** — i.e. the surface
-interface is ``k=0`` (``ulevels_nod2D == 1``, no cavities in CORE2; the driver asserts
-this). ``nlev`` ``[N]`` is the per-node layer count, so the **bottom interface is
-``k=nlev``** (``= nlevels_nod2D-1``) and ``k>nlev`` is below-bottom (dry, masked-inert).
+**column-local interface index ``k``** — i.e. the surface interface is ``k=0``: the column's
+top wet interface. Without cavities (``ulevels_nod2D == 1``, as in CORE2 and pi) that is the
+global interface index. Under ``mixing_tke(cavity=True)`` the driver shifts
+each column up by ``ulevels_nod2D-1`` before the core and back after it; with ``cavity=False``
+nothing checks a cavity mesh. ``nlev`` ``[N]`` is the per-node layer count, so the **bottom interface is
+``k=nlev``** (``= nlevels_nod2D-1``; ``- (ulevels_nod2D-1)`` under the cavity shift) and ``k>nlev`` is below-bottom (dry, masked-inert).
 Layer quantities (``dzw``) are valid ``k=0..nlev-1``; interface quantities (everything
 else) ``k=0..nlev``.
 

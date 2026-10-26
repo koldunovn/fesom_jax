@@ -170,24 +170,46 @@ def _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch):
     return Kv, Av
 
 
-def _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior):
+def _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior, nzmin=None):
     """``dz_trr`` from the interface masks and layer-centre spacing ``dZ`` that
     :func:`tke_column_inputs` already holds: the four lines of upstream's inline code, verbatim,
-    so the TKE trace is unchanged."""
+    so the TKE trace is unchanged.
+
+    ``nzmin`` (``[N, 1]`` top wet interface, opt-in; only :func:`interface_spacing`, i.e. the
+    IDEMIX column, passes it) takes the surface cap from the column's own top wet layer,
+    ``hnode[uln0]/2`` (F90:520). ``None`` keeps upstream's ``hnode[:, :1]/2``: the TKE path, whose
+    cavity block (:func:`mixing_tke` with ``cavity=True``) re-caps from ``hnode[uln0]`` itself."""
     # dz_trr: interior |ΔZ| (tracer-point spacing) + hnode/2 surface & bottom end caps
     dz_trr = jnp.where(is_interior, jnp.abs(dZ), 0.0)
-    dz_trr = jnp.where(is_surf, hnode[:, :1] / 2.0, dz_trr)    # dz_trr[uln0]=hnode[uln0]/2
+    if nzmin is None:
+        dz_trr = jnp.where(is_surf, hnode[:, :1] / 2.0, dz_trr)    # dz_trr[uln0]=hnode[uln0]/2
+    else:
+        hnode_top = jnp.take_along_axis(hnode, nzmin, axis=-1)     # hnode[uln0], the top wet layer
+        dz_trr = jnp.where(is_surf, hnode_top / 2.0, dz_trr)       # dz_trr[uln0]=hnode[uln0]/2 (F90:520)
     hnode_bot = jnp.take_along_axis(hnode, (nlev - 1)[:, None], axis=-1)   # hnode[nln0]
     dz_trr = jnp.where(is_bot, hnode_bot / 2.0, dz_trr)        # dz_trr[nln0+1]=hnode[nln0]/2
     return dz_trr
 
 
 def interface_spacing(mesh, hnode, Z3d):
-    """The tracer-point interface spacing ``dz_trr`` ``[N, nl]`` the TKE column core takes as
-    ``dzt`` (and the IDEMIX column as its ``dzt``): interior ``|ΔZ|`` + ``hnode/2`` surface &
-    bottom end caps. Factored out of :func:`tke_column_inputs` verbatim (no numerical change);
-    :func:`tke_column_inputs` calls the shared :func:`_dz_trr` on its own masks, so its program
-    is the one it was before the factoring."""
+    """The tracer-point interface spacing ``dz_trr`` ``[N, nl]`` the IDEMIX column takes as its
+    ``dzt``: interior ``|ΔZ|`` + ``hnode/2`` surface & bottom end caps, each from the column's own
+    top / bottom wet layer (``gen_modules_cvmix_idemix.F90:518-521``,
+    ``gen_modules_cvmix_tke.F90:352-355``). Factored out of :func:`tke_column_inputs`. It is the
+    ``dzt`` the TKE column core takes only where the two agree (below). The surface cap reads
+    ``hnode[uln0]``; before it read
+    ``hnode[:, 0]`` whatever ``ulevels_nod2D`` -- identical without cavities (every CORE2 and pi
+    node has ``ulevels_nod2D == 1``), 0 under a cavity, where ``hnode`` above the top wet layer
+    is 0.
+
+    :func:`tke_column_inputs` (the TKE path) calls the shared :func:`_dz_trr` on its own masks
+    WITHOUT the top-wet-layer cap, so its program is upstream's: there ``hnode[:, :1]/2``, and
+    :func:`mixing_tke` with ``cavity=True`` re-caps ``dz_trr`` from ``hnode[uln0]`` before its
+    column shift (upstream 4fe45cc). The two agree on a mesh without cavities
+    (``ulevels_nod2D == 1`` everywhere), and with ``cavity=True`` once that re-cap is applied. On a
+    cavity mesh with ``cavity=False`` (upstream's unrefused gap) they differ at the surface
+    interface of every cavity node: the TKE's ``hnode[:, 0]/2`` is 0 there, this
+    ``hnode[uln0]/2``."""
     nl = mesh.nl
     k = jnp.arange(nl)[None, :]
     nzmin = (mesh.ulevels_nod2D - 1)[:, None]                   # surface interface (0, no cavity)
@@ -198,7 +220,7 @@ def interface_spacing(mesh, hnode, Z3d):
     is_interior = (k >= nzmin + 1) & (k <= nzmax - 1)           # interfaces [uln0+1, nln0]
     Z = _layer_center_Z(mesh, Z3d)                             # (N|1, nl) layer centers
     dZ = _shift_down(Z) - Z                                    # Z[nz-1]-Z[nz] (>0 interior; 0 at k=0)
-    return _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior)
+    return _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior, nzmin=nzmin)
 
 
 COLUMN_INPUTS = ("tke_old", "Ssqr", "Nsqr", "dzw", "dzt", "forc_tke_surf", "nlev")
@@ -214,7 +236,10 @@ def tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, *, Z3d=Non
     Returns a dict: the column-core inputs ``tke_old`` (= ``tke``), ``Ssqr`` (vertical shear²
     of the node velocity over the live layer-centre spacing, interior interfaces only),
     ``Nsqr`` (``bvfreq`` zeroed at the surface and bottom interfaces), ``dzw`` (= ``hnode``),
-    ``dzt`` (interface spacing with ``hnode/2`` end caps, :func:`interface_spacing`),
+    ``dzt`` (interface spacing with ``hnode/2`` end caps, the surface cap upstream's
+    ``hnode[:, 0]/2``: :func:`interface_spacing` on a mesh without cavities; on a cavity mesh it
+    differs at the cavity nodes' surface interface until :func:`mixing_tke` with ``cavity=True``
+    re-caps it),
     ``forc_tke_surf`` (``|stress_node_surf|/ρ₀``), ``nlev`` (per-node layer count); plus
     ``uvnode`` (the element→node velocity the step reuses) and the interface masks ``is_surf``,
     ``is_bot``, ``is_interior``. ``integrate_tke_column(*(d[k] for k in COLUMN_INPUTS), ...)``
@@ -249,7 +274,9 @@ def tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, *, Z3d=Non
     # bvfreq2 = the shared smoothed N², ZEROED at surface+bottom (nonzero only interior) —
     # ⚠️ a naive slice leaks the nonzero surface value (fesom_tke.c:362-364).
     bvfreq2 = jnp.where(is_interior, bvfreq, 0.0)
-    dz_trr = _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior)   # = interface_spacing
+    # upstream's surface cap hnode[:, 0]/2: interface_spacing without cavities, and under
+    # mixing_tke(cavity=True) after its re-cap; not at cavity nodes with cavity=False
+    dz_trr = _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior)
     out = dict(tke_old=tke, Ssqr=vshear2, Nsqr=bvfreq2, dzw=hnode, dzt=dz_trr,
                forc_tke_surf=forc_tke_surf, nlev=nlev, uvnode=uvnode,
                is_surf=is_surf, is_bot=is_bot, is_interior=is_interior)

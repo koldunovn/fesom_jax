@@ -20,7 +20,9 @@ connectivity).
    passes and a halo exchange, and the Fortran's own TKE consumes node-averaged fields
    anyway (SPEC_STAGE3 §6.3). Per-node inputs: the wet interfaces
    ``ulevels_nod2D-1 .. nlevels_nod2D-1`` (0-based), ``dzw = hnode[:, :nl-1]``,
-   ``dzt = tke.interface_spacing`` (the TKE's ``dz_trr``), ``Nsqr = bvfreq``,
+   ``dzt = tke.interface_spacing`` (the Fortran ``dz_trr``, surface cap from the column's own
+   top wet layer; the TKE column's ``dzt`` on a mesh without cavities, the only meshes IDEMIX
+   accepts), ``Nsqr = bvfreq``,
    ``coriolis = mesh.coriolis_node``.
 2. **Propagation after the column solve.** As in the Fortran (which propagates in place on
    ``iwe_n`` after ``integrate_idemix``), the lateral step acts on the column-step energy

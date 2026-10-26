@@ -256,7 +256,9 @@ def test_mixing_tke_refuses_idemix_with_cavity():
 def test_interface_spacing_is_the_tke_dzt_bitwise():
     """``tke.interface_spacing`` (the IDEMIX column's ``dzt``) recomputes the interface masks and
     the layer-centre spacing itself; ``tke_column_inputs`` keeps its inline masks and calls the
-    shared ``_dz_trr`` (so the TKE program is upstream's). The two give the same ``dzt`` bitwise."""
+    shared ``_dz_trr`` (so the TKE program is upstream's). On pi (no cavities) the two give the
+    same ``dzt`` bitwise; on a cavity mesh they differ at the cavity nodes' surface interface
+    unless ``mixing_tke(cavity=True)`` re-caps it (test_tke_interface_spacing.py)."""
     from fesom_jax import tke as tkemod
     from fesom_jax.tests.test_tke_cuts_pi import _pi_driver
     mesh, a = _pi_driver()
