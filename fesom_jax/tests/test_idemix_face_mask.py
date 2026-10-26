@@ -148,7 +148,7 @@ def test_mask_off_is_bitwise_the_old_operator(host, cap):
     """lateral_face_mask=False: the step is bitwise the 0001-0010 composition with the 2-D
     full-face weight (cap 1e-5 makes the v0 cap bind on pi); mask on: bitwise the same
     composition with the per-level weight."""
-    cfg = I.IdemixConfig(lateral_cfl_cap=cap, n_hor_iter=3, lateral_face_mask=False)
+    cfg = I.IdemixConfig(lateral_cfl_cap=cap, n_hor_iter=3, lateral_face_mask=False, metric="mixed")
     off = _run(host, cfg)
     np.testing.assert_array_equal(np.asarray(off.iwe_new),
                                   np.asarray(_composed(host, cfg, host["lateral"].nbr_weight)))
@@ -229,7 +229,7 @@ def test_lateral_stability_preflight(host):
     step uses; the masked face never raises s*mu_max on any level (its Laplacian is the full
     one minus a PSD part), and the result scales with tau_h/n_hor_iter."""
     mesh, lat = host["mesh"], host["lateral"]
-    cfg = I.IdemixConfig(lateral_cfl_cap=1e-5)          # binds on pi (dt = 100 s)
+    cfg = I.IdemixConfig(lateral_cfl_cap=1e-5, metric="mixed")     # binds on pi (dt = 100 s)
     st = I.lateral_stability(mesh, host["iwe0"], host["bvfreq"], host["hnode"], host["forcing"],
                              PARAMS, cfg, lat, dt=DT)
     from fesom_jax.tke import interface_spacing

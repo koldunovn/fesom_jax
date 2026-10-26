@@ -61,6 +61,8 @@ optional::
                                #   full face, pre-0011)     }
       tke_e_iw: post_lateral   # E for TKE's Rinum cap      }
                                #   (column = pre-0013)      }
+      metric: volume           # energy metric: volume |    }
+                               #   mixed (pre-0014) | prism }
       params: fesom_operational   # | oe13 | {tau_v, tau_h, gamma, jstar, mu0} (all five)
       surf_file: /pool/.../fourier_smooth_2005_cfsr_inert_rgrid.nc   # } idemix_jax.
       bot_file:  /pool/.../tidal_energy_gx1v6_20090205_rgrid.nc      # } load_idemix_forcing
@@ -226,7 +228,7 @@ _HALO_TRANSPORTS = ("all_gather", "padded", "coloured", "grouped", "ragged")
 # The `idemix:` mapping (see the module docstring). Kept as plain names here so importing
 # run_config never imports idemix_jax; the config/params objects are built lazily.
 _IDEMIX_CFG_KEYS = ("n_hor_iter", "lateral", "lateral_cfl_cap",
-                    "lateral_face_mask", "tke_e_iw")             # IdemixConfig._fields
+                    "lateral_face_mask", "tke_e_iw", "metric")   # IdemixConfig._fields
 _IDEMIX_FORCING_KEYS = ("surf_file", "bot_file", "sforcusage", "botforc_Etot")
 _IDEMIX_KEYS = _IDEMIX_CFG_KEYS + ("params",) + _IDEMIX_FORCING_KEYS
 _IDEMIX_PARAM_PRESETS = ("fesom_operational", "oe13")
@@ -391,16 +393,20 @@ class RunConfig:
             return None, None
         import numpy as np
         from idemix_jax import load_idemix_forcing
-        from .idemix import build_lateral_operator, check_no_cavity_mesh, check_wet_columns
+        from .idemix import (build_lateral_operator, check_layer_areas, check_no_cavity_mesh,
+                             check_wet_columns)
         check_no_cavity_mesh(mesh)
         check_wet_columns(mesh)
+        if self.idemix_config().metric == "volume":
+            check_layer_areas(mesh)
         kw = {k: self.idemix[k] for k in _IDEMIX_FORCING_KEYS if k in self.idemix}
         if kw.get("botforc_Etot", 0.0) != 0.0:
             top = np.asarray(mesh.ulevels_nod2D) - 1
             kw["node_area"] = np.take_along_axis(np.asarray(mesh.areasvol), top[:, None], 1)[:, 0]
         geo = np.degrees(np.asarray(mesh.geo_coord_nod2D, dtype=np.float64))
         forcing = load_idemix_forcing(geo[:, 0], geo[:, 1], **kw)
-        lateral = build_lateral_operator(mesh) if self.idemix_config().lateral else None
+        lateral = (build_lateral_operator(mesh, metric=self.idemix_config().metric)
+                   if self.idemix_config().lateral else None)
         return forcing, lateral
 
     def ssh_cheb(self) -> tuple:

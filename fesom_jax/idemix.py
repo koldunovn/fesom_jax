@@ -44,6 +44,30 @@ connectivity).
    ``idemix.f90:85-99`` with a 2x margin at the default ``cap = 0.1``), ``res`` the per-node
    ``mesh.mesh_resolution`` (Voronoi diameter, m). ``lateral_cfl_cap = 0`` disables it.
 
+**Energy metric** (patch 0014, ``IdemixConfig.metric``). Node placement puts the Fortran's
+ELEMENT column (a prism of one area, ``F90:365-455``) on a node's dual cell, whose area shrinks
+at every sea-floor step (``areasvol``). The area-blind column then conserves the prism
+``sum A0 dzt E`` (``A0`` the top wet layer's area) while the lateral step conserves
+``sum area_if dzt E``, so each step is a spurious source in the other's metric, and the whole
+dual cell's bottom flux lands at its deepest interface (budget review 2026-10-26, B1).
+``metric``:
+
+* ``"volume"`` (default): the finite-volume node column (``idemix_jax``
+  ``idemix_step(layer_area=...)``) on the lateral step's cells ``area_if * dzt``: the vertical
+  flux through layer ``k`` crosses ``areasvol[k]``, the bottom flux enters at every sea-floor
+  step (``areasvol[k-1] - areasvol[k]``, the elements whose own bottom is interface ``k``, as
+  the Fortran's element columns deposit it). Both steps conserve ``sum area_if dzt E`` and the
+  column takes ``A0 (fs + fb)``. ``iw_diss`` differs from the area-blind column at every node
+  whose elements end at different depths, and is bitwise the same at the others. No cavities:
+  :func:`check_layer_areas` refuses layer areas that grow with depth wherever the mesh is
+  concrete (the run entry, the run config, :func:`build_lateral_operator` and the column step
+  itself), and :func:`check_no_cavity_mesh` (patch 0004) a mesh with ``ulevels_nod2D > 1`` at the
+  same places under every metric;
+* ``"mixed"``: the scheme above, the Fortran's area-blind column on the node, bitwise patches
+  0001-0013; for reproducing old campaigns;
+* ``"prism"``: the column unchanged and the lateral step on the prism cells ``A0 * dzt``:
+  both conserve ``sum A0 dzt E`` (cheap closure; keeps the prism's dilution of the deep cells).
+
 Lateral operator (:func:`build_lateral_operator`, host-side NumPy, once per mesh): the
 two-point flux weight of edge ``(a, b)`` is ``w = cross_len / node_dist`` — the cross-edge
 length (the two ``edge_cross_dxdy`` segments, m; one is zero on a boundary edge) over the
@@ -92,6 +116,10 @@ from . import pp, tke
 from .config import R_EARTH
 
 
+#: the values of :attr:`IdemixConfig.metric` (module docstring, "Energy metric")
+METRICS = ("mixed", "volume", "prism")
+
+
 class IdemixConfig(NamedTuple):
     """Static IDEMIX config (the :class:`~fesom_jax.tke.TkeConfig` precedent): hashable,
     no differentiable leaves — the tunables ``tau_v``/``tau_h``/``gamma``/``jstar``/``mu0``
@@ -105,6 +133,10 @@ class IdemixConfig(NamedTuple):
     tke_e_iw: str = "post_lateral"  # energy for TKE's Rinum cap (tke_coupling): "post_lateral" =
     #                                 iwe_new, the Fortran's iwe_n (patch 0013); "column" = the
     #                                 column-step E_iw (patches 0001-0012)
+    metric: str = "volume"          # energy metric (patch 0014, module docstring): "volume" =
+    #                                 finite-volume column on area_if cells; "mixed" = area-blind
+    #                                 column + area_if lateral (patches 0001-0013); "prism" =
+    #                                 area-blind column + lateral on A0 * dzt cells
 
     def validate(self) -> "IdemixConfig":
         """Raise on an invalid combination; returns ``self``. ``n_hor_iter`` may be any
@@ -121,6 +153,8 @@ class IdemixConfig(NamedTuple):
         if self.tke_e_iw not in ("post_lateral", "column"):
             raise ValueError("IdemixConfig.tke_e_iw must be 'post_lateral' or 'column', got "
                              f"{self.tke_e_iw!r}")
+        if self.metric not in METRICS:
+            raise ValueError(f"IdemixConfig.metric must be one of {METRICS}, got {self.metric!r}")
         return self
 
 
@@ -228,7 +262,7 @@ def check_wet_columns(mesh) -> None:
             f"(nlevels_nod2D - ulevels_nod2D < 1), e.g. node(s) {bad[:5].tolist()}")
 
 
-def build_lateral_operator(mesh) -> LateralOperator:
+def build_lateral_operator(mesh, *, metric: str = "volume") -> LateralOperator:
     """The lateral-propagation connectivity of ``mesh`` (host-side NumPy, once per mesh).
 
     Edge weight ``w = cross_len / node_dist`` (dimensionless, unclipped): ``cross_len`` =
@@ -241,7 +275,11 @@ def build_lateral_operator(mesh) -> LateralOperator:
     :func:`interface_area` the lateral step will use is not finite and > 0 on every wet interface
     (``idemix_jax.mesh.validate_lateral_inputs``: ``horizontal_propagation`` silently
     exchanges nothing at such an interface, which hid the per-layer ``areasvol`` bug of
-    patch 0003 for a whole campaign). All checks are host-side NumPy and change no number.
+    patch 0003 for a whole campaign). ``metric`` is the :attr:`IdemixConfig.metric` the operator
+    will run with: ``"volume"`` (default, as the config's) also refuses layer areas that grow with
+    depth (:func:`check_layer_areas`, a cavity ceiling), so a caller with another metric on such a
+    mesh says so; a mesh with cavities (``ulevels_nod2D > 1``) is refused under every metric.
+    All checks are host-side NumPy and change no number.
 
     The face fields (patch 0011): per slot and adjacent element (``mesh.edge_tri``, ``-1`` =
     none) the segment ``hypot(cross[2e], cross[2e+1]) / node_dist`` and the element's wet
@@ -253,6 +291,8 @@ def build_lateral_operator(mesh) -> LateralOperator:
     wet = np.asarray(_wet_interfaces(mesh))
     area_if = np.asarray(interface_area(mesh))
     validate_lateral_inputs(area_if, wet)
+    if metric == "volume":
+        check_layer_areas(mesh)
     nl = int(mesh.nl)
     edges = np.asarray(mesh.edges)
     cross = np.asarray(mesh.edge_cross_dxdy, dtype=np.float64)
@@ -329,6 +369,52 @@ def interface_area(mesh):
     return jnp.where(_wet_interfaces(mesh), area_if, 0.0)
 
 
+def node_area(mesh):
+    """``[nod2D]`` the node's dual-cell area ``A0`` [m^2]: ``areasvol`` of its top wet layer, the
+    projected area the per-node forcing maps (W/m^2) act on (``sum A0 == sum elem_area``)."""
+    uln0 = (mesh.ulevels_nod2D - 1)[:, None]
+    return jnp.take_along_axis(mesh.areasvol, uln0, axis=1)[:, 0]
+
+
+def layer_area(mesh):
+    """``[nod2D, nl-1]`` the per-LAYER dual-cell area ``areasvol`` [m^2] on the node's wet layers,
+    0 elsewhere: the face areas of the finite-volume column (``metric="volume"``)."""
+    wet = _wet_interfaces(mesh)
+    return jnp.where(wet[:, :-1] & wet[:, 1:], mesh.areasvol[:, :mesh.nl - 1], 0.0)
+
+
+def cell_area(mesh, cfg: IdemixConfig):
+    """``[nod2D, nl]`` per-interface area of the energy cells (volumes ``cell_area * dzt``) the
+    lateral step uses and :func:`budget_terms` sums in: :func:`interface_area` (the Fortran
+    ``vol_wcelli``) for ``metric`` ``"mixed"`` and ``"volume"``, the node area ``A0`` on every
+    wet interface for ``"prism"``."""
+    if cfg.metric == "prism":
+        return jnp.where(_wet_interfaces(mesh), node_area(mesh)[:, None], 0.0)
+    return interface_area(mesh)
+
+
+def check_layer_areas(mesh) -> None:
+    """Raise ``ValueError`` unless every wet layer has area > 0 and no layer is wider than the
+    one above it (``metric="volume"`` deposits the bottom flux on the steps ``areasvol[k-1] -
+    areasvol[k]``; a layer that grows with depth -- a cavity ceiling -- would make a step
+    negative). Host-side NumPy on the static mesh, for ``metric="volume"`` only: the run entry, the
+    run config's ``idemix_inputs``, :func:`build_lateral_operator`, and the column step when its
+    mesh is concrete (:func:`_column_step`)."""
+    a = np.asarray(mesh.areasvol, dtype=np.float64)[:, :int(mesh.nl) - 1]
+    k = np.arange(a.shape[1])[None, :]
+    u = np.asarray(mesh.ulevels_nod2D)[:, None] - 1
+    b = np.asarray(mesh.nlevels_nod2D)[:, None] - 2
+    wl = (k >= u) & (k <= b)
+    if np.any(a[wl] <= 0.0):
+        raise ValueError("IDEMIX metric='volume' needs areasvol > 0 on every wet layer")
+    grow = wl[:, 1:] & wl[:, :-1] & (a[:, 1:] > a[:, :-1])
+    if np.any(grow):
+        bad = np.flatnonzero(grow.any(axis=1))
+        raise ValueError(
+            f"IDEMIX metric='volume' needs layer areas that do not grow with depth (no cavities); "
+            f"{bad.size} node(s) have a wider layer below a narrower one, e.g. {bad[:5].tolist()}")
+
+
 def _v0_cap(params_idemix: IdemixParams, cfg: IdemixConfig, lateral_op: LateralOperator,
             dt: float):
     """``[nod2D, 1]`` cap ``sqrt(cap * res**2 / (tau_h * dt / n_hor_iter))`` (ruling 3)."""
@@ -346,30 +432,53 @@ def _lateral_v0(v0, params_idemix: IdemixParams, cfg: IdemixConfig,
 
 
 def _columns_per_node_mu0(iwe, bvfreq, dzw, dzt, coriolis, fsrf, fbot, dt, params_idemix,
-                          mu0_node, is_wet):
+                          mu0_node, is_wet, layer_area_=None):
     """``idemix_step_columns``'s masked column step with ``mu0`` per column (``mu0_node``
     ``[nod2D]``): ``idemix_jax.core.idemix_step`` vmapped over the columns with the parameters'
     ``mu0`` batched and the other four shared (the library's column map closes over one
-    ``IdemixParams``)."""
-    def one(E, N2, dw, dz, f, fs, fb, w, m):
+    ``IdemixParams``). ``layer_area_`` ``[nod2D, nl-1]``: the finite-volume column
+    (``metric="volume"``); ``None`` = the area-blind column."""
+    if layer_area_ is None:
+        def one(E, N2, dw, dz, f, fs, fb, w, m):
+            return idemix_step(E, N2, dw, dz, f, fs, fb, dt, params=params_idemix._replace(mu0=m),
+                               forc=jnp.zeros_like(E), is_wet=w)
+
+        return jax.vmap(one)(iwe, bvfreq, dzw, dzt, coriolis, fsrf, fbot,
+                             jnp.asarray(is_wet, dtype=bool), mu0_node)
+
+    def one_fv(E, N2, dw, dz, f, fs, fb, w, m, a):
         return idemix_step(E, N2, dw, dz, f, fs, fb, dt, params=params_idemix._replace(mu0=m),
-                           forc=jnp.zeros_like(E), is_wet=w)
+                           forc=jnp.zeros_like(E), is_wet=w, layer_area=a)
 
-    return jax.vmap(one)(iwe, bvfreq, dzw, dzt, coriolis, fsrf, fbot,
-                         jnp.asarray(is_wet, dtype=bool), mu0_node)
+    return jax.vmap(one_fv)(iwe, bvfreq, dzw, dzt, coriolis, fsrf, fbot,
+                            jnp.asarray(is_wet, dtype=bool), mu0_node, layer_area_)
 
 
-def _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d, params_field=None):
-    """The step's column evaluation: ``(res, dzt, is_wet)`` (:func:`_idemix_core`)."""
+def _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d, params_field=None,
+                 metric="volume"):
+    """The step's column evaluation: ``(res, dzt, is_wet)`` (:func:`_idemix_core`).
+    ``metric="volume"``: the finite-volume column on :func:`layer_area` (module docstring). Every
+    IDEMIX path passes here, lateral on or off, so this is where a mesh driven directly from
+    Python meets :func:`check_no_cavity_mesh` (patch 0004, every metric) and
+    :func:`check_layer_areas` (``metric="volume"``). A concrete mesh is checked, also while a
+    caller traces its other inputs (at trace time, once per compilation). A traced mesh
+    (``step_jit``, ``integrate_jit``, the sharded runners) cannot be read: those paths rest on the
+    checks of the run entry and :func:`build_lateral_operator`."""
+    if not _is_traced(mesh):
+        check_no_cavity_mesh(mesh)
+        if metric == "volume":
+            check_layer_areas(mesh)
     nl = mesh.nl
     is_wet = _wet_interfaces(mesh)
     dzw = hnode[:, :nl - 1]
     dzt = tke.interface_spacing(mesh, hnode, Z3d)
+    la = layer_area(mesh) if metric == "volume" else None
+    fv = {} if la is None else dict(layer_area=la)
     if not _field_active(params_field):
         res = idemix_step_columns(
             iwe, bvfreq, dzw, dzt, mesh.coriolis_node,
             jnp.asarray(forcing.fsrf), jnp.asarray(forcing.fbot), dt, params_idemix,
-            forc=None, is_wet=is_wet)
+            forc=None, is_wet=is_wet, **fv)
     else:
         _check_field(mesh, params_field)
         fbot = jnp.asarray(forcing.fbot)
@@ -378,12 +487,12 @@ def _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d, para
         if params_field.log_mu0 is None:
             res = idemix_step_columns(
                 iwe, bvfreq, dzw, dzt, mesh.coriolis_node, jnp.asarray(forcing.fsrf), fbot,
-                dt, params_idemix, forc=None, is_wet=is_wet)
+                dt, params_idemix, forc=None, is_wet=is_wet, **fv)
         else:
             mu0_node = params_idemix.mu0 * jnp.exp(params_field.log_mu0)
             res = _columns_per_node_mu0(iwe, bvfreq, dzw, dzt, mesh.coriolis_node,
                                         jnp.asarray(forcing.fsrf), fbot, dt, params_idemix,
-                                        mu0_node, is_wet)
+                                        mu0_node, is_wet, la)
     return res, dzt, is_wet
 
 
@@ -395,13 +504,13 @@ def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_
     the step's arithmetic. ``params_field`` (:class:`IdemixParamsField`): per-node log
     multipliers of ``mu0`` and of the bottom forcing; ``None`` (or all entries ``None``) is the
     scalar path, unchanged. The lateral face is :func:`lateral_face_weight` (``cfg.
-    lateral_face_mask``)."""
+    lateral_face_mask``). The cells are :func:`cell_area` ``* dzt`` (``cfg.metric``)."""
     res, dzt, is_wet = _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d,
-                                    params_field)
+                                    params_field, cfg.metric)
     if cfg.lateral:
         v0 = _lateral_v0(res.v0, params_idemix, cfg, lateral_op, dt)
         tend = horizontal_propagation(
-            res.E_iw, v0, dzt, interface_area(mesh), lateral_op.nbr_idx,
+            res.E_iw, v0, dzt, cell_area(mesh, cfg), lateral_op.nbr_idx,
             lateral_face_weight(lateral_op, mesh.nl, cfg),
             dt, params_idemix, n_iter=int(cfg.n_hor_iter), is_wet=is_wet)   # [m^2/s^3]
         iwe_new = res.E_iw + dt * tend
@@ -423,19 +532,16 @@ def lateral_stability(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
     well above 2 is an instability). For screening parameter sets (e.g. ensemble members) on
     the state they start from. ``kw`` goes to ``lateral_step_stability`` (``dense_max``,
     ``tol``). Returns its ``LateralStability`` (``s_mu_max``, ``level``, ``column``,
-    ``by_level``, ``s_diag_max``, ...). A concrete cavity mesh raises
-    (:func:`check_no_cavity_mesh`, as in :func:`mixing_idemix`); a traced one cannot be read."""
+    ``by_level``, ``s_diag_max``, ...)."""
     cfg.validate()
     if not cfg.lateral or lateral_op is None:
         raise ValueError("lateral_stability needs cfg.lateral=True and a LateralOperator")
-    if not _is_traced(mesh):
-        check_no_cavity_mesh(mesh)
     res, dzt, is_wet = _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d,
-                                    params_field)
+                                    params_field, cfg.metric)
     v0 = _lateral_v0(res.v0, params_idemix, cfg, lateral_op, dt)
     w = lateral_face_weight(lateral_op, mesh.nl, cfg)
     return lateral_step_stability(
-        np.asarray(v0), np.asarray(dzt), np.asarray(interface_area(mesh)),
+        np.asarray(v0), np.asarray(dzt), np.asarray(cell_area(mesh, cfg)),
         np.asarray(lateral_op.nbr_idx), np.asarray(w), dt, params_idemix,
         n_iter=int(cfg.n_hor_iter), is_wet=np.asarray(is_wet), **kw)
 
@@ -453,11 +559,9 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
     with ``cfg.lateral`` raises: the neighbor arrays index the global mesh.
     ``params_field`` (:class:`IdemixParamsField`, ``Params.idemix_field``): per-node log
     multipliers of ``mu0`` and of the bottom forcing ``fbot``; ``None`` (default) ⇒ the scalar
-    path, bitwise unchanged; refused with ``sharded=True``. A concrete cavity mesh raises
-    (:func:`check_no_cavity_mesh`); a traced one cannot be read."""
+    path, bitwise unchanged; refused with ``sharded=True``. A concrete cavity mesh raises in
+    the column step (:func:`_column_step`); a traced one cannot be read."""
     cfg.validate()
-    if not _is_traced(mesh):
-        check_no_cavity_mesh(mesh)
     if sharded and _field_active(params_field):
         raise NotImplementedError(
             "Params.idemix_field (per-node IDEMIX multipliers) is dense/1-device only: its "
@@ -501,14 +605,20 @@ def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixPara
     step computes N^2 from the start-of-step T/S and carries it), ``s0.hnode`` and ``Z3d`` =
     the live zstar layer centres of ``s0.hnode`` (``None`` = static), and the step's
     ``params_field`` (``Params.idemix_field``; ``None`` = the scalar path). Volumes
-    ``V = interface_area * dzt``. Each entry is a ``[nod2D]`` sum over the column's wet
-    interfaces (sum over nodes for the global budget):
+    ``V = cell_area * dzt`` (:func:`cell_area`: ``interface_area`` unless ``cfg.metric`` is
+    ``"prism"``). Each entry is a ``[nod2D]`` sum over the column's wet interfaces (sum over
+    nodes for the global budget):
 
     * ``dEdt = sum V (s1.iwe - s0.iwe) / dt`` — from the CARRIED new energy;
     * ``P_surf``/``P_bot`` = ``sum V Tsur`` / ``sum V Tbot`` (forcing power);
     * ``D = sum V iw_diss`` (dissipation, >= 0 for physical states);
-    * ``Dif = sum V Tdif`` (vertical diffusion: zero per column in the ``dzt`` metric, not in
-      ``V``, because the node area changes with depth);
+    * ``Dif = sum V Tdif`` (vertical diffusion). ``metric`` ``"volume"`` (default) and
+      ``"prism"``: 0 per column (both steps conserve ``sum V E``), and ``P_bot`` is the full
+      ``sum A0 fb``. ``"mixed"``: the area-blind column conserves ``sum A0 dzt E``, not
+      ``sum V E``, so ``Dif`` is a spurious source wherever the node area changes with depth,
+      and ``P_bot`` is the bottom flux on the deepest interface's area only (``sum Abot fb``, a
+      part of the column's ``sum A0 fb``): read ``P_bot`` and ``Dif`` together; ``D`` is the
+      energy the step dissipates;
     * ``Lat = sum V (iwe_new - E_iw) / dt`` (lateral propagation; sums to ~0 over the mesh);
     * ``E = sum V s1.iwe``; ``abs_resid = |dEdt - (P_surf + P_bot - D + Dif + Lat)|``;
     * ``n_wet`` wet interfaces; ``n_capped`` those where the v0 CFL cap binds
@@ -519,15 +629,11 @@ def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixPara
       :func:`lateral_stability`).
 
     If ``s1`` is the step's output, ``dEdt = P_surf + P_bot - D + Dif + Lat`` per node and
-    globally, to roundoff (the column solve's budget identity plus the lateral composition).
-    A concrete cavity mesh raises (:func:`check_no_cavity_mesh`, as in :func:`mixing_idemix`);
-    a traced one cannot be read."""
-    if not _is_traced(mesh):
-        check_no_cavity_mesh(mesh)
+    globally, to roundoff (the column solve's budget identity plus the lateral composition)."""
     res, iwe_new, dzt, is_wet = _idemix_core(mesh, s0.iwe, s1.bvfreq, s0.hnode, forcing,
                                              params_idemix, cfg, lateral_op, dt, Z3d,
                                              params_field)
-    V = interface_area(mesh) * dzt
+    V = cell_area(mesh, cfg) * dzt
 
     def col(x):
         return jnp.sum(jnp.where(is_wet, x, 0.0), axis=1)

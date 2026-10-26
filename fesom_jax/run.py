@@ -504,6 +504,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         _idemix.check_no_cavity_mesh(mesh)       # host-side, whatever cfg.cavity says
         _iw_cfg = cfg.idemix_config()
         _idemix.check_wet_columns(mesh)          # host-side, before any forcing is built
+        if _iw_cfg.metric == "volume":
+            _idemix.check_layer_areas(mesh)
         if _iw_cfg.lateral and npes > 1:
             raise NotImplementedError(
                 f"idemix lateral propagation runs on one device only (partition has npes={npes}); "
@@ -517,7 +519,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             idemix_forcing, _lat = cfg.idemix_inputs(mesh)
             idemix_lateral = _lat if idemix_lateral is None else idemix_lateral
         elif idemix_lateral is None and _iw_cfg.lateral:
-            idemix_lateral = _idemix.build_lateral_operator(mesh)
+            idemix_lateral = _idemix.build_lateral_operator(mesh, metric=_iw_cfg.metric)
         _f_p, _l_p = _idemix.partition_idemix_inputs(idemix_forcing, idemix_lateral, part)
         _iw_kw = dict(idemix_forcing=_f_p, idemix_lateral=_l_p)
         if jax.process_index() == 0:

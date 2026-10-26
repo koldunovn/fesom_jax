@@ -168,6 +168,38 @@ def test_cavity_mesh_is_refused_on_every_concrete_idemix_path(pi, monkeypatch):
                                           None, dt=DT).iwe_new)(z)
 
 
+def test_cavity_mesh_is_refused_by_the_column_step_on_every_path(pi):
+    """Patch 0014 moved the column-step guards of ``mixing_idemix``, ``budget_terms`` (0006) and
+    ``lateral_stability`` (0011) into ``_column_step``, which the step, the budget re-evaluation
+    and the lateral stability preflight all pass, under every metric."""
+    pytest.importorskip("idemix_jax")
+    from idemix_jax import IdemixForcing, IdemixParams
+    from fesom_jax import idemix as I
+    good, bad = pi["mesh"], _cavity_mesh(pi["mesh"])
+    msg = r"ice-shelf cavities: 3 node\(s\) have ulevels_nod2D > 1"
+    n, nl = int(bad.nod2D), int(bad.nl)
+    f = IdemixForcing(fsrf=jnp.full(n, 1e-6), fbot=jnp.full(n, 1e-6))
+    z = jnp.zeros((n, nl))
+    params = jax.tree.map(jnp.asarray, IdemixParams.fesom_operational())
+    lat = I.build_lateral_operator(good)
+
+    class S:
+        pass
+    s0, s1 = S(), S()
+    s0.iwe, s0.hnode, s1.iwe, s1.bvfreq = z, z, z, z
+    for metric in ("volume", "mixed", "prism"):
+        for lateral in (False, True):
+            cfg = I.IdemixConfig(lateral=lateral, metric=metric)
+            op = lat if lateral else None
+            with pytest.raises(ValueError, match=msg):
+                I.mixing_idemix(bad, z, z, z, f, params, cfg, op, dt=DT)
+            with pytest.raises(ValueError, match=msg):
+                I.budget_terms(bad, s0, s1, f, params, cfg, op, dt=DT)
+            if lateral:
+                with pytest.raises(ValueError, match=msg):
+                    I.lateral_stability(bad, z, z, z, f, params, cfg, op, dt=DT)
+
+
 # --- several JAX processes -----------------------------------------------------------------------
 def test_run_entry_refuses_idemix_under_several_processes(pi, monkeypatch):
     pytest.importorskip("idemix_jax")          # run_from_config validates the idemix block first
