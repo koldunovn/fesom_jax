@@ -148,7 +148,8 @@ def test_mask_off_is_bitwise_the_old_operator(host, cap):
     """lateral_face_mask=False: the step is bitwise the 0001-0010 composition with the 2-D
     full-face weight (cap 1e-5 makes the v0 cap bind on pi); mask on: bitwise the same
     composition with the per-level weight."""
-    cfg = I.IdemixConfig(lateral_cfl_cap=cap, n_hor_iter=3, lateral_face_mask=False, metric="mixed")
+    cfg = I.IdemixConfig(lateral_cfl_cap=cap, n_hor_iter=3, lateral_face_mask=False, metric="mixed",
+                         lateral_face_thickness="node")
     off = _run(host, cfg)
     np.testing.assert_array_equal(np.asarray(off.iwe_new),
                                   np.asarray(_composed(host, cfg, host["lateral"].nbr_weight)))
@@ -168,7 +169,7 @@ def test_mask_changes_the_tendency_only_where_faces_shrink(host):
     have a shrunk face to a neighbour with volume there, and on all of them the masked step
     moves less energy across."""
     mesh, lat = host["mesh"], host["lateral"]
-    cfg = I.IdemixConfig(n_hor_iter=1, lateral_cfl_cap=0.0)
+    cfg = I.IdemixConfig(n_hor_iter=1, lateral_cfl_cap=0.0, lateral_face_thickness="node")
     on = np.asarray(_run(host, cfg).iwe_new)
     off = np.asarray(_run(host, cfg._replace(lateral_face_mask=False)).iwe_new)
     col = np.asarray(_run(host, cfg._replace(lateral=False)).iwe_new)
@@ -229,7 +230,8 @@ def test_lateral_stability_preflight(host):
     step uses; the masked face never raises s*mu_max on any level (its Laplacian is the full
     one minus a PSD part), and the result scales with tau_h/n_hor_iter."""
     mesh, lat = host["mesh"], host["lateral"]
-    cfg = I.IdemixConfig(lateral_cfl_cap=1e-5, metric="mixed")     # binds on pi (dt = 100 s)
+    cfg = I.IdemixConfig(lateral_cfl_cap=1e-5, metric="mixed",      # binds on pi (dt = 100 s)
+                         lateral_face_thickness="node")
     st = I.lateral_stability(mesh, host["iwe0"], host["bvfreq"], host["hnode"], host["forcing"],
                              PARAMS, cfg, lat, dt=DT)
     from fesom_jax.tke import interface_spacing
@@ -259,7 +261,9 @@ def test_run_config_idemix_block_takes_the_flag():
     from fesom_jax.run_config import RunConfig
     from fesom_jax.run_config import _IDEMIX_CFG_KEYS
     assert set(_IDEMIX_CFG_KEYS) == set(I.IdemixConfig._fields)
-    old = RunConfig.from_dict({"idemix": {"lateral_face_mask": False}})
+    old = RunConfig.from_dict({"idemix": {"lateral_face_mask": False,
+                                          "lateral_face_thickness": "node"}})
     old.validate()
-    assert old.idemix_config() == I.IdemixConfig(lateral_face_mask=False)
+    assert old.idemix_config() == I.IdemixConfig(lateral_face_mask=False,
+                                                 lateral_face_thickness="node")
     assert RunConfig.from_dict({"idemix": {}}).idemix_config().lateral_face_mask is True

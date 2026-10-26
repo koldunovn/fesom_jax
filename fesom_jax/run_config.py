@@ -58,11 +58,13 @@ optional::
       lateral: true            # horizontal propagation    }   (defaults when absent)
       lateral_cfl_cap: 0.1     # v0 CFL cap (0 = off)      }
       lateral_face_mask: true  # depth-masked face (false = }
-                               #   full face, pre-0011)     }
+                               #   full face, pre-0011;     }
+                               #   needs thickness node)    }
       tke_e_iw: post_lateral   # E for TKE's Rinum cap      }
                                #   (column = pre-0013)      }
       metric: volume           # energy metric: volume |    }
                                #   mixed (pre-0014) | prism }
+      lateral_face_thickness: element   # | node (pre-0015) }
       params: fesom_operational   # | oe13 | {tau_v, tau_h, gamma, jstar, mu0} (all five)
       surf_file: /pool/.../fourier_smooth_2005_cfsr_inert_rgrid.nc   # } idemix_jax.
       bot_file:  /pool/.../tidal_energy_gx1v6_20090205_rgrid.nc      # } load_idemix_forcing
@@ -228,7 +230,8 @@ _HALO_TRANSPORTS = ("all_gather", "padded", "coloured", "grouped", "ragged")
 # The `idemix:` mapping (see the module docstring). Kept as plain names here so importing
 # run_config never imports idemix_jax; the config/params objects are built lazily.
 _IDEMIX_CFG_KEYS = ("n_hor_iter", "lateral", "lateral_cfl_cap",
-                    "lateral_face_mask", "tke_e_iw", "metric")   # IdemixConfig._fields
+                    "lateral_face_mask", "tke_e_iw", "metric",
+                    "lateral_face_thickness")                    # IdemixConfig._fields
 _IDEMIX_FORCING_KEYS = ("surf_file", "bot_file", "sforcusage", "botforc_Etot")
 _IDEMIX_KEYS = _IDEMIX_CFG_KEYS + ("params",) + _IDEMIX_FORCING_KEYS
 _IDEMIX_PARAM_PRESETS = ("fesom_operational", "oe13")

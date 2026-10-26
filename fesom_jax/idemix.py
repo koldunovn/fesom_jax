@@ -112,7 +112,7 @@ from idemix_jax.mesh import (horizontal_propagation, idemix_step_columns,
                              validate_lateral_inputs)
 from idemix_jax.params import IdemixParams
 
-from . import pp, tke
+from . import ale, pp, tke
 from .config import R_EARTH
 
 
@@ -129,7 +129,8 @@ class IdemixConfig(NamedTuple):
     lateral: bool = True            # horizontal propagation on/off
     lateral_cfl_cap: float = 0.1    # v0 <= sqrt(cap*res^2/(tau_h*dt/n_hor_iter)); 0.0 disables
     lateral_face_mask: bool = True  # face at k = wet elements' segments only (patch 0011);
-    #                                 False = full face at every level (patches 0001-0010)
+    #                                 False = full face at every level (patches 0001-0010), needs
+    #                                 lateral_face_thickness="node"
     tke_e_iw: str = "post_lateral"  # energy for TKE's Rinum cap (tke_coupling): "post_lateral" =
     #                                 iwe_new, the Fortran's iwe_n (patch 0013); "column" = the
     #                                 column-step E_iw (patches 0001-0012)
@@ -137,6 +138,8 @@ class IdemixConfig(NamedTuple):
     #                                 finite-volume column on area_if cells; "mixed" = area-blind
     #                                 column + area_if lateral (patches 0001-0013); "prism" =
     #                                 area-blind column + lateral on A0 * dzt cells
+    lateral_face_thickness: str = "element"  # "element" = the Fortran's element dz_trr (patch
+    #                                 0015); "node" = 0.5 (dzt_i + dzt_j) (patches 0001-0014)
 
     def validate(self) -> "IdemixConfig":
         """Raise on an invalid combination; returns ``self``. ``n_hor_iter`` may be any
@@ -155,6 +158,13 @@ class IdemixConfig(NamedTuple):
                              f"{self.tke_e_iw!r}")
         if self.metric not in METRICS:
             raise ValueError(f"IdemixConfig.metric must be one of {METRICS}, got {self.metric!r}")
+        if self.lateral_face_thickness not in ("node", "element"):
+            raise ValueError("IdemixConfig.lateral_face_thickness must be 'node' or 'element', got "
+                             f"{self.lateral_face_thickness!r}")
+        if self.lateral_face_thickness == "element" and not self.lateral_face_mask:
+            raise ValueError("IdemixConfig.lateral_face_thickness='element' (the default) needs "
+                             "lateral_face_mask=True (the element faces of loops C/D/E); a full "
+                             "face takes lateral_face_thickness='node'")
         return self
 
 
@@ -174,6 +184,10 @@ class LateralOperator(NamedTuple):
     face_seg: jax.Array     # [N, max_deg, 2] float64, element cross segment / node distance
     face_top: jax.Array     # [N, max_deg, 2] int32, element's first wet interface (0-based)
     face_bot: jax.Array     # [N, max_deg, 2] int32, element's last wet interface (0-based)
+    face_el: jax.Array      # [N, max_deg, 2] int32, the adjacent element (edge_tri), an index
+    #                         into the step's mesh: the global id, the device's element lane after
+    #                         partition_idemix_inputs; -1 for a missing element and on pads
+    #                         (patch 0015, element face thickness)
 
 
 class IdemixParamsField(NamedTuple):
@@ -316,19 +330,22 @@ def build_lateral_operator(mesh, *, metric: str = "volume") -> LateralOperator:
     top = np.where(has, np.asarray(mesh.ulevels)[el] - 1, nl)
     bot = np.where(has, np.asarray(mesh.nlevels)[el] - 1, -1)
     seg = np.stack([seg1, seg2], axis=1) / node_dist[:, None]
+    elid = np.where(has, et, -1)
     _, packed = neighbors_from_edges(int(mesh.nod2D), edges,
-                                     np.concatenate([seg, top, bot], axis=1))
+                                     np.concatenate([seg, top, bot, elid], axis=1))
     packed = np.asarray(packed)
     nbr_np = np.asarray(nbr_idx)
     pad = (nbr_np == np.arange(nbr_np.shape[0])[:, None])[:, :, None]
     face_top = np.where(pad, nl, packed[:, :, 2:4]).astype(np.int32)
     face_bot = np.where(pad, -1, packed[:, :, 4:6]).astype(np.int32)
+    face_el = np.where(pad, -1, np.rint(packed[:, :, 6:8])).astype(np.int32)
     validate_lateral_inputs(area_if, wet, nbr_idx=nbr_np, nbr_weight=np.asarray(nbr_weight))
     return LateralOperator(nbr_idx=jnp.asarray(nbr_idx, dtype=jnp.int32),
                            nbr_weight=jnp.asarray(nbr_weight, dtype=jnp.float64),
                            resolution=jnp.asarray(mesh.mesh_resolution, dtype=jnp.float64),
                            face_seg=jnp.asarray(packed[:, :, 0:2], dtype=jnp.float64),
-                           face_top=jnp.asarray(face_top), face_bot=jnp.asarray(face_bot))
+                           face_top=jnp.asarray(face_top), face_bot=jnp.asarray(face_bot),
+                           face_el=jnp.asarray(face_el))
 
 
 def lateral_face_weight(lateral_op: LateralOperator, nl: int, cfg: IdemixConfig):
@@ -350,6 +367,56 @@ def lateral_face_weight(lateral_op: LateralOperator, nl: int, cfg: IdemixConfig)
     return jnp.where(m1 & m2, jnp.asarray(lateral_op.nbr_weight)[:, :, None],
                      jnp.where(m1, seg[:, :, 0, None],
                                jnp.where(m2, seg[:, :, 1, None], 0.0)))
+
+
+def element_dz_trr(mesh, hnode):
+    """``[elem2D, nl]`` the Fortran's per-element interface spacing ``dz_trr`` of the lateral
+    loops (``gen_modules_cvmix_idemix.F90:570-577``, el2 ``:591-598``) from ``helem`` = the
+    vertex mean of ``hnode`` (:func:`fesom_jax.ale.commit_thickness`): half the top wet layer at
+    the element's top interface, mid-level to mid-level on the interior, half the element's OWN
+    bottom layer at its bottom interface ``nlevels-1`` (0-based), 0 outside."""
+    nl = mesh.nl
+    helem = ale.commit_thickness(mesh, hnode)[1][:, :nl - 1]
+    z = jnp.zeros_like(helem[:, :1])
+    above = jnp.concatenate([z, helem], axis=1)          # layer k-1 at interface k (0 at k = 0)
+    below = jnp.concatenate([helem, z], axis=1)          # layer k   (0 at k = nl-1)
+    k = jnp.arange(nl)[None, :]
+    u = (mesh.ulevels - 1)[:, None]
+    b = (mesh.nlevels - 1)[:, None]
+    dz = 0.5 * (above + below)
+    dz = jnp.where(k == u, 0.5 * below, dz)
+    dz = jnp.where(k == b, 0.5 * above, dz)
+    return jnp.where((k >= u) & (k <= b), dz, 0.0)
+
+
+def lateral_weight(mesh, lateral_op: LateralOperator, cfg: IdemixConfig, hnode, dzt):
+    """The per-slot weight the step passes to ``horizontal_propagation``. ``cfg.
+    lateral_face_thickness = "element"`` (default, patch 0015, the face-thickness deviation F1):
+    :func:`lateral_face_weight` times ``dz_el / (0.5 (dzt_i + dzt_j))``, the Fortran's face
+    thickness ``dz_el`` over the operator's: the mean of the two elements' :func:`element_dz_trr`
+    where both are wet at the interface (loop C, ``F90:686``), the wet element's own where only
+    one is (loops D/E, ``:714``, ``:742``) -- half the element's bottom layer at its bottom
+    interface, where the node columns are a full spacing. Symmetric per slot pair, so the lateral
+    step stays conservative. ``"node"``: :func:`lateral_face_weight` itself (the face thickness
+    ``0.5 (dzt_i + dzt_j)``, patches 0001-0014)."""
+    cfg.validate()
+    w = lateral_face_weight(lateral_op, mesh.nl, cfg)
+    if cfg.lateral_face_thickness == "node":
+        return w
+    nl = mesh.nl
+    k = jnp.arange(nl)
+    wet_e = ((k >= jnp.asarray(lateral_op.face_top)[..., None])
+             & (k <= jnp.asarray(lateral_op.face_bot)[..., None]))        # [N, D, 2, nl]
+    m1, m2 = wet_e[:, :, 0], wet_e[:, :, 1]
+    dz_e = element_dz_trr(mesh, hnode)
+    el = jnp.asarray(lateral_op.face_el)
+    d1 = dz_e[jnp.maximum(el[:, :, 0], 0)]                                # [N, D, nl]
+    d2 = dz_e[jnp.maximum(el[:, :, 1], 0)]
+    dz_el = jnp.where(m1 & m2, 0.5 * (d1 + d2), jnp.where(m1, d1, jnp.where(m2, d2, 0.0)))
+    idx = jnp.asarray(lateral_op.nbr_idx)
+    dz_node = 0.5 * (dzt[:, None, :] + dzt[idx])                         # the operator's face
+    ratio = jnp.where(dz_node > 0.0, dz_el / jnp.where(dz_node > 0.0, dz_node, 1.0), 0.0)
+    return w * ratio
 
 
 def _wet_interfaces(mesh):
@@ -511,7 +578,7 @@ def _idemix_core(mesh, iwe, bvfreq, hnode, forcing, params_idemix, cfg, lateral_
         v0 = _lateral_v0(res.v0, params_idemix, cfg, lateral_op, dt)
         tend = horizontal_propagation(
             res.E_iw, v0, dzt, cell_area(mesh, cfg), lateral_op.nbr_idx,
-            lateral_face_weight(lateral_op, mesh.nl, cfg),
+            lateral_weight(mesh, lateral_op, cfg, hnode, dzt),
             dt, params_idemix, n_iter=int(cfg.n_hor_iter), is_wet=is_wet)   # [m^2/s^3]
         iwe_new = res.E_iw + dt * tend
     else:
@@ -539,7 +606,7 @@ def lateral_stability(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
     res, dzt, is_wet = _column_step(mesh, iwe, bvfreq, hnode, forcing, params_idemix, dt, Z3d,
                                     params_field, cfg.metric)
     v0 = _lateral_v0(res.v0, params_idemix, cfg, lateral_op, dt)
-    w = lateral_face_weight(lateral_op, mesh.nl, cfg)
+    w = lateral_weight(mesh, lateral_op, cfg, hnode, dzt)
     return lateral_step_stability(
         np.asarray(v0), np.asarray(dzt), np.asarray(cell_area(mesh, cfg)),
         np.asarray(lateral_op.nbr_idx), np.asarray(w), dt, params_idemix,
@@ -685,9 +752,13 @@ def partition_idemix_inputs(forcing: IdemixForcing | None, lateral: LateralOpera
     ``shard_mesh.partition_forcing_static`` precedent; pad lanes get the safe float pad 1.0).
 
     The lateral neighbor indices are mapped from global node ids to each device's LOCAL lanes
-    (``myList_nod2D`` order); a neighbor absent from the device — possible only for halo nodes
-    when ``P > 1`` — and every pad lane point at the lane itself with weight 0. On one device
-    (``synth_serial``: identity list, no pad) the result equals the global operator. Either
+    (``myList_nod2D`` order), and ``face_el`` from global element ids to the device's element
+    lanes (``myList_elem2D``); a neighbor absent from the device — possible only for halo nodes
+    when ``P > 1`` — and every pad lane point at the lane itself with weight 0. An element absent
+    from the device is a missing element of the face (``face_el = -1``, the empty range, segment
+    0), so :func:`lateral_weight` never takes a thickness from a lane that is not that element;
+    a device holds every element of the nodes it owns, so this too touches halo nodes only. On one
+    device (``synth_serial``: identity list, no pad) the result equals the global operator. Either
     argument may be ``None`` (returned as ``None``)."""
     from .shard_mesh import _default_pad, _shard_along_axis, local_sizes
 
@@ -707,6 +778,7 @@ def partition_idemix_inputs(forcing: IdemixForcing | None, lateral: LateralOpera
         seg = np.asarray(lateral.face_seg, dtype=np.float64)
         top = np.asarray(lateral.face_top, dtype=np.int32)
         bot = np.asarray(lateral.face_bot, dtype=np.int32)
+        fel = np.asarray(lateral.face_el, dtype=np.int32)
         empty_top = int(top.max()) if top.size else 0       # >= nl on pads / missing elements
         deg = nbr.shape[1]
         P = len(lists)
@@ -715,17 +787,24 @@ def partition_idemix_inputs(forcing: IdemixForcing | None, lateral: LateralOpera
         seg_p = np.zeros((P, L, deg, 2))
         top_p = np.full((P, L, deg, 2), empty_top, dtype=np.int32)
         bot_p = np.full((P, L, deg, 2), -1, dtype=np.int32)
+        fel_p = np.full((P, L, deg, 2), -1, dtype=np.int32)    # the device's element lanes
         for d, ml in enumerate(lists):
             g2l = np.full(int(part.nod2D), -1, dtype=np.int64)
             g2l[ml] = np.arange(ml.size)
+            el_list = np.asarray(part.myList_elem2D[d])
+            g2l_el = np.full(int(part.elem2D), -1, dtype=np.int64)
+            g2l_el[el_list] = np.arange(el_list.size)
             loc = g2l[nbr[ml]]                                    # [n_local, deg]
             ok = loc >= 0
             idx_p[d, :ml.size] = np.where(ok, loc, np.arange(ml.size)[:, None])
             w_p[d, :ml.size] = np.where(ok, w[ml], 0.0)
-            seg_p[d, :ml.size] = np.where(ok[:, :, None], seg[ml], 0.0)
-            top_p[d, :ml.size] = np.where(ok[:, :, None], top[ml], empty_top)
-            bot_p[d, :ml.size] = np.where(ok[:, :, None], bot[ml], -1)
+            lane = np.where(fel[ml] >= 0, g2l_el[np.maximum(fel[ml], 0)], -1)
+            on = ok[:, :, None] & (lane >= 0)                     # the element is on this device
+            seg_p[d, :ml.size] = np.where(on, seg[ml], 0.0)
+            top_p[d, :ml.size] = np.where(on, top[ml], empty_top)
+            bot_p[d, :ml.size] = np.where(on, bot[ml], -1)
+            fel_p[d, :ml.size] = np.where(on, lane, -1)
         lateral_p = LateralOperator(nbr_idx=idx_p, nbr_weight=w_p,
                                     resolution=_nodes(lateral.resolution), face_seg=seg_p,
-                                    face_top=top_p, face_bot=bot_p)
+                                    face_top=top_p, face_bot=bot_p, face_el=fel_p)
     return forcing_p, lateral_p

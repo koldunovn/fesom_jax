@@ -66,8 +66,8 @@ def _core(h, cfg, forcing=None):
 def test_mixed_is_the_old_composition_bitwise(host):
     """metric 'mixed': the area-blind column + horizontal_propagation on interface_area, exactly
     the pre-0014 operations."""
-    assert I.IdemixConfig().metric == "volume" and I.IdemixConfig._fields[-1] == "metric"
-    cfg = I.IdemixConfig(metric="mixed")
+    assert I.IdemixConfig().metric == "volume" and "metric" in I.IdemixConfig._fields
+    cfg = I.IdemixConfig(metric="mixed", lateral_face_thickness="node")
     res, iwe_new, dzt, is_wet = _core(host, cfg)
     mesh = host["mesh"]
     ref = idemix_step_columns(host["iwe0"], host["bvfreq"], host["hnode"][:, :mesh.nl - 1], dzt,
@@ -206,10 +206,10 @@ def test_stability_preflight_uses_the_metric_cells(host):
                              PARAMS, cfg, lat, dt=DT)
     res, _, dzt, is_wet = _core(host, cfg)
     v0 = jnp.minimum(res.v0, I._v0_cap(PARAMS, cfg, lat, DT))
+    w = I.lateral_weight(mesh, lat, cfg, host["hnode"], dzt)
     ref = lateral_step_stability(np.asarray(v0), np.asarray(dzt), np.asarray(I.cell_area(mesh, cfg)),
-                                 np.asarray(lat.nbr_idx), np.asarray(I.lateral_face_weight(lat, mesh.nl,
-                                                                                           cfg)),
-                                 DT, PARAMS, n_iter=cfg.n_hor_iter, is_wet=np.asarray(is_wet))
+                                 np.asarray(lat.nbr_idx), np.asarray(w), DT, PARAMS,
+                                 n_iter=cfg.n_hor_iter, is_wet=np.asarray(is_wet))
     np.testing.assert_allclose(st.by_level, ref.by_level, rtol=1e-9, atol=0.0)
 
 
