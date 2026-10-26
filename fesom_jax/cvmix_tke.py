@@ -344,7 +344,8 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
 
     IDEMIX coupling (``.not.only_tke``, keyword-only, ``[N, nl]`` each): ``iw_diss`` (the
     internal-wave dissipation, m²/s³, ≥0), ``alpha_c`` (s/m²) and ``E_iw`` (the CURRENT wave
-    energy, m²/s²). All three ``None`` ⇒ the ``only_tke`` path above, unchanged; all three
+    energy, m²/s²: after IDEMIX's lateral propagation, as the Fortran's ``iwe_n``,
+    ``gen_modules_cvmix_tke.F90:305``; :func:`fesom_jax.idemix.tke_coupling`). All three ``None`` ⇒ the ``only_tke`` path above, unchanged; all three
     given ⇒ the three Fortran insertions: the Rinum cap (``cvmix_tke.F90:710-712``), the
     forcing ``forc += iw_diss`` (``:741-744``) and the ``only_tke``-gated ``tke_min`` floor
     NOT applied (``:866-869``), with ``Tiwf = iw_diss`` under ``with_diags`` (``:898``).

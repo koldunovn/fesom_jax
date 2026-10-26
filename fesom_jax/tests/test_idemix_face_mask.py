@@ -78,7 +78,8 @@ def _expected_face_weight(mesh):
 def test_config_default_and_validate():
     cfg = I.IdemixConfig()
     assert cfg.lateral_face_mask is True
-    assert I.IdemixConfig._fields[-1] == "lateral_face_mask"
+    assert I.IdemixConfig._fields[:4] == ("n_hor_iter", "lateral", "lateral_cfl_cap",
+                                          "lateral_face_mask")      # positional order unchanged
     with pytest.raises(ValueError, match="lateral_face_mask"):
         I.IdemixConfig(lateral_face_mask=1).validate()
 

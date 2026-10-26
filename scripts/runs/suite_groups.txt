@@ -266,3 +266,4 @@ unit fesom_jax/tests/test_tke_mxl_floor.py
 unit fesom_jax/tests/test_idemix_params_field.py
 unit fesom_jax/tests/test_idemix_face_mask.py
 unit fesom_jax/tests/test_tke_interface_spacing.py
+unit fesom_jax/tests/test_idemix_tke_coupling.py

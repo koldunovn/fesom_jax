@@ -513,8 +513,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         if _adj.tke_pr_tu_cut is not None:
             _sa, _sb = eos.compute_sw_alpha_beta(mesh, st.T, st.S, Z3d=Z3d_live)
             _turner = jax.lax.stop_gradient(eos.turner_angle(st.T, st.S, _sa, _sb))
-        _iw = (None if idemix_out is None
-               else (idemix_out.iw_diss, idemix_out.alpha_c, idemix_out.E_iw))
+        _iw = (None if idemix_out is None                 # ruling 2 (fesom_jax.idemix)
+               else _idemix.tke_coupling(idemix_out, idemix_cfg))
         Kv, Av, uvnode, tke_new = _ckpt(lambda: tke.mixing_tke(
             mesh, st.uv, _bv_tke, st.tke, stress_node_surf, h_wp, tke_cfg, params,
             freeze_convection=_adj.freeze_convection, cuts=_adj.diag_cuts,

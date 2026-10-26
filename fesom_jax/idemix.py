@@ -29,8 +29,16 @@ connectivity).
    ``E_iw``: ``iwe_new = E_iw + dt * tend``, where ``tend`` is
    ``horizontal_propagation``'s return value — a tendency in m²/s³ defined as
    ``(E_after - E_iw) / dt`` — so the composition recovers ``E_after`` (to roundoff).
-   ``iw_diss``/``alpha_c``/``KappaH``/``KappaM``/``E_iw`` are the COLUMN-step fields (the
-   Fortran's TKE consumes ``iwe_Tdis`` from ``integrate_idemix``, before propagation).
+   ``iw_diss``/``alpha_c``/``KappaH``/``KappaM``/``E_iw`` are the COLUMN-step fields. TKE
+   takes (:func:`tke_coupling`, called by ``step``) the column step's ``iw_diss``/``alpha_c``,
+   as the Fortran's TKE takes ``iwe_Tdis_n``/``iwe_alpha_c_n`` averaged from the column step
+   before propagation (``gen_modules_cvmix_idemix.F90:484-485``, ``gen_modules_cvmix_tke.F90:
+   306-307``), and for its Rinum cap the energy AFTER propagation, ``iwe_new``, as the Fortran's
+   ``tke_in3d_iwe = iwe_n`` (``gen_modules_cvmix_tke.F90:305``) after the in-place lateral
+   update (``gen_modules_cvmix_idemix.F90:630-631`` and loops B-E) -- patch 0013,
+   ``IdemixConfig.tke_e_iw = "post_lateral"`` (default). ``tke_e_iw = "column"`` gives TKE the
+   column-step ``E_iw`` instead, bitwise patches 0001-0012. Without lateral propagation the two
+   are the same array.
 3. **v0 CFL cap.** The lateral sub-stepping is explicit; the horizontal group velocity is
    capped at ``v0 <= sqrt(cap * res**2 / (tau_h * dt / n_hor_iter))`` (pyOM2
    ``idemix.f90:85-99`` with a 2x margin at the default ``cap = 0.1``), ``res`` the per-node
@@ -94,6 +102,9 @@ class IdemixConfig(NamedTuple):
     lateral_cfl_cap: float = 0.1    # v0 <= sqrt(cap*res^2/(tau_h*dt/n_hor_iter)); 0.0 disables
     lateral_face_mask: bool = True  # face at k = wet elements' segments only (patch 0011);
     #                                 False = full face at every level (patches 0001-0010)
+    tke_e_iw: str = "post_lateral"  # energy for TKE's Rinum cap (tke_coupling): "post_lateral" =
+    #                                 iwe_new, the Fortran's iwe_n (patch 0013); "column" = the
+    #                                 column-step E_iw (patches 0001-0012)
 
     def validate(self) -> "IdemixConfig":
         """Raise on an invalid combination; returns ``self``. ``n_hor_iter`` may be any
@@ -107,6 +118,9 @@ class IdemixConfig(NamedTuple):
         if not isinstance(self.lateral_face_mask, bool):
             raise ValueError(
                 f"IdemixConfig.lateral_face_mask must be a bool, got {self.lateral_face_mask!r}")
+        if self.tke_e_iw not in ("post_lateral", "column"):
+            raise ValueError("IdemixConfig.tke_e_iw must be 'post_lateral' or 'column', got "
+                             f"{self.tke_e_iw!r}")
         return self
 
 
@@ -164,7 +178,8 @@ class IdemixOut(NamedTuple):
     iwe_new: jax.Array      # wave energy after column step + lateral [m^2/s^2] (the new state)
     iw_diss: jax.Array      # wave dissipation (>= 0 for physical states) [m^2/s^3] -> TKE
     alpha_c: jax.Array      # dissipation coefficient [s/m^2] -> TKE
-    E_iw: jax.Array         # column-step energy [m^2/s^2] (what TKE's Rinum cap reads)
+    E_iw: jax.Array         # column-step energy [m^2/s^2] (TKE's Rinum cap reads iwe_new
+    #                         unless IdemixConfig.tke_e_iw = "column": tke_coupling)
     KappaH: jax.Array       # Osborn-shortcut diffusivity [m^2/s]
     KappaM: jax.Array       # Osborn-shortcut viscosity [m^2/s]
 
@@ -458,6 +473,16 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
                                       lateral_op, dt, Z3d, params_field)
     return IdemixOut(iwe_new=iwe_new, iw_diss=res.iw_diss, alpha_c=res.alpha_c,
                      E_iw=res.E_iw, KappaH=res.KappaH, KappaM=res.KappaM)
+
+
+def tke_coupling(out: IdemixOut, cfg: IdemixConfig):
+    """The ``(iw_diss, alpha_c, E_iw)`` triple :func:`fesom_jax.tke.mixing_tke` takes (ruling 2):
+    the column step's dissipation and coefficient, and for the Rinum cap the energy after the
+    lateral step, ``out.iwe_new`` (``cfg.tke_e_iw = "post_lateral"``, the Fortran's ``iwe_n``,
+    ``gen_modules_cvmix_tke.F90:305``), or the column step's ``out.E_iw`` (``"column"``,
+    patches 0001-0012)."""
+    e = out.iwe_new if cfg.tke_e_iw == "post_lateral" else out.E_iw
+    return out.iw_diss, out.alpha_c, e
 
 
 #: keys of :func:`budget_terms` (the run entry's ``idemix_budget_out`` files)
