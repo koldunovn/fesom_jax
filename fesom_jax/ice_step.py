@@ -565,16 +565,31 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     # gate in test_ice_step.py); passing state.a_ice instead leaks
     # ⟨prec_snow·(A_entry−A_state)⟩ into the volume budget every step (2026-07-03 review).
     # Under linfs this is skipped (dead branch ⇒ byte-identical). With ice_ave_steps > 1 the
-    # thermo outputs and a_old are the held ones on a step without an ice update, while
-    # prec_rain/prec_snow/runoff are this step's forcing (oce_fluxes runs every step,
-    # fesom_module.F90:1165-1166), so the balance is exact only on the update steps.
+    # thermo outputs and a_old are the held ones on a step without an ice update, while FESOM2's
+    # balance takes this step's prec_rain/prec_snow/runoff (oce_fluxes runs every step,
+    # fesom_module.F90:1165-1166) and so is exact only on the update steps: the mean SSH fell
+    # 5.9 µm a year in the OMIP run. A deviation: the steps without an update balance the held
+    # flux itself (ice_coupling.fresh_water_balance_held); the update steps are FESOM2's.
     water_flux = icef.water_flux
     if not use_virt_salt:
-        water_flux = ice_coupling.fresh_water_balance_zstar(
-            water_flux, evaporation, ice_sublimation, sf.prec_rain, sf.prec_snow,
-            a_old, fs.runoff_node, thdgr, thdgrsn,
-            fs.areasvol_surf, fs.ocean_area, cfg,
-            owned_mask=owned_mask, axis_name=axis_name)
+        def _balance_now():
+            return ice_coupling.fresh_water_balance_zstar(
+                water_flux, evaporation, ice_sublimation, sf.prec_rain, sf.prec_snow,
+                a_old, fs.runoff_node, thdgr, thdgrsn,
+                fs.areasvol_surf, fs.ocean_area, cfg,
+                owned_mask=owned_mask, axis_name=axis_name)
+
+        def _balance_held():
+            return ice_coupling.fresh_water_balance_held(
+                water_flux, flx_fw, fs.areasvol_surf, fs.ocean_area,
+                owned_mask=owned_mask, axis_name=axis_name)
+
+        if not avg:
+            water_flux = _balance_now()
+        elif ice_update is not None:                  # the update steps fixed at trace time
+            water_flux = _balance_now() if ice_update else _balance_held()
+        else:
+            water_flux = jnp.where(upd_now, _balance_now(), _balance_held())
 
     water_flux = _cut(("water_flux",), water_flux)
 

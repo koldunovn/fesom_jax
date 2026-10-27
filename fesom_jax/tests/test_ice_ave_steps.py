@@ -267,12 +267,12 @@ def test_core2_n2_schedule_and_means(core2):
     assert np.isfinite(np.asarray(traj[-1].T)).all()
 
 
-def _ice_call(fx, state, cfg, i, dt, use_virt_salt):
+def _ice_call(fx, state, cfg, i, dt, use_virt_salt, sf=None):
     from fesom_jax import ice_evp
     bn = ice_evp.boundary_node_mask(fx["mesh"])
     fn = jax.jit(lambda s, sf: ice_step.ice_surface_step(
         cfg, fx["mesh"], s, sf, fx["fs"], dt=dt, boundary_node=bn, use_virt_salt=use_virt_salt))
-    return fn(state, _sf(fx, i))
+    return fn(state, _sf(fx, i) if sf is None else sf)
 
 
 def _close(a, b, what, rtol=1e-12):
@@ -289,9 +289,10 @@ def test_core2_ice_dt_and_held_fluxes(core2, use_virt_salt):
     """(a) The first step of a cycle (an update, ocean2ice takes the current values) at N = 2 and
     dt is the N = 1 ice step at 2*dt: ice_dt = N*dt. (b) The step after it (no update) returns the
     held ice state and builds the ocean fluxes from the held thermo outputs: heat = shortwave
-    penetration of -flx_h, water = -flx_fw (+ the zstar balance from the held evaporation /
-    sublimation / growth / a_old and this step's precipitation), stress = the blend of the held
-    u_ice / a_ice with the bulk of the running means."""
+    penetration of -flx_h, water = -flx_fw (+ the zstar balance of that held flux, so the volume
+    is kept as on the update step: a deviation from FESOM2, which balances this step's
+    precipitation), stress = the blend of the held u_ice / a_ice with the bulk of the running
+    means."""
     from fesom_jax import forcing as _forcing
     fx = core2
     mesh, fs = fx["mesh"], fx["fs"]
@@ -310,12 +311,14 @@ def test_core2_ice_dt_and_held_fluxes(core2, use_virt_salt):
     # (b) the in-between step, from the state the first step leaves
     s1 = dataclasses.replace(s0, **{f: getattr(o2, f) for f in _PROG + ICE_AVG_FIELDS})
     assert int(s1.ice_steps_since_upd[0]) == 0 and int(s1.ice_update[0]) == 1
-    o = _ice_call(fx, s1, ICE2, 1, DT, use_virt_salt)
+    # this step's precipitation 1.5 times the update step's (the first 3-hour record is constant), so a balance
+    # from this step's precipitation would see a water flux the held thermo flux does not carry
+    sf = _sf(fx, 1)._replace(prec_rain=1.5 * _sf(fx, 1).prec_rain, prec_snow=1.5 * _sf(fx, 1).prec_snow)
+    o = _ice_call(fx, s1, ICE2, 1, DT, use_virt_salt, sf=sf)
     assert int(o.ice_update[0]) == 0 and int(o.ice_steps_since_upd[0]) == 1
     for f in _PROG + _HELD:
         np.testing.assert_array_equal(np.asarray(getattr(o, f)), np.asarray(getattr(s1, f)),
                                       err_msg=f"{f} not held")
-    sf = _sf(fx, 1)
     open_water = fs.open_water
     heat, sw3 = _forcing.cal_shortwave_rad(mesh, -s1.ice_flx_h, sf.shortwave, sf.chl,
                                            open_water & (s1.a_ice <= 0.0))
@@ -323,9 +326,20 @@ def test_core2_ice_dt_and_held_fluxes(core2, use_virt_salt):
     _close(o.sw_3d, sw3, "sw_3d")
     wf = -s1.ice_flx_fw
     if not use_virt_salt:
-        wf = ice_coupling.fresh_water_balance_zstar(
-            wf, s1.ice_evaporation, s1.ice_sublimation, sf.prec_rain, sf.prec_snow, s1.ice_a_old,
+        wf = ice_coupling.fresh_water_balance_held(wf, s1.ice_flx_fw, fs.areasvol_surf, fs.ocean_area)
+        # the volume: the in-between step's water flux balances to zero as the update step's does (FESOM2's
+        # balance from this step's precipitation, while the held thermo flux carries the update step's, need not)
+        av = np.asarray(fs.areasvol_surf)
+        scale = float(np.sum(av * np.abs(np.asarray(o.water_flux))))
+        assert abs(float(np.sum(av * np.asarray(o.water_flux)))) <= 1e-12 * scale, "in-between step: volume"
+        assert abs(float(np.sum(av * np.asarray(o2.water_flux)))) <= 1e-12 * scale, "update step: volume"
+        upstream = ice_coupling.fresh_water_balance_zstar(
+            -s1.ice_flx_fw, s1.ice_evaporation, s1.ice_sublimation, sf.prec_rain, sf.prec_snow, s1.ice_a_old,
             fs.runoff_node, s1.ice_thdgr, s1.ice_thdgrsn, fs.areasvol_surf, fs.ocean_area, ICE2)
+        bias = float(np.sum(av * np.asarray(upstream))) / scale
+        print(f"in-between step, sum av*water_flux / sum av*|water_flux|: here "
+              f"{float(np.sum(av * np.asarray(o.water_flux))) / scale:+.2e}, FESOM2's {bias:+.2e}")
+        assert abs(bias) > 1e-6, "the test forcing does not tell the two balances apart"
     _close(o.water_flux, wf, "water_flux")
     bulk = _forcing.bulk_surface_fluxes(mesh, sf.u_air, sf.v_air, sf.shum, sf.shortwave,
                                         sf.longwave, sf.Tair, sf.prec_rain, sf.prec_snow,

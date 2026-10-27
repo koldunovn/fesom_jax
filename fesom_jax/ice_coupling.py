@@ -160,6 +160,26 @@ def fresh_water_balance_zstar(water_flux, evaporation, ice_sublimation, prec_rai
     return water_flux + net
 
 
+def fresh_water_balance_held(water_flux, flx_fw, areasvol_surf, ocean_area,
+                             *, owned_mask=None, axis_name=None):
+    """The zstar balancing on a step WITHOUT an ice update (``ice_ave_steps > 1``), a deviation
+    from FESOM2: ``water_flux += ⟨flx_fw⟩``, the global mean of the held thermo flux the ocean
+    gets on this step, so ``⟨water_flux⟩ = 0`` as on the update steps.
+
+    FESOM2 (``ice_oce_coupling.F90:528-646``) rebuilds the flux of
+    :func:`fresh_water_balance_zstar` from THIS step's ``prec_rain``, ``prec_snow`` and runoff
+    while ``water_flux = -flx_fw`` carries those of the update step; on an update step the two
+    are the same flux (thermo's ``fw = prec + evap + fwice + fwsnw``, ``prec = rain + runo +
+    snow·(1−A)``), on the step after it they differ by the change of the forcing. The rain part
+    averages out, the snow part does not: ``a_old`` changes only at the updates, so the
+    in-between steps take ``½·Σ snow·Δa`` per update, > 0 because snow falls as the ice cover
+    grows. Measured on CORE2, 1980 (runs/omip/ssh_drift/fw_probe.py, job 28456098): all of the
+    −3.3 µm a year of mean SSH on the in-between steps, −4.3 µm of it from the snow."""
+    net = _area_mean(flx_fw, areasvol_surf, ocean_area,
+                     owned_mask=owned_mask, axis_name=axis_name)
+    return water_flux + net
+
+
 # --------------------------------------------------------------------------
 # ice-mediated surface momentum stress blend — :213-264
 # --------------------------------------------------------------------------
