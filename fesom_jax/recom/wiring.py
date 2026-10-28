@@ -148,7 +148,7 @@ def with_bgc_state(state, ic, rcfg):
     import dataclasses
     xp = np if isinstance(state.S, np.ndarray) else jnp
     out = {k: xp.asarray(v) for k, v in ic_fields(ic).items()}
-    out.update(segment_fields(ic.bgc.shape[0], ic.bgc.shape[1], rcfg, xp))
+    out.update(segment_fields(ic.bgc.shape[0], ic.bgc.shape[1], rcfg, xp, ntr=ic.bgc.shape[2]))
     return dataclasses.replace(state, **out)
 
 
@@ -161,13 +161,13 @@ def ic_fields(ic) -> dict:
                 bgc_alk_surf=np.asarray(ic.alk_surf))
 
 
-def segment_fields(n: int, nl1: int, rcfg, xp=jnp) -> dict:
+def segment_fields(n: int, nl1: int, rcfg, xp=jnp, ntr: int = NTR) -> dict:
     """The fields that restart with every run segment: ``bgc_mstep`` 0, the carbonate cache, the diagnostics and the
-    budget sums zero."""
+    budget sums zero (``ntr`` the tracer count of the State's stack; the layout's, not read from the namelist here)."""
     out = dict(bgc_carb=xp.zeros((n, nl1, len(CARB_FIELDS))), bgc_mstep=xp.zeros((n,), np.int32),
                bgc_diag=xp.zeros((n, len(DIAG2D))))
     if rcfg.budget:
-        out["bgc_budget"] = xp.zeros((n, len(BUDGET_TERMS), rcfg.ntr))
+        out["bgc_budget"] = xp.zeros((n, len(BUDGET_TERMS), int(ntr)))
     return out
 
 
@@ -188,7 +188,8 @@ def start_segment(state, rcfg):
                bgc_carb=xp.stack([z3] * len(CARB_FIELDS), axis=-1),
                bgc_diag=xp.stack([z2] * len(DIAG2D), axis=-1))
     if rcfg.budget:
-        out["bgc_budget"] = xp.stack([xp.stack([z2] * rcfg.ntr, axis=-1)] * len(BUDGET_TERMS), axis=-2)
+        ntr = int(state.bgc.shape[-1])
+        out["bgc_budget"] = xp.stack([xp.stack([z2] * ntr, axis=-1)] * len(BUDGET_TERMS), axis=-2)
     else:
         out["bgc_budget"] = None
     return dataclasses.replace(state, **out)

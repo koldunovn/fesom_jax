@@ -65,10 +65,18 @@ def test_fork_namelist_loads_with_fork_defaults():
     assert d.tiny_N_c == P.TINY_CHL / par.Chl2N_max_c and d.tiny_C_p == d.tiny_N_p / par.NCmax_p
 
 
-def test_fork_namelist_is_refused_until_the_lanes_land():
+def test_fork_namelist_is_accepted_and_its_unported_switches_refused():
+    """Lanes E, L and W landed (2026-10-28): the fork's reference namelist (4 PFT, 37 tracers) passes the switch
+    check; the switches the port leaves out (RECOM_MARSHALL, RECOM_CALC_APHYT, ...) are still refused, and a bgc_num
+    that fits none of the fork's layouts is a ValueError."""
     sw, _ = P.load_namelist(FORK_NML, check=False)
-    with pytest.raises(NotImplementedError, match="spectral_fork|enable_coccos"):
-        P.check_supported(sw)
+    assert sw.spectral_fork and sw.enable_coccos
+    P.check_supported(sw)
+    import dataclasses
+    with pytest.raises(NotImplementedError, match="RECOM_MARSHALL"):
+        P.check_supported(dataclasses.replace(sw, RECOM_MARSHALL=True))
+    with pytest.raises(ValueError, match="bgc_num"):
+        P.check_supported(dataclasses.replace(sw, bgc_num=35))
 
 
 def test_reference_namelist_unchanged():

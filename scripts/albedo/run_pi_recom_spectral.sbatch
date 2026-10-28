@@ -19,6 +19,7 @@ source scripts/albedo/env.sh
 OUT=/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/pi_recom_spectral
 mkdir -p $OUT
 echo "=== $(hostname) $(date) job $SLURM_JOB_ID ==="
-$PY scripts/run_from_config.py configs/albedo/pi_recom_spectral.yaml --progress --diagnostics \
+# --ic-dir: the mesh is the fork's pi bundle (not the packaged pi), so the packaged pi PHC IC must be named
+$PY scripts/run_from_config.py configs/albedo/pi_recom_spectral.yaml --ic-dir fesom_jax/data/ic_pi --progress --diagnostics \
     --restart-out $OUT/restart --monthly-out $OUT/monthly "$@"
 echo "=== exit $? $(date) ==="
