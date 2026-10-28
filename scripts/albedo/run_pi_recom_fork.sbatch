@@ -55,7 +55,7 @@ cp -p $CLIM/optics/*.dat "$RD/"                      # the spectral tables are r
 mkdir -p "$RD/exe_seg$SEG/bin" "$RD/exe_seg$SEG/lib64"
 cp -p "$EXE" "$RD/exe_seg$SEG/bin/fesom.x"
 cp -p "$(dirname "$EXE")/../lib64/libfesom.so" "$RD/exe_seg$SEG/lib64/libfesom.so"
-set +u; source "$FESOM2/env.sh"; set -u
+set +u; source "$FESOM2/env/albedo/shell"; set -u   # env.sh keys on the hostname and knows no compute node
 export LD_LIBRARY_PATH=$RD/exe_seg$SEG/lib64:${LD_LIBRARY_PATH:-}
 {
     echo "segment       $SEG"
@@ -72,6 +72,7 @@ export LD_LIBRARY_PATH=$RD/exe_seg$SEG/lib64:${LD_LIBRARY_PATH:-}
 } | tee "seg_$SEG.info"
 if [ -n "${FESOM_RECOM_DUMP_DIR:-}" ]; then mkdir -p "$FESOM_RECOM_DUMP_DIR"; fi
 export OMP_NUM_THREADS=1
+export FORT_BUFFERED=false            # unbuffered stdout: progress lines appear in fesom2.0.out as they are written
 ulimit -s unlimited
 date
 srun --mpi=pmi2 "$RD/exe_seg$SEG/bin/fesom.x" > "fesom2.0.out.seg$SEG" 2>&1
