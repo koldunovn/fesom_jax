@@ -91,9 +91,12 @@ def test_dtypes(mesh):
         "coast_flag", "nlevels_nod2D", "nlevels_nod2D_min", "ulevels_nod2D",
         "ulevels_nod2D_max", "nod_in_elem2D_offsets", "elem_nodes", "nlevels",
         "ulevels", "edges", "edge_tri", "edge_up_dn_tri", "nod_in_elem2D",
+        "inv_elem_nodes", "inv_edges", "inv_edge_tri",
     }
     for f in dataclasses.fields(Mesh):
         if f.metadata.get("static") or f.name.endswith("_mask"):
+            continue
+        if getattr(mesh, f.name) is None:        # optional tables (INVERSE_MAP_FIELDS) not built by load_mesh
             continue
         arr = np.asarray(getattr(mesh, f.name))
         if f.name in int_fields:
@@ -226,8 +229,8 @@ def test_pytree_roundtrip(mesh):
     leaves, treedef = tree_util.tree_flatten(mesh)
     # leaves are arrays; static counts live in the treedef, not the leaves
     assert all(hasattr(l, "shape") for l in leaves)
-    assert len(leaves) == len([f for f in dataclasses.fields(Mesh)
-                               if not f.metadata.get("static")])
+    assert len(leaves) == len([f for f in dataclasses.fields(Mesh)        # None (an optional table) is no leaf
+                               if not f.metadata.get("static") and getattr(mesh, f.name) is not None])
     rebuilt = tree_util.tree_unflatten(treedef, leaves)
     assert rebuilt.nod2D == mesh.nod2D and rebuilt.nl == mesh.nl
     np.testing.assert_array_equal(

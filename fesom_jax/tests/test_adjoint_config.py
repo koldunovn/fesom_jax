@@ -95,9 +95,22 @@ K0 = jnp.asarray(0.0, jnp.float64)        # control point: the unperturbed initi
 ALL_FLAGS = list(FREEZE_FLAGS)
 # AdjointConfig fields that are NOT boolean freeze flags, classified explicitly so that a new
 # non-flag field cannot slip past the registries below (diag_cuts: test_adjoint_diag_cuts.py).
-NON_FLAG_FIELDS = ["diag_cuts"]
+NON_FLAG_FIELDS = ["diag_cuts",
+                   # the classical-TKE candidate settings (None = off): test_tke_candidates.py,
+                   # test_tke_candidates_core2.py and the explicit CORE2 cases in
+                   # test_adjoint_config_tke.py
+                   "tke_pr_cut", "tke_pr_mode", "tke_pr_ratio", "tke_pr_raw_cut", "tke_kme_tke",
+                   "tke_kme_scope",
+                   "tke_kme_term", "tke_ml_cut", "tke_ml_ratio", "tke_ml_raw_cut",
+                   "tke_pr_ice_cut", "tke_pr_lat_cut", "tke_pr_tu_cut",
+                   # the GM/Redi-input cuts (None = off): test_adjoint_diag_cuts.py,
+                   # test_adjoint_config_prod.py
+                   "gm_n2_ratio", "gm_n2_raw_cut", "gm_slope_cut",
+                   # the convective-adjustment surrogate (None = off): test_pp.py,
+                   # test_tke_candidates_core2.py
+                   "conv_surrogate"]
 ACTIVE_ON_PI = ["freeze_mixing", "freeze_convection", "freeze_vert_visc",
-                "freeze_advection"]
+                "freeze_advection", "freeze_fct_limiter"]
 # ⚠️ freeze_pgf is INACTIVE here, not active. Its stop_gradient sits inside
 # `if ale_cfg is not None:` (step.py:270-274) — the zstar branch — and this fixture calls
 # `integrate` with no ale_cfg, so it runs the linfs pressure-gradient path where the flag is
@@ -112,7 +125,9 @@ ACTIVE_ON_PI = ["freeze_mixing", "freeze_convection", "freeze_vert_visc",
 # what happened to freeze_pgf on 2026-08-07. Its effect test belongs with the seam
 # (tests/test_gm_nn_seam.py), where a network exists.
 INACTIVE_ON_PI = ["freeze_stratification", "freeze_tke_state", "freeze_gm_slope", "freeze_k33",
-                  "freeze_pgf", "freeze_nn_features"]
+                  "freeze_pgf", "freeze_nn_features",
+                  # read only by the TKE closure (tke.mixing_tke); pi runs PP mixing
+                  "freeze_mixing_state"]
 
 
 def test_every_flag_is_covered():

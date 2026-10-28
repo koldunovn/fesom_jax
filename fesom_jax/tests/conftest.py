@@ -91,6 +91,20 @@ def probe_gid() -> int:
     return PROBE_GID
 
 
+def pytest_collection_modifyitems(config, items):
+    """``@pytest.mark.gpu`` tests (GPU kernels against their XLA reference, CORE2 GPU speed plan)
+    run only where JAX's default backend is a GPU; everywhere else they SKIP, never fail."""
+    if not any(item.get_closest_marker("gpu") for item in items):
+        return
+    import jax
+    if jax.default_backend() == "gpu":
+        return
+    skip = pytest.mark.skip(reason=f"needs a GPU (default backend: {jax.default_backend()})")
+    for item in items:
+        if item.get_closest_marker("gpu"):
+            item.add_marker(skip)
+
+
 def pytest_terminal_summary(terminalreporter, exitstatus, config):
     """Close with an honest coverage summary (usability review P5): most verification gates
     read unpublished Fortran/C reference dumps and SKIP without them, so a green run off

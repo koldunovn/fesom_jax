@@ -22,6 +22,7 @@ one device == the dense step, byte-identical — the proof the plumbing is corre
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import os
 
@@ -32,6 +33,11 @@ from jax import lax
 from jax.sharding import PartitionSpec, NamedSharding
 
 from . import halo
+from . import halo_grouped
+from . import ops
+from . import precision as PR
+from . import shard_mesh as shard_mesh_mod
+from . import ssh as ssh_mod
 from . import step as stepmod
 from .halo import HaloCtx
 from .mesh import Mesh
@@ -44,6 +50,18 @@ from .state import State
 _P = PartitionSpec("p")          # sharded on the device axis (folded leading dim)
 _R = PartitionSpec()             # replicated (every device gets the full array)
 _TP = PartitionSpec(None, "p")   # [n_steps, P*Lmax]: time replicated, the folded dim sharded (A4)
+from .surface_forcing import STEP_SCALARS as _STEP_SCALARS  # noqa: E402  (REcoM calendar: replicated [T] xs)
+
+
+def step_unroll() -> int:
+    """``FESOM_STEP_UNROLL=u`` (``gpu.step_unroll``, read at trace time; default 1): the forced runner's step scan
+    runs ``u`` steps per loop trip. A GPU while loop syncs the host once per trip (the predicate), and after the sync
+    the device waits until the host has launched the next trip's first graphs; ``u`` steps per trip cut those waits
+    ``u``-fold. The compile grows with ``u``; XLA may fuse across steps, so the values move by round-off."""
+    u = int(os.environ.get("FESOM_STEP_UNROLL", "1") or 1)
+    if u < 1:
+        raise ValueError(f"FESOM_STEP_UNROLL must be >= 1, got {u}")
+    return u
 
 
 def _to_global_sharded(x, spec, mesh):
@@ -83,6 +101,15 @@ _ENTITY_FIELDS = (set(NODE_FIELDS) | set(ELEM_FIELDS) | set(EDGE_FIELDS)
 # --------------------------------------------------------------------------
 # Local reconstruction (one device's [Lmax, …] Mesh)
 # --------------------------------------------------------------------------
+def _mesh_fields(sm: ShardedMesh) -> dict:
+    """``sm.fields`` for the local/folded Mesh: with ``gpu.ordered_sums`` on, plus the per-device
+    inverse maps (``shard_mesh.with_inverse_maps``, built here unless ``sm`` has them); off, WITHOUT
+    them even if ``sm`` carries them, so the default program never sees them."""
+    if ops.ordered_sums_enabled():
+        return shard_mesh_mod.with_inverse_maps(sm).fields
+    return {k: v for k, v in sm.fields.items() if not k.startswith("inv_")}
+
+
 def local_mesh(sm: ShardedMesh, d: int) -> Mesh:
     """Reconstruct device ``d``'s local :class:`Mesh` from a :class:`ShardedMesh`
     (host helper / tests). Static sizes are the local ``Lmax``; the node→elem CSR is
@@ -90,7 +117,7 @@ def local_mesh(sm: ShardedMesh, d: int) -> Mesh:
     to the dense ``Mesh`` for every step-read field (verified)."""
     Ln, Le, Led = sm.Lmax["nod"], sm.Lmax["elem"], sm.Lmax["edge"]
     f = {name: jnp.asarray(arr if name in REPLICATED_FIELDS else arr[d])
-         for name, arr in sm.fields.items()}
+         for name, arr in _mesh_fields(sm).items()}
     return Mesh(
         **f,
         nod_in_elem2D_offsets=jnp.zeros(Ln + 1, jnp.int32),
@@ -125,11 +152,12 @@ def _unfold(arr, P: int) -> jax.Array:
 def folded_mesh(sm: ShardedMesh) -> tuple[Mesh, Mesh]:
     """Build the ``shard_map`` input ``Mesh`` (folded ``[P*Lmax_kind, …]`` leaves, local
     ``Lmax`` static sizes) and its ``PartitionSpec`` tree. Entity-leading fields shard
-    ``'p'``; ``zbar``/``Z`` + the CSR dummy replicate."""
+    ``'p'``; ``zbar``/``Z`` + the CSR dummy replicate. With ``gpu.ordered_sums`` on, the per-device
+    inverse maps (``shard_mesh.with_inverse_maps``, built here unless ``sm`` already has them) fold too."""
     Ln, Le, Led = sm.Lmax["nod"], sm.Lmax["elem"], sm.Lmax["edge"]
     data: dict = {}
     spec: dict = {}
-    for name, arr in sm.fields.items():
+    for name, arr in _mesh_fields(sm).items():
         if name in REPLICATED_FIELDS:
             data[name] = np.asarray(arr)          # host (replicated; device_put places it)
             spec[name] = _R
@@ -162,7 +190,9 @@ def _fold_forcing(f):
     data, spec = {}, {}
     for name in f._fields:
         arr = getattr(f, name)
-        if np.ndim(arr) == 0:
+        if arr is None:                                    # an optional field that is off (press_air): no leaf
+            data[name], spec[name] = None, None
+        elif np.ndim(arr) == 0:
             data[name], spec[name] = np.asarray(arr), _R   # scalar (ocean_area) → replicated (host)
         else:
             data[name], spec[name] = _fold(arr), _P        # [P, Lmax_nod, …] → [P*Lmax_nod, …] (host)
@@ -179,6 +209,12 @@ def _fold_forcing_seq(sf_seq):
     path uses). Mirrors :func:`_fold` (host numpy in ⇒ host numpy out, never staged on a device)."""
     data, spec = {}, {}
     for name in sf_seq._fields:
+        if getattr(sf_seq, name) is None:                  # an optional field that is off (press_air): no leaf
+            data[name], spec[name] = None, None
+            continue
+        if name in _STEP_SCALARS:                          # [T] per-step scalars (REcoM calendar): replicated
+            data[name], spec[name] = np.asarray(getattr(sf_seq, name)), _R
+            continue
         arr = np.asarray(getattr(sf_seq, name))            # [P, T, Lmax, …]
         P, T = arr.shape[0], arr.shape[1]
         rest = arr.shape[2:]                                # (Lmax, …)
@@ -196,6 +232,9 @@ def _fold_forcing_tables(ft):
     per-chunk device CONSTANT (not scan ``xs``) — the schedule indexes into them."""
     data, spec = {}, {}
     for name in ft._fields:
+        if getattr(ft, name) is None:                      # an optional table that is off (REcoM dust): no leaf
+            data[name], spec[name] = None, None
+            continue
         arr = np.asarray(getattr(ft, name))                # [P, …, Lmax]
         P, L = arr.shape[0], arr.shape[-1]
         mid = arr.shape[1:-1]                               # the small table axes
@@ -226,7 +265,7 @@ def folded_operator(sop: ShardedSSHOperator) -> tuple[SSHOperator, SSHOperator]:
     op = SSHOperator(
         rows=_fold(sop.rows), cols=_fold(sop.cols),
         stiff_vals=_fold(sop.stiff_vals), precond_vals=_fold(sop.precond_vals),
-        diag=_fold(sop.diag), n_nodes=sop.Lmax_nod, cheb=sop.cheb,
+        diag=_fold(sop.diag), n_nodes=sop.Lmax_nod, cheb=sop.cheb, ell=sop.ell,
     )
     return op, jax.tree.map(lambda _: _P, op)
 
@@ -293,8 +332,10 @@ def _halo_arrays(sm: ShardedMesh, ragged: bool = False, padded: bool = False,
         if ragged or padded or coloured:
             r = sm.exchange_ragged[k]
             ha[f"rhm_{k}"] = _fold(r.halo_mask)
-        if coloured:
+        if coloured or halo_grouped.bulk():         # bulk: the BGC stack's grouped exchanges (HaloCtx.exchange_bulk)
             c = sm.exchange_coloured[k]
+            if not (ragged or padded or coloured):
+                ha[f"rhm_{k}"] = _fold(sm.exchange_ragged[k].halo_mask)
             ha[f"csi_{k}"] = _fold(c.send_idx).astype(np.int32)
             ha[f"csv_{k}"] = _fold(c.send_valid)
             ha[f"cpp_{k}"] = _fold(c.colpos).astype(np.int32)
@@ -318,6 +359,18 @@ def _halo_arrays(sm: ShardedMesh, ragged: bool = False, padded: bool = False,
         ha["ppv_nod"] = _fold(r.pad_valid)
         ha["ppp_nod"] = _fold(r.pad_slotpos).astype(np.int32)
         ha.setdefault("rhm_nod", _fold(r.halo_mask))          # allgather main folds no rhm
+    if halo.halo_compact_enabled():
+        if ragged or padded or coloured:
+            raise ValueError("FESOM_HALO_COMPACT=1 compacts the all_gather transport; it cannot "
+                             "be combined with --ragged / --padded / --coloured")
+        for k in _RKINDS:
+            send, read = halo.compact_exchange_maps(*sm.exchange[k])
+            ha[f"cs_{k}"] = _fold(send)
+            ha[f"cr_{k}"] = _fold(read)
+            if halo.halo_compact_scatter():
+                upd, src = halo.compact_update_maps(read)
+                ha[f"cu_{k}"] = _fold(upd)
+                ha[f"cv_{k}"] = _fold(src)
     ha["owned_nod"] = _fold(sm.owned_mask["nod"])
     return ha, {k: _P for k in ha}
 
@@ -348,10 +401,14 @@ def _coloured_ctx(h: dict) -> dict:
 
 
 def _col_meta(sm: ShardedMesh) -> dict:
-    """Per-kind STATIC coloured metadata ``{kind: (perms, slots, offs)}`` (closed into the
-    body — never a shard_map input, so the perms stay Python and the slices stay static)."""
-    return {k: (sm.exchange_coloured[k].perms, sm.exchange_coloured[k].slots,
-                sm.exchange_coloured[k].offs) for k in _RKINDS}
+    """Per-kind STATIC coloured metadata ``{kind: (perms, slots, offs, sendn)}`` (closed into the
+    body — never a shard_map input, so the perms stay Python and the slices stay static);
+    ``sendn[k][r]`` the real rows shard r sends in round k, which the grouped transport sends."""
+    out = {}
+    for k in _RKINDS:
+        c = sm.exchange_coloured[k]
+        out[k] = (c.perms, c.slots, c.offs, halo_grouped.send_rows(c.send_valid, c.slots, c.offs))
+    return out
 
 
 def _recv_max(sm: ShardedMesh) -> dict:
@@ -391,11 +448,31 @@ def _make_halo_ctx(h: dict, n_global: int, use_ragged: bool, use_padded: bool,
                            use_ragged=use_ragged, use_padded=use_padded,
                            use_coloured=use_coloured,
                            col_meta=col_meta["nod"] if use_coloured else None)
+    compact = ({k: (h[f"cs_{k}"], h[f"cr_{k}"]) + ((h[f"cu_{k}"], h[f"cv_{k}"]) if "cu_nod" in h else ())
+                for k in _RKINDS} if "cs_nod" in h else None)
+    bulk = halo_grouped.bulk() and col_meta is not None and "csi_nod" in h
     return HaloCtx(exch=exch, axis_name="p", ssh_halo=ssh_halo,
                    owned_mask={"nod": h["owned_nod"]},
                    exch_ragged=rmaps, recv_max=recv_max,
                    use_ragged=use_ragged, use_padded=use_padded,
-                   use_coloured=use_coloured, col_meta=col_meta)
+                   use_coloured=use_coloured, col_meta=col_meta, exch_compact=compact,
+                   bulk_maps=_coloured_ctx(h) if bulk else None, bulk_meta=col_meta if bulk else None)
+
+
+def _coast_mask(sm: ShardedMesh, ice_cfg, boundary_node_p):
+    """The partitioned GLOBAL coastal mask the sea-ice step gets: the caller's ``boundary_node_p``, else (sea ice on)
+    the one the ShardedMesh carries. Without either, the ice step would rebuild the mask from each device's LOCAL
+    mesh, whose edge lanes are not the global ids ``edge2D_in`` splits: on more than one device it finds no coast
+    (a device holds fewer edges than ``edge2D_in``), the ice velocity is not zeroed at the coast (pi dist_4: O(1)
+    in u_ice after one step) — refused."""
+    if boundary_node_p is not None or ice_cfg is None:
+        return boundary_node_p
+    if sm.boundary_node is not None:
+        return sm.boundary_node
+    if sm.P > 1:
+        raise ValueError("sea ice on a sharded mesh needs the global coastal mask: pass boundary_node_p (or a "
+                         "ShardedMesh from build_sharded_mesh, which carries it)")
+    return None
 
 
 def _check_halo_mode(use_ragged: bool, use_padded: bool, use_coloured: bool = False):
@@ -446,7 +523,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                      kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None,
                      tracer_cfg=None, boundary_node_p=None,
                      use_ragged: bool = False, use_padded: bool = False,
-                     use_coloured: bool = False) -> State:
+                     use_coloured: bool = False, recom_cfg=None) -> State:
     """Run one :func:`fesom_jax.step.step` under ``shard_map`` over ``npes`` devices and
     return the ``[P, Lmax, …]`` next State.
 
@@ -461,6 +538,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     carry CONSTANT initial carries — non-"varying" under ``shard_map``'s varying-manual-axes
     typing — while their bodies produce per-device-varying outputs; relaxing it treats every
     value conservatively as per-device-varying, always correct here, so the kernels lower)."""
+    boundary_node_p = _coast_mask(sm, ice_cfg, boundary_node_p)
     fm, fm_spec = folded_mesh(sm)
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
@@ -499,7 +577,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                             forcing_static=fs_, ice_cfg=ice_cfg, gm_cfg=gm_cfg,
                             kpp_cfg=kpp_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
                             visc_cfg=visc_cfg, tracer_cfg=tracer_cfg, halo_ctx=ctx,
-                            boundary_node=bn_)
+                            boundary_node=bn_, recom_cfg=recom_cfg)
 
     if not wire_halo:
         def body0(m, s, o, stress, *ex):
@@ -513,7 +591,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded,
                                coloured=use_coloured)
     recv_max = _recv_max(sm) if use_ragged else None
-    col_meta = _col_meta(sm) if use_coloured else None
+    col_meta = _col_meta(sm) if use_coloured or halo_grouped.bulk() else None
 
     def body(m, s, o, stress, h, *ex):
         ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max,
@@ -534,7 +612,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                       use_coloured: bool = False,
                       ice_cfg=None, step_forcing=None, forcing_static=None,
                       boundary_node_p=None, return_executable: bool = False,
-                      return_grad_fn: bool = False):
+                      return_grad_fn: bool = False, recom_cfg=None):
     """Multi-step (S.7 part 3): step-1 eager (``is_first_step=True``) + ``lax.scan`` of steps
     2..N under ONE ``shard_map`` — the :func:`fesom_jax.integrate.integrate` pattern, sharded.
     Returns the ``[P, Lmax, …]`` final State after ``n_steps``.
@@ -549,6 +627,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     ``[n_steps, P*Lmax]`` ``PartitionSpec(None,'p')`` fold) is the follow-up for the PRIMARY
     KPP+GM+ice few-step gate."""
     _check_halo_mode(use_ragged, use_padded, use_coloured)
+    boundary_node_p = _coast_mask(sm, ice_cfg, boundary_node_p)
     if return_grad_fn and use_ragged:
         # lax.ragged_all_to_all has a WRONG reverse-mode transpose (over-counts ~axis_size×,
         # GPU-only; docs/JAX_RAGGED_A2A_BUG.md + the test_halo.py xfail). The forward is
@@ -572,7 +651,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded,
                                coloured=use_coloured)
     recv_max = _recv_max(sm) if use_ragged else None
-    col_meta = _col_meta(sm) if use_coloured else None
+    col_meta = _col_meta(sm) if use_coloured or halo_grouped.bulk() else None
 
     # Full forced+ice step (constant forcing across the scan — correct for TIMING / scaling, the
     # per-step cost is forcing-VALUE-independent; per-step forcing as the scan xs is the science
@@ -600,7 +679,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                                 step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
                                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                 ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                halo_ctx=ctx, boundary_node=bn_)
+                                halo_ctx=ctx, boundary_node=bn_, recom_cfg=recom_cfg)
 
         st = one(s, True)                            # step 1 eager (AB2 first-step branch)
         if n_steps > 1:
@@ -626,7 +705,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
                                     step_forcing=sf_, forcing_static=fs_, ice_cfg=ice_cfg,
                                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                     ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                    halo_ctx=ctx, boundary_node=bn_)
+                                    halo_ctx=ctx, boundary_node=bn_, recom_cfg=recom_cfg)
 
             st = one(s, True)
             if n_steps > 1:
@@ -678,9 +757,62 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
 _FORCED_JIT_CACHE: dict = {}
 
 
+def _trace_env() -> tuple:
+    """The ``FESOM_*`` switches the step reads at TRACE time (the ``gpu:`` options, the SP and debug knobs):
+    part of the executable-cache key, so a later run in the same process with other switches never reuses an
+    executable traced under the earlier ones (the ``id()`` parts of the key cannot tell them apart)."""
+    return tuple(sorted((k, v) for k, v in os.environ.items()
+                        if k.startswith("FESOM_") and k not in _NOT_TRACE_ENV))
+
+
+_NOT_TRACE_ENV = frozenset({"FESOM_PLACE_CACHE"})    # host-side only: never changes the traced program
+
+
+# Device-placed run-constant inputs of run_steps_sharded_forced(reuse_executable=True), keyed like the
+# executable cache by the identity of their source objects (+ precision, transport, the FESOM_* switches).
+# Without it every chunk re-folded, re-cast (single precision) and re-transferred the whole mesh, operator
+# and halo arrays: ~50-70 ms per chunk call on 4 GH200 (job 28295867: chunk 32 vs 96 at dt 2700).
+# LRU-bounded; FESOM_PLACE_CACHE=0 turns it off.
+_PLACED_CACHE: "collections.OrderedDict" = collections.OrderedDict()
+_PLACED_MAX = 8
+
+
+def _forced_consts(sm, sop, stress_p, forcing_static, boundary_node_p, forcing_const, ssh_gather,
+                   mevp_wide, use_ragged, use_padded, use_coloured, precision, se_wide=None) -> dict:
+    """The run-constant shard_map inputs of :func:`run_steps_sharded_forced`, folded (host) and cast to the
+    working precision, each ``name`` with its spec tree under ``name + "_spec"``."""
+    fm, fm_spec = folded_mesh(sm)
+    fop, fop_spec = folded_operator(sop)
+    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded, coloured=use_coloured)
+    fsf, fsf_spec = _fold_forcing(forcing_static)
+    c = {"fm": fm, "fm_spec": fm_spec, "fop": fop, "fop_spec": fop_spec, "fstress": _fold(stress_p),
+         "fstress_spec": _P, "ha": ha, "ha_spec": ha_spec, "fsf": fsf, "fsf_spec": fsf_spec}
+    if boundary_node_p is not None:
+        c["bn"], c["bn_spec"] = _fold(boundary_node_p), _P
+    if forcing_const is not None:
+        c["con"], c["con_spec"] = _fold_forcing_const(forcing_const)
+    if ssh_gather is not None:
+        g_rep, g_lanes = ssh_mod.gather_inputs(ssh_gather)
+        c["g_rep"], c["g_rep_spec"] = g_rep, jax.tree.map(lambda _: _R, g_rep)
+        c["g_lanes"], c["g_lanes_spec"] = g_lanes, (_P, _P)
+    if mevp_wide is not None:
+        from . import ice_wide
+        w = ice_wide.fold_arrays(mevp_wide)
+        c["w"], c["w_spec"] = w, {k: _P for k in w}
+    if se_wide is not None:
+        from . import se_wide as se_wide_mod
+        sw = se_wide_mod.fold_arrays(se_wide)
+        c["sw"], c["sw_spec"] = sw, {k: _P for k in sw}
+    if precision == "single":
+        c = {k: (v if k.endswith("_spec") else PR.cast_tree(v)) for k, v in c.items()}
+    return c
+
+
 def clear_forced_jit_cache() -> None:
-    """Drop all cached forced-step executables (call between independent run setups / in tests)."""
+    """Drop all cached forced-step executables and placed constants (call between independent run setups /
+    in tests)."""
     _FORCED_JIT_CACHE.clear()
+    _PLACED_CACHE.clear()
 
 
 def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
@@ -693,8 +825,36 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              return_folded: bool = False, return_executable: bool = False,
                              reuse_executable: bool = False, sample_fn=None,
                              forcing_tables=None, forcing_sched=None, forcing_const=None,
-                             return_grad_fn: bool = False):
+                             forcing_tables_folded: bool = False,
+                             return_grad_fn: bool = False, ssh_gather=None,
+                             mevp_wide=None, precision: str = "double", se_wide=None, ice_phase=None,
+                             recom_cfg=None):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
+
+    ``ice_phase`` (an int, the ``ice_steps_since_upd`` the State carries into this chunk; ``ice_ave_steps > 1``
+    only, the opt-in ``gpu.ice_static``): every step's ice update decision is taken here at trace time (step ``j``
+    updates when ``(ice_phase + j) % N == N - 1``, FESOM2's rule) and the scan runs over whole ice cycles of ``N``
+    steps, so no step has a ``lax.cond`` whose predicate the host must fetch (one host sync a step on a GPU, after
+    which the devices wait for the next step's first launches). The steps a chunk leaves after its last whole cycle
+    run inline. ``None`` ⇒ byte-unchanged.
+
+    ``precision`` (``"double"`` default ⇒ byte-unchanged; ``"single"`` ⇒ FESOM2's single-precision build,
+    :mod:`fesom_jax.precision`): every floating input is cast to float32 (``hnode``/``hnode_new`` stay float64, the
+    rounding carry is added to the State), the program is traced and run inside :func:`precision.scope` and compiled
+    with ``xla_allow_excess_precision=False``. Forward only.
+
+    ``mevp_wide`` (a :class:`~fesom_jax.ice_wide.MevpWideHost` from
+    :func:`ice_wide.build_mevp_wide`, the opt-in ``gpu.mevp_wide``) runs the sharded mEVP on
+    K-ring ice lanes with one exchange every K subcycles (owned lanes bitwise the per-subcycle
+    exchange on CPU); ``None`` ⇒ byte-unchanged.
+
+    ``se_wide`` (a :class:`~fesom_jax.se_wide.SeWideHost` from :func:`se_wide.build_se_wide`, the opt-in
+    ``gpu.se_wide``) runs the split-explicit substeps on K+1-ring lanes with one exchange every K substeps (owned
+    lanes bitwise the per-substep exchange on CPU); ``None`` ⇒ byte-unchanged.
+
+    ``ssh_gather`` (a :class:`~fesom_jax.ssh.SSHGatherHost` from :func:`ssh.build_ssh_gather`,
+    the opt-in ``ssh.gathered``) solves the SSH system on every device after one all-gather
+    instead of the sharded CG; ``None`` ⇒ byte-unchanged.
 
     Like :func:`run_steps_sharded` but the surface forcing **changes every step** — the real
     seasonal cycle NG5/dars need — instead of being held constant across the scan (which is
@@ -729,21 +889,17 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     device under multi-node ⇒ OOM). ``return_folded`` ⇒ return the folded ``[P*Lmax]`` scan output
     directly (no ``unfold_state`` reshape). Cold start passes a HOST ``[P,Lmax]`` (``state_is_folded
     =False``); the driver chains the folded output between chunks and to ``write_restart``."""
-    fm, fm_spec = folded_mesh(sm)
     if state_is_folded:
         fs = state_p                                      # already folded [P*Lmax] device-sharded
         fs_spec = jax.tree.map(lambda _: _P, fs)
     else:
         fs, fs_spec = folded_state(state_p)               # [P,Lmax] (host cold-start) → [P*Lmax]
-    fop, fop_spec = folded_operator(sop)
-    fstress = _fold(stress_p)
     jmesh = halo.device_mesh(devices=jax.devices()[:npes])
     n_global = sm.nod2D
     _check_halo_mode(use_ragged, use_padded, use_coloured)
-    ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded,
-                               coloured=use_coloured)
+    boundary_node_p = _coast_mask(sm, ice_cfg, boundary_node_p)
     recv_max = _recv_max(sm) if use_ragged else None
-    col_meta = _col_meta(sm) if use_coloured else None
+    col_meta = _col_meta(sm) if use_coloured or halo_grouped.bulk() else None
 
     if forcing_static is None:
         raise ValueError("run_steps_sharded_forced needs forcing_static (the CORE2 forced path)")
@@ -753,6 +909,17 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     #    (docs/plans/20260715-fesom-jax-ondevice-forcing.md): the tables are a per-chunk
     #    node-sharded CONSTANT, the scan xs is the tiny replicated schedule, and
     #    surface_forcing.combine_step_forcing builds each step's StepForcing in-scan.
+    if ice_phase is not None:
+        if ice_cfg is None or int(ice_cfg.ice_ave_steps) < 2:
+            raise ValueError("ice_phase (gpu.ice_static) needs sea ice with ice_ave_steps > 1")
+        if return_grad_fn:
+            raise ValueError("ice_phase (gpu.ice_static) is wired into the forward only")
+        _nave = int(ice_cfg.ice_ave_steps)
+        if not 0 <= int(ice_phase) < _nave:
+            raise ValueError(f"ice_phase must be in [0, {_nave}), got {ice_phase}")
+
+        def _ice_flag(j):
+            return (int(ice_phase) + j) % _nave == _nave - 1     # FESOM2: update when the counter is N - 1
     use_tables = forcing_tables is not None
     if use_tables:
         if step_forcing_seq is not None:
@@ -761,8 +928,13 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             raise ValueError("forcing_tables needs forcing_sched and forcing_const")
         seq_folded = jax.tree.map(np.asarray, forcing_sched)      # tiny [T,…] host leaves
         seq_spec = jax.tree.map(lambda _: _R, seq_folded)         # replicated scan xs
-        tab_folded, tab_spec = _fold_forcing_tables(forcing_tables)
-        con_folded, con_spec = _fold_forcing_const(forcing_const)
+        if forcing_tables_folded:     # partition_forcing_tables(folded=True): already [..., P*Lmax]
+            tab_folded = forcing_tables
+            tab_spec = type(forcing_tables)(**{n: (None if getattr(forcing_tables, n) is None else   # REcoM dust off
+                                                   PartitionSpec(*([None] * (np.ndim(getattr(forcing_tables, n)) - 1)),
+                                                                 "p")) for n in forcing_tables._fields})
+        else:
+            tab_folded, tab_spec = _fold_forcing_tables(forcing_tables)
         T = int(seq_folded.rdate.shape[0])
         if T != n_steps:
             raise ValueError(f"forcing_sched has {T} steps but n_steps={n_steps}")
@@ -772,21 +944,101 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
         T = int(np.asarray(getattr(seq_folded, seq_folded._fields[0])).shape[0])
         if T != n_steps:
             raise ValueError(f"step_forcing_seq has {T} steps but n_steps={n_steps}")
+    have_bn = boundary_node_p is not None
+    have_gather = ssh_gather is not None
+    have_wide = mevp_wide is not None
+    if have_wide:
+        if ice_cfg is None or ice_cfg.whichEVP != 1:
+            raise ValueError("mevp_wide needs the mEVP sea ice (ice_cfg.whichEVP=1)")
+        from . import ice_wide                       # _with_wide (the traced body) reads it
+    have_se_wide = se_wide is not None
+    if have_se_wide:
+        if ale_cfg is None or ale_cfg.split_explicit is None:
+            raise ValueError("se_wide needs the split-explicit SSH (ale_cfg.split_explicit)")
+        from . import se_wide as se_wide_mod         # _with_wide (the traced body) reads it
+
+    # The run-constant inputs (mesh, operator, stress, halo arrays, forcing_static, boundary_node, the
+    # on-device forcing constants, the gathered-SSH and mEVP-wide arrays): with reuse_executable they are
+    # the same objects every chunk of a run, so they are folded, cast (single precision) and placed on the
+    # devices ONCE and reused (_PLACED_CACHE); otherwise built and placed every call as before.
+    pc_key = None
+    if reuse_executable and not return_grad_fn and os.environ.get("FESOM_PLACE_CACHE", "1") != "0":
+        pc_key = (id(sm), id(sop), id(stress_p), id(forcing_static), id(boundary_node_p),
+                  id(forcing_const), id(ssh_gather), id(mevp_wide), bool(use_ragged), bool(use_padded),
+                  bool(use_coloured), bool(use_tables), int(npes), precision, _trace_env())
+        if have_se_wide:                              # the CG key is unchanged
+            pc_key = pc_key + (id(se_wide),)
+    hit = _PLACED_CACHE.get(pc_key) if pc_key is not None else None
+    if hit is not None:
+        _PLACED_CACHE.move_to_end(pc_key)
+        c = hit[0]
+    else:
+        c = _forced_consts(sm, sop, stress_p, forcing_static, boundary_node_p,
+                           forcing_const if use_tables else None, ssh_gather, mevp_wide,
+                           use_ragged, use_padded, use_coloured, precision, se_wide)
+        if pc_key is not None:
+            c = {k: (_to_global_sharded(v, c[k + "_spec"], jmesh) if k + "_spec" in c else v)
+                 for k, v in c.items()}
+            # the entry keeps its source objects alive, so their id()s cannot be reused while it exists
+            _PLACED_CACHE[pc_key] = (c, (sm, sop, stress_p, forcing_static, boundary_node_p,
+                                         forcing_const, ssh_gather, mevp_wide, se_wide))
+            while len(_PLACED_CACHE) > _PLACED_MAX:
+                _PLACED_CACHE.popitem(last=False)
+    fm, fm_spec, fop, fop_spec = c["fm"], c["fm_spec"], c["fop"], c["fop_spec"]
+    fstress, ha, ha_spec = c["fstress"], c["ha"], c["ha_spec"]
+
+    _params_obj = params                 # the executable-cache key uses the caller's object (a cast is new each call)
+    _params_id = id(params)
+    if precision == "single":           # FESOM2 single precision: WP inputs (host casts; placement stays below)
+        if return_grad_fn:
+            raise NotImplementedError("precision='single' is forward-only (SP gradients are out of scope)")
+        fs = PR.cast_state(fs)
+        fs_spec = jax.tree.map(lambda _: _P, fs)
+        co2 = getattr(seq_folded, "co2_atm", None)
+        seq_folded = PR.cast_tree(seq_folded)
+        if co2 is not None:             # REcoM's AtmCO2 is REcoM's own WP = 8, as the rest of its inputs' use
+            seq_folded = seq_folded._replace(co2_atm=co2)
+        if use_tables:
+            tab_folded = PR.cast_tree(tab_folded)
+        params = PR.cast_tree(params if params is not None else Params.defaults())
 
     # forcing_static (device-constant) + the optional global boundary_node, as in run_steps_sharded.
-    fsf, fsf_spec = _fold_forcing(forcing_static)
-    extras, extras_spec = [fsf], [fsf_spec]
-    have_bn = boundary_node_p is not None
+    extras, extras_spec = [c["fsf"]], [c["fsf_spec"]]
     if have_bn:
-        extras.append(_fold(boundary_node_p)); extras_spec.append(_P)
+        extras.append(c["bn"]); extras_spec.append(_P)
     if use_tables:
-        extras.extend([tab_folded, con_folded])
-        extras_spec.extend([tab_spec, con_spec])
+        extras.extend([tab_folded, c["con"]])
+        extras_spec.extend([tab_spec, c["con_spec"]])
+    if have_gather:
+        extras.extend([c["g_rep"], c["g_lanes"]])
+        extras_spec.extend([c["g_rep_spec"], c["g_lanes_spec"]])
+    if have_wide:
+        extras.append(c["w"])
+        extras_spec.append(c["w_spec"])
+    if have_se_wide:
+        extras.append(c["sw"])
+        extras_spec.append(c["sw_spec"])
     extras, extras_spec = tuple(extras), tuple(extras_spec)
+    i_gather = 1 + have_bn + 2 * use_tables
+    i_wide = i_gather + 2 * have_gather
+    i_se_wide = i_wide + have_wide
+
+    def _with_wide(ctx, ex):
+        if have_wide:
+            ctx = dataclasses.replace(ctx, mevp_wide=ice_wide.local_mevp_wide(
+                ex[i_wide], mevp_wide.K, ctx.axis_name))
+        if have_se_wide:
+            ctx = dataclasses.replace(ctx, se_wide=se_wide_mod.local_se_wide(
+                ex[i_se_wide], se_wide.K, ctx.axis_name))
+        return ctx
 
     def body(m, s, o, stress, h, seq, *ex):
         ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max,
                              use_coloured, col_meta)
+        if have_gather:
+            ctx = dataclasses.replace(ctx, ssh_gather=ssh_mod.local_ssh_gather(
+                ex[i_gather], ex[i_gather + 1], ctx.axis_name))
+        ctx = _with_wide(ctx, ex)
         fs_ = ex[0]
         bn_ = ex[1] if have_bn else None
         if use_tables:
@@ -794,17 +1046,51 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             tab_ = ex[1 + have_bn]
             con_ = ex[2 + have_bn]
 
-        def one(carry, is_first, sf_step):
+        def one(carry, is_first, sf_step, upd=None):
             if use_tables:  # sf_step is a ForcingSched slice — combine in-scan (elementwise)
                 sf_step = combine_step_forcing(tab_, sf_step.rdate, sf_step.fidx,
-                                               sf_step.midx, con_)
+                                               sf_step.midx, con_, elapsed=sf_step.elapsed,
+                                               didx=sf_step.didx, daynew=sf_step.daynew, ndpyr=sf_step.ndpyr,
+                                               co2_atm=sf_step.co2_atm)
             return stepmod.step(carry, m, o, stress, params, dt=dt, is_first_step=is_first,
                                 step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                 ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                halo_ctx=ctx, boundary_node=bn_)
+                                halo_ctx=ctx, boundary_node=bn_, ice_update=upd, recom_cfg=recom_cfg)
 
         sf0 = jax.tree.map(lambda x: x[0], seq)             # this chunk's first-step forcing
+        if ice_phase is not None:
+            # gpu.ice_static: the ice branch of every step fixed at trace time. A bootstrap step stays first and
+            # alone; the rest scan over whole ice cycles (the flags of one cycle are those of any other).
+            j0 = 1 if bootstrap_ab2 else 0
+            if j0:
+                st = one(s, True, sf0, _ice_flag(0))
+                acc = None if sample_fn is None else PR.full_tree(sample_fn(st))
+            else:
+                st = s
+                acc = (None if sample_fn is None
+                       else jax.tree.map(jnp.zeros_like, PR.full_tree(sample_fn(s))))
+            flags = tuple(_ice_flag(j0 + i) for i in range(_nave))
+
+            def adv(c, a, sf, upd):
+                c = one(c, False, sf, upd)
+                if a is not None:
+                    a = jax.tree.map(lambda u, v: u + v, a, PR.full_tree(sample_fn(c)))
+                return c, a
+
+            ncyc, nrest = divmod(n_steps - j0, _nave)
+            if ncyc:
+                cyc = jax.tree.map(lambda x: x[j0:j0 + ncyc * _nave].reshape((ncyc, _nave) + x.shape[1:]), seq)
+
+                def cycle(carry, sfc):
+                    c, a = carry
+                    for i in range(_nave):
+                        c, a = adv(c, a, jax.tree.map(lambda x: x[i], sfc), flags[i])
+                    return (c, a), None
+                (st, acc), _ = lax.scan(jax.checkpoint(cycle), (st, acc), xs=cyc, length=ncyc)
+            for i in range(nrest):
+                st, acc = adv(st, acc, jax.tree.map(lambda x: x[j0 + ncyc * _nave + i], seq), flags[i])
+            return st if sample_fn is None else (st, acc)
         # bootstrap_ab2: True ⇒ cold start / post-dt-ramp (AB2 first-step branch); False ⇒ a
         # restart-continuation chunk carries the AB2 history forward (is_first_step=False), so a
         # chained run is bit-identical to a continuous one (the A6 restart-seam invariant).
@@ -818,18 +1104,19 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             if n_steps > 1:
                 rest = jax.tree.map(lambda x: x[1:], seq)   # [n_steps-1, Lmax] per leaf
                 st, _ = lax.scan(jax.checkpoint(lambda c, sf: (one(c, False, sf), None)),
-                                 st, xs=rest, length=n_steps - 1)
+                                 st, xs=rest, length=n_steps - 1, unroll=min(step_unroll(), n_steps - 1))
             return st
-        acc = sample_fn(st)                                 # running sum, seeded by step-1's output
+        # single precision: the output means accumulate in real64 (FESOM2 #1032); identity in double
+        acc = PR.full_tree(sample_fn(st))                   # running sum, seeded by step-1's output
         if n_steps > 1:
             rest = jax.tree.map(lambda x: x[1:], seq)
             def _accum(carry, sf):
                 c, a = carry
                 c = one(c, False, sf)
-                a = jax.tree.map(lambda u, v: u + v, a, sample_fn(c))
+                a = jax.tree.map(lambda u, v: u + v, a, PR.full_tree(sample_fn(c)))
                 return (c, a), None
             (st, acc), _ = lax.scan(jax.checkpoint(_accum), (st, acc),
-                                    xs=rest, length=n_steps - 1)
+                                    xs=rest, length=n_steps - 1, unroll=min(step_unroll(), n_steps - 1))
         return st, acc
 
     # ------------------------------------------------------------------ gradient path
@@ -857,10 +1144,15 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             raise ValueError("return_grad_fn=True with sample_fn is not supported: the "
                              "per-step accumulation changes out_specs and nothing needs the "
                              "combination yet. Take the gradient of the final State.")
+        if have_gather:
+            raise ValueError("return_grad_fn=True with ssh_gather is not supported: the "
+                             "gathered SSH solve is a forward speed option (nothing needs "
+                             "its gradient through this runner yet).")
 
         def bodyg(p, m, s, o, stress, h, seq, *ex):
             ctx = _make_halo_ctx(h, n_global, use_ragged, use_padded, recv_max,
                                  use_coloured, col_meta)
+            ctx = _with_wide(ctx, ex)
             fs_ = ex[0]
             bn_ = ex[1] if have_bn else None
             if use_tables:
@@ -871,12 +1163,14 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             def one(carry, is_first, sf_step):
                 if use_tables:
                     sf_step = combine_step_forcing(tab_, sf_step.rdate, sf_step.fidx,
-                                                   sf_step.midx, con_)
+                                                   sf_step.midx, con_, didx=sf_step.didx,
+                                                   daynew=sf_step.daynew, ndpyr=sf_step.ndpyr,
+                                                   co2_atm=sf_step.co2_atm)
                 return stepmod.step(carry, m, o, stress, p, dt=dt, is_first_step=is_first,
                                     step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                     ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                    halo_ctx=ctx, boundary_node=bn_)
+                                    halo_ctx=ctx, boundary_node=bn_, recom_cfg=recom_cfg)
 
             sf0 = jax.tree.map(lambda x: x[0], seq)
             st = one(s, bootstrap_ab2, sf0)
@@ -917,19 +1211,36 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     # A hit reuses the executable; the args (fresh state + forcing VALUES, identical shapes) are
     # rebuilt every call and fed to it ⇒ bit-identical to a fresh compile (asserted on GPU).
     if reuse_executable:
-        key = (id(sm), id(sop), id(params), int(n_steps), float(dt), bool(bootstrap_ab2),
+        key = (id(sm), id(sop), _params_id, int(n_steps), float(dt), bool(bootstrap_ab2),
                bool(state_is_folded), bool(use_ragged), bool(use_padded), bool(use_coloured),
                int(npes), bool(have_bn), bool(use_tables),
                id(ice_cfg), id(gm_cfg), id(kpp_cfg), id(tke_cfg),
-               id(ale_cfg), id(visc_cfg), id(tracer_cfg), id(sample_fn))
-        jfn = _FORCED_JIT_CACHE.get(key)
+               id(ale_cfg), id(visc_cfg), id(tracer_cfg), id(sample_fn), id(ssh_gather),
+               id(mevp_wide), _trace_env())
+        if precision != "double":                     # the double key is unchanged
+            key = key + (precision,)
+        if have_se_wide:
+            key = key + (id(se_wide),)
+        if ice_phase is not None:
+            key = key + (("ice_phase", int(ice_phase)),)
+        if recom_cfg is not None:                     # the REcoM-off key is unchanged
+            key = key + (("recom", id(recom_cfg)),)
+        hit = _FORCED_JIT_CACHE.get(key)
+        jfn = None if hit is None else hit[0]
         if jfn is None:
-            jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
-                                        out_specs=out_specs, check_vma=False))
-            _FORCED_JIT_CACHE[key] = jfn
+            jfn = PR.scoped(PR.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
+                                                 out_specs=out_specs, check_vma=False), precision),
+                            precision)
+            # the entry keeps the keyed objects alive, so their id()s cannot be reused by a later
+            # run's objects while the entry exists (a freed id handed to a new config would return
+            # this run's executable)
+            _FORCED_JIT_CACHE[key] = (jfn, (sm, sop, _params_obj, ice_cfg, gm_cfg, kpp_cfg, tke_cfg,
+                                            ale_cfg, visc_cfg, tracer_cfg, sample_fn, ssh_gather,
+                                            mevp_wide, se_wide, recom_cfg))
     else:
-        jfn = jax.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
-                                    out_specs=out_specs, check_vma=False))
+        jfn = PR.scoped(PR.jit(jax.shard_map(body, mesh=jmesh, in_specs=in_specs,
+                                             out_specs=out_specs, check_vma=False), precision),
+                        precision)
     args = (fm, fs, fop, fstress, ha, seq_folded, *extras)
     args = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(args, in_specs))
     if return_executable:

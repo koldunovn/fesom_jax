@@ -84,3 +84,7 @@ scripts/logs/
 /docs/plans/20260808-nn-eddy-training-machinery.md
 /docs/plans/20260810-split-nn-eddy-and-promote-adjoint.md
 /docs/plans/20260810-inventory.md
+fesom_jax/_build/
+/docs/plans/20261023-fram-export-adjoint.md
+/scripts/paper/fram_maps.py
+/scripts/paper/fram_tables.py

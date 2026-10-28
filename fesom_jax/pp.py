@@ -28,8 +28,10 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 
-from . import ops
+from . import adjoint_stab, ops
 from .config import A_VER, INSTABMIX_KV, K_VER, MIX_COEFF_PP, USE_INSTABMIX
+
+CONVECTION_MODES = ("switch", "ramp", "ramp_kv", "off")   #: mo_convect forward modes (FESOM2: "switch")
 from .mesh import Mesh
 
 
@@ -62,9 +64,9 @@ def compute_vel_nodes(mesh: Mesh, uv):
                          jnp.broadcast_to(mesh.elem_area[:, None], (e, nl)), 0.0)
 
     num = ops.scatter_add(jnp.broadcast_to(contrib[:, None], (e, 3, nl, 2)),
-                          mesh.elem_nodes, mesh.nod2D)            # (nod2D,nl,2)
+                          mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)            # (nod2D,nl,2)
     den = ops.scatter_add(jnp.broadcast_to(area_lev[:, None], (e, 3, nl)),
-                          mesh.elem_nodes, mesh.nod2D)            # (nod2D,nl)
+                          mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)            # (nod2D,nl)
     safe = jnp.where(den > 0.0, den, 1.0)[..., None]
     uvnode = jnp.where(mesh.node_layer_mask[..., None], num / safe, 0.0)
     return uvnode
@@ -122,17 +124,56 @@ def pp_mixing(mesh: Mesh, uvnode, bvfreq, *, k_ver=K_VER, a_ver=A_VER, Z3d=None)
     return Kv, Av
 
 
-def mo_convect(mesh: Mesh, Kv, Av, bvfreq, *, freeze_increment: bool = False):
+def mo_convect(mesh: Mesh, Kv, Av, bvfreq, *, freeze_increment: bool = False,
+               surrogate_dn2: float | None = None, mode: str = "switch",
+               ramp_dn2: float | None = None):
     """Convective adjustment (``fesom_mo_convect``, use_instabmix branch): where
     ``N²<0`` raise ``Kv`` (node) / ``Av`` (element, if ANY vertex N²<0) to
-    ``instabmix_kv``. No-op where the column is stably stratified."""
-    if not USE_INSTABMIX:
+    ``instabmix_kv``. No-op where the column is stably stratified.
+
+    ``mode`` (a forward option, :attr:`fesom_jax.tke.TkeConfig.convection`; FESOM2 has only
+    the first): ``"switch"`` the adjustment above; ``"off"`` none (``Kv``/``Av`` returned
+    as given: the closure alone mixes unstable columns); ``"ramp"`` the switch smoothed on the
+    convecting side, ``Kv_in + w·(max(Kv_in, instabmix_kv) − Kv_in)`` with
+    ``w = clip(−N²/ramp_dn2, 0, 1)`` (node), and for ``Av`` the largest ``w`` of the element's
+    vertices: the full bump for ``N² ≤ −ramp_dn2``, none for ``N² ≥ 0``, so the flux
+    ``Kv·N²`` stays monotone in N² (a ramp on the stable side would be anti-diffusive);
+    ``"ramp_kv"`` the node ``Kv`` ramp with the ``Av`` switch.
+
+    ``surrogate_dn2`` (``AdjointConfig.conv_surrogate``, backward only): the node ``Kv`` keeps
+    its value, and its derivative is that of ``Kv_in + w·(max(Kv_in, instabmix_kv) − Kv_in)``
+    with the one-sided ramp ``w = clip(−N²/surrogate_dn2, 0, 1)``: the switch gets the N²
+    derivative ``−(max(Kv_in, instabmix_kv) − Kv_in)/surrogate_dn2`` where
+    ``−surrogate_dn2 < N² < 0`` and none elsewhere; outside the band the derivative is the
+    exact one. The ramp sits on the convecting side only: on the stable side a falling
+    ``Kv(N²)`` makes the linearised flux ``Kv·N²`` decrease with N² (anti-diffusive), and a
+    centred ramp blew the 30-day reverse sweep up in its first chunk. ``Av`` keeps the exact
+    switch."""
+    if mode not in CONVECTION_MODES:
+        raise ValueError(f"mo_convect mode must be one of {CONVECTION_MODES}, got {mode!r}")
+    if mode != "switch" and (freeze_increment or surrogate_dn2 is not None):
+        raise ValueError("freeze_convection / conv_surrogate act on the convective switch; "
+                         f"the forward convection mode is {mode!r}")
+    if not USE_INSTABMIX or mode == "off":
         return Kv, Av
     Kv_in, Av_in = Kv, Av
     nl = mesh.nl
     imix = INSTABMIX_KV
     nmask = _interior_iface_mask(mesh.ulevels_nod2D, mesh.nlevels_nod2D, nl)
-    Kv = jnp.where(nmask & (bvfreq < 0.0), jnp.maximum(Kv, imix), Kv)
+    if mode in ("ramp", "ramp_kv"):
+        if ramp_dn2 is None or not ramp_dn2 > 0.0:
+            raise ValueError(f"mo_convect ramp needs ramp_dn2 > 0, got {ramp_dn2!r}")
+        # (1 − w)·a + w·b: exactly the switch's value at w = 1 and the closure's at w = 0
+        w = jnp.clip(-bvfreq / ramp_dn2, 0.0, 1.0)                    # (nod2D,nl)
+        wn = jnp.where(nmask, w, 0.0)
+        Kv = (1.0 - wn) * Kv_in + wn * jnp.maximum(Kv_in, imix)
+        if mode == "ramp":
+            w_e = jnp.max(ops.gather_nodes_to_elem(w, mesh.elem_nodes), axis=1)   # (elem2D,nl)
+            we = jnp.where(_interior_iface_mask(mesh.ulevels, mesh.nlevels, nl), w_e, 0.0)
+            Av = (1.0 - we) * Av_in + we * jnp.maximum(Av_in, imix)
+            return Kv, Av
+    else:
+        Kv = jnp.where(nmask & (bvfreq < 0.0), jnp.maximum(Kv, imix), Kv)
 
     b_corners = ops.gather_nodes_to_elem(bvfreq, mesh.elem_nodes)   # (elem2D,3,nl)
     any_neg = jnp.any(b_corners < 0.0, axis=1)                      # (elem2D,nl)
@@ -142,13 +183,17 @@ def mo_convect(mesh: Mesh, Kv, Av, bvfreq, *, freeze_increment: bool = False):
         # Backward-only (AdjointConfig.freeze_convection): keep the bump's VALUE but differentiate
         # only the pre-convection coefficients, so the N^2<0 switch contributes no gradient
         # while the closure's own state-dependence stays live.
-        Kv = Kv_in + jax.lax.stop_gradient(Kv - Kv_in)
-        Av = Av_in + jax.lax.stop_gradient(Av - Av_in)
+        # Straight-through form (adjoint_stab.freeze_increment): the forward is exactly the
+        # bumped value, which the increment form Kv_in + sg(Kv - Kv_in) does not guarantee.
+        Kv, Av = adjoint_stab.freeze_increment((Kv_in, Av_in), (Kv, Av))
+    if surrogate_dn2 is not None:
+        w = jnp.where(nmask, jnp.clip(-bvfreq / surrogate_dn2, 0.0, 1.0), 0.0)
+        Kv = adjoint_stab.freeze_increment(Kv_in + w * (jnp.maximum(Kv_in, imix) - Kv_in), Kv)
     return Kv, Av
 
 
 def mixing_pp(mesh: Mesh, uv, bvfreq, *, k_ver=K_VER, a_ver=A_VER, Z3d=None,
-              freeze_convection: bool = False):
+              freeze_convection: bool = False, conv_surrogate: float | None = None):
     """Driver mirror of ``fesom_step.c:122-135``: node velocity → PP → convection.
     Returns ``(Kv, Av, uvnode)`` — the substep-4 dump fields (+ uvnode for reuse).
     ``k_ver``/``a_ver`` thread the differentiable backgrounds (default = config).
@@ -156,5 +201,6 @@ def mixing_pp(mesh: Mesh, uv, bvfreq, *, k_ver=K_VER, a_ver=A_VER, Z3d=None,
     shear spacing (JZ.6)."""
     uvnode = compute_vel_nodes(mesh, uv)
     Kv, Av = pp_mixing(mesh, uvnode, bvfreq, k_ver=k_ver, a_ver=a_ver, Z3d=Z3d)
-    Kv, Av = mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection)
+    Kv, Av = mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection,
+                        surrogate_dn2=conv_surrogate)
     return Kv, Av, uvnode

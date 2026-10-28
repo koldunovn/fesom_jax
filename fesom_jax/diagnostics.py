@@ -45,12 +45,15 @@ def state_diagnostics(state: State, *, fields=None) -> dict:
     and the tracer ranges ``T_min`` / ``T_max`` / ``S_min`` / ``S_max`` plus ``a_ice_max`` /
     ``m_ice_max``. All values are HOST python scalars (each reduction blocks on a single
     replicated all-reduce). ``fields`` restricts the leaf scan (default: every State leaf)."""
-    names = fields if fields is not None else [f.name for f in dataclasses.fields(State)]
+    names = fields if fields is not None else [f.name for f in dataclasses.fields(State)
+                                               if getattr(state, f.name) is not None]
 
     nonfinite_by_field, field_maxabs = {}, {}
     n_nonfinite = 0
     for name in names:
         arr = getattr(state, name)
+        if arr is None:                               # the single-precision carry in a double State
+            continue
         nf = int(jnp.sum(~jnp.isfinite(arr)))         # padding/dry lanes are 0 ⇒ finite ⇒ no false +
         n_nonfinite += nf
         if nf:
@@ -117,3 +120,39 @@ def format_diagnostics(diags: dict, *, label: str = "") -> str:
     for warn in warns:
         lines.append("  WARN: " + warn)
     return "\n".join(lines)
+
+
+def budget_sums(state_p, sm, ice_cfg=None) -> dict:
+    """Global ocean volume, salt and heat content of a FOLDED sharded State, float64, owned lanes only — the
+    single-precision conservation gate (docs/plans/20261020-core2-single-precision.md, Tasks 6 and 9).
+
+    ``V = Σ hnode·areasvol`` [m³]; ``S_oce``/``T_oce = Σ X·hnode·areasvol`` plus the rounding carry's content
+    ``Σ carry·areasvol`` when present (FESOM2 counts the carry as content, ``fesom_conservation.F90:197``);
+    ``S_ice = Sice·ρice/ρwat·Σ m_ice·areasvol_surf`` (the salt the ice thermodynamics takes from the ocean,
+    ``ice_thermo`` ``rsf = fwice·Sice``), so ``S_oce + S_ice`` changes only by the globally balanced salinity
+    restoring and the discretisation; ``eta_mean`` is the area-weighted mean SSH. With water fluxes balanced to a
+    zero global integral (zstar) ``V`` should not drift. All sums are float64 regardless of the run's precision."""
+    import numpy as np
+    from .integrate_sharded import _fold
+    owned = np.asarray(sm.owned_mask["nod"]).reshape(-1)
+    av = np.asarray(_fold(sm.fields["areasvol"]), np.float64)          # [P*Lmax, nl]
+    av = np.where(owned[:, None], av, 0.0)
+    av = np.nan_to_num(av)
+
+    def g(x):
+        return np.nan_to_num(np.asarray(x, np.float64))
+
+    h = g(state_p.hnode)
+    out = {"V": float((h * av).sum())}
+    for X, C in (("S", "carry_S"), ("T", "carry_T")):
+        c = float((g(getattr(state_p, X)) * h * av).sum())
+        car = getattr(state_p, C, None)
+        if car is not None:
+            c += float((g(car) * av).sum())
+        out[f"{X}_oce"] = c
+    a0 = av[:, 0]
+    if ice_cfg is not None:
+        out["S_ice"] = float(ice_cfg.Sice * ice_cfg.rhoice / ice_cfg.rhowat * (g(state_p.m_ice) * a0).sum())
+        out["ice_vol"] = float((g(state_p.m_ice) * a0).sum())
+    out["eta_mean"] = float((g(state_p.eta_n) * a0).sum() / a0.sum())
+    return out

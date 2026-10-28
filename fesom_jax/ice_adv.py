@@ -40,7 +40,7 @@ def _mm_times(mesh: Mesh, X):
     Xv = X[en]                                              # [elem,3]
     contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + Xv.sum(axis=1, keepdims=True))
     contrib = jnp.where((mesh.ulevels <= 1)[:, None], contrib, 0.0)
-    return ops.scatter_add(contrib, en, mesh.nod2D)
+    return ops.scatter_add(contrib, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
 
 
 def _tg_rhs(cfg: IceConfig, mesh: Mesh, u_ice, v_ice, a_ice, m_ice, m_snow):
@@ -66,7 +66,7 @@ def _tg_rhs(cfg: IceConfig, mesh: Mesh, u_ice, v_ice, a_ice, m_ice, m_snow):
     def rhs_of(X):
         Xv = X[en]                                          # [elem,3] (q)
         contrib = jnp.where(on, (entries * Xv[:, None, :]).sum(axis=2), 0.0)   # [elem, n]
-        return ops.scatter_add(contrib, en, mesh.nod2D)
+        return ops.scatter_add(contrib, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
 
     return rhs_of(m_ice), rhs_of(a_ice), rhs_of(m_snow)
 
@@ -108,7 +108,8 @@ def _solve_high_order(cfg: IceConfig, mesh: Mesh, rhs_a, rhs_m, rhs_ms, exch=Non
     return hi(rhs_a), hi(rhs_m), hi(rhs_ms)
 
 
-def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None):
+def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
+             freeze_limiter=False, freeze_limited_flux=False):
     """The Zalesak limiter for one tracer (``ice_fem_fct``, ``:351-518``). Returns the
     flux-corrected tracer ``= vals_l + limited antidiffusive flux``.
 
@@ -116,7 +117,14 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None):
     the element's HALO vertices by the limiter (``cand = pplus[en]``), but are built from the
     SCATTER sums ``fp``/``fm`` (incomplete on the halo) — so ``exch`` refreshes them before the
     element gather (``fesom_ice_fct.c:474``, ``SYNC_MAP`` M4.3c). ``vals_l``/``dvals`` are
-    exchanged by the caller (``fct_solve``) before this."""
+    exchanged by the caller (``fct_solve``) before this.
+
+    ``freeze_limiter`` (derivative only, the forward is unchanged): the limiter factors ``ae``
+    enter the tangent as constants, as ``AdjointConfig.freeze_fct_limiter`` does for the ocean
+    FCT; the antidiffusive fluxes and the low-order solution stay differentiated.
+    ``freeze_limited_flux`` (derivative only): the whole limited antidiffusive correction
+    enters as a constant, so the tangent is that of the low-order solution, as
+    ``AdjointConfig.freeze_advection`` does for the ocean FCT."""
     _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
     en = mesh.elem_nodes
     g = cfg.ice_gamma_fct
@@ -149,8 +157,8 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None):
     tmin = lo - vals_l
 
     # +/- flux sums per node, then the clipping ratios (C lines 440-472).
-    fp = ops.scatter_add(jnp.maximum(icefluxes, 0.0), en, mesh.nod2D)
-    fm = ops.scatter_add(jnp.minimum(icefluxes, 0.0), en, mesh.nod2D)
+    fp = ops.scatter_add(jnp.maximum(icefluxes, 0.0), en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
+    fm = ops.scatter_add(jnp.minimum(icefluxes, 0.0), en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
     pplus = jnp.where(fp > 0.0,
                       jnp.minimum(tmax / jnp.where(fp > _ICE_FLUX_EPS, fp, _ICE_FLUX_EPS), 1.0),
                       0.0)
@@ -165,13 +173,19 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None):
     # limit element fluxes: ae = min over the 3 vertices of (pplus|pminus by flux sign).
     cand = jnp.where(icefluxes >= 0.0, pplus[en], pminus[en])   # [elem,3]
     ae = cand.min(axis=1)                                       # [elem]
+    if freeze_limiter:
+        ae = jax.lax.stop_gradient(ae)
     limited = jnp.where(nc_e[:, None], icefluxes * ae[:, None], 0.0)
 
     # apply: vals_l + scatter(limited).  vals_l already == vals on cavity nodes.
-    return vals_l + ops.scatter_add(limited, en, mesh.nod2D)
+    corr = ops.scatter_add(limited, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
+    if freeze_limited_flux:
+        corr = jax.lax.stop_gradient(corr)
+    return vals_l + corr
 
 
-def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, exch=None):
+def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, exch=None,
+              freeze_limiter=False, freeze_limited_flux=False):
     """Advance the 3 ice tracers one step by FCT (``fesom_ice_fct_solve``). Returns the
     advected ``(a_ice, m_ice, m_snow)`` (before ``cut_off``).
 
@@ -180,7 +194,9 @@ def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, ex
     the element's HALO vertices, and both are SCATTER results (incomplete on the halo) — so
     refresh them before the limiter (``SYNC_MAP`` M4.3c: the low-order ``a_l/m_l/ms_l`` + the
     high-order ``dvalues`` halos). The high-order solve's per-iteration ``dvalues`` refresh +
-    the limiter's ``icepplus/icepminus`` refresh are owned by ``_solve_high_order``/``_fem_fct``."""
+    the limiter's ``icepplus/icepminus`` refresh are owned by ``_solve_high_order``/``_fem_fct``.
+    ``freeze_limiter``, ``freeze_limited_flux``: see ``_fem_fct`` (``IceConfig.adjoint_cuts``
+    "fct_limiter", "fct_flux")."""
     _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
     rhs_m, rhs_a, rhs_ms = _tg_rhs(cfg, mesh, u_ice, v_ice, a_ice, m_ice, m_snow)
     da, dm, dms = _solve_high_order(cfg, mesh, rhs_a, rhs_m, rhs_ms, exch=exch)
@@ -188,7 +204,10 @@ def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, ex
     # refresh the low- + high-order halos read at element vertices inside the limiter.
     a_l, m_l, ms_l = _exch(a_l, "nod"), _exch(m_l, "nod"), _exch(ms_l, "nod")
     da, dm, dms = _exch(da, "nod"), _exch(dm, "nod"), _exch(dms, "nod")
-    m_new = _fem_fct(cfg, mesh, m_ice, m_l, dm, exch=exch)
-    a_new = _fem_fct(cfg, mesh, a_ice, a_l, da, exch=exch)
-    ms_new = _fem_fct(cfg, mesh, m_snow, ms_l, dms, exch=exch)
+    m_new = _fem_fct(cfg, mesh, m_ice, m_l, dm, exch=exch, freeze_limiter=freeze_limiter,
+                     freeze_limited_flux=freeze_limited_flux)
+    a_new = _fem_fct(cfg, mesh, a_ice, a_l, da, exch=exch, freeze_limiter=freeze_limiter,
+                     freeze_limited_flux=freeze_limited_flux)
+    ms_new = _fem_fct(cfg, mesh, m_snow, ms_l, dms, exch=exch, freeze_limiter=freeze_limiter,
+                      freeze_limited_flux=freeze_limited_flux)
     return a_new, m_new, ms_new

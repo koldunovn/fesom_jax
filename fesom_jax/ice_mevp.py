@@ -31,6 +31,8 @@ The 14 fidelity traps (plan ``20260611-fesom-jax-mevp.md``) are cited inline by 
 
 from __future__ import annotations
 
+import os
+
 from typing import NamedTuple
 
 import jax
@@ -38,6 +40,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from . import ops
+from .adjoint_stab import scale_tangent
 from .config import DENSITY_0
 from .forcing import _safe_speed
 from .halo import exchange_pair
@@ -86,8 +89,8 @@ def mevp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation,
     bb = jnp.where(non_cavity_el, bb0 * edy, 0.0)              # :158
     cu = (-aa)[:, None] * jnp.ones((1, 3))                     # rhs_a[nk] -= aa  (:159-161)
     cv = (-bb)[:, None] * jnp.ones((1, 3))
-    rhs_a = ops.scatter_add(cu, en, nod2D)
-    rhs_m = ops.scatter_add(cv, en, nod2D)
+    rhs_a = ops.scatter_add(cu, en, nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
+    rhs_m = ops.scatter_add(cv, en, nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
 
     # --- node precompute (:168-187): masks + mass. T4 node mask a_ice≥0.01; T5 verbatim mass. ---
     ice_nod = (a_ice >= 0.01) & non_cavity_n
@@ -96,6 +99,13 @@ def mevp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation,
     inv_thickness = jnp.where(ice_nod, 1.0 / jnp.maximum(it, 9.0), 0.0)   # limit small mass (:176)
     M = m_ice * cfg.rhoice + m_snow * cfg.rhosno              # per-area mass M (NOT /a_ice) (:178)
     mass = jnp.where(ice_nod, M / ((1.0 + M * M) * area_safe), 0.0)        # T5 (:179)
+    # Derivative-only (IceConfig.adjoint_thin_mass; 0 = off, nothing traced): below that load the
+    # velocity's dependence on the load leaves the tangent; the values are bitwise unchanged.
+    thin = float(getattr(cfg, "adjoint_thin_mass", 0.0))
+    if thin > 0.0:
+        cut = jax.lax.stop_gradient(ice_nod & (it < thin))
+        inv_thickness = jnp.where(cut, jax.lax.stop_gradient(inv_thickness), inv_thickness)
+        mass = jnp.where(cut, jax.lax.stop_gradient(mass), mass)
     # scale the ssh-tilt by 1/area ON ICE NODES (:182-183); non-ice keep the raw scatter (unused)
     tilt_u = jnp.where(ice_nod, rhs_a / area_safe, rhs_a)
     tilt_v = jnp.where(ice_nod, rhs_m / area_safe, rhs_m)
@@ -107,6 +117,10 @@ def mevp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation,
     msum = (m_v[:, 0] + m_v[:, 1] + m_v[:, 2]) * val3          # mean (:200)
     asum = (a_v[:, 0] + a_v[:, 1] + a_v[:, 2]) * val3          # mean (:203)
     ice_el = (msum > 0.01) & non_cavity_el
+    # Derivative-only (IceConfig.adjoint_cuts "strength_conc"): the concentration factor
+    # exp(-C(1-A)) of the strength enters the tangent as a constant; the values are unchanged.
+    if "strength_conc" in tuple(getattr(cfg, "adjoint_cuts", ())):
+        asum = jax.lax.stop_gradient(asum)
     pressure_fac = jnp.where(
         ice_el, cfg.mevp_det2 * cfg.pstar * msum * jnp.exp(-cfg.c_pressure * (1.0 - asum)), 0.0)
 
@@ -120,15 +134,31 @@ def mevp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation,
 # --------------------------------------------------------------------------
 def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: MevpStatic,
                  u_anchor, v_anchor, srfoce_u, srfoce_v, stress_ax, stress_ay, rdt,
-                 *, freeze_viscosity: bool = False):
+                 *, freeze_viscosity: bool = False, sigma_in_f=None, sigma_out_f=None, node_sum=None):
     """One mEVP pseudo-time iteration. Returns the new ``(u_aux, v_aux, σ11, σ12, σ22)`` AFTER
     the edge-BC, BEFORE the halo exchange (the C dump placement, :324-337).
 
     ``u_anchor``/``v_anchor`` are the backward-Euler rhs anchor — in production the **FROZEN
     entry** ``(u_ice, v_ice)`` (closed over, constant across iterations; Decisions #4 / T1).
     std-EVP anchors on the current iterate; passing ``u_aux`` here reproduces that (wrong) fixed
-    point — exercised by the it2 entry-anchor test."""
+    point — exercised by the it2 entry-anchor test.
+
+    Derivative-only stress-tangent hooks (Newtonian damping of the tangent stress equations,
+    Panteleev et al. 2020, The Cryosphere 14, 4427-4451). Each is ``None`` (default: not traced
+    at all, the program is the unhooked one) or a factor broadcastable to ``[elem2D]`` built
+    from forward values; :func:`fesom_jax.adjoint_stab.scale_tangent` applies it, so the forward
+    is bitwise unchanged for any value:
+      * ``sigma_in_f`` multiplies the tangent of the INCOMING σ before it enters ``det1·σ``
+        (and the element-skip carry): the explicit form, δσ' = det1·f·δσ + det2·δS(u).
+        ``f = 1 − 1/(T_N·det1)`` is a friction ε_N = 1/T_N per sweep.
+      * ``sigma_out_f`` multiplies the tangent of the NEW σ after the element skip and BEFORE
+        the stress-divergence scatter, so this sweep's velocity update already sees the damped
+        δσ': the implicit form, δσ' = f·(det1·δσ + det2·δS(u)), ``f = 1/(1 + 1/T_N)``.
+    Both also act on the σ of skipped (ice-free) elements, which is only carried; pass a
+    per-element factor of 1 there to leave it alone."""
     vale = cfg.vale
+    if sigma_in_f is not None:
+        s11, s12, s22 = (scale_tangent(s, sigma_in_f) for s in (s11, s12, s22))
 
     # --- element: strain (shared) → Δ (additive δmin, T10) → α-relaxed σ (T2: 0.5 in σ11/σ22) ---
     eps11, eps22, eps12 = strain_rates(mesh, u_aux, v_aux)     # shared block (:241-246)
@@ -145,6 +175,10 @@ def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: Me
     # to build a usable approximated adjoint of viscous-plastic rheology, which beat the
     # free-drift adjoint by a further 7.9% cost reduction over a 1-year assimilation window.
     # stop_gradient is the identity in the forward, so the ice trajectory is unchanged.
+    # On the unrolled tangent this changes nothing. Combined with linearizing once at the final
+    # iterate and raising α, a frozen viscosity is stable: that is θ = 0 of
+    # adjoint_damping="frozen_sweep" (ice_mevp_frozen.py; it uses θ = 0.97 by default and also
+    # freezes the replacement pressure, which this flag leaves live).
     _delta_v = jax.lax.stop_gradient(delta) if freeze_viscosity else delta
     pressure = st.pressure_fac / (_delta_v + cfg.delta_min)   # T10 ADDITIVE δmin (:254)
     det1 = cfg.mevp_det1
@@ -155,10 +189,12 @@ def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: Me
     s11 = jnp.where(st.ice_el, s11n, s11)
     s12 = jnp.where(st.ice_el, s12n, s12)
     s22 = jnp.where(st.ice_el, s22n, s22)
+    if sigma_out_f is not None:
+        s11, s12, s22 = (scale_tangent(s, sigma_out_f) for s in (s11, s12, s22))
 
     # --- stress-divergence scatter (shared raw scatter; act=ice_el guards ice-free elems, T6
     #     owned-guard is implicit on a single device — scatter-to-all, read-at-owned) (:265-272) ---
-    u_rhs, v_rhs = stress_div_scatter(mesh, s11, s12, s22, st.ice_el)
+    u_rhs, v_rhs = stress_div_scatter(mesh, s11, s12, s22, st.ice_el, node_sum=node_sum)
 
     # --- node solve (:281-309): β-relaxed, bc_index-masked, drag carries rdt (T1), frozen-entry
     #     rhs anchor (T1/Decisions #4), non-ice identity carry (T13), NO theta_io (T3). ---
@@ -188,13 +224,62 @@ def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: Me
 
 
 # --------------------------------------------------------------------------
+# Local stability number and the derivative-only local damping (IceConfig.adjoint_damping)
+# --------------------------------------------------------------------------
+def mevp_stability_coef(cfg: IceConfig, mesh: Mesh, m_ice, m_snow):
+    """Per-element ``rdt·M/(1+M²) / (A_e·det2·α·β)`` with ``M = ρᵢ·m̄ + ρₛ·m̄ₛ`` (element means of
+    the entry m_ice / m_snow): the part of the local stability number that is fixed over the
+    sweeps of one call. Forward values only (stop_gradient)."""
+    sg = jax.lax.stop_gradient
+    en = mesh.elem_nodes
+    m_v, ms_v = sg(m_ice)[en], sg(m_snow)[en]
+    m_e = (m_v[:, 0] + m_v[:, 1] + m_v[:, 2]) / 3.0
+    ms_e = (ms_v[:, 0] + ms_v[:, 1] + ms_v[:, 2]) / 3.0
+    M = cfg.rhoice * m_e + cfg.rhosno * ms_e
+    return cfg.ice_dt * (M / (1.0 + M * M)) / (
+        jnp.asarray(mesh.elem_area) * cfg.mevp_det2 * cfg.alpha_evp * cfg.beta_evp)
+
+
+def mevp_stability_number(cfg: IceConfig, mesh: Mesh, st: MevpStatic, u_aux, v_aux, coef):
+    """``γ/(αβ)`` per element at the iterate ``(u_aux, v_aux)``:
+    ``γ = P/(Δ+δmin) · rdt · M/(1+M²) / A_e`` (P = P*·m̄·e^{−C(1−ā)}, the viscosity of this sweep
+    times the node-solve mass factor). The mEVP iteration is stiff where γ ≫ αβ; there its exact
+    tangent has the sign-flipping near-rigid stress mode (docs/PORTING_LESSONS.md I5).
+    Forward values only: every input is stop_gradient-ed. ``coef`` = :func:`mevp_stability_coef`."""
+    sg = jax.lax.stop_gradient
+    e11, e22, e12 = strain_rates(mesh, sg(u_aux), sg(v_aux))
+    eps1, eps2 = e11 + e22, e11 - e22
+    delta = _safe_sqrt(eps1 * eps1 + cfg.vale * (eps2 * eps2 + 4.0 * e12 * e12))
+    return sg(st.pressure_fac) / (delta + cfg.delta_min) * coef
+
+
+def mevp_local_damping(cfg: IceConfig, mesh: Mesh, st: MevpStatic, u_aux, v_aux, coef, kappa):
+    """The ``adjoint_damping="local"`` factor of one sweep: ``f = min(1, κ/(γ/αβ))`` on ice
+    elements, 1 elsewhere (ice-free σ is only carried). ``κ = 0`` gives 0 on every ice element
+    (the zero-stress tangent). Applied by :func:`mevp_iterate` as ``sigma_out_f``."""
+    g = mevp_stability_number(cfg, mesh, st, u_aux, v_aux, coef)
+    f = jnp.minimum(1.0, kappa / jnp.maximum(g, 1e-300))
+    return jnp.where(st.ice_el, f, 1.0)
+
+
+# --------------------------------------------------------------------------
 # Full mEVP driver — the 120-iteration scan — fesom_ice_maevp.c:66-363
 # --------------------------------------------------------------------------
+def mevp_unroll() -> int:
+    """``FESOM_MEVP_UNROLL=u`` (``gpu.mevp_unroll``, read at trace time; default 1): the mEVP subcycle scans
+    unroll ``u`` subcycles per loop trip (fewer trips and launches; XLA may fuse across subcycles, so the
+    values move by round-off)."""
+    u = int(os.environ.get("FESOM_MEVP_UNROLL", "1") or 1)
+    if u < 1:
+        raise ValueError(f"FESOM_MEVP_UNROLL must be >= 1, got {u}")
+    return u
+
+
 def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
                   a_ice, m_ice, m_snow,
                   u_ice, v_ice, sigma11, sigma12, sigma22,
                   srfoce_u, srfoce_v, elevation, stress_ax, stress_ay,
-                  boundary_node=None, exch=None):
+                  boundary_node=None, exch=None, wide=None):
     """Run the mEVP momentum solver (setup + 120 pseudo-time iterations). Same signature /
     outputs as :func:`fesom_jax.ice_evp.evp_dynamics`: returns the updated
     ``(u_ice, v_ice, sigma11, sigma12, sigma22)``. ``stress_ax/ay`` = the atm-ice wind stress;
@@ -211,22 +296,62 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
     ``strain_rates`` reads ``u_aux`` at the element's HALO vertices, so the halo must be refreshed
     each iteration. ``boundary_node`` MUST be the GLOBAL coastal mask (partitioned in), never a
     local recompute (T9). No exchange after the final copy — the aux halo is current from the last
-    iteration's exchange (T8)."""
+    iteration's exchange (T8).
+
+    **Wide halo.** ``wide`` (a :class:`fesom_jax.ice_wide.MevpWide`, ``None`` ⇒ the
+    per-subcycle exchange above) runs the subcycles on the shard's K-ring ice lanes with one
+    refresh every K subcycles (:func:`_mevp_wide`); owned lanes get the same bits. The
+    backward truncation (``adjoint_subcycles`` below the subcycle count) keeps the
+    per-subcycle path."""
     if boundary_node is None:
         boundary_node = boundary_node_mask(mesh)
+    if getattr(cfg, "adjoint_damping", "none") == "frozen_sweep":
+        # the same forward; a custom_vjp backward (ice_mevp_frozen, docs/PORTING_LESSONS.md I5g)
+        if adjoint_subcycles >= 0:
+            raise ValueError("adjoint_damping='frozen_sweep' differentiates the whole solve; "
+                             "it does not combine with adjoint_sweeps / adjoint_subcycles")
+        from .ice_mevp_frozen import mevp_dynamics_frozen_sweep
+        return mevp_dynamics_frozen_sweep(
+            cfg, mesh, a_ice=a_ice, m_ice=m_ice, m_snow=m_snow, u_ice=u_ice, v_ice=v_ice,
+            sigma11=sigma11, sigma12=sigma12, sigma22=sigma22, srfoce_u=srfoce_u,
+            srfoce_v=srfoce_v, elevation=elevation, stress_ax=stress_ax, stress_ay=stress_ay,
+            boundary_node=boundary_node, exch=exch)
     st = mevp_setup(cfg, mesh, a_ice, m_ice, m_snow, elevation, boundary_node)
     rdt = cfg.ice_dt                                          # T1: the FULL ice step
 
-    # ⚠️ Backward-only Newtonian damping of the subcycle carry USED TO LIVE HERE
-    # (`adjoint_damping`, a damping timescale in sweeps). It was the one published stabilization
-    # that keeps EVP rheology in the adjoint rather than removing it — the Kauker-line eps_N*sigma
-    # term, T_N = 7 sweeps generally and 3 in thick converging ice. It was implemented, measured
-    # and REJECTED (docs/ADJOINT_HORIZON.md): amplification is 1.1795/sweep, so over 120 sweeps
-    # and a 48-step day the result swings from annihilated at T_N=6 (1e-44) to blown at T_N=7
-    # (1e+27), cancelling exactly at 6.57 — a single global constant cannot be right anywhere.
-    # Removed 2026-08-07: it also diverged mevp_dynamics' signature from evp_dynamics', breaking
-    # the whichEVP dispatch-parity gate (test_mevp.py). Use adjoint_subcycles=0 instead
-    # (IceConfig.adjoint_mode="rheology"), which is what the measurements actually support.
+    # Derivative-only damping (IceConfig.adjoint_damping, a static choice; "none" ⇒ the hook is
+    # not traced and the program is the undamped one). "local": each differentiated sweep
+    # scales the tangent of its NEW stress by f = min(1, κ/(γ/αβ)) computed from that sweep's
+    # input iterate (mevp_local_damping) — the implicit Newtonian damping of Panteleev et al.
+    # (2020), with the timescale set by the local stability number. History: a global
+    # damping of the whole sweep carry by one constant (1 − 1/T_N) was tried and removed on
+    # 2026-08-07 (docs/ADJOINT_HORIZON.md: annihilated at T_N = 6, blown at 7); the mode study of
+    # 2026-10-08 (docs/PORTING_LESSONS.md I5/I5b) showed why: the unstable mode is local to a
+    # few near-rigid elements (γ/αβ = 6-130), so no fixed T_N fits, and the stable local form
+    # needs κ ≤ 0.3. The damping fields live in IceConfig, so the signature stays that of
+    # evp_dynamics (the whichEVP dispatch-parity gate).
+    damping = getattr(cfg, "adjoint_damping", "none")
+    if damping not in ("none", "local"):
+        raise ValueError(f"IceConfig.adjoint_damping={damping!r}: use 'none' or 'local'")
+    if damping == "local":
+        coef = mevp_stability_coef(cfg, mesh, m_ice, m_snow)
+        kappa = float(cfg.adjoint_kappa)
+
+        def body_grad(carry, _):
+            u_i, v_i, s11, s12, s22 = carry
+            f = mevp_local_damping(cfg, mesh, st, u_i, v_i, coef, kappa)
+            u_i, v_i, s11, s12, s22 = mevp_iterate(
+                cfg, mesh, u_i, v_i, s11, s12, s22, st,
+                u_ice, v_ice, srfoce_u, srfoce_v, stress_ax, stress_ay, rdt, sigma_out_f=f)
+            u_i, v_i = exchange_pair(exch, u_i, v_i, "nod")
+            return (u_i, v_i, s11, s12, s22), None
+    else:
+        body_grad = None
+
+    n_free = int(cfg.evp_rheol_steps)
+    if wide is not None and (adjoint_subcycles < 0 or int(adjoint_subcycles) >= n_free):
+        return _mevp_wide(cfg, wide, st, rdt, n_free, u_ice, v_ice, sigma11, sigma12, sigma22,
+                          srfoce_u, srfoce_v, stress_ax, stress_ay)
 
     def body(carry, _):
         u_i, v_i, s11, s12, s22 = carry
@@ -241,13 +366,12 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
 
     # Backward-only: differentiate through only the LAST `adjoint_subcycles` sweeps.
     #
-    # Why this knob exists. The reverse pass through the full 120 sweeps amplifies by a
-    # measured 1.1795 PER SWEEP — 4e8 per ice step — even though each individual relaxation
-    # contracts at mevp_det1 = 0.9960. The coupled stress<->momentum loop gain exceeds one in
-    # the LINEARIZATION while the nonlinear iteration stays bounded, because the plastic yield
-    # holds the forward together and the tangent-linear model has no such cap. So this is not
-    # a term that can be frozen (freezing the viscosity's strain dependence, the Toyoda/Lyu
-    # move, was measured to change nothing) — it is the unrolling itself.
+    # Why this knob exists. The reverse pass through the full 120 sweeps amplifies by 4e8 or
+    # more per ice step, even though each individual relaxation contracts at mevp_det1 = 0.9960.
+    # The growth is LOCAL (docs/PORTING_LESSONS.md I5): a near-rigid stress mode that flips sign
+    # each sweep and grows 6-18 per sweep in single elements whose stability number γ/αβ is
+    # 6-130. The nonlinear iteration stays bounded there, because the plastic yield holds it,
+    # while its linearization around these non-converged iterates does not.
     #
     # It also cannot be fixed the way solve_ssh's conjugate gradient was, by handing JAX a
     # transpose solve via custom_linear_solve. That works there because the SSH step solves a
@@ -256,17 +380,106 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
     # sweeps (0.9960^120), so the model's answer really is the 120th iterate rather than a
     # fixed point; and with a linearized spectral radius above one the implicit derivative
     # (I - J)^-1 is ill-posed anyway. MITgcm CAN use the transpose-solve route because its
-    # viscous-plastic solver is a linear solve (LSOR) with the viscosities held fixed.
+    # viscous-plastic solver is a linear solve (LSOR) with the viscosities held fixed. The
+    # working route here is adjoint_damping="frozen_sweep" (dispatched at the top of this
+    # function): one sweep linearized at the final iterate, with raised α and partial softening.
     #
-    # Truncating is the available middle ground, and it is a controlled one: 0 sweeps is
-    # exactly a frozen rheology (measured clean), 120 is the exact-but-useless gradient, and K
-    # in between costs 1.1795^K of amplification for the sensitivity of the last K sweeps.
+    # Truncating was the earlier middle ground: 0 sweeps is exactly a frozen rheology (measured
+    # clean), 120 is the exact-but-useless gradient, and K in between keeps the sensitivity of
+    # the last K sweeps (clean over 8 steps for K ≤ 32).
     # `adjoint_subcycles < 0` (the default) means all of them ⇒ a dead branch, unchanged.
     n_free = int(cfg.evp_rheol_steps)
     n_grad = n_free if adjoint_subcycles < 0 else min(int(adjoint_subcycles), n_free)
     if n_grad < n_free:
         init, _ = lax.scan(body, init, None, length=n_free - n_grad)
         init = jax.tree.map(jax.lax.stop_gradient, init)       # cut the earlier sweeps loose
+    if body_grad is not None:                                   # the damping acts on the
+        body = jax.checkpoint(body_grad)                        # differentiated sweeps only
     (u_ice, v_ice, sigma11, sigma12, sigma22), _ = lax.scan(
-        body, init, None, length=n_grad) if n_grad else (init, None)
+        body, init, None, length=n_grad,
+        **({"unroll": mevp_unroll()} if mevp_unroll() > 1 else {})) if n_grad else (init, None)
     return u_ice, v_ice, sigma11, sigma12, sigma22            # T8 final copy; no extra exchange
+
+
+# --------------------------------------------------------------------------
+# Wide halo: one refresh every K subcycles (docs/plans/20261020-core2-mevp-wide-halo.md)
+# --------------------------------------------------------------------------
+def _mevp_wide(cfg: IceConfig, wide, st: MevpStatic, rdt, n: int,
+               u_ice, v_ice, sigma11, sigma12, sigma22,
+               srfoce_u, srfoce_v, stress_ax, stress_ay):
+    """The ``n`` mEVP subcycles on the shard's ice lanes (:mod:`fesom_jax.ice_wide`).
+
+    (1) entry: the subcycle inputs AND the standard-lane precompute ``st`` move onto the ice
+    lanes in one exchange (every lane its owner's value; the precompute is never redone in
+    another order); (2) blocks of K subcycles, the carry ``(u, v | σ11, σ12, σ22)`` refreshed
+    before every block but the first; (3) exit: the owned lanes back into the standard layout
+    and one standard exchange of ``(u, v | σ)``, which gives the standard halo lanes their
+    owner's value as the last per-subcycle exchange does. Each subcycle is
+    :func:`mevp_iterate` with the element→node sums in the owner's order
+    (:meth:`~fesom_jax.ice_wide.MevpWide.node_sum`) ⇒ owned lanes bitwise the per-subcycle
+    path (CPU). Collectives per call: ``2 + ceil(n/K) - 1`` instead of ``n``."""
+    f = u_ice.dtype
+    nod = jnp.stack([u_ice, v_ice, srfoce_u, srfoce_v, stress_ax, stress_ay,
+                     st.inv_thickness, st.mass, st.tilt_u, st.tilt_v,
+                     st.ice_nod.astype(f), st.bc_index.astype(f)], axis=-1)
+    elem = jnp.stack([sigma11, sigma12, sigma22, st.pressure_fac, st.ice_el.astype(f)], axis=-1)
+    xn, xe = wide.entry(nod, elem)
+    u0, v0, su, sv, sax, say, ith, mass, tu, tv, inod, bci = (xn[:, i] for i in range(12))
+    wst = MevpStatic(ice_nod=inod > 0.5, inv_thickness=ith, mass=mass, tilt_u=tu, tilt_v=tv,
+                     ice_el=xe[:, 4] > 0.5, pressure_fac=xe[:, 3], bc_index=bci)
+    lm = wide.lane_mesh()
+
+    def body(c, _):
+        return mevp_iterate(cfg, lm, *c, wst, u0, v0, su, sv, sax, say, rdt,
+                            node_sum=wide.node_sum), None   # anchor = frozen entry (T1)
+
+    body = jax.checkpoint(body)
+
+    def run(c, length):
+        return (lax.scan(body, c, None, length=length, unroll=min(mevp_unroll(), length))[0]
+                if length > 0 else c)
+
+    def refresh(c):
+        rn, re_ = wide.refresh(jnp.stack(c[:2], axis=-1), jnp.stack(c[2:], axis=-1))
+        return (rn[:, 0], rn[:, 1], re_[:, 0], re_[:, 1], re_[:, 2])
+
+    skip = int(wide.skip_refresh)
+
+    def window(c, i):
+        r = refresh(c)
+        if skip >= 0:                                         # test-only negative control
+            r = jax.tree.map(lambda new, old: jnp.where(i == skip, old, new), r, c)
+        return run(r, wide.K), None
+
+    # Block lengths: first, `windows` x K, rest — none longer than K. ⚠️ No block of ONE subcycle:
+    # XLA removes a trip-count-1 loop and inlines its body, whose fusion with the neighbouring ops
+    # then rounds differently (measured: K = 7, rest 1 ⇒ 1-ulp differences on 8.6 % of the owned
+    # velocities). So a remainder of 1 shortens the first block by one instead (rest becomes 2).
+    K = int(wide.K)
+    first = min(K, n)
+    windows = (n - first) // K
+    rest = n - first - windows * K
+    if rest == 1 and first > 2:
+        first -= 1
+        windows = (n - first) // K
+        rest = n - first - windows * K
+    if 1 in (first, rest):
+        raise NotImplementedError(
+            f"mevp_wide: K={K} with {n} subcycles leaves a 1-subcycle block, which XLA inlines "
+            "(round-off no longer bitwise the per-subcycle path); pick K that divides the "
+            "subcycle count")
+    c = run((xn[:, 0], xn[:, 1], xe[:, 0], xe[:, 1], xe[:, 2]), first)
+    if windows > 0:
+        c, _ = lax.scan(window, c, jnp.arange(windows))
+    if rest > 0:
+        c = run(refresh(c), rest)
+
+    Lsn, Lse = u_ice.shape[0], sigma11.shape[0]
+    own_n, own_e = wide.a["own_n"], wide.a["own_e"]
+    un, vn, s11, s12, s22 = c
+    nod = jnp.stack([jnp.where(own_n, un[:Lsn], u_ice), jnp.where(own_n, vn[:Lsn], v_ice)],
+                    axis=-1)
+    elem = jnp.stack([jnp.where(own_e, s11[:Lse], sigma11), jnp.where(own_e, s12[:Lse], sigma12),
+                      jnp.where(own_e, s22[:Lse], sigma22)], axis=-1)
+    xn, xe = wide.exit(nod, elem)
+    return xn[:, 0], xn[:, 1], xe[:, 0], xe[:, 1], xe[:, 2]

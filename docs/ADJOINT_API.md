@@ -325,7 +325,22 @@ grad_so_far)`. No `ReverseCheckpoint` (raises).
 - `FREEZE_FLAGS`: the boolean `freeze_*` fields; iterate over these, not `_fields`.
 - Presets: `AdjointConfig.exact()` (everything differentiated) and `AdjointConfig.long_window()`
   (`freeze_mixing + freeze_gm_slope`, today's recommendation beyond about a day; see the
-  guard numbers below for what `exact()` does over 10 days).
+  guard numbers below for what `exact()` does over 10 days). Opt-in:
+  `AdjointConfig.long_window_tke()` (`tke_pr_cut=1e-8`, `tke_pr_ratio=100`,
+  `tke_pr_raw_cut=-1e-6`, `tke_ml_cut=1e-8`): the TKE closure differentiated except the Prandtl
+  derivative at near-neutral and inverted cells and the free mixing length's N² derivative at
+  near-neutral cells, so the TKE-constant gradients survive (`freeze_mixing` zeroes them). On
+  CORE2 from January and July 2013, the window-mean MLD gradient is within 7.7 % of finite
+  differences at 30, 60 and 90 days in both seasons and the July window-mean box T within 2.2 %;
+  the January box T misses by 11-500 % at every window, a separate open error (PORTING_LESSONS,
+  steps C3-C5). `AdjointConfig.long_window_combined()` (opt-in) = `long_window_tke()` +
+  `tke_ml_ratio=100` + `tke_ml_raw_cut=-1e-6` (the Prandtl masks on the mixing length's N²
+  derivative) + `freeze_fct_limiter`, GM/Redi differentiated in full, for the model with the
+  sea-ice adjoint live (`IceConfig(adjoint_mode="exact", adjoint_damping="frozen_sweep")`): ice
+  drift gradients (ln P*, ln C_d) within 3.1 % of full FDs at 30-90 days in the Arctic (P* 8.2 %
+  in the Antarctic), window-mean MLD within 8.4 % at 30-90 days in January and July, the January
+  box T within 5.1 % at 90 days and missing at 30 and 60 days (PORTING_LESSONS, combined
+  adjoint, 2026-10-10 and 2026-10-11).
 
 ## `differentiate_at(fn, args, alt)`
 

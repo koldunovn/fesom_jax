@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from fesom_jax import ale, ssh, surface_forcing
+from fesom_jax import adjoint_stab, ale, ssh, surface_forcing
 from fesom_jax import step as stepmod
 from fesom_jax.adjoint_stab import FREEZE_FLAGS, AdjointConfig
 from fesom_jax.mesh import DEFAULT_PI_MESH_DIR, load_mesh
@@ -105,6 +105,28 @@ def test_convection_flag_keeps_the_value_and_drops_the_switch(closure):
         "freeze_convection zeroed the whole gradient; it must cut only the switch"
 
 
+def _increment_form(base, out):
+    """``freeze_increment`` as it was written before (``base + sg(out - base)``): the same
+    derivative as the straight-through form, a value that need not be exact."""
+    return jax.tree.map(lambda b, o: b + jax.lax.stop_gradient(o - b), base, out)
+
+
+def test_convection_flag_gradient_matches_the_increment_form(closure, monkeypatch):
+    """Switching ``freeze_convection`` from the increment form to the straight-through form
+    changes no derivative: the closure-level VJP (Kv and Av, w.r.t. N²) is bitwise the old
+    one on this fixture (CPU)."""
+    run, bv = closure["run"], closure["bv"]
+
+    def grads():
+        return [np.asarray(jax.grad(lambda b: jnp.sum(run(b, True)[i]))(bv)) for i in (0, 1)]
+
+    new = grads()
+    monkeypatch.setattr(adjoint_stab, "freeze_increment", _increment_form)
+    old = grads()
+    for a, b in zip(new, old):
+        assert np.array_equal(a, b)
+
+
 # ===========================================================================
 # 2. step level — the real assembled TKE step on CORE2
 # ===========================================================================
@@ -125,7 +147,32 @@ core2_only = pytest.mark.skipif(
 # two steps: 2.18e-04. It gets its own two-step test below; no control variable can rescue it
 # here. The remaining flags need the eddy parameterization (off here) or are covered on pi.
 TKE_PATH_FLAGS = ["freeze_mixing", "freeze_stratification", "freeze_convection",
-                  "freeze_vert_visc"]
+                  "freeze_vert_visc", "freeze_mixing_state"]
+
+# One explicit case per NON-boolean AdjointConfig field (the classical-TKE candidate settings;
+# ``None`` = off). The forward must not move under any of them; their effect is tested on a
+# fixture with live shear and near-floor first interfaces in test_tke_candidates_core2.py
+# (from rest the shear is zero, Ri is clipped and the Pr derivative vanishes on this fixture).
+NON_BOOL_CASES = {
+    "tke_pr_cut": dict(tke_pr_cut=1.0e-6),
+    "tke_pr_mode": dict(tke_pr_cut=1.0e-6, tke_pr_mode="at"),
+    "tke_pr_ratio": dict(tke_pr_ratio=10.0),
+    "tke_pr_raw_cut": dict(tke_pr_raw_cut=0.0),
+    "tke_kme_tke": dict(tke_kme_tke=1.0e-2),
+    "tke_kme_scope": dict(tke_kme_tke=1.0e-2, tke_kme_scope="iface1"),
+    "tke_kme_term": dict(tke_kme_tke=1.0e-2, tke_kme_term="ke_diff"),
+    "tke_ml_cut": dict(tke_ml_cut=1.0e-8),
+    "tke_ml_ratio": dict(tke_ml_ratio=100.0),
+    "tke_ml_raw_cut": dict(tke_ml_raw_cut=-1.0e-6),
+    "tke_pr_ice_cut": dict(tke_pr_ice_cut=0.15),
+    "tke_pr_lat_cut": dict(tke_pr_lat_cut=70.0),
+    "tke_pr_tu_cut": dict(tke_pr_tu_cut=-45.0),
+    # GM-input cuts: inert in this fixture (no gm_cfg); test_adjoint_config_prod.py tests them
+    "gm_n2_ratio": dict(gm_n2_ratio=100.0),
+    "gm_n2_raw_cut": dict(gm_n2_raw_cut=-1.0e-6),
+    "gm_slope_cut": dict(gm_slope_cut=2.0e-3),
+    "conv_surrogate": dict(conv_surrogate=1.0e-6),
+}
 
 TKE_SEED = 1.0e-3          # the value the closure-level fixture above uses, for the same reason
 
@@ -227,6 +274,23 @@ def test_core2_tke_forward_bit_identical(core2_tke, flag):
     assert_forward_identity(l_off, l_on, k0, f"{flag}=True on the CORE2 TKE forward")
 
 
+def test_non_bool_cases_cover_every_non_bool_field():
+    from fesom_jax.adjoint_stab import TKE_CANDIDATE_FIELDS
+    assert sorted(NON_BOOL_CASES) == sorted(TKE_CANDIDATE_FIELDS)
+    assert sorted(set(AdjointConfig._fields) - set(FREEZE_FLAGS) - {"diag_cuts"}) == \
+        sorted(NON_BOOL_CASES)
+
+
+@core2_only
+@pytest.mark.parametrize("field", sorted(NON_BOOL_CASES))
+def test_core2_tke_non_bool_field_forward_bit_identical(core2_tke, field):
+    make, k0 = core2_tke
+    l_off, _ = make(AdjointConfig())
+    l_on, g_on = make(AdjointConfig(**NON_BOOL_CASES[field]))
+    assert_forward_identity(l_off, l_on, k0, f"{field} on the CORE2 TKE forward")
+    assert np.isfinite(float(g_on(k0)))
+
+
 @core2_only
 @pytest.mark.parametrize("flag", TKE_PATH_FLAGS)
 def test_core2_tke_flag_changes_the_gradient(core2_tke, flag):
@@ -238,6 +302,23 @@ def test_core2_tke_flag_changes_the_gradient(core2_tke, flag):
     a, b = float(g_off(k0)), float(g_on(k0))
     assert np.isfinite(a) and np.isfinite(b)
     assert a != b, f"{flag}=True did not change the CORE2 TKE gradient ({a:.6e})"
+
+
+@core2_only
+def test_core2_convection_flag_matches_the_increment_form(core2_tke, monkeypatch):
+    """The one-step CORE2 loss and gradient under ``freeze_convection`` are unchanged by the
+    switch to the straight-through form (bitwise on CPU; on GPU within 1e-12 relative, two
+    separately compiled programs)."""
+    make, k0 = core2_tke
+    l_new, g_new = make(AdjointConfig(freeze_convection=True))
+    new = (float(l_new(k0)), float(g_new(k0)))
+    monkeypatch.setattr(adjoint_stab, "freeze_increment", _increment_form)
+    l_old, g_old = make(AdjointConfig(freeze_convection=True))      # fresh jit ⇒ retraced
+    old = (float(l_old(k0)), float(g_old(k0)))
+    if jax.default_backend() == "cpu":
+        assert new == old, (new, old)
+    else:
+        assert np.allclose(new, old, rtol=1e-12, atol=0.0), (new, old)
 
 
 @core2_only

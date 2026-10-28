@@ -48,10 +48,12 @@ from jax import lax, tree_util
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 
+from . import ops
 from .config import DT_DEFAULT, G, MAXITER, SOLTOL, SSH_ALPHA, SSH_THETA
 from .halo import (halo_exchange, halo_exchange_coloured, halo_exchange_padded,
                    halo_exchange_ragged)
 from .mesh import Mesh
+from . import precision as PR
 from .reductions import global_dot, global_dot_pair
 
 # Tolerance for the *gradient* (transpose) solve — tight so the implicit-diff
@@ -82,12 +84,22 @@ class SSHOperator:
     # of the MITgcm M⁻¹. STATIC meta (Python floats via :func:`enable_cheb_precond`) —
     # identical on every process ⇒ identical executables. None (default) ⇒ byte-identical.
     cheb: tuple = dataclasses.field(default=None, metadata={"static": True})
+    # ELL layout (:func:`to_ell`, opt-in FESOM_SSH_ELL / ``gpu.ssh_ell``): ``ell = D`` ⇒ the nnz arrays are
+    # slot-major ``[D, n_nodes]`` (entry ``k·n_nodes + i`` = row i's k-th nonzero, zero-padded) and the
+    # matvecs sum each row's slots in order instead of a ``segment_sum`` (no atomics on a GPU). 0 ⇒ COO.
+    ell: int = dataclasses.field(default=0, metadata={"static": True})
+    # The zstar increment as explicit per-entry weights (:func:`with_increment`, opt-in FESOM_SSH_INC_ELL /
+    # ``gpu.ssh_inc_ell``): entry i's ΔA value is ``g·dt·α·θ · Σ_j depth[inc_el[i, j]] · inc_w[i, j]`` with
+    # ``depth = −mean₃(hbar)`` per element (0 in a cavity; unused slots: element 0, weight 0). None ⇒ the matrix-free
+    # :func:`stiff_increment_matvec`.
+    inc_el: jax.Array = None     # (nnz, Dc) i4
+    inc_w: jax.Array = None      # (nnz, Dc) f8
 
 
 tree_util.register_dataclass(
     SSHOperator,
-    data_fields=["rows", "cols", "stiff_vals", "precond_vals", "diag"],
-    meta_fields=["n_nodes", "cheb"],
+    data_fields=["rows", "cols", "stiff_vals", "precond_vals", "diag", "inc_el", "inc_w"],
+    meta_fields=["n_nodes", "cheb", "ell"],
 )
 
 
@@ -169,6 +181,156 @@ class ShardedSSHOperator:
     nnz_max: int
     Lmax_nod: int
     cheb: tuple = None        # carried through from the global op (static meta)
+    ell: int = 0              # :func:`to_ell_sharded`: nnz_max = ell·Lmax_nod in the ELL layout
+
+
+def ssh_ell_enabled() -> bool:
+    """``FESOM_SSH_ELL=1`` (``gpu.ssh_ell``, read where the run builds its operators): the SSH matvecs run on
+    the ELL layout of :func:`to_ell` / :func:`to_ell_sharded`."""
+    return os.environ.get("FESOM_SSH_ELL", "0").strip() not in ("", "0")
+
+
+def _ell_layout(rows, cols, sv, pv, n_rows: int, keep):
+    """Slot-major ELL arrays from COO ones: each row's kept entries in their COO order (a stable sort by
+    row), slot k of row i at ``k·n_rows + i``, missing slots ``(row i, col 0, value 0)``."""
+    rows, cols, sv, pv = rows[keep], cols[keep], sv[keep], pv[keep]
+    order = np.argsort(rows, kind="stable")
+    r = rows[order]
+    counts = np.bincount(r, minlength=n_rows)
+    D = int(counts.max())
+    slot = np.arange(r.size) - np.repeat(np.cumsum(counts) - counts, counts)
+    pos = slot * n_rows + r
+    out_rows = np.tile(np.arange(n_rows, dtype=np.int32), D)
+    out = [np.zeros(D * n_rows, dtype=a.dtype) for a in (cols, sv, pv)]
+    for o, a in zip(out, (cols, sv, pv)):
+        o[pos] = a[order]
+    return D, out_rows, out[0], out[1], out[2]
+
+
+def ssh_inc_ell_enabled() -> bool:
+    """``FESOM_SSH_INC_ELL=1`` (``gpu.ssh_inc_ell``): the gathered solve's zstar increment as explicit entries."""
+    return os.environ.get("FESOM_SSH_INC_ELL", "0").strip() not in ("", "0")
+
+
+def with_increment(op: SSHOperator, mesh) -> SSHOperator:
+    """``op`` (global, COO) with the zstar increment's explicit weights (host). ΔA·x
+    (:func:`stiff_increment_matvec`) is linear in x and in the element depth: edge e, side s (element
+    ``edge_tri[e, s]``, cross columns (0, 1) with sign +1 or (2, 3) with −1) adds, for each vertex k of that element,
+    ``w = sign·(∂N_k/∂x·cross[e, dy] − ∂N_k/∂y·cross[e, dx])`` times depth to entry (edges[e, 0], vertex) and
+    ``−w`` to entry (edges[e, 1], vertex). Every such entry is in the operator's pattern (asserted)."""
+    rows, cols = np.asarray(op.rows), np.asarray(op.cols)
+    N = op.n_nodes
+    key = rows.astype(np.int64) * N + cols
+    order = np.argsort(key)
+    en = np.asarray(mesh.elem_nodes)
+    g = np.asarray(mesh.gradient_sca)
+    et = np.asarray(mesh.edge_tri)
+    cross = np.asarray(mesh.edge_cross_dxdy)
+    edges = np.asarray(mesh.edges)
+    R, C, L, W = [], [], [], []
+    for side, (dx, dy, sign) in enumerate(((0, 1, 1.0), (2, 3, -1.0))):
+        el = et[:, side]
+        ok = el >= 0
+        els = np.where(ok, el, 0)
+        for k in range(3):
+            w = sign * (g[els, k] * cross[:, dy] - g[els, 3 + k] * cross[:, dx])
+            col = en[els, k]
+            for tgt, sg in ((edges[:, 0], 1.0), (edges[:, 1], -1.0)):
+                R.append(tgt[ok]); C.append(col[ok]); L.append(el[ok]); W.append(sg * w[ok])
+    R, C, L, W = (np.concatenate(v) for v in (R, C, L, W))
+    k2 = R.astype(np.int64) * N + C
+    at = np.searchsorted(key[order], k2)
+    at = np.minimum(at, key.size - 1)
+    if not np.array_equal(key[order][at], k2):
+        raise ValueError("with_increment: a zstar increment entry lies outside the operator's pattern")
+    slot = order[at]                                         # COO entry of each contribution
+    srt = np.argsort(slot, kind="stable")
+    slot, L, W = slot[srt], L[srt], W[srt]
+    counts = np.bincount(slot, minlength=key.size)
+    Dc = int(counts.max())
+    j = np.arange(slot.size) - np.repeat(np.cumsum(counts) - counts, counts)
+    inc_el = np.zeros((key.size, Dc), dtype=np.int32)       # unused slots: element 0 with weight 0
+    inc_w = np.zeros((key.size, Dc), dtype=np.float64)
+    inc_el[slot, j] = L
+    inc_w[slot, j] = W
+    return dataclasses.replace(op, inc_el=jnp.asarray(inc_el), inc_w=jnp.asarray(inc_w))
+
+
+def _increment_values(op: SSHOperator, mesh, hbar, factor: float):
+    """The explicit ΔA entries of :func:`with_increment` for this ``hbar``.
+
+    Single precision (D1): the entries are formed in WP_full from the WP ``hbar`` and stay WP_full (the live matrix
+    ``S + ΔA`` is then float64; :func:`_spmv` sums its rows in float64). Identity in double precision."""
+    hbar = PR.full(hbar)
+    en = mesh.elem_nodes
+    dhe = (hbar[en[:, 0]] + hbar[en[:, 1]] + hbar[en[:, 2]]) / 3.0
+    depth = jnp.where(mesh.ulevels == 1, -dhe, 0.0)
+    gath = depth[op.inc_el] * PR.full(op.inc_w)               # (nnz, Dc)
+    acc = gath[:, 0]
+    for k in range(1, gath.shape[1]):
+        acc = acc + gath[:, k]
+    return acc * factor
+
+
+def to_ell(op: SSHOperator) -> SSHOperator:
+    """``op`` in the ELL layout (host). The matvecs add each row's products in the COO order of that row; XLA
+    fuses each multiply-add of that chain into an FMA, so the result is the ``segment_sum``'s to round-off
+    (1 ulp), not bitwise (``tests/test_ssh_ell.py``)."""
+    rows = np.asarray(op.rows)
+    D, r, c, sv, pv = _ell_layout(rows, np.asarray(op.cols), np.asarray(op.stiff_vals),
+                                  np.asarray(op.precond_vals), op.n_nodes, np.ones(rows.size, bool))
+    extra = {}
+    if op.inc_el is not None:                                 # move the increment rows like the values
+        real = np.zeros(D * op.n_nodes, bool)
+        order = np.argsort(rows, kind="stable")
+        counts = np.bincount(rows[order], minlength=op.n_nodes)
+        slot = np.arange(rows.size) - np.repeat(np.cumsum(counts) - counts, counts)
+        dest = slot * op.n_nodes + rows[order]
+        real[dest] = True
+        src = np.zeros(D * op.n_nodes, dtype=np.int64)
+        src[dest] = order
+        ie, iw = np.asarray(op.inc_el), np.asarray(op.inc_w)
+        extra = {"inc_el": jnp.asarray(np.where(real[:, None], ie[src], 0).astype(np.int32)),
+                 "inc_w": jnp.asarray(np.where(real[:, None], iw[src], 0.0))}
+    return dataclasses.replace(op, rows=jnp.asarray(r), cols=jnp.asarray(c), stiff_vals=jnp.asarray(sv),
+                               precond_vals=jnp.asarray(pv), ell=D, **extra)
+
+
+def to_ell_sharded(sop: "ShardedSSHOperator") -> "ShardedSSHOperator":
+    """Each device's local operator in the ELL layout, padded to the largest row count over the devices.
+    The partition's padding entries ``(row 0, col 0, both values 0)`` are dropped first (a real (0, 0)
+    entry is a diagonal and never zero)."""
+    lay = []
+    for d in range(sop.P):
+        rows, cols = sop.rows[d], sop.cols[d]
+        sv, pv = sop.stiff_vals[d], sop.precond_vals[d]
+        pad = (rows == 0) & (cols == 0) & (sv == 0.0) & (pv == 0.0)
+        lay.append(_ell_layout(rows, cols, sv, pv, sop.Lmax_nod, ~pad))
+    D = max(x[0] for x in lay)
+    L = sop.Lmax_nod
+    arr = {k: np.zeros((sop.P, D * L), dtype=dt) for k, dt in
+           (("rows", np.int32), ("cols", np.int32), ("sv", np.float64), ("pv", np.float64))}
+    for d, (Dd, r, c, sv, pv) in enumerate(lay):
+        arr["rows"][d] = np.tile(np.arange(L, dtype=np.int32), D)
+        arr["cols"][d, :Dd * L], arr["sv"][d, :Dd * L], arr["pv"][d, :Dd * L] = c, sv, pv
+    return dataclasses.replace(sop, rows=arr["rows"], cols=arr["cols"], stiff_vals=arr["sv"],
+                               precond_vals=arr["pv"], nnz_max=D * L, ell=D)
+
+
+def _spmv(op: SSHOperator, vals, x):
+    """``Σ_col vals·x[col]`` per row: a ``segment_sum`` on the COO layout, or the ELL layout's slots added in
+    order (one fused gather-and-add, deterministic, no atomics).
+
+    Single precision (FESOM2 #994, D7): products and row sums in WP_full on both layouts; the callers round the row
+    once (identity in double precision)."""
+    p = PR.full(vals) * PR.full(x[op.cols])
+    if not op.ell:
+        return jax.ops.segment_sum(p, op.rows, num_segments=op.n_nodes)
+    p = p.reshape(op.ell, op.n_nodes)
+    y = p[0]
+    for k in range(1, op.ell):
+        y = y + p[k]
+    return y
 
 
 def partition_ssh_operator(op: SSHOperator, partition) -> ShardedSSHOperator:
@@ -251,12 +413,127 @@ def local_ssh_operator(sop: ShardedSSHOperator, d: int) -> SSHOperator:
         rows=jnp.asarray(sop.rows[d]), cols=jnp.asarray(sop.cols[d]),
         stiff_vals=jnp.asarray(sop.stiff_vals[d]),
         precond_vals=jnp.asarray(sop.precond_vals[d]),
-        diag=jnp.asarray(sop.diag[d]), n_nodes=sop.Lmax_nod, cheb=sop.cheb,
+        diag=jnp.asarray(sop.diag[d]), n_nodes=sop.Lmax_nod, cheb=sop.cheb, ell=sop.ell,
     )
 
 
+# ==========================================================================
+# The SSH solve gathered onto every device (opt-in ``ssh.gathered``; CORE2 GPU speed plan A4)
+# ==========================================================================
+# The sharded CG pays ~2 collectives per iteration (the halo refresh of the iterate and the
+# reduction of its dot products), ~130-250 latency-bound collectives a CORE2 step on 4 GPUs.
+# On a small mesh the whole 2-D system fits every device: all-gather the right-hand side, the
+# warm start and hbar ONCE, run the dense single-device solve redundantly on every device, keep
+# the local lanes. On identical global inputs that is the dense solve itself (bitwise). Worth it
+# only where the 2-D system is small (CORE2-class); off by default.
+@dataclasses.dataclass(frozen=True)
+class SSHGeom:
+    """The global mesh arrays :func:`stiff_increment_matvec` reads (the zstar increment), as a
+    pytree that can be replicated into ``shard_map`` without the whole 3-D mesh."""
+
+    elem_nodes: jax.Array
+    gradient_sca: jax.Array
+    ulevels: jax.Array
+    edge_tri: jax.Array
+    edge_cross_dxdy: jax.Array
+    edges: jax.Array
+    nod2D: int = dataclasses.field(metadata={"static": True})
+    inv_edges: jax.Array = None     # ops.inverse_map(edges) with gpu.ordered_sums, else None
+
+
+tree_util.register_dataclass(
+    SSHGeom,
+    data_fields=["elem_nodes", "gradient_sca", "ulevels", "edge_tri", "edge_cross_dxdy", "edges",
+                 "inv_edges"],
+    meta_fields=["nod2D"],
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class SSHGather:
+    """Per-device context of the gathered solve, built inside ``shard_map`` by
+    :func:`local_ssh_gather`: the GLOBAL operator and zstar geometry and the owner
+    ``(device, lane)`` of every global node (all replicated), and this device's lanes
+    (``lane_glob``: the global node of each lane, ``lane_valid``: owned or halo, ``[Lmax]``)."""
+
+    op: SSHOperator
+    geom: SSHGeom
+    own_dev: jax.Array       # (nod2D,) i4
+    own_lane: jax.Array      # (nod2D,) i4
+    lane_glob: jax.Array     # (Lmax,) i4
+    lane_valid: jax.Array    # (Lmax,) bool
+    axis_name: str = dataclasses.field(default="p", metadata={"static": True})
+
+
+tree_util.register_dataclass(
+    SSHGather,
+    data_fields=["op", "geom", "own_dev", "own_lane", "lane_glob", "lane_valid"],
+    meta_fields=["axis_name"],
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class SSHGatherHost:
+    """Host-built inputs of the gathered solve (:func:`build_ssh_gather`)."""
+
+    op: SSHOperator          # the global operator, with its preconditioner setting
+    geom: SSHGeom
+    own_dev: np.ndarray      # (nod2D,) i4
+    own_lane: np.ndarray     # (nod2D,) i4
+    lane_glob: np.ndarray    # (P, Lmax) i4, 0 on padding lanes
+    lane_valid: np.ndarray   # (P, Lmax) bool
+    Lmax: int
+    npes: int
+
+
+def build_ssh_gather(op: SSHOperator, mesh: Mesh, partition) -> SSHGatherHost:
+    """The gathered solve's host tables for ``partition``. ``op`` is the GLOBAL operator (with
+    the Chebyshev setting the run uses); the lanes follow the partition's ``myList_nod2D``
+    (owned first, then halo) padded to the sharded State's ``Lmax["nod"]``."""
+    from .shard_mesh import local_sizes
+
+    _, Lmax = local_sizes(partition)
+    L, P, N = Lmax["nod"], partition.npes, int(mesh.nod2D)
+    own_dev = np.full(N, -1, np.int32)
+    own_lane = np.full(N, -1, np.int32)
+    lane_glob = np.zeros((P, L), np.int32)
+    lane_valid = np.zeros((P, L), bool)
+    for d in range(P):
+        ml = np.asarray(partition.myList_nod2D[d])
+        md = int(partition.myDim_nod2D[d])
+        own_dev[ml[:md]] = d
+        own_lane[ml[:md]] = np.arange(md, dtype=np.int32)
+        lane_glob[d, :ml.size] = ml
+        lane_valid[d, :ml.size] = True
+    if (own_dev < 0).any():
+        raise ValueError(f"build_ssh_gather: {int((own_dev < 0).sum())} nodes have no owner")
+    geom = SSHGeom(elem_nodes=np.asarray(mesh.elem_nodes), gradient_sca=np.asarray(mesh.gradient_sca),
+                   ulevels=np.asarray(mesh.ulevels), edge_tri=np.asarray(mesh.edge_tri),
+                   edge_cross_dxdy=np.asarray(mesh.edge_cross_dxdy), edges=np.asarray(mesh.edges),
+                   nod2D=N, inv_edges=(ops.inverse_map(np.asarray(mesh.edges), N)
+                                       if ops.ordered_sums_enabled() else None))
+    return SSHGatherHost(op=op, geom=geom, own_dev=own_dev, own_lane=own_lane,
+                         lane_glob=lane_glob, lane_valid=lane_valid, Lmax=L, npes=P)
+
+
+def gather_inputs(g: SSHGatherHost):
+    """``(replicated, lanes)``: the ``shard_map`` inputs of the gathered solve — the replicated
+    pytree (``PartitionSpec()``) and the folded ``[P*Lmax]`` lane tables (``PartitionSpec('p')``)."""
+    rep = (g.op, g.geom, g.own_dev, g.own_lane)
+    lanes = (g.lane_glob.reshape(-1), g.lane_valid.reshape(-1))
+    return rep, lanes
+
+
+def local_ssh_gather(rep, lanes, axis_name: str = "p") -> SSHGather:
+    """Inside ``shard_map``: this device's :class:`SSHGather` from :func:`gather_inputs`' slices."""
+    op, geom, own_dev, own_lane = rep
+    return SSHGather(op=op, geom=geom, own_dev=own_dev, own_lane=own_lane,
+                     lane_glob=lanes[0], lane_valid=lanes[1], axis_name=axis_name)
+
+
 def build_ssh_operator(
-    mesh: Mesh, *, dt: float, alpha: float = SSH_ALPHA, theta: float = SSH_THETA
+    mesh: Mesh, *, dt: float, alpha: float = SSH_ALPHA, theta: float = SSH_THETA,
+    precond_variant: int = 0,
 ) -> SSHOperator:
     """Assemble the static stiffness matrix + MITgcm preconditioner (host numpy).
 
@@ -266,7 +543,13 @@ def build_ssh_operator(
     ``i=1``), scattered with sign ``+`` into row ``edges[ed,0]`` and ``−`` into row
     ``edges[ed,1]`` at columns = the cell's 3 nodes, times ``factor = g·dt·α·θ``.
     The mass term ``areasvol[n,0]/dt`` is added on the diagonal (non-cavity).
+
+    ``precond_variant`` (FESOM2 #995, ``namelist.dyn`` ``precond_variant``): 0 = the formula FESOM2 has used since
+    60b46bdc (the default, byte-identical); 1 = the textbook symmetric Jacobi ``M⁻¹ = 2D⁻¹ − D⁻¹AD⁻¹``
+    (off-diagonal ``−a_rc/(a_rr·a_cc)``), which upstream selects automatically in a single-precision build.
     """
+    if precond_variant not in (0, 1):
+        raise ValueError(f"precond_variant must be 0 or 1, got {precond_variant!r}")
     N = mesh.nod2D
     E = mesh.myDim_edge2D
     edges = np.asarray(mesh.edges)[:E]
@@ -329,7 +612,10 @@ def build_ssh_operator(
     dc = diag[col_of]
     is_diag = row_of == col_of
     with np.errstate(divide="ignore", invalid="ignore"):
-        pr = np.where(is_diag, 1.0 / dr, -0.5 * (val_of / dr) / (dr + dc))
+        if precond_variant == 0:
+            pr = np.where(is_diag, 1.0 / dr, -0.5 * (val_of / dr) / (dr + dc))
+        else:
+            pr = np.where(is_diag, 1.0 / dr, -val_of / (dr * dc))
 
     return SSHOperator(
         rows=jnp.asarray(row_of.astype(np.int32)),
@@ -354,9 +640,8 @@ def ssh_matvec(op: SSHOperator, x, halo: "SSHHalo | None" = None):
     """
     if halo is not None:
         x = _halo_refresh(x, halo)
-    return jax.ops.segment_sum(
-        op.stiff_vals * x[op.cols], op.rows, num_segments=op.n_nodes
-    )
+    # single precision (FESOM2 #994): each row of A·x summed in WP_full; the caller rounds it once (PR.wp).
+    return _spmv(op, op.stiff_vals, x)
 
 
 def ssh_precond(op: SSHOperator, r, halo: "SSHHalo | None" = None):
@@ -367,9 +652,27 @@ def ssh_precond(op: SSHOperator, r, halo: "SSHHalo | None" = None):
     ``segment_sum``. ``halo=None`` ⇒ dense (byte-identical)."""
     if halo is not None:
         r = _halo_refresh(r, halo)
-    return jax.ops.segment_sum(
-        op.precond_vals * r[op.cols], op.rows, num_segments=op.n_nodes
-    )
+    return PR.wp(_spmv(op, op.precond_vals, r))           # rows in WP_full, rounded once (#994)
+
+
+def _power_lam(A, n: int, power_iters: int) -> float:
+    """Fixed-seed power iteration for the largest eigenvalue of the CSR matrix ``A``.
+
+    The norms are numpy's own pairwise sums (``np.sum``), not BLAS ``nrm2``: a threaded BLAS sums
+    in an order that depends on the host thread count, which moved ``lam_max`` (and so the Chebyshev
+    coefficients baked into the program) by an ulp between nodes with 32 and 64 CPUs. scipy's CSR
+    matvec is single-threaded. Same floats on every host."""
+    v = np.random.default_rng(0).standard_normal(n)     # FIXED seed ⇒ same floats everywhere
+    v /= np.sqrt(np.sum(v * v))
+    lam = 1.0
+    for _ in range(power_iters):
+        w = A @ v
+        lam = float(np.sqrt(np.sum(w * w)))
+        if lam == 0.0:                                   # degenerate (S=0) — keep lam sane
+            lam = 1.0
+            break
+        v = w / lam
+    return lam
 
 
 def enable_cheb_precond(op: SSHOperator, degree: int, *, kappa_guess: float = 30.0,
@@ -395,17 +698,7 @@ def enable_cheb_precond(op: SSHOperator, degree: int, *, kappa_guess: float = 30
     dis = 1.0 / np.sqrt(np.where(diag > 0.0, diag, 1.0))
     A = sp.coo_matrix((vals * dis[rows] * dis[cols], (rows, cols)),
                       shape=(n, n)).tocsr()
-    v = np.random.default_rng(0).standard_normal(n)     # FIXED seed ⇒ same floats everywhere
-    v /= np.linalg.norm(v)
-    lam = 1.0
-    for _ in range(power_iters):
-        w = A @ v
-        lam = float(np.linalg.norm(w))
-        if lam == 0.0:                                   # degenerate (S=0) — keep lam sane
-            lam = 1.0
-            break
-        v = w / lam
-    lam_max = lam * safety
+    lam_max = _power_lam(A, n, power_iters) * safety
     lam_min = lam_max / kappa_guess
     return dataclasses.replace(op, cheb=(int(degree), float(lam_min), float(lam_max)))
 
@@ -436,7 +729,7 @@ def ssh_precond_cheb(op: SSHOperator, r, halo: "SSHHalo | None" = None):
     d = f / theta
     z = d
     for _ in range(degree):
-        res = f - inv_d * ssh_matvec(op, z, halo)   # SpMV refreshes z's halo lanes
+        res = f - inv_d * PR.wp(ssh_matvec(op, z, halo))   # SpMV refreshes z's halo lanes; rows f64 (D7)
         rho_new = 1.0 / (2.0 * sigma1 - rho)
         d = rho_new * rho * d + (2.0 * rho_new / delta) * res
         z = z + d
@@ -492,9 +785,12 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
 
     c = cterm(el1s, has1, 0, 1, 1.0) + cterm(el2s, has2, 2, 3, -1.0)
     vals = jnp.stack([c, -c], axis=1)                     # n1 += c, n2 −= c
-    ssh_rhs = jax.ops.segment_sum(
-        vals.reshape(-1), mesh.edges.reshape(-1), num_segments=mesh.nod2D
-    )
+    if ops.ordered_sums_enabled() and getattr(mesh, "inv_edges", None) is not None:
+        ssh_rhs = ops.ordered_sum(vals.reshape(-1), mesh.inv_edges)   # gpu.ordered_sums
+    else:
+        ssh_rhs = jax.ops.segment_sum(
+            vals.reshape(-1), mesh.edges.reshape(-1), num_segments=mesh.nod2D
+        )
     # zstar water-flux tail (fesom_ssh.c:413-421): −α·wf·areasvol[n,0] on non-cavity.
     if water_flux is not None:
         nocav = mesh.ulevels_nod2D == 1
@@ -507,6 +803,16 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
 # ==========================================================================
 # Substep 9 — preconditioned CG solve
 # ==========================================================================
+def cg_batch() -> int:
+    """``FESOM_CG_BATCH=k`` (``gpu.cg_batch``, read at trace time; default 1): the CG runs k iterations per
+    trip of its while loop, the extra ones masked by the stopping test, so the iterate and the iteration
+    count are the one-at-a-time loop's while the GPU syncs with the host k times less often."""
+    k = int(os.environ.get("FESOM_CG_BATCH", "1") or 1)
+    if k < 1:
+        raise ValueError(f"FESOM_CG_BATCH must be >= 1, got {k}")
+    return k
+
+
 def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
          reduce=None, reduce_pair=None, n_global=None, return_iters=False):
     """Preconditioned CG, a literal port of ``fesom_ssh_solve_cg``
@@ -535,14 +841,16 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
     2 of the 3 per-iteration ``psum``s become 1. ``None`` ⇒ two ``dot`` calls,
     keeping the dense graph (and any caller not passing it) untouched."""
     n = b.shape[0] if n_global is None else n_global
-    dot = (lambda u, v: jnp.sum(u * v)) if reduce is None else reduce
+    dot = (lambda u, v: jnp.sum(PR.full(u) * PR.full(v))) if reduce is None else reduce
     dot_rz_rr = ((lambda r, z: (dot(r, z), dot(r, r)))
                  if reduce_pair is None else reduce_pair)
     s0 = dot(b, b)
     rtol = (soltol * jnp.sqrt(s0 / n)) if rtol_abs is None else rtol_abs
 
     def run(_):
-        r0 = b - matvec(x0)
+        # single precision (#994): the matvec rows come back in WP_full and are rounded once into the WP
+        # vectors; dots, scalars and the stopping test stay WP_full (identity in double precision).
+        r0 = PR.wp(PR.full(b) - matvec(x0))
         z0 = precond(r0)
         sold0, rr0 = dot_rz_rr(r0, z0)
         resid0 = jnp.sqrt(rr0 / n)
@@ -553,16 +861,30 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
 
         def body(c):
             x, r, z, p, s_old, _resid, it = c
-            Ap = matvec(p)
+            Ap = PR.wp(matvec(p))
             al = s_old / dot(p, Ap)
-            x = x + al * p
-            r = r - al * Ap
+            x = PR.wp(PR.full(x) + al * PR.full(p))
+            r = PR.wp(PR.full(r) - al * PR.full(Ap))
             z = precond(r)
             sp0, sp1 = dot_rz_rr(r, z)
             resid = jnp.sqrt(sp1 / n)
             be = sp0 / s_old
-            p = z + be * p
+            p = PR.wp(PR.full(z) + be * PR.full(p))
             return (x, r, z, p, sp0, resid, it + 1)
+
+        k = cg_batch()
+        if k > 1:
+            # k iterations per trip of the while loop, each after the first masked by the stopping
+            # test: the iterate is the one-at-a-time loop's (the masked steps are discarded by
+            # `where`), but the host reads the loop predicate once per k iterations
+            body1 = body
+
+            def body(c):
+                c = body1(c)
+                for _ in range(k - 1):
+                    live = cond(c)
+                    c = jax.tree.map(lambda new, old: jnp.where(live, new, old), body1(c), c)
+                return c
 
         init = (x0, r0, z0, z0, sold0, resid0, jnp.array(0))
         final = lax.while_loop(cond, body, init)
@@ -573,16 +895,17 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
         # — which is invisible to every static/structural check.  `hit_cap=1` is the smoking
         # gun and ALSO a correctness warning: the returned eta is then NOT solved to soltol.
         if os.environ.get("FESOM_CG_ITERS"):
+            # float32/int32 operands: a 64-bit host callback is not allowed in a single-precision (x64-off) trace
             jax.debug.print(
                 "[cg-iters] it={it} hit_cap={cap} resid={r:.3e} rtol={t:.3e}",
-                it=final[6], cap=(final[6] >= maxiter).astype(jnp.int32),
-                r=final[5], t=rtol, ordered=False)
+                it=final[6].astype(jnp.int32), cap=(final[6] >= maxiter).astype(jnp.int32),
+                r=final[5].astype(jnp.float32), t=jnp.asarray(rtol).astype(jnp.float32), ordered=False)
         return final if return_iters else final[0]
 
     if return_iters:
         zero_carry = (jnp.zeros_like(x0), jnp.zeros_like(b), jnp.zeros_like(b),
-                      jnp.zeros_like(b), jnp.zeros((), b.dtype),
-                      jnp.zeros((), b.dtype), jnp.array(0))
+                      jnp.zeros_like(b), jnp.zeros((), s0.dtype),
+                      jnp.zeros((), s0.dtype), jnp.array(0))
         out = lax.cond(s0 > 0.0, run, lambda _: zero_carry, operand=None)
         return out[0], out[6]
 
@@ -613,8 +936,11 @@ def stiff_increment_matvec(mesh: Mesh, hbar, x, *, dt: float = DT_DEFAULT,
     dense single-device path (validated at JZ.3; the sharded zstar solve is JZ.7)."""
     if halo is not None:
         x = _halo_refresh(x, halo)
+    # single precision (D1, user 2026-10-20): the increment is rebuilt from the WP hbar with WP_full
+    # arithmetic, and its rows are summed in WP_full with the base rows (the caller rounds once).
+    x, hbar = PR.full(x), PR.full(hbar)
     en = mesh.elem_nodes
-    g = mesh.gradient_sca                                  # (elem2D,6): ∂N/∂x(0:3),∂N/∂y(3:6)
+    g = PR.full(mesh.gradient_sca)                         # (elem2D,6): ∂N/∂x(0:3),∂N/∂y(3:6)
     xe = x[en]                                             # (elem2D,3)
     gx = jnp.sum(g[:, 0:3] * xe, axis=1)                   # ∂x/∂x per element
     gy = jnp.sum(g[:, 3:6] * xe, axis=1)                   # ∂x/∂y per element
@@ -628,7 +954,7 @@ def stiff_increment_matvec(mesh: Mesh, hbar, x, *, dt: float = DT_DEFAULT,
     has1, has2 = el1 >= 0, el2 >= 0
     el1s = jnp.where(has1, el1, 0)
     el2s = jnp.where(has2, el2, 0)
-    cross = mesh.edge_cross_dxdy
+    cross = PR.full(mesh.edge_cross_dxdy)
 
     def cterm(els, has, dxcol, dycol, sign):
         # base flux (fesom_ssh.c:157), k-summed against x: depth·(∂ₓx·dy_i − ∂ᵧx·dx_i)
@@ -637,6 +963,8 @@ def stiff_increment_matvec(mesh: Mesh, hbar, x, *, dt: float = DT_DEFAULT,
 
     c = cterm(el1s, has1, 0, 1, 1.0) + cterm(el2s, has2, 2, 3, -1.0)
     vals = jnp.stack([c, -c], axis=1) * factor            # n1 += c·factor, n2 −= c·factor
+    if ops.ordered_sums_enabled() and getattr(mesh, "inv_edges", None) is not None:
+        return ops.ordered_sum(vals.reshape(-1), mesh.inv_edges)      # gpu.ordered_sums
     return jax.ops.segment_sum(
         vals.reshape(-1), mesh.edges.reshape(-1), num_segments=mesh.nod2D)
 
@@ -648,6 +976,11 @@ def _ssh_solver_parts(op: SSHOperator, mesh, halo, cfg, hbar):
     dt, alpha, theta = cfg[0], cfg[1], cfg[2]
     if hbar is None:
         matvec = lambda x: ssh_matvec(op, x, halo)    # noqa: E731
+    elif op.inc_el is not None and halo is None:
+        # the increment's entries once per solve, then one matvec on (S + ΔA)
+        live = dataclasses.replace(op, stiff_vals=PR.full(op.stiff_vals) + _increment_values(
+            op, mesh, hbar, float(G) * float(dt) * float(alpha) * float(theta)))
+        matvec = lambda x: ssh_matvec(live, x)        # noqa: E731
     else:
         def matvec(x):
             return ssh_matvec(op, x, halo) + stiff_increment_matvec(
@@ -794,7 +1127,7 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = Non
 
     # Solve for the correction δ = S⁻¹·b_eff from δ0=0 (linear), then d_eta = x0+δ.
     # For x0=0 (step 1) b_eff = ssh_rhs and this is exactly the C's solve-from-zero.
-    b_eff = ssh_rhs - matvec(x0)
+    b_eff = PR.wp(PR.full(ssh_rhs) - matvec(x0))
 
     # ⚠️ Warm-start fidelity (step ≥2): the C measures the CG residual against the
     # ORIGINAL ‖ssh_rhs‖, not the deflated ‖b_eff‖. Because the inner residual
@@ -806,13 +1139,36 @@ def solve_ssh(op: SSHOperator, ssh_rhs, *, x0=None, halo: "SSHHalo | None" = Non
     # through it.
     if halo is None:
         nrhs = ssh_rhs.shape[0]
-        rtol_fwd = forward_tol * jnp.sqrt(jnp.sum(ssh_rhs * ssh_rhs) / nrhs)
+        rtol_fwd = forward_tol * jnp.sqrt(jnp.sum(PR.full(ssh_rhs) * PR.full(ssh_rhs)) / nrhs)
     else:
         rtol_fwd = forward_tol * jnp.sqrt(reduce_fn(ssh_rhs, ssh_rhs) / n_global)
     rtol_fwd = lax.stop_gradient(rtol_fwd)
 
     delta = _ssh_implicit(cfg, op, mesh, halo, b_eff, hbar, rtol_fwd)   # named "ssh_delta"
     return x0 + delta
+
+
+def solve_ssh_gathered(g: SSHGather, ssh_rhs, x0, hbar=None, *, dt: float = DT_DEFAULT,
+                       alpha: float = SSH_ALPHA, theta: float = SSH_THETA,
+                       forward_tol: float = SOLTOL, grad_tol: float = GRAD_SOLTOL,
+                       maxiter: int = MAXITER):
+    """:func:`solve_ssh` with the 2-D system gathered onto every device (inside ``shard_map``).
+
+    ``ssh_rhs``, ``x0`` and ``hbar`` (zstar; ``None`` under linfs) are this device's
+    ``[Lmax]`` lanes. ONE ``all_gather`` brings their OWNED lanes to every device in global node
+    order, the dense single-device solve runs on the global operator (its implicit-derivative
+    rule included), and each device keeps its valid lanes (owned and halo; padding lanes 0).
+    The value is the dense solve's on the same global inputs, bit for bit. Derivatives: the
+    gather transposes to a reduce-scatter onto the owned lanes, so halo and padding lanes get
+    no cotangent."""
+    parts = [ssh_rhs, x0] + ([] if hbar is None else [hbar])
+    allv = lax.all_gather(jnp.stack(parts), g.axis_name)          # (P, k, Lmax)
+    glob = allv[g.own_dev, :, g.own_lane]                         # (nod2D, k), global order
+    d = solve_ssh(g.op, glob[:, 0], x0=glob[:, 1], halo=None,
+                  mesh=None if hbar is None else g.geom,
+                  hbar=None if hbar is None else glob[:, 2], dt=dt, alpha=alpha,
+                  theta=theta, forward_tol=forward_tol, grad_tol=grad_tol, maxiter=maxiter)
+    return jnp.where(g.lane_valid, d[g.lane_glob], jnp.zeros((), d.dtype))
 
 
 # ==========================================================================

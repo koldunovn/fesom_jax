@@ -179,6 +179,50 @@ def test_the_production_only_flag_leaves_the_forward_alone(prod, flag):
 
 
 @core2_only
+def test_gm_n2_cut_everywhere_is_freeze_gm_slope(prod):
+    """The masked GM-input cut is wired to the same N² as ``freeze_gm_slope``: with a raw
+    threshold above every N² the mask covers the whole field and the gradient is the
+    ``freeze_gm_slope`` one; the production values (R* 100, raw* -1e-6) leave the forward
+    alone and give a finite gradient."""
+    make, k0, *_ = prod
+    _, g_off = make(AdjointConfig())
+    _, g_frz = make(AdjointConfig(freeze_gm_slope=True))
+    _, g_all = make(AdjointConfig(gm_n2_raw_cut=1.0))
+    a, b, c = float(g_off(k0)), float(g_frz(k0)), float(g_all(k0))
+    print(f"\nbaseline {a!r} freeze_gm_slope {b!r} gm_n2_raw_cut=1 {c!r}")
+    assert c != a
+    np.testing.assert_allclose(c, b, rtol=1e-12, atol=0.0)
+    l_off, _ = make(AdjointConfig())
+    l_cut, g_cut = make(AdjointConfig(gm_n2_ratio=100.0, gm_n2_raw_cut=-1e-6))
+    assert_forward_identity(l_off, l_cut, k0, "gm_n2_ratio/gm_n2_raw_cut in the production "
+                                              "configuration")
+    assert np.isfinite(float(g_cut(k0)))
+
+
+@core2_only
+def test_gm_named_n2_cuts_together_are_freeze_gm_slope(prod):
+    """The three named N² cuts of the eddy block (slope, wave speed, streamfunction solve)
+    cover every N² use there: together they give the ``freeze_gm_slope`` gradient. Each one
+    alone and the steep-slope cut move the gradient and leave the forward alone."""
+    make, k0, *_ = prod
+    l_off, g_off = make(AdjointConfig())
+    _, g_frz = make(AdjointConfig(freeze_gm_slope=True))
+    three = frozenset({"gm.slope_n2", "gm.cm_n2", "gm.bvp_n2"})
+    _, g_all = make(AdjointConfig(diag_cuts=three))
+    a, b, c = float(g_off(k0)), float(g_frz(k0)), float(g_all(k0))
+    print(f"\nbaseline {a!r} freeze_gm_slope {b!r} three named cuts {c!r}")
+    np.testing.assert_allclose(c, b, rtol=1e-12, atol=0.0)
+    for cfg in [AdjointConfig(diag_cuts=frozenset({n})) for n in sorted(three)] + [
+            AdjointConfig(gm_slope_cut=2e-3)]:
+        l_on, g_on = make(cfg)
+        v = float(g_on(k0))
+        print(f"{cfg.describe()}: {v!r} (relative {abs(v - a) / abs(a):.3e})")
+        assert np.isfinite(v) and v != a, cfg.describe()
+        assert_forward_identity(l_off, l_on, k0, f"{cfg.describe()} in the production "
+                                                 "configuration")
+
+
+@core2_only
 def test_freeze_k33_cuts_redi_kmax_and_is_exactly_free_for_k_gm(prod):
     """WHICH trained parameter ``freeze_k33`` is not free with respect to — and it is not the one
     the name GM suggests.
@@ -276,6 +320,11 @@ def test_every_production_only_flag_is_listed_here():
     # and fails this test rather than disappearing
     elsewhere = {"freeze_mixing", "freeze_stratification", "freeze_convection",
                  "freeze_vert_visc", "freeze_tke_state", "freeze_advection",
+                 # the FCT limiter factors: test_adjoint_config.py (pi) and test_tracers.py
+                 "freeze_fct_limiter",
+                 # the TKE-closure flag: test_adjoint_config_tke.py (TKE_PATH_FLAGS) and
+                 # test_tke_candidates{,_core2}.py
+                 "freeze_mixing_state",
                  # ⚠️ covered by a THIRD file, which this set did not know about:
                  # test_gm_nn_seam.py::test_freeze_nn_features_is_forward_identical_and_keeps_
                  # the_weight_gradient. It cannot go in PROD_ONLY_FLAGS — it is read only inside

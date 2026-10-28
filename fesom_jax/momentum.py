@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
+from . import precision as PR
 from . import ops
 from .config import (
     C_D,
@@ -65,7 +66,7 @@ def _scatter3(mesh: Mesh, contrib):
     ``[nod2D, *rest]`` (each element adds its value to all 3 of its nodes)."""
     e = mesh.elem2D
     vals = jnp.broadcast_to(contrib[:, None], (e, 3) + contrib.shape[1:])
-    return ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D)
+    return ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)
 
 
 def _horizontal_adv(mesh: Mesh, uv):
@@ -95,7 +96,7 @@ def _horizontal_adv(mesh: Mesh, uv):
 
     # n1 += flux, n2 -= flux
     vals = jnp.stack([flux, -flux], axis=1)                              # (edge, 2, nl, 2)
-    return ops.scatter_add(vals, mesh.edges, mesh.nod2D)                 # (nod2D, nl, 2)
+    return ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)                 # (nod2D, nl, 2)
 
 
 def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
@@ -145,11 +146,16 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
 
 
 def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
-                    *, is_first_step, dt=DT_DEFAULT, exch=None):
+                    *, is_first_step, dt=DT_DEFAULT, exch=None, press_air=None):
     """``(uv_rhs, uv_rhsAB_new)`` element fields ``[elem2D, nl, 2]``.
 
     ``uv``, ``w_e``, ``hnode`` and ``eta_n`` are the *previous-step* state (lagged,
-    as in the C). ``uv_rhsAB`` is the incoming AB slot (overwritten on return)."""
+    as in the C). ``uv_rhsAB`` is the incoming AB slot (overwritten on return).
+
+    ``press_air`` (``[nod2D]`` Pa, FESOM2's ``l_mslp``): the sea-level pressure enters the
+    surface pressure as ``p_air = press_air/1000`` (``oce_ale_vel_rhs.F90:208-209``, not
+    divided by rho0) and its gradient is taken together with the SSH term,
+    ``pre = -(g·eta + p_air)``. ``None`` (l_mslp off) is the unchanged program."""
     g = G
     lm = mesh.elem_layer_mask
     area = mesh.elem_area[:, None]                                  # (elem2D,1)
@@ -159,7 +165,11 @@ def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
 
     # (2) SSH gradient F = ∇N·(−g·η) at the 3 vertices, then += (F − pgf)·area
     eta_c = ops.gather_nodes_to_elem(eta_n, mesh.elem_nodes)        # (elem2D,3)
-    pre = -g * eta_c
+    if press_air is None:
+        pre = -g * eta_c
+    else:   # l_mslp: pre = -(p_eta + p_ice + p_air), p_ice = 0 (no floating ice), p_air = press_air/1000
+        p_air = ops.gather_nodes_to_elem(press_air, mesh.elem_nodes) / 1000.0
+        pre = -(g * eta_c + p_air)
     gs = mesh.gradient_sca
     Fx = gs[:, 0] * pre[:, 0] + gs[:, 1] * pre[:, 1] + gs[:, 2] * pre[:, 2]   # (elem2D,)
     Fy = gs[:, 3] * pre[:, 0] + gs[:, 4] * pre[:, 1] + gs[:, 5] * pre[:, 2]
@@ -211,6 +221,9 @@ def _bidiff_edge_terms(mesh: Mesh, uv, vc: ViscConfig = _DEFAULT_VISC):
 
     u1 = ops.gather(uv[:, :, 0], el1s) - ops.gather(uv[:, :, 0], el2s)   # (edge,nl)
     v1 = ops.gather(uv[:, :, 1], el1s) - ops.gather(uv[:, :, 1], el2s)
+    # single precision: visc_filt_bidiff's locals u1, v1, len, vi are real(kind=8) upstream (oce_dyn.F90:745-747) —
+    # WP differences widened, the rest of the edge arithmetic in float64 (identity in double precision).
+    u1, v1, length = PR.full(u1), PR.full(v1), PR.full(length)
     vi2 = u1 * u1 + v1 * v1
     sq = _safe_sqrt(vi2)
     inner = jnp.maximum(vc.gamma1 * sq, vc.gamma2 * vi2)
@@ -239,8 +252,10 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_c
     # Stage 1: U_c[el1] -= u1·coef, U_c[el2] += u1·coef  (antisymmetric scatter)
     du = jnp.where(emask, u1 * coef, 0.0)                          # (edge,nl)
     dv = jnp.where(emask, v1 * coef, 0.0)
-    Uc = ops.scatter_add(jnp.stack([-du, du], axis=1), mesh.edge_tri, mesh.elem2D)
-    Vc = ops.scatter_add(jnp.stack([-dv, dv], axis=1), mesh.edge_tri, mesh.elem2D)
+    Uc = PR.wp(ops.scatter_add(jnp.stack([-du, du], axis=1), mesh.edge_tri, mesh.elem2D,
+                               inv=mesh.inv_edge_tri))                       # U_c is WP
+    Vc = PR.wp(ops.scatter_add(jnp.stack([-dv, dv], axis=1), mesh.edge_tri, mesh.elem2D,
+                               inv=mesh.inv_edge_tri))
 
     # S.7 intra-kernel exchange: refresh halo Uc/Vc before stage 2 gathers them.
     Uc = _exch(Uc, "elem")
@@ -249,17 +264,18 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_c
     # Stage 2: update = -dt·coef·(U_c[el1]-U_c[el2]) + viLapl·u1, scatter /area
     coef2 = -dt * coef
     viLapl = dt * jnp.maximum(vc.gamma0_h, vc.gamma1_h * sq) * length   # 0 for CORE2
-    Uc_d = ops.gather(Uc, el1s) - ops.gather(Uc, el2s)
-    Vc_d = ops.gather(Vc, el1s) - ops.gather(Vc, el2s)
+    Uc_d = PR.full(ops.gather(Uc, el1s) - ops.gather(Uc, el2s))
+    Vc_d = PR.full(ops.gather(Vc, el1s) - ops.gather(Vc, el2s))
     upd_u = jnp.where(emask, coef2 * Uc_d + viLapl * u1, 0.0)
     upd_v = jnp.where(emask, coef2 * Vc_d + viLapl * v1, 0.0)
 
+    a1, a2 = PR.full(a1), PR.full(a2)
     du_u = jnp.stack([-upd_u / a1[:, None], upd_u / a2[:, None]], axis=1)
     du_v = jnp.stack([-upd_v / a1[:, None], upd_v / a2[:, None]], axis=1)
-    delta_u = ops.scatter_add(du_u, mesh.edge_tri, mesh.elem2D)    # (elem2D,nl)
-    delta_v = ops.scatter_add(du_v, mesh.edge_tri, mesh.elem2D)
+    delta_u = ops.scatter_add(du_u, mesh.edge_tri, mesh.elem2D, inv=mesh.inv_edge_tri)    # (elem2D,nl)
+    delta_v = ops.scatter_add(du_v, mesh.edge_tri, mesh.elem2D, inv=mesh.inv_edge_tri)
 
-    out = uv_rhs + jnp.stack([delta_u, delta_v], axis=-1)
+    out = PR.wp(PR.full(uv_rhs) + jnp.stack([delta_u, delta_v], axis=-1))
     return ops.mask_below_bottom(out, mesh.elem_layer_mask)
 
 

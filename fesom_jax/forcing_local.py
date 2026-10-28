@@ -22,7 +22,7 @@ from __future__ import annotations
 import numpy as np
 
 from . import jra55, sss_runoff
-from .surface_forcing import _midstep_days, SurfaceForcing, StepForcing
+from .surface_forcing import STEP_SCALARS, BgcForcing, SurfaceForcing, StepForcing, set_midstep
 from .shard_mesh import _default_pad, local_sizes
 
 
@@ -92,7 +92,8 @@ class LocalForcing:
         :class:`~fesom_jax.surface_forcing.ForcingSched` is node-independent, hence identical
         to the global build's."""
         tables, sched = self.cf.stack_tables(dates, nb=nb, nm=nm)
-        return (type(tables)(**{name: self._scatter_last(np.asarray(getattr(tables, name)))
+        return (type(tables)(**{name: (None if getattr(tables, name) is None
+                                       else self._scatter_last(np.asarray(getattr(tables, name))))
                                 for name in tables._fields}), sched)
 
     def forcing_const_partitioned(self):
@@ -115,7 +116,13 @@ class LocalForcing:
         seq_local = self.cf.stack(dates, xp=xp)            # [n_steps, n_local] host leaves
         out = {}
         for name in seq_local._fields:
+            if getattr(seq_local, name) is None:           # an optional field that is off (press_air)
+                out[name] = None
+                continue
             arr = np.asarray(getattr(seq_local, name))     # [n_steps, n_local]
+            if name in STEP_SCALARS:                       # [n_steps] per-step scalars (REcoM calendar): replicated
+                out[name] = arr
+                continue
             n_steps = arr.shape[0]
             pad = _default_pad(arr.dtype)
             full = np.full((self.npes, n_steps, self.L) + arr.shape[2:], pad, arr.dtype)
@@ -138,7 +145,8 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
                         runoff_path=None,
                         chl_path=None,
                         chl_const=None, static=None,
-                        dt=None, forcing_midstep: bool = True) -> LocalForcing:
+                        dt=None, forcing_midstep: bool = True, mslp: bool = False,
+                        bgc_dust_path=None, dt_ramp=None, bgc_co2=None) -> LocalForcing:
     """Build a :class:`LocalForcing` for this process's local partitions.
 
     The four input-path kwargs default to ``None`` ⇒ resolved by the readers through
@@ -148,7 +156,10 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
     so a single process can exercise the multi-partition scatter without N real devices).
     ``static`` is the global :class:`~fesom_jax.surface_forcing.ForcingStatic` (reused as-is; the
     per-step path never touches it). ``sst_ic`` is accepted for signature parity (the static, not
-    the per-step forcing, uses it) and ignored here."""
+    the per-step forcing, uses it) and ignored here. ``mslp``: also read the sea-level pressure
+    (:func:`fesom_jax.surface_forcing.build_surface_forcing`). ``bgc_dust_path``: REcoM's per-step inputs, the
+    dust taken at the local nodes (as there), ``dt_ramp`` the run's dt ramp and ``bgc_co2`` the CO2 time series (as
+    there)."""
     if local_parts is None:
         local_parts = local_partitions(npes)
     lists = [np.asarray(part.myList_nod2D[p]) for p in local_parts]
@@ -157,9 +168,16 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
     sub = _SubMesh(mesh, local_nodes)
     chl = (np.full((12, int(len(local_nodes))), float(chl_const), dtype=np.float64)
            if chl_const is not None else sss_runoff.build_chl_clim(sub, chl_path))
-    jra = jra55.JRA55Reader(sub, int(year), jra_dir)
-    jra.midstep_days = _midstep_days(dt, forcing_midstep)        # drift fix 2 (see surface_forcing)
+    jra = jra55.JRA55Reader(sub, int(year), jra_dir, mslp=mslp)
+    set_midstep(jra, dt, forcing_midstep, dt_ramp, year)         # drift fix 2 (see surface_forcing)
+    bgc = None
+    if bgc_dust_path is not None:
+        if dt is None:
+            raise ValueError("bgc_dust_path needs dt: FESOM2's clock at the recom call is the step end")
+        from .surface_forcing import read_dust_clim
+        bgc = BgcForcing(read_dust_clim(bgc_dust_path, int(mesh.nod2D))[:, local_nodes], float(dt),
+                         dt_ramp=dt_ramp, year0=year, co2=bgc_co2)
     cf = SurfaceForcing(jra=jra,
                      sss=sss_runoff.build_reader(sub, sss_path, runoff_path),
-                     chl_clim=chl, static=static)
+                     chl_clim=chl, static=static, bgc=bgc)
     return LocalForcing(cf, part, npes, local_parts, local_nodes)

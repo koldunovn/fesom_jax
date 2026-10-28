@@ -58,6 +58,11 @@ The adjoint foundation adds a forcing-direction seam (not a physics parameter):
   wind-stress direction. ``heat`` is in W/m², POSITIVE INTO the ocean (warming); the stresses
   are in N/m² in the model (rotated) frame. ``None`` (default) ⇒ nothing is traced.
 
+The sea-ice adjoint track adds two ice parameters (optional, ``None`` ⇒ nothing traced):
+
+* ``ice_pstar`` — the ice strength P* [N/m²] (``IceConfig.pstar``);
+* ``ice_cd`` — the ice-ocean drag coefficient C_d (``IceConfig.cd_oce_ice``), ice path only.
+
 :meth:`Params.defaults` reproduces the config constants exactly (so passing
 ``Params.defaults()`` is numerically identical to the un-parameterised path).
 """
@@ -115,6 +120,24 @@ class Params:
     # (default) ⇒ no leaves, nothing traced, byte-identical. Dense runs only (step() raises
     # under a halo context). See ``step._apply_surface_adj`` for the sign convention.
     surface_adj: object = None
+    # Atmospheric-forcing seam (sensitivities to the atmosphere; ported from the ice session's e0381dc): a dict
+    # {StepForcing field name: anomaly}, names from step.FORCING_ADJ_KEYS, each the shape of the forcing field (dense
+    # [nod2D]; the local lanes under shard_map, adjoint_sharded.localize_forcing_adj), added to the step forcing at the
+    # top of step() — before the bulk formulae and the ice step, so the ice-atmosphere stress, the ice and open-water
+    # heat budgets and the snowfall all see it. ``None`` (default) ⇒ no leaves, nothing traced, byte-identical.
+    forcing_adj: object = None
+    # Sea-ice controls: the ice strength P* [N/m²] and the ice-ocean drag coefficient C_d [-]
+    # as traced scalars. ``None`` (default) ⇒ no leaves, nothing traced, byte-identical: the ice
+    # step keeps ``IceConfig.pstar`` / ``IceConfig.cd_oce_ice``. Set ⇒ ``ice_surface_step``
+    # replaces the config field by the value (``cfg._replace``), so P* reaches the ice pressure
+    # (``ice_mevp.mevp_setup`` / ``ice_evp``) and C_d the four ice-path drag sites (the mEVP and
+    # EVP momentum solves, the ice-ocean stress blend, the thermodynamic friction velocity). The
+    # no-ice bulk path keeps its own constant (``surface_forcing``, unused when ice is on).
+    ice_pstar: object = None
+    ice_cd: object = None
+    # REcoM parameters (fesom_jax.recom.params.RecomParams with traced leaves, full REcoM only): ``None`` (default) ⇒
+    # no leaves, nothing traced; the step then reads the namelist values of RecomConfig.namelist as constants.
+    recom: object = None
 
     @staticmethod
     def defaults() -> "Params":
@@ -136,6 +159,6 @@ tree_util.register_dataclass(
     Params,
     data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
                  "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn", "gm_nn",
-                 "surface_adj"],
+                 "surface_adj", "forcing_adj", "ice_pstar", "ice_cd", "recom"],
     meta_fields=[],
 )

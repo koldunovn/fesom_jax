@@ -179,12 +179,10 @@ choice for us, not because any is obviously right.
 available further step, it is what we already do.** `ice_step.py:102`:
 `_evp_kw = {"adjoint_subcycles": 0} if cfg.adjoint_mode == "rheology" else {}` — the forward
 runs all 120 mEVP subcycles, the backward unrolls none, so the ice velocity has no gradient path
-at all. (The forward is full mEVP, `whichEVP=1`, not free drift.) The one published alternative
-that keeps EVP rheology in the adjoint — Newtonian damping of the subcycle carry, the
-Kauker-line `eps_N·sigma` term — was implemented, measured and rejected here: amplification
-1.1795 per sweep means that over 120 sweeps the result swings from annihilated at `T_N=6`
-(1e-44) to blown at `T_N=7` (1e+27), cancelling exactly at 6.57, so no single global constant
-is right anywhere.
+at all. (The forward is full mEVP, `whichEVP=1`, not free drift.) This paragraph describes
+`"rheology"`. Since 2026-10 the momentum solve can be kept in the adjoint instead
+(`adjoint_damping="frozen_sweep"`, §5): the exact mEVP tangent fails because of a LOCAL
+near-rigid stress mode, not a uniform growth per sweep.
 
 So the gap to ECCO is NARROWER than "we differentiate the rheology and they do not": dynamics is
 dark in both. What we keep beyond them is ice **thermodynamics, advection, cut-off and the
@@ -334,6 +332,12 @@ the stabilizing term and keeps the destabilizing one. `AdjointConfig.freeze_adve
 other direction — drop the whole antidiffusive correction — and measures it as not the
 amplifier.
 
+Measured since (PORTING_LESSONS.md I17e, 2026-10-09): on the 30-day March 2013 sea-ice drift
+gradient, the `ae` derivative IS the amplifier. A salinity-cotangent burst sat on deep cells whose
+values are tied to round-off (Bismarck Sea, 1.4-1.9 km). Freezing `ae` alone
+(`FESOM_FCT_STOPGRAD_AE=1`) or the whole limited flux (`freeze_advection`) removes it, and the ice
+gradients move by ≤ 0.05 %.
+
 **Memory was never the real constraint on window length.** The old scan ran out of GPU memory
 at 7 and 10 days because it built the entire window's reverse pass as one computation.
 Accumulating it chunk by chunk, with chunk-boundary states parked on the host, caps peak
@@ -472,27 +476,44 @@ every step pinned holds to ≤ 5.8e-9, so what varies is the trajectory, not the
 
 ### Sea ice in the adjoint — SOLVED, and how to switch it on
 
-**Use `IceConfig(adjoint_mode="rheology")`.** It differentiates ice thermodynamics, advection,
-the concentration cut-off and the ocean-to-ice coupling, and unrolls **zero** momentum-solver
-subcycles in the backward, so only the ice velocity is dark. Available on both the mEVP and the
-standard-EVP path. Measured at a 5-day window: clean, reproducible, growth 1.0004 per timestep,
-and it changes an eddy-diffusivity gradient by 0.21% against freezing the whole ice — so it
-costs nothing in stability and recovers the pathway that matters (eddy transport changes SST,
-which changes ice growth, which changes the surface heat and salt fluxes back into the ocean).
+**With ice controls or ice-velocity sensitivity (2026-10, mEVP only): use
+`adjoint_mode="exact"` or `"dynamics"` with `adjoint_damping="frozen_sweep"`.** The forward is
+unchanged. The backward linearizes one mEVP sweep once, at the step's final iterate, with raised
+pseudo-time coefficients (κ0 = 1) and the plastic softening scaled by θ (default 0.97), and runs
+that frozen map transposed 120 times (`fesom_jax/ice_mevp_frozen.py`). Checked against finite
+differences of the coupled CORE2 model (Arctic drift cost, windows starting in 2013, ice state
+replayed ("dynamics", replay FD) or live ("exact", full FD)):
+
+| ice backward | windows | ln P* adjoint / FD | ln C_d adjoint / FD | cost per step |
+|---|---|---|---|---|
+| `frozen_sweep`, θ 0.97 (default), κ0 1 | Jan, Jul 2-30 d; Mar 2-10 d | 0.95-1.02 | 0.99-1.00 | as the unrolled backward |
+| `frozen_sweep`, θ 0.95, κ0 1 | Jan, Mar 2-10 d | 0.885-0.95 | 0.99-1.00 | as the unrolled backward |
+| `local`, κ = 0 (zero-stress tangent) | Jan, Mar 2-10 d | 0 (no P* path) | 0.93-0.96 | cheapest |
+
+The θ 0.97 rows are "exact" against the full FD, on the drift-fixed physics with the TKE and GM
+adjoint frozen (`AdjointConfig.long_window()`), and the amplification screen is clean in all of
+them. θ moves the fixed point of the stress tangent and with it the size of the P* response:
+θ 0.99 overshoots (1.08 at March 5 d), θ 1 is unstable, and κ0 only changes the pseudo-time path
+(κ0 4 diverges). docs/PORTING_LESSONS.md I17 and I19.
+
+The cheapest option, if only C_d (drag) matters, is `adjoint_damping="local"` with
+`adjoint_kappa=0`.
 
 ```python
-adj = AdjointConfig(freeze_mixing=True)                        # ocean
-ice = IceConfig(whichEVP=1, adjoint_mode="rheology")    # ice
-integrate(state, mesh, op, stress, n_steps=n, params=p, dt=1800.0,
-          gm_cfg=gm_cfg, tke_cfg=tke_cfg, ale_cfg=ale_cfg,
-          ice_cfg=ice, adjoint_cfg=adj)
+adj = AdjointConfig(freeze_mixing=True)                                      # ocean
+ice = IceConfig(whichEVP=1, adjoint_mode="exact", adjoint_damping="frozen_sweep")  # ice
 ```
 
-The three modes: `"rheology"` (recommended), `"frozen"` (freeze the whole ice update — the
-conservative fallback, and what every published adjoint sea-ice study fell back to),
-`"exact"` (faithful, and returns NaN on realistic configurations). An unknown mode raises.
-Tests: `fesom_jax/tests/test_ice_adjoint_mode.py`. Worked example on the public data release:
-`examples/05_five_day_adjoint.ipynb`.
+**Without ice controls, `IceConfig(adjoint_mode="rheology")` remains a good choice.** It
+differentiates ice thermodynamics, advection, the concentration cut-off and the ocean-to-ice
+coupling, and unrolls **zero** momentum-solver subcycles, so only the ice velocity is dark. It
+runs on both the mEVP and the standard-EVP path. Measured at a 5-day window: clean and
+reproducible, growth 1.0004 per timestep, and it changes an eddy-diffusivity gradient by 0.21%
+against freezing the whole ice. `"frozen"` freezes the whole ice update (the conservative
+fallback). `"exact"` with `adjoint_damping="none"` unrolls the exact tangent and returns NaN.
+An unknown mode raises. Tests: `fesom_jax/tests/test_ice_adjoint_mode.py`,
+`test_ice_damping_config.py`, `test_ice_frozen_sweep.py`. Worked example on the public data
+release: `examples/05_five_day_adjoint.ipynb`.
 
 #### How it was found, and what does not work
 
@@ -511,7 +532,10 @@ The momentum solve is solely responsible; the two dominant cotangent components 
 `v_ice`, three orders above everything else.
 
 **It is the unrolling, not a term.** The reverse pass amplifies by a steady ~4e8 per model step
-from the very first backward step — 1.18 per subcycle over 120 sweeps. It is not a threshold:
+from the very first backward step. In August this was read as 1.18 per subcycle over 120 sweeps.
+The 2026-10 mode study (docs/PORTING_LESSONS.md I5) found otherwise. The growth sits in single
+near-rigid elements, whose stability number γ/(αβ) is 6-130: a stress mode that flips sign every
+sweep and grows 6-18 per sweep there. It is not a threshold:
 the forward deformation rate, ice concentration near the 1% branch, and nodes at full
 concentration are all flat across the apparent "cliff". (The cliff in the gradient at 4 steps
 was an artefact: `dL/dm` sums per-step contributions of alternating sign, and for short windows
@@ -522,26 +546,28 @@ they cancel while the cotangent underneath is already growing.)
 - *Constant viscosities in the adjoint* (Toyoda et al. 2019, used by Lyu et al. 2023) — removes
   one term's contribution to the per-sweep Jacobian but leaves the 120-sweep unrolling
   untouched. Measured: still NaN.
-- *Newtonian damping of the adjoint* (the only published route that keeps EVP rather than
-  removing it; damping timescale 7 sweeps generally, 3 in thick converging ice) — measured at a
-  damping timescale of 4 sweeps it returns −3.753715e−03 against the rheology-frozen
-  −3.751338e−03, i.e. **the same answer as freezing, while still paying to unroll all 120
-  sweeps.** Its premise is also falsified here: uniform per-sweep damping is the right shape
-  only if the amplification is uniform per sweep, and it is not — truncating to the last 32
-  sweeps stays clean where uniform growth would predict ×197. Dead idea for this model.
+- *Newtonian damping of the tangent stress* (Panteleev et al. 2020, *The Cryosphere* 14,
+  4427: damping timescale 7 sweeps generally, 3 in thick converging ice). The August test
+  scaled the whole carry, not the stress, and at 4 sweeps returned the rheology-frozen answer.
+  In 2026-10 the mode study tested the published stress forms directly (explicit, implicit,
+  the 3/7 switch). A fixed per-sweep factor cannot hold a local |λ| of 6-18, so they all blow
+  up, or survive only by removing the P* response. Local damping from the stability number
+  (`adjoint_damping="local"`) is stable for κ ≤ 0.3 but biases P* (r about 0.75, pattern
+  correlation 0.4-0.6). aEVP (FESOM2 whichEVP=2, per-element α) makes the tangent worse.
 
-**Truncated unrolling is the option if ice-velocity sensitivity is ever wanted.** Differentiate
-only the last K subcycles (`adjoint_subcycles=K`); K=0 is `"rheology"`, K=120 is `"exact"`.
-Measured over 8 steps, K = 0, 1, 2, 4, 8, 16 and 32 all stay at O(3e−05) and only 120 blows up
-— so the amplification is concentrated in the early sweeps, not spread evenly. Untested beyond
-8 steps; check it over a full day before relying on it.
+**What works** is to stop linearizing around the non-converged forward iterates. The frozen
+sweep (above, I5e-I5h) linearizes once at the final iterate. It raises α only in that tangent
+(γ/(α_t β_t) ≤ κ0) and keeps 95% of the viscosity's plastic softening. Freezing alone, raising α
+alone, or both with the full softening (θ = 1) all stay unstable.
+
+Truncated unrolling (`adjoint_subcycles=K`; K = 0 is `"rheology"`, K = 120 is `"exact"`) stayed
+at O(3e−05) over 8 steps for K ≤ 32. It is superseded by the frozen sweep, which carries the P*
+sensitivity of all 120 sweeps.
 
 #### Background: the published route forward
 
-The ice is currently excluded entirely (`IceConfig.adjoint_mode="frozen"`): the forward runs
-full mEVP, the backward skips the whole ice update, so no gradient flows through ice at all.
-Changes in eddy diffusivity that alter SST, hence ice formation, hence surface fluxes, are
-invisible to the gradient.
+(Written before "rheology" and "frozen_sweep" existed, when the default excluded the ice
+entirely; kept as the record of how the problem was diagnosed.)
 
 **Exact ice was tested and returns NaN**, immediately — at the first chunk of the backward,
 with the forward healthy and matching the frozen-ice forward to 2.6e−04 (the usual GPU
@@ -626,6 +652,8 @@ issues". So freezing the ice, as we do, is the established default rather than a
   viscosities constant w.r.t. strain rate, local sensitivity thresholding, KPP off, added
   horizontal diffusivity, spatial filtering of the thermodynamics adjoint.
 - Toyoda et al. (2019) — the source of the constant-viscosity adjoint approximation.
+- Panteleev et al. (2020), *The Cryosphere* 14, 4427-4451 — Newtonian damping of the tangent
+  ice stress equations (timescale 7 sweeps, 3 in thick converging ice).
 - Nakayama et al. (2021), *Adjoint-based ocean state estimation for the Amundsen and
   Bellingshausen seas*, GMD 14, 4909 — "the sea-ice adjoint is not used in this study due to
   persistent instability issues".

@@ -1,0 +1,28 @@
+# farc (global, Arctic-refined: 638 k nodes, ~5 km north of ~65N, 25-120 km elsewhere; 48 levels).
+# The CORE2 adjoint physics (core2_full.yaml: zstar + TKE + GM + mEVP, tracer (0,1)) on farc, with the
+# mEVP settings used for farc in practice: alpha = beta = 500, 120 iterations. GM keeps its resolution
+# scaling (sqrt(area)/ref, capped at 1): about full on the 60-120 km open ocean, small on the 5 km
+# Arctic nodes. Used for the sea-ice adjoint study on farc (Track I): a 5-year spin-up from the PHC
+# cold start, 2008-01-01 -> 2013-01-01, JRA55-do.
+
+ale: {}            # zstar
+gm: {}             # GM on, resolution-scaled
+kpp: null
+tke: {}            # classical TKE
+ice: {whichEVP: 1, alpha_evp: 500.0, beta_evp: 500.0, evp_rheol_steps: 120}   # mEVP; ice_dt = dt
+visc: {}
+tracer: {}
+
+dt: 900.0          # farc timestep [s]
+
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_farc
+partition: serial  # one GH200, dense
+forcing:
+  kind: core2      # the JRA55-do loader (interpolated to the farc nodes at runtime)
+  start_year: 2008
+output_dir: /work/ab0995/a270088/fesom_jax_dev/runs/farc_spinup
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null   # cold PHC IC (--ic-dir = the farc mesh directory)
+restart_out: null  # set per job (--restart-out)
+duration: 5yr      # the chain sets --steps per calendar year

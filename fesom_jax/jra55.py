@@ -56,6 +56,12 @@ DEFAULT_JRA_DIR = paths.resolve("jra_dir")
 JRA_VARS = ("uas", "vas", "huss", "rsds", "rlds", "tas", "prra", "prsn")
 N_FLD = len(JRA_VARS)
 (I_XWIND, I_YWIND, I_HUMI, I_QSR, I_QLW, I_TAIR, I_PREC, I_SNOW) = range(N_FLD)
+# FESOM2's l_mslp (gen_surface_forcing.F90: i_mslp = the next i_totfl after the eight fields above): JRA55-do
+# sea-level pressure [Pa], read only when the reader is built with mslp=True. It is the ninth field, read, time- and
+# mesh-interpolated exactly like the others (sbc_do/getcoeffld), and goes to press_air unchanged
+# (gen_forcing_couple.F90:680, "unit should be Pa").
+MSLP_VAR = "psl"
+I_MSLP = N_FLD
 
 # Namelist scalars (fesom_jra55_init, fesom_jra55.c:578-583).
 NM_NC_IYEAR = 1900
@@ -203,6 +209,7 @@ class JRAFields:
     Tair: np.ndarray
     prec_rain: np.ndarray
     prec_snow: np.ndarray
+    press_air: "np.ndarray | None" = None    # sea-level pressure [Pa]; only with mslp=True (FESOM2 l_mslp)
 
     def as_array(self) -> np.ndarray:
         """``[nod2D, 8]`` in the JRA field order (uas,vas,huss,rsds,rlds,tas,prra,prsn)."""
@@ -281,12 +288,18 @@ class _Field:
         self.t_indx_p1 = -1
         self.coef_a = None
         self.coef_b = None
+        # the current bracket's two gathered slices by 1-based time index: a roll (t, t+1) -> (t+1, t+2) starts
+        # where the last bracket ended, so it reads and interpolates one slice, not two
+        self.slices = {}
 
-    def read_slice(self, t_indx_1based: int) -> np.ndarray:
+    def read_slice(self, t_indx_1based: int, raw=None) -> np.ndarray:
         """``read_one_time_slice`` (``fesom_jra55.c:336``): the (Nlat×Nlon) slice at
         the 1-based time index, with optional lat-flip + cyclic halo. Returns a
-        flat ``[Nlat*Nlon]`` float64 array (row-major, matching ``idx4``)."""
-        raw = np.asarray(self.ncvar[t_indx_1based - 1, :, :], dtype=np.float64)
+        flat ``[Nlat*Nlon]`` float64 array (row-major, matching ``idx4``). ``raw``: the record as
+        stored, already decoded (:mod:`fesom_jax.jra_readahead`)."""
+        if raw is None:
+            raw = self.ncvar[t_indx_1based - 1, :, :]
+        raw = np.asarray(raw, dtype=np.float64)
         if self.flip_lat:
             raw = raw[::-1, :]
         sd = np.empty((self.Nlat, self.Nlon), dtype=np.float64)
@@ -316,12 +329,26 @@ class JRA55Reader:
     # build_local_forcing when dt is given) is added to every rdate; 0.0 = the legacy
     # step-start evaluation (a uniform 15-minute lag of every forcing field at dt=1800).
     midstep_days: float = 0.0
+    # With a dt ramp (run_config.DtRamp) the steps starting at or after ``midstep_switch`` = (year, day, sec) are
+    # taken with the ramp dt, so their middle is ``midstep_days_after`` past the step start (set by
+    # surface_forcing.set_midstep); None = one offset for every step.
+    midstep_switch: tuple | None = None
+    midstep_days_after: float = 0.0
 
-    def __init__(self, mesh, year: int, jra_dir: str | Path | None = None):
+    def _midstep(self, year, day, sec) -> float:
+        """The step-start -> mid-step offset [days] of the step starting at ``(year, day, sec)``."""
+        if self.midstep_switch is not None and (int(year), int(day), float(sec)) >= self.midstep_switch:
+            return self.midstep_days_after
+        return self.midstep_days
+
+    def __init__(self, mesh, year: int, jra_dir: str | Path | None = None, *, mslp: bool = False):
         """``jra_dir=None`` ⇒ resolved from ``$FESOM_JRA_DIR``, else the Levante default
         (:func:`fesom_jax.paths.require`, which raises an actionable ``FileNotFoundError``
-        if the directory is absent)."""
+        if the directory is absent). ``mslp`` (FESOM2's ``l_mslp``) adds ``psl`` as a ninth field
+        (:data:`I_MSLP`); off, the reader opens and returns exactly the eight fields it always did."""
         self.year = int(year)
+        self.mslp = bool(mslp)
+        self.vars = JRA_VARS + ((MSLP_VAR,) if self.mslp else ())
         self.N = int(mesh.nod2D)
         self.jra_dir = Path(paths.require("jra_dir", jra_dir))
 
@@ -346,12 +373,14 @@ class JRA55Reader:
         self.idx4, self.dx4, self.dy4, self.denom = self._build_stencil(
             f0.nc_lon, f0.nc_lat, f0.Nlon, f0.Nlat)
         self._grid_lon, self._grid_lat = f0.nc_lon, f0.nc_lat   # reopen_year invariance guard
+        self._ra = None                          # the read-ahead workers (jra_readahead), made at the first chunk
+        self._ra_checked = False
 
     def _open_fields(self, year: int) -> "list[_Field]":
-        """Open the 8 JRA fields for ``year`` (``{var}.{year:04d}.nc``) and verify they share one
-        (lon,lat) grid — the precondition for the single shared bilinear stencil."""
+        """Open the 8 JRA fields (9 with ``mslp``) for ``year`` (``{var}.{year:04d}.nc``) and verify they share
+        one (lon,lat) grid — the precondition for the single shared bilinear stencil."""
         fields = [_Field(var, str(self.jra_dir / f"{var}.{int(year):04d}.nc"), int(year))
-                  for var in JRA_VARS]
+                  for var in self.vars]
         f0 = fields[0]
         for f in fields[1:]:
             if not (np.array_equal(f.nc_lon, f0.nc_lon)
@@ -379,6 +408,8 @@ class JRA55Reader:
             raise ValueError(f"JRA55 year {year}'s grid differs from the build year's — the "
                              "shared interpolation stencil cannot be reused.")
         for f in self.fields:                  # release the old year's open Datasets
+            if self._ra is not None:
+                self._ra.forget(f.path)
             f.close()
         self.fields = new_fields
         self.year = year
@@ -502,6 +533,41 @@ class JRA55Reader:
         return num / self.denom
 
     # ---- per-field time coefficients (getcoeffld) ----------------------
+    def _slice(self, f: _Field, t_indx: int) -> np.ndarray:
+        """``_gather(f.read_slice(t_indx))``, or the same array from the field's last bracket (the C reads and
+        gathers both ends at every roll; the values are the same, the host forcing does half the work)."""
+        got = f.slices.get(t_indx)
+        if got is not None:
+            return got
+        raw = self._ra.take(f.path, t_indx) if self._ra is not None else None
+        return self._gather(f.read_slice(t_indx, raw))
+
+    def _read_ahead(self, rdates):
+        """Ask the read-ahead workers (``$FESOM_FORCING_PROCS``; none by default) for every record the brackets of
+        ``rdates`` touch that the fields do not hold yet."""
+        if not self._ra_checked:
+            from . import jra_readahead
+            n = jra_readahead.workers()
+            self._ra = jra_readahead.ReadAhead(n) if n > 0 else None
+            self._ra_checked = True
+        if self._ra is None:
+            return
+        for f in self.fields:
+            lo = min(max(_binarysearch(f.nc_time, float(rdates[0])), 1), f.Ntime)
+            hi = min(_binarysearch(f.nc_time, float(rdates[-1])) + 1, f.Ntime)
+            for t in range(lo, hi + 1):
+                if t not in f.slices:
+                    self._ra.want(f.path, f.var, t)
+
+    def read_ahead(self, dates):
+        """The request :meth:`bracket_schedule` makes, for steps evaluated one by one through :meth:`step` (the
+        adjoint drivers' chunks): ``dates`` = ``(year, day, sec[, month])`` in this reader's year, in step order.
+        Without workers it does nothing; with them :meth:`step` takes the records decoded, the same bytes."""
+        cal0 = self.fields[0].calendar
+        rdates = np.asarray([float(_julday(int(d[0]), 1, 1, cal0)) + float(d[1] - 1) + d[2] / 86400.0
+                             + float(self._midstep(d[0], d[1], d[2])) for d in dates])
+        self._read_ahead(rdates)
+
     def _getcoeffld(self, f: _Field, rdate: float):
         """``getcoeffld`` (``fesom_jra55.c:386``): locate the bracketing slices around
         ``rdate``, bilinear-interp each, set ``f.coef_a``/``f.coef_b`` + the bracket."""
@@ -515,10 +581,12 @@ class JRA55Reader:
         else:                                            # t_indx <= 0: no past extrap
             t_indx = 1; t_indx_p1 = 1; delta_t = 1.0
 
-        d1 = self._gather(f.read_slice(t_indx))
-        d2 = d1 if t_indx_p1 == t_indx else self._gather(f.read_slice(t_indx_p1))
+        d1 = self._slice(f, t_indx)
+        d2 = d1 if t_indx_p1 == t_indx else self._slice(f, t_indx_p1)
+        f.slices = {t_indx: d1, t_indx_p1: d2}
         f.coef_a = (d2 - d1) / delta_t
         f.coef_b = d1 - f.coef_a * f.nc_time[t_indx - 1]
+        f.d1, f.t0 = d1, f.nc_time[t_indx - 1]     # point-slope form (single precision, FESOM2 #940)
         f.t_indx = t_indx
         f.t_indx_p1 = t_indx_p1
 
@@ -544,19 +612,27 @@ class JRA55Reader:
         return rdate < lo or rdate > hi
 
     # ---- per-step update (fesom_jra55_step) ----------------------------
-    def step(self, year: int, day: int, sec: float) -> JRAFields:
+    def step(self, year: int, day: int, sec: float, *, point_slope: bool = False) -> JRAFields:
         """``fesom_jra55_step`` (``:638``): refresh per-field coefficients as needed,
         time-interpolate, distribute to physics units, rotate the wind. ``day`` is
-        1-based day-of-year, ``sec`` is seconds-into-day."""
+        1-based day-of-year, ``sec`` is seconds-into-day.
+
+        ``point_slope`` (single precision, FESOM2 #940, ``gen_surface_forcing.F90:200-210``): the WP values
+        ``coef_b + f32(rdate − t0)·coef_a`` with ``coef_b`` the field at the bracket start and the elapsed time
+        formed in float64, evaluated in float32 (the default keeps the double-precision ``rdate·coef_a + coef_b``)."""
         cal0 = self.fields[0].calendar
         rdate = (float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
-                 + float(self.midstep_days))
+                 + float(self._midstep(year, day, sec)))
 
         vals = []
         for f in self.fields:
             if self._needs_refresh(f, rdate):
                 self._getcoeffld(f, rdate)
-            vals.append(rdate * f.coef_a + f.coef_b)
+            if point_slope:
+                el = np.float32(rdate - f.t0)
+                vals.append(np.asarray(f.d1, np.float32) + el * np.asarray(f.coef_a, np.float32))
+            else:
+                vals.append(rdate * f.coef_a + f.coef_b)
 
         u = vals[I_XWIND]
         v = vals[I_YWIND]
@@ -572,10 +648,11 @@ class JRA55Reader:
             Tair=vals[I_TAIR] - 273.15,
             prec_rain=vals[I_PREC] / 1000.0,
             prec_snow=vals[I_SNOW] / 1000.0,
+            press_air=vals[I_MSLP] if self.mslp else None,
         )
 
     # ---- per-chunk bracket schedule (the on-device forcing seam) --------
-    def bracket_schedule(self, dates, nb: int):
+    def bracket_schedule(self, dates, nb: int, *, point_slope: bool = False):
         """Per-chunk coefficient TABLES + per-step schedule for the on-device combine
         (``docs/plans/20260715-fesom-jax-ondevice-forcing.md``): instead of evaluating
         ``rdate·coef_a + coef_b`` on host every step, hand the device the (few) bracket
@@ -586,7 +663,8 @@ class JRA55Reader:
         depth (pad target — fixed per (chunk length, dt) so the compiled executable is
         reusable across chunks). Returns ``(coef_a, coef_b, rdates, fidx)`` with
         ``coef_a``/``coef_b`` ``[N_FLD, nb, nod2D]`` float64, ``rdates [T]`` float64 and
-        ``fidx [T, N_FLD]`` int32, satisfying BIT-exactly (same values, same op order)
+        ``fidx [T, N_FLD]`` int32 (``N_FLD + 1`` rows with ``mslp``, ``psl`` last), satisfying BIT-exactly (same
+        values, same op order)
 
             rdates[i]·coef_a[f, fidx[i, f]] + coef_b[f, fidx[i, f]]
                 == the raw ``vals[f]`` of ``step(*dates[i])``
@@ -596,7 +674,11 @@ class JRA55Reader:
         3 h / day per field) instead of per step. Unused pad rows stay zero and are
         never indexed. Uses/advances the same per-field bracket cache as :meth:`step`
         (afterwards the cache holds the chunk's LAST bracket — exactly as if
-        :meth:`step` had walked the chunk)."""
+        :meth:`step` had walked the chunk).
+
+        ``point_slope`` (single precision): ``coef_b`` holds the bracket-start value ``d1`` (float32), ``coef_a``
+        the float32 slope, and a fifth return value ``elapsed [T, N_FLD]`` = ``f32(rdate − t0)`` (formed in float64)
+        so the device evaluates ``coef_b + elapsed·coef_a`` in float32 (FESOM2 #940)."""
         dates = list(dates)
         T = len(dates)
         cal0 = self.fields[0].calendar
@@ -605,11 +687,16 @@ class JRA55Reader:
             year, day, sec = d[0], d[1], d[2]
             # the exact step() expression (same op order ⇒ same f64 value)
             rdates[i] = (float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
-                         + float(self.midstep_days))
+                         + float(self._midstep(year, day, sec)))
 
-        coef_a = np.zeros((N_FLD, nb, self.N), dtype=np.float64)
-        coef_b = np.zeros((N_FLD, nb, self.N), dtype=np.float64)
-        fidx = np.empty((T, N_FLD), dtype=np.int32)
+        self._read_ahead(rdates)
+        # point-slope tables are float32: the rows round on assignment, as the astype of a float64 table would
+        tdt = np.float32 if point_slope else np.float64
+        nf = len(self.fields)                    # N_FLD, + 1 with mslp
+        coef_a = np.zeros((nf, nb, self.N), dtype=tdt)
+        coef_b = np.zeros((nf, nb, self.N), dtype=tdt)
+        fidx = np.empty((T, nf), dtype=np.int32)
+        elapsed = np.empty((T, nf), dtype=np.float32) if point_slope else None
         for fi, f in enumerate(self.fields):
             nb_used = 0
             cur_key = None
@@ -625,15 +712,22 @@ class JRA55Reader:
                             f"steps touches more than nb={nb} brackets — raise nb "
                             f"(driver formula: chunk_seconds//10800 + 2).")
                     coef_a[fi, nb_used] = f.coef_a
-                    coef_b[fi, nb_used] = f.coef_b
+                    coef_b[fi, nb_used] = f.d1 if point_slope else f.coef_b
                     cur_key = key
                     nb_used += 1
                 fidx[i, fi] = nb_used - 1
+                if point_slope:
+                    elapsed[i, fi] = np.float32(rdate - f.t0)
+        if point_slope:
+            return coef_a, coef_b, rdates, fidx, elapsed
         return coef_a, coef_b, rdates, fidx
 
     def close(self):
         for f in self.fields:
             f.close()
+        if self._ra is not None:
+            self._ra.close()
+            self._ra = None
 
     def __enter__(self):
         return self

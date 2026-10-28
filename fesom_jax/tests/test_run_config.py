@@ -35,6 +35,8 @@ DT = 100.0
 
 def _leaves_equal(a: State, b: State) -> bool:
     for f in dataclasses.fields(State):
+        if getattr(a, f.name) is None:   # unused optional field
+            continue
         if not np.array_equal(np.asarray(getattr(a, f.name)), np.asarray(getattr(b, f.name))):
             return False
     return True
@@ -113,6 +115,152 @@ def test_core2_config_loads():
     assert cfg.gm is not None                        # GM on for CORE2
 
 
+def test_core2_gpu_config():
+    """``configs/core2_gpu.yaml`` (CORE2 GPU speed plan, Task 3) = ``core2_full.yaml`` + the two
+    certified speed options (Chebyshev CG preconditioner degree 3 / kappa 30, on-device forcing)
+    and no default restart target. ``core2_full.yaml`` keeps both OFF: it is the adjoint's
+    reference configuration (``scripts/adjoint/core2_adj.py`` refuses the preconditioner)."""
+    full = load_yaml(CONFIGS / "core2_full.yaml")
+    gpu = load_yaml(CONFIGS / "core2_gpu.yaml")
+    assert gpu.ssh_cheb() == (3, 30.0)
+    assert gpu.forcing["on_device"] is True
+    assert gpu.restart_out is None
+    assert gpu.gpu_env() == {"FESOM_HALO_COMPACT": "1", "FESOM_COLUMN_UNROLL": "1",
+                             "FESOM_MEVP_WIDE": "12", "FESOM_SSH_ELL": "1", "FESOM_CG_BATCH": "4",
+                             "FESOM_MEVP_UNROLL": "12", "FESOM_COLUMN_KERNEL": "1", "FESOM_SSH_INC_ELL": "1",
+                             "FESOM_OUTPUT_ASYNC": "1", "FESOM_RESTART_ASYNC": "1", "FESOM_FORCING_AHEAD": "2"}
+    assert gpu.gpu["lane_order"] == "rcm"           # applied by the driver, not an environment switch
+    assert gpu.ssh_gathered() and not full.ssh_gathered()
+    assert full.ssh_cheb()[0] == 0 and not full.forcing.get("on_device")
+    assert full.gpu is None and full.gpu_env() == {}
+    assert dataclasses.replace(gpu, ssh=full.ssh, forcing=full.forcing, gpu=full.gpu,
+                               restart_out=full.restart_out) == full
+
+
+def test_gpu_block_validation():
+    with pytest.raises(KeyError, match="halo_compactt"):
+        RunConfig.from_dict({"gpu": {"halo_compactt": True}}).validate()
+    with pytest.raises(TypeError, match="gpu.halo_compact"):
+        RunConfig.from_dict({"gpu": {"halo_compact": 1}}).validate()
+    assert RunConfig.from_dict({"gpu": {"halo_compact": False}}).gpu_env() == {}
+
+
+def test_gpu_mevp_wide_key(monkeypatch):
+    """``gpu.mevp_wide`` is an integer K >= 0 (not a bool) and becomes ``FESOM_MEVP_WIDE=K``;
+    0 is off. ``core2_gpu.yaml`` turns it on at K = 12 (user 2026-10-20)."""
+    from fesom_jax import ice_wide
+    for bad in (True, -1, 2.0, "8"):
+        with pytest.raises(TypeError, match="gpu.mevp_wide"):
+            RunConfig.from_dict({"gpu": {"mevp_wide": bad}}).validate()
+    cfg = RunConfig.from_dict({"gpu": {"mevp_wide": 8, "halo_compact": True}})
+    cfg.validate()
+    assert cfg.gpu_env() == {"FESOM_MEVP_WIDE": "8", "FESOM_HALO_COMPACT": "1"}
+    assert RunConfig.from_dict({"gpu": {"mevp_wide": 0}}).gpu_env() == {}
+    # a string switch is passed through as written (it used to become "1")
+    assert RunConfig.from_dict({"gpu": {"bgc_layout": "loop"}}).gpu_env() == {"FESOM_BGC_LAYOUT": "loop"}
+    assert RunConfig.from_dict({"gpu": {"ssh_ell": True}}).gpu_env() == {"FESOM_SSH_ELL": "1"}
+    assert RunConfig.from_dict({"gpu": {"cg_batch": 4}}).gpu_env() == {"FESOM_CG_BATCH": "4"}
+    assert RunConfig.from_dict({"gpu": {"step_unroll": 2}}).gpu_env() == {"FESOM_STEP_UNROLL": "2"}
+    assert RunConfig.from_dict({"gpu": {"ice_static": True}}).gpu_env() == {"FESOM_ICE_STATIC": "1"}
+    assert RunConfig.from_dict({"gpu": {"chunk_tail": 32}}).gpu_env() == {"FESOM_CHUNK_TAIL": "32"}
+    assert RunConfig.from_dict({"gpu": {"mevp_unroll": 12}}).gpu_env() == {"FESOM_MEVP_UNROLL": "12"}
+    assert load_yaml(CONFIGS / "core2_gpu.yaml").gpu_env()["FESOM_MEVP_WIDE"] == "12"   # on since 8980bf8
+    monkeypatch.delenv("FESOM_MEVP_WIDE", raising=False)
+    assert ice_wide.mevp_wide_from_env() == 0
+    monkeypatch.setenv("FESOM_MEVP_WIDE", "8")
+    assert ice_wide.mevp_wide_from_env() == 8
+    monkeypatch.setenv("FESOM_MEVP_WIDE", "x")
+    with pytest.raises(ValueError, match="FESOM_MEVP_WIDE"):
+        ice_wide.mevp_wide_from_env()
+
+
+def test_gpu_halo_transport_and_chunk_steps():
+    """``gpu.halo_transport`` and ``gpu.chunk_steps`` are driver keys (no environment switch); a transport other than
+    all_gather refuses ``gpu.halo_compact``; bad values are refused."""
+    cfg = RunConfig.from_dict({"gpu": {"halo_transport": "padded", "chunk_steps": 96, "column_unroll": True}})
+    cfg.validate()
+    assert cfg.halo_transport() == "padded" and cfg.chunk_steps() == 96
+    assert cfg.gpu_env() == {"FESOM_COLUMN_UNROLL": "1"}
+    assert RunConfig.from_dict({}).halo_transport() == "all_gather" and RunConfig.from_dict({}).chunk_steps() is None
+    with pytest.raises(ValueError, match="halo_compact"):
+        RunConfig.from_dict({"gpu": {"halo_transport": "padded", "halo_compact": True}}).validate()
+    with pytest.raises(ValueError, match="halo_transport"):
+        RunConfig.from_dict({"gpu": {"halo_transport": "pigeon"}}).validate()
+    with pytest.raises(TypeError, match="chunk_steps"):
+        RunConfig.from_dict({"gpu": {"chunk_steps": 0}}).validate()
+
+
+def test_split_tails():
+    """``gpu.chunk_tail``: a short chunk of a multiple of q steps becomes q-chunks; the bootstrap flag stays on the
+    first; full chunks and other lengths are untouched; 0 is off."""
+    from fesom_jax.run import Chunk, split_tails
+    ch = [Chunk(0, 64, 2700.0, True), Chunk(64, 96, 2700.0, False), Chunk(160, 64, 2700.0, False),
+          Chunk(224, 32, 2700.0, False), Chunk(256, 48, 2700.0, False)]
+    got = split_tails(ch, 96, 32)
+    assert [(c.start, c.count, c.bootstrap_ab2) for c in got] == [
+        (0, 32, True), (32, 32, False), (64, 96, False), (160, 32, False), (192, 32, False), (224, 32, False),
+        (256, 48, False)]
+    assert split_tails(ch, 96, 0) == ch
+
+
+def test_gpu_ordered_sums_key(monkeypatch):
+    """``gpu.ordered_sums`` (a bool) becomes ``FESOM_ORDERED_SUMS=1``, read by ``ops.ordered_sums_enabled``;
+    off unless the config turns it on (``core2_gpu.yaml`` does not, yet)."""
+    from fesom_jax import ops
+    with pytest.raises(TypeError, match="gpu.ordered_sums"):
+        RunConfig.from_dict({"gpu": {"ordered_sums": 1}}).validate()
+    cfg = RunConfig.from_dict({"gpu": {"ordered_sums": True}})
+    cfg.validate()
+    assert cfg.gpu_env() == {"FESOM_ORDERED_SUMS": "1"}
+    assert RunConfig.from_dict({"gpu": {"ordered_sums": False}}).gpu_env() == {}
+    assert "FESOM_ORDERED_SUMS" not in load_yaml(CONFIGS / "core2_gpu.yaml").gpu_env()
+    monkeypatch.delenv("FESOM_ORDERED_SUMS", raising=False)
+    assert not ops.ordered_sums_enabled()
+    monkeypatch.setenv("FESOM_ORDERED_SUMS", "1")
+    assert ops.ordered_sums_enabled()
+    monkeypatch.setenv("FESOM_ORDERED_SUMS", "0")
+    assert not ops.ordered_sums_enabled()
+
+
+def test_run_from_config_gpu_env_is_scoped(monkeypatch):
+    """``run_from_config`` sets the ``gpu:`` switches for the run only, and an explicit
+    environment setting wins over the config."""
+    import os
+    from fesom_jax import run
+    seen = {}
+
+    @run._with_gpu_env
+    def fake(cfg):
+        seen.update({k: os.environ.get(k) for k in ("FESOM_HALO_COMPACT", "FESOM_COLUMN_UNROLL")})
+        raise RuntimeError("boom")
+
+    cfg = RunConfig.from_dict({"gpu": {"halo_compact": True, "column_unroll": True}})
+    monkeypatch.delenv("FESOM_HALO_COMPACT", raising=False)
+    monkeypatch.setenv("FESOM_COLUMN_UNROLL", "0")
+    with pytest.raises(RuntimeError, match="boom"):
+        fake(cfg)
+    assert seen == {"FESOM_HALO_COMPACT": "1", "FESOM_COLUMN_UNROLL": "0"}
+    assert "FESOM_HALO_COMPACT" not in os.environ
+    assert os.environ["FESOM_COLUMN_UNROLL"] == "0"
+
+
+def test_ice_ave_steps_config():
+    """``ice.ice_ave_steps`` (speed plan Task 12): N >= 1 validates and ``ice_dt = N*dt``
+    (``ice_setup_step.F90:56``); 0, negatives and non-integers are refused. Until Task 12 this
+    was a guard refusing anything but 1 (the ice ran every step while ice_dt doubled)."""
+    from fesom_jax.ice import IceConfig
+    from fesom_jax.ice_step import _with_ice_dt
+    for n in (1, 2, 3):
+        RunConfig.from_dict({"ice": {"ice_ave_steps": n}}).validate()
+        assert _with_ice_dt(IceConfig(ice_ave_steps=n), 1800.0).ice_dt == n * 1800.0
+    for bad in (0, -1, 1.5, True):
+        with pytest.raises(ValueError, match="ice_ave_steps"):
+            RunConfig.from_dict({"ice": {"ice_ave_steps": bad}}).validate()
+    with pytest.raises(ValueError, match="ice_ave_steps"):
+        _with_ice_dt(IceConfig(ice_ave_steps=0), 1800.0)
+    assert _with_ice_dt(IceConfig(), 1800.0).ice_dt == 1800.0
+
+
 # --------------------------------------------------------------------------
 # 5. Unknown keys raise (no silent typos) — top level and sub-config
 # --------------------------------------------------------------------------
@@ -183,3 +331,14 @@ def test_restart_archive_yaml_roundtrip(tmp_path):
 def test_run_config_ok():
     assert RunConfig.defaults() == RunConfig()
     print("RUN_CONFIG_OK")
+
+
+def test_executable_cache_key_follows_the_trace_time_switches(monkeypatch):
+    """The forced runner's executable cache keys on the FESOM_* switches read at trace time, so a second run in
+    one process with other `gpu:` options cannot reuse an executable traced under the first run's options."""
+    from fesom_jax import integrate_sharded as ish
+    monkeypatch.delenv("FESOM_HALO_COMPACT", raising=False)
+    a = ish._trace_env()
+    monkeypatch.setenv("FESOM_HALO_COMPACT", "1")
+    b = ish._trace_env()
+    assert a != b and ("FESOM_HALO_COMPACT", "1") in b

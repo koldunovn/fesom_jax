@@ -805,7 +805,8 @@ def assemble_mixing(mesh: Mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffK
 # ============================================================================
 def mixing_kpp(mesh: Mesh, uv, bvfreq, dbsfc, sw_alpha, sw_beta, S,
                heat_flux, water_flux, stress_node_surf, sw_3d, hnode, cfg: KppConfig,
-               exch=None, Z3d=None, zbar3=None, *, freeze_convection: bool = False):
+               exch=None, Z3d=None, zbar3=None, *, freeze_convection: bool = False,
+               conv_surrogate: float | None = None):
     """Assembled KPP vertical-mixing driver — the mirror of ``fesom_kpp_mixing``
     (``fesom_kpp.c:784-939``) preceded by ``compute_vel_nodes`` and followed by the
     shared ``mo_convect`` (the ``fesom_step.c:251-264`` dispatch). Returns
@@ -860,5 +861,6 @@ def mixing_kpp(mesh: Mesh, uv, bvfreq, dbsfc, sw_alpha, sw_beta, S,
         mesh, blmcM, blmcT, blmcS, ghats, viscA, diffKt, diffKs, kbl, cfg, exch=exch)
 
     # shared convective adjustment (fesom_step.c:264 — applied after PP or KPP)
-    Kv, Av = pp.mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection)
+    Kv, Av = pp.mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection,
+                           surrogate_dn2=conv_surrogate)
     return Kv, Av, uvnode

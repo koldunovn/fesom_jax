@@ -125,6 +125,8 @@ def test_serial_sharded_step_matches_dense():
 
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_dense, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_dense, fld.name))
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
@@ -171,6 +173,8 @@ def _owned_match(st_dense, st_N, mesh, part, npes, *, tag="",
     worst_clean = 0.0
     rows = []
     for fld in dataclasses.fields(State):
+        if getattr(st_dense, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_dense, fld.name))
         B = np.asarray(getattr(st_N, fld.name))
         if a.shape[0] == mesh.nod2D:
@@ -258,6 +262,8 @@ def test_ragged_step_matches_allgather(npes):
     st_rg = ish.run_step_sharded(sm, state_p, sop, stress_p, use_ragged=True, **kw)
     rows, worst = [], 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_ag, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_ag, fld.name))
         b = np.asarray(getattr(st_rg, fld.name))
         if a.ndim < 2:
@@ -303,6 +309,8 @@ def test_padded_step_matches_allgather(npes):
     st_pd = ish.run_step_sharded(sm, state_p, sop, stress_p, use_padded=True, **kw)
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_ag, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_ag, fld.name))
         b = np.asarray(getattr(st_pd, fld.name))
         if a.ndim < 2:
@@ -313,6 +321,102 @@ def test_padded_step_matches_allgather(npes):
             if md:
                 worst = max(worst, float(np.max(np.abs(a[d, :md] - b[d, :md]))))
     assert worst < 1e-5, f"padded step != all_gather on owned: worst max|Δ|={worst:.3e}"
+
+
+@avail
+@pytest.mark.parametrize("npes", [2])
+def test_column_unroll_compact_step_matches_scan(npes, monkeypatch):
+    """``FESOM_COLUMN_UNROLL=1`` + ``FESOM_HALO_COMPACT=1`` (the GPU layout pair) leave the full
+    sharded ocean step at round-off from the default (``lax.scan`` level sweeps, all_gather halo).
+    NOT bitwise on CPU: unrolled, the tracer tdma fuses with its producers and XLA:CPU contracts
+    across them (job 28287268: T off by 1 ulp in 0.017 % of entries, max rel 3.7e-16); the solves
+    themselves are bitwise in isolation (test_ops.py) and the C-replay gates pass with the unroll on
+    (job 28287269)."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    state = _perturbed_state(mesh)
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    state_p = shard_mesh.partition_state(state, part)
+    sop = ssh.partition_ssh_operator(op, part)
+    stress_p = _stress_p(mesh, part, sm.Lmax["elem"])
+    kw = dict(dt=DT, is_first_step=True, npes=npes)
+    monkeypatch.delenv("FESOM_HALO_COMPACT", raising=False)
+    monkeypatch.delenv("FESOM_COLUMN_UNROLL", raising=False)
+    st_ref = ish.run_step_sharded(sm, state_p, sop, stress_p, **kw)
+    monkeypatch.setenv("FESOM_HALO_COMPACT", "1")
+    monkeypatch.setenv("FESOM_COLUMN_UNROLL", "1")
+    st_new = ish.run_step_sharded(sm, state_p, sop, stress_p, **kw)
+    for fld in dataclasses.fields(State):
+        if getattr(st_new, fld.name) is None:   # unused optional field
+            continue
+        a = np.asarray(getattr(st_new, fld.name))
+        b = np.asarray(getattr(st_ref, fld.name))
+        # 1e-11 of the field's scale: the 1-ulp T difference reaches w (a cumulative sum of the
+        # divergence) as 1.5e-17 on a 3e-4 field, 2e-9 relative on its smallest entries (job 28288425)
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-11 * max(np.abs(b).max(), 1e-300),
+                                   err_msg=fld.name)
+
+
+@avail
+@pytest.mark.parametrize("npes", [2])
+def test_ssh_ell_step_matches_coo(npes):
+    """The full sharded ocean step with the ELL-layout SSH operator (``ssh.to_ell_sharded``) stays at round-off
+    from the COO step (the same products in the same order; XLA:CPU fuses each multiply-add into an FMA)."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    state = _perturbed_state(mesh)
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    state_p = shard_mesh.partition_state(state, part)
+    sop = ssh.partition_ssh_operator(op, part)
+    stress_p = _stress_p(mesh, part, sm.Lmax["elem"])
+    kw = dict(dt=DT, is_first_step=True, npes=npes)
+    st_coo = ish.run_step_sharded(sm, state_p, sop, stress_p, **kw)
+    st_ell = ish.run_step_sharded(sm, state_p, ssh.to_ell_sharded(sop), stress_p, **kw)
+    for fld in dataclasses.fields(State):
+        if getattr(st_ell, fld.name) is None:   # unused optional field
+            continue
+        a = np.asarray(getattr(st_ell, fld.name))
+        b = np.asarray(getattr(st_coo, fld.name))
+        np.testing.assert_allclose(a, b, rtol=0, atol=1e-9 * max(np.abs(b).max(), 1e-300),
+                                   err_msg=fld.name)          # the CG stops at its tolerance either way
+
+
+@avail
+@pytest.mark.parametrize("mode", ["1", "2"])
+@pytest.mark.parametrize("npes", [2])
+def test_compact_step_matches_allgather(npes, mode, monkeypatch):
+    """``FESOM_HALO_COMPACT=1``: the full sharded ocean step with the compact all_gather (only
+    the lanes other devices read) is BITWISE the all_gather step on every lane — it moves the
+    same values; only the wire volume differs."""
+    if NDEV < npes:
+        pytest.skip(f"needs {npes} devices, have {NDEV}")
+    mesh = load_mesh(CORE2_MESH)
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    state = _perturbed_state(mesh)
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    state_p = shard_mesh.partition_state(state, part)
+    sop = ssh.partition_ssh_operator(op, part)
+    stress_p = _stress_p(mesh, part, sm.Lmax["elem"])
+    kw = dict(dt=DT, is_first_step=True, npes=npes)
+    monkeypatch.delenv("FESOM_HALO_COMPACT", raising=False)
+    st_ag = ish.run_step_sharded(sm, state_p, sop, stress_p, **kw)
+    monkeypatch.setenv("FESOM_HALO_COMPACT", mode)
+    assert "cs_nod" in ish._halo_arrays(sm)[0]
+    st_cp = ish.run_step_sharded(sm, state_p, sop, stress_p, **kw)
+    for fld in dataclasses.fields(State):
+        if getattr(st_cp, fld.name) is None:   # unused optional field
+            continue
+        np.testing.assert_array_equal(np.asarray(getattr(st_cp, fld.name)),
+                                      np.asarray(getattr(st_ag, fld.name)), err_msg=fld.name)
+    with pytest.raises(ValueError, match="FESOM_HALO_COMPACT"):
+        ish._halo_arrays(sm, padded=True)
 
 
 @avail
@@ -341,6 +445,8 @@ def test_coloured_step_matches_allgather(npes):
     st_cl = ish.run_step_sharded(sm, state_p, sop, stress_p, use_coloured=True, **kw)
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_ag, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_ag, fld.name))
         b = np.asarray(getattr(st_cl, fld.name))
         if a.ndim < 2:
@@ -388,6 +494,8 @@ def test_gm_serial_sharded_step_matches_dense():
 
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_dense, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_dense, fld.name))
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
@@ -532,6 +640,8 @@ def test_kpp_serial_sharded_step_matches_dense(core2_forced):
     st_dense, st_N = _forced_sharded_step(fx, ser, 1, kpp_cfg=KppConfig())
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_dense, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_dense, fld.name))
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
@@ -578,6 +688,8 @@ def test_tke_serial_sharded_step_matches_dense(core2_forced):
     st_dense, st_N = _forced_sharded_step(fx, ser, 1, tke_cfg=TkeConfig())
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_dense, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_dense, fld.name))
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
@@ -651,6 +763,8 @@ def test_ice_serial_sharded_step_matches_dense(core2_forced):
                                           boundary_node_p=bn_p)
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_dense, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_dense, fld.name))
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
@@ -698,6 +812,8 @@ def test_mevp_serial_sharded_step_matches_dense(core2_forced):
                                           boundary_node_p=bn_p)
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_dense, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_dense, fld.name))
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
@@ -766,6 +882,8 @@ def test_multistep_scan_lowers_and_is_finite(npes):
     # no tight compare; the per-step gate is teacher-forced below).
     n2 = ish.run_steps_sharded(sm, state_p, sop, stress_p, 2, dt=DT, npes=npes)
     for fld in dataclasses.fields(State):
+        if getattr(n2, fld.name) is None:   # unused optional field
+            continue
         v = np.asarray(getattr(n2, fld.name))
         assert np.isfinite(v).all(), f"multistep n=2: {fld.name} has non-finite lanes"
     # T on OWNED lanes stays physical (boolean mask [P, Lmax] selects the leading 2 axes of
@@ -868,6 +986,8 @@ def test_zstar_serial_sharded_step_matches_dense(core2_forced):
                                           boundary_node_p=bn_p)
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(st_dense, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(st_dense, fld.name))
         b = np.asarray(getattr(st_N, fld.name))[0][: a.shape[0]]
         if a.size:
@@ -903,3 +1023,60 @@ def test_zstar_assembled_sharded_owned_matches(npes, core2_forced):
                                           boundary_node_p=bn_p)
     _owned_match(st_dense, st_N, mesh, part, npes, tag="zstar", fct_atol=3e-2,
                  extra_fct=_ICE_FIELDS)
+
+
+# ==========================================================================
+# 10. Sea ice every second step (ice_ave_steps = 2, speed plan Task 12): dense == dist_4
+# ==========================================================================
+@avail
+@have_forcing
+@pytest.mark.skipif(NDEV < 4 or not (CORE2_DIST / "dist_4").is_dir(),
+                    reason="needs 4 devices and the CORE2 dist_4 partition")
+def test_ice_ave_steps_sharded_owned_matches():
+    """Sea ice every second step under shard_map on dist_4, teacher-forced like the multi-step
+    gates above: steps 1 (update), 2 (hold) and 3 (update, with the running means) each start
+    from the DENSE state of the step before (ice counter, means and held fluxes included) and the
+    one sharded step matches the dense step on OWNED entities at the mEVP step gate's tolerance
+    (_CLEAN_ATOL; the FCT tracers, the ice scalars, the means of the FCT tracers and the held
+    thermo outputs at 2e-2; sigma printed, not gated). The counter and the flag must be equal.
+    The ice update runs under lax.cond with the halo exchanges inside the branch."""
+    from fesom_jax import ice_evp, ice_step, surface_forcing
+    from fesom_jax.ice import IceConfig
+    from fesom_jax.phc_ic import cold_start_state
+    ice2 = IceConfig(whichEVP=1, ice_ave_steps=2)
+    mesh = load_mesh(CORE2_MESH)
+    state = ice_step.init_ice_avg(cold_start_state(mesh, IC_DIR), ice2)   # + the seeded ice
+    cf = surface_forcing.build_surface_forcing(mesh, YEAR, sst_ic=np.asarray(state.T[:, 0]))
+    op = ssh.build_ssh_operator(mesh, dt=DT)
+    n = 3
+    stack = cf.stack(surface_forcing.dates_for_steps(YEAR, DT, n))
+    part = partit.read_partition(CORE2_DIST, 4)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    sop = ssh.partition_ssh_operator(op, part)
+    fs_p = shard_mesh.partition_forcing_static(cf.static, part)
+    bn = np.asarray(ice_evp.boundary_node_mask(mesh))
+    bn_p = shard_mesh._shard_along_axis(bn, part.myList_nod2D, sm.Lmax["nod"], 0, False)
+    zero_e = jnp.zeros((mesh.elem2D, 2))
+    for s in range(n):
+        sf = jax.tree.map(lambda x: x[s], stack)
+        nxt = stepmod.step_jit(state, mesh, op, zero_e, dt=DT, is_first_step=(s == 0),
+                               step_forcing=sf, forcing_static=cf.static, ice_cfg=ice2,
+                               kpp_cfg=KppConfig())
+        seq_p = shard_mesh.partition_step_forcing(
+            jax.tree.map(lambda x: np.asarray(x)[s:s + 1], stack), part)
+        out = ish.run_steps_sharded_forced(
+            sm, shard_mesh.partition_state(jax.tree.map(np.asarray, state), part), sop,
+            jnp.zeros((4, sm.Lmax["elem"], 2)), seq_p, fs_p, 1, dt=DT, npes=4, ice_cfg=ice2,
+            kpp_cfg=KppConfig(), boundary_node_p=bn_p, bootstrap_ab2=(s == 0))
+        for f in ("ice_steps_since_upd", "ice_update"):
+            for d in range(4):
+                md = int(part.myDim_nod2D[d])
+                np.testing.assert_array_equal(np.asarray(getattr(out, f))[d, :md],
+                                              np.asarray(getattr(nxt, f))[part.myList_nod2D[d][:md]])
+        assert int(np.asarray(nxt.ice_update)[0]) == (1 if s % 2 == 0 else 0)
+        _owned_match(nxt, out, mesh, part, 4, tag=f"ice2-step{s + 1}", fct_atol=2e-2,
+                     extra_fct=("a_ice", "m_ice", "m_snow", "t_skin", "srfoce_temp",
+                                "srfoce_salt", "ice_flx_h", "ice_flx_fw", "ice_evaporation",
+                                "ice_sublimation", "ice_thdgr", "ice_thdgrsn",
+                                "ice_real_salt_flux", "ice_a_old"))
+        state = nxt

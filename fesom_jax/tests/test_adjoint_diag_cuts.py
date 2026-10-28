@@ -119,9 +119,12 @@ def _rel_change(a, b):
 # config object: fields, validate, presets, describe
 # --------------------------------------------------------------------------
 def test_freeze_flags_and_known_cuts():
-    assert FREEZE_FLAGS == tuple(f for f in AdjointConfig._fields if f != "diag_cuts")
+    from fesom_jax.adjoint_stab import TKE_CANDIDATE_FIELDS
+    assert FREEZE_FLAGS == tuple(f for f in AdjointConfig._fields
+                                 if f != "diag_cuts" and f not in TKE_CANDIDATE_FIELDS)
     assert all(f.startswith("freeze_") for f in FREEZE_FLAGS)
     assert all(getattr(AdjointConfig(), f) is False for f in FREEZE_FLAGS)
+    assert all(getattr(AdjointConfig(), f) is None for f in TKE_CANDIDATE_FIELDS)
     assert AdjointConfig().diag_cuts == frozenset()
     assert set(KNOWN_CUTS) >= PHASE0_CUTS
     # cut names never duplicate a flag
@@ -157,6 +160,22 @@ def test_presets_and_describe():
     c2 = AdjointConfig(freeze_mixing=True, diag_cuts=frozenset({"mix.kv_out"}))
     assert c2.describe() == "mixing+cuts=mix.kv_out"
     assert lw.describe() == "mixing+gm_slope"
+    lt = AdjointConfig.long_window_tke()
+    assert not any(getattr(lt, f) for f in FREEZE_FLAGS) and lt.diag_cuts == frozenset()
+    assert (lt.tke_pr_cut, lt.tke_pr_ratio, lt.tke_pr_raw_cut, lt.tke_ml_cut) == \
+        (1e-8, 100.0, -1e-6, 1e-8)
+    assert lt.validate() == lt and lt.active
+    lc = AdjointConfig.long_window_combined()
+    assert {f for f in FREEZE_FLAGS if getattr(lc, f)} == {"freeze_fct_limiter"}
+    assert (lc.tke_ml_ratio, lc.tke_ml_raw_cut) == (100.0, -1e-6)
+    assert lc._replace(freeze_fct_limiter=False, tke_ml_ratio=None, tke_ml_raw_cut=None) == lt
+    assert lc.validate() == lc and lc.active
+    yc = AdjointConfig.year_window_combined()
+    assert yc._replace(tke_pr_cut=1e-8, tke_pr_lat_cut=None) == lc
+    assert (yc.tke_pr_cut, yc.tke_pr_lat_cut, yc.tke_ml_cut) == (1e-6, 70.0, 1e-8)
+    assert yc.validate() == yc
+    opt = lc.tke_options()
+    assert (opt.ml_n2_star, opt.ml_ratio, opt.ml_raw_cut) == (1e-8, 100.0, -1e-6)
 
 
 def test_dcut_primitive():
@@ -174,6 +193,41 @@ def test_dcut_primitive():
     np.testing.assert_array_equal(np.asarray(g), np.asarray(x["a"]))   # only the uncut factor
     y = dcut(cfg, "mix.kv_out", x)
     assert y["i"] is x["i"]                   # integer leaves untouched
+
+
+def test_gm_n2_cut_config_and_mask():
+    g = AdjointConfig(gm_n2_ratio=100.0, gm_n2_raw_cut=-1e-6).validate()
+    assert g.gm_n2_cut and g.active and not AdjointConfig().gm_n2_cut
+    assert g.describe() == "gm_n2_ratio=100.0+gm_n2_raw_cut=-1e-06"
+    assert g.tke_options() is None            # a GM-input cut, nothing for the TKE core
+    assert AdjointConfig(gm_n2_raw_cut=0.0).validate().gm_n2_cut
+    with pytest.raises(ValueError, match="freeze_gm_slope"):
+        AdjointConfig(gm_n2_ratio=100.0, freeze_gm_slope=True).validate()
+    with pytest.raises(ValueError, match="> 0"):
+        AdjointConfig(gm_n2_ratio=0.0).validate()
+    with pytest.raises(ValueError, match="finite"):
+        AdjointConfig(gm_n2_raw_cut=float("inf")).validate()
+    st = AdjointConfig(gm_slope_cut=2e-3).validate()
+    assert st.active and not st.gm_n2_cut and st.describe() == "gm_slope_cut=0.002"
+    with pytest.raises(ValueError, match="freeze_gm_slope"):
+        AdjointConfig(gm_slope_cut=2e-3, freeze_gm_slope=True).validate()
+    with pytest.raises(ValueError, match="> 0"):
+        AdjointConfig(gm_slope_cut=-1.0).validate()
+    assert {"gm.slope_n2", "gm.cm_n2", "gm.bvp_n2"} <= set(KNOWN_CUTS)
+    # the mask: the cancellation residual (|raw| > R |smoothed|) or the low raw N², joined
+    n2 = jnp.array([1.5e-7, 1e-5, 1e-5, 2e-4, 0.0])
+    raw = jnp.array([-6.9e-5, 5e-5, -2e-6, 1.6e-4, 0.0])
+    m = adjoint_stab.n2_cancel_mask
+    assert m(n2, raw, 100.0, None).tolist() == [True, False, False, False, False]
+    assert m(n2, raw, None, -1e-6).tolist() == [True, False, True, False, False]
+    assert m(n2, raw, 100.0, -1e-6).tolist() == [True, False, True, False, False]
+    assert m(n2, raw).tolist() == [False] * 5
+    # cut_where with that mask: forward bitwise, derivative zero only in the masked cells
+    mask = m(n2, raw, 100.0, -1e-6)
+    f = lambda x: jnp.sum(adjoint_stab.cut_where(x, mask) ** 2)   # noqa: E731
+    assert float(f(n2)) == float(jnp.sum(n2 ** 2))
+    np.testing.assert_array_equal(np.asarray(jax.grad(f)(n2)),
+                                  np.where(np.asarray(mask), 0.0, 2.0 * np.asarray(n2)))
 
 
 # --------------------------------------------------------------------------

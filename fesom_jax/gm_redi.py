@@ -45,7 +45,7 @@ def tr_xy_elem(mesh: Mesh, T_old):
 
 
 def diff_ver_part_redi_expl(mesh: Mesh, T_old, slope_tapered, Ki, hnode_new,
-                            *, dt: float = DT_DEFAULT, zbar3=None, Z3d=None):
+                            *, dt: float = DT_DEFAULT, zbar3=None, Z3d=None, content: bool = False):
     """G7a — the Redi vertical-explicit flux's contribution to T.
 
     Returns ``delta`` ``(N, nl)`` to ADD to the post-advection T. Per node:
@@ -64,7 +64,7 @@ def diff_ver_part_redi_expl(mesh: Mesh, T_old, slope_tapered, Ki, hnode_new,
     cy = jnp.where(mesh.elem_layer_mask, area_e * gy, 0.0)
     stacked = jnp.stack([cx, cy], axis=-1)                     # (E,nl,2)
     vals = jnp.broadcast_to(stacked[:, None, :, :], (E, 3, nl, 2))
-    txn_sum = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D)   # (N,nl,2)
+    txn_sum = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)   # (N,nl,2)
     asv = mesh.areasvol
     inv3 = jnp.where(asv > 0.0, 1.0 / (3.0 * jnp.where(asv > 0.0, asv, 1.0)), 0.0)
     txn = txn_sum * inv3[..., None]                            # (N,nl,2)
@@ -103,6 +103,9 @@ def diff_ver_part_redi_expl(mesh: Mesh, T_old, slope_tapered, Ki, hnode_new,
     vd_dn = jnp.concatenate([vd_flux[:, 1:], vd_flux[:, :1]], axis=1)   # vd_flux[nz+1]
     divergence = vd_flux - vd_dn
     layer = mesh.node_layer_mask
+    if content:      # single precision: the content increment (flux·dt/areasvol) added to del_ttf (#1206)
+        safe = jnp.where(asv > 0.0, asv, 1.0)
+        return jnp.where(layer, divergence * dt / safe, 0.0)
     denom = asv * hnode_new
     safe = jnp.where(denom > 0.0, denom, 1.0)
     return jnp.where(layer, divergence * dt / safe, 0.0)      # (N,nl)
@@ -114,7 +117,7 @@ def _shift_down(x):
 
 
 def diff_part_hor_redi(mesh: Mesh, T_old, slope_tapered, Ki, hnode, hnode_new,
-                       helem, *, dt: float = DT_DEFAULT):
+                       helem, *, dt: float = DT_DEFAULT, content: bool = False):
     """G7b — the horizontal Redi edge flux's contribution to T (``(N, nl)`` delta).
 
     Per edge, the C's 5 partial-cell branches A/B/C/D/E (level mismatch between the
@@ -173,8 +176,11 @@ def diff_part_hor_redi(mesh: Mesh, T_old, slope_tapered, Ki, hnode, hnode_new,
 
     # antisymmetric edge→node scatter (+c→e1, −c→e2), then ÷(areasvol·hnode_new).
     vals = jnp.stack([c, -c], axis=1)                        # (Ed,2,nl1)
-    rhs = ops.scatter_add(vals, mesh.edges, mesh.nod2D)      # (N,nl1)
+    rhs = ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)      # (N,nl1)
     rhs = jnp.pad(rhs, ((0, 0), (0, 1)))                     # (N,nl)
+    if content:      # single precision: the content increment added to del_ttf (oce_ale_tracer.F90:1904)
+        safe = jnp.where(mesh.areasvol > 0.0, mesh.areasvol, 1.0)
+        return jnp.where(mesh.node_layer_mask, rhs * dt / safe, 0.0)
     denom = mesh.areasvol * hnode_new
     safe = jnp.where(denom > 0.0, denom, 1.0)
     return jnp.where(mesh.node_layer_mask, rhs * dt / safe, 0.0)   # (N,nl)
@@ -183,15 +189,23 @@ def diff_part_hor_redi(mesh: Mesh, T_old, slope_tapered, Ki, hnode, hnode_new,
 # ============================================================================
 # G.6 — K33 isoneutral augmentation (fesom_tracer_diff.c:167-246)
 # ============================================================================
-def k33_augmentation(mesh: Mesh, slope_tapered, Ki, zbar3=None, Z3d=None):
+def k33_augmentation(mesh: Mesh, slope_tapered, Ki, zbar3=None, Z3d=None, *, legacy_weights: bool = False):
     """The Redi K33 (3,3-tensor) augmentation of the vertical tracer diffusivity:
     a per-interface ``K33_aug`` to ADD to ``Kv`` before ``impl_vert_diff`` (the C's
     ``Ty/Ty1`` terms; note ``Ty(nz) == Ty1(nz-1)`` ⇒ one per-interface value).
 
-    ``K33_aug[k] = (Z[k-1]−zbar[k])·zinv·s[k-1]²·Ki[k-1] + (zbar[k]−Z[k])·zinv·
+    ``K33_aug[k] = (zbar[k]−Z[k])·zinv·s[k-1]²·Ki[k-1] + (Z[k-1]−zbar[k])·zinv·
     s[k]²·Ki[k]`` with ``zinv=1/(Z[k-1]−Z[k])`` and ``s = slope_tapered[...,2]`` (the
-    |slope| magnitude). Static linfs vertical geometry. Returns ``(N, nl)``, on the
-    interior interfaces (0 at surface/bottom; ``impl_vert_diff`` masks anyway).
+    |slope| magnitude): the linear interpolation of the layer-centre ``s²·Ki`` to the
+    interface ``zbar[k]``, each layer weighted by the half-distance on the OTHER side, as
+    FESOM2 since PR #944 (0452259a, merged 6526e4be 2026-08-21; ``oce_ale_tracer.F90:1296,
+    1329,1331,1372`` in e96a2b13). Static linfs vertical geometry, or the live zstar one.
+    Returns ``(N, nl)``, on the interior interfaces (0 at surface/bottom; ``impl_vert_diff``
+    masks anyway).
+
+    ``legacy_weights=True`` restores the pre-#944 (swapped) weights, ``(Z[k-1]−zbar[k])`` on
+    ``s[k-1]²·Ki[k-1]`` and ``(zbar[k]−Z[k])`` on ``s[k]²·Ki[k]``. Only for the gates whose
+    C/Fortran dumps predate #944; on a uniform grid both weightings are 1/2 and agree.
 
     The vertical diffusion then uses ``Kv + K33_aug`` — since ``impl_vert_diff``
     builds ``a[nz]∝Kv[nz]``, ``c[nz]∝Kv[nz+1]``, the augmented Kv reproduces the C's
@@ -217,7 +231,11 @@ def k33_augmentation(mesh: Mesh, slope_tapered, Ki, zbar3=None, Z3d=None):
         zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(1.0 / (Zm[:, : nl - 2] - Zm[:, 1:nl - 1]))
         gu_zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(Zm[:, : nl - 2] - zbar3[:, 1:nl - 1]) * zinv
         gd_zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(zbar3[:, 1:nl - 1] - Zm[:, 1:nl - 1]) * zinv
-    K33 = gu_zinv * stKi_up + gd_zinv * stKi_full
+    # gu_zinv = (Z[k-1]−zbar[k])·zinv, the upper half-distance; gd_zinv = (zbar[k]−Z[k])·zinv, the lower one.
+    if legacy_weights:
+        K33 = gu_zinv * stKi_up + gd_zinv * stKi_full          # pre-#944
+    else:
+        K33 = gd_zinv * stKi_up + gu_zinv * stKi_full          # #944: linear interpolation to zbar[k]
 
     k = jnp.arange(nl)[None, :]
     iface = (k >= mesh.ulevels_nod2D[:, None]) & (k < (mesh.nlevels_nod2D - 1)[:, None])

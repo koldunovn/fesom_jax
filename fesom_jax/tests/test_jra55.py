@@ -312,3 +312,72 @@ def test_combine_device_matches_host_bit(jra):
         np.testing.assert_array_equal(np.asarray(sf.chl), chl_tab[i % 2])
     r.close(); r2.close()
     print(f"COMBINE_DEVICE_OK (bit-identical; prec {'bit' if div_ieee else '<=1 ULP, non-IEEE platform divide'})")
+
+
+def test_slice_cache_halves_reads_and_is_bit_identical(jra):
+    """A bracket roll (t, t+1) -> (t+1, t+2) reuses the gathered slice t+1 (``JRA55Reader._slice``): the coefficient
+    tables of a 72-h chunk (96 steps of 2700 s, the CORE2 GPU production chunk) are bit for bit those of a reader that
+    reads and gathers both ends at every roll, as the C does, with about half the netCDF reads."""
+    from fesom_jax import jra55
+    from fesom_jax.surface_forcing import dates_for_steps
+    dates = dates_for_steps(YEAR, 2700.0, 2 * 96)[96:]          # inside January: interior brackets only
+    out, reads = {}, {}
+    for cache in (True, False):
+        r = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+        n = [0]
+        for f in r.fields:
+            f.read_slice = lambda i, raw=None, orig=f.read_slice: (n.__setitem__(0, n[0] + 1), orig(i, raw))[1]
+        if not cache:
+            r._slice = lambda f, t, r=r: r._gather(f.read_slice(t))
+        out[cache] = r.bracket_schedule(dates, 26, point_slope=True)
+        reads[cache] = n[0]
+        r.close()
+    for a, b in zip(out[True], out[False]):
+        np.testing.assert_array_equal(a, b)
+    assert reads[True] < 0.6 * reads[False], reads
+
+
+def test_read_ahead_is_bit_identical(jra, monkeypatch):
+    """The JRA slices decoded ahead in worker processes (``FESOM_FORCING_PROCS`` / ``gpu.forcing_procs``,
+    :mod:`fesom_jax.jra_readahead`) give bit for bit the tables of reads in the calling thread, over two consecutive
+    chunks, and every record asked for is taken; without the variable no worker is started."""
+    from fesom_jax import jra55
+    from fesom_jax.surface_forcing import dates_for_steps
+    dates = dates_for_steps(YEAR, 2700.0, 3 * 96)[96:]          # inside January: interior brackets only
+    out = {}
+    for procs in ("0", "2"):
+        monkeypatch.setenv("FESOM_FORCING_PROCS", procs)
+        r = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+        out[procs] = [r.bracket_schedule(dates[i * 96:(i + 1) * 96], 26, point_slope=True) for i in range(2)]
+        if procs == "0":
+            assert r._ra is None
+        else:
+            assert r._ra is not None and r._ra.pending == {}, sorted(r._ra.pending)
+        r.close()
+    for a, b in zip(out["0"], out["2"]):
+        for x, y in zip(a, b):
+            np.testing.assert_array_equal(x, y)
+
+
+def test_read_ahead_of_the_per_step_path_is_bit_identical(jra, monkeypatch):
+    """:meth:`JRA55Reader.read_ahead` (the adjoint drivers' step-by-step chunks): the fields of :meth:`step` with
+    the records decoded ahead are bit for bit those of reads in the calling thread, for two 48-step chunks of 1800 s
+    taken in reverse order (the adjoint's walk: no bracket carried over), and every record asked for is taken."""
+    from fesom_jax import jra55
+    from fesom_jax.surface_forcing import dates_for_steps
+    dates = dates_for_steps(YEAR, 1800.0, 3 * 48)[48:]
+    chunks = [dates[48:], dates[:48]]
+    out = {}
+    for procs in ("0", "2"):
+        monkeypatch.setenv("FESOM_FORCING_PROCS", procs)
+        r = jra55.JRA55Reader(jra["mesh"], YEAR, JRA_DIR)
+        out[procs] = []
+        for ch in chunks:
+            r.read_ahead(ch)
+            out[procs] += [r.step(*d[:3], point_slope=True) for d in ch]
+        if procs == "2":
+            assert r._ra is not None and r._ra.pending == {}, sorted(r._ra.pending)
+        r.close()
+    for a, b in zip(out["0"], out["2"]):
+        for k in vars(a):
+            np.testing.assert_array_equal(getattr(a, k), getattr(b, k))

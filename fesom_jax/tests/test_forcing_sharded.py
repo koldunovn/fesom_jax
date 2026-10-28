@@ -70,6 +70,8 @@ def test_fold_forcing_seq_delivers_per_step():
     base = {name: ((i + 1) * 1e6 + np.arange(T)[:, None] * 1e3
                    + np.arange(nod2D)[None, :]).astype(float)
             for i, name in enumerate(fields)}
+    for i, name in enumerate(surface_forcing.STEP_SCALARS):   # per-step scalars (REcoM calendar): [T], replicated
+        base[name] = (np.arange(T) + 100 * (i + 1)).astype(np.int32)
     stack = StepForcing(**{name: base[name] for name in fields})
 
     seq_p = shard_mesh.partition_step_forcing(stack, part)        # [P, T, Lmax]
@@ -126,6 +128,9 @@ def test_host_forcing_stack_equals_device(core2_forced_seq):
     dev = fx["stack"]                                  # xp=jnp default (device)
     for fld in host._fields:
         h = getattr(host, fld)
+        if h is None:                                  # an optional field that is off (press_air)
+            assert getattr(dev, fld) is None, fld
+            continue
         assert isinstance(h, np.ndarray), f"{fld} is not host numpy under xp=np"
         np.testing.assert_array_equal(h, np.asarray(getattr(dev, fld)))
 
@@ -210,6 +215,8 @@ def _dense_forced(fx, stack=None):
 def _worst_diff(a_state, b_state, *, fold_b=False):
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(a_state, fld.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(a_state, fld.name))
         b = np.asarray(getattr(b_state, fld.name))
         if fold_b:
@@ -332,6 +339,8 @@ def test_forced_multistep_owned_matches(npes, core2_forced_seq):
     # physically bounded. A broken exchange blows this up long before it decorrelates.
     free = _sharded_forced(fx, part, npes)
     for fld in dataclasses.fields(State):
+        if getattr(free, fld.name) is None:   # unused optional field
+            continue
         v = np.asarray(getattr(free, fld.name))
         assert np.isfinite(v).all(), \
             f"free-running forced n={fx['n']}: {fld.name} has non-finite lanes"
@@ -366,12 +375,20 @@ def test_fold_forcing_tables_places_nodes():
     for p in range(npes):
         lst = part.myList_nod2D[p]
         for name in ft._fields:
+            if getattr(ft, name) is None:              # an optional table that is off (REcoM dust)
+                assert getattr(folded, name) is None and getattr(spec, name) is None
+                continue
             g = np.asarray(getattr(ft, name))
             f = np.asarray(getattr(folded, name))
             slab = f[..., p * L:(p + 1) * L][..., :len(lst)]
             np.testing.assert_array_equal(slab, g[..., lst], err_msg=f"{name} dev {p}")
     assert spec.coef_a == jax.sharding.PartitionSpec(None, None, "p")
     assert spec.sss == jax.sharding.PartitionSpec(None, "p")
+    # the one-copy folded build (run.py's tables path) is the same array, pads included
+    direct = shard_mesh.partition_forcing_tables(ft, part, folded=True)
+    for name in ft._fields:
+        np.testing.assert_array_equal(np.asarray(getattr(direct, name)), np.asarray(getattr(folded, name)),
+                                      err_msg=name)
 
 
 def _tables_path_run(fx, part, npes, dates, mode):
@@ -421,6 +438,8 @@ def _slow_field_rel_check(a, c, tag):
     """Per-field relative diff report; assert the slow-field budget."""
     bad, report = [], []
     for fld in dataclasses.fields(State):
+        if getattr(a, fld.name) is None:   # unused optional field
+            continue
         xa = np.asarray(getattr(a, fld.name))
         xc = np.asarray(getattr(c, fld.name))
         if not xa.size:

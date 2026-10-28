@@ -122,7 +122,10 @@ def test_the_conventions_that_define_the_groups_hold():
         if rel.startswith("scripts/tests/") != (group == "scripts"):
             wrong.append(f"{rel}: everything under scripts/tests/ belongs to the 'scripts' "
                          f"group and nothing else does, but it is in {group!r}")
-        if name.startswith("test_ice_") and group != "ice":
+        # test_ice_* means the assembled-ice MEMORY class for library tests; a driver test
+        # under scripts/tests/ (e.g. test_ice_modes.py) is bound by the location rule above.
+        if (name.startswith("test_ice_") and group != "ice"
+                and not rel.startswith("scripts/tests/")):
             wrong.append(f"{rel}: named test_ice_* but in {group!r}")
         if (name.endswith("_sharded.py") or name == "test_halo.py") and group != "sharding":
             wrong.append(f"{rel}: needs 4 fake devices but is in {group!r}")

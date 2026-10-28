@@ -33,6 +33,7 @@ from typing import NamedTuple
 import jax.numpy as jnp
 from jax import lax
 
+from . import precision as PR
 from . import ops
 from .config import DT_DEFAULT, USE_WSPLIT, WSPLIT_MAXCFL
 from .mesh import Mesh
@@ -68,6 +69,11 @@ class AleConfig(NamedTuple):
     # patch) stays stable at a large dt that would otherwise violate the explicit vertical CFL.
     use_wsplit: bool = False
     wsplit_maxcfl: float = 1.0    # CFL threshold above which w is split (MOD_DYN.F90:113)
+    # Split-explicit SSH (FESOM2's use_ssh_se_subcycl, the other dynamics_general switch): a
+    # fesom_jax.ssh_se.SeConfig replaces the CG SSH solve (substeps 8-12) by Sergey Danilov's AB3-AM4
+    # barotropic subcycling, a stated deviation from upstream FESOM2 (fesom_jax/ssh_se.py). None ⇒ the CG,
+    # byte-identical. YAML: ``ssh: {split_explicit: {...}}`` (RunConfig puts it here).
+    split_explicit: object = None
 
     @property
     def use_virt_salt(self) -> bool:
@@ -89,6 +95,12 @@ class AleConfig(NamedTuple):
                 "AleConfig only supports which_ALE='zstar' (zstar=True); zlevel / "
                 "local-zstar / partial cells are out of scope (no C reference run). "
                 "Use ale_cfg=None for the linfs path. (fesom_ale.c:25-30 abort parity)")
+        if self.split_explicit is not None:
+            from .ssh_se import SeConfig
+            if not isinstance(self.split_explicit, SeConfig):
+                raise TypeError("AleConfig.split_explicit must be a fesom_jax.ssh_se.SeConfig or None, got "
+                                f"{type(self.split_explicit).__name__}")
+            self.split_explicit.validate()
         return self
 
 
@@ -122,7 +134,7 @@ def commit_thickness(mesh: Mesh, hnode_new):
     ``hnode_new`` was at substep 13)."""
     hnode = jnp.asarray(hnode_new)
     h3 = ops.gather_nodes_to_elem(hnode, mesh.elem_nodes)   # (elem2D, 3, nl)
-    helem = (h3[:, 0] + h3[:, 1] + h3[:, 2]) / 3.0
+    helem = PR.wp((h3[:, 0] + h3[:, 1] + h3[:, 2]) / 3.0)     # WP in single precision (hnode is WP_full)
     helem = ops.mask_below_bottom(helem, mesh.elem_layer_mask)
     return hnode, helem
 
@@ -191,7 +203,7 @@ def init_thickness_zstar(mesh: Mesh, hbar, hbar_old, *, alpha: float = 1.0,
     return hnode, helem, eta_n, ssh_rhs_old
 
 
-def live_geometry(mesh: Mesh, hnode):
+def live_geometry(mesh: Mesh, hnode, *, keep_f64: bool = False):
     """Derived per-node interface/mid-layer depths ``(zbar_3d_n, Z_3d_n)`` ``[nod2D, nl]``
     from the carried ``hnode`` (decision D1) — the zstar commit's bottom→top
     reconstruction (``fesom_ale_update_thickness_zstar``, ``fesom_ale.c:228-240``) as a
@@ -223,13 +235,16 @@ def live_geometry(mesh: Mesh, hnode):
     h_str = jnp.where(stretch, hnode, 0.0)
     revcum = lax.cumsum(h_str, axis=1, reverse=True)        # Σ_{j≥nz} h_str[j]
     zbar_nom = jnp.broadcast_to(zbar[None, :], (mesh.nod2D, nl))   # AD-safe nominal (dz>0)
-    zbar_3d_n = jnp.where(stretch, anchor + revcum, zbar_nom)
+    # single precision (FESOM2 #1207): hnode is WP_full, zbar_3d_n / Z_3d_n are WP — formed from the
+    # float64 thickness and rounded once (PR.full / PR.wp are the identity in double precision).
+    zbar_3d_n = jnp.where(stretch, PR.full(anchor) + revcum, PR.full(zbar_nom))
+    zbar_3d_n = zbar_3d_n if keep_f64 else PR.wp(zbar_3d_n)
 
     # Z mid-layer: zbar_3d_n[nz+1] + hnode[nz]/2 in the stretch range; nominal mesh.Z below.
     zbar_below = jnp.concatenate([zbar_3d_n[:, 1:], zbar_3d_n[:, -1:]], axis=1)  # [nz+1]
     Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])             # (nl,) nominal mid-depths, padded
-    Z_3d_n = jnp.where(stretch, zbar_below + 0.5 * hnode, Zp[None, :])
-    return zbar_3d_n, Z_3d_n
+    Z_3d_n = jnp.where(stretch, PR.full(zbar_below) + 0.5 * hnode, PR.full(Zp[None, :]))
+    return zbar_3d_n, (Z_3d_n if keep_f64 else PR.wp(Z_3d_n))
 
 
 def live_geometry_elem(mesh: Mesh, helem):
@@ -298,7 +313,7 @@ def vert_vel_zstar_distribute(mesh: Mesh, w, hnode, zbar_3d_n, hbar, hbar_old,
     w = w - jnp.where(stretch, (zbar_3d_n - dd1[:, None]) * dddt[:, None], 0.0)
     # hnode_new: stretch layers grow by (Δzbar_3d_n)·dd; non-stretch (+ below bottom) stay nominal hnode.
     zbar_below = jnp.concatenate([zbar_3d_n[:, 1:], zbar_3d_n[:, -1:]], axis=1)   # [nz+1]
-    hnode_new = jnp.where(stretch, hnode + (zbar_3d_n - zbar_below) * dd[:, None], hnode)
+    hnode_new = jnp.where(stretch, hnode + PR.full((zbar_3d_n - zbar_below) * dd[:, None]), hnode)
     # surface freshwater BC w[0] −= wf (non-cavity; independent of the stretch range, fesom_ale.c:189).
     # water_flux=None ⇒ zero flux (the C's `water_flux ? water_flux[n] : 0.0` startup arm).
     if water_flux is not None:
@@ -354,7 +369,7 @@ def compute_w(mesh: Mesh, uv, helem):
     # Stage 1: per-level antisymmetric edge→node divergence scatter.
     c = cterm(el1s, has1, 0, 1, 1.0) + cterm(el2s, has2, 2, 3, -1.0)   # (edge,nl)
     vals = jnp.stack([c, -c], axis=1)                     # (edge,2,nl)
-    div = ops.scatter_add(vals, mesh.edges, mesh.nod2D)   # (nod2D,nl)
+    div = ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)   # (nod2D,nl)
 
     # Stage 2: reverse (bottom→top) cumulative sum over levels.
     w = lax.cumsum(div, axis=1, reverse=True)

@@ -118,6 +118,11 @@ class ShardedMesh:
     ocean_area: float = 0.0
     exchange_ragged: dict = None  # {kind: RaggedExchange} — Phase 8b B.0 (None ⇒ not built)
     exchange_coloured: dict = None  # {kind: ColouredExchange} — Phase 8d (None ⇒ not built)
+    # The GLOBAL coastal-node mask (the sea-ice EVP/mEVP boundary condition), partitioned to [P, Lmax_nod] bool.
+    # A device's local mesh cannot rebuild it: its edge lanes are not the global ids that ``edge2D_in`` splits (a
+    # device holds fewer edges than ``edge2D_in``, so the local recompute finds no coast at all). The sharded runners
+    # use it when no ``boundary_node_p`` is passed (None ⇒ not built: a bundle exported before it existed).
+    boundary_node: np.ndarray = None
 
 
 # --------------------------------------------------------------------------
@@ -505,7 +510,47 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
         nod2D=mesh.nod2D, elem2D=mesh.elem2D, edge2D=mesh.edge2D,
         edge2D_in=mesh.edge2D_in, myDim_edge2D_global=mesh.myDim_edge2D,
         ocean_area=mesh.ocean_area,
+        boundary_node=_shard_along_axis(global_boundary_node(mesh), mylist["nod"], Lmax["nod"], 0, False),
     )
+
+
+def global_boundary_node(mesh: Mesh) -> np.ndarray:
+    """The coastal-node mask of the GLOBAL mesh (``[nod2D]`` bool, host): the endpoints of the boundary edges (global
+    index ``>= edge2D_in``), = :func:`fesom_jax.ice_evp.boundary_node_mask` of the dense mesh."""
+    edges = np.asarray(mesh.edges)
+    bn = np.zeros(mesh.nod2D, bool)
+    bn[edges[mesh.edge2D_in:].ravel()] = True
+    return bn
+
+
+def with_inverse_maps(sm: ShardedMesh) -> ShardedMesh:
+    """``sm`` with the ordered-sum inverse maps (``gpu.ordered_sums``; :data:`fesom_jax.mesh.INVERSE_MAP_FIELDS`)
+    added to ``fields``: per device from its LOCAL connectivity (``-1`` = not on the device, pad lanes
+    ``-1``), ``[P, Lmax_target, D]`` with one ``D`` for all devices, and the sentinel position
+    ``Lmax_row * 2|3`` (the flattened local index array's length, the same on every device). They fold and
+    shard like the other entity fields (``integrate_sharded.folded_mesh``). Already present ⇒ ``sm``."""
+    from .mesh import INVERSE_MAP_FIELDS
+    from .ops import inverse_map
+    if all(name in sm.fields for name, _, _ in INVERSE_MAP_FIELDS):
+        return sm
+    fields = dict(sm.fields)
+    for name, src, tgt in INVERSE_MAP_FIELDS:
+        conn = sm.fields[src]                                   # [P, Lmax_row, k] local ids
+        per = [inverse_map(conn[d], sm.Lmax[tgt]) for d in range(sm.P)]
+        D = max(m.shape[1] for m in per)
+        fields[name] = np.stack([np.pad(m, ((0, 0), (0, D - m.shape[1])), constant_values=conn[d].size)
+                                 for d, m in enumerate(per)])
+    return dataclasses.replace(sm, fields=fields)
+
+
+def with_se_tables(sm: ShardedMesh, mesh: Mesh, partition: Partition) -> ShardedMesh:
+    """``sm`` with the split-explicit SSH tables (:data:`fesom_jax.ssh_se.TABLE_FIELDS`) on each device's local lanes
+    (:func:`fesom_jax.ssh_se.shard_tables`), ``[P, Lmax_kind, …]``; they fold and shard like the other entity fields.
+    Needed only by a run with ``ssh.split_explicit``; already present ⇒ ``sm``."""
+    from .ssh_se import TABLE_FIELDS, shard_tables
+    if all(name in sm.fields for name in TABLE_FIELDS):
+        return sm
+    return dataclasses.replace(sm, fields={**sm.fields, **shard_tables(mesh, partition, sm.Lmax)})
 
 
 def build_serial_sharded_mesh(mesh: Mesh) -> ShardedMesh:
@@ -550,6 +595,9 @@ def partition_state(state, partition: Partition):
     _, Lmax = local_sizes(partition)
     out = {}
     for f in dataclasses.fields(State):
+        if getattr(state, f.name) is None:          # the SP carry in a double State, an unused ICE_AVG_FIELDS
+            out[f.name] = None
+            continue
         arr = np.asarray(getattr(state, f.name))
         n0 = arr.shape[0]
         if n0 == partition.nod2D:
@@ -572,6 +620,9 @@ def partition_forcing_static(fs, partition: Partition):
     _, Lmax = local_sizes(partition)
     out = {}
     for name in fs._fields:
+        if getattr(fs, name) is None:                         # an optional field that is off (full REcoM's)
+            out[name] = None
+            continue
         arr = np.asarray(getattr(fs, name))
         if arr.ndim == 0:
             out[name] = arr                                   # scalar — replicated
@@ -588,31 +639,55 @@ def partition_step_forcing(sf, partition: Partition):
     form, handling both a single step (``[nod2D]`` fields → ``[P, Lmax_nod]``) and a
     scanned stack (``[n_steps, nod2D]`` → ``[P, n_steps, Lmax_nod]``): the node axis
     is detected by size and sharded, the ``n_steps`` axis is preserved."""
-    from .surface_forcing import StepForcing
+    from .surface_forcing import STEP_SCALARS, StepForcing
 
     _, Lmax = local_sizes(partition)
     out = {}
     for name in sf._fields:
+        if getattr(sf, name) is None:                         # an optional field that is off (press_air)
+            out[name] = None
+            continue
         arr = np.asarray(getattr(sf, name))
+        if name in STEP_SCALARS:                              # per-step scalars (REcoM calendar): replicated
+            out[name] = arr
+            continue
         ax = _node_axis(arr.shape, partition.nod2D)
         out[name] = _shard_along_axis(arr, partition.myList_nod2D, Lmax["nod"],
                                       ax, _default_pad(arr.dtype))
     return StepForcing(**out)
 
 
-def partition_forcing_tables(ft, partition: Partition):
+def partition_forcing_tables(ft, partition: Partition, *, folded: bool = False):
     """Gather a :class:`~fesom_jax.surface_forcing.ForcingTables` to per-device padded
     form: every leaf's (last) ``nod2D`` axis is sharded (``[…, nod2D]`` →
-    ``[P, …, Lmax_nod]``), the small table axes are preserved."""
+    ``[P, …, Lmax_nod]``), the small table axes are preserved.
+
+    ``folded`` ⇒ the leaves come out as the sharded runner's input ``[…, P*Lmax_nod]`` (what
+    ``integrate_sharded._fold_forcing_tables`` makes of the ``[P, …]`` form, the same values), each
+    device's lanes taken straight into place: one copy of the ~0.2 GB a CORE2 chunk's tables hold
+    instead of four (take, pad, stack, and the fold's moveaxis copy on the main thread)."""
     from .surface_forcing import ForcingTables
 
     _, Lmax = local_sizes(partition)
     out = {}
     for name in ft._fields:
+        if getattr(ft, name) is None:                         # an optional table that is off (REcoM dust)
+            out[name] = None
+            continue
         arr = np.asarray(getattr(ft, name))
         ax = _node_axis(arr.shape, partition.nod2D)
-        out[name] = _shard_along_axis(arr, partition.myList_nod2D, Lmax["nod"],
-                                      ax, _default_pad(arr.dtype))
+        if folded:
+            if ax != arr.ndim - 1:
+                raise ValueError(f"folded tables need the node axis last, {name} has shape {arr.shape}")
+            P, L = len(partition.myList_nod2D), Lmax["nod"]
+            buf = np.full(arr.shape[:-1] + (P, L), _default_pad(arr.dtype), dtype=arr.dtype)
+            for p, ml in enumerate(partition.myList_nod2D):
+                ml = np.asarray(ml)
+                np.take(arr, ml, axis=-1, out=buf[..., p, :ml.size], mode="clip")
+            out[name] = buf.reshape(arr.shape[:-1] + (P * L,))
+        else:
+            out[name] = _shard_along_axis(arr, partition.myList_nod2D, Lmax["nod"],
+                                          ax, _default_pad(arr.dtype))
     return ForcingTables(**out)
 
 
@@ -654,6 +729,8 @@ def export_sharded_mesh(sm: ShardedMesh, out_dir: str | Path) -> Path:
         np.save(out_dir / f"exch_srclane_{k}.npy", sm.exchange[k][1])
     for name, arr in sm.counts.items():
         np.save(out_dir / f"count_{name}.npy", arr)
+    if sm.boundary_node is not None:
+        np.save(out_dir / "boundary_node.npy", sm.boundary_node)
     meta = dict(P=sm.P, nl=sm.nl, nod2D=sm.nod2D, elem2D=sm.elem2D, edge2D=sm.edge2D,
                 edge2D_in=sm.edge2D_in, myDim_edge2D_global=sm.myDim_edge2D_global,
                 Lmax_nod=sm.Lmax["nod"], Lmax_elem=sm.Lmax["elem"], Lmax_edge=sm.Lmax["edge"])
@@ -689,4 +766,5 @@ def load_sharded_mesh(in_dir: str | Path) -> ShardedMesh:
         edge2D_in=int(meta["edge2D_in"]),
         myDim_edge2D_global=int(meta["myDim_edge2D_global"]),
         ocean_area=float(meta["ocean_area"]),
+        boundary_node=np.load(in_dir / "boundary_node.npy") if (in_dir / "boundary_node.npy").exists() else None,
     )

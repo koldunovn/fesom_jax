@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import dataclasses
 from pathlib import Path
-from typing import Mapping
+from typing import Mapping, Optional
 
 import jax
 import jax.numpy as jnp
@@ -121,6 +121,35 @@ class Mesh:
     edge2D_in: int = _meta(static=True)
     myDim_edge2D: int = _meta(static=True)
     ocean_area: float = _meta(static=True)
+
+    # --- optional inverse maps for ops.scatter_add's ordered sums (gpu.ordered_sums; ops.inverse_map of
+    #     elem_nodes / edges / edge_tri). None unless built (with_inverse_maps, or per device on the sharded
+    #     mesh), so the default program never sees them. ---
+    inv_elem_nodes: Optional[jax.Array] = None    # (nod2D, D1) i4 flattened (elem,corner) positions
+    inv_edges: Optional[jax.Array] = None         # (nod2D, D2) i4 flattened (edge,end) positions
+    inv_edge_tri: Optional[jax.Array] = None      # (elem2D, D3) i4 flattened (edge,side) positions
+    # --- optional split-explicit SSH tables (fesom_jax.ssh_se.build_tables; AleConfig.split_explicit). None unless
+    #     built (ssh_se.with_tables, or per device by shard_mesh.with_se_tables), so the CG program never sees them. ---
+    se_div_elem: Optional[jax.Array] = None       # (nod2D, D) i4 elements of a node's divergence row (id order)
+    se_div_c: Optional[jax.Array] = None          # (nod2D, D, 2) f8 their coefficients / areasvol (0 = pad)
+    se_elem_nb: Optional[jax.Array] = None        # (elem2D, 3) i4 edge neighbours, ascending edge id; -1 = coast
+    se_kappa: Optional[jax.Array] = None          # (elem2D, 3) f8 FESOM_F's l^2/(d A_e) per neighbour slot
+    se_div_inv: Optional[jax.Array] = None        # (elem2D, Dinv) i4 the divergence rows' inverse (ssh_se.div_inverse)
+
+
+INVERSE_MAP_FIELDS = (("inv_elem_nodes", "elem_nodes", "nod"),
+                      ("inv_edges", "edges", "nod"),
+                      ("inv_edge_tri", "edge_tri", "elem"))
+
+
+def with_inverse_maps(mesh: "Mesh") -> "Mesh":
+    """``mesh`` with :data:`INVERSE_MAP_FIELDS` built (host numpy, :func:`fesom_jax.ops.inverse_map`), for
+    the dense path; the sharded mesh builds them per device (``shard_mesh.with_inverse_maps``)."""
+    from . import ops
+    n = {"nod": mesh.nod2D, "elem": mesh.elem2D}
+    return dataclasses.replace(mesh, **{
+        name: jnp.asarray(ops.inverse_map(np.asarray(getattr(mesh, src)), n[kind]))
+        for name, src, kind in INVERSE_MAP_FIELDS})
 
 
 # Register Mesh as a pytree: array fields are leaves, scalar fields are static.
@@ -248,6 +277,7 @@ def load_mesh(mesh_dir: str | Path = DEFAULT_PI_MESH_DIR,
         f.name: load(f.name)
         for f in dataclasses.fields(Mesh)
         if not f.metadata.get("static") and not f.name.endswith("_mask")
+        and not f.name.startswith(("inv_", "se_"))
     }
 
     if check_orientation:
@@ -282,4 +312,5 @@ def mesh_field_files() -> Mapping[str, str]:
         f.name: f"{f.name}.npy"
         for f in dataclasses.fields(Mesh)
         if not f.metadata.get("static") and not f.name.endswith("_mask")
+        and not f.name.startswith(("inv_", "se_"))
     }

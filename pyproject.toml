@@ -54,3 +54,6 @@ fesom_jax = [
 
 [tool.pytest.ini_options]
 testpaths = ["fesom_jax/tests"]
+markers = [
+    "gpu: needs a GPU (kernel vs XLA reference on the device); skipped elsewhere by conftest.py",
+]

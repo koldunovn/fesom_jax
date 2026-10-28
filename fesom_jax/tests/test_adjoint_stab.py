@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax import lax
 
 from fesom_jax import adjoint_stab, coarsen
 from fesom_jax.mesh import load_mesh
@@ -81,6 +82,82 @@ def test_freeze_increment_keeps_the_value_but_not_the_derivative():
     x = jnp.array(3.0)
     assert np.isclose(float(f(x)), float(full_fn(x)))        # value: the full stage
     assert np.isclose(float(jax.grad(f)(x)), 2.0)            # slope: base only, not 2+20x
+
+
+def _increment_form(base, out):
+    """The form ``freeze_increment`` had before: same derivative, value NOT exact."""
+    return jax.tree.map(lambda b, o: b + jax.lax.stop_gradient(o - b), base, out)
+
+
+def _inexact_bases(out: float, n: int = 64, seed: int = 0) -> np.ndarray:
+    """Positive bases below ``out`` for which ``base + (out - base) != out`` in float64."""
+    rng = np.random.default_rng(seed)
+    b = out * 10.0 ** (-rng.uniform(0.3, 3.0, 200_000))
+    bad = b[(b + (out - b)) != out]
+    assert bad.size >= n, "no inexact increment found — the planted case is not live"
+    return bad[:n]
+
+
+def test_freeze_increment_is_exact_where_the_increment_form_is_not():
+    """Planted case: bases whose increment ``out - base`` rounds, so the old increment form
+    returns a value off ``out`` by an ulp, while the straight-through form returns ``out``
+    bit for bit. The derivative is the same in both forms, bitwise."""
+    base0 = jnp.asarray(_inexact_bases(0.3))
+    out0 = jnp.full_like(base0, 0.3)
+    old = np.asarray(_increment_form(base0, out0))
+    assert np.sum(old != 0.3) == base0.size                  # the plant is live
+    new = np.asarray(adjoint_stab.freeze_increment(base0, out0))
+    assert np.array_equal(new, np.asarray(out0))             # exact in the forward
+
+    w = jnp.linspace(0.5, 1.5, base0.size)
+
+    def loss(form, x):
+        return jnp.sum(w * form(2.0 * x, jnp.maximum(2.0 * x, 0.3) + x ** 2))
+
+    g_new = np.asarray(jax.grad(lambda x: loss(adjoint_stab.freeze_increment, x))(base0 / 2))
+    g_old = np.asarray(jax.grad(lambda x: loss(_increment_form, x))(base0 / 2))
+    assert np.array_equal(g_new, g_old)
+    assert np.array_equal(g_new, 2.0 * np.asarray(w))        # d base only
+
+
+def test_mo_convect_frozen_bump_is_exact_where_the_increment_form_is_not(mesh, monkeypatch):
+    """``freeze_convection`` (``mo_convect(freeze_increment=True)``) keeps the convective bump
+    bit for bit. At the configured bump ``INSTABMIX_KV = 0.1`` the increment form happens to be
+    exact for every coefficient below it; the plant raises the bump to 0.3, where it is not
+    for the chosen coefficients, and checks the forward against the unfrozen call and the
+    one-call VJP against the old increment form."""
+    from fesom_jax import pp
+
+    monkeypatch.setattr(pp, "INSTABMIX_KV", 0.3)
+    nl = int(mesh.nl)
+    vals = _inexact_bases(0.3, n=16)
+    rng = np.random.default_rng(1)
+    Kv = jnp.asarray(vals[rng.integers(0, vals.size, (mesh.nod2D, nl))])
+    Av = jnp.asarray(vals[rng.integers(0, vals.size, (mesh.elem2D, nl))])
+    bv = jnp.asarray(rng.standard_normal((mesh.nod2D, nl)) * 1e-5)   # both signs
+
+    Kv_x, Av_x = pp.mo_convect(mesh, Kv, Av, bv)
+    Kv_f, Av_f = pp.mo_convect(mesh, Kv, Av, bv, freeze_increment=True)
+    bumped = np.asarray(Kv_x) != np.asarray(Kv)
+    assert bumped.sum() > 100 and (np.asarray(Av_x) != np.asarray(Av)).sum() > 100
+    assert np.array_equal(np.asarray(Kv_f), np.asarray(Kv_x))
+    assert np.array_equal(np.asarray(Av_f), np.asarray(Av_x))
+    old_K, _ = _increment_form((Kv, Av), (Kv_x, Av_x))
+    assert np.sum(np.asarray(old_K) != np.asarray(Kv_x)) == bumped.sum()   # old form: off
+
+    ck = jnp.asarray(rng.standard_normal(Kv.shape))
+    ca = jnp.asarray(rng.standard_normal(Av.shape))
+
+    def vjp(form):
+        monkeypatch.setattr(adjoint_stab, "freeze_increment", form)
+        f = lambda k, a: pp.mo_convect(mesh, k, a, bv, freeze_increment=True)  # noqa: E731
+        return jax.vjp(f, Kv, Av)[1]((ck, ca))
+
+    new = vjp(adjoint_stab.freeze_increment)
+    old = vjp(_increment_form)
+    for a, b in zip(new, old):
+        assert np.array_equal(np.asarray(a), np.asarray(b))
+    assert np.array_equal(np.asarray(new[0]), np.asarray(ck))   # the bump carries no derivative
 
 
 def test_clipper_caps_the_norm_and_keeps_the_direction():
@@ -363,3 +440,83 @@ def test_amplification_refuses_to_pass_a_degenerate_trace():
     for bad in ([], [1.0], [0.0, 0.0]):
         amp = adjoint_stab.amplification(bad, 48)
         assert not amp.clean and amp.reason
+
+
+# ---------------------------------------------------------------------------
+# scale_tangent: Newtonian damping of a tangent (Panteleev et al. 2020), derivative-only
+
+_ST_X = np.array([0.3, -1.7, 2.25, 4.0e-9, -8.5])
+_ST_F = np.array([0.5, 0.875, 1.0, 0.0, 0.25])
+
+
+def test_scale_tangent_forward_is_x_bitwise():
+    """The primal output is the input itself, for every factor, also under jit."""
+    x = jnp.asarray(_ST_X)
+    for f in (0.0, 0.875, 1.0, 3.0, jnp.asarray(_ST_F)):
+        out = jax.jit(adjoint_stab.scale_tangent)(x, f)
+        assert np.asarray(out).tobytes() == _ST_X.tobytes()
+
+
+def test_scale_tangent_jvp_and_vjp_are_f_times():
+    """Tangent f*dx; cotangent f*g (reverse mode transposes the linear rule)."""
+    x, dx, g = jnp.asarray(_ST_X), jnp.asarray(np.arange(1.0, 6.0)), jnp.asarray(_ST_X[::-1])
+    for f in (0.875, _ST_F):
+        y, t = jax.jvp(lambda z: adjoint_stab.scale_tangent(jnp.sin(z), f), (x,), (dx,))
+        np.testing.assert_array_equal(np.asarray(y), np.sin(_ST_X))
+        np.testing.assert_allclose(np.asarray(t), np.asarray(f) * np.cos(_ST_X) * np.arange(1.0, 6.0),
+                                   rtol=1e-15)
+        _, vjp = jax.vjp(lambda z: adjoint_stab.scale_tangent(z, f), x)
+        np.testing.assert_array_equal(np.asarray(vjp(g)[0]), np.asarray(f) * _ST_X[::-1])
+
+
+def test_scale_tangent_f1_is_plain_autodiff_bitwise():
+    def h(z, scale):
+        y = jnp.tanh(z) * z
+        y = adjoint_stab.scale_tangent(y, 1.0) if scale else y
+        return jnp.sum(y ** 3)
+    x = jnp.asarray(_ST_X)
+    assert (np.asarray(jax.grad(h)(x, True)).tobytes()
+            == np.asarray(jax.grad(h)(x, False)).tobytes())
+
+
+def test_scale_tangent_compounds_in_a_checkpointed_scan():
+    """A per-step factor f_k inside a checkpointed 10-step scan gives prod_k f_k (not f**10),
+    in forward and reverse mode alike."""
+    fs = jnp.asarray(np.linspace(0.5, 0.95, 10))
+
+    def run(x0):
+        def body(c, f):
+            return jax.checkpoint(lambda c: adjoint_stab.scale_tangent(1.1 * c, f))(c), None
+        return lax.scan(body, x0, fs)[0]
+    _, t = jax.jvp(run, (jnp.asarray(2.0),), (jnp.asarray(1.0),))
+    want = np.prod(np.linspace(0.5, 0.95, 10)) * 1.1 ** 10
+    np.testing.assert_allclose(float(t), want, rtol=1e-14)
+    np.testing.assert_allclose(float(jax.grad(run)(jnp.asarray(2.0))), want, rtol=1e-14)
+    assert abs(want - 0.725 ** 10 * 1.1 ** 10) > 1e-3 * want    # not the closed form f**10
+
+
+def test_scale_tangent_per_element_and_zero_factor_cuts():
+    """Per-element f; f = 0 on an element removes exactly that element's derivative."""
+    x = jnp.asarray(np.stack([_ST_X, 2 * _ST_X]))              # (2, 5)
+    f_row = jnp.asarray(_ST_F)                                   # broadcasts along axis 0
+    g = jax.grad(lambda z: jnp.sum(adjoint_stab.scale_tangent(z * z, f_row)))(x)
+    np.testing.assert_allclose(np.asarray(g), 2 * np.asarray(x) * _ST_F[None, :], rtol=1e-15)
+    assert np.all(np.asarray(g)[:, 3] == 0.0)
+    g0 = jax.grad(lambda z: jnp.sum(adjoint_stab.scale_tangent(z, 0.0)))(x)
+    assert np.all(np.asarray(g0) == 0.0)
+
+
+def test_scale_tangent_refuses_a_factor_wider_than_x():
+    with pytest.raises(ValueError, match="without widening"):
+        adjoint_stab.scale_tangent(jnp.ones(5), jnp.ones((2, 5)))
+    with pytest.raises(ValueError, match="without widening"):
+        adjoint_stab.scale_tangent(jnp.ones(5), jnp.ones(4))
+    with pytest.raises(ValueError, match="without widening"):
+        adjoint_stab.scale_tangent(jnp.asarray(1.0), jnp.ones(3))
+
+
+def test_scale_tangent_passes_integers_through():
+    i = jnp.arange(4)
+    assert adjoint_stab.scale_tangent(i, 0.5) is i
+    b = jnp.array([True, False])
+    assert adjoint_stab.scale_tangent(b, 0.0) is b

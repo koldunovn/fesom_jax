@@ -72,10 +72,11 @@ def run_gm():
     for n in range(NSTEPS):
         sf = cf.step_forcing(*dates[n])
         # The C dumps predate drift fix 1 (2026-09-18: the bulk taps the carried uv, not the
-        # previous step's uvnode); replay the legacy tap so the gate stays a C comparison.
+        # previous step's uvnode) and FESOM2 #944 (the Redi K33 interface weights); replay the
+        # legacy tap and weights so the gate stays a C comparison.
         st = stepmod.step(st, mesh, op, None, dt=DT, is_first_step=(n == 0),
                           step_forcing=sf, forcing_static=fs, gm_cfg=gm_cfg,
-                          bulk_uvnode_lag=True)
+                          bulk_uvnode_lag=True, legacy_k33_weights=True)
         states.append(st)
     return dict(mesh=mesh, recs=recs, states=states)
 

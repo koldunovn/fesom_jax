@@ -73,15 +73,21 @@ import importlib.util
 import json
 import math
 import os
+import re
 import socket
 import subprocess
 import sys
+import threading
 import time
+from collections.abc import MutableMapping
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Mapping, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "configs" / "core2_full.yaml"
+#: the CORE2 production configuration whose physics ``build_model(fast=...)`` takes piece by piece
+FAST_CONFIG = ROOT / "configs" / "core2_gpu_fast.yaml"
 
 
 def _check_import_root() -> None:
@@ -104,8 +110,9 @@ import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 
 from fesom_jax import adjoint, adjoint_check, adjoint_stab, ale, obs_compare, partit  # noqa: E402
-from fesom_jax import shard_mesh, ssh  # noqa: E402
+from fesom_jax import shard_mesh, ssh, ssh_se  # noqa: E402
 from fesom_jax import adjoint_costs as AC  # noqa: E402
+from fesom_jax import ice_step as _ice_step  # noqa: E402
 from fesom_jax import step as stepmod  # noqa: E402
 from fesom_jax import surface_forcing, zarr_output  # noqa: E402
 from fesom_jax.adjoint_stab import AdjointConfig  # noqa: E402
@@ -115,10 +122,22 @@ from fesom_jax.run_config import load_yaml  # noqa: E402
 from fesom_jax.state import State  # noqa: E402
 
 RESTART_ARCHIVE = Path("/work/ab0995/a270088/port_jax/runs/core2_hindcast_v3/restart_archive")
+CORE2_DIST = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2")   #: the dist_<N> partitions (build_model devices)
 STATES_DIR = Path("/work/ab0995/a270088/fesom_jax_dev/states_2013")
 RUNS_DIR = Path("/work/ab0995/a270088/fesom_jax_dev/runs/p0")
 DT = 1800.0
-ICE_MODES = ("prescribed", "rheology", "frozen", "exact")
+ICE_MODES = ("prescribed", "rheology", "frozen", "exact", "dynamics")
+#: the IceConfig fields ``build_model(ice_adjoint=...)`` may set (derivative-only, mEVP sweeps)
+ICE_ADJOINT_FIELDS = ("adjoint_damping", "adjoint_kappa", "adjoint_sweeps", "adjoint_cuts",
+                      "adjoint_alpha_kappa", "adjoint_theta", "adjoint_thin_mass",
+                      "adjoint_sweep_guard")
+#: ``build_model(fast=...)`` names, each one piece of :data:`FAST_CONFIG`'s physics on top of the reference:
+#: ``ice2`` its ``ice.ice_ave_steps`` (ice every second step), ``se`` its ``ssh.split_explicit``, ``dt2700`` its
+#: ``dt``, ``sp`` its ``precision``. The timestep piece may name another dt: ``dt<seconds>`` (``dt2400`` = 40 min;
+#: Nikolay 2026-10-22: 45 min falls apart, 40 or 30 min may be the stabler choice for the adjoint)
+FAST_PHYSICS = ("ice2", "se", "dt2700", "sp")
+#: the pieces build_model runs so far (the fast-adjoint plan, docs/plans/20261022-core2-fast-adjoint.md)
+FAST_IMPLEMENTED = ("ice2", "se", "dt2700", "sp")
 ABORT_AT = 1e250
 #: XLA options of the tangent-linear chunk program (``tl``/``dot``): without constant folding it
 #: compiles in ~30 s instead of ~13 min on CORE2 (see ``adjoint_check.NO_CONSTANT_FOLDING``).
@@ -259,6 +278,8 @@ def default_to_params(u) -> Params:
     repl = {n: getattr(base, n) * jnp.exp(u[f"ln_{n}"]) for n in LOG_CONTROLS}
     if "surface_adj" in u:
         repl["surface_adj"] = dict(u["surface_adj"])
+    if "forcing_adj" in u:                      # the monthly atmospheric maps [M, nod2D] (the step takes one month)
+        repl["forcing_adj"] = dict(u["forcing_adj"])
     return dataclasses.replace(base, **repl)
 
 
@@ -311,10 +332,26 @@ def load_state(path):
     """``(State, meta)``: a full dense State (host numpy) and the restart attributes of a
     :func:`~fesom_jax.zarr_output.write_restart` store (any layout, any device count)."""
     import zarr
-    st = State(**{f: np.asarray(zarr_output.reconstruct_global(path, f))
-                  for f in zarr_output._all_state_fields()})
-    meta = dict(zarr.open_group(str(path), mode="r").attrs)
+    from fesom_jax.precision import CARRY_FIELDS
+    from fesom_jax.state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+    root = zarr.open_group(str(path), mode="r")
+    # as zarr_output.read_restart: the single-precision carry, the ice-cycle fields and the SE rings are in the
+    # store only when the writing run used them (None otherwise; build_model sets them for its own physics)
+    optional = CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS
+    st = State(**{f: None if f in optional and f not in root
+                  else np.asarray(zarr_output.reconstruct_global(path, f))
+                  for f in zarr_output._all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS})
+    meta = dict(root.attrs)
     return st, meta
+
+
+def _check_restart_dt(rpath: Path, meta: dict, dt: float) -> None:
+    """A restart's AB2 history (``uv_rhsAB``, ``T_old``) was formed at its ``dt_stage``; every step of a window
+    continues AB2, so the window's dt must be that one (a run at another dt starts from a restart its production
+    driver wrote after re-bootstrapping AB2, ``run.py``)."""
+    if "dt_stage" in meta and float(meta["dt_stage"]) != float(dt):
+        raise ValueError(f"restart {rpath} was written at dt {float(meta['dt_stage']):g} s, the window runs at "
+                         f"dt {float(dt):g} s: start from a restart written by a dt-{float(dt):g} run")
 
 
 def _check_restart_date(rpath: Path, meta: dict, start: datetime.datetime) -> None:
@@ -351,9 +388,94 @@ def _write_state(out_dir: Path, state, mesh, *, step: int, when: datetime.dateti
 # the model
 
 
-def assert_physics(cfg) -> None:
-    """The reference configuration: zstar, classical TKE (no KPP), GM, mEVP sea ice, dt 1800 s,
-    JRA55-do forcing, the default SSH preconditioner, no dt ramp."""
+def parse_tke_settings(spec) -> dict:
+    """``"name=value+name=value"``, a dict, or ``None``/``"none"``/``""`` -> a dict of
+    ``TkeConfig`` fields (values typed like the field's default). Unknown fields raise."""
+    from fesom_jax.tke import TkeConfig
+    if spec is None:
+        return {}
+    if isinstance(spec, Mapping):
+        d = dict(spec)
+    else:
+        text = str(spec).strip()
+        if text in ("", "none"):
+            return {}
+        d = {}
+        for tok in text.split("+"):
+            name, eq, val = tok.partition("=")
+            if not eq:
+                raise ValueError(f"tke setting {tok!r} is not name=value")
+            d[name.strip()] = val.strip()
+    bad = [k for k in d if k not in TkeConfig._fields]
+    if bad:
+        raise ValueError(f"unknown TkeConfig field(s) {bad}")
+    out = {}
+    for k, v in d.items():
+        default = getattr(TkeConfig(), k)
+        if isinstance(v, str) and not isinstance(default, str):
+            v = (v.lower() in ("1", "true", "yes") if isinstance(default, bool)
+                 else int(v) if isinstance(default, int) else float(v))
+        out[k] = v
+    return out
+
+
+def _piece_dt(name: str):
+    """The timestep of a ``dt<seconds>`` piece name, else None."""
+    m = re.fullmatch(r"dt([1-9][0-9]*)", name)
+    return float(m.group(1)) if m else None
+
+
+def parse_fast(spec) -> tuple:
+    """``"ice2+se"`` (or a sequence of names, or None) -> the :data:`FAST_PHYSICS` names in their canonical
+    order, a ``dt<seconds>`` piece in the timestep's place; unknown names and two timesteps are refused."""
+    if spec is None or spec == "" or spec == "none":
+        return ()
+    names = [x for x in spec.split("+") if x] if isinstance(spec, str) else list(spec)
+    dts = [n for n in names if _piece_dt(n) is not None]
+    bad = sorted(set(names) - set(FAST_PHYSICS) - set(dts))
+    if bad:
+        raise ValueError(f"fast physics: unknown {bad}; known {FAST_PHYSICS} (a timestep as dt<seconds>)")
+    if len(set(dts)) > 1:
+        raise ValueError(f"fast physics: two timesteps {sorted(set(dts))}")
+    return tuple((dts[0] if n == "dt2700" else n) for n in FAST_PHYSICS
+                 if (n in names if n != "dt2700" else bool(dts)))
+
+
+def fast_dt(fast) -> float:
+    """The window's timestep [s]: the ``dt<seconds>`` piece's (``dt2700`` = :data:`FAST_CONFIG`'s), else :data:`DT`.
+    The tools turn window lengths in days into steps with it before the model is built."""
+    d = [_piece_dt(n) for n in parse_fast(fast) if _piece_dt(n) is not None]
+    return d[0] if d else DT
+
+
+def with_fast_physics(cfg, fast):
+    """``cfg`` with the :data:`FAST_CONFIG` values of the pieces named in ``fast`` (:func:`parse_fast`)."""
+    fast = parse_fast(fast)
+    if not fast:
+        return cfg
+    f = load_yaml(FAST_CONFIG)
+    kw = {}
+    if "ice2" in fast:
+        kw["ice"] = cfg.ice._replace(ice_ave_steps=f.ice.ice_ave_steps)
+    if "se" in fast:
+        # the barotropic substep of the fast configuration (dt 2700 / M 60 = 45 s, at its CFL guard's bound): at
+        # another window dt the substep count scales with it, M = ceil(M_fast dt / dt_fast) (dt 1800: M 40, the
+        # guard's M_min there), not the fast configuration's M (Nikolay 2026-10-22)
+        se = dict(f.ssh["split_explicit"])
+        se["M"] = int(math.ceil(int(se["M"]) * fast_dt(fast) / float(f.dt) - 1e-9))
+        kw["ssh"] = {**(cfg.ssh or {}), "split_explicit": se}
+    if fast_dt(fast) != DT:
+        kw["dt"] = fast_dt(fast)
+    if "sp" in fast:
+        kw["precision"] = f.precision
+    return dataclasses.replace(cfg, **kw)
+
+
+def assert_physics(cfg, fast=()) -> None:
+    """The reference configuration: zstar, classical TKE (no KPP), GM, mEVP sea ice every step, dt 1800 s,
+    JRA55-do forcing, the CG SSH solve with the default preconditioner, no dt ramp, double precision; each piece
+    named in ``fast`` (:data:`FAST_PHYSICS`) may instead be :data:`FAST_CONFIG`'s."""
+    fast = parse_fast(fast)
     bad = []
     if cfg.ale is None:
         bad.append("ale (zstar) is off")
@@ -363,12 +485,25 @@ def assert_physics(cfg) -> None:
         bad.append("GM is off")
     if cfg.ice is None or cfg.ice.whichEVP != 1:
         bad.append("sea ice is not mEVP")
-    if float(cfg.dt) != DT or cfg.dt_ramp is not None:
+    elif int(cfg.ice.ice_ave_steps) != 1 and "ice2" not in fast:
+        bad.append(f"sea ice every {cfg.ice.ice_ave_steps} steps (fast piece ice2)")
+    fcfg = with_fast_physics(cfg, fast) if fast else None
+    if fcfg is not None and "ice2" in fast and cfg.ice is not None \
+            and int(cfg.ice.ice_ave_steps) != int(fcfg.ice.ice_ave_steps):
+        bad.append(f"ice_ave_steps {cfg.ice.ice_ave_steps}, not the fast configuration's")
+    want_dt = fast_dt(fast)
+    if float(cfg.dt) != want_dt or cfg.dt_ramp is not None:
         bad.append(f"dt {cfg.dt} / ramp {cfg.dt_ramp}")
+    if cfg.split_explicit() is not None and "se" not in fast:
+        bad.append("split-explicit SSH (fast piece se)")
+    if "se" in fast and cfg.split_explicit() != fcfg.split_explicit():
+        bad.append(f"split_explicit {cfg.split_explicit()}, not the fast configuration's")
     if (cfg.forcing or {}).get("kind") != "core2":
         bad.append(f"forcing {cfg.forcing}")
     if cfg.ssh_cheb()[0] != 0:
         bad.append("Chebyshev SSH preconditioner on")
+    if getattr(cfg, "precision", "double") != ("single" if "sp" in fast else "double"):
+        bad.append(f"precision {cfg.precision} (fast piece sp)")
     if bad:
         raise AssertionError("core2_adj: not the reference physics: " + "; ".join(bad))
 
@@ -400,9 +535,17 @@ class Model:
     params0: Any                     #: control pytree (host, strong float64)
     to_params: Callable
     surface_adj: bool
+    tke_settings: dict = dataclasses.field(default_factory=dict)   #: TkeConfig forward options
+    fast: tuple = ()                 #: the FAST_PHYSICS pieces in the model (empty: the reference physics)
+    shard: Any = None                #: fesom_jax.adjoint_sharded.ShardedChunk (devices > 1), else None (dense)
+    #: the per-step schedule in xs (None: plain forcing): {"n_months": M (the forcing-control maps' months),
+    #: "cost_from": the first window step of the cost (None: every step), "cost_to": the step after its last}
+    schedule: Any = None
+    acc_factories: dict = dataclasses.field(default_factory=dict)   #: name -> factory(mesh) -> fn (sharded)
     chunk_fn: Callable = None
     forcing_seconds: float = 0.0
     _chunk_fn_tl: Callable = None
+    _forcing_lock: Any = dataclasses.field(default_factory=threading.Lock, repr=False)   #: see stack_forcing
 
     @property
     def dt(self) -> float:
@@ -426,10 +569,23 @@ class Model:
             self._chunk_fn_tl = _make_chunk_fn(self, rematerialize=False)
         return self._chunk_fn_tl
 
+    @property
+    def devices(self) -> int:
+        return 1 if self.shard is None else int(self.shard.npes)
+
     def init_carry(self, state=None, *, host: bool = False):
-        """The chunk carry at a window start: ``state`` (default: the model's start State) with
-        zero accumulators if any. On the device unless ``host``."""
+        """The chunk carry at a window start: ``state`` (default: the model's start State, a global State) with
+        zero accumulators if any. On the device unless ``host``. Sharded: the folded State and folded sums."""
         st = self.s0 if state is None else state
+        if self.shard is not None:
+            from fesom_jax import adjoint_sharded
+            fst = self.shard.fold_state(st)
+            if self.accumulators:
+                shapes = {k: jax.eval_shape(fn, st).shape for k, fn in self.accumulators.items()}
+                carry = (fst, adjoint_sharded.init_accumulators(self.shard, shapes))
+            else:
+                carry = fst
+            return carry if host else self.shard.place(carry)
         if self.accumulators:
             acc = {k: np.zeros(s.shape, s.dtype)
                    for k, s in AC.init_accumulators(self.accumulators, st).items()}
@@ -448,33 +604,104 @@ class Model:
         return (d.year, doy, d.hour * 3600.0 + d.minute * 60.0 + d.second, d.month)
 
     def stack_forcing(self, dates):
-        """Host ``StepForcing`` stack for a list of dates, rolling the JRA reader across years."""
-        t0 = time.time()
-        steps = []
-        for d in dates:
-            if int(d[0]) != int(self.forcing.jra.year):
-                self.forcing.reopen_year(int(d[0]))
-            steps.append(self.forcing.step_forcing(*d, xp=np))
-        out = surface_forcing.StepForcing(*[np.stack(leaves, axis=0) for leaves in zip(*steps)])
-        self.forcing_seconds += time.time() - t0
+        """Host ``StepForcing`` stack for a list of dates, rolling the JRA reader across years. One build at a time
+        (the reader is stateful, and :class:`_XsAhead` builds on a worker thread); with ``$FESOM_FORCING_PROCS``
+        read-ahead workers each year's JRA records of the list are decoded in parallel first."""
+        with self._forcing_lock:
+            t0 = time.time()
+            steps = []
+            for i, d in enumerate(dates):
+                if int(d[0]) != int(self.forcing.jra.year):
+                    self.forcing.reopen_year(int(d[0]))
+                if i == 0 or int(d[0]) != int(dates[i - 1][0]):
+                    self.forcing.jra.read_ahead([e for e in dates[i:] if int(e[0]) == int(d[0])])
+                steps.append(self.forcing.step_forcing(*d, xp=np))
+            out = surface_forcing.StepForcing(*[None if leaves[0] is None else np.stack(leaves, axis=0)
+                                                for leaves in zip(*steps)])
+            self.forcing_seconds += time.time() - t0
         return out
 
     def xs_fn(self, start=None) -> Callable[[int], Any]:
         """``c -> xs`` for a window starting at ``start`` (default: the model start): chunk
-        ``c``'s per-step forcing, built fresh on every call (the library frees it)."""
+        ``c``'s per-step forcing, built fresh on every call (the library frees it); the next
+        chunk's is built ahead on a worker thread (:class:`_XsAhead`, off with
+        ``FESOM_FORCING_PREFETCH=0``)."""
         start = self.start if start is None else _parse_date(start)
         K = self.chunk_steps
 
         def fn(c):
-            return jax.device_put(self.stack_forcing([self.date(start, c * K + n)
-                                                      for n in range(K)]))
-        return fn
+            dates = [self.date(start, c * K + n) for n in range(K)]
+            sf = self.stack_forcing(dates)
+            sched = None if self.schedule is None else self.sched(start, c * K, dates)
+            if self.shard is not None:
+                return self.shard.forcing_xs(sf, sched)
+            return jax.device_put(sf if sched is None else (sf, sched))
+        if os.environ.get("FESOM_FORCING_PREFETCH", "1") == "0":
+            return fn
+        return _XsAhead(fn)
+
+    def sched(self, start, n0: int, dates) -> dict:
+        """The per-step schedule of the steps ``n0 ..`` of a window starting at ``start``: ``month`` = the window
+        month of the step (0 = the start month), ``cost_w`` = 1 inside ``[cost_from, cost_to)``, else 0."""
+        start = _parse_date(start)
+        sch = self.schedule
+        month = np.asarray([(int(d[0]) - start.year) * 12 + int(d[3]) - start.month for d in dates], np.int32)
+        M = int(sch.get("n_months") or 0)
+        if M and (month.min() < 0 or month.max() >= M):
+            raise ValueError(f"window month {int(month.max())} outside the {M} control months")
+        n = n0 + np.arange(len(dates))
+        lo = sch.get("cost_from")
+        hi = sch.get("cost_to")
+        w = np.ones(len(dates)) if lo is None else ((n >= int(lo)) & (n < int(hi if hi is not None else 1 << 62)))
+        return {"month": month, "cost_w": np.asarray(w, np.float64)}
+
+
+class _XsAhead:
+    """An ``xs_fn`` that builds the next chunk's ``xs`` on ONE worker thread while the device runs this chunk (the
+    production loop's forcing prefetch, ``fesom_jax/run.py``; without it the host forcing left the GPUs of a CORE2
+    forward chunk ~60 % idle). The next chunk is guessed from the last two calls: one on in the same direction (a
+    forward pass, a reverse walk), else ``c + 1`` (the start of a span rebuild). A wrong guess is dropped (built to
+    the end if it had started, then freed); a guess that raises (past the window) is ignored. One worker ⇒ the builds
+    run one at a time, as without it, and give the same ``xs`` bit for bit."""
+
+    def __init__(self, build: Callable[[int], Any]):
+        self.build = build
+        self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xs_ahead")
+        self.ahead = None                    #: (chunk, future) of the guess
+        self.last = None
+
+    def __call__(self, c):
+        c = int(c)
+        fut = None
+        if self.ahead is not None:
+            ca, fa = self.ahead
+            self.ahead = None
+            if ca == c:
+                fut = fa
+            elif not fa.cancel():
+                try:
+                    adjoint._free(fa.result())
+                except Exception:            # a guess past the window: nothing was built
+                    pass
+        if fut is None:
+            fut = self.pool.submit(self.build, c)
+        d = c - self.last if self.last is not None and abs(c - self.last) == 1 else 1
+        self.last = c
+        if c + d >= 0:
+            self.ahead = (c + d, self.pool.submit(self.build, c + d))
+        return fut.result()
 
 
 def _make_chunk_fn(model: Model, *, rematerialize: bool) -> Callable:
+    if model.shard is not None:
+        return model.shard.make_chunk_fn(dt=model.dt, phys=model.phys, adjoint_cfg=model.adjoint_cfg,
+                                         to_params=model.to_params, accumulators=model.acc_factories,
+                                         rematerialize=rematerialize, save_names=tuple(model.save_names))
     mesh, op, fs, phys = model.mesh, model.op, model.forcing.static, model.phys
     adj, dt, to_params = model.adjoint_cfg, model.dt, model.to_params
     accs, save_names = dict(model.accumulators), tuple(model.save_names)
+
+    scheduled = model.schedule is not None
 
     def chunk_fn(carry, xs, u):
         p = to_params(u)
@@ -483,7 +710,14 @@ def _make_chunk_fn(model: Model, *, rematerialize: bool) -> Callable:
             return stepmod.step(s, mesh, op, None, p, dt=dt, is_first_step=False,
                                 step_forcing=x, forcing_static=fs, adjoint_cfg=adj, **phys)
 
-        body = AC.with_running_costs(one_step, accs) if accs else one_step
+        def step3(s, x, month):                # the scheduled chunk: the month's forcing-control maps
+            return stepmod.step(s, mesh, op, None, AC.month_params(p, month), dt=dt, is_first_step=False,
+                                step_forcing=x, forcing_static=fs, adjoint_cfg=adj, **phys)
+
+        if scheduled:
+            body = AC.with_schedule(step3, accs)
+        else:
+            body = AC.with_running_costs(one_step, accs) if accs else one_step
         return adjoint.scan_steps(body, carry, xs, rematerialize=rematerialize,
                                   save_names=save_names if rematerialize else ())
     return chunk_fn
@@ -493,6 +727,7 @@ def _make_chunk_fn(model: Model, *, rematerialize: bool) -> Callable:
 ACCUMULATORS: dict = {
     "mld": lambda mesh: (lambda s: AC.mld_field(s, mesh, invalid="column")),
     "mld_zero": lambda mesh: (lambda s: AC.mld_field(s, mesh, invalid="zero")),
+    "fram": lambda mesh: (lambda s: AC.ice_export_field(s, mesh)),       # Fram Strait ice export [m3/s per node]
 }
 
 
@@ -500,7 +735,10 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
                 adjoint_cfg: AdjointConfig | None = None, ice_mode: str = "prescribed",
                 save_names: tuple = (), accumulators=None, rematerialize: bool = True, *,
                 params0=None, to_params: Callable | None = None, surface_adj: bool = False,
-                config=None, state=None) -> Model:
+                config=None, state=None, ice_adjoint: Mapping | None = None,
+                tke_settings=None, fast=None, devices: int = 1, transport: str = "padded",
+                forcing_ctrl=(), n_months: int = 0, cost_from: int | None = None,
+                cost_to: int | None = None) -> Model:
     """Assemble the reference CORE2 model (see the module docstring).
 
     :param start: window start (ISO date/time or ``datetime``); the restart must be at it.
@@ -509,6 +747,9 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
         ``start`` from :data:`STATES_DIR`, else the hindcast :data:`RESTART_ARCHIVE`.
     :param adjoint_cfg: derivative-only settings (default :meth:`AdjointConfig.exact`).
     :param ice_mode: ``IceConfig.adjoint_mode`` (default ``"prescribed"``).
+    :param ice_adjoint: derivative-only mEVP settings merged into the IceConfig with
+        ``_replace``: any of :data:`ICE_ADJOINT_FIELDS` (``adjoint_damping``, ``adjoint_kappa``,
+        ``adjoint_sweeps``); validated here as the ice step validates them at trace time.
     :param save_names: remat policy names (e.g. ``("ssh_delta",)``).
     :param accumulators: running per-step sums on the carry: a sequence of names from
         :data:`ACCUMULATORS`, a mapping ``name -> fn(State)``, or a factory ``mesh -> mapping``.
@@ -519,13 +760,42 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
     :param surface_adj: add the ``[nod2D]`` surface adjustments to the default controls.
     :param state: a host State to start from instead of loading ``restart`` (its date is
         ``start``).
+    :param tke_settings: ``TkeConfig`` forward options merged with ``_replace``
+        (:func:`parse_tke_settings`; e.g. ``"convection=ramp+conv_ramp_dn2=1e-6"``). They
+        change the forward model; empty ⇒ the reference physics.
+    :param fast: pieces of the fast configuration's physics on top of ``config`` (:func:`parse_fast`, e.g.
+        ``"ice2+se"``; :data:`FAST_PHYSICS`). They change the forward model; empty ⇒ the reference physics.
+        ``ice2`` gives the start State the ice-cycle fields at the upstream init values (a restart without them
+        starts a new cycle, ``ice_step.init_ice_avg``), ``se`` flat SE rings (a CG restart entering SE,
+        ``ssh_se.init_state``).
+    :param forcing_ctrl: atmospheric controls: names from ``step.FORCING_ADJ_KEYS``; the control pytree gets
+        ``forcing_adj = {name: zeros [n_months, nod2D]}`` (a monthly anomaly map per window month, added to the step
+        forcing; the gradient at zero is the sensitivity map), and the chunk's xs a per-step schedule.
+    :param cost_from, cost_to: the accumulators sum the window steps ``[cost_from, cost_to)`` only (the schedule's
+        cost weight; None: every step).
+    :param devices: > 1 runs every chunk sharded over that many devices (the ``dist_<devices>`` partition of
+        :data:`CORE2_DIST`, :mod:`fesom_jax.adjoint_sharded`, halo ``transport`` padded or coloured): the carry is
+        the folded State, the accumulators per-node fields only (names or a factory), the controls scalars.
     """
+    fast = parse_fast(fast)
+    todo = [n for n in fast if n not in FAST_IMPLEMENTED and _piece_dt(n) is None]
+    if todo:
+        raise NotImplementedError(f"fast physics {todo}: not in the adjoint driver yet (have {FAST_IMPLEMENTED})")
+    if "sp" in fast and int(devices) == 1:
+        raise NotImplementedError("fast piece sp needs devices > 1: single precision exists on the sharded path only "
+                                  "(the production runner's casts; the dense step never ran in single precision)")
     config_path = Path(config) if config is not None else CONFIG
-    cfg = load_yaml(config_path)
+    cfg = with_fast_physics(load_yaml(config_path), fast)
     cfg.validate()
-    assert_physics(cfg)
+    assert_physics(cfg, fast)
     if ice_mode not in ICE_MODES:
         raise ValueError(f"ice_mode must be one of {ICE_MODES}, got {ice_mode!r}")
+    ice_kw = dict(ice_adjoint or {})
+    bad = sorted(set(ice_kw) - set(ICE_ADJOINT_FIELDS))
+    if bad:
+        raise ValueError(f"ice_adjoint: unknown field(s) {bad}; allowed {ICE_ADJOINT_FIELDS}")
+    ice_cfg = cfg.ice._replace(adjoint_mode=ice_mode, **ice_kw)
+    _ice_step.validate_adjoint_settings(ice_cfg)
     if n_steps % chunk_steps:
         raise ValueError(f"n_steps {n_steps} is not a multiple of chunk_steps {chunk_steps}")
     start = _parse_date(start)
@@ -535,22 +805,44 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
         rpath = _resolve_restart(start, restart)
         s0, meta = load_state(rpath)
         _check_restart_date(rpath, meta, start)
+        _check_restart_dt(rpath, meta, cfg.dt)
     else:
         rpath, s0, meta = Path("<in-memory>"), jax.device_get(state), {}
-    op = ssh.build_ssh_operator(mesh, dt=cfg.dt)
-    forcing = surface_forcing.build_surface_forcing(mesh, start.year, dt=cfg.dt,
+    # the State of this physics: the ice-cycle fields kept (a run resumes mid-cycle), started at the upstream init
+    # values, or dropped with ice every step (ice_step.init_ice_avg); the SE rings kept or flat (a CG restart entering
+    # SE); a CG window from an SE restart refused (ssh_se.init_state); the SP carry dropped (double precision)
+    s0 = _ice_step.init_ice_avg(s0, ice_cfg, xp=np)
+    se_cfg = cfg.split_explicit()
+    if se_cfg is not None:
+        mesh = ssh_se.with_tables(mesh)
+    s0 = ssh_se.init_state(s0, np.asarray(mesh.elem_layer_mask), se_cfg, restart=True)
+    if "sp" not in fast:
+        from fesom_jax.precision import drop_carry
+        s0 = drop_carry(s0)
+    sp = "sp" in fast
+    # single precision as run.py: the SP preconditioner variant (FESOM2 #995; the CG only), the forcing's per-step
+    # values in the point-slope form (#940)
+    op = ssh.build_ssh_operator(mesh, dt=cfg.dt, **({"precond_variant": 1} if sp else {}))
+    forcing = surface_forcing.build_surface_forcing(mesh, start.year, dt=cfg.dt, mslp=cfg.forcing_mslp(),
                                                    **cfg.forcing_paths())
+    if sp:
+        forcing.point_slope = True
     phys = cfg.physics_kwargs()
-    phys["ice_cfg"] = cfg.ice._replace(adjoint_mode=ice_mode)
+    phys["ice_cfg"] = ice_cfg
+    tke_kw = parse_tke_settings(tke_settings)
+    if tke_kw:
+        phys["tke_cfg"] = phys["tke_cfg"]._replace(**tke_kw).validate()
     adj = (adjoint_cfg if adjoint_cfg is not None else AdjointConfig.exact()).validate()
     if accumulators is None:
-        accs = {}
+        accs, acc_fac = {}, {}
     elif callable(accumulators):
         accs = dict(accumulators(mesh))
+        acc_fac = {k: (lambda m, k=k: accumulators(m)[k]) for k in accs}
     elif isinstance(accumulators, Mapping):
-        accs = dict(accumulators)
+        accs, acc_fac = dict(accumulators), None          # functions of the dense mesh's State
     else:
         accs = {n: ACCUMULATORS[n](mesh) for n in accumulators}
+        acc_fac = {n: ACCUMULATORS[n] for n in accumulators}
     if params0 is None:
         if to_params is not None:
             raise ValueError("to_params needs params0")
@@ -562,7 +854,30 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
                   restart_meta=meta, s0=s0, n_steps=int(n_steps), chunk_steps=int(chunk_steps),
                   save_names=tuple(save_names), rematerialize=bool(rematerialize),
                   accumulators=accs, params0=_strong_f64(params0), to_params=to_params,
-                  surface_adj=bool(surface_adj))
+                  surface_adj=bool(surface_adj), tke_settings=tke_kw, fast=fast)
+    forcing_ctrl = tuple(forcing_ctrl or ())
+    if forcing_ctrl:
+        bad = sorted(set(forcing_ctrl) - set(stepmod.FORCING_ADJ_KEYS))
+        if bad or int(n_months) < 1:
+            raise ValueError(f"forcing_ctrl: unknown {bad} (known {stepmod.FORCING_ADJ_KEYS}) or n_months < 1")
+        model.params0 = dict(model.params0)
+        model.params0["forcing_adj"] = {k: np.zeros((int(n_months), int(mesh.nod2D)), np.float64)
+                                        for k in forcing_ctrl}
+    if forcing_ctrl or cost_from is not None:
+        model.schedule = {"n_months": int(n_months), "cost_from": cost_from, "cost_to": cost_to}
+    if int(devices) > 1:
+        from fesom_jax import adjoint_sharded
+        if acc_fac is None:
+            raise ValueError("devices > 1: give the accumulators as names or a factory mesh -> mapping (each is "
+                             "rebuilt on the device-local mesh)")
+        others = {k: v for k, v in model.params0.items() if k != "forcing_adj"}
+        if surface_adj or any(np.ndim(v) for v in jax.tree.leaves(others)):
+            raise ValueError("devices > 1: scalar controls (and the forcing-control maps) only; a per-node field "
+                             "control other than forcing_adj is not folded")
+        part = partit.read_partition(CORE2_DIST, int(devices))
+        model.shard = adjoint_sharded.build(mesh, part, op, forcing.static, phys=phys, transport=transport,
+                                            precision="single" if sp else "double", node_ids=bool(forcing_ctrl))
+        model.acc_factories = acc_fac
     model.chunk_fn = _make_chunk_fn(model, rematerialize=bool(rematerialize))
     return model
 
@@ -664,6 +979,8 @@ def direction(model: Model, name: str, box=DEFAULT_BOX) -> Direction:
     """The named direction ``name`` (:data:`DIRECTIONS`) as full host tangents of the start carry
     and of ``params`` (unit sizes: :data:`DIRECTION_UNITS`). Parameter directions need the
     default control pytree; ``heat``/``stress_x`` need ``surface_adj=True``."""
+    if model.shard is not None and name in ("T_inside", "T_above", "T_outside"):
+        raise NotImplementedError("a state direction on the sharded (folded) carry")
     carry0 = model.init_carry(host=True)
     t_carry = jax.tree.map(lambda a: np.zeros(np.shape(a), np.asarray(a).dtype), carry0)
     t_par = jax.tree.map(lambda a: np.zeros(np.shape(a), np.asarray(a).dtype), model.params0)
@@ -738,6 +1055,21 @@ def provenance(model: Model, action: str, *, n_steps: int | None = None, start=N
         "compile_s": None, "run_s": None,
         "time": datetime.datetime.now().isoformat(timespec="seconds"),
     }
+    if model.tke_settings:
+        row["tke_settings"] = dict(model.tke_settings)
+    if model.fast:
+        row["fast"] = list(model.fast)
+    if model.schedule is not None:
+        row["schedule"] = dict(model.schedule)
+        if "forcing_adj" in model.params0:
+            row["forcing_ctrl"] = sorted(model.params0["forcing_adj"])
+    if model.shard is not None:
+        row["devices"], row["transport"] = model.devices, model.shard.transport
+        if model.shard.se_wide:
+            row["se_wide"] = model.shard.se_wide
+    fenv = {k: v for k, v in os.environ.items() if k.startswith("FESOM_")}
+    if fenv:                                     # the GPU options (round-off) and the derivative switches in force
+        row["fesom_env"] = fenv
     if timer is not None:
         row.update(timer.fields())
     row.update(extra)
@@ -797,6 +1129,42 @@ def _save_npz(path: Path, tree) -> str:
 # resumable reverse sweep
 
 
+class DiskBoundaries(MutableMapping):
+    """The saved boundaries ``chunks`` of a run directory, read from disk on ``[c]`` (the lazy
+    :meth:`~fesom_jax.adjoint.ReverseCheckpoint.load_boundaries`). Only states assigned to it
+    (a resumed forward adds its new boundaries) stay on the host. A year at stride 24 is 31
+    stored states, 60 GB that the eager load holds on the host for the whole sweep; the reverse
+    walk reads each one once, ~2 s per 1.93 GB state."""
+
+    def __init__(self, directory, chunks, like, load):
+        self.dir, self.like, self._read = Path(directory), like, load
+        self._disk = set(int(c) for c in chunks)
+        self._host: dict = {}
+
+    def __getitem__(self, c):
+        if c in self._host:
+            return self._host[c]
+        if c not in self._disk:
+            raise KeyError(c)
+        return self._read(self.dir / f"boundary_{c}.npz", self.like)
+
+    def __setitem__(self, c, state):
+        self._host[c] = state
+
+    def __delitem__(self, c):
+        self._host.pop(c, None)
+        self._disk.discard(c)
+
+    def __iter__(self):
+        return iter(sorted(self._disk | set(self._host)))
+
+    def __len__(self):
+        return len(self._disk | set(self._host))
+
+    def resident_bytes(self) -> int:
+        return sum(a.nbytes for a in jax.tree.leaves(self._host))
+
+
 class DiskCheckpoint:
     """A :class:`~fesom_jax.adjoint.ReverseCheckpoint` on disk, for sweeps longer than a job.
 
@@ -806,9 +1174,12 @@ class DiskCheckpoint:
     partial gradient and the trace in ``reverse_<next>.npz`` / ``reverse_<next>.json``; the
     sweep then raises :class:`~fesom_jax.adjoint.LegIncomplete` and a rerun with the same
     directory continues. Nothing is overwritten or deleted: the directory is a job's scratch
-    and may be removed by hand when the result is in."""
+    and may be removed by hand when the result is in. ``lazy``: serve the boundaries from disk
+    (:class:`DiskBoundaries`) instead of loading them all to the host."""
 
-    def __init__(self, directory, params_like, *, budget_s: float = math.inf):
+    def __init__(self, directory, params_like, *, budget_s: float = math.inf,
+                 lazy: bool = False):
+        self.lazy = bool(lazy)
         self.dir = Path(directory)
         self.dir.mkdir(parents=True, exist_ok=True)
         self.params_like = params_like
@@ -849,8 +1220,13 @@ class DiskCheckpoint:
         self._save(self.dir / f"boundary_{c}.npz", state)
         return self._out_of_time()
 
-    def load_boundaries(self, like) -> dict:
-        return {c: self._load(self.dir / f"boundary_{c}.npz", like) for c in self._saved()}
+    def load_boundaries(self, like):
+        return self._boundaries(self._saved(), like)
+
+    def _boundaries(self, chunks, like):
+        if self.lazy:
+            return DiskBoundaries(self.dir, chunks, like, self._load)
+        return {c: self._load(self.dir / f"boundary_{c}.npz", like) for c in chunks}
 
     def finish_forward(self, loss: float) -> None:
         fj = self.dir / "forward.json"
@@ -915,12 +1291,14 @@ def run_fwd(model: Model, costs=("box_T_vw",), *, box=DEFAULT_BOX, params=None, 
 def run_grad(model: Model, costs=("box_T_vw",), *, box=DEFAULT_BOX, params=None, start=None,
              n_steps=None, init=None, stride: int = 1, check_linear=True, on_cot=None,
              on_chunk=None, resume_dir=None, budget_s: float = math.inf,
-             abort_at: float | None = None, action: str = "grad") -> list:
+             abort_at: float | None = None, action: str = "grad",
+             checkpoint_factory: Callable | None = None) -> list:
     """Gradients of one or several costs over a window. One cost: :func:`chunked_grad`
     (resumable with ``resume_dir``); several: :func:`chunked_grad_multi` (``on_cot(k, c,
     cot)``). ``abort_at``: stop the sweep when a boundary cotangent norm exceeds it or is not
-    finite (the row gets ``overflow``). Returns one row per cost; ``row["_result"]`` holds the
-    library result (grads, ``state_cot`` on the host)."""
+    finite (the row gets ``overflow``). ``checkpoint_factory(resume_dir, params, budget_s)``
+    replaces :class:`DiskCheckpoint` for a resumable sweep. Returns one row per cost;
+    ``row["_result"]`` holds the library result (grads, ``state_cot`` on the host)."""
     start, n, nc, carry = _window(model, start, n_steps, init)
     params = model.params0 if params is None else params
     names = [c if isinstance(c, str) else getattr(c, "__name__", "callable") for c in costs]
@@ -958,8 +1336,9 @@ def run_grad(model: Model, costs=("box_T_vw",), *, box=DEFAULT_BOX, params=None,
                     boundary_stride=stride, check_linear=check_linear, on_cot=hook,
                     on_chunk=on_chunk, field_trace=False)
             else:
-                ck = (None if resume_dir is None
-                      else DiskCheckpoint(resume_dir, params, budget_s=budget_s))
+                make_ck = checkpoint_factory or (
+                    lambda d, p, b: DiskCheckpoint(d, p, budget_s=b))
+                ck = None if resume_dir is None else make_ck(resume_dir, params, budget_s)
                 res = adjoint.chunked_grad(
                     model.chunk_fn, params, init_state=carry, n_chunks=nc,
                     xs_fn=model.xs_fn(start), loss_fn=losses[0], chunk_steps=model.chunk_steps,
@@ -1355,6 +1734,22 @@ def _adjoint_cfg(args) -> AdjointConfig:
     return cfg.validate()
 
 
+def _ice_adjoint_args(args) -> dict:
+    """The ``--ice-damping/--ice-kappa/--ice-sweeps/--ice-cuts/--ice-alpha-kappa/--ice-theta/
+    --ice-thin-mass/--ice-sweep-guard`` options given, as
+    ``ice_adjoint`` (``--ice-cuts advect+ssh`` -> ``("advect", "ssh")``; ``none`` -> ``()``)."""
+    cuts = getattr(args, "ice_cuts", None)
+    if cuts is not None:
+        cuts = tuple(c for c in cuts.split("+") if c and c != "none")
+    pairs = (("adjoint_damping", args.ice_damping), ("adjoint_kappa", args.ice_kappa),
+             ("adjoint_sweeps", args.ice_sweeps), ("adjoint_cuts", cuts),
+             ("adjoint_alpha_kappa", getattr(args, "ice_alpha_kappa", None)),
+             ("adjoint_theta", getattr(args, "ice_theta", None)),
+             ("adjoint_thin_mass", getattr(args, "ice_thin_mass", None)),
+             ("adjoint_sweep_guard", getattr(args, "ice_sweep_guard", None)))
+    return {k: v for k, v in pairs if v is not None}
+
+
 def _parse(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1370,6 +1765,23 @@ def _parse(argv=None):
     ap.add_argument("--freeze", action="append", default=[], help="extra freeze flag (repeat)")
     ap.add_argument("--cut", action="append", default=[], help="named derivative cut (repeat)")
     ap.add_argument("--ice", choices=ICE_MODES, default="prescribed")
+    ap.add_argument("--ice-damping", choices=("none", "local", "frozen_sweep"), default=None,
+                    help="IceConfig.adjoint_damping (mEVP, with --ice exact/dynamics)")
+    ap.add_argument("--ice-kappa", type=float, default=None, help="IceConfig.adjoint_kappa")
+    ap.add_argument("--ice-alpha-kappa", type=float, default=None,
+                    help="IceConfig.adjoint_alpha_kappa (frozen_sweep κ0)")
+    ap.add_argument("--ice-theta", type=float, default=None,
+                    help="IceConfig.adjoint_theta (frozen_sweep softening θ)")
+    ap.add_argument("--ice-thin-mass", type=float, default=None,
+                    help="IceConfig.adjoint_thin_mass [kg/m²] (mEVP load derivative cut on thin "
+                         "ice; 0 = off)")
+    ap.add_argument("--ice-sweep-guard", type=float, default=None,
+                    help="IceConfig.adjoint_sweep_guard (frozen_sweep: drop an ice step's mEVP "
+                         "derivative whose transposed sweeps grow past this factor; 0 = off)")
+    ap.add_argument("--ice-sweeps", type=int, default=None,
+                    help="IceConfig.adjoint_sweeps (-1 = all)")
+    ap.add_argument("--ice-cuts", default=None,
+                    help="IceConfig.adjoint_cuts, e.g. advect+ssh or fct_flux (dynamics/exact)")
     ap.add_argument("--save-names", default="", help="comma list, e.g. ssh_delta")
     ap.add_argument("--no-remat", action="store_true")
     ap.add_argument("--accumulate", action="append", default=[],
@@ -1427,7 +1839,7 @@ def main(argv=None) -> int:
     model = build_model(args.start, n_steps, args.chunk_steps, args.restart, _adjoint_cfg(args),
                         args.ice, tuple(s for s in args.save_names.split(",") if s),
                         tuple(args.accumulate) or None, not args.no_remat,
-                        surface_adj=args.surface_adj)
+                        surface_adj=args.surface_adj, ice_adjoint=_ice_adjoint_args(args))
     costs = tuple(args.cost) or ("box_T_vw",)
     lin = {"zero": True, "full": "full", "off": False}[args.check_linear]
     tlo = None if args.tl_constant_folding else TL_COMPILER_OPTIONS

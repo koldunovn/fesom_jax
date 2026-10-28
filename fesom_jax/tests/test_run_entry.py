@@ -158,6 +158,8 @@ def core2_setup():
 def _owned_worst(a, b, part, sm, npes):
     worst = 0.0
     for fld in dataclasses.fields(State):
+        if getattr(a, fld.name) is None:   # unused optional field
+            continue
         A, B = np.asarray(getattr(a, fld.name)), np.asarray(getattr(b, fld.name))
         if A.shape[1] == sm.Lmax["nod"]:
             myd = part.myDim_nod2D
@@ -291,6 +293,28 @@ def test_restart_archive_cadence(core2_setup, tmp_path, monkeypatch):
     assert int(g_last.attrs["step"]) == 60
     dirs = sorted(p.name for p in archive.iterdir() if p.is_dir())
     assert len(dirs) == 2, f"expected 2 immutable archival dirs, got {dirs}"
+
+
+@have_forcing
+@pytest.mark.parametrize("on_device", [False, True])
+def test_forcing_prefetch_bitwise(core2_setup, monkeypatch, on_device):
+    """CORE2 GPU speed plan A6: chunk i+1's forcing is built on a worker thread while chunk i
+    runs. Same reads in the same order (the year roll included) ⇒ the run is BITWISE the serial
+    one — on the calendar JRA path, for the host per-step stack and the on-device tables."""
+    fx = core2_setup
+    common = dict(mesh=fx["mesh"], part=fx["part"], sm=fx["sm"], sop=fx["sop"], year=YEAR)
+    cfg = RunConfig(n_steps=6, kpp=KppConfig(), dt=DT,
+                    forcing={"kind": "core2", "on_device": on_device})
+    out = {}
+    for flag in ("0", "1"):
+        monkeypatch.setenv("FESOM_FORCING_PREFETCH", flag)
+        res = run_from_config(cfg, state0=fx["state"], forcing=fx["cf"], chunk_steps=2, **common)
+        out[flag] = res.state_p
+    for fld in dataclasses.fields(State):
+        if getattr(out["0"], fld.name) is None:   # unused optional field
+            continue
+        a, b = np.asarray(getattr(out["0"], fld.name)), np.asarray(getattr(out["1"], fld.name))
+        assert np.array_equal(a, b), f"{fld.name}: prefetch changed the run"
 
 
 @have_forcing

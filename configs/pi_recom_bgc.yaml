@@ -1,0 +1,39 @@
+# pi + full REcoM (plan docs/plans/20261025-recom-port.md, lane W): configs/pi_recom.yaml's physics with FESOM2-REcoM's
+# bin_2p3z2d ecosystem switched on. The physics-matched Fortran twin is /work/ab0995/a270088/recom_ref/pi_30d_jan_jaxphys
+# (docs/recom/FORTRAN_REFERENCE.md); gates G4b/G5 start JAX from the twin's step-0 state (fesom_jax.recom.reference).
+#
+# REcoM inputs (FESOM2's test/input/recom, the 5-degree pi set the twin read; read only):
+#   recom.namelist   the twin's namelist.recom (bin_2p3z2d with the pi dust file name)
+#   recom.ic_dir     the BGC IC files of fesom_jax.recom.ic.PI_IC_FILES (cold start without a BGC restart)
+#   forcing.dust_file  the Albani monthly dust on the pi mesh (REcoM's nm_fe_data_file under ClimateDataPath)
+# The tracer advection, Redi, the vertical diffusion and every physics choice are those of pi_recom.yaml.
+
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 2700.0
+
+mesh: null
+partition: null
+forcing:
+  kind: core2
+  start_year: 1958
+  mslp: true
+  dust_file: /work/ab0995/a270088/fesom2_sp_zstar/test/input/recom/DustClimMonthlyAlbani_pimesh.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_jaxphys/namelist.recom
+  ic_set: pi
+  ic_dir: /work/ab0995/a270088/fesom2_sp_zstar/test/input/recom
+
+output_dir: runs/pi_recom_bgc
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+duration: 960step         # 30 days

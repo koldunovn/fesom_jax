@@ -42,6 +42,7 @@ import jax
 import jax.numpy as jnp
 
 from . import adjoint_stab
+from . import precision as PR
 from .integrate import _run_steps
 
 __all__ = ["scan_steps", "chunked_forward", "chunked_grad", "ChunkedGrad", "chunked_grad_multi",
@@ -155,7 +156,12 @@ class ReverseCheckpoint(Protocol):
     def put_boundary(self, c: int, state) -> bool:
         """Store boundary ``c``. Return True to stop the leg here."""
 
-    def load_boundaries(self, like) -> dict: ...
+    def load_boundaries(self, like) -> dict:
+        """``{chunk: host state}``, or any mapping that reads the state on ``[chunk]``. A lazy
+        store keeps the stored boundaries off the host: the reverse walk asks for each one once,
+        when it rebuilds that boundary's span, so the host then holds one span (``stride``
+        states) instead of ``n/stride + stride``. A lazy store reports what it holds through a
+        ``resident_bytes()`` method (``ChunkedGrad.host_gb``)."""
 
     def finish_forward(self, loss: float) -> None: ...
 
@@ -193,18 +199,27 @@ class LegIncomplete(Exception):
 _JIT_CACHE = 4
 
 
+def _precision(chunk_fn) -> str:
+    """A chunk function's working precision: its ``precision`` attribute (``"single"``: the sharded chunk of a
+    single-precision model, :mod:`fesom_jax.adjoint_sharded`), else ``"double"``."""
+    return getattr(chunk_fn, "precision", "double")
+
+
 @functools.lru_cache(maxsize=_JIT_CACHE)
 def _jitted_forward(chunk_fn):
-    return jax.jit(chunk_fn)
+    # single precision: compiled with precision.compiler_options and traced/run inside precision.scope (the
+    # production runner's PR.scoped(PR.jit(...))); double: exactly jax.jit(chunk_fn)
+    prec = _precision(chunk_fn)
+    return PR.scoped(PR.jit(chunk_fn, prec), prec)
 
 
 @functools.lru_cache(maxsize=_JIT_CACHE)
 def _jitted_backward(chunk_fn):
-    @jax.jit
     def bwd(state, xs, params, cot):
         _, vjp = jax.vjp(lambda s, p: chunk_fn(s, xs, p), state, params)
         return vjp(cot)
-    return bwd
+    prec = _precision(chunk_fn)
+    return PR.scoped(PR.jit(bwd, prec), prec)
 
 
 # Both caches are keyed on the `chunk_fn` OBJECT, and that is load-bearing rather than a
@@ -217,12 +232,28 @@ def _jitted_backward(chunk_fn):
 # extraction having made the adjoint slower. `maxsize` bounds what the cache keeps alive.
 
 
+#: id -> array of the run constants :func:`_free` never deletes (:func:`keep`); the strong reference keeps an id
+#: from being reused by another array while it is registered
+_KEPT: dict = {}
+
+
+def keep(tree):
+    """Mark the device arrays of ``tree`` as run constants: :func:`_free` (every chunk's ``xs`` after its use,
+    ``free_xs``) leaves them alone. For constants a chunk function takes through ``xs`` instead of a closure
+    (a closed-over array is embedded in the HLO as a constant, losing its sharding; the sharded chunk of
+    :mod:`fesom_jax.adjoint_sharded`). Returns ``tree``."""
+    for x in jax.tree.leaves(tree):
+        if hasattr(x, "delete"):
+            _KEPT[id(x)] = x
+    return tree
+
+
 def _free(tree) -> None:
-    """Release device buffers now instead of at the next GC.
+    """Release device buffers now instead of at the next GC (not the :func:`keep` run constants).
 
     ⚠️ Only ever after :func:`jax.block_until_ready` on everything that consumes them. A VJP's
     inputs stay live until it completes, and freeing a live buffer does not fail loudly."""
-    jax.tree.map(lambda x: x.delete() if hasattr(x, "delete") else None, tree)
+    jax.tree.map(lambda x: x.delete() if hasattr(x, "delete") and id(x) not in _KEPT else None, tree)
 
 
 def _add_grads(a, b):
@@ -386,7 +417,9 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         :func:`fesom_jax.adjoint_stab.amplification` to turn the trace into a per-STEP rate.
     :param boundary_stride: keep every Nth chunk boundary on the host and recompute the spans
         between, for one extra forward pass. Host cost is ``n/stride + stride`` states, minimised
-        near ``√n_chunks``. The gradient is unchanged: the recomputed states are the same states.
+        near ``√n_chunks``; ``stride`` states when the ``checkpoint`` serves its boundaries
+        lazily from disk (:meth:`ReverseCheckpoint.load_boundaries`). The gradient is unchanged:
+        the recomputed states are the same states.
     :param checkpoint: optional :class:`ReverseCheckpoint`. Raises :class:`LegIncomplete` when it
         asks to stop.
     :param on_forward: ``(loss, host_gb, seconds)`` once the forward completes. A reverse sweep can
@@ -472,7 +505,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         fwd_t = time.time() - ta
         if checkpoint is not None:
             checkpoint.finish_forward(loss_v)
-    host_gb = sum(a.nbytes for a in jax.tree.leaves(boundaries)) / 1e9
+    host_gb = _host_gb(boundaries)
     if on_forward is not None:
         on_forward(loss_v, host_gb, fwd_t)
 
@@ -628,7 +661,7 @@ def chunked_grad_multi(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
                                  None)
     losses = [float(f(s_fin)) for f in loss_fns]
     fwd_t = time.time() - ta
-    host_gb = sum(a.nbytes for a in jax.tree.leaves(boundaries)) / 1e9
+    host_gb = _host_gb(boundaries)
     if on_forward is not None:
         on_forward(losses, host_gb, fwd_t)
 
@@ -740,6 +773,14 @@ def _forward(fwd_chunk, params, init_state, n_chunks, xs_fn, stride, free, check
     return s, kept
 
 
+def _host_gb(boundaries) -> float:
+    """GB of boundary states on the host; a lazy store counts what it holds."""
+    resident = getattr(boundaries, "resident_bytes", None)
+    if resident is not None:
+        return resident() / 1e9
+    return sum(a.nbytes for a in jax.tree.leaves(boundaries)) / 1e9
+
+
 def _rebuild_span(fwd_chunk, params, stored, lo, hi, xs_fn, free):
     """Re-run chunks ``lo..hi-1`` from the stored boundary at ``lo``; host states by chunk index.
 
@@ -749,9 +790,11 @@ def _rebuild_span(fwd_chunk, params, stored, lo, hi, xs_fn, free):
     a year at stride 19, against 706 GB at stride 1 on a 515 GB node.
 
     The price is exactly ONE extra forward pass over the window, because each chunk is recomputed
-    at most once across the whole sweep. The gradient is unchanged; these are the same states."""
-    s = jax.device_put(stored[lo])
-    local = {lo: stored[lo]}
+    at most once across the whole sweep. The gradient is unchanged; these are the same states.
+    ``stored[lo]`` is read once: a lazy store reads it from disk on that access."""
+    first = stored[lo]
+    s = jax.device_put(first)
+    local = {lo: first}
     for c in range(lo, hi - 1):
         xs_c = xs_fn(c)
         nxt = jax.block_until_ready(fwd_chunk(s, xs_c, params))

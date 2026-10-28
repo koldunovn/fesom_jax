@@ -66,7 +66,7 @@ def test_serial_noop_array_equal(mesh):
     assert sm.Lmax == {"nod": mesh.nod2D, "elem": mesh.elem2D, "edge": mesh.edge2D}
     for f in dataclasses.fields(Mesh):
         name = f.name
-        if f.metadata.get("static") or name in _DENSE_SKIP:
+        if f.metadata.get("static") or name in _DENSE_SKIP or getattr(mesh, name) is None:
             continue
         dense = np.asarray(getattr(mesh, name))
         got = sm.fields[name] if name in shard_mesh.REPLICATED_FIELDS else sm.fields[name][0]
@@ -176,6 +176,32 @@ def test_masks_and_padding(mesh, npes):
         if ne < sm.Lmax["elem"]:
             assert (sm.fields["elem_nodes"][d, ne:] == -1).all()
             assert np.isfinite(sm.fields["elem_area"][d, ne:]).all()
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+def test_boundary_node_is_the_global_coast(mesh, npes, tmp_path):
+    """The ShardedMesh carries the GLOBAL coastal mask (the sea-ice boundary condition) on every local node lane, and
+    keeps it through export/load. A device's local mesh cannot rebuild it (its edge lanes are not the global ids that
+    ``edge2D_in`` splits; a device holds fewer edges than ``edge2D_in``, so the local recompute finds no coast): the
+    bug that made the sharded ice step differ from the dense one by O(1) in u_ice on pi dist_4."""
+    from fesom_jax import ice_evp
+    from fesom_jax.integrate_sharded import local_mesh
+    part = partit.read_partition(CORE2_DIST, npes)
+    sm = shard_mesh.build_sharded_mesh(mesh, part)
+    bn = np.asarray(ice_evp.boundary_node_mask(mesh))
+    np.testing.assert_array_equal(shard_mesh.global_boundary_node(mesh), bn)
+    wrong = 0
+    for d in range(npes):
+        n = int(sm.counts["n_local_nod"][d])
+        np.testing.assert_array_equal(sm.boundary_node[d, :n], bn[part.myList_nod2D[d]])
+        assert not sm.boundary_node[d, n:].any()
+        own = int(sm.counts["myDim_nod"][d])
+        loc = np.asarray(ice_evp.boundary_node_mask(local_mesh(sm, d)))[:own]
+        wrong += int((loc != sm.boundary_node[d, :own]).sum())
+    assert wrong > 0                     # the trap the carried mask replaces
+    back = shard_mesh.load_sharded_mesh(shard_mesh.export_sharded_mesh(sm, tmp_path / "sm"))
+    np.testing.assert_array_equal(back.boundary_node, sm.boundary_node)
 
 
 # --------------------------------------------------------------------------
