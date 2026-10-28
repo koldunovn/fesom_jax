@@ -494,7 +494,7 @@ class RecomSwitches:
     # ---- the spectral fork (fesom2.6_recom_tra_diags_spectral) ----
     spectral_fork: bool = False         # the namelist has an &spectral group: the fork's flavour (fesom_jax.recom.layout)
     recom_neg_diag: bool = False        # fork recom_modules.F90:102 (a print diagnostic)
-    DIC_PI: bool = True                 # fork :162 (the IC's DIC is preindustrial; read by the ciso/atbox paths only)
+    DIC_PI: bool = True                 # fork :162; the fork's oce_setup_step.F90 reads the GLODAP PI DIC file when on
     par_layer_mean: bool = False        # fork :283 default .true. (FORK_DEFAULTS): the exact layer-mean broadband PAR
     res_phy_const: bool = False         # fork :336
     ovf_to_cdom: bool = True            # fork :478
@@ -558,8 +558,8 @@ SUPPORTED: dict = {
     "fe_2ligands": (False, "two-ligand iron chemistry is not ported"),
     "fe_compl_nica": (False, "the NICA iron complexation is not ported"),
     "fe_data_source": ("Albani", "only the Albani monthly dust climatology is ported"),
-    # the spectral fork (docs/plans/20261028-recom-spectral-port.md): accepted as the lanes land
-    "spectral_fork": (False, "the fork's ecosystem and light are not ported yet (lanes E, L, W)"),
+    # the spectral fork (docs/plans/20261028-recom-spectral-port.md): the ecosystem (lane E), the light (lane L)
+    # and the wiring (lane W) are ported; what stays out:
     "RECOM_MARSHALL": (False, "the D1 photoinhibition tracers are out of scope"),
     "RECOM_CALC_APHYT": (False, "the D1-dependent phytoplankton absorption is out of scope"),
     "RECOM_CALC_REFLEC": (False, "the reflectance diagnostic is out of scope"),
@@ -726,12 +726,24 @@ def load_namelist(path: Union[str, Path], check: bool = True) -> Tuple[RecomSwit
     return sw, par
 
 
+# What the spectral fork's flavour ports beyond bin_2p3z2d (lanes E/L/W): its 4-PFT layouts (enable_coccos) and
+# the tracer counts of its layouts (bgc_num, checked by fesom_jax.recom.layout.layout_of).
+FORK_PORTED = ("enable_coccos", "bgc_num")
+
+
 def check_supported(sw: RecomSwitches) -> RecomSwitches:
-    """Raise ``NotImplementedError`` for any switch outside the ported ``bin_2p3z2d`` configuration."""
+    """Raise ``NotImplementedError`` for any switch outside the ported ``bin_2p3z2d`` configuration (or, for a
+    namelist of the spectral fork, outside its ported flavour)."""
     bad = []
+    fork = bool(getattr(sw, "spectral_fork", False))
     for name, (want, why) in SUPPORTED.items():
+        if fork and name in FORK_PORTED:
+            continue
         if getattr(sw, name) != want:
             bad.append(f"{name} = {getattr(sw, name)!r} ({why})")
+    if fork and not bad:
+        from .layout import layout_of
+        layout_of(sw)                     # ValueError when bgc_num fits none of the fork's layouts
     if bad:
         raise NotImplementedError("REcoM switch(es) outside the ported bin_2p3z2d configuration "
                                   "(fesom_jax/recom/params.py SUPPORTED): " + "; ".join(bad))

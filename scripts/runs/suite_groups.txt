@@ -223,3 +223,4 @@ unit fesom_jax/tests/test_recom_sms_fork.py
 unit fesom_jax/tests/test_recom_sinking_fork.py
 unit fesom_jax/tests/test_recom_stage3_fork.py
 unit fesom_jax/tests/test_recom_spectral_light.py
+unit fesom_jax/tests/test_recom_spectral_wiring.py

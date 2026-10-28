@@ -267,7 +267,7 @@ def main():
         forcing = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0,
                                                    dt=cfg.dt, mslp=cfg.forcing_mslp(),
                                                    bgc_dust_path=cfg.bgc_dust_path(), dt_ramp=cfg.dt_ramp,
-                                                   bgc_co2=cfg.bgc_co2(),
+                                                   bgc_co2=cfg.bgc_co2(), bgc_oasim=cfg.bgc_oasim(),
                                                    **fpaths); _lap("forcing_setup")
 
     # The NG5 host-forcing fix: build a LOCAL-node forcing (interp only this process's owned
@@ -278,7 +278,8 @@ def main():
         local_forcing = build_local_forcing(mesh, args.year, part, part.npes,
                                              static=forcing.static, sst_ic=sst0, dt=cfg.dt,
                                              mslp=cfg.forcing_mslp(), bgc_dust_path=cfg.bgc_dust_path(),
-                                             dt_ramp=cfg.dt_ramp, bgc_co2=cfg.bgc_co2(), **fpaths)
+                                             dt_ramp=cfg.dt_ramp, bgc_co2=cfg.bgc_co2(), bgc_oasim=cfg.bgc_oasim(),
+                                             **fpaths)
         _lap("local_forcing_setup")
 
     # the halo transport: a --padded / --coloured / --ragged flag wins over gpu.halo_transport

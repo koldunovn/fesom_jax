@@ -17,7 +17,7 @@ from functools import lru_cache
 from typing import NamedTuple, Optional
 
 PASSIVE_BC = ("zero", "salt")
-IC_SETS = ("pi", "core2", "core2_present")
+IC_SETS = ("pi", "pi_present", "core2", "core2_present")
 # The BGC fields a run can write into its mean-output streams (fesom_jax.recom.wiring.output_fields): 3-D tracers
 # (Chl = PhyChl + DiaChl) and the 2-D diagnostics of State.bgc_diag
 OUTPUT_FIELDS = ("DIC", "Alk", "DIN", "DSi", "DFe", "O2", "Chl", "co2flux", "pco2surf", "npp", "export100", "ph",
@@ -50,6 +50,14 @@ class RecomConfig(NamedTuple):
     ic_dir: Optional[str] = None
     output: tuple = ("DIC", "Alk", "DIN", "DSi", "DFe", "O2", "Chl", "co2flux", "pco2surf", "npp", "export100")
     budget: bool = False
+    # the spectral fork (docs/plans/20261028-recom-spectral-port.md; a namelist with an &spectral group): spectral =
+    # the __RECOM_WAVEBANDS build (fesom_jax.recom.spectral: 13-band light from OASIM, the spectral growth terms, the
+    # N:C clamp), optics_dir = the directory of its .dat optics files (the namelist names them), spectral_co2lim =
+    # apply CO2 limitation in the spectral growth as the broadband build does (the fork does not; the user's stated
+    # deviation, 2026-10-28). False = the fork's non-spectral build of the same namelist.
+    spectral: bool = False
+    optics_dir: Optional[str] = None
+    spectral_co2lim: bool = True
 
     @property
     def mode(self) -> str:
@@ -99,6 +107,22 @@ class RecomConfig(NamedTuple):
                                  f"({self.layout.describe()})")
             if self.ic_set not in IC_SETS:
                 raise ValueError(f"recom.ic_set must be one of {IC_SETS}, got {self.ic_set!r}")
+            if (self.ic_set.endswith("_present") and getattr(sw, "DIC_PI", True)
+                    and getattr(sw, "spectral_fork", False)):
+                raise ValueError(f"recom.ic_set {self.ic_set!r} (present-day DIC) with the fork's DIC_PI on: the "
+                                 "fork's FESOM2 reads the preindustrial GLODAP DIC whenever DIC_PI is on "
+                                 "(oce_setup_step.F90); set DIC_PI = .false. in the namelist or ic_set without _present")
+            if self.spectral:
+                if not getattr(sw, "spectral_fork", False):
+                    raise ValueError("recom.spectral needs the spectral fork's namelist (an &spectral group)")
+                if self.optics_dir is None:
+                    raise ValueError("recom.spectral needs recom.optics_dir (the directory of the .dat optics files)")
+                if sw.RECOM_CDOM != self.layout.cdom:
+                    raise ValueError("recom.spectral: the namelist's bgc_num must count the CDOM tracer of a spectral "
+                                     "build (RECOM_CDOM)")
+            elif getattr(sw, "spectral_fork", False) and self.layout.cdom:
+                raise ValueError("a non-spectral run of the fork has no CDOM tracer: set recom.spectral or a "
+                                 "namelist with bgc_num without it")
             if not isinstance(self.output, tuple):
                 raise TypeError("recom.output must be a tuple (RunConfig.from_dict converts a YAML list)")
             bad = sorted(set(self.output) - set(OUTPUT_FIELDS))

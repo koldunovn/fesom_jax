@@ -111,7 +111,7 @@ _ARCHIVE_PERIODS = ("year", "month", "day")
 # `co2_file` (full REcoM with constant_CO2 off): the AtmCO2_<year> monthly time series; absent ⇒ the namelist's
 # nm_co2_data_file when that is an absolute path (as dust_file).
 _FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path",
-                 "on_device", "mslp", "dust_file", "co2_file")
+                 "on_device", "mslp", "dust_file", "co2_file", "oasim_dir", "oasim_pattern")
 _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 # The `ssh:` mapping — SSH CG solver options. `cheb_degree` (int ≥1) enables the degree-k
 # Chebyshev polynomial preconditioner (CGPOLY, ssh.enable_cheb_precond) in place of the
@@ -256,6 +256,25 @@ class RunConfig:
                              f"nm_co2_data_file {sw.nm_co2_data_file!r} is relative to FESOM2's ClimateDataPath)")
         return AtmCO2Series(path, first_year=sw.firstyearoffesomcycle, last_year=sw.lastyearoffesomcycle,
                             n_cycles=sw.numofCO2cycles, cycle=sw.currentCO2cycle)
+
+    def bgc_oasim(self):
+        """The OASIM spectral surface irradiance (the spectral fork with ``OASIM``, :mod:`fesom_jax.recom.oasim`):
+        ``dict(path, pattern, ed_var, es_var)`` from ``forcing.oasim_dir`` / ``forcing.oasim_pattern`` (else the
+        namelist's ``OASIM_path`` / ``OASIM_file_pattern``, &nam_rspecsbc) when ``recom.spectral`` runs with OASIM,
+        else None."""
+        if self.recom is None or self.recom.mode != "full" or not getattr(self.recom, "spectral", False):
+            return None
+        sw, _ = self.recom.load()
+        if not sw.OASIM:
+            return None
+        from pathlib import Path
+        f = self.forcing or {}
+        path = f.get("oasim_dir") or sw.OASIM_path
+        if not path or not Path(path).is_absolute():
+            raise ValueError(f"recom.spectral with OASIM needs the OASIM directory: set forcing.oasim_dir (the "
+                             f"namelist's OASIM_path {sw.OASIM_path!r})")
+        return dict(path=str(path), pattern=str(f.get("oasim_pattern") or sw.OASIM_file_pattern),
+                    ed_var=sw.OASIM_Ed_varname, es_var=sw.OASIM_Es_varname)
 
     def forcing_mslp(self) -> bool:
         """``forcing.mslp`` (FESOM2's ``l_mslp``): the sea-level pressure read and its momentum term on.

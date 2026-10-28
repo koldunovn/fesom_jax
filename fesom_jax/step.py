@@ -673,7 +673,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             # position: T/S/hnode of the step start, a_ice after the ice step, this step's forcing) and stage 3 (the
             # BGC tracers in the tracer loop, with this step's transport, T_new and S before the floor)
             from .recom import wiring as _rw
-            _rw.check_step_inputs(step_forcing, forcing_static, ale_cfg, _sp, int(recom_cfg.bgc_every))
+            _rw.check_step_inputs(step_forcing, forcing_static, ale_cfg, _sp, int(recom_cfg.bgc_every), recom_cfg)
             if halo_ctx is None:
                 _red_sum = jnp.sum
             else:

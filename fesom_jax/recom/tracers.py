@@ -100,13 +100,37 @@ def check_tracer_ids(ids) -> None:
                          "(REcoM's validate_tracer_id_sequence)")
 
 
-def init_value(tracer_id: int, params) -> float:
+def init_value(tracer_id: int, params, layout=None) -> float:
     """The constant cold-start value of a BGC tracer without an IC file,
     ``get_tracer_init_value`` (``recom_init.F90:647-708``), from a :class:`~fesom_jax.recom.params.RecomParams`.
-    Quirks kept: DiaN uses ``Chl2N_max`` (not ``_d``) and DiaSi divides by ``SiCmax``."""
+    Quirks kept: DiaN uses ``Chl2N_max`` (not ``_d``) and DiaSi divides by ``SiCmax``.
+
+    ``layout`` of the spectral fork (``layout.dicremin`` False): the fork's ``recom_init.F90:436-640`` instead --
+    DiaN/DiaC with ``Chl2N_max_d``/``NCmax_d``, the coccolithophores and Phaeocystis from ``Chl2N_max_c/p`` and
+    ``NCmax_c/p``, MicZoo ``tiny``/``tiny Redfield``, CDOM ``tiny``, and the 3zoo2det tracers 1023-1028 left at 0
+    when the coccolithophores are on too (no SELECT branch covers both switches; the sms clip floors them later).
+    Checked against the twins' ``recom_in`` at step 1 (test_recom_spectral_wiring)."""
     p = params
     tid = int(tracer_id)
     tiny = TINY
+    if layout is not None and not layout.dicremin:
+        name = layout.names[layout.slot(tid)]
+        both = layout.enable_3zoo2det and layout.enable_coccos
+        fork = {"PhyN": TINY_CHL / p.Chl2N_max, "PhyC": TINY_CHL / p.Chl2N_max / p.NCmax, "PhyChl": TINY_CHL,
+                "DiaN": TINY_CHL / p.Chl2N_max_d, "DiaC": TINY_CHL / p.Chl2N_max_d / p.NCmax_d, "DiaChl": TINY_CHL,
+                "DiaSi": TINY_CHL / p.Chl2N_max_d / p.NCmax_d / p.SiCmax,
+                "DetN": tiny, "DetC": tiny, "HetN": tiny, "HetC": tiny * p.Redfield, "DON": tiny, "DOC": tiny,
+                "DetSi": tiny, "PhyCalc": tiny * p.Redfield, "DetCalc": tiny,
+                "Zoo2N": 0.0 if both else tiny, "Zoo2C": 0.0 if both else tiny * p.Redfield,
+                "DetZ2N": 0.0 if both else tiny, "DetZ2C": 0.0 if both else tiny, "DetZ2Si": 0.0 if both else tiny,
+                "DetZ2Calc": 0.0 if both else tiny,
+                "CoccoN": TINY_CHL / p.Chl2N_max_c, "CoccoC": TINY_CHL / p.Chl2N_max_c / p.NCmax_c,
+                "CoccoChl": TINY_CHL, "PhaeoN": TINY_CHL / p.Chl2N_max_p,
+                "PhaeoC": TINY_CHL / p.Chl2N_max_p / p.NCmax_p, "PhaeoChl": TINY_CHL,
+                "MicZooN": tiny, "MicZooC": tiny * p.Redfield, "CDOM": tiny}
+        if name in fork:
+            return fork[name]
+        raise KeyError(f"tracer {tid} ({name}) is initialised from a file, not by the fork's recom_init")
     if tid in (1004, 1013):                                  # PhyN, DiaN
         return TINY_CHL / p.Chl2N_max
     if tid in (1005, 1014):                                  # PhyC, DiaC

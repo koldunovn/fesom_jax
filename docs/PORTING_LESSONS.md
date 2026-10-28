@@ -9975,3 +9975,14 @@ followed by a whole-array assignment is a global (rank-wide) branch, not a per-c
 `where`, and say which domain the reduction runs over (here the rank: owned + halo, including the stale entries below
 the bottom, which is why the very first call of a run also resets); (b) gate at a step late enough for the slow
 quantities (particle composition at depth) to have moved: steps 1-17 see the IC, day 7 sees the model.
+
+### 2026-10-28 (branch recom-spectral, lane W) — the IC file a run reads is not the one its namelist names
+
+The fork's cold start of DIC was off by 3 % against the twin while the five other file-initialised tracers matched to
+1e-12: the fork's `oce_setup_step.F90` overrides `filelist(5)` (the DIC entry of FESOM's hard-wired `idlist` order)
+with the GLODAP preindustrial file whenever REcoM's `DIC_PI` is on, and `DIC_PI` defaults to on. `namelist.tra`'s
+`tco2_5deg.nc` is never opened. Upstream FESOM2 has dropped that override by e96a2b13 (the 692f804 reference), so the
+port keys it on the fork flavour. Lessons: (a) gate the cold start against the twin's own `recom_in` at step 1 before
+any step gate: it is one load, and it catches every "the model reads something else" surprise at once; (b) grep the
+host model for every REcoM switch the port lists as "no effect" (`NO_EFFECT`): `DIC_PI` was there because REcoM's
+own sources never read it, but FESOM's setup does.

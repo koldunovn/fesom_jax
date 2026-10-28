@@ -613,7 +613,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     _fstatic = None if unforced else forcing.static
     if _recom_full and _fstatic is not None:       # full REcoM's per-run node constants (fesom_jax.recom.wiring)
         from .recom import wiring as _rw
-        _fstatic = _rw.with_recom_static(_fstatic, mesh)
+        _fstatic = _rw.with_recom_static(_fstatic, mesh, cfg.recom)
     fs_p = None if unforced else shard_mesh.partition_forcing_static(_fstatic, part)
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)
 

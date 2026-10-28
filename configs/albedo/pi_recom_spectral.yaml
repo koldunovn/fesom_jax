@@ -1,0 +1,45 @@
+# Albedo: the spectral REcoM fork (4 phytoplankton groups, CDOM, 13-band light from OASIM) on the pi mesh, 30 days,
+# one CPU node (docs/recom/RUNNING_ALBEDO.md, docs/plans/20261028-recom-spectral-port.md).
+#   The pi mesh bundle built from the fork's partition directory (fesom_jax_data/mesh_pi_fork: the levels the
+#   Fortran twin ran with); the pi PHC IC; JRA55-do 1958 + psl (l_mslp); the 5-degree pi REcoM IC set of FESOM2's
+#   test/input/recom (DIC_PI: the preindustrial GLODAP DIC), the Albani dust on pi, the OASIM monthly
+#   climatology (forcing_oasim_v2) and the fork's optics tables. Physics as configs/albedo/pi_recom_bgc.yaml.
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 2700.0
+
+mesh: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/mesh_pi_fork
+partition: null
+forcing:
+  kind: core2
+  start_year: 1958
+  mslp: true
+  jra_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/forcing_1958_mslp
+  sss_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/PHC2_salx.nc
+  runoff_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/CORE2_runoff.nc
+  chl_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/Sweeney_2005.nc
+  dust_file: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi/DustClimMonthlyAlbani_pimesh.nc
+  oasim_dir: /albedo/work/projects/p_specbic/sloza/forcing_oasim_v2
+  oasim_pattern: oasim_clim1998-2012_darwin400.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_albedo_spectral/namelist.recom   # 37 tracers: 3zoo2det + coccos + CDOM
+  spectral: true
+  spectral_co2lim: true                 # the user's deviation from the fork (2026-10-28): CO2 limitation in the spectral growth
+  optics_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi/optics
+  ic_set: pi                            # DIC_PI is on in the namelist: FESOM2 reads the GLODAP PI DIC whatever namelist.tra names
+  ic_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi
+  output: [DIC, Alk, DIN, DSi, DFe, O2, Chl, co2flux, pco2surf, npp, export100]
+
+output_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/pi_recom_spectral
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+duration: 960step         # 30 days

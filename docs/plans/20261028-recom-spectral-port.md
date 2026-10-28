@@ -110,13 +110,13 @@ the fork is first rebased onto the submodule REcoM, a Fortran task outside this 
       calcification, aggregation, mortality, CDOM, the new switches; `sinking.py`: Fe-dependent Phaeocystis sinking
       + benthic flux. Gate G2 on the broadband 4-PFT dumps (lane 0, `RECOM_WAVEBANDS=OFF`): updated tracers and
       diagnostics rel 1e-11. This lane is independent of the light model and is where most of the biology risk is.
-- [ ] **Lane L, the spectral light (C.1-C.4).** New `fesom_jax/recom/spectral.py`: band tables, the `.dat` readers
+- [x] **Lane L, the spectral light (C.1-C.4).** New `fesom_jax/recom/spectral.py`: band tables, the `.dat` readers
       (host, numpy), IOPs as array ops over `(nod2D, nl, 13)`, the 3-stream direct solver as a vectorised
       tridiagonal (`ops.tdma` over the column, batched over nodes and bands; `lax.scan`, no Python loops), the
       Beer-Lambert alternative, `PARw(nod2D, nl, 13)` and `PARave`. Gate: `PARw`/`Edz..Estop` against the lane-0
       spectral dumps at the probe columns (rel 1e-10; the solver is a direct method so this should be tight).
       Differentiability check: `jax.grad` of the column PAR w.r.t. Chl finite and matching FD.
-- [ ] **Lane F, OASIM forcing.** `fesom_jax/recom/oasim.py` + `surface_forcing.BgcForcing`: 26 monthly fields
+- [x] **Lane F, OASIM forcing.** `fesom_jax/recom/oasim.py` + `surface_forcing.BgcForcing`: 26 monthly fields
       interpolated to nodes once on the host (the JRA bilinear machinery of `jra55.py`/`read_other_NetCDF` port),
       held per month in the per-step input tables like the dust (`didx` row), `(1 - a_ice)` shading in the step,
       NaN fill. Run-YAML keys `forcing.oasim_dir`, `forcing.oasim_pattern`.
@@ -205,6 +205,19 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   (`any(scaling_density <= tiny) -> 1` on the rank's array, recom_sinking.F90 K:858-861, upstream d5f9f8ac): mirrored
   for the fork layout in `sinking.ballast` (a per-device `any` over the wet layers; 692f804's programs unchanged).
   Open: steps 960 once the reruns finish; the first-call reset at step 1 stays a documented skip.
+
+- 2026-10-28 late night, lanes F and W wired: `fesom_jax/recom/oasim.py` (the 12 x 13 OASIM fields through the
+  `read_other_NetCDF` port of `sss_runoff`, gate: January vs `recom_out.oasim_ed2D/es2D` of the spectral twin
+  <= 1e-12), held with the Albani dust in `BgcForcing` (`StepForcing.oasim_ed/es`, `ForcingTables.oasim_*`, the
+  on-device combine, the local-forcing builder). `RecomConfig.spectral / optics_dir / spectral_co2lim`,
+  `RunConfig.bgc_oasim()`, `ic_set: pi_present`; `wiring.full_bgc_step` is layout-aware and takes the fork's stage 1
+  (`recom_sources_sinks_fork`) with the spectral light of the step, `nlmin` in `ForcingStatic.bgc_nlmin`, the 4-PFT
+  NPP/Chl/export outputs; `check_supported` admits the fork's layouts. The cold start reproduces the twin's step-1
+  tracers (`test_recom_spectral_wiring`): the fork's `recom_init` constants (`tracers.init_value(layout=)`: DiaN
+  with `Chl2N_max_d`, 1023-1028 left at 0 when 3zoo2det and coccos are both on, CDOM `tiny`) and the fork's
+  `DIC_PI` file override (`oce_setup_step.F90:1012`, removed upstream by e96a2b13: namelist.tra's `tco2_5deg.nc`
+  is never read when `DIC_PI` is on). Config `configs/albedo/pi_recom_spectral.yaml`, job
+  `scripts/albedo/run_pi_recom_spectral.sbatch` (first submission: job 48602583, 30 days of pi on one CPU node).
 
 ## Rules (as the parent REcoM port)
 
