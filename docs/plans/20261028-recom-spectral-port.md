@@ -231,6 +231,9 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   (`configs/albedo/core2_recom_spectral.yaml`, 96 steps) submitted next.
 - 2026-10-28 22:29, CORE2 + the spectral fork on one A100: job 48603697, 96 steps, `FINITE`, 2.50 s/step (the 692f804
   configuration: 2.63), from `configs/albedo/core2_recom_spectral.yaml` through `scripts/albedo/run_core2_gpu.sbatch`.
+- 2026-10-28 22:45, the reruns finished (48602452 2h05, 48602453 2h15): every fork gate also passes at step 960 on
+  both twins (broadband: sms, sinking, stage 3; spectral: those plus the light planes). The gate table is in
+  `docs/recom/VALIDATION.md`.
 
 ## Rules (as the parent REcoM port)
 

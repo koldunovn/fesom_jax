@@ -183,16 +183,16 @@ built with the 11 upstream REcoM commits cherry-picked (`/albedo/work/user/sloza
 
 | gate | test | twin | steps | result |
 |---|---|---|---|---|
-| G2, sources and sinks (recom_in -> recom_out, every tracer, diagnostic, flux and cache field) | `test_recom_sms_fork.py` | broadband | 1, 2, 3, 17, 224 | <= 2.4e-13 |
-| G2 with the spectral light (TCphotLigLim_* skipped: unset by the fork) | `test_recom_sms_fork.py` | spectral | 1, 2, 3, 17, 224 | <= 1.3e-13 |
-| the light planes Edz/Esz/Euz/Eutop/Estop x 13 bands and PAR3D | `test_recom_spectral_light.py` | spectral | 1, 2, 3, 17, 224 | <= 1.5e-12 |
-| G3, per-tracer loop terms (benthic return, ballasting, sinking, benthos, the whole loop) | `test_recom_sinking_fork.py` | both | 1, 2, 3, 17, 224 | <= 4.6e-15 |
-| G4a, stage 3 fed with the twin's transport | `test_recom_stage3_fork.py` | both | 1, 2, 3, 17, 224 | <= 3.2e-14 |
+| G2, sources and sinks (recom_in -> recom_out, every tracer, diagnostic, flux and cache field) | `test_recom_sms_fork.py` | broadband | 1, 2, 3, 17, 224, 960 | <= 2.4e-13 |
+| G2 with the spectral light (TCphotLigLim_* skipped: unset by the fork) | `test_recom_sms_fork.py` | spectral | 1, 2, 3, 17, 224, 960 | <= 1.3e-13 |
+| the light planes Edz/Esz/Euz/Eutop/Estop x 13 bands and PAR3D | `test_recom_spectral_light.py` | spectral | 1, 2, 3, 17, 224, 960 | <= 1.5e-12 |
+| G3, per-tracer loop terms (benthic return, ballasting, sinking, benthos, the whole loop) | `test_recom_sinking_fork.py` | both | 1, 2, 3, 17, 224, 960 | <= 4.6e-15 |
+| G4a, stage 3 fed with the twin's transport | `test_recom_stage3_fork.py` | both | 1, 2, 3, 17, 224, 960 | <= 3.2e-14 |
 | the cold start (the twin's recom_in at step 1, 37 tracers) | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
 | the OASIM January fields on the nodes | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
 
 Known skips: the fork's first-call ballast reset (step 1, tracer 1004: `any(scaling_density <= tiny)` on the
 never-written entries below the bottom) and its bottom-interface ballast diagnostics, both documented in
-`test_recom_sinking_fork.py`. Step 960 is pending the reruns. No full-step (G4b) gate: the twins run the user's
+`test_recom_sinking_fork.py`. No full-step (G4b) gate: the twins run the user's
 experiment physics (`namelists_albedo_spectral/namelist.oce`, opt_visc 7, KPP), not the JAX-matched
 `namelists_jaxphys` set; a G4b would need a twin rerun with that set.
