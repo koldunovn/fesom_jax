@@ -189,19 +189,22 @@ def bgc_diffuse(mesh, X_adv, *, Kv_eff, hnode_new, Z3d_new, bc, dt, exch, ckpt, 
     return _over_stack(one, (X_adv, bc), (-1, -1 if per_tracer_bc else None))
 
 
-def surface_bc(sfc, dt):
+def surface_bc(sfc, dt, tracer_layout=None):
     """REcoM's ``bc_surface`` (``oce_ale_tracer.F90:2232-2290``) for the whole stack, ``(nod2D, ntr)``: ``dt`` times
-    the stage-1 flux of :data:`fesom_jax.recom.tracers.BC_SURFACE_SOURCE` for the IDs that have one, 0 elsewhere."""
-    from .tracers import BC_SURFACE_SOURCE, BGC_IDS
+    the stage-1 flux of :data:`fesom_jax.recom.tracers.BC_SURFACE_SOURCE` for the IDs that have one, 0 elsewhere
+    (``tracer_layout``: the tracer :class:`~fesom_jax.recom.layout.Layout`; default REcoM 692f804's bin_2p3z2d)."""
+    from .layout import DEFAULT
+    from .tracers import BC_SURFACE_SOURCE
+    ids = (tracer_layout or DEFAULT).ids
     ref = sfc.GloCO2flux_seaicemask
     cols = [dt * getattr(sfc, BC_SURFACE_SOURCE[i]) if BC_SURFACE_SOURCE.get(i, "zero") != "zero"
-            else jnp.zeros_like(ref) for i in BGC_IDS]
+            else jnp.zeros_like(ref) for i in ids]
     return jnp.stack(cols, axis=-1)
 
 
 def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_new, zbar3_live, Z3d_live, Z3d_new,
                  gm_diag, Kv_eff, temp, salt, sfc, benthos, geom_sink, params, switches, dt, exch, ckpt, adj,
-                 helem_flux=None, return_terms: bool = False, carry=None):
+                 helem_flux=None, return_terms: bool = False, carry=None, tracer_layout=None):
     """Full REcoM's stage 3: FESOM2's tracer loop for the 31 BGC tracers (``solve_tracers_ale``,
     ``oce_ale_tracer.F90:725-930``). ``X1`` is stage 1's output (the tracers at the start of the loop, ``(nod2D, nl,
     31)``), ``temp``/``salt`` the step's final T and S (S before ``S_FLOOR``), ``sfc``/``benthos`` stage 1's
@@ -218,7 +221,9 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
     ``carry`` (single precision, the BGC rounding carry ``State.bgc_carry``): :func:`_recom_stage3_sp`, the #1207
     scheme; the result tuple then ends with the new carry."""
     from . import sinking
-    from .tracers import SLOT
+    from .layout import DEFAULT
+    tracer_layout = tracer_layout or DEFAULT
+    SLOT = tracer_layout.slot_map
     if carry is not None:
         if w_i is not None or helem_flux is not None:
             raise NotImplementedError("single precision + REcoM: no w_split, bgc_every = 1 only")
@@ -226,14 +231,14 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
                                 hnode_new=hnode_new, zbar3_live=zbar3_live, Z3d_live=Z3d_live, Z3d_new=Z3d_new,
                                 gm_diag=gm_diag, Kv_eff=Kv_eff, temp=temp, salt=salt, sfc=sfc, benthos=benthos,
                                 geom_sink=geom_sink, params=params, switches=switches, dt=dt, exch=exch, ckpt=ckpt,
-                                adj=adj, return_terms=return_terms)
+                                adj=adj, return_terms=return_terms, tracer_layout=tracer_layout)
     nl1 = mesh.nl - 1
     X1 = hold_major(X1)             # the advection, the T* of every group and the loop terms read this one buffer
     X_adv, X_old_new = bgc_advect_redi(
         mesh, X1, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=w_i, helem=helem, hnode=hnode, hnode_new=hnode_new,
         zbar3_live=zbar3_live, Z3d_live=Z3d_live, gm_diag=gm_diag, dt=dt, exch=exch, ckpt=ckpt, adj=adj,
         helem_flux=helem_flux)
-    bc = surface_bc(sfc, dt)
+    bc = surface_bc(sfc, dt, tracer_layout)
     ratio = jnp.where(hnode_new > 0.0, hnode / jnp.where(hnode_new > 0.0, hnode_new, 1.0), 0.0)[..., None]
 
     def finish(ids, values_mod):
@@ -246,7 +251,8 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
         return x_new[:, :nl1]
 
     res = sinking.recom_tracer_loop_terms(X1[:, :nl1], temp[:, :nl1], salt[:, :nl1], geom_sink,
-                                          sfc.GlodecayBenthos, benthos, dt, params, finish, switches=switches)
+                                          sfc.GlodecayBenthos, benthos, dt, params, finish, switches=switches,
+                                          layout=tracer_layout)
     X_new = exch(jnp.concatenate([res.bgc, X1[:, nl1:]], axis=1), "nod")
     if return_terms:
         return X_new, X_old_new, exch(res.benthos, "nod"), res
@@ -255,7 +261,7 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
 
 def _recom_stage3_sp(mesh, X1, X_old, carry, *, uv_adv, w_e_adv, helem, hnode, hnode_new, zbar3_live, Z3d_live,
                      Z3d_new, gm_diag, Kv_eff, temp, salt, sfc, benthos, geom_sink, params, switches, dt, exch, ckpt,
-                     adj, return_terms):
+                     adj, return_terms, tracer_layout=None):
     """Stage 3 in single precision + full REcoM (an opt-in deviation; plan ``20261026-recom-lane-sp``, S1 design).
 
     FESOM2 #1207's tracer scheme for every BGC tracer, as for T and S (:func:`fesom_jax.step._tracers_advect_sp`),
@@ -274,7 +280,9 @@ def _recom_stage3_sp(mesh, X1, X_old, carry, *, uv_adv, w_e_adv, helem, hnode, h
     from .. import precision as PR
     from ..step import tracer_content_sp
     from . import sinking
-    from .tracers import SLOT
+    from .layout import DEFAULT
+    tracer_layout = tracer_layout or DEFAULT
+    SLOT = tracer_layout.slot_map
     nl1 = mesh.nl - 1
     X1, carry = hold_major(X1), hold_major(carry)        # one tracer-major buffer each (hold_major)
     V1 = PR.wp(X1)                                        # FESOM2's WP values after recom()
@@ -287,7 +295,7 @@ def _recom_stage3_sp(mesh, X1, X_old, carry, *, uv_adv, w_e_adv, helem, hnode, h
 
     d, X_old_new = _over_stack(content, (V1, X_old), (-1, -1))       # d float64 (nod2D, nl, ntr)
     d = hold_major(d)
-    bc = surface_bc(sfc, dt)                          # REcoM's real(8) fluxes · dt, (nod2D, ntr)
+    bc = surface_bc(sfc, dt, tracer_layout)                          # REcoM's real(8) fluxes · dt, (nod2D, ntr)
     carry_cols = [carry[..., s] for s in range(carry.shape[-1])]
 
     def finish(ids, values_mod):
