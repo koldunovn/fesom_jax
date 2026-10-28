@@ -167,6 +167,33 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   override in the job script, and the non-spectral twin's namelist set `namelists_albedo_spectral_nowb/` (36
   tracers: a WAVEBANDS=OFF build has no CDOM, `validate_recom_tracers` stops otherwise; job 48602195).
 
+- 2026-10-28 night, lane E part 1 DONE (commit on `recom-spectral`): `fesom_jax/recom/sms_fork.py` +
+  `stage1.recom_sources_sinks_fork`; gate `test_recom_sms_fork.py` against the non-spectral twin `pi_30d_nowb`
+  (job 48602409) <= 2.4e-13 at steps 1, 2, 3, 17 for every tracer, diagnostic, flux and cache field. Finding: the
+  fork's `tiny_Si = tiny_C_d / SiCmax` (692f804 multiplies). The 30-day runs (48602409 broadband, 48602410
+  spectral) write dumps at 224 and 960 too. Part 2 = the fork's sinking (VCocco/VPhaeo, the Fe-dependent
+  Phaeocystis speed and benthic flux, PhyCalc with VCocco in the column but VPhy in the benthos) and stage 3.
+
+- 2026-10-28 late, lane E part 2 DONE (commit 0f969cd + the stage-3 fix-up): the fork's sinking/benthos in
+  `sinking.py` (layout-aware), `transport.recom_stage3(tracer_layout=...)`; gate `test_recom_sinking_fork.py`
+  <= 4.6e-15. The stage-3 gate `test_recom_stage3_fork.py` first missed by 1e-3..5e-2 rel; three causes, all in
+  the fork's FESOM2 base (merge base with upstream cda35117, 2025-10-09), none in REcoM:
+  1. `namelist.tra` weights: the fork's run dirs use `tra_adv_ph/pv = 1., 1.`; the JAX kernels implement
+     `0., 1.` only (`TracerConfig`). Both namelist sets now say `0., 1.` and the twins were rerun as
+     `pi_30d_nowb_adv01` (job 48602452) and `pi_30d_spectral_adv01` (48602453); the `1., 1.` runs
+     (48602409/48602410) stay valid for the column-local gates (G2, G3, the light solver) only.
+  2. The FCT limiter bounds: the fork has `flux = fct_plus*dt/areasvol +- eps` without the thickness
+     (FESOM2 added `/hnode` in 18346243, 2025-10-29, and `/hnode_new` in 9afdae7b, 2026-03-03): 3.6e-4 rel on T.
+     `tracer_adv.zalesak_limit(legacy_bounds=True)`, threaded as `legacy_fct_bounds` through `advect_one_fct`,
+     `recom.transport`, `recom.wiring.full_bgc_step` and `step()` next to `legacy_k33_weights` (also needed:
+     the fork predates #944) — default off, `test_dp_lock`/`test_run_config` unchanged.
+  3. The level structure: the fork's run read `mesh_pi_part/elvls.out` written by its own `fesom_ini`, which
+     differs from the repo's `test/meshes/pi/elvls.out` (= the packaged pi) at elements 0, 1, 22 (22/20/22 vs
+     19/18/19, node 11's `nlevels_nod2D` 22 vs 19): 2.6e-5 rel on T at nodes 0-11. `fesom_jax_data/mesh_pi_fork`
+     is now `prepare_mesh.py` of `mesh_pi_part` (the old bundle kept as `mesh_pi_fork_repo_levels`).
+  With the three: G4a on `pi_30d_nowb_adv01` <= 3.2e-14 at steps 1, 2, 3, 17 (`FESOM_RECOM_FORK_RUN` selects
+  the run; all three fork gates default to the adv01 run). Steps 224/960 once the reruns write them.
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.

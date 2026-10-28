@@ -413,7 +413,8 @@ FCT_STOP_GRADIENT_AE = os.environ.get("FESOM_FCT_STOPGRAD_AE", "0") == "1"
 
 
 def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
-                  dt: float = DT_DEFAULT, exch=None, freeze_factors: bool = False):
+                  dt: float = DT_DEFAULT, exch=None, freeze_factors: bool = False,
+                  legacy_bounds: bool = False):
     """Zalesak flux limiter (``oce_tra_adv_fct``, ``fesom_tracer_adv.c:851``).
     Limits the antidiffusive fluxes ``adf_h``/``adf_v`` so ``T_new = LO + limited``
     introduces no new local extrema. Returns ``(adf_h_lim, adf_v_lim)``.
@@ -433,7 +434,12 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
 
     ``freeze_factors`` (``AdjointConfig.freeze_fct_limiter``; or the process-wide
     :data:`FCT_STOP_GRADIENT_AE`): the factors ``ae`` are constants in the backward. The
-    forward is unchanged."""
+    forward is unchanged.
+
+    ``legacy_bounds=True``: the limiter ratios before FESOM2 18346243 (2025-10-29, "add fct bugfix") and 9afdae7b
+    (2026-03-03): ``flux = fct_plus·dt/areasvol ± flux_eps`` without the ``/hnode_new`` (the admissible increment
+    ``fct_ttf_max/min`` is a concentration, the sum ``fct_plus/minus`` a content). Only for the gates whose Fortran
+    dumps come from a FESOM2 older than that (the REcoM spectral fork, base cda35117 of 2025-10-09)."""
     freeze = FCT_STOP_GRADIENT_AE or freeze_factors
     nl = mesh.nl
     nlm = mesh.node_layer_mask
@@ -491,8 +497,12 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     a = mesh.areasvol
     safe_a = jnp.where(a > 0.0, a, 1.0)
     safe_hn = jnp.where(hnode_new > 0.0, hnode_new, 1.0)
-    flux_pos = fct_plus * dt / safe_a / safe_hn + _FCT_FLUX_EPS
-    flux_neg = fct_minus * dt / safe_a / safe_hn - _FCT_FLUX_EPS
+    if legacy_bounds:
+        flux_pos = fct_plus * dt / safe_a + _FCT_FLUX_EPS
+        flux_neg = fct_minus * dt / safe_a - _FCT_FLUX_EPS
+    else:
+        flux_pos = fct_plus * dt / safe_a / safe_hn + _FCT_FLUX_EPS
+        flux_neg = fct_minus * dt / safe_a / safe_hn - _FCT_FLUX_EPS
     plus_fac = jnp.minimum(1.0, fct_ttf_max / flux_pos)
     minus_fac = jnp.minimum(1.0, fct_ttf_min / flux_neg)
     valid = nlm & (a > 0.0) & (hnode_new > 0.0)
@@ -599,7 +609,7 @@ def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
 
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
                    *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None, w_i=None,
-                   freeze_limited_flux: bool = False, freeze_limiter: bool = False, content: bool = False):
+                   freeze_limited_flux: bool = False, freeze_limiter: bool = False, legacy_fct_bounds: bool = False, content: bool = False):
     """One tracer's FCT advection + ALE reconstruction
     (``fesom_tracer_advect_one_fct``, ``fesom_tracer_adv.c:1199``). Returns
     ``(T_new, T_old_new)`` with ``T_old_new = T`` (the AB2 ``valuesold`` save).
@@ -617,7 +627,8 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
 
     Backward-only: ``freeze_limited_flux`` (``AdjointConfig.freeze_advection``) drops the
     whole limited antidiffusive flux; ``freeze_limiter`` (``AdjointConfig.freeze_fct_limiter``)
-    freezes only the limiter factors."""
+    freezes only the limiter factors. ``legacy_fct_bounds``: the pre-18346243 limiter ratios
+    (:func:`zalesak_limit`); default off, byte-identical."""
     _exch = exch if exch is not None else (lambda f, kind: f)
     ttfAB, T_old_new = tracer_ab(T, T_old)
     # 2 — LO upwind fluxes from values
@@ -655,7 +666,7 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
                  - adv_flux_ver(mesh, w_full, T))
     # 5 — Zalesak limit (exchanges the limiter factors internally)
     adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, PR.wp(hnode_new), dt=dt, exch=exch,
-                                 freeze_factors=freeze_limiter)
+                                 freeze_factors=freeze_limiter, legacy_bounds=legacy_fct_bounds)
     # Backward-only (AdjointConfig.freeze_advection): drop the whole limited antidiffusive
     # correction from the adjoint, so the backward sees plain monotone upwind advection
     # while the forward keeps full FCT. The NWP incremental-4D-Var practice of running

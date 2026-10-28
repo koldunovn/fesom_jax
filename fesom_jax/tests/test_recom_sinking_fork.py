@@ -1,6 +1,6 @@
 """Gate G3 of the spectral port's lane E (docs/plans/20261028-recom-spectral-port.md): the fork's tracer-loop
 additions (fesom_jax.recom.sinking with the fork's layout and sinking rules) against the per-tracer stages of the
-fork's NON-spectral twin dumps (run pi_30d_nowb on Albedo). A copy of test_recom_sinking.py (REcoM 692f804) with
+fork's NON-spectral twin dumps (run pi_30d_nowb_adv01 on Albedo, namelist.tra weights 0., 1.). A copy of test_recom_sinking.py (REcoM 692f804) with
 the fork's reference, namelist and layout; the fork writes Benthos inside the loop, so the per-tracer Benthos
 check is dropped. Gate G3 (parent plan Task 11): REcoM's additions inside FESOM2's tracer loop (``fesom_jax.recom.sinking``)
 against the per-tracer stages of the Fortran reference dumps, in Fortran tracer order, plus the edge cases
@@ -46,7 +46,7 @@ REF = Path(os.environ.get("FESOM_RECOM_FORK_REF", "/albedo/work/projects/p_specb
 MESH = Path(os.environ.get("FESOM_RECOM_FORK_MESH", "/albedo/work/projects/p_specbic/sloza/fesom_jax_data/mesh_pi_part"))
 REPO = Path(__file__).resolve().parents[2]
 NML = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb" / "namelist.recom"
-RUN = "pi_30d_nowb"
+RUN = os.environ.get("FESOM_RECOM_FORK_RUN", "pi_30d_nowb_adv01")
 STEPS = [(RUN, s) for s in (1, 2, 3, 17, 224, 960) if (REF / RUN / "dumps" / f"step_{s:06d}").is_dir()] or [(RUN, 1)]
 TOL = 1e-12
 LOOSE: dict = {}        # field -> (tolerance, reason)

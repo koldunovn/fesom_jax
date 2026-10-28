@@ -40,7 +40,7 @@ REF = Path(os.environ.get("FESOM_RECOM_FORK_REF", "/albedo/work/projects/p_specb
 MESH_JAX = Path(os.environ.get("FESOM_RECOM_FORK_MESH_JAX", "/albedo/work/projects/p_specbic/sloza/fesom_jax_data/mesh_pi_fork"))
 REPO = Path(__file__).resolve().parents[2]
 NML = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb" / "namelist.recom"
-RUN = "pi_30d_nowb"
+RUN = os.environ.get("FESOM_RECOM_FORK_RUN", "pi_30d_nowb_adv01")
 STEPS = [(RUN, s) for s in (1, 2, 3, 17, 224, 960) if (REF / RUN / "dumps" / f"step_{s:06d}").is_dir()] or [(RUN, 1)]
 TOL = 1e-11
 HAVE_REF = (REF / RUN / "dumps").is_dir()
@@ -110,7 +110,8 @@ def g4a_errors(run, step) -> dict:
     ident = lambda f, kind: f                                         # noqa: E731
     closed = {k: kw.pop(k) for k in ("params", "switches", "dt", "geom_sink")}   # constants of the program
     X_new, _, b_new = jax.jit(lambda X1, X0, dyn: transport.recom_stage3(
-        mesh, X1, X0, exch=ident, ckpt=lambda g: g, adj=AdjointConfig(), tracer_layout=LAY, **dyn, **closed))(X1, X0, kw)
+        mesh, X1, X0, exch=ident, ckpt=lambda g: g, adj=AdjointConfig(), tracer_layout=LAY, legacy_fct_bounds=True,
+        **dyn, **closed))(X1, X0, kw)
     nl1 = mesh.nl - 1
     wet = np.arange(nl1)[None, :] < want["nlev"][:, None]
     out = {}
@@ -127,8 +128,10 @@ def g4a_errors(run, step) -> dict:
 
 @need_ref
 @pytest.mark.parametrize("run,step", STEPS)
-# Needs FESOM2 #944 (the Redi K33 weights) in gm_redi.k33_augmentation (8707dce): without it the BGC tracers miss by
-# ~3e-4 rel in the implicit diffusion (advection, Redi and T* match at round-off — stage diagnosis 2026-10-25).
+# The fork's FESOM2 base is cda35117 (2025-10-09): before #944 (K33 weights: legacy_weights=True above), before
+# 18346243 / 9afdae7b (the FCT limiter bounds without the thickness: legacy_fct_bounds=True; 3.6e-4 rel on T without
+# it) and read with the level structure its own partitioner wrote (mesh_pi_part/elvls.out differs from the repo's
+# test/meshes/pi/elvls.out at elements 0, 1, 22: the JAX bundle mesh_pi_fork is built from mesh_pi_part).
 def test_g4a_stage3_vs_fortran(run, step):
     err = g4a_errors(run, step)
     worst = max(err.items(), key=lambda kv: kv[1][0])

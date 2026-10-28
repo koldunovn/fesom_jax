@@ -9942,3 +9942,23 @@ one-GPU reproduction did not reproduce it (XLA chose tracer-major there by itsel
 away: each updated column as its own kernel behind `lax.optimization_barrier`, then a plain stack (14.0 -> 6.2 ms;
 DP 65.7 -> 60.1, SP 36.3 -> 32.6 ms on 4 GH200, job 28473598). Rule (d): a layout constraint fixes the layout of
 its own result, not of what feeds it; to change how a producer is laid out, change what it is fused with.
+
+### 2026-10-28 (branch recom-spectral, lane E) — a fork's physics is its FESOM2 base: three silent differences behind one 1e-3 gate miss
+
+The spectral REcoM fork (`sveta-loza/fesom2`, merge base with upstream cda35117 of 2025-10-09) reproduces 692f804's
+sources and sinks and sinking to 1e-13, yet the connected tracer loop missed by 1e-3..5e-2 rel — and the per-tracer
+terms matched to 1e-16, so the miss was in the host model, not in REcoM. Staging the dumps (`tra_adv.del_ttf`,
+`tra_redi`, `tra_tstar`, `tra_impl`) against the JAX pieces one at a time found three causes, none visible from the
+REcoM code: (1) the fork's `namelist.tra` asks for `tra_adv_ph/pv = 1., 1.` while the JAX MFCT/QR4C kernels are the
+`0., 1.` reconstruction (a `TracerConfig` validator, not a switch) — rerun the twin with `0., 1.`; (2) the fork's FCT
+limiter normalizes its bounds without the layer thickness (FESOM2 added `/hnode` on 2025-10-29 and `/hnode_new` on
+2026-03-03): 3.6e-4 rel on T, now `zalesak_limit(legacy_bounds=True)` / `step(legacy_fct_bounds=True)`; (3) the
+fork's run read the element levels its own partitioner wrote (`elvls.out`), which differ from the repo's committed
+file at three polar elements: 2.6e-5 rel at the eleven nodes around them, and the dumped `mesh.nlevels` says so
+directly. Rules: (a) for a twin from another FESOM2 revision, diff the ADVECTION and LIMITER sources against the
+revision the port follows (`git diff <ref> -- src/oce_adv_tra_*.F90` after normalizing `mesh%`/`partit%`), not only
+the BGC; the fixes with a date (#944, 18346243, 9afdae7b, #1116) each want a `legacy_*` flag, default off;
+(b) gate the host's own T first (`tra_tstar.tr1`): it has no BGC terms, so a miss there is the host's; (c) compare
+the dumped `mesh.nlevels`/`nlevels_nod2D` with the JAX bundle before anything else — a level mismatch looks like an
+advection bug at the bottom of a few columns; (d) a near-zero tracer (DetN at 1e-14 in the IC) has a meaningless
+relative error; rank the misses by the error over the step's own change instead.

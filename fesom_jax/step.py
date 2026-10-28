@@ -56,7 +56,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
          halo_ctx=None, boundary_node=None, adjoint_cfg=None,
          remat_blocks: bool = False, bulk_uvnode_lag: bool = False, ice_update=None,
-         recom_cfg=None, legacy_k33_weights: bool = False, legacy_sw_depth: bool = False) -> State:
+         recom_cfg=None, legacy_k33_weights: bool = False, legacy_sw_depth: bool = False,
+         legacy_fct_bounds: bool = False) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -85,8 +86,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     (:func:`ice_step.ice_surface_step`); ``None`` ⇒ the device decision under ``lax.cond``.
     ``legacy_k33_weights`` / ``legacy_sw_depth`` restore the Redi K33 interface weights before
     FESOM2 #944 and the absolute shortwave attenuation depth before FESOM2 #1116
-    (:func:`gm_redi.k33_augmentation`, :func:`forcing.cal_shortwave_rad`); only for the gates
-    whose C/Fortran dumps predate those changes.
+    (:func:`gm_redi.k33_augmentation`, :func:`forcing.cal_shortwave_rad`); ``legacy_fct_bounds`` the
+    FCT limiter bounds before FESOM2 18346243 (:func:`tracer_adv.zalesak_limit`); only for the gates
+    whose C/Fortran dumps predate those changes (the REcoM spectral fork needs all three).
 
     **GM/Redi (Phase 6B).** ``gm_cfg`` (a :class:`fesom_jax.gm.GMConfig`, static/hashable —
     the ``ice_cfg`` precedent) turns on the mesoscale eddy parameterization: after EOS the
@@ -584,20 +586,21 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     if _sp:
         T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff = _tracers_advect_sp(
             mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live, zbar3_new,
-            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj, legacy_k33_weights=legacy_k33_weights)
+            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj, legacy_k33_weights=legacy_k33_weights,
+            legacy_fct_bounds=legacy_fct_bounds)
     else:
         T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, st.helem, st.hnode,
             hnode_new, st.T, st.T_old, dt=dt, exch=_exch,
             Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
             freeze_limited_flux=_adj.freeze_advection,
-                freeze_limiter=_adj.freeze_fct_limiter))()
+                freeze_limiter=_adj.freeze_fct_limiter, legacy_fct_bounds=legacy_fct_bounds))()
         S_adv, S_old = _ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, st.helem, st.hnode,
             hnode_new, st.S, st.S_old, dt=dt, exch=_exch,
             Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
             freeze_limited_flux=_adj.freeze_advection,
-                freeze_limiter=_adj.freeze_fct_limiter))()
+                freeze_limiter=_adj.freeze_fct_limiter, legacy_fct_bounds=legacy_fct_bounds))()
         T_adv = _exch(T_adv, "nod")
         S_adv = _exch(S_adv, "nod")
 
@@ -686,22 +689,24 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         if _full and int(recom_cfg.bgc_every) == 1:
             bgc_out = _rw.full_bgc_step(
                 mesh, st, recom_cfg, h0=st.hnode, zbar0=zbar3_live, Z0=Z3d_live, helem=st.helem, helem_flux=None,
-                uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv, Kv_eff=Kv_eff, dt_bgc=dt, **_full_kw)
+                uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv, Kv_eff=Kv_eff, dt_bgc=dt,
+                legacy_fct_bounds=legacy_fct_bounds, **_full_kw)
         elif _full:
             if st.bgc_steps is None:
                 raise ValueError("recom.bgc_every > 1 needs the interval sums (recom.transport.init_every_k)")
             bgc_out = bgc_transport.bgc_every_k(
                 mesh, st, int(recom_cfg.bgc_every), uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv,
                 helem=st.helem, hnode_new=hnode_new, Z3d_new=Z3d_new, gm_diag=gm_diag, Kv_eff=Kv_eff, bc=None, dt=dt,
-                exch=_bgc_exch, ckpt=_ckpt, adj=_adj, zstar=True,
-                full=lambda **kw: _rw.full_bgc_step(mesh, st, recom_cfg, **kw, **_full_kw))
+                exch=_bgc_exch, ckpt=_ckpt, adj=_adj, zstar=True, legacy_fct_bounds=legacy_fct_bounds,
+                full=lambda **kw: _rw.full_bgc_step(mesh, st, recom_cfg, **kw, legacy_fct_bounds=legacy_fct_bounds,
+                                                    **_full_kw))
         elif int(recom_cfg.bgc_every) == 1:
             bgc_new, bgc_old_new = bgc_transport.bgc_transport(
                 mesh, st.bgc, st.bgc_old, uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv, helem=st.helem,
                 hnode=st.hnode, hnode_new=hnode_new, zbar3_live=zbar3_live, Z3d_live=Z3d_live,
                 Z3d_new=Z3d_diff if _sp else Z3d_new,
                 gm_diag=gm_diag, Kv_eff=Kv_eff, bc=_bgc_bc,
-                dt=dt, exch=_bgc_exch, ckpt=_ckpt, adj=_adj, sp_estimate=_sp)
+                dt=dt, exch=_bgc_exch, ckpt=_ckpt, adj=_adj, sp_estimate=_sp, legacy_fct_bounds=legacy_fct_bounds)
             bgc_out = dict(bgc=bgc_new, bgc_old=bgc_old_new)
         else:
             # BGC every k-th step (RecomConfig.bgc_every, a stated deviation): this step's transport joins the
@@ -712,7 +717,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 mesh, st, int(recom_cfg.bgc_every), uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv,
                 helem=st.helem, hnode_new=hnode_new, Z3d_new=Z3d_diff if _sp else Z3d_new, gm_diag=gm_diag,
                 Kv_eff=Kv_eff, bc=_bgc_bc, dt=dt, exch=_bgc_exch, ckpt=_ckpt, adj=_adj, zstar=ale_cfg is not None,
-                sp_estimate=_sp)
+                sp_estimate=_sp, legacy_fct_bounds=legacy_fct_bounds)
 
     # 16 — commit thickness (hnode := hnode_new; helem = vertex mean)
     hnode, helem = ale.commit_thickness(mesh, hnode_new)
@@ -755,7 +760,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
 
 def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live,
-                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj, legacy_k33_weights=False):
+                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj, legacy_k33_weights=False, legacy_fct_bounds=False):
     """Single-precision tracer advection + explicit Redi + ALE reconstruction (FESOM2 #1054/#1056/#1206/#1207).
 
     Upstream order (``oce_ale_tracer.F90``): the FCT advection fills the WP_full ``del_ttf`` (low-order tendency in
@@ -768,7 +773,7 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
         d, X_old_new = tracer_content_sp(mesh, X, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, helem=st.helem,
                                          hnode=st.hnode, hnode_new=hnode_new, h_wp=h_wp, gm_diag=gm_diag,
                                          zbar3_live=zbar3_live, Z3d_live=Z3d_live, dt=dt, exch=exch, ckpt=ckpt,
-                                         adj=adj)
+                                         adj=adj, legacy_fct_bounds=legacy_fct_bounds)
         Xn, carry = tracer_adv.ale_reconstruct_carry(mesh, X, d, st.hnode, hnode_new, carry)
         return exch(Xn, "nod"), X_old_new, carry
 
@@ -783,7 +788,7 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
 
 
 def tracer_content_sp(mesh, X, X_old, *, uv_adv, w_e_adv, helem, hnode, hnode_new, h_wp, gm_diag, zbar3_live,
-                      Z3d_live, dt, exch, ckpt, adj):
+                      Z3d_live, dt, exch, ckpt, adj, legacy_fct_bounds: bool = False):
     """Single precision, one tracer: the float64 ``del_ttf`` of the FCT advection (flux-form low order, #1054/#1056)
     plus the explicit Redi content increments (``oce_ale_tracer.F90:1715-1720``, ``:1904``), from the WP tracer ``X``
     with the WP thicknesses ``h_wp`` / ``WP(hnode_new)`` for Redi. Returns ``(del_ttf, X_old_new)``; the caller rounds
@@ -793,7 +798,7 @@ def tracer_content_sp(mesh, X, X_old, *, uv_adv, w_e_adv, helem, hnode, hnode_ne
     d, X_old_new = ckpt(lambda: tracer_adv.advect_one_fct(
         mesh, uv_adv, w_e_adv, helem, hnode, hnode_new, X, X_old, dt=dt, exch=exch,
         Z3d=Z3d_live, zbar3=zbar3_live, w_i=None, freeze_limited_flux=adj.freeze_advection,
-        freeze_limiter=adj.freeze_fct_limiter,
+        freeze_limiter=adj.freeze_fct_limiter, legacy_fct_bounds=legacy_fct_bounds,
         content=True))()
     if gm_diag is not None:
         sl, Ki = gm_diag.slope_tapered, gm_diag.Ki
@@ -877,7 +882,7 @@ step_jit = jax.jit(step,
                    static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg", "kpp_cfg",
                                     "tke_cfg", "ale_cfg", "visc_cfg", "tracer_cfg",
                                     "remat_blocks", "recom_cfg", "legacy_k33_weights",
-                                    "legacy_sw_depth"))
+                                    "legacy_sw_depth", "legacy_fct_bounds"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,

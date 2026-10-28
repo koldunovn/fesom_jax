@@ -202,7 +202,7 @@ def recom_params(rcfg, params):
 
 def full_bgc_step(mesh, st, rcfg, *, params, h0, zbar0, Z0, helem, helem_flux, uv_adv, w_e_adv, w_i, hnode_new,
                   Z3d_new, gm_diag, Kv_eff, T0, S0, T_fin, S_fin, a_ice, sf, fs, dt_bgc, reduce_sum, exch, ckpt,
-                  adj) -> dict:
+                  adj, legacy_fct_bounds: bool = False) -> dict:
     """One full REcoM BGC step (stage 1 + stage 3) from ``st``; returns the updated ``State`` BGC fields
     (:data:`fesom_jax.recom.transport.FULL_STEP_FIELDS`, + ``bgc_budget`` when carried).
 
@@ -263,7 +263,8 @@ def full_bgc_step(mesh, st, rcfg, *, params, h0, zbar0, Z0, helem, helem_flux, u
         mesh, X1, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=w_i, helem=helem, hnode=h0, hnode_new=hnode_new,
         zbar3_live=zbar0, Z3d_live=Z0, Z3d_new=Z3d_new, gm_diag=gm_diag, Kv_eff=Kv_eff, temp=T_fin, salt=S_fin,
         sfc=r1.sfc, benthos=r1.benthos, geom_sink=geom_sink, params=p, switches=sw, dt=dt_bgc, exch=exch, ckpt=ckpt,
-        adj=adj, helem_flux=helem_flux, return_terms=True, **({"carry": st.bgc_carry} if _sp else {}))
+        adj=adj, helem_flux=helem_flux, return_terms=True, legacy_fct_bounds=legacy_fct_bounds,
+        **({"carry": st.bgc_carry} if _sp else {}))
     X_new, X_old_new, benthos_new, res = out3[:4]
 
     # ---- 2-D diagnostics ----

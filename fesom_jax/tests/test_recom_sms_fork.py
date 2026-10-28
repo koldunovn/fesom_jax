@@ -1,6 +1,6 @@
 """Lane E gate (docs/plans/20261028-recom-spectral-port.md): stage 1 of the spectral fork's REcoM
 (``recom_sources_sinks_fork``, 4 phytoplankton + 3 zooplankton + 2 detritus, broadband light) from each dumped
-``recom_in`` of the fork's NON-spectral twin (``install_nowb_rel``, run ``pi_30d_nowb`` on Albedo) against its
+``recom_in`` of the fork's NON-spectral twin (``install_nowb_rel``, run ``pi_30d_nowb_adv01`` on Albedo, namelist.tra weights 0., 1.) against its
 ``recom_out``: the 36 updated tracers, the fork's 3-D and 2-D diagnostics, PAR, the benthos, ``GlodecayBenthos``,
 the surface fluxes and the carbonate cache. Error = ``max |jax - fortran| / max |fortran|`` over the wet cells,
 ``TOL = 1e-11`` unless listed in ``LOOSE``. Skips without the dumps. ``python -m fesom_jax.tests.test_recom_sms_fork``
@@ -31,7 +31,7 @@ from fesom_jax.recom.stage1 import BgcStepInputs, RecomGeometry, recom_sources_s
 REF = Path(os.environ.get("FESOM_RECOM_FORK_REF", "/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/recom_ref"))
 REPO = Path(__file__).resolve().parents[2]
 NML = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb" / "namelist.recom"
-RUN = "pi_30d_nowb"
+RUN = os.environ.get("FESOM_RECOM_FORK_RUN", "pi_30d_nowb_adv01")
 STEPS = (1, 2, 3, 17, 224, 960)
 TOL = 1e-11
 LOOSE: dict = {}
