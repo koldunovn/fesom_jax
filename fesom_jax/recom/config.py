@@ -60,9 +60,16 @@ class RecomConfig(NamedTuple):
     def ntr(self) -> int:
         """The number of BGC tracers the State carries (the trailing axis of ``State.bgc``)."""
         if self.namelist is not None:
-            from .tracers import NTR
-            return NTR
+            return self.layout.ntr
         return int(self.passive_tracers)
+
+    @property
+    def layout(self):
+        """The tracer :class:`~fesom_jax.recom.layout.Layout` of the namelist's switches (full mode): REcoM
+        692f804's ``bin_2p3z2d`` (31) or the spectral fork's configurations (22-37, lane P)."""
+        from .layout import layout_of
+        sw, _ = self.load()
+        return layout_of(sw)
 
     def namelist_path(self) -> str:
         """``namelist`` as given, or relative to the repository root when it does not exist relative to the cwd."""
@@ -88,7 +95,8 @@ class RecomConfig(NamedTuple):
                 raise ValueError("recom.namelist (full REcoM) and recom.passive_tracers are exclusive")
             sw, _ = self.load()                     # NotImplementedError for an out-of-scope switch
             if sw.bgc_num != self.ntr:
-                raise ValueError(f"namelist bgc_num {sw.bgc_num} != the {self.ntr} tracers of fesom_jax.recom.tracers")
+                raise ValueError(f"namelist bgc_num {sw.bgc_num} != the {self.ntr} tracers of its layout "
+                                 f"({self.layout.describe()})")
             if self.ic_set not in IC_SETS:
                 raise ValueError(f"recom.ic_set must be one of {IC_SETS}, got {self.ic_set!r}")
             if not isinstance(self.output, tuple):
