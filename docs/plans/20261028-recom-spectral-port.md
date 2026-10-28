@@ -1,0 +1,149 @@
+# REcoM spectral light + 4-PFT ecosystem in fesom-jax
+
+Branch `recom-spectral` off `main` (bdeb99e, "REcoM-2 biogeochemistry"). Written 2026-10-28 on Albedo (AWI), from
+a read-only inventory of the Fortran fork; nothing below is ported yet.
+
+## Goal
+
+Run, in fesom-jax, the REcoM configuration of Svetlana Losa's FESOM2-REcoM fork
+(`sveta-loza/fesom2`, branch `fesom2.6_recom_tra_diags_spectral`, checkout
+`/albedo/work/user/sloza/SPECTRAL/recom_tra_diags_spectral`, HEAD e1e62886): the `bin_4p3z2d` ecosystem (4
+phytoplankton groups: small phytoplankton, diatoms, coccolithophores, Phaeocystis; 3 zooplankton; 2 detritus
+classes; CDOM; 37 BGC tracers) under spectrally resolved underwater light (13 wavebands, 400-700 nm, Darwin
+"wavebands" heritage; OASIM surface spectral irradiance), reproducing the Fortran run and staying differentiable.
+
+The reference Fortran run is `tmp_run_kdind15/` (CORE2, clim61 repeat-year forcing, 1958 cold start, OASIM v2
+`darwin400`, optics `optics_phyto_recom_carbon_12_4pft_REFINED_v5.dat`, `RECOM_CALC_ACDOM/APART`, `RECOM_BMASS`).
+
+## What has to be ported (inventory, from the fork's diff `cda35117..e1e62886`: 84 commits, +5096/-138 lines)
+
+The JAX port (`fesom_jax/recom/`) is REcoM 692f804 in its `bin_2p3z2d` configuration: 2 phytoplankton, 3
+zooplankton, 2 detritus, 31 tracers, broadband PAR (Beer-Lambert, `k_w + a_chl*Chl`), mocsy carbonate chemistry.
+`fesom_jax/recom/params.py` `SUPPORTED` refuses `enable_coccos`. Three blocks of new physics sit on top:
+
+### A. The 4-PFT ecosystem (already in the fork's BASELINE branch, not spectral-specific)
+
+- Tracers 1029-1031 CoccoN/C/Chl, 1032-1034 PhaeoN/C/Chl (`enable_coccos`), `bgc_num` 36; the JAX slot table
+  (`tracers.py` `BGC_IDS`) and `State.bgc` grow accordingly. ID layout: `recom_modules.F90:759-884`.
+- Coccolithophore and Phaeocystis growth, quotas (`NCmax_p` 0.2), temperature functions (Blanchard, NaN guard
+  `recom_sms.F90:1290`), grazing by the 3 zooplankton (`pzPhaeo`, `pzCocco`...), calcification by coccos (replaces
+  the 2-PFT "calcifying fraction of small phytoplankton"), aggregation (`agg_fac_phaeo`, `recom_sms.F90:4254-4320`),
+  Phaeocystis linear mortality (`:6212-6223`), iron-dependent Phaeocystis sinking incl. its benthic flux
+  (`recom_sinking.F90:96-135, 593-648`), per-PFT seed quotas in `recom_init.F90`.
+- Smaller biology switches (defaults bit-identical unless noted): Platt photoinhibition `beta_inh*` (both
+  builds), `res_phy_const`, pseudo N fixation (`nfix_*`, `recom_sms.F90:2974-2995`), overflow DOC/respiration
+  `f_ovf, ovf_to_cdom, res_ovf*` (`:6545-6585`), `k_din_calc`, `mort_phaeo`, `par_layer_mean` (default `.true.`,
+  CHANGES the broadband light: exact layer mean instead of FESOM's layer top, `:1465-1484`).
+
+### B. CDOM (spectral branch, `RECOM_CDOM`)
+
+- Tracer 1037 CDOM (37 tracers with 3zoo2det + coccos). Source `fcdom`(0.02) x the DOC sources, DOC gets
+  `(1-fcdom)`; sinks `rho_cdom*arrFunc` + photolysis `phot_cdom*min(PARave/kphot_cdom, 1)`
+  (`recom_sms.F90:551, 5802-5807, 6485-6542`; constants `recom_modules.F90:2677-2680`). Feeds the CDOM absorption
+  when `RECOM_CALC_ACDOM`.
+
+### C. The spectral light model (`REcoM_spectral`, `recom_modules.F90:2356-4543`, ~2200 lines, all new)
+
+1. Bands: `tlam = 13`, centres 400..700 by 25 nm, edges halfway (end bands 12.5 nm), `WtouEins` per band
+   (`:2813-2910, 2852-2861`).
+2. Surface irradiance: OASIM monthly climatology `Ed_<nnn>_*.nc`, `Es_<nnn>_*.nc` (1-degree grid, 12 records,
+   W m-2 per band, `/albedo/work/projects/p_specbic/sloza/forcing_oasim_v2/`), horizontally interpolated to nodes,
+   monthly HOLD (no time interpolation; the read triggers at month end, `gen_surface_forcing.F90:1800-1822`), NaN
+   gap fill (`gen_modules_read_NetCDF.F90:117-146`), sea-ice shading `(1 - a_ice)` on the call
+   (`recom_main.F90:429-434`). Without OASIM: `Edwsf = wb_width*sf*SurfSW` from `surfspec_13amt6.dat`, `Es = tiny`.
+3. Inherent optical properties per level and band (`recom_forcing.F90:306-460, 596-667`): water (`abw25par.dat`,
+   `bbw = 0.5 bw`); phytoplankton absorption `sum_PFT Chl_X * aphy_chl_X(lambda)` from `optics_phyto_*.dat`
+   (4 blocks x 13 lines: lambda, ap, ap_ps, b, bb; columns b/bb per mmol C with `RECOM_BMASS`); CDOM
+   (`aCDOM13amtVK2006.dat`, or `cdomcoeff*CDOM*exp(-0.021(lambda-450))` with `RECOM_CALC_ACDOM`); detritus
+   (`optics_detritus_3bb.dat` per particle / `1.06e-13`, or the `RECOM_CALC_APART` formulas); optional background
+   backscatter; `bb >= 2e-4`.
+4. Vertical integration: default `RECOM_RADTRANS` = the 3-stream (Ed, Es, Eu) direct solver
+   `MONOD_RADTRANS_DIRECT` (`:4069-4333`): Ed integrated exactly, Es/Eu amplitudes from a tridiagonal system
+   (`SOLVE_TRIDIAGONAL_PIVOT`, `:4338-4419`), `rmud = min(1/cosAI, 1.5)`, `rmus = 1/0.83`, `rmuu = 2.5`, skipped where
+   `Ed, Es < 1e-4`; scalar irradiance per band `sqrt(Etop*Ebot)` of `(rmud Ed + rmus Es + rmuu Eu)*WtouEins`
+   (`:4298-4327`). Alternative `RECOM_RADTRANS=.false.`: per-band Beer-Lambert (`recom_forcing.F90:497-590`).
+5. Growth: `alpha_I_X = 86400 * sum_lambda alphachl_nl_X(lambda) * PARw(lambda, k)`, `alphachl_nl_X = mQY_X *
+   ap_ps_X(lambda)`, `mQY_X = sum(QYmax_X/13/WtouEins)` (`WAVEBANDS_INIT_VARI`, `:3607-3638`); `Cphot_X = pMax_X (1 -
+   exp(-alpha_I_X * Chl2C_X / pMax_X))` (`recom_sms.F90:2501-2708`); Chl degradation and synthesis use `alpha_I`
+   (`:2794-2890, 3079-3133`); `PARave = sum PARw / WtouEins` for photodamage, CDOM photolysis, `beta_inh`. The
+   broadband `alfa*` are dead in a spectral build.
+6. Diagnostics: `Edz/Esz/Euz/Eutop/Estop` x 13 bands (`io_meandata.F90`, `max_io_streams` 400).
+7. Optional, NOT in the reference run: `RECOM_MARSHALL` (D1 photoinhibition tracers 1038-1041, `RECOM_APHYTO`),
+   `DAR_NONSPECTRAL_BACKSCATTERING_RATIO`, `RECOM_CALC_REFLEC`, `MONOD_RADTRANS_ITER` (niter >= 0).
+
+Two fork quirks to decide with the user before porting (they are not upstream REcoM):
+- CO2 limitation (`CO2lim`) is applied only in the non-spectral `#else` branches (`recom_sms.F90:2544, 2605,
+  2665, 2723`): the spectral `Cphot` never sees `PhyCO2` even with `CO2lim=.true.`.
+- The N:C quota is clamped to `[NCmin_X, NCmax_X]` in the spectral build only (`:845-848, 903-906, 973-976,
+  1015-1018`).
+Mirror the fork (quirks included, as the port's rule) unless the user says otherwise.
+
+### Version mismatch
+
+The fork's REcoM is in-tree (`src/int_recom`), based on `cda35117` (2025-10-09), i.e. OLDER than the 692f804
+submodule the JAX port tracks: 11 upstream commits (ballasting bug fixes, `ErosionTOC2D` NaN fix; ~7 files,
++264/-307, mainly `recom_sinking`/`recom_sms`) are in JAX but not in the fork. The Fortran twin for the gates
+must therefore be the FORK built on Albedo, and the comparison tolerances must account for those 11 commits (or
+the fork is first rebased onto the submodule REcoM, a Fortran task outside this plan).
+
+## Lanes (each a branch off `recom-spectral`, each gated before the next starts)
+
+- [ ] **Lane 0, Fortran reference on Albedo.** Build the fork with REcoM dumps (the env-gated dump hooks of
+      `docs/recom/FORTRAN_REFERENCE.md`, ported to `src/int_recom` of the fork; `recom_in`/`recom_out` stages plus
+      the new light arrays `PARw`, `Edz..Estop`, `oasim_ed2D/es2D`, `alpha_I_X`) on the pi mesh with
+      `bin_4p3z2d` + spectral, 30 days, one rank, and the same run with `RECOM_WAVEBANDS=OFF` (the broadband
+      4-PFT twin). Needs the pi REcoM inputs (`din5deg.nc` etc., FESOM2 `test/input/recom`, not on Albedo: fetch
+      from the FESOM2 test-data server) and an OASIM climatology interpolated to pi (the reader does that).
+      Partition: `mpp`, account `clidyn.clidyn`.
+- [ ] **Lane P, parameters and tracers (A, B).** `params.py`: every `&spectral`, `&nam_rspecsbc` and new biology
+      key with the fork's defaults; `SUPPORTED` gains `enable_coccos`, `RECOM_CDOM`, `RECOM_RADTRANS`, `OASIM`,
+      `RECOM_BMASS`, `RECOM_CALC_ACDOM/APART`, refuses `RECOM_MARSHALL`, `RECOM_CALC_APHYT/REFLEC`,
+      `DAR_NONSPECTRAL_BACKSCATTERING_RATIO`, niter >= 0. `tracers.py`: the 37-ID layout as a function of the
+      switches (the fork's `initialize_tracer_indices`), IC file map, sinking/remin/bc_surface sets per layout.
+      `State.bgc` sized by `NTR` from the config, restart reading tolerant of both layouts. Test: slot tables
+      against `recom_modules.F90:759-884` for the 4 layouts.
+- [ ] **Lane E, the 4-PFT sources and sinks (A, B).** `sms.py`: cocco/phaeo growth, quotas, grazing matrix,
+      calcification, aggregation, mortality, CDOM, the new switches; `sinking.py`: Fe-dependent Phaeocystis sinking
+      + benthic flux. Gate G2 on the broadband 4-PFT dumps (lane 0, `RECOM_WAVEBANDS=OFF`): updated tracers and
+      diagnostics rel 1e-11. This lane is independent of the light model and is where most of the biology risk is.
+- [ ] **Lane L, the spectral light (C.1-C.4).** New `fesom_jax/recom/spectral.py`: band tables, the `.dat` readers
+      (host, numpy), IOPs as array ops over `(nod2D, nl, 13)`, the 3-stream direct solver as a vectorised
+      tridiagonal (`ops.tdma` over the column, batched over nodes and bands; `lax.scan`, no Python loops), the
+      Beer-Lambert alternative, `PARw(nod2D, nl, 13)` and `PARave`. Gate: `PARw`/`Edz..Estop` against the lane-0
+      spectral dumps at the probe columns (rel 1e-10; the solver is a direct method so this should be tight).
+      Differentiability check: `jax.grad` of the column PAR w.r.t. Chl finite and matching FD.
+- [ ] **Lane F, OASIM forcing.** `fesom_jax/recom/oasim.py` + `surface_forcing.BgcForcing`: 26 monthly fields
+      interpolated to nodes once on the host (the JRA bilinear machinery of `jra55.py`/`read_other_NetCDF` port),
+      held per month in the per-step input tables like the dust (`didx` row), `(1 - a_ice)` shading in the step,
+      NaN fill. Run-YAML keys `forcing.oasim_dir`, `forcing.oasim_pattern`.
+- [ ] **Lane W, wiring.** `stage1.py`/`wiring.py`: light before growth, `alpha_I` into the growth terms, the
+      no-OASIM `surfspec` path, outputs (`edz3d` etc. in the mean streams, `recom.output`), budget terms for CDOM;
+      configs `configs/pi_recom_spectral.yaml`, `configs/albedo/core2_recom_spectral.yaml`. Gates G4b/G5 on pi
+      against the lane-0 spectral twin (one step, 30 days: inventories, CO2 flux, NPP per PFT); sharded = dense;
+      gradient of a one-day NPP cost vs FD. Then the CORE2 run of `tmp_run_kdind15` on one Albedo GPU and the
+      `scripts/recom/page` figures against it.
+
+Rough size: lanes P+E are of the order of the original `recom-lane-sources` work (the sms grows by ~1000 Fortran
+lines); lane L is ~2200 Fortran lines but structurally simple (columns x bands); lane 0 is a Fortran build and
+dump exercise. Expect several sessions per lane; do not start lane E or L without lane 0's dumps.
+
+## Rules (as the parent REcoM port)
+
+- Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.
+- Every new switch off by default; `recom_cfg=None` and the `bin_2p3z2d` namelist must leave the existing
+  programs byte-identical (`test_dp_lock.py`, the pi twin gates in `docs/recom/VALIDATION.md` keep passing).
+- Fortran `file:line` citations in docstrings; `jax.lax` control flow only; f64; no host-side branching on traced
+  values; the light solver must be grad-safe (the point of the port).
+- Cite the Albedo SLURM job ids as evidence in this plan.
+
+## Inputs on Albedo (for lane 0 and the final run)
+
+- Fortran fork: `/albedo/work/user/sloza/SPECTRAL/recom_tra_diags_spectral` (build via
+  `/albedo/home/cvoelker/fesom2/env/albedo/shell`, CMake option `RECOM_WAVEBANDS`); run dirs `tmp_run_kdind15/`
+  (reference), `tmp_run_cocco/`; optics `.dat` files next to the namelists (read as relative paths).
+- OASIM: `/albedo/work/projects/p_specbic/sloza/forcing_oasim_v2/{Ed,Es}_{400..700}_oasim_clim1998-2012_darwin400.nc`.
+- REcoM IC, dust, CO2: `/albedo/work/user/anbros001/Maresys/` and `/albedo/pool/FESOM2/recom/`.
+- Atmosphere: clim61 repeat-year JRA55-do (`Maresys/*.clim61.nc`, `y_perpetual`); the JAX reader wants
+  `{var}.{year}.nc` per year, so a `forcing.repeat_year` option (or symlinks per year) is part of lane W.
+- Warm start: `/albedo/work/projects/p_specbic/sloza/restart_1997_4pft/` (Fortran restart layout; a converter to
+  the JAX restart is lane W's last step if a warm start is wanted).
