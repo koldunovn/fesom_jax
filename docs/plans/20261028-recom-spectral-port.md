@@ -76,7 +76,11 @@ Two fork quirks to decide with the user before porting (they are not upstream RE
   2665, 2723`): the spectral `Cphot` never sees `PhyCO2` even with `CO2lim=.true.`.
 - The N:C quota is clamped to `[NCmin_X, NCmax_X]` in the spectral build only (`:845-848, 903-906, 973-976,
   1015-1018`).
-Mirror the fork (quirks included, as the port's rule) unless the user says otherwise.
+Decisions (user, 2026-10-28): mirror the N:C clamp; apply CO2 limitation in the spectral growth too (a stated
+deviation from the fork, documented in the port and in the fork's issue list). The fork is first brought up to the
+submodule REcoM by cherry-picking the 11 upstream commits (branch `fesom2.6_recom_tra_diags_spectral_recom692`,
+worktree `/albedo/work/user/sloza/SPECTRAL/recom_spectral_r692`). The pi REcoM inputs come from upstream FESOM2's
+committed `test/input/recom` (extracted to `fesom_jax_data/recom_pi/`).
 
 ### Version mismatch
 
