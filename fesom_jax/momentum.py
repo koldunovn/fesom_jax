@@ -146,11 +146,16 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
 
 
 def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
-                    *, is_first_step, dt=DT_DEFAULT, exch=None):
+                    *, is_first_step, dt=DT_DEFAULT, exch=None, press_air=None):
     """``(uv_rhs, uv_rhsAB_new)`` element fields ``[elem2D, nl, 2]``.
 
     ``uv``, ``w_e``, ``hnode`` and ``eta_n`` are the *previous-step* state (lagged,
-    as in the C). ``uv_rhsAB`` is the incoming AB slot (overwritten on return)."""
+    as in the C). ``uv_rhsAB`` is the incoming AB slot (overwritten on return).
+
+    ``press_air`` (``[nod2D]`` Pa, FESOM2's ``l_mslp``): the sea-level pressure enters the
+    surface pressure as ``p_air = press_air/1000`` (``oce_ale_vel_rhs.F90:208-209``, not
+    divided by rho0) and its gradient is taken together with the SSH term,
+    ``pre = -(g·eta + p_air)``. ``None`` (l_mslp off) is the unchanged program."""
     g = G
     lm = mesh.elem_layer_mask
     area = mesh.elem_area[:, None]                                  # (elem2D,1)
@@ -160,7 +165,11 @@ def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
 
     # (2) SSH gradient F = ∇N·(−g·η) at the 3 vertices, then += (F − pgf)·area
     eta_c = ops.gather_nodes_to_elem(eta_n, mesh.elem_nodes)        # (elem2D,3)
-    pre = -g * eta_c
+    if press_air is None:
+        pre = -g * eta_c
+    else:   # l_mslp: pre = -(p_eta + p_ice + p_air), p_ice = 0 (no floating ice), p_air = press_air/1000
+        p_air = ops.gather_nodes_to_elem(press_air, mesh.elem_nodes) / 1000.0
+        pre = -(g * eta_c + p_air)
     gs = mesh.gradient_sca
     Fx = gs[:, 0] * pre[:, 0] + gs[:, 1] * pre[:, 1] + gs[:, 2] * pre[:, 2]   # (elem2D,)
     Fy = gs[:, 3] * pre[:, 0] + gs[:, 4] * pre[:, 1] + gs[:, 5] * pre[:, 2]

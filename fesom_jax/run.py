@@ -28,6 +28,7 @@ noted, not yet wired (de-risk on the smaller meshes first per the run plan).
 """
 from __future__ import annotations
 
+import dataclasses
 import datetime
 import functools
 import math
@@ -501,6 +502,13 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # The State is kept FOLDED through the chunk loop + restart (no [P,Lmax]↔[P*Lmax] reshape, which
     # MATERIALIZES the global array on one device under multi-node ⇒ OOM). Cold start is the one
     # [P,Lmax] (host) entry; run_steps_sharded_forced folds it once and returns folded thereafter.
+    _recom_full = cfg.recom is not None and cfg.recom.mode == "full"
+    if _recom_full and state0 is not None and getattr(state0, "bgc", None) is None:
+        # full REcoM cold start: the BGC tracers from FESOM2-REcoM's IC (fesom_jax.recom.ic) on the host
+        from .recom import wiring as _rw
+        state0 = _rw.with_bgc_state(state0, _rw.cold_ic(mesh, cfg.recom), cfg.recom)
+        if jax.process_index() == 0:
+            print(f"[run] recom: cold-start BGC state from the {cfg.recom.ic_set} IC ({cfg.recom.ic_dir})", flush=True)
     if state0 is not None:
         state_p = shard_mesh.partition_state(state0, part)   # [P, Lmax] HOST
         folded_in = False
@@ -517,6 +525,25 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # carries them (resume mid-cycle), else the upstream init values; None when ice_ave_steps == 1
     from .ice_step import init_ice_avg
     state_p = init_ice_avg(state_p, cfg.ice)
+    # REcoM (fesom_jax.recom): the BGC tracers from the restart when it carries them, else (passive-tracer mode,
+    # plan Task 1) copies of salinity
+    if _recom_full:
+        from .recom import wiring as _rw
+        if getattr(state_p, "bgc", None) is None:
+            # a physics-only restart into a REcoM run: the BGC state starts from the IC (as a Fortran run with
+            # REcoM_restart = .false.), placed like the restart's own fields
+            state_p = dataclasses.replace(state_p, **_rw.place_global_fields(
+                _rw.ic_fields(_rw.cold_ic(mesh, cfg.recom)), part, devices))
+            if jax.process_index() == 0:
+                print(f"[run] recom: restart without BGC fields -> BGC from the {cfg.recom.ic_set} IC", flush=True)
+        # FESOM2's run-segment start: mstep restarts at 1, the carbonate cache is refilled then (neither restarted)
+        state_p = _rw.start_segment(state_p, cfg.recom)
+    elif cfg.recom is not None and getattr(state_p, "bgc", None) is None:
+        from .recom.transport import init_passive
+        state_p = init_passive(state_p, cfg.recom.ntr)
+    if cfg.recom is not None:          # recom.bgc_every > 1: the interval sums (kept from a mid-interval restart)
+        from .recom.transport import init_every_k
+        state_p = init_every_k(state_p, cfg.recom.bgc_every)
     # ssh.split_explicit (fesom_jax.ssh_se): the CG/SE restart guard (an SE restart into a CG run is refused), the
     # rings (kept from an SE restart = the exact resume; flat for a cold start or a CG restart, announced), the
     # per-device SE tables, and the CFL guard (power iteration on the 2-D operator; raises below M_min).
@@ -583,7 +610,11 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                              split_at=sorted(set(_split)))
         chunks = split_tails(chunks, cs, int(os.environ.get("FESOM_CHUNK_TAIL", "0") or 0))
 
-    fs_p = None if unforced else shard_mesh.partition_forcing_static(forcing.static, part)
+    _fstatic = None if unforced else forcing.static
+    if _recom_full and _fstatic is not None:       # full REcoM's per-run node constants (fesom_jax.recom.wiring)
+        from .recom import wiring as _rw
+        _fstatic = _rw.with_recom_static(_fstatic, mesh)
+    fs_p = None if unforced else shard_mesh.partition_forcing_static(_fstatic, part)
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)
 
     # mEVP sea-ice boundary condition (the EVP zeros u_ice/v_ice at PHYSICAL-coast nodes,
@@ -737,6 +768,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # only its post-boundary steps — ~1 period per multi-year segment, negligible for a climatology.)
     streams = []
     out_sample_specs = []
+    # full REcoM: the BGC fields of recom.output join every active mean stream (fesom_jax.recom.wiring.output_fields)
+    if _recom_full:
+        from .recom import wiring as _rw
+        _bgc_names = tuple(cfg.recom.output)
+        _bgc_out = functools.partial(_rw.output_fields, rcfg=cfg.recom)
+    else:
+        _bgc_names = ()
+        _bgc_out = lambda s: {}                                  # noqa: E731
     k100 = None
     if daily_out is not None:
         k100 = int(np.argmin(np.abs(np.asarray(mesh.Z) - (-100.0))))
@@ -748,7 +787,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     "usurf": s.uvnode[:, 0, 0], "vsurf": s.uvnode[:, 0, 1],
                     "u100": s.uvnode[:, _k100, 0], "v100": s.uvnode[:, _k100, 1],
                     "u500": s.uvnode[:, _k500, 0], "v500": s.uvnode[:, _k500, 1],
-                    "a_ice": s.a_ice, "m_ice": s.m_ice}
+                    "a_ice": s.a_ice, "m_ice": s.m_ice, **_bgc_out(s)}
 
         def _write_daily(day, mean, count, _k100=k100, _k500=k500):
             yr, doy = day
@@ -763,14 +802,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             return (int(yr), int(doy))
 
         streams.append(_MeanStream(("sst", "sss", "ssh", "temp100", "usurf", "vsurf",
-                                    "u100", "v100", "u500", "v500", "a_ice", "m_ice"),
+                                    "u100", "v100", "u500", "v500", "a_ice", "m_ice") + _bgc_names,
                                    _daily_key, _write_daily, daily_start_step))
         out_sample_specs.append(_daily_fields)
 
     if monthly_out is not None:
         def _monthly_fields(s):
             return {"temp": s.T, "salt": s.S, "u": s.uvnode[:, :, 0], "v": s.uvnode[:, :, 1],
-                    "ssh": s.eta_n, "a_ice": s.a_ice, "m_ice": s.m_ice}
+                    "ssh": s.eta_n, "a_ice": s.a_ice, "m_ice": s.m_ice, **_bgc_out(s)}
 
         def _write_monthly(key, mean, count):
             yr, mo = key
@@ -783,7 +822,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             yr, _, _, mo = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
             return (int(yr), int(mo))
 
-        streams.append(_MeanStream(("temp", "salt", "u", "v", "ssh", "a_ice", "m_ice"),
+        streams.append(_MeanStream(("temp", "salt", "u", "v", "ssh", "a_ice", "m_ice") + _bgc_names,
                                    _monthly_key, _write_monthly, monthly_start_step))
         out_sample_specs.append(_monthly_fields)
 

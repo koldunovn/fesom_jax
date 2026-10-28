@@ -1,0 +1,216 @@
+From b9e98a24ce6f6538a233419779b12aabd219de4d Mon Sep 17 00:00:00 2001
+From: koldunovn <koldunovn@gmail.com>
+Date: Sun, 25 Oct 2026 16:49:59 +0100
+Subject: [PATCH] recom_ref_dump: env-gated full-field reference dumps
+ (FESOM_RECOM_DUMP_DIR, FESOM_RECOM_DUMP_STEPS)
+
+---
+ recom_ref_dump.F90 | 199 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 199 insertions(+)
+ create mode 100644 recom_ref_dump.F90
+
+diff --git a/recom_ref_dump.F90 b/recom_ref_dump.F90
+new file mode 100644
+index 0000000..55768db
+--- /dev/null
++++ b/recom_ref_dump.F90
+@@ -0,0 +1,199 @@
++!==============================================================================
++! recom_ref_dump: full-field reference dumps of FESOM2 + REcoM for the fesom-jax
++! REcoM port (lane F of docs/plans/20261025-recom-port.md in fesom-jax).
++!
++! Off unless the environment variable FESOM_RECOM_DUMP_DIR is set; then the
++! steps listed in FESOM_RECOM_DUMP_STEPS (comma-separated mstep values, mstep =
++! the step number within this run segment, starting at 1) are dumped.
++! Without the variable every routine returns at its first test, so the model
++! state is untouched (the dumps only read model arrays).
++!
++! Layout, one directory per dumped step:  <dir>/step_<mstep, 6 digits>/
++!   fields.bin   raw little-endian records, concatenated in write order
++!   index.txt    line 1: '# recom_ref_dump v1 key=value ...' (step, calendar, mesh sizes)
++!                then one line per record:
++!                  <name> <dtype f8|i4> <ndim> <d1> [<d2> [<d3>]] <offset bytes>
++!                dims are the Fortran (column-major) shape; a reader reverses them
++!                to get a C-order array, e.g. a(nl, nod2D) -> numpy (nod2D, nl).
++! Single MPI rank only (the pi reference): local numbering = global numbering,
++! checked against myList_nod2D / myList_elem2D by the caller (gid_nod / gid_elem
++! records).
++!==============================================================================
++module recom_ref_dump
++    use iso_fortran_env, only: int32, real64
++    implicit none
++    private
++
++    public :: rdump_init, rdump_step, rdump_active, rdump
++    public :: rdump_enabled
++
++    logical, save :: rdump_enabled = .false.
++    logical, save :: rdump_initialized = .false.
++    logical, save :: active = .false.
++    character(len=1024), save :: rd_dir = ''
++    character(len=1100), save :: step_dir = ''
++    integer, save :: nsteps_list = 0
++    integer, save :: steps_list(1000)
++    integer(kind=8), save :: offset = 0
++
++    interface rdump
++        module procedure rdump_r0, rdump_r1, rdump_r2, rdump_r3, rdump_i1
++    end interface rdump
++
++contains
++
++    !--------------------------------------------------------------------------
++    subroutine rdump_init(npes)
++        integer, intent(in) :: npes
++        character(len=4096) :: buf
++        integer :: l, stat, i0, i, k, v
++        if (rdump_initialized) return
++        rdump_initialized = .true.
++        call get_environment_variable('FESOM_RECOM_DUMP_DIR', rd_dir, l, stat)
++        if (stat /= 0 .or. l == 0) then
++            rdump_enabled = .false.
++            return
++        end if
++        rdump_enabled = .true.
++        if (npes /= 1) then
++            write(*, *) 'recom_ref_dump: FESOM_RECOM_DUMP_DIR needs a single MPI rank, npes =', npes
++            stop 1
++        end if
++        call get_environment_variable('FESOM_RECOM_DUMP_STEPS', buf, l, stat)
++        nsteps_list = 0
++        if (stat == 0 .and. l > 0) then
++            i0 = 1
++            do i = 1, l + 1
++                if (i > l) then
++                    k = 1
++                else if (buf(i:i) == ',') then
++                    k = 1
++                else
++                    k = 0
++                end if
++                if (k == 1) then
++                    if (i > i0) then
++                        read(buf(i0:i - 1), *) v
++                        nsteps_list = nsteps_list + 1
++                        steps_list(nsteps_list) = v
++                    end if
++                    i0 = i + 1
++                end if
++            end do
++        end if
++        write(*, '(a,a)') ' recom_ref_dump: ON, directory ', trim(rd_dir)
++        write(*, '(a,1000(1x,i0))') ' recom_ref_dump: steps', steps_list(1:nsteps_list)
++    end subroutine rdump_init
++
++    !--------------------------------------------------------------------------
++    ! Called once per time step, after the clock update. Opens the step
++    ! directory when mstep is in the list; closes the dumping window otherwise.
++    subroutine rdump_step(mstep, yearnew, daynew, timenew, month, ndpyr, dt, nod2D, elem2D, nl)
++        integer, intent(in) :: mstep, yearnew, daynew, month, ndpyr, nod2D, elem2D, nl
++        real(kind=8), intent(in) :: timenew, dt
++        integer :: u
++        active = .false.
++        if (.not. rdump_enabled) return
++        if (.not. any(steps_list(1:nsteps_list) == mstep)) return
++        active = .true.
++        write(step_dir, '(a,a,i6.6)') trim(rd_dir), '/step_', mstep
++        call execute_command_line('mkdir -p '//trim(step_dir))
++        offset = 0
++        open(newunit=u, file=trim(step_dir)//'/fields.bin', access='stream', form='unformatted', &
++             status='replace', action='write')
++        close(u)
++        open(newunit=u, file=trim(step_dir)//'/index.txt', status='replace', action='write')
++        write(u, '(a,i0,a,i0,a,i0,a,es24.16,a,i0,a,i0,a,es24.16,a,i0,a,i0,a,i0,a)') &
++            '# recom_ref_dump v1 mstep=', mstep, ' yearnew=', yearnew, ' daynew=', daynew, &
++            ' timenew=', timenew, ' month=', month, ' ndpyr=', ndpyr, ' dt=', dt, &
++            ' nod2D=', nod2D, ' elem2D=', elem2D, ' nl=', nl, ' npes=1'
++        close(u)
++        write(*, '(a,i0,a,a)') ' recom_ref_dump: dumping step ', mstep, ' to ', trim(step_dir)
++    end subroutine rdump_step
++
++    logical function rdump_active()
++        rdump_active = active
++    end function rdump_active
++
++    !--------------------------------------------------------------------------
++    subroutine append_index(name, dtype, ndim, dims, nbytes)
++        character(len=*), intent(in) :: name, dtype
++        integer, intent(in) :: ndim, dims(3)
++        integer(kind=8), intent(in) :: nbytes
++        integer :: u
++        open(newunit=u, file=trim(step_dir)//'/index.txt', status='old', position='append', action='write')
++        select case (ndim)
++        case (1)
++            write(u, '(a,1x,a,1x,i0,1x,i0,1x,i0)') trim(name), dtype, ndim, dims(1), offset
++        case (2)
++            write(u, '(a,1x,a,1x,i0,2(1x,i0),1x,i0)') trim(name), dtype, ndim, dims(1:2), offset
++        case (3)
++            write(u, '(a,1x,a,1x,i0,3(1x,i0),1x,i0)') trim(name), dtype, ndim, dims(1:3), offset
++        end select
++        close(u)
++        offset = offset + nbytes
++    end subroutine append_index
++
++    subroutine open_bin(u)
++        integer, intent(out) :: u
++        open(newunit=u, file=trim(step_dir)//'/fields.bin', access='stream', form='unformatted', &
++             status='old', position='append', action='write')
++    end subroutine open_bin
++
++    !--------------------------------------------------------------------------
++    subroutine rdump_r0(name, a)
++        character(len=*), intent(in) :: name
++        real(kind=8), intent(in) :: a
++        integer :: u
++        if (.not. active) return
++        call open_bin(u)
++        write(u) real(a, real64)
++        close(u)
++        call append_index(name, 'f8', 1, (/1, 0, 0/), 8_8)
++    end subroutine rdump_r0
++
++    subroutine rdump_r1(name, a)
++        character(len=*), intent(in) :: name
++        real(kind=8), intent(in) :: a(:)
++        integer :: u
++        if (.not. active) return
++        call open_bin(u)
++        write(u) real(a, real64)
++        close(u)
++        call append_index(name, 'f8', 1, (/size(a, 1), 0, 0/), 8_8 * size(a, kind=8))
++    end subroutine rdump_r1
++
++    subroutine rdump_r2(name, a)
++        character(len=*), intent(in) :: name
++        real(kind=8), intent(in) :: a(:, :)
++        integer :: u
++        if (.not. active) return
++        call open_bin(u)
++        write(u) real(a, real64)
++        close(u)
++        call append_index(name, 'f8', 2, (/size(a, 1), size(a, 2), 0/), 8_8 * size(a, kind=8))
++    end subroutine rdump_r2
++
++    subroutine rdump_r3(name, a)
++        character(len=*), intent(in) :: name
++        real(kind=8), intent(in) :: a(:, :, :)
++        integer :: u
++        if (.not. active) return
++        call open_bin(u)
++        write(u) real(a, real64)
++        close(u)
++        call append_index(name, 'f8', 3, (/size(a, 1), size(a, 2), size(a, 3)/), 8_8 * size(a, kind=8))
++    end subroutine rdump_r3
++
++    subroutine rdump_i1(name, a)
++        character(len=*), intent(in) :: name
++        integer, intent(in) :: a(:)
++        integer :: u
++        if (.not. active) return
++        call open_bin(u)
++        write(u) int(a, int32)
++        close(u)
++        call append_index(name, 'i4', 1, (/size(a, 1), 0, 0/), 4_8 * size(a, kind=8))
++    end subroutine rdump_i1
++
++end module recom_ref_dump

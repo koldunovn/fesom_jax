@@ -55,7 +55,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
          kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
          halo_ctx=None, boundary_node=None, adjoint_cfg=None,
-         remat_blocks: bool = False, bulk_uvnode_lag: bool = False, ice_update=None) -> State:
+         remat_blocks: bool = False, bulk_uvnode_lag: bool = False, ice_update=None,
+         recom_cfg=None, legacy_k33_weights: bool = False, legacy_sw_depth: bool = False) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -82,6 +83,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     ``bulk_uvnode_lag=True`` restores the legacy tap (the pre-fix C dumps). ``ice_update`` (static
     ``True``/``False``, ``ice_ave_steps > 1`` only) chooses the ice update branch at trace time
     (:func:`ice_step.ice_surface_step`); ``None`` ⇒ the device decision under ``lax.cond``.
+    ``legacy_k33_weights`` / ``legacy_sw_depth`` restore the Redi K33 interface weights before
+    FESOM2 #944 and the absolute shortwave attenuation depth before FESOM2 #1116
+    (:func:`gm_redi.k33_augmentation`, :func:`forcing.cal_shortwave_rad`); only for the gates
+    whose C/Fortran dumps predate those changes.
 
     **GM/Redi (Phase 6B).** ``gm_cfg`` (a :class:`fesom_jax.gm.GMConfig`, static/hashable —
     the ``ice_cfg`` precedent) turns on the mesoscale eddy parameterization: after EOS the
@@ -125,7 +130,15 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     layer thicknesses (``hnode``/``helem``/``zbar_3d_n``/``Z_3d_n``) become time-varying and the
     forcing flips to real freshwater/salt fluxes. ``ale_cfg=None`` ⇒ the linfs path
     (``dh/dt=0``), **byte-identical** to the pre-Phase-9 model (a dead branch — no trace).
-    Validated at the seam (the C ``fesom_ale_mode_init`` abort parity)."""
+    Validated at the seam (the C ``fesom_ale_mode_init`` abort parity).
+
+    **REcoM (plan 20261025-recom-port).** ``recom_cfg`` (a :class:`fesom_jax.recom.config.RecomConfig`,
+    static/hashable) runs the BGC tracers ``State.bgc`` through FESOM2's tracer loop for the IDs > 2 right after
+    T and S, with the same transport fields (:func:`fesom_jax.recom.transport.bgc_transport`). Nothing in the
+    physics reads them. ``recom_cfg=None`` ⇒ **byte-identical** (a dead branch — no trace). Full REcoM
+    (``recom_cfg.mode == "full"``) adds stage 1 (FESOM2's ``recom()``) and REcoM's own tracer-loop terms
+    (:func:`fesom_jax.recom.wiring.full_bgc_step`); it needs zstar, the forced path with ``press_air`` and REcoM's
+    per-step inputs, and ``forcing_static`` from :func:`fesom_jax.recom.wiring.with_recom_static`."""
     st = state
     if params is None:
         params = PR.wp_tree(Params.defaults())       # WP leaves in single precision (identity in double)
@@ -233,7 +246,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt,
                 owned_mask=_red_mask, axis_name=_red_axis, exch=_exch,
                 boundary_node=boundary_node, use_virt_salt=use_virt_salt, zbar3=zbar3_live,
-                params=params, ice_update=ice_update,
+                params=params, ice_update=ice_update, legacy_sw_depth=legacy_sw_depth,
                 **({} if halo_ctx is None or halo_ctx.mevp_wide is None
                    else {"mevp_wide": halo_ctx.mevp_wide}))
             # Frozen-ice adjoint (paper §2): run the FULL mEVP ice in the forward but
@@ -267,7 +280,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             sfx = surface_forcing.compute_surface_fluxes(
                 mesh, st, step_forcing, forcing_static, dt=dt,
                 owned_mask=_red_mask, axis_name=_red_axis, use_virt_salt=use_virt_salt,
-                zbar3=zbar3_live)
+                zbar3=zbar3_live, legacy_sw_depth=legacy_sw_depth)
             stress_surf = sfx.stress_surf
             bc_T, bc_S, sw_3d = sfx.bc_T, sfx.bc_S, sfx.sw_3d
             heat_flux, water_flux = sfx.heat_flux, sfx.water_flux
@@ -442,7 +455,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     momentum_adv_scalar, which exchanges its node uvnode_rhs internally (S.7).
     uv_rhs, uv_rhsAB = _ckpt(lambda: momentum.compute_vel_rhs(
         mesh, st.uv, st.uv_rhsAB, st.eta_n, pgf_x, pgf_y, st.w_e, h_wp,
-        is_first_step=is_first_step, dt=dt, exch=_exch))()
+        is_first_step=is_first_step, dt=dt, exch=_exch,
+        press_air=getattr(step_forcing, "press_air", None)))()
     uv_rhs = _exch(uv_rhs, "elem")
     uv_rhsAB = _exch(uv_rhsAB, "elem")
 
@@ -570,7 +584,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     if _sp:
         T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff = _tracers_advect_sp(
             mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live, zbar3_new,
-            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj)
+            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj, legacy_k33_weights=legacy_k33_weights)
     else:
         T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, st.helem, st.hnode,
@@ -609,7 +623,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                      + _ckpt(lambda: gm_redi.diff_part_hor_redi(
                          mesh, st.S, slope_tap, Ki, st.hnode, hnode_new, st.helem, dt=dt))())
             _k33 = _ckpt(lambda: gm_redi.k33_augmentation(
-                mesh, slope_tap, Ki, zbar3=zbar3_new, Z3d=Z3d_new))()
+                mesh, slope_tap, Ki, zbar3=zbar3_new, Z3d=Z3d_new, legacy_weights=legacy_k33_weights))()
             # NOTE this one is unlike the others: K33 is how the eddy coefficients reach the
             # vertical diffusion, so freezing it cuts part of the gradient path of the very
             # parameter being trained. Off unless you are deliberately isolating that term.
@@ -631,10 +645,74 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         T_new, S_new = _ckpt(lambda: tracer_diff.impl_vert_diff(
             mesh, T_adv, S_adv, Kv_eff, hnode_new, dt=dt,
             bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d, Z3d=Z3d_new))()
-    # salinity floor on wet layers only (below-bottom stays 0)
+    # salinity floor on wet layers only (below-bottom stays 0). Fortran clips after the whole tracer loop, so full
+    # REcoM's sinking (stage 3 below) reads S before the floor.
+    S_unclipped = S_new
     S_new = jnp.where(mesh.node_layer_mask, jnp.maximum(S_new, S_FLOOR), S_new)
     T_new = _exch(T_new, "nod")        # refresh halo for next step's EOS/FCT/Redi reads
     S_new = _exch(S_new, "nod")
+
+    # 15c — REcoM: the BGC tracers through the same tracer stage (FESOM2's tracer loop continues past T and S with
+    #       the same transport fields). recom_cfg=None ⇒ not traced. Under single precision full REcoM (bgc_every 1)
+    #       runs the BGC stack through the #1207 scheme of T/S with its own carry and REcoM's code in float64 (an
+    #       opt-in deviation: FESOM2 has no SP REcoM build; plan 20261026-recom-lane-sp); the passive mode is the plain
+    #       double-precision scheme on WP arrays (a cost estimate only, plan Task 2).
+    bgc_out = None
+    if recom_cfg is not None:
+        from .recom import transport as bgc_transport
+        # the BGC stack's exchanges: grouped under gpu.bgc_halo (HaloCtx.exchange_bulk), else the step's own
+        _bgc_exch = _exch if halo_ctx is None else halo_ctx.exchange_bulk
+        if st.bgc is None:
+            raise ValueError("recom_cfg is set but the State carries no BGC tracers (State.bgc is None)")
+        _full = recom_cfg.mode == "full"
+        if _full:
+            # Full REcoM (fesom_jax.recom.wiring): stage 1 (FESOM2's recom(), from the values it has at its Fortran
+            # position: T/S/hnode of the step start, a_ice after the ice step, this step's forcing) and stage 3 (the
+            # BGC tracers in the tracer loop, with this step's transport, T_new and S before the floor)
+            from .recom import wiring as _rw
+            _rw.check_step_inputs(step_forcing, forcing_static, ale_cfg, _sp, int(recom_cfg.bgc_every))
+            if halo_ctx is None:
+                _red_sum = jnp.sum
+            else:
+                from .reductions import global_sum as _gsum
+                _red_sum = lambda x: _gsum(x, _red_mask, _red_axis)          # noqa: E731
+            _full_kw = dict(params=params, hnode_new=hnode_new, Z3d_new=Z3d_diff if _sp else Z3d_new, gm_diag=gm_diag,
+                            T0=st.T, S0=st.S,
+                            T_fin=T_new, S_fin=S_unclipped,
+                            a_ice=ice_out.a_ice if ice_out is not None else forcing_static.a_ice,
+                            sf=step_forcing, fs=forcing_static, reduce_sum=_red_sum, exch=_bgc_exch, ckpt=_ckpt,
+                            adj=_adj)
+        _bgc_bc = bc_S if (not _full and recom_cfg.passive_bc == "salt") else None
+        if _full and int(recom_cfg.bgc_every) == 1:
+            bgc_out = _rw.full_bgc_step(
+                mesh, st, recom_cfg, h0=st.hnode, zbar0=zbar3_live, Z0=Z3d_live, helem=st.helem, helem_flux=None,
+                uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv, Kv_eff=Kv_eff, dt_bgc=dt, **_full_kw)
+        elif _full:
+            if st.bgc_steps is None:
+                raise ValueError("recom.bgc_every > 1 needs the interval sums (recom.transport.init_every_k)")
+            bgc_out = bgc_transport.bgc_every_k(
+                mesh, st, int(recom_cfg.bgc_every), uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv,
+                helem=st.helem, hnode_new=hnode_new, Z3d_new=Z3d_new, gm_diag=gm_diag, Kv_eff=Kv_eff, bc=None, dt=dt,
+                exch=_bgc_exch, ckpt=_ckpt, adj=_adj, zstar=True,
+                full=lambda **kw: _rw.full_bgc_step(mesh, st, recom_cfg, **kw, **_full_kw))
+        elif int(recom_cfg.bgc_every) == 1:
+            bgc_new, bgc_old_new = bgc_transport.bgc_transport(
+                mesh, st.bgc, st.bgc_old, uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv, helem=st.helem,
+                hnode=st.hnode, hnode_new=hnode_new, zbar3_live=zbar3_live, Z3d_live=Z3d_live,
+                Z3d_new=Z3d_diff if _sp else Z3d_new,
+                gm_diag=gm_diag, Kv_eff=Kv_eff, bc=_bgc_bc,
+                dt=dt, exch=_bgc_exch, ckpt=_ckpt, adj=_adj, sp_estimate=_sp)
+            bgc_out = dict(bgc=bgc_new, bgc_old=bgc_old_new)
+        else:
+            # BGC every k-th step (RecomConfig.bgc_every, a stated deviation): this step's transport joins the
+            # interval sums; the k-th step runs the BGC stage once on the means with k*dt
+            if st.bgc_steps is None:
+                raise ValueError("recom.bgc_every > 1 needs the interval sums (recom.transport.init_every_k)")
+            bgc_out = bgc_transport.bgc_every_k(
+                mesh, st, int(recom_cfg.bgc_every), uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=_wi_adv,
+                helem=st.helem, hnode_new=hnode_new, Z3d_new=Z3d_diff if _sp else Z3d_new, gm_diag=gm_diag,
+                Kv_eff=Kv_eff, bc=_bgc_bc, dt=dt, exch=_bgc_exch, ckpt=_ckpt, adj=_adj, zstar=ale_cfg is not None,
+                sp_estimate=_sp)
 
     # 16 — commit thickness (hnode := hnode_new; helem = vertex mean)
     hnode, helem = ale.commit_thickness(mesh, hnode_new)
@@ -653,6 +731,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     )
     if _sp:
         new = dataclasses.replace(new, carry_T=carry_T, carry_S=carry_S)
+    if bgc_out is not None:
+        new = dataclasses.replace(new, **bgc_out)
     if se_out is not None:
         new = dataclasses.replace(new, se_eta=se_out.se_eta, se_ubt=se_out.se_ubt,
                                   se_sbar_old=se_out.se_sbar_old)
@@ -675,7 +755,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
 
 def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live,
-                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj):
+                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj, legacy_k33_weights=False):
     """Single-precision tracer advection + explicit Redi + ALE reconstruction (FESOM2 #1054/#1056/#1206/#1207).
 
     Upstream order (``oce_ale_tracer.F90``): the FCT advection fills the WP_full ``del_ttf`` (low-order tendency in
@@ -684,20 +764,11 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
     going back into the carry (``:864-869``). Deviation D3 (user, 2026-10-20): the double-precision path of
     :func:`step` adds Redi after its reconstruction; only this single-precision path follows upstream's order.
     Returns ``(T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff)``."""
-    hn_wp = PR.wp(hnode_new)
-
     def one(X, X_old, carry):
-        d, X_old_new = ckpt(lambda: tracer_adv.advect_one_fct(
-            mesh, uv_adv, w_e_adv, st.helem, st.hnode, hnode_new, X, X_old, dt=dt, exch=exch,
-            Z3d=Z3d_live, zbar3=zbar3_live, w_i=None, freeze_limited_flux=adj.freeze_advection,
-            freeze_limiter=adj.freeze_fct_limiter,
-            content=True))()
-        if gm_diag is not None:
-            sl, Ki = gm_diag.slope_tapered, gm_diag.Ki
-            d = (d + PR.full(ckpt(lambda: gm_redi.diff_ver_part_redi_expl(
-                     mesh, X, sl, Ki, hn_wp, dt=dt, zbar3=zbar3_live, Z3d=Z3d_live, content=True))())
-                 + PR.full(ckpt(lambda: gm_redi.diff_part_hor_redi(
-                     mesh, X, sl, Ki, h_wp, hn_wp, st.helem, dt=dt, content=True))()))
+        d, X_old_new = tracer_content_sp(mesh, X, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, helem=st.helem,
+                                         hnode=st.hnode, hnode_new=hnode_new, h_wp=h_wp, gm_diag=gm_diag,
+                                         zbar3_live=zbar3_live, Z3d_live=Z3d_live, dt=dt, exch=exch, ckpt=ckpt,
+                                         adj=adj)
         Xn, carry = tracer_adv.ale_reconstruct_carry(mesh, X, d, st.hnode, hnode_new, carry)
         return exch(Xn, "nod"), X_old_new, carry
 
@@ -706,9 +777,31 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
     Kv_eff = Kv
     if gm_diag is not None:
         k33 = ckpt(lambda: gm_redi.k33_augmentation(mesh, gm_diag.slope_tapered, gm_diag.Ki, zbar3=zbar3_new,
-                                                    Z3d=Z3d_new))()
+                                                    Z3d=Z3d_new, legacy_weights=legacy_k33_weights))()
         Kv_eff = Kv + (jax.lax.stop_gradient(k33) if adj.freeze_k33 else k33)
     return T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff
+
+
+def tracer_content_sp(mesh, X, X_old, *, uv_adv, w_e_adv, helem, hnode, hnode_new, h_wp, gm_diag, zbar3_live,
+                      Z3d_live, dt, exch, ckpt, adj):
+    """Single precision, one tracer: the float64 ``del_ttf`` of the FCT advection (flux-form low order, #1054/#1056)
+    plus the explicit Redi content increments (``oce_ale_tracer.F90:1715-1720``, ``:1904``), from the WP tracer ``X``
+    with the WP thicknesses ``h_wp`` / ``WP(hnode_new)`` for Redi. Returns ``(del_ttf, X_old_new)``; the caller rounds
+    ``X·hnode + del_ttf (+ its own content increments) + carry`` once (:func:`tracer_adv.ale_reconstruct_carry`).
+    Shared by T/S (:func:`_tracers_advect_sp`) and the full-REcoM BGC stack (``recom.transport.recom_stage3``)."""
+    hn_wp = PR.wp(hnode_new)
+    d, X_old_new = ckpt(lambda: tracer_adv.advect_one_fct(
+        mesh, uv_adv, w_e_adv, helem, hnode, hnode_new, X, X_old, dt=dt, exch=exch,
+        Z3d=Z3d_live, zbar3=zbar3_live, w_i=None, freeze_limited_flux=adj.freeze_advection,
+        freeze_limiter=adj.freeze_fct_limiter,
+        content=True))()
+    if gm_diag is not None:
+        sl, Ki = gm_diag.slope_tapered, gm_diag.Ki
+        d = (d + PR.full(ckpt(lambda: gm_redi.diff_ver_part_redi_expl(
+                 mesh, X, sl, Ki, hn_wp, dt=dt, zbar3=zbar3_live, Z3d=Z3d_live, content=True))())
+             + PR.full(ckpt(lambda: gm_redi.diff_part_hor_redi(
+                 mesh, X, sl, Ki, h_wp, hn_wp, helem, dt=dt, content=True))()))
+    return d, X_old_new
 
 
 # Jitted entry point (the Task-2.11 deliverable; also what Phase 3's lax.scan wraps).
@@ -783,7 +876,8 @@ def _apply_surface_adj(mesh, adj, *, bc_T, heat_flux, stress_surf, stress_node_s
 step_jit = jax.jit(step,
                    static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg", "kpp_cfg",
                                     "tke_cfg", "ale_cfg", "visc_cfg", "tracer_cfg",
-                                    "remat_blocks"))
+                                    "remat_blocks", "recom_cfg", "legacy_k33_weights",
+                                    "legacy_sw_depth"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,

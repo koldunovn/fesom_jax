@@ -728,6 +728,146 @@ def evp_component(fields: dict, meta: dict, point: str, name: str) -> np.ndarray
     return fields[point][:, layout.index(name)]
 
 
+# ---------------------------------------------------------------------------
+# REcoM full-field dumps (lane F of docs/plans/20261025-recom-port.md): the Fortran
+# FESOM2 + REcoM reference, ``recom_ref_dump`` (FESOM_RECOM_DUMP_DIR /
+# FESOM_RECOM_DUMP_STEPS). One directory per dumped step, ``step_<mstep:06d>/`` with
+#   index.txt   line 1 ``# recom_ref_dump v1 mstep=.. yearnew=.. daynew=.. timenew=..
+#               month=.. ndpyr=.. dt=.. nod2D=.. elem2D=.. nl=.. npes=1``, then one line
+#               per record ``<name> <f8|i4> <ndim> <d1> [<d2> [<d3>]] <offset>`` with the
+#               FORTRAN (column-major) shape
+#   fields.bin  the raw little-endian records, concatenated in write order.
+# A Fortran array ``a(d1, d2, d3)`` is read as the C-order numpy array of shape
+# ``(d3, d2, d1)``: node fields ``(nl, nod2D)`` arrive entity-leading as
+# ``(nod2D, nl)``, ``uv(2, nl-1, elem2D)`` as ``(elem2D, nl-1, 2)``.
+# Names: ``<stage>.<field>``, per tracer ``<stage>.tr<ID>[.<field>]``; the stage list
+# and field catalogue are in docs/recom/FORTRAN_REFERENCE.md.
+# ---------------------------------------------------------------------------
+
+RECOM_DUMP_VERSION = "v1"
+_RECOM_DTYPES = {"f8": np.dtype("<f8"), "i4": np.dtype("<i4")}
+
+
+def recom_dump_steps(dirpath: Union[str, Path]) -> list[int]:
+    """The dumped steps (mstep values) present under a REcoM dump directory."""
+    d = Path(dirpath)
+    out = []
+    for p in sorted(d.glob("step_*")):
+        if (p / "index.txt").is_file():
+            out.append(int(p.name.split("_", 1)[1]))
+    return out
+
+
+def _parse_recom_header(line: str) -> dict:
+    toks = line.split()
+    if len(toks) < 3 or toks[0] != "#" or toks[1] != "recom_ref_dump":
+        raise IOError(f"REcoM dump: bad index header {line!r}")
+    if toks[2] != RECOM_DUMP_VERSION:
+        raise IOError(f"REcoM dump: version {toks[2]!r}, reader knows {RECOM_DUMP_VERSION!r}")
+    meta: dict = {}
+    rest = toks[3:]
+    i = 0
+    while i < len(rest):  # Fortran's es24.16 pads the value: ``timenew=  2.7E+03``
+        k, v = rest[i].split("=", 1)
+        if v == "":
+            i += 1
+            v = rest[i]
+        meta[k] = float(v) if k in ("timenew", "dt") else int(v)
+        i += 1
+    return meta
+
+
+def load_recom_dump(dirpath: Union[str, Path], step: int,
+                    names: Union[Iterable[str], None] = None) -> tuple[dict, dict]:
+    """Read one dumped step of the Fortran REcoM reference.
+
+    Returns ``(fields, meta)``: ``fields`` maps record name → numpy array (C order,
+    the reversed Fortran shape, see above); ``meta`` is the index header (``mstep``,
+    calendar, ``dt``, ``nod2D``, ``elem2D``, ``nl``) plus ``order`` (the record names
+    in write order). ``names`` restricts loading to those records. Raises on a
+    duplicate record name, a missing ``step_<step>`` directory or a truncated file.
+    """
+    d = Path(dirpath) / f"step_{int(step):06d}"
+    idx_path, bin_path = d / "index.txt", d / "fields.bin"
+    if not idx_path.is_file() or not bin_path.is_file():
+        raise FileNotFoundError(f"REcoM dump step {step}: {d} has no index.txt/fields.bin")
+    lines = idx_path.read_text().splitlines()
+    meta = _parse_recom_header(lines[0])
+    want = None if names is None else set(names)
+    raw = np.memmap(bin_path, dtype=np.uint8, mode="r")
+    fields: dict = {}
+    order: list[str] = []
+    for line in lines[1:]:
+        if not line.strip():
+            continue
+        tok = line.split()
+        name, dt, ndim = tok[0], tok[1], int(tok[2])
+        dims = [int(x) for x in tok[3:3 + ndim]]
+        offset = int(tok[3 + ndim])
+        if name in order:
+            raise ValueError(f"REcoM dump step {step}: duplicate record {name!r}")
+        order.append(name)
+        if want is not None and name not in want:
+            continue
+        dtype = _RECOM_DTYPES[dt]
+        count = int(np.prod(dims))
+        nbytes = count * dtype.itemsize
+        if offset + nbytes > raw.size:
+            raise IOError(f"REcoM dump step {step}: record {name!r} runs past the end of fields.bin")
+        arr = np.frombuffer(raw[offset:offset + nbytes].tobytes(), dtype=dtype, count=count)
+        fields[name] = arr.reshape(dims[::-1]).astype(dtype.newbyteorder("="))
+    if want is not None and want - set(fields):
+        raise KeyError(f"REcoM dump step {step}: no record(s) {sorted(want - set(fields))}")
+    meta["order"] = order
+    return fields, meta
+
+
+def recom_dump_tracer_ids(fields: dict, stage: str = "recom_in") -> list[int]:
+    """The tracer IDs present at ``stage`` (``<stage>.tr<ID>`` records), in write
+    order (= FESOM's tracer order: 1, 2, then the BGC tracers)."""
+    out = []
+    pre = stage + ".tr"
+    for k in fields:
+        if k.startswith(pre) and "." not in k[len(pre):]:
+            out.append(int(k[len(pre):]))
+    return out
+
+
+def write_recom_dump(dirpath: Union[str, Path], step: int, fields: dict, meta: dict) -> Path:
+    """Write ``fields`` (name → numpy array, C order) in the ``recom_ref_dump`` v1
+    layout, so that :func:`load_recom_dump` returns them unchanged; for JAX-side
+    dumps and the format round trip. ``meta`` supplies the header integers/floats."""
+    d = Path(dirpath) / f"step_{int(step):06d}"
+    d.mkdir(parents=True, exist_ok=False)
+    keys = ("mstep", "yearnew", "daynew", "timenew", "month", "ndpyr", "dt",
+            "nod2D", "elem2D", "nl")
+    head = "# recom_ref_dump v1 " + " ".join(
+        f"{k}={meta.get(k, step if k == 'mstep' else 0)!r}" if k in ("timenew", "dt")
+        else f"{k}={int(meta.get(k, step if k == 'mstep' else 0))}" for k in keys) + " npes=1"
+    lines = [head]
+    offset = 0
+    with open(d / "fields.bin", "wb") as fh:
+        for name, a in fields.items():
+            a = np.asarray(a)
+            if a.dtype.kind == "f":
+                dt, a = "f8", a.astype("<f8")
+            elif a.dtype.kind in "iu":
+                dt, a = "i4", a.astype("<i4")
+            else:
+                raise TypeError(f"write_recom_dump: {name!r} has dtype {a.dtype}")
+            if a.ndim == 0:
+                a = a.reshape(1)
+            if not 1 <= a.ndim <= 3:
+                raise ValueError(f"write_recom_dump: {name!r} has ndim {a.ndim}")
+            fdims = a.shape[::-1]
+            lines.append(f"{name} {dt} {a.ndim} " + " ".join(map(str, fdims)) + f" {offset}")
+            buf = np.ascontiguousarray(a).tobytes()
+            fh.write(buf)
+            offset += len(buf)
+    (d / "index.txt").write_text("\n".join(lines) + "\n")
+    return d
+
+
 def _summary_main(argv: list[str]) -> int:  # pragma: no cover - debug CLI
     if not argv:
         print("usage: python -m fesom_jax.io_dump <dumpfile> [more...]")

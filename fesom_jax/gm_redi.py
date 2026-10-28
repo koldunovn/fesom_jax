@@ -189,15 +189,23 @@ def diff_part_hor_redi(mesh: Mesh, T_old, slope_tapered, Ki, hnode, hnode_new,
 # ============================================================================
 # G.6 — K33 isoneutral augmentation (fesom_tracer_diff.c:167-246)
 # ============================================================================
-def k33_augmentation(mesh: Mesh, slope_tapered, Ki, zbar3=None, Z3d=None):
+def k33_augmentation(mesh: Mesh, slope_tapered, Ki, zbar3=None, Z3d=None, *, legacy_weights: bool = False):
     """The Redi K33 (3,3-tensor) augmentation of the vertical tracer diffusivity:
     a per-interface ``K33_aug`` to ADD to ``Kv`` before ``impl_vert_diff`` (the C's
     ``Ty/Ty1`` terms; note ``Ty(nz) == Ty1(nz-1)`` ⇒ one per-interface value).
 
-    ``K33_aug[k] = (Z[k-1]−zbar[k])·zinv·s[k-1]²·Ki[k-1] + (zbar[k]−Z[k])·zinv·
+    ``K33_aug[k] = (zbar[k]−Z[k])·zinv·s[k-1]²·Ki[k-1] + (Z[k-1]−zbar[k])·zinv·
     s[k]²·Ki[k]`` with ``zinv=1/(Z[k-1]−Z[k])`` and ``s = slope_tapered[...,2]`` (the
-    |slope| magnitude). Static linfs vertical geometry. Returns ``(N, nl)``, on the
-    interior interfaces (0 at surface/bottom; ``impl_vert_diff`` masks anyway).
+    |slope| magnitude): the linear interpolation of the layer-centre ``s²·Ki`` to the
+    interface ``zbar[k]``, each layer weighted by the half-distance on the OTHER side, as
+    FESOM2 since PR #944 (0452259a, merged 6526e4be 2026-08-21; ``oce_ale_tracer.F90:1296,
+    1329,1331,1372`` in e96a2b13). Static linfs vertical geometry, or the live zstar one.
+    Returns ``(N, nl)``, on the interior interfaces (0 at surface/bottom; ``impl_vert_diff``
+    masks anyway).
+
+    ``legacy_weights=True`` restores the pre-#944 (swapped) weights, ``(Z[k-1]−zbar[k])`` on
+    ``s[k-1]²·Ki[k-1]`` and ``(zbar[k]−Z[k])`` on ``s[k]²·Ki[k]``. Only for the gates whose
+    C/Fortran dumps predate #944; on a uniform grid both weightings are 1/2 and agree.
 
     The vertical diffusion then uses ``Kv + K33_aug`` — since ``impl_vert_diff``
     builds ``a[nz]∝Kv[nz]``, ``c[nz]∝Kv[nz+1]``, the augmented Kv reproduces the C's
@@ -223,7 +231,11 @@ def k33_augmentation(mesh: Mesh, slope_tapered, Ki, zbar3=None, Z3d=None):
         zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(1.0 / (Zm[:, : nl - 2] - Zm[:, 1:nl - 1]))
         gu_zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(Zm[:, : nl - 2] - zbar3[:, 1:nl - 1]) * zinv
         gd_zinv = jnp.zeros((N, nl)).at[:, 1:nl - 1].set(zbar3[:, 1:nl - 1] - Zm[:, 1:nl - 1]) * zinv
-    K33 = gu_zinv * stKi_up + gd_zinv * stKi_full
+    # gu_zinv = (Z[k-1]−zbar[k])·zinv, the upper half-distance; gd_zinv = (zbar[k]−Z[k])·zinv, the lower one.
+    if legacy_weights:
+        K33 = gu_zinv * stKi_up + gd_zinv * stKi_full          # pre-#944
+    else:
+        K33 = gd_zinv * stKi_up + gu_zinv * stKi_full          # #944: linear interpolation to zbar[k]
 
     k = jnp.arange(nl)[None, :]
     iface = (k >= mesh.ulevels_nod2D[:, None]) & (k < (mesh.nlevels_nod2D - 1)[:, None])

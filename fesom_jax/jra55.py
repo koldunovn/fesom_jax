@@ -56,6 +56,12 @@ DEFAULT_JRA_DIR = paths.resolve("jra_dir")
 JRA_VARS = ("uas", "vas", "huss", "rsds", "rlds", "tas", "prra", "prsn")
 N_FLD = len(JRA_VARS)
 (I_XWIND, I_YWIND, I_HUMI, I_QSR, I_QLW, I_TAIR, I_PREC, I_SNOW) = range(N_FLD)
+# FESOM2's l_mslp (gen_surface_forcing.F90: i_mslp = the next i_totfl after the eight fields above): JRA55-do
+# sea-level pressure [Pa], read only when the reader is built with mslp=True. It is the ninth field, read, time- and
+# mesh-interpolated exactly like the others (sbc_do/getcoeffld), and goes to press_air unchanged
+# (gen_forcing_couple.F90:680, "unit should be Pa").
+MSLP_VAR = "psl"
+I_MSLP = N_FLD
 
 # Namelist scalars (fesom_jra55_init, fesom_jra55.c:578-583).
 NM_NC_IYEAR = 1900
@@ -203,6 +209,7 @@ class JRAFields:
     Tair: np.ndarray
     prec_rain: np.ndarray
     prec_snow: np.ndarray
+    press_air: "np.ndarray | None" = None    # sea-level pressure [Pa]; only with mslp=True (FESOM2 l_mslp)
 
     def as_array(self) -> np.ndarray:
         """``[nod2D, 8]`` in the JRA field order (uas,vas,huss,rsds,rlds,tas,prra,prsn)."""
@@ -322,12 +329,26 @@ class JRA55Reader:
     # build_local_forcing when dt is given) is added to every rdate; 0.0 = the legacy
     # step-start evaluation (a uniform 15-minute lag of every forcing field at dt=1800).
     midstep_days: float = 0.0
+    # With a dt ramp (run_config.DtRamp) the steps starting at or after ``midstep_switch`` = (year, day, sec) are
+    # taken with the ramp dt, so their middle is ``midstep_days_after`` past the step start (set by
+    # surface_forcing.set_midstep); None = one offset for every step.
+    midstep_switch: tuple | None = None
+    midstep_days_after: float = 0.0
 
-    def __init__(self, mesh, year: int, jra_dir: str | Path | None = None):
+    def _midstep(self, year, day, sec) -> float:
+        """The step-start -> mid-step offset [days] of the step starting at ``(year, day, sec)``."""
+        if self.midstep_switch is not None and (int(year), int(day), float(sec)) >= self.midstep_switch:
+            return self.midstep_days_after
+        return self.midstep_days
+
+    def __init__(self, mesh, year: int, jra_dir: str | Path | None = None, *, mslp: bool = False):
         """``jra_dir=None`` ⇒ resolved from ``$FESOM_JRA_DIR``, else the Levante default
         (:func:`fesom_jax.paths.require`, which raises an actionable ``FileNotFoundError``
-        if the directory is absent)."""
+        if the directory is absent). ``mslp`` (FESOM2's ``l_mslp``) adds ``psl`` as a ninth field
+        (:data:`I_MSLP`); off, the reader opens and returns exactly the eight fields it always did."""
         self.year = int(year)
+        self.mslp = bool(mslp)
+        self.vars = JRA_VARS + ((MSLP_VAR,) if self.mslp else ())
         self.N = int(mesh.nod2D)
         self.jra_dir = Path(paths.require("jra_dir", jra_dir))
 
@@ -356,10 +377,10 @@ class JRA55Reader:
         self._ra_checked = False
 
     def _open_fields(self, year: int) -> "list[_Field]":
-        """Open the 8 JRA fields for ``year`` (``{var}.{year:04d}.nc``) and verify they share one
-        (lon,lat) grid — the precondition for the single shared bilinear stencil."""
+        """Open the 8 JRA fields (9 with ``mslp``) for ``year`` (``{var}.{year:04d}.nc``) and verify they share
+        one (lon,lat) grid — the precondition for the single shared bilinear stencil."""
         fields = [_Field(var, str(self.jra_dir / f"{var}.{int(year):04d}.nc"), int(year))
-                  for var in JRA_VARS]
+                  for var in self.vars]
         f0 = fields[0]
         for f in fields[1:]:
             if not (np.array_equal(f.nc_lon, f0.nc_lon)
@@ -544,7 +565,7 @@ class JRA55Reader:
         Without workers it does nothing; with them :meth:`step` takes the records decoded, the same bytes."""
         cal0 = self.fields[0].calendar
         rdates = np.asarray([float(_julday(int(d[0]), 1, 1, cal0)) + float(d[1] - 1) + d[2] / 86400.0
-                             + float(self.midstep_days) for d in dates])
+                             + float(self._midstep(d[0], d[1], d[2])) for d in dates])
         self._read_ahead(rdates)
 
     def _getcoeffld(self, f: _Field, rdate: float):
@@ -601,7 +622,7 @@ class JRA55Reader:
         formed in float64, evaluated in float32 (the default keeps the double-precision ``rdate·coef_a + coef_b``)."""
         cal0 = self.fields[0].calendar
         rdate = (float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
-                 + float(self.midstep_days))
+                 + float(self._midstep(year, day, sec)))
 
         vals = []
         for f in self.fields:
@@ -627,6 +648,7 @@ class JRA55Reader:
             Tair=vals[I_TAIR] - 273.15,
             prec_rain=vals[I_PREC] / 1000.0,
             prec_snow=vals[I_SNOW] / 1000.0,
+            press_air=vals[I_MSLP] if self.mslp else None,
         )
 
     # ---- per-chunk bracket schedule (the on-device forcing seam) --------
@@ -641,7 +663,8 @@ class JRA55Reader:
         depth (pad target — fixed per (chunk length, dt) so the compiled executable is
         reusable across chunks). Returns ``(coef_a, coef_b, rdates, fidx)`` with
         ``coef_a``/``coef_b`` ``[N_FLD, nb, nod2D]`` float64, ``rdates [T]`` float64 and
-        ``fidx [T, N_FLD]`` int32, satisfying BIT-exactly (same values, same op order)
+        ``fidx [T, N_FLD]`` int32 (``N_FLD + 1`` rows with ``mslp``, ``psl`` last), satisfying BIT-exactly (same
+        values, same op order)
 
             rdates[i]·coef_a[f, fidx[i, f]] + coef_b[f, fidx[i, f]]
                 == the raw ``vals[f]`` of ``step(*dates[i])``
@@ -664,15 +687,16 @@ class JRA55Reader:
             year, day, sec = d[0], d[1], d[2]
             # the exact step() expression (same op order ⇒ same f64 value)
             rdates[i] = (float(_julday(int(year), 1, 1, cal0)) + float(day - 1) + sec / 86400.0
-                         + float(self.midstep_days))
+                         + float(self._midstep(year, day, sec)))
 
         self._read_ahead(rdates)
         # point-slope tables are float32: the rows round on assignment, as the astype of a float64 table would
         tdt = np.float32 if point_slope else np.float64
-        coef_a = np.zeros((N_FLD, nb, self.N), dtype=tdt)
-        coef_b = np.zeros((N_FLD, nb, self.N), dtype=tdt)
-        fidx = np.empty((T, N_FLD), dtype=np.int32)
-        elapsed = np.empty((T, N_FLD), dtype=np.float32) if point_slope else None
+        nf = len(self.fields)                    # N_FLD, + 1 with mslp
+        coef_a = np.zeros((nf, nb, self.N), dtype=tdt)
+        coef_b = np.zeros((nf, nb, self.N), dtype=tdt)
+        fidx = np.empty((T, nf), dtype=np.int32)
+        elapsed = np.empty((T, nf), dtype=np.float32) if point_slope else None
         for fi, f in enumerate(self.fields):
             nb_used = 0
             cur_key = None

@@ -265,7 +265,10 @@ def main():
         # (fesom_jax/paths.py, docs/DATA.md) — the historical behaviour.
         fpaths = cfg.forcing_paths()
         forcing = surface_forcing.build_surface_forcing(mesh, args.year, sst_ic=sst0,
-                                                   dt=cfg.dt, **fpaths); _lap("forcing_setup")
+                                                   dt=cfg.dt, mslp=cfg.forcing_mslp(),
+                                                   bgc_dust_path=cfg.bgc_dust_path(), dt_ramp=cfg.dt_ramp,
+                                                   bgc_co2=cfg.bgc_co2(),
+                                                   **fpaths); _lap("forcing_setup")
 
     # The NG5 host-forcing fix: build a LOCAL-node forcing (interp only this process's owned
     # partitions, ~npes× less). forcing.static is reused for the (cheap, once) static path.
@@ -273,12 +276,16 @@ def main():
     if args.local_forcing:
         from fesom_jax.forcing_local import build_local_forcing
         local_forcing = build_local_forcing(mesh, args.year, part, part.npes,
-                                             static=forcing.static, sst_ic=sst0, dt=cfg.dt, **fpaths)
+                                             static=forcing.static, sst_ic=sst0, dt=cfg.dt,
+                                             mslp=cfg.forcing_mslp(), bgc_dust_path=cfg.bgc_dust_path(),
+                                             dt_ramp=cfg.dt_ramp, bgc_co2=cfg.bgc_co2(), **fpaths)
         _lap("local_forcing_setup")
 
     # the halo transport: a --padded / --coloured / --ragged flag wins over gpu.halo_transport
     _transport = ("padded" if args.padded else "coloured" if args.coloured else "ragged" if args.ragged
                   else cfg.halo_transport())
+    if _transport == "grouped":     # the coloured maps, their rounds in one NCCL group (read by device_mesh and when traced)
+        os.environ["FESOM_HALO_GROUPED"] = "1"
     if _IS_LEAD:
         print(f"[run] mesh={mesh_dir} npes={part.npes} devices={len(jax.devices())} "
               f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in} "
@@ -287,7 +294,7 @@ def main():
                           state0=state0, start_step=0, year=args.year,
                           chunk_steps=args.chunk_steps or cfg.chunk_steps() or 240, out_dir=cfg.restart_out,
                           use_ragged=_transport == "ragged", use_padded=_transport == "padded",
-                          use_coloured=_transport == "coloured",
+                          use_coloured=_transport in ("coloured", "grouped"),
                           progress=(args.progress and _IS_LEAD),
                           local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
                           restart_archive_out=args.restart_archive_out,

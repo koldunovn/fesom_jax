@@ -44,7 +44,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax import lax
 
-from .halo import compact_exchange_maps
+from .halo import compact_exchange_maps, halo_none
 from .shard_mesh import _owner_map
 
 
@@ -275,7 +275,11 @@ def _xfer(nod, elem, sn, rn, se, re_, axis_name):
         bn = jnp.concatenate([bn, jnp.zeros((Sn, C - cn), bn.dtype)], axis=1)
     if ce < C:
         be = jnp.concatenate([be, jnp.zeros((Se, C - ce), be.dtype)], axis=1)
-    g = lax.all_gather(jnp.concatenate([bn, be], axis=0), axis_name, axis=0, tiled=False)
+    buf = jnp.concatenate([bn, be], axis=0)
+    if halo_none():                                   # timing only: the own lanes stand in for every device's
+        g = jnp.broadcast_to(buf[None], (lax.psum(1, axis_name),) + buf.shape)
+    else:
+        g = lax.all_gather(buf, axis_name, axis=0, tiled=False)
     P = g.shape[0]
     gn = g[:, :Sn, :cn].reshape(P * Sn, cn)
     ge = g[:, Sn:, :ce].reshape(P * Se, ce)

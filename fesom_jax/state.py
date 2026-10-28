@@ -130,6 +130,35 @@ class State:
     se_eta: jax.Array | None = None               # (nod2D,2) eta^{n-1/M}, eta^{n-2/M} (eta^n is eta_n)
     se_ubt: jax.Array | None = None               # (elem2D,3,2) U^n, U^{n-1/M}, U^{n-2/M} barotropic transport
     se_sbar_old: jax.Array | None = None          # (elem2D,2) last step's sum_k h u (the AB2 Coriolis of the r-term)
+    # --- REcoM biogeochemistry (RunConfig.recom, fesom_jax.recom; plan 20261025-recom-port) ---
+    # OPTIONAL: all None unless REcoM is on (the SE_FIELDS precedent). The tracer axis is TRAILING so every leaf stays
+    # entity-leading and the sharded partition/fold/restart plumbing carries them unchanged.
+    bgc: jax.Array | None = None                  # (nod2D,nl,ntr) BGC tracers, in recom slot order (tracers%data(3:))
+    bgc_old: jax.Array | None = None              # (nod2D,nl,ntr) previous-step BGC tracers (AB2 valuesold)
+    # single precision + full REcoM only (an opt-in deviation, plan 20261026-recom-lane-sp): the #1206 rounding carry of
+    # every BGC tracer, as carry_T/carry_S (float32; None in double precision and in the passive mode)
+    bgc_carry: jax.Array | None = None            # (nod2D,nl,ntr)
+    # BGC every k-th step (RecomConfig.bgc_every > 1, a stated deviation; None at k = 1): the running sums of the
+    # transport the physics steps of the current interval used, and the thickness at the interval start
+    bgc_steps: jax.Array | None = None            # (nod2D,) int32 physics steps summed so far in this interval
+    bgc_uvh: jax.Array | None = None              # (elem2D,nl,2) sum of the advecting uv * helem (incl. GM bolus)
+    bgc_we: jax.Array | None = None               # (nod2D,nl) sum of the advecting explicit w (incl. GM bolus)
+    bgc_wi: jax.Array | None = None               # (nod2D,nl) sum of the implicit w (w_split; 0 without)
+    bgc_kv: jax.Array | None = None               # (nod2D,nl) sum of the K33-augmented Kv
+    bgc_bc: jax.Array | None = None               # (nod2D,) sum of the surface BC increments (passive "salt" mode)
+    bgc_h0: jax.Array | None = None               # (nod2D,nl) hnode at the interval start
+    # full REcoM (RecomConfig.mode == "full"; None in the passive mode): FESOM2-REcoM's own carried arrays
+    bgc_benthos: jax.Array | None = None          # (nod2D,4) Benthos: benthic N, C, Si, Calc [mmol m-2] (restarted)
+    bgc_alk_surf: jax.Array | None = None         # (nod2D,) Alk_surf, the alkalinity restoring target (restarted;
+    #                                               Fortran rebuilds it from the IC every run: the same values)
+    bgc_carb: jax.Array | None = None             # (nod2D,nl-1,8) the cached carbonate system CO23D..rhoSW3D (sms.CARB_FIELDS);
+    #                                               NOT restarted (as Fortran; the mstep == 1 refresh fills every wet cell)
+    bgc_mstep: jax.Array | None = None            # (nod2D,) int32 FESOM2's mstep - 1: BGC steps done in this run segment;
+    #                                               0 at EVERY run start (never from a restart), as fesom_module.F90's n
+    bgc_diag: jax.Array | None = None             # (nod2D,len(recom.wiring.DIAG2D)) the last BGC step's 2-D diagnostics
+    #                                               (output only, not restarted; GloHplus = surface pH among them)
+    bgc_budget: jax.Array | None = None           # (nod2D,4,ntr) RecomConfig.budget only: per-column content sums
+    #                                               (recom.wiring.BUDGET_TERMS), not restarted
 
     # ---- constructors -----------------------------------------------------
     @classmethod
@@ -229,11 +258,19 @@ ICE_AVG_FIELDS = ("ice_steps_since_upd", "ice_update", "srfoce_temp", "srfoce_sa
                   "ice_real_salt_flux", "ice_a_old")
 # The optional split-explicit SSH fields, in State order (None on the CG path; = ssh_se.STATE_FIELDS).
 SE_FIELDS = ("se_eta", "se_ubt", "se_sbar_old")
+# The optional REcoM fields, in State order (None unless RunConfig.recom is set).
+BGC_MR_FIELDS = ("bgc_steps", "bgc_uvh", "bgc_we", "bgc_wi", "bgc_kv", "bgc_bc", "bgc_h0")  # BGC-every-k sums (None at k=1)
+BGC_FULL_FIELDS = ("bgc_benthos", "bgc_alk_surf", "bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget")  # full REcoM only
+BGC_FIELDS = ("bgc", "bgc_old", "bgc_carry") + BGC_MR_FIELDS + BGC_FULL_FIELDS
+# Present but never written to a restart: FESOM2 restarts neither the carbonate cache nor mstep (both restart with
+# the run segment, fesom_module.F90:849,983,1049; recom_sms.F90:489); the diagnostics and budget sums are output.
+RESTART_SKIP = ("bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget")
 
 
 def present_fields(state) -> tuple[str, ...]:
     """The names of ``state``'s array fields, in State order: every field except an optional
-    one that is None (``ICE_AVG_FIELDS`` when ``ice_ave_steps == 1``, ``SE_FIELDS`` on the CG path)."""
+    one that is None (``ICE_AVG_FIELDS`` when ``ice_ave_steps == 1``, ``SE_FIELDS`` on the CG path, ``BGC_FIELDS``
+    without REcoM)."""
     return tuple(f.name for f in dataclasses.fields(State) if getattr(state, f.name) is not None)
 
 

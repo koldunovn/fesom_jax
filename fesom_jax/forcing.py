@@ -297,7 +297,8 @@ def atm_ice_stress(u_air, v_air, u_ice, v_ice):
     return BULK_CD_ATM_ICE * mag * dux, BULK_CD_ATM_ICE * mag * dvy
 
 
-def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None, zbar3=None):
+def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None, zbar3=None, *,
+                      legacy_depth: bool = False):
     """Shortwave penetration — AD-safe port of ``fesom_cal_shortwave_rad``
     (``oce_shortwave_pene.F90``, ``fesom_bulk.c:362-415``). Returns
     ``(heat_flux_pene, sw_3d)``:
@@ -316,7 +317,14 @@ def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None, zb
     per-step forcing constant with no AD path. The only differentiable effect is the
     additive ``swsurf_W`` on ``heat_flux`` (a constant offset ⇒ ``d(heat_flux)/d(SST)``
     from the bulk is preserved). ``open_water`` (``ulevels<=1`` and ice-free; all-True on
-    CORE2) gates the penetration: no penetration under cavity or sea ice."""
+    CORE2) gates the penetration: no penetration under cavity or sea ice.
+
+    The attenuation depth is measured from the surface interface, ``z = zbar_3d_n[k] −
+    zbar_3d_n[nzmin]``, as FESOM2 since PR #1116 (4aab0efd, merged ba245401 2026-10-14;
+    ``oce_shortwave_pene.F90:88`` in e96a2b13): under zstar the surface interface sits at the
+    sea surface, not at 0, and an elevated SSH no longer amplifies the subsurface flux. At rest
+    and under linfs (surface interface at 0) this is the absolute depth. ``legacy_depth=True``
+    restores the pre-#1116 absolute ``zbar_3d_n[k]``; only for the gates whose dumps predate it."""
     nl = mesh.nl
     if open_water is None:
         open_water = mesh.ulevels_nod2D <= 1
@@ -339,11 +347,13 @@ def cal_shortwave_rad(mesh: Mesh, heat_flux, shortwave, chl, open_water=None, zb
     # per-interface attenuation aux[n, nz] = v1·e^{z/sc1} + v2·e^{z/sc2}, z≤0 (depth).
     # static zbar_3d_n or zstar live zbar3 (committed = st.hnode side; JZ.6).
     z = mesh.zbar_3d_n if zbar3 is None else zbar3            # (nod2D, nl)
+    nzmin = (mesh.ulevels_nod2D - 1)[:, None]
+    if not legacy_depth:                                      # #1116: below the surface interface
+        z = z - jnp.take_along_axis(z, nzmin, axis=1)
     aux = (v1[:, None] * jnp.exp(z / sc1[:, None])
            + v2[:, None] * jnp.exp(z / sc2[:, None]))
 
     k = jnp.arange(nl)[None, :]
-    nzmin = (mesh.ulevels_nod2D - 1)[:, None]
     nzmax = (mesh.nlevels_nod2D - 1)[:, None]
     is_surf = k == nzmin
     # Interior levels nz∈(nzmin, nzmax] walk down; the C breaks (and zeros) at the FIRST

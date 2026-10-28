@@ -1,0 +1,40 @@
+# CORE2 + full REcoM in double precision (plan docs/plans/20261025-recom-port.md, Tasks 13/15; lane W wrote it, Task 15
+# runs it). configs/core2_full.yaml's physics with FESOM2's l_mslp on (required by REcoM) and the bin_2p3z2d ecosystem.
+#
+# Inputs (read only, a colleague's directory; nothing is copied into the repository):
+#   recom.ic_dir       /work/ab0246/a270092/input/fesom2/recom: the 1-degree IC set of fesom_jax.recom.ic.CORE2_IC_FILES
+#                      (GLODAPv2 PI TCO2 + TAlk, WOA13 n00/i00, WOA18 o00, PISCES Fe), as bin_2p3z2d's namelist.tra
+#   forcing.dust_file  .../CORE2/DustClimMonthlyAlbani.nc, DustClim(12, 126858) on the CORE2 nodes, in
+#                      data/mesh_core2's node order (verified: lesson 2026-10-25, lane I).
+#   recom.namelist     the bin_2p3z2d namelist.recom of the pi reference (the same ecosystem; its nm_fe_data_file is
+#                      overridden by forcing.dust_file)
+# A BGC restart continues the BGC; a physics-only restart (e.g. the v3 1990 restart) starts the BGC from the IC.
+
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 1800.0
+mesh: data/mesh_core2
+partition: dist_4
+forcing:
+  kind: core2
+  start_year: 1958
+  mslp: true
+  dust_file: /work/ab0246/a270092/input/fesom2/recom/CORE2/DustClimMonthlyAlbani.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_jaxphys/namelist.recom
+  ic_set: core2
+  ic_dir: /work/ab0246/a270092/input/fesom2/recom
+
+output_dir: runs/core2_recom
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+duration: 1yr

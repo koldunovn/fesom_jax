@@ -39,7 +39,7 @@ if [ -e "$OUT/restart" ] || [ -e "$OUT/monthly" ] || [ -e "$OUT/restart_archive"
     echo "FATAL: $OUT already holds a run (restart/monthly/restart_archive); pick a new OUT"; exit 2
 fi
 cd "$WT" || exit 2
-export TMPDIR=/scratch/a/a270088/fesom_jax_dev_tmp
+export TMPDIR=${FJ_TMPDIR:-/scratch/${USER:0:1}/$USER/fesom_jax_dev_tmp}
 export CUDA_CACHE_PATH=$TMPDIR/nv_$(uname -m)
 mkdir -p "$TMPDIR" "$CUDA_CACHE_PATH" "$OUT"
 if [ -n "${JAX_COMPILATION_CACHE_DIR+x}" ]; then

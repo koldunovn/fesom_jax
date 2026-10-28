@@ -156,6 +156,8 @@ def test_gpu_mevp_wide_key(monkeypatch):
     cfg.validate()
     assert cfg.gpu_env() == {"FESOM_MEVP_WIDE": "8", "FESOM_HALO_COMPACT": "1"}
     assert RunConfig.from_dict({"gpu": {"mevp_wide": 0}}).gpu_env() == {}
+    # a string switch is passed through as written (it used to become "1")
+    assert RunConfig.from_dict({"gpu": {"bgc_layout": "loop"}}).gpu_env() == {"FESOM_BGC_LAYOUT": "loop"}
     assert RunConfig.from_dict({"gpu": {"ssh_ell": True}}).gpu_env() == {"FESOM_SSH_ELL": "1"}
     assert RunConfig.from_dict({"gpu": {"cg_batch": 4}}).gpu_env() == {"FESOM_CG_BATCH": "4"}
     assert RunConfig.from_dict({"gpu": {"step_unroll": 2}}).gpu_env() == {"FESOM_STEP_UNROLL": "2"}

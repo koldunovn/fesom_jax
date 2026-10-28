@@ -245,7 +245,8 @@ def init_ice_avg(state: State, cfg, *, xp=None) -> State:
 def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
                      dt: float, boundary_node=None, use_virt_salt: bool = True,
                      owned_mask=None, axis_name=None, exch=None, zbar3=None,
-                     params=None, mevp_wide=None, ice_update=None) -> IceStepOut:
+                     params=None, mevp_wide=None, ice_update=None,
+                     legacy_sw_depth: bool = False) -> IceStepOut:
     """One assembled ice step → the surface fluxes + the new ice state. ``sf`` is this step's
     :class:`surface_forcing.StepForcing` (atmosphere + month SSS/chl); ``fs`` the
     :class:`surface_forcing.ForcingStatic` (runoff/areas/open_water). ``boundary_node`` (the
@@ -516,7 +517,7 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     # --- shortwave penetration (open-water-only gate on the prognostic a_ice) ---
     pene_open = open_water & (a_out <= 0.0)
     heat_flux, sw_3d = _forcing.cal_shortwave_rad(
-        mesh, icef.heat_flux, sf.shortwave, sf.chl, pene_open, zbar3=zbar3)
+        mesh, icef.heat_flux, sf.shortwave, sf.chl, pene_open, zbar3=zbar3, legacy_depth=legacy_sw_depth)
 
     # --- surface BCs (fesom_tracer_diff.c:43-75 / bc_surface). bc_T's base; the zstar
     #     −dt·sval·water_flux·is_nonlinfs term needs the POST-ADVECTION surface T (the C's

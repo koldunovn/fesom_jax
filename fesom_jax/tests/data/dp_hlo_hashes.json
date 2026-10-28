@@ -1,24 +1,24 @@
 {
- "commit": "1a45534fa03062eaf8b8398b03b06e21dea15747",
+ "commit": "7e4dd4c3d813c7424c5c2c78928dbf6bd2899a5d",
  "jax": "0.10.1",
  "programs": {
   "fwd_core2_full": {
-   "sha256": "344023b4c1d2b3d4119543ee59c018bef3c5997eb7c0b8a726194f06b0deeaa0",
+   "sha256": "2fa27c64f6072f9332a18e3e87a14b6e2cdca1afaabf5db623fe2ace635a2579",
    "f32_types": 0,
-   "f64_types": 40760,
-   "chars": 3421000
+   "f64_types": 40770,
+   "chars": 3421599
   },
   "fwd_core2_gpu": {
-   "sha256": "89b35ed7c0fcf3184c802d5f88d62e0cd4f3cedffb81fd955e3d87587bc1a22b",
+   "sha256": "a2055ce8a8d2345bd7aa06dfd4d0da137f885ab3f45f275866e4858e384618f1",
    "f32_types": 0,
-   "f64_types": 77396,
-   "chars": 5475702
+   "f64_types": 77406,
+   "chars": 5476297
   },
   "adj_core2": {
-   "sha256": "7c10df37712113b623dffd9a806063390c5c4780ae393ad8956e33ef0a11f5f1",
+   "sha256": "4d7b2c166d801b7be39e87af2c612dfdbd1f9c60c9a2fc68d1b6d47f0585c217",
    "f32_types": 0,
-   "f64_types": 70032,
-   "chars": 1148669189
+   "f64_types": 70052,
+   "chars": 1148670660
   }
  }
 }

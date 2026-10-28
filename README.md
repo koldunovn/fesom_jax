@@ -37,6 +37,9 @@ sea-ice EVP scan).
 - **Competitive**: within a few-to-~16 % of Kokkos-CUDA in SYPD across the mesh ladder
   (see `docs/figures/jax_vs_kokkos_sypd.png`).
 - **Gather-free output**: each GPU writes its own shard to Zarr in parallel — no rank-0 gather.
+- **Biogeochemistry**: FESOM2's REcoM (`bin_2p3z2d`, 31 tracers) runs inside the same step, matched against a
+  FESOM2-REcoM Fortran twin on pi; CORE2 + REcoM runs at 123 SYPD in double precision (227 in single) on 4 GH200 — see
+  [Biogeochemistry (REcoM)](#biogeochemistry-recom).
 
 ---
 
@@ -318,6 +321,101 @@ recipes in **[docs/PARALLELISM.md](docs/PARALLELISM.md)**:
 | **Any sharded run on CPU** (no GPU, laptop, CI, gates) | **`use_padded`**, ≤16 in-process devices — or the multi-process gloo launch (`JDIST_CPU=1`, best: 8 procs × 16 cores/node) | ragged doesn't exist on XLA:CPU, and all_gather **crashes** at ≥32 in-process CPU devices; padded runs everywhere |
 | **CPU across nodes** | **`use_coloured`** (superseded the old "don't") | the 2026-07-13 "CPU is single-node" verdict was about the *transport*, not the backend: padded's dense all-to-all is ruinous on TCP. Coloured is 2.9× faster than padded at CORE2 2 nodes and 11.8× at 16 ranks/node, and **dars scales 8→16 nodes at ~95 % efficiency**. Caveats: absolute throughput is low (dars 16 nodes = 0.057 SYPD), a gloo collective-permute defect kills certain (mesh, npes) pairs, and NG5-on-CPU is unreachable on Levante (per-rank host memory) |
 | **CPU production throughput** | ❌ wrong tool | best JAX-CPU ≈ 3.3 SYPD/node at CORE2 vs Fortran's ~22 — use GPUs (JAX ≈ Kokkos there) or Fortran |
+
+---
+
+## Biogeochemistry (REcoM)
+
+FESOM2's biogeochemistry REcoM (the `src/recom` submodule at 692f804) in its `bin_2p3z2d` configuration: two
+phytoplankton groups (nanophytoplankton, diatoms), three zooplankton groups, two detritus classes, iron, silicate,
+calcite and oxygen, 31 tracers plus four benthic pools, with mocsy carbonate chemistry and a constant atmospheric CO2.
+It runs on the forced (JRA55-do) zstar path, in the order of FESOM2's step: REcoM's sources and sinks after the ice
+step, then the BGC tracers in the tracer loop with T and S. The port and its decisions are in
+[`docs/plans/20261025-recom-port.md`](docs/plans/20261025-recom-port.md); the numbers in
+[`docs/recom/VALIDATION.md`](docs/recom/VALIDATION.md).
+
+**Running it on Levante** (for colleagues: code, inputs, the 2000–2019 job, common changes, output):
+[`docs/recom/RUNNING.md`](docs/recom/RUNNING.md).
+
+**Switching it on**: a `recom:` block in the run YAML, plus two forcing keys.
+
+```yaml
+recom:
+  namelist: scripts/recom/fortran/namelists_jaxphys/namelist.recom   # REcoM's switches and parameters
+  ic_set: core2                 # cold-start IC files: "pi" (5-degree) or "core2" (1-degree)
+  ic_dir: /path/to/recom/inputs # FESOM's ClimateDataPath for those files
+  bgc_every: 1                  # 1 = FESOM2 (see below)
+  output: [DIC, Alk, DIN, DSi, DFe, O2, Chl, co2flux, pco2surf, npp, export100]   # into the mean-output streams
+forcing:
+  mslp: true                    # FESOM2's l_mslp, required: REcoM's CO2/O2 solubility reads the sea-level pressure
+  dust_file: /path/to/DustClimMonthlyAlbani.nc   # monthly dust on this mesh, in the mesh's node order
+```
+
+`forcing.mslp` also adds the sea-level-pressure gradient to the momentum equation, as FESOM2 does. The inputs are
+not in the repository: the pi set is FESOM2's `test/input/recom`, the CORE2 set the 1-degree files listed in
+[`configs/core2_recom.yaml`](configs/core2_recom.yaml). A restart with BGC fields continues the BGC; a physics-only
+restart starts it from the IC files.
+
+| config | what |
+|---|---|
+| [`configs/pi_recom_bgc.yaml`](configs/pi_recom_bgc.yaml) | pi, 30 days, CPU; the setup of the Fortran twin |
+| [`configs/core2_recom.yaml`](configs/core2_recom.yaml) | CORE2 with `core2_full.yaml`'s physics, double precision |
+| [`configs/core2_gpu_recom.yaml`](configs/core2_gpu_recom.yaml) | CORE2 on the fast 4-GPU stack, double precision |
+| [`configs/core2_gpu_recom_v3_1990.yaml`](configs/core2_gpu_recom_v3_1990.yaml) | the same for a run from the dt-1800 v3 restart (`dt_ramp` to 2700 s) |
+
+```bash
+# pi, cold start of physics and BGC, 30 days on one CPU device
+python scripts/run_from_config.py configs/pi_recom_bgc.yaml --restart-out runs/pi_recom/seg0
+# CORE2 on 4 GPUs from a physics restart, one year with monthly means (BGC fields included)
+python scripts/run_from_config.py configs/core2_gpu_recom_v3_1990.yaml --restart-in <restart> --steps 11680 \
+    --restart-out <run>/restart --monthly-out <run>/monthly
+```
+
+**Speed** (CORE2, 4 GH200, dt 2700 s; [`docs/PERFORMANCE_CORE2_GPU.md`](docs/PERFORMANCE_CORE2_GPU.md)):
+
+| | ms/step | SYPD |
+|---|---|---|
+| without REcoM (single precision, the fast stack) | 7.4 | ~1000 (897 in a 10-year production job) |
+| full REcoM, double precision (the default) | 60.1 | 123 |
+| full REcoM, single precision (opt-in) | 32.6 | 227 |
+
+The REcoM rows are the timed step (2026-10-27, job 28473598). One year in the production loop with monthly output
+was measured before the memory-layout fixes only (120 / 76.6 ms a step then): 51.5 / 72.3 SYPD.
+
+Across nodes the halo exchanges decide. On 4 nodes of 4 A100 (16 GPUs) they took half of the double-precision step
+with the padded exchange (47.5 ms, 156 SYPD). The grouped exchange (`gpu.halo_transport: grouped`, from fesom3-jax:
+every neighbour's real halo rows in one NCCL group per exchange, the same values bit for bit) takes it to 33.3 ms
+(222 SYPD); in single precision grouping only the BGC stack's exchanges (`gpu.bgc_halo: grouped`) is fastest, 28.7 ms
+(258 SYPD) against 32.9 padded (jobs 28489084, 28487014). On one GH200 node padded stays the double-precision setting
+(grouped +2.8 %, job 28490129).
+
+The REcoM step is bound by the transport of the 31 tracers (advection, GM/Redi and the ordered sums take about
+three quarters of its kernel time), not by REcoM's own sources and sinks.
+
+**How it was checked** ([`docs/recom/VALIDATION.md`](docs/recom/VALIDATION.md)): on pi against a FESOM2-REcoM run with
+the same physics, one step agrees to <= 1.8e-8 (relative, every BGC tracer, below the 4.1e-8 of temperature); over 30
+days the global inventories of DIC, Alk, DIN, DSi, DFe and O2 stay within 1.1e-9 of the Fortran run on every day, the
+air-sea CO2 flux within 1.9e-5 and NPP within 5e-6; every tracer's budget closes to <= 7e-15; the gradient of a
+one-day NPP cost matches finite differences to 7e-7 ... 5e-5; sharded runs equal the single-device run to round-off.
+On CORE2 there is no Fortran run to compare with; one year from the 1990 restart gives an ocean CO2 uptake of
+2.03 Pg C/yr (at 278 uatm), NPP 47.3 Pg C/yr and a POC export at 100 m of 5.63 Pg C/yr.
+
+**Options that deviate from FESOM2** (both off by default):
+
+- `precision: single` (or `--precision single`): the BGC tracers in FESOM2 #1207's single-precision tracer scheme,
+  REcoM's own code in float64. FESOM2 refuses single precision with REcoM, so this mode has no Fortran counterpart;
+  after a CORE2 year its annual CO2 uptake, NPP and export equal the double-precision run's to three digits, while
+  plankton fields differ pointwise by 1-6 % (the single-precision physics' own divergence carried into the biology).
+  For spin-ups, ensembles and sensitivity runs; double precision stays the production mode.
+- `recom.bgc_every: k` with k > 1: the BGC tracers step once every k physics steps on the k-step mean transport. The
+  inventories hold (to 2e-5 after a month), but the biology does not: at k = 4 NPP is 8 % and export 14 % low after one month. A
+  transport shortcut, not a faithful mode; not allowed with single precision.
+
+**Not ported** (each raises `NotImplementedError` naming what is missing; every REcoM switch and its reason is in
+`SUPPORTED` of [`fesom_jax/recom/params.py`](fesom_jax/recom/params.py)): ciso, atbox, coccolithophores and
+Phaeocystis, rivers and erosion, aeolian nitrogen, the MEDUSA sediments, an atmospheric CO2 time series
+(`constant_CO2 = .false.`), a run without alkalinity restoring, BGC sub-stepping (`biostep` > 1), and REcoM under linfs
+or with ice-shelf cavities.
 
 ---
 
@@ -648,6 +746,8 @@ above; these are the constraints on the *gradient* modes):
 | [`docs/JAX_RAGGED_A2A_BUG.md`](docs/JAX_RAGGED_A2A_BUG.md) | the ragged AD bug: record, repro, workaround |
 | [`docs/MESH_EXPORT_LAYOUT.md`](docs/MESH_EXPORT_LAYOUT.md) | the dense mesh `.npy` bundle format |
 | [`docs/PORTING_LESSONS.md`](docs/PORTING_LESSONS.md) | per-task gotchas & hard-won facts (AD seams, sharding, fidelity) |
+| [`docs/recom/VALIDATION.md`](docs/recom/VALIDATION.md) | REcoM: the gates against the Fortran twin, the CORE2 year, the `bgc_every` and single-precision checks |
+| [`docs/recom/FORTRAN_REFERENCE.md`](docs/recom/FORTRAN_REFERENCE.md) | REcoM: how the FESOM2-REcoM Fortran reference was built, run and instrumented |
 | [`docs/plans/20260605-fesom-jax-port.md`](docs/plans/20260605-fesom-jax-port.md) | roadmap + locked design decisions (source of truth) |
 | [`docs/plans/20260608-fesom-jax-phase8b-scaling.md`](docs/plans/20260608-fesom-jax-phase8b-scaling.md) | multi-GPU/multi-node scaling phase (the scaling work above) |
 

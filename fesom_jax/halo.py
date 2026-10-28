@@ -41,6 +41,8 @@ import numpy as np
 from jax import lax
 from jax.sharding import Mesh, PartitionSpec
 
+from . import halo_grouped
+
 DEFAULT_AXIS = "p"
 
 
@@ -85,6 +87,9 @@ class HaloCtx:
     se_wide: object = None      # se_wide.SeWide ⇒ the split-explicit substeps run K per exchange on
     #                             K+1-ring lanes (opt-in gpu.se_wide / FESOM_SE_WIDE); None ⇒ two
     #                             exchanges per substep
+    bulk_maps: dict = None      # {kind: coloured maps} ⇒ :meth:`exchange_bulk` (the BGC stack) runs the grouped
+    #                             transport (opt-in gpu.bgc_halo: grouped, halo_grouped.bulk); None ⇒ exchange
+    bulk_meta: dict = None      # {kind: (perms, slots, offs, sendn)} STATIC, as col_meta
 
     def exchange(self, field, kind: str):
         """Broadcast-refresh ``field``'s halo lanes from their owners (a no-op on
@@ -97,6 +102,19 @@ class HaloCtx:
         if mode == "both":
             field = lax.optimization_barrier(field)
         out = self._transport(field, kind)
+        return out if mode == "off" else lax.optimization_barrier(out)
+
+    def exchange_bulk(self, field, kind: str):
+        """The BGC stack's halo refresh: the grouped transport on the coloured maps when ``bulk_maps`` are set up
+        (``gpu.bgc_halo: grouped``), else :meth:`exchange`. The same values either way. Its exchanges carry 31
+        tracers a call (bound by their bytes, where the grouped transport sends only the pairs' real rows); the rest
+        of the step's (bound by their latency) stay with the run's transport."""
+        if self.bulk_maps is None:
+            return self.exchange(field, kind)
+        mode = halo_barrier_mode()
+        if mode == "both":
+            field = lax.optimization_barrier(field)
+        out = halo_exchange_coloured(field, self.bulk_maps[kind], self.bulk_meta[kind], self.axis_name, grouped=True)
         return out if mode == "off" else lax.optimization_barrier(out)
 
     def _transport(self, field, kind: str):
@@ -180,8 +198,18 @@ def halo_exchange(field, src_dev, src_lane, axis_name: str = DEFAULT_AXIS):
     pad lanes unchanged). Handles ``[Lmax]``, ``[Lmax, nl]``, ``[Lmax, nl, 2]`` —
     the gather indexes the leading two axes, trailing axes ride along.
     """
+    if halo_none():
+        return field
     gathered = lax.all_gather(field, axis_name, axis=0, tiled=False)  # [P, Lmax, *rest]
     return gathered[src_dev, src_lane]
+
+
+def halo_none() -> bool:
+    """``FESOM_HALO_NONE=1`` (read at trace time; TIMING ONLY, the results are wrong): every halo exchange returns
+    its field unchanged and the wide-halo gathers read the device's own lanes, so a timed step has no halo
+    collective at all (the global sums stay). The step's exchange cost is then its time minus this one (fesom3_jax's
+    ``--halo none`` measurement, docs/PERFORMANCE.md there)."""
+    return os.environ.get("FESOM_HALO_NONE", "0").strip() not in ("", "0")
 
 
 def halo_compact_enabled() -> bool:
@@ -225,6 +253,8 @@ def halo_exchange_compact_scatter(field, send, upd, src, axis_name: str = DEFAUL
     """:func:`halo_exchange_compact` with the receive written only into the lanes that change (halo lanes
     from their gathered slot, pad lanes from lane 0): ``field.at[upd].set(...)``, which XLA can do in place,
     instead of a full elementwise pass over the field. The same value on every lane."""
+    if halo_none():
+        return field
     sent = lax.all_gather(field[send], axis_name, axis=0, tiled=True)    # [P*S, *rest]
     ext = jnp.concatenate([sent, field[0:1]], axis=0)
     return field.at[upd].set(ext[jnp.where(src < 0, sent.shape[0], src)])
@@ -276,6 +306,8 @@ def halo_exchange_compact(field, send, read, axis_name: str = DEFAULT_AXIS):
     on every lane; every step is linear with a registered transpose. (It used to be one gather out of
     ``concatenate([field, gathered])``: a full copy of the field per exchange, ~4 ms a CORE2 step on
     4 GH200, job 28291187.)"""
+    if halo_none():
+        return field
     sent = lax.all_gather(field[send], axis_name, axis=0, tiled=True)    # [P*S, *rest]
     L = field.shape[0]
     halo = read >= L
@@ -300,6 +332,8 @@ def halo_exchange_ragged(field, r: dict, recv_max: int, axis_name: str = DEFAULT
     ``halo_mask``. All three steps (gather / ``ragged_all_to_all`` / gather-back +
     masked select) are linear in ``field`` with registered transposes ⇒ the reverse
     pass scatter-adds each halo cotangent back to its owner (the AD gate's oracle)."""
+    if halo_none():
+        return field
     rest = field.shape[1:]
     operand = field[r["send_idx"]]                                   # [send_max, *rest]
     output = jnp.zeros((recv_max,) + rest, dtype=field.dtype)        # [recv_max, *rest]
@@ -332,6 +366,8 @@ def halo_exchange_padded(field, r: dict, axis_name: str = DEFAULT_AXIS):
     device d sent me and ``pad_slotpos`` reads each halo lane straight out of it.
     Returns the refreshed ``[Lmax, *rest]`` (halo lanes overwritten by their owner's
     value; interior + pad lanes untouched — the same contract as the other two)."""
+    if halo_none():
+        return field
     rest = field.shape[1:]
     buf = field[r["pad_src"]]                                        # [P*slot, *rest]
     vmask = r["pad_valid"].reshape(r["pad_valid"].shape + (1,) * len(rest))
@@ -342,7 +378,7 @@ def halo_exchange_padded(field, r: dict, axis_name: str = DEFAULT_AXIS):
     return jnp.where(mask, gathered, field)
 
 
-def halo_exchange_coloured(field, c: dict, meta, axis_name: str = DEFAULT_AXIS):
+def halo_exchange_coloured(field, c: dict, meta, axis_name: str = DEFAULT_AXIS, grouped: bool | None = None):
     """One broadcast halo exchange via **coloured ``lax.ppermute`` rounds** (Phase 8d) — the
     AD-correct transport *without* the padded exchange's P-growing padding tax.
 
@@ -367,24 +403,34 @@ def halo_exchange_coloured(field, c: dict, meta, axis_name: str = DEFAULT_AXIS):
     duplicated gathers), static slice, ``ppermute`` (transposes to the inverse ``ppermute``),
     concatenate, gather-back, ``where``. Verified against the ``all_gather`` oracle, forward AND
     ``jax.grad``, in ``fesom_jax/tests/test_halo.py::test_coloured_*``."""
-    perms, slots, offs = meta
+    if halo_none():
+        return field
+    perms, slots, offs = meta[:3]
     if not perms:                       # no halo at all (npes==1) — the exchange is the identity
         return field
     rest = field.shape[1:]
     buf = field[c["send_idx"]]                                       # [total, *rest]
     vmask = c["send_valid"].reshape(c["send_valid"].shape + (1,) * len(rest))
     buf = jnp.where(vmask, buf, jnp.zeros_like(buf))
-    rounds = [lax.ppermute(buf[o: o + s], axis_name, perm=list(p))   # static o/s ⇒ static slice
-              for p, s, o in zip(perms, slots, offs)]
-    recv = jnp.concatenate(rounds, axis=0) if len(rounds) > 1 else rounds[0]   # [total, *rest]
+    if halo_grouped.enabled() if grouped is None else grouped:
+        # every round in ONE NCCL group, only the pairs' real rows (meta[3]: sendn); the same rows to the same places
+        recv = halo_grouped.exchange(buf, meta)
+    else:
+        rounds = [lax.ppermute(buf[o: o + s], axis_name, perm=list(p))   # static o/s ⇒ static slice
+                  for p, s, o in zip(perms, slots, offs)]
+        recv = jnp.concatenate(rounds, axis=0) if len(rounds) > 1 else rounds[0]   # [total, *rest]
     gathered = recv[c["colpos"]]                                     # [Lmax, *rest]
     mask = c["halo_mask"].reshape(c["halo_mask"].shape + (1,) * len(rest))
     return jnp.where(mask, gathered, field)
 
 
 def device_mesh(axis_name: str = DEFAULT_AXIS, devices=None) -> Mesh:
-    """A 1-D :class:`jax.sharding.Mesh` over all (or the given) devices."""
+    """A 1-D :class:`jax.sharding.Mesh` over all (or the given) devices. With ``FESOM_HALO_GROUPED=1`` it also sets up
+    the grouped transport's NCCL communicator over them (also for ``FESOM_BGC_HALO=grouped``; once per process; every
+    process builds the mesh at the same point)."""
     devs = np.asarray(jax.devices() if devices is None else devices)
+    if halo_grouped.wanted() and devs.size > 1:
+        halo_grouped.init(devs.ravel())
     return Mesh(devs, (axis_name,))
 
 
@@ -500,7 +546,8 @@ def run_halo_exchange_coloured(field_PL, cmap, hmask, jmesh: Mesh,
     sv = fold0(cmap.send_valid)
     cp = fold0(cmap.colpos).astype(jnp.int32)
     hm = fold0(hmask)
-    meta = (cmap.perms, cmap.slots, cmap.offs)          # static
+    meta = (cmap.perms, cmap.slots, cmap.offs,          # static; sendn for the grouped transport
+            halo_grouped.send_rows(cmap.send_valid, cmap.slots, cmap.offs))
     spec = PartitionSpec(axis_name)
 
     def f(fld, si, sv, cp, hm):

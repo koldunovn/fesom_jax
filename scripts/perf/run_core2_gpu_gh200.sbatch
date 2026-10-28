@@ -15,5 +15,5 @@
 #SBATCH -o /work/ab0995/a270088/fesom_jax_dev/runs/slurm/%x.%j.out
 set -u
 WT=${WT:?WT (the checkout) must be set}
-export ARM_ENV_SH=${ARM_ENV_SH:-/home/a/a270088/MIT/scripts/dolpung/env_dolpung.sh}
+export ARM_ENV_SH=${ARM_ENV_SH:-$WT/scripts/perf/env_dolpung.sh}
 exec bash "$WT/scripts/perf/run_core2_gpu.sbatch" "$@"

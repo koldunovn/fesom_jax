@@ -99,6 +99,9 @@ def test_partition_forcing_serial_noop(mesh):
     for sf in (_mk_step(mesh.nod2D), _mk_step(mesh.nod2D, n_steps=3)):
         sff = shard_mesh.partition_step_forcing(sf, p1)
         for name in StepForcing._fields:
+            if getattr(sf, name) is None:                          # optional field off (press_air)
+                assert getattr(sff, name) is None
+                continue
             dense = np.asarray(getattr(sf, name))
             got = np.asarray(getattr(sff, name))
             assert got.shape == (1,) + dense.shape

@@ -190,8 +190,8 @@ def test_pi_path_bit_identical(mesh):
 # --------------------------------------------------------------------------
 # cal_shortwave_rad vs a per-node loop reference
 # --------------------------------------------------------------------------
-def _ref_cal_shortwave(mesh, shortwave, chl, open_water):
-    z = np.asarray(mesh.zbar_3d_n)
+def _ref_cal_shortwave(mesh, shortwave, chl, open_water, z=None):
+    z = np.asarray(mesh.zbar_3d_n) if z is None else z
     ulev = np.asarray(mesh.ulevels_nod2D)
     nlev = np.asarray(mesh.nlevels_nod2D)
     N, nl = z.shape
@@ -235,6 +235,27 @@ def test_cal_shortwave_matches_reference(mesh):
     # heat_flux_pene with input heat_flux=0 == the visible-band increment
     assert np.max(np.abs(np.asarray(hf_pene) - heat_ref)) < 1e-12
     assert np.max(np.abs(np.asarray(sw_3d) - sw_ref)) < 1e-12
+
+
+def test_cal_shortwave_depth_from_surface(mesh):
+    """FESOM2 #1116 (4aab0efd, ``oce_shortwave_pene.F90:88``): the attenuation depth is measured from the surface
+    interface. Lifting every column's interfaces by its own sea-surface elevation (zstar) leaves the profile unchanged;
+    the pre-#1116 absolute depth (``legacy_depth=True``) changes it, as the absolute-depth loop reference does."""
+    N = int(mesh.nod2D)
+    rng = np.random.default_rng(23)
+    shortwave = 50.0 + 250.0 * rng.random(N)
+    chl = jnp.asarray(0.02 + 1.5 * rng.random(N))
+    open_water = np.asarray(mesh.ulevels_nod2D) <= 1
+    eta = 0.5 * rng.standard_normal(N)
+    z_lift = np.asarray(mesh.zbar_3d_n) + eta[:, None]
+    _, sw_rest = forcing.cal_shortwave_rad(mesh, jnp.zeros(N), jnp.asarray(shortwave), chl)
+    _, sw_lift = forcing.cal_shortwave_rad(mesh, jnp.zeros(N), jnp.asarray(shortwave), chl, zbar3=jnp.asarray(z_lift))
+    assert np.max(np.abs(np.asarray(sw_lift) - np.asarray(sw_rest))) < 1e-12 * np.max(np.asarray(sw_rest))
+    _, sw_old = forcing.cal_shortwave_rad(mesh, jnp.zeros(N), jnp.asarray(shortwave), chl, zbar3=jnp.asarray(z_lift),
+                                          legacy_depth=True)
+    _, sw_ref = _ref_cal_shortwave(mesh, shortwave, np.asarray(chl), open_water, z=z_lift)
+    assert np.max(np.abs(np.asarray(sw_old) - sw_ref)) < 1e-12
+    assert np.max(np.abs(np.asarray(sw_old) - np.asarray(sw_rest))) > 1e-2 * np.max(np.asarray(sw_rest))
 
 
 def test_cal_shortwave_heat_flux_additive(mesh):

@@ -9552,3 +9552,393 @@ transport cost whose answer lives in a delayed response; re-run the FD for each 
 (2) localize a long-window miss by shortening the window until it passes, then bisect the cuts at the shortest window
 that fails — the 90-d bisection cost 2 h where a two-year one costs 6; (3) the first stable cut set is not the right
 one: after the year is stable, try removing each cut again, because stability often came from one of them only.
+
+### 2026-10-25 (REcoM plan, Task 1) — a stack of salinity copies is the identity test of an added tracer stage
+
+REcoM's tracers go through the T/S tracer stage of `step()` with the same transport fields (`recom/transport.py`,
+`State.bgc` as `(nod2D, nl, ntr)`, optional like `SE_FIELDS`). Given the salinity surface BC, a stack of salinity
+copies must equal S after every step, which tests the whole stage at once: FCT with w_split and the GM bolus velocity,
+Redi + K33, implicit vertical diffusion under zstar, the halo refreshes. Forced pi, 3 steps of dt 2700, zstar + mEVP +
+TKE + GM: one tracer at a time (`loop`) is bitwise dense and on FESOM2's pi `dist_4`; the batched pass (`vmap`) is
+within 4 ulp dense and differs on 10 of 158400 values sharded, by at most 1.2e-15 relative (the batched edge sums run in
+another order). The physics with the stage on is bitwise the physics without it. Rules: (1) keep a one-at-a-time
+layout as the bitwise reference and test the batched one against it with a stated ulp bound; (2) the environment's
+editable install points at `~/port_jax`: a script run from another directory silently imports the main checkout, so
+set `PYTHONPATH=<worktree>` (pytest from the worktree root is fine); (3) on pi, `cold_start_state` falls back to the
+CORE2 IC cache (shape error in `seed_ice`), `mesh.Z` has `nl-1` entries while tracers have `nl`, and
+`synth_block_partition` gives halos too narrow for the zstar SSH operator: use a synthetic T/S and FESOM2's
+`/pool/.../MESHES_FESOM2.1/pi/dist_4`.
+
+### 2026-10-25 (REcoM port, Task 8 / lane M) — mocsy at round-off, and an iteration count decided by an exact zero
+
+`fesom_jax/recom/carbonate.py` ports the mocsy routines REcoM 692f804 calls (`vars_sprac` for the interior,
+`pistonvel` + `flxco2` + `o2flux` at the surface) with REcoM's options only, gated (G1) against a standalone driver
+(`scripts/recom/fortran/mocsy_driver.F90`) that links REcoM's own mocsy sources with REcoM's Intel flags, on a
+4324-point grid of ocean values plus edges. Every output matches to <= 1.9e-13 and the constants to <= 4.7e-13 (Kb:
+ln Kb is ~-20 assembled from terms of ~150), pH to 1e-13 absolute, p / rhoSW / kw660 bitwise. Three things were not
+obvious.
+(1) The pH-solver iteration counts disagree by one on ~4 % of points, in both directions, although the values agree.
+Near the root the residual of the alkalinity equation is pure round-off, and SolveSAPHE EXITs without counting when it
+is exactly 0.0; which code hits an exact zero is decided by the last ulp, and the extra step moves [H+] by round-off
+only. The driver cannot read the count from `vars_sprac` (it runs the solver three times, for pH and twice for the
+Revelle factor), so it repeats the solver set-up and calls `solve_at_general` itself, and checks that this replica's
+pH is bitwise the `vars_sprac` pH. (2) At REcoM's DIC floor (tiny*1e-3 = 2e-19 mol m-3) the species do not converge
+between the codes (7.7e-5): mocsy forms CO2* from `2*DIC - Ac`, with `Ac` an O(1e-3) alkalinity balance, so both codes
+return the round-off of that cancellation (CO2* ~1e3 x DIC). Gate those points loosely and say why, rather than chase
+them. (3) mocsy's Revelle factor is a centred difference with a 5e-5 relative DIC step, so it carries the solver
+round-off x2e4 (7.7e-11), and it divides by the pCO2 of the LAST perturbed solve, not the base one; REcoM computes and
+discards it, so it is opt-in (`betad=True`). Design: the solver is a fixed `n_iter` (default 50 = Fortran's cap, so
+the failure value h = -1 is reproduced too) fori_loop in which a point freezes once Fortran would EXIT, and the root's
+derivative is a custom JVP (implicit function theorem), so reverse mode stores no iterates; G1's worst count is 12.
+Rules: (1) for an iterative Fortran solver, gate the values and allow the count to differ by one where the stopping
+test can fire on an exactly-zero residual; (2) a gate on a difference of two outputs (air-sea flux, dpCO2) is relative
+to the cancelling terms, not to the difference itself; (3) jit vs eager in XLA is not bitwise for this code (1.3e-13),
+so a G1 comparison states which path it measured (here jit). The login node ran out of threads compiling it (XLA
+pthread_create failed, 1405 of 2048 user threads in use); pytest goes to a compute node.
+
+### 2026-10-25 (REcoM port, lane F) — the Fortran REcoM reference: read the switches, dump on one rank, check the dumps against themselves
+
+FESOM2 e96a2b13 + REcoM 692f804 built in DP with `RECOM_COUPLED=ON` (Intel 2022, FESOM2's own flags) and ran on pi
+from the `bin_2p3z2d` namelists with the 5-degree pi inputs and JRA55-do + `l_mslp`. Reference and dumps:
+`docs/recom/FORTRAN_REFERENCE.md`. What was worth knowing: (1) `bin_2p3z2d` is not the plan's physics as it
+stands: it sets 36 steps/day, `whichEVP 0` and no wsplit (overridden by the fixed choices), and its mixing is
+FESOM-native KPP with `opt_visc 5` (kept); the pi CI test initialises DIC from the PRESENT-DAY file against 278 ppm
+and outgasses 11 PgC/yr on day 1, while the preindustrial 5-degree DIC that `bin_2p3z2d` implies sits in the same
+input directory (2.1 PgC/yr uptake on day 1). (2) FESOM2 has no `dist_1` for pi; `fesom_meshpart` with
+`n_part = 1` writes one (identity `myList_nod2D`), so full-field dumps need no gather. (3) Reading the code for
+the hooks turned up three facts the port must mirror: `__usetp` is always on with REcoM, so the sinking benthos is
+buffered per tracer and added to `Benthos` only after the whole tracer loop, in tracer order; `GloHplus` / the
+`HPlus` restart field hold the surface pH, and `flxco2` takes `ph` as `intent(out)`, so it is no first guess and
+restarting it changes nothing; the SLP term divides `press_air` by 1000, not rho0. (4) A FESOM2 run split at a
+restart matches the unsplit run bitwise up to the restart and differs from the first day after it IN THE PHYSICS
+TOO (salt 3e-3 on day 16, T 0.36 degC by day 30), so the split pair tests restart semantics as a whole, not only
+REcoM's `mstep` reset. (5) The instrumentation is a no-op (30-day restarts and daily output bitwise equal with and
+without the env variable, and the 1-day run equal to the uninstrumented binary), and numpy rebuilds the T* update
+of every tracer bitwise from the dumped `values`, `del_ttf`, `dtr_bf`, `vert_sink`, `str_bf`, `hnode`,
+`hnode_new`, which shows the dump stages are labelled where they are taken. (6) One rank costs 2.3 s/step on pi
+(tracers 65 %, `recom()` 29 %): a 30-day run is 37 min and needs more than the 30-min debug QOS. Rules: (a) diff a
+borrowed namelist set against the plan's fixed physics switch by switch before the first run, and look in the
+input directory for the file the namelist actually means; (b) a dump hook is checked twice: bitwise no-op on
+the model, and the dumped stages recombined offline into the next dumped stage; (c) run the split-vs-unsplit
+comparison day by day, so a restart discontinuity shows at the restart day instead of as drift.
+
+### 2026-10-25 (REcoM plan, Task 2b) — BGC every k steps: test the mass, not the concentration
+
+The k-step mean transport (`recom.bgc_every`) sums each step's `uv·helem` (the FCT sees the velocity only through the
+edge volume flux, so the summed product IS the mean mass transport), `w`, `Kv` and the surface BC, and advects once
+with k·dt from the interval-start thickness to the new one. Three things the tests taught: (1) "a uniform tracer stays
+uniform" is FALSE under zstar for any scheme, the every-step one included (precipitation and runoff add water without
+tracer: 4.8e-3 after 4 pi steps at river mouths); test free-stream preservation under linfs (exactly 1.0 at k = 1 and
+2) and test the CONTENT under zstar (constant to 1e-12); (2) the decisive k > 1 check is an inventory identity —
+salinity copies with the salinity BC hold S's inventory to 1e-12 at every interval end although they differ from S
+pointwise (0.03 psu after two intervals); (3) a sharded-vs-dense test must be judged against the physics' own
+sharded-vs-dense difference of the same run (here 0.030 psu in S after 4 forced pi steps with w_split + mEVP + TKE +
+GM — itself a finding, not bitwise), not against round-off. Speed on 4 GH200, SP + 31 tracers: 156 / 276 / 430 SYPD at
+k = 1 / 2 / 4, i.e. 7.6 + 39.7/k ms/step; the lax.cond and the sums cost nothing visible.
+
+### 2026-10-25 (REcoM port, lane S, Tasks 6/9/10) — REcoM's sources and sinks at round-off on the first gate run
+
+`params.py` (every namelist REAL as a pytree NamedTuple, every switch in a frozen dataclass, a strict namelist
+reader, `NotImplementedError` outside `bin_2p3z2d`), `tracers.py`, `sms.py` (REcoM_sms + init + update),
+`forcing.py` and `stage1.py` (`recom_sources_sinks`, all of `recom()` as one pure function). Gate G2 from the 8
+dumped `recom_in` of lane F: every tracer, 3-D/2-D diagnostic, PAR, surface flux and cache field within 1.3e-13 of
+its field max (tracers <= 1.2e-14, benthos bitwise), and the carbonate refresh mask cell-for-cell equal to where
+Fortran's cache changed (101749 / 54986 / 51799 cells at steps 1 / 224 / 960, none elsewhere). What made it pass
+on the first run: (1) strip the comment-only lines of the Fortran before reading (`grep -v '^\s*!'`: recom_sms.F90
+shrinks from 4072 to 1253 lines, and every multi-line flux keeps its terms in order); (2) port only the switch set
+the reference runs and raise for the rest, so each `if (enable_coccos)`/`is_coccos` branch disappears instead of
+being half-ported; terms multiplied by `is_coccos = 0` add an exact zero and can be dropped, factors
+`is_3zoo2det = 1` too; (3) write every sum in Fortran's textual order and parenthesisation (Python's
+left-to-right `*` and `+` then reproduce ifort's association; e.g. `N_assim` and `N_assim_dia` associate
+differently, `grazmeso_tot` sums in two groups); (4) find the cross-layer couplings before vectorising: only the
+light (cumulative attenuation) and `calc_diss_ben`, a module variable the benthic decay reads AFTER the layer
+loop, i.e. the value of the bottom layer (`zF(Nn)`, the top of the last wet layer); (5) mirror quirks found on the
+way: REcoM's `pi = 3.14159265358979` in the solar declination, `mod(daynew, ndpyr)` (day 365 = day 0), the
+default `visc_ref_water = 0.d00158` and `depth_scaling1 = 0.d015` are ZERO in Fortran (mantissa `0.`), DiaN's cold
+start uses `Chl2N_max` not `_d`, `vertNNAd` uses `lossN` not `lossN_d`, REcoM overwrites FESOM's `kappa` (the von
+Karman constant of `oce_modules`) with the last light attenuation, harmless because no physics reads it (the bulk
+formulae use a local parameter). (6) At night every layer counts as LIT for the cache refresh (`PARave =
+max(tiny, ...) > 0.01 * SurfSR = 0`), which the dumps confirm (step 224 refreshes in all 3140 columns); the parent
+plan's "at night no layer refreshes" was wrong. Rules: (a) gate the refresh MASK, not only the values; a value
+gate misses cells refreshed to an unchanged value; (b) a dead or print-only Fortran switch (`UseFeDust`,
+`HetRespFlux_plus`, `Diags`) is accepted with a comment, not raised, or the reference namelist itself fails;
+(c) a jitted closure over numpy arrays reaches `.at[]` with a numpy array: convert inputs with `jnp.asarray`
+at the entry of a public stage function.
+
+### 2026-10-25 (REcoM port, lane P: Tasks 4b + 5) — l_mslp, and the physics floor of the pi pair
+
+`l_mslp` in fesom-jax: the JRA55-do `psl` is a ninth reader field (`JRA55Reader(mslp=True)`, `I_MSLP`), time- and
+mesh-interpolated like the other eight, into `StepForcing.press_air` [Pa]; `momentum.compute_vel_rhs(press_air=)`
+adds `press_air/1000` to the SSH pressure before the gradient, `pre = -(g·eta + p_air)`, as
+`oce_ale_vel_rhs.F90:208-224`; `forcing.mslp` in the run YAML, required when REcoM proper (not the passive-tracer
+mode) is on. Off, `press_air` is None, an empty pytree node: no leaf, and the DP lock (`test_dp_lock.py`) is
+unchanged. What was worth knowing: (1) a NamedTuple field defaulting to None is invisible to `jax.tree` but not to
+the loops that walk `_fields` with `np.asarray` (partition, fold, local scatter, the stackers in `surface_forcing`
+and `core2_adj`): each needed a None branch, and the spec tree must carry None where the data does. (2) GP: the
+JAX `press_air` is 1.5e-11..4.3e-11 relative off the Fortran dump (up to 4e-6 Pa) on every step past the first
+JRA55 record and 4e-16 on steps 1-2 (the clamped bracket before the first record, slope 0). The cause is the
+evaluation form, not the reader: FESOM2 e96a2b13 evaluates every field in the point-slope form
+`coef_b + (rdate - t0)·coef_a` in double precision too (#940), at `timenew - dt/2`, while fesom-jax's DP path keeps
+`rdate·coef_a + coef_b` at an absolute Julian day (~2.4e6, one ulp = 4.7e-10 d). The same bracket evaluated in
+FESOM2's form from the JAX reader's state matches to 3e-16..8e-16 (asserted). The other eight JRA fields carry the
+same few-1e-11 difference against this FESOM2 version; the SLP momentum term from Fortran's own pressure matches to
+3.4e-13. (3) The physics floor (JAX `configs/pi_recom.yaml` from the Fortran step-0 state, 1 step): forcing 1e-14,
+`press_air` 4e-16, a_ice 2.7e-7, uv 1.1e-6, w 1.8e-7, hnode 9e-12, Kv bitwise, but T 3.4e-3 degC (1.1e-4 rel) and
+S 1.4e-3 psu in the top four layers of cold, ice-covered high-latitude columns (6352 cells above 1e-6, 117 above
+1e-3); after step 2 a convective switch flips Kv by 0.1 m2/s and T reaches 0.1 degC. With Kv equal and the velocities
+at 1e-6, the step-1 tracer gap enters in the tracer step (advection or GM/Redi), not in the mixing; G4b must be judged
+against this floor, not at round-off. Rules: (a) when a FESOM2 field is read "like the others", check which form
+the pinned FESOM2 version evaluates it in; the reference may have moved since the port; (b) give an added optional
+pytree field a test that walks every `_fields` consumer with the field off and on; (c) measure the physics floor of a
+twin pair at step 1 per field in model order (forcing, ice, momentum, ALE, mixing, tracers) before using the pair to
+judge anything that rides on it.
+
+### 2026-10-25 (REcoM port, lane T, Task 11) — sinking and benthos at round-off; an out-of-bounds read decided by `nm`
+
+`fesom_jax/recom/sinking.py`: `recom_sinking.F90` (return flux, viscosity, particle density, ballast, DST3 sinking,
+benthos deposit) plus the TEOS-10 chain its `ballast` calls (`gsw_sa_from_sp` with the 91x45x45 SAAR table and the
+Baltic branch, `gsw_ct_from_pt`, `gsw_rho`), and `recom_tracer_loop_terms`, which runs the per-tracer sequence over
+the BGC stack in Fortran tracer order and calls stage 3's `finish` (T* + implicit diffusion) per group. Gate G3 from
+the per-tracer dump stages of all 8 dumped steps: every field within 1.7e-15 of its max on the first run (TOL 1e-12,
+nothing loose). What carried it: (1) rebuild the stack Fortran holds at each tracer's turn from the dumps
+(`tra_out` for the tracers before it, `tra_in` for it and those after, T/S from `tra_out`): the particle density
+reads the CURRENT detritus tracers, so the order dependence is gated tracer by tracer instead of guessed; (2) only
+the detritus speeds read that density, the two detritus classes read disjoint ones, so a value-identical schedule is
+one batch of 23 tracers plus four rounds of two (bitwise equal to the sequential loop with an oracle `finish`);
+(3) compare transcribed polynomials (`gsw_specvol`, `gsw_ct_from_pt`) to the Fortran text by normalising both
+strings, not by eye. Quirks mirrored: the benthos deposit uses its own speed (`VDet/VPhy/VDia + Vdet_a|zbar|`, so
+phytoplankton and diatoms deposit although `VPhy = VDia = 0` skips their water-column sinking; the chlorophylls lose
+`str_bf` into no pool); the ballasted detritus speed sits inside `allow_var_sinking`, `|w| > max` sets `w = +max`;
+FESOM's dumped `SinkingVel1/2` are never written (zero). The finding: mocsy's `gsw_saar` accepts the land flag 999
+of its integer `ndepth_ref` as a depth index and reads `p_ref(999)` past the 45-entry table (72 coastal pi nodes).
+`nm -S libfesom.so` places that address in a zero `.bss` I/O-message buffer, so the pressure cap is 0 and those
+columns take the surface SAAR at every depth; the dumped density scaling of exactly those columns matches with
+cap 0 and misses by > 1e-9 with any real cap (test `test_saar_out_of_bounds_quirk`). Rules: (a) when Fortran reads
+out of bounds, find what it reads (`nm`/`readelf` on the reference binary) and let the dumps decide, then name it
+as build-dependent undefined behaviour; (b) `jit` vs eager and two fusions of the same terms differ by an ulp on XLA
+CPU (a division by a constant, an FMA): bitwise tests only between programs of the same structure.
+
+### 2026-10-25 (REcoM port, lane I, Task 13 IC part) — REcoM's cold start bitwise, once the compiler's divisions are mirrored
+
+`fesom_jax/recom/ic.py` (`bgc_initial_state(mesh, ic_files, switches, params, *, ic_dir, geo_coord) -> BgcIC(bgc,
+bgc_old, alk_surf, benthos, hplus)`, `with_bgc_ic`) builds the cold-start state as FESOM2 `do_ic3d` + `oce_initial_state`
++ `recom_init` do; gated against the `recom_in` tracers, `tra_in.valuesold`, `Alk_surf`, `Benthos` and `GloHplus` of
+the pi step-1 dump: all 31 tracers on all `nl-1` levels BITWISE (74 tests). What it took: (1) read the init ORDER, not
+only the routines: `recom_init` runs after `ocean_setup`, whose `valuesold = values` copy precedes it, so FESOM2's AB2
+history at step 1 holds Fe in the file's unit (no x1e9, cap or floor) and ZERO for the constant-start tracers; and the
+constants are set on every level, below the bottom too (Fe below the bottom = `tiny`), which the dump confirms; (2) the
+reference binary's `-no-prec-div` changes the result at 1 ulp: with plain divisions 1e5 of 9e5 file-tracer cells
+differed (rel <= 2e-14). Trying the variants against the dump pinned it down: `geo/rad` and the bilinear `/denom` are
+reciprocal multiplies (divisor loop-invariant), except the LAST depth of an odd-length column (33-depth Fe file), which
+is a true division — the scalar remainder of the 2-wide SSE2 vector loop; `(d2-d1)/delta_d` and the extrapolation mean
+`val/cnt` stay true divisions. That is a property of the build, written down as such; (3) FESOM2's `rad` uses the full
+`pi`, while `fesom_jax.config.RAD` is the C port's truncated one (0.017453292519943278): use `math.pi/180` for anything
+mirrored from the Fortran; (4) the JAX meshes' `geo_coord_nod2D` (C export) differ from FESOM2's by ~1e-14 rad and keep
+lon in `[0, 2 pi)`; with them the interpolated fields move by <= 8e-13 relative, so the gate takes the dumped Fortran
+coordinates (`geo_coord=`) for bitwise and a second test bounds the mesh-coordinate version at 2e-12; (5) differences
+from the older C-ported `phc_ic`: per-node `Z_3d_n` from `init_ale` for the depth bracket, the `nc_depth` sign flip,
+the extrapolation runs only while the SURFACE layer has a hole and has no sweep cap. CORE2 smoke (1-degree set of
+bin_2p3z2d, 46 s on one node): finite, DIN 0.008-53, DIC 1083-2468, Alk 1103-2715, DSi 0.34-245, DFe tiny-5.7 (11904
+cells at the 0.3 vent cap), O2 1.8-461. The CORE2 Albani dust file is in our node order: annual log-dust differs by 0.027
+across mesh edges against 0.92 for random pairs, and by 0.13 when shifted by one node index; no 1000-node block is
+rough; the maximum is off Senegal. Rule: when a gate is a few ulp off everywhere and the algorithm is right, check the
+reference's compile flags before blaming the formula; enumerate the cheap variants against the dump.
+
+### 2026-10-25 (REcoM port, lane P part 2: Task 7) — REcoM's per-step inputs, and the clock FESOM2 reads at `call recom`
+
+`StepForcing.fe_dust` (the held Albani dust), `.daynew` and `.ndpyr` (int32 scalars), built by
+`surface_forcing.BgcForcing` through the host, local and on-device-tables paths, serial and sharded; None unless full
+REcoM is on. What was worth knowing: (1) FESOM2 calls `clock` before the forcing and `recom`, so REcoM sees the step
+END: `timenew = timenew + dt` and only `timenew > 86400` (strict) moves the day on, so the last step of a day ends at
+`timenew == 86400` of THAT day. JAX's `dates_for_steps` gives the step START; `recom_clock` converts, and the gate
+compares both `daynew` and the dump header's `timenew`. (2) The dust is a HOLD with a segment-dependent rule
+(`sbc_do_recom`): update on the last step of a month (to month + 1, so that step already sees the next month) or
+at `mstep == 1` (to the current month). A segment that starts on a month's last step therefore keeps the old month
+for the whole next month; a `dt` that never ends a step at 24:00 never switches after `mstep == 1`. The hold is a
+function of (date, segment start), and the object answers by replaying the rule from the last answered step, so
+the prefetch worker, a repeated stack and an out-of-order query give the same answer. (3) Scalars per step do not
+fit the node-partition helpers (`_node_axis` would also misread a `[T]` leaf whose length equals `nod2D`): name
+them (`STEP_SCALARS`) and replicate them; on the tables path they belong to the schedule, which is replicated
+already. (4) Every place that builds a spec tree by iterating `_fields` (here the folded-tables spec in
+`run_steps_sharded_forced`) must emit None where the data is None, or `jax.tree.map` refuses the prefix: the DP lock
+caught it, not the new tests. (5) Synthetic tests that fill every `StepForcing` field with node data need to know
+which fields are scalars. Rules: (a) read the clock at the call site, not at the step start, and gate both the day
+and the time of day; (b) a held input is a function of the run segment, so build its owner once per segment and make
+the answer independent of the query order; (c) run the program lock as part of every forcing-plumbing change.
+
+### 2026-10-25 (investigation D, branch physics/sharded-dense) — the sharded ice had no coast when the caller passed no coastal mask
+
+Symptom: on pi `dist_4` (4 host devices, forced 1958-01-01, dt 2700, zstar + w_split + mEVP + TKE + GM/Redi) the
+sharded forced run differed from the dense one by 0.03 psu in S after 4 steps. Per-field comparison on owned nodes and
+elements after every step (dense `step_jit` loop against `run_steps_sharded_forced` chained one step at a time): the
+FIRST step already differs, and only through the sea ice: sigma11/12/22 O(1) relative, u_ice 0.065 m/s (rel 0.53),
+then uv, eta, T, S downstream. Switching w_split, GM/Redi or TKE off, mEVP to EVP, or the halo transport to padded
+changes nothing (w_split is the identity on this cold start: cfl_z < 1). Cause: the runners take the partitioned GLOBAL
+coastal mask as `boundary_node_p=None` by default, and with None the ice step rebuilds it per device with
+`ice_evp.boundary_node_mask(local mesh)` (`ice_evp.py:270`, `ice_mevp.py:306`), i.e. `arange(edge2D_local) >=
+edge2D_in`. The local edge lanes are not global edge ids and a device holds fewer edges than `edge2D_in` (pi: at most
+2332 local lanes against 8531), so the local mask is EMPTY: none of the 455 coastal nodes had u_ice zeroed (EVP) or
+`bc_index` 0 (mEVP). Production was not affected: `run.py`, `adjoint_sharded.py` and the sharded ice tests partition
+the global mask themselves; the callers that did not were `tests/test_recom_transport.py` (the symptom) and
+`scripts/adjoint/sharded_grad_ab.py` (mEVP "rheology", so its sharded-vs-dense gradients had the same defect). Fix:
+`ShardedMesh.boundary_node` (the global mask partitioned by `build_sharded_mesh`, kept by export/load) and
+`integrate_sharded._coast_mask`, which the three runners use when no mask is passed with ice on, and which refuses a
+P > 1 sea-ice run that has neither. With it, every State field agrees to <= 2e-11 relative (Kv), S to 5e-13 psu after
+4 steps. DP lock unchanged (the production programs pass the mask explicitly). Tests:
+`test_sharded_physics_equals_dense` (pi, every field, every owned lane), `test_boundary_node_is_the_global_coast`
+(CORE2 dist_2/4, and that the local recompute is wrong). Rules: (a) a sharded default that silently recomputes a
+GLOBAL property from the local mesh is a bug even when every production caller overrides it — carry the global value in
+the sharded bundle or refuse; (b) bisect a sharded-vs-dense gap per field and per step on owned lanes before reading
+halo schedules: here the first-step field list (ice only, all ocean fields downstream) pointed at the ice BC in one run.
+
+### 2026-10-26 (REcoM port, lane W: Tasks 10/12/13/14 wiring) — the connected model matches its twin; the adjoint needed two 0*inf fixes the forward never showed
+
+Full REcoM is now in `step()` (`fesom_jax.recom.wiring.full_bgc_step`: stage 1 = FESOM2's `recom()`, stage 3 = the BGC
+part of the tracer loop) and in `run_from_config`. Against the physics-matched twin: one step (G4b) leaves every BGC
+tracer below the pair's own T error (<= 1.8e-8 against 4.1e-8); 30 days (G5) keep the daily DIC/Alk/DIN/DSi/DFe/O2
+inventories within 1.1e-9; the JAX budget closes to <= 7e-15 per tracer; sharded == dense to 4e-13. Lessons:
+(1) Stage 1 does not have to sit where Fortran calls it. Nothing in the physics reads a BGC tracer, so the step runs
+stage 1 next to stage 3 from the values it had at its Fortran position (T/S/hnode of the step start, a_ice after the
+ice step); that also lets `bgc_every = k` put both inside one `lax.cond`. (2) Per-run constants that need host work
+(SAAR interpolation, an element scatter) fit as optional fields of an existing partitioned bundle (`ForcingStatic`):
+partitioning, folding, placement and the placed-constants cache come for free, and a None field adds no leaf, so the
+REcoM-off program stays byte-identical. A bundle helper that `np.asarray`s every field must skip None first
+(`partition_forcing_static` turned None into an object array). (3) A forward-faithful masked expression is not
+reverse-safe: `where(wet, x / areasvol, 0)` with areasvol = 0 below the bottom, and `max(deg/10, deg*(1 - exp(a)))`
+with `a` = +1706 where N:C < NCmin (exp = inf, the max picks deg/10 as in Fortran), both gave `jax.grad` = nan
+through 0 * inf in the unselected branch. The NaN appeared only after one step (from a state the cold start never
+produced) and only under jit; `jax_debug_nans` and the eager re-run found nothing. What found it: evaluate the jaxpr of
+the gradient equation by equation on a two-column subset and report the first primitive whose output is non-finite
+while its inputs are finite (it named `exp` in `chlorophyll_degradation`). Fix by making the masked operand safe (a 1
+divisor on dry layers, the exponent capped at 700), which leaves every forward value unchanged. A real (not symbolic)
+zero cotangent is enough to trigger it: a diagnostic stacked next to the cost (`bgc_diag`) sends zeros through every
+path that feeds the other columns. Note: FESOM2 built with `-fpe0` would trap that exp overflow, so a Fortran run
+reaching such a cell would stop. (4) Comparing a split run with a continuous one bitwise needs the same chunking on
+both sides: a 3-step chunk and 2 + 1 chunks round differently by an ulp in T (different programs), unrelated to the
+restart. (5) A cold-start state makes some derivatives numerically zero (the mesozooplankton grazing rate after 30 days:
+dJ/dlog p = -14 against J = 2.7e17); FD then returns exactly 0, so the gate checks such a parameter as "both below
+1e-12 J", and the gradient test starts from a grown state. Rules: (a) gate the reverse pass separately from the forward,
+from a state the model actually reaches, and treat a nan gradient as a masked-branch singularity until proven otherwise;
+(b) for a gradient-only defect, bisect on the gradient jaxpr itself, not with debug_nans.
+
+### 2026-10-26 (REcoM port, Task 15 smoke) — the XLA:CPU all_gather rendezvous abort also hits 4 in-process devices on CORE2
+
+The first CORE2 + full REcoM run through `scripts/run_from_config.py` on 4 in-process CPU devices (`dist_4`) aborted in
+the final restart write: `np.asarray` of a sharded leaf (`zarr_output._write_state_global`) runs an all_gather, and
+XLA:CPU's rendezvous failed its `id < num_threads (4 vs. 4)` / `use_count == num_threads (5 vs. 4)` checks. The same run
+without REcoM died at the same line (segfault), and pi with full REcoM on `dist_4` ran (job 28425055), so the defect is
+the runtime's, not the port's: the `docs/PARALLELISM.md` all_gather bug, documented so far only at >= 32 devices, also
+fires at 4 when the leaves are CORE2-sized. The test captured `stdout[-4000:] + stderr[-4000:]` and showed one line:
+the abort's message goes to the C++ log, so rerun the command bare with `PYTHONFAULTHANDLER=1` to get the Python stack.
+`fesom_jax/tests/test_recom_core2.py` now runs CORE2 on one device (`--partition serial`, 3 steps, 4 min; volume means
+DIN 21.0, DIC 2201.5, Alk 2380.4, DSi 48.4, O2 219.3 mmol m-3). Rule: a multi-device CPU crash inside XLA's collective
+code is checked first with the feature off and on a smaller mesh before reading one's own changes.
+
+### 2026-10-26 (branch physics/ramp-midstep) — a dt ramp moved the calendar right but left the forcing's mid-step offset at the base dt
+
+Drift fix 2 evaluates the forcing at the middle of the step (FESOM2's `timenew - dt/2`) by adding
+`midstep_days = 0.5 * dt / 86400` to every step start, with the `dt` the forcing was built with. A run with a dt
+ramp (the CORE2 runs from the dt-1800 v3 restart: `dt: 1800` + `dt_ramp: {after_step: 561024, dt: 2700}`, the se10/sp10
+runs and the REcoM year) builds the forcing with the base dt, so after the switch every step read the forcing at start
++ 900 s instead of start + 1350 s: 450 s early. The calendar itself was right (`run._elapsed_seconds` is piecewise).
+Fix: `surface_forcing.set_midstep` gives the JRA reader the switch time and the post-switch offset, and
+`JRA55Reader._midstep` picks the offset by the step start; without a ramp it is the same number as before (DP lock
+unchanged). Test `test_forcing_ramp.py`: past the switch a ramped reader returns, bitwise, the fields of a reader
+built with dt 2700. The same oversight had stopped REcoM's dust hold (`BgcForcing`, fixed in 91b8210). Rule: every
+quantity derived from `dt` at setup time (offsets, grids, step counts) has to be checked against a mid-run dt change;
+grep the builders for `dt` when a ramp is added or used for the first time.
+
+### 2026-10-26 (REcoM port, lane SP) — float64 islands inside a float32 trace, and an SP-vs-DP step that cannot see the scheme
+
+Single precision with full REcoM (an opt-in deviation; FESOM2 refuses the build) keeps REcoM's own code in float64
+(REcoM's module sets `WP = 8`) inside the x64-off single-precision trace. Three things learned:
+
+1. **A nested `jax.enable_x64(True)` around the float64 code traces but does not lower.** The jaxpr built inside the
+   nested scope carries int64 index types (`jnp.select` -> `argmax`), and the whole program is lowered once in the
+   outer x64-off context, where the reduction's init value is canonicalised to int32: `TypeError: reduce operand dtypes
+   should match` (job 28437901). What works: stay in the one x64-off scope, widen every WP input at the island's
+   boundary (`PR.full`) and give REcoM's dtype-less constructors an explicit dtype. The promotion check of
+   `test_precision.py` (patching `dtypes.lattice_result_type`) found the two such sites in seconds (a `jnp.full` and
+   a `jnp.zeros` that were float32 in the x64-off trace; the `jnp.full` held `finfo(float64).max`, i.e. inf in
+   float32). Both edits are dtype-identical in double precision (`scripts/recom/dp_hash_recom.py`: equal StableHLO).
+2. **`jnp.log10` fails on a float64 argument in an x64-off trace** (JAX 0.10.1): it multiplies by a numpy float64
+   constant that `lax.mul` narrows to float32, then refuses the dtype pair. `precision.log10` is `jnp.log10` in double
+   precision and the same product with the constant in the argument's dtype in single precision. Expect the same of
+   any jnp function that builds a numpy constant from `finfo(x.dtype)` and calls `lax` directly.
+3. **An SP-vs-DP model step is not a test of an SP scheme.** One pi step from the twin's state: T differs by 7.7e-3 of
+   its max (1.2e-3 rms) between SP and DP, but only by 7e-6 when DP starts from the float32-rounded state. The
+   difference is the physics' own SP path, not the BGC tracers (which do not feed back): with `l_mslp` off the numbers
+   are the same, and the first-step `Kv` (TKE spun up from zero) differs by ~36 % rms (not traced further: the physics
+   SP is the accepted #1207 port). Every BGC tracer's SP - DP (DIN 4e-2) sits on top of that. The scheme was tested by
+   feeding stage 3 the same transport fields (the G4a dumps) in SP and DP: <= 2.5e-7 of each tracer's max, a few f32
+   ulps. Rule: test a reduced-precision scheme with its inputs held fixed, and keep the step-level pair only as a
+   "same order as the physics" check; and measure the float32 envelope (DP from the float32-rounded state) before
+   calling any SP - DP difference a floor.
+
+### 2026-10-26 (REcoM plan, Task 15) — every-k BGC conserves the mass and still gets the biology wrong: measure the rates
+
+Task 2b's lesson was to test the mass. On CORE2 the mass test passes and the biology fails: one January 1990 at
+`bgc_every = 4` against k = 1 on the same code (k = 1 twice as the floor) holds the inventories to <= 2e-5 and leaves the
+physics at the floor, but NPP is -8.1 %, the CO2 flux -6.0 %, the 100 m export -14.4 % and Chl -5.5 % (end state PhyC
+-9 %, DetC -13.5 %). The transport identities and budgets test what the k-step mean transport does, not what one
+3-hour source/sink step does to a nonlinear ecosystem; which of the two (the long source/sink step, or one step's light
+standing for the interval) causes the error is not separated. Rule: a time-stepping shortcut for a nonlinear source
+term is judged on the rates it produces (NPP, fluxes, export) against the run-to-run floor, over at least a month, not
+on conservation. `RecomConfig.bgc_every` says so; production is k = 1.
+
+### 2026-10-26 (branch perf/recom-2node) — CORE2 on two GH200 nodes: the heavy REcoM step scales, the light physics step does not; and srun eats a `while read` loop's input
+
+`gpu_profile.py time` now runs one process per node (`JDIST=1` under `srun`; run_from_config's import initialises
+`jax.distributed`, so the harness loads it before any jax call), and `scripts/perf/time_2node_gh200.sbatch` times
+variants on `dist_8` in one allocation (the async output/restart writers off: single-process only). Job 28446572: the
+physics-only fast stack 7.36 ms/step on 8 GH200 against 7.39 on 4 (coloured 7.95), full REcoM DP 67.1 against 120.1
+(1.79x, 110 SYPD) and SP 43.1 against 76.6 (1.78x, 172 SYPD). The REcoM step is ~16x heavier per step with about the
+same number of exchanges, so the exchanges' cost across the nodes hides in it; the 7.4 ms physics step is all
+exchange latency at two nodes. fesom3_jax's CORE2 gains +26 % on two JUPITER nodes from a grouped NCCL exchange (one
+FFI call per exchange, real rows only) plus joined exchanges, after its plain all_to_all gave +16 %
+(fesom3_jax docs/PERFORMANCE.md, JUPITER). The first try (28446432) timed only its first variant: `srun` inside
+`while read ... done <<< "$VARIANTS"` read the rest of the list from stdin. Rule: give every `srun` in a read loop
+`< /dev/null`.
+
+### 2026-10-26 (branches perf/recom-opt, perf/recom-opt2) — the 31-tracer stack was strided in memory; a logical axis move does not change that, a layout constraint does
+
+CORE2 + full REcoM on 4 GH200 ran 120 ms a step in DP (76.6 in SP) against 7.4 for the physics alone. FESOM2 does the
+same work per tracer, so the gap was ours. Three causes, found by comparing the passive-tracer profile (job 28417424)
+with the full one (28430158) kernel by kernel and then with Nsight Compute on ONE GPU (`scripts/perf/ncu_gh200.sbatch`;
+on four the NCCL kernel replay hangs, job 28455372): (1) the BGC stack is entity-leading `[nod, nl, 31]` in the State,
+the vmapped transport works tracer-major, and in full mode XLA kept the node fields tracer-minor, so every gather of
+the advection, Redi, limiter and ordered sums read one tracer's levels at a stride of 31 (8 useful bytes per 32-byte
+sector): the HO-LO edge flux alone moved 247 GB a step on one GPU, ~55x its output; (2) REcoM's tracer-loop terms wrote
+each finished group back into the full stack, ten full-stack copies a step; (3) the FCT limiter's node clusters used
+atomic float64 `segment_max`/`segment_min` (FESOM2 loops over `nod_in_elem2D`). Fixes: per-slot columns, a gather chain
+over `inv_elem_nodes` (`ops.segment_extreme`, exact), and the stack moved to `[31, entity, level]` and held so by
+`jax.experimental.layout.with_layout_constraint(x, Layout(major_to_minor=(0, 1, 2)))`. What did NOT work: `jnp.moveaxis`
+alone (XLA made it a bitcast and fused the move into each gather, job 28455642) and `moveaxis` behind
+`lax.optimization_barrier` (layout `{0,2,1}`, the same bytes, job 28457487). Result: DP 119.8 -> 66 ms, SP 76.6 -> 39.5
+ms (187 SYPD; 5.3x the physics step). Rules: (a) read the physical layout (`{...}` in the optimized HLO) of a gather's
+operand before blaming the algorithm; (b) a logical transpose is free for XLA and therefore does nothing; force the
+copy with a layout constraint; (c) profile bytes per kernel on one GPU with ncu: the ratio of bytes to output size
+finds strided and recomputing fusions at once.
+
+### 2026-10-27 (branch perf/recom-opt3) — a layout constraint at a jit's output leaks its layout, and the next jit reads the buffer as row-major
+
+After the tracer-major transport (above) the 19 ms a step of tracer-major copies were 17 ms of ONE fusion: the T* input
+of REcoM's 23 non-detritus tracers, which gathered them from the tracer-minor copy of the stage-1 stack (XLA kept that
+stack in both layouts) at 0.68 TB/s (ncu, job 28457954). The fix holds the stage-1 stack, each group's T* input and
+stage 1's input tracer-major with `with_layout_constraint(x, Layout(major_to_minor=(2, 0, 1)))` on the entity-leading
+array (`transport.hold_major`); DP 65.4 -> 62.4 ms on 4 GH200, the copy gone (jobs 28470553/54). The first version
+also held the step's OUTPUTS (the new `State.bgc` and the SP carry), and the CPU tests failed with O(1) errors
+(`test_sharded_equals_dense`, `test_budget_closed`, NaN SP budgets). Cause (JAX 0.10.1, reproduced on tiny arrays): a
+constraint that is itself the jit's output sets the output's layout; `y.format` reports it and `np.asarray(y)` is
+right, but a second jit reads `y` as row-major, silently: the tracers come back permuted. A constraint on an input or an
+intermediate (`hold(a) * 2`, `where(w, hold(a), s)`, a scan body) leaves the output row-major. My first sanity check
+compared sums, which a permutation does not change. Rules: (a) a layout constraint goes on inputs and intermediates,
+never on a value a jit returns; (b) check a layout change element by element THROUGH A SECOND JIT, never by sums; (c)
+run the sharded and budget tests before any GPU timing of a layout change: they caught it in eight minutes.
+The same constraint on stage 1's result stack did nothing (DP 62.36 against 62.34, job 28471929): XLA lowers it to a
+copy, the one place a layout may change, so it never reaches the producer, and the stack was still built tracer-minor
+(14 ms on one GPU at 0.42 TB/s: the 31 tracers' expressions alternate within every warp) and copied after. A small
+one-GPU reproduction did not reproduce it (XLA chose tracer-major there by itself). What worked was taking the choice
+away: each updated column as its own kernel behind `lax.optimization_barrier`, then a plain stack (14.0 -> 6.2 ms;
+DP 65.7 -> 60.1, SP 36.3 -> 32.6 ms on 4 GH200, job 28473598). Rule (d): a layout constraint fixes the layout of
+its own result, not of what feeds it; to change how a producer is laid out, change what it is fused with.

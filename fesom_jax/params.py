@@ -135,6 +135,9 @@ class Params:
     # no-ice bulk path keeps its own constant (``surface_forcing``, unused when ice is on).
     ice_pstar: object = None
     ice_cd: object = None
+    # REcoM parameters (fesom_jax.recom.params.RecomParams with traced leaves, full REcoM only): ``None`` (default) ⇒
+    # no leaves, nothing traced; the step then reads the namelist values of RecomConfig.namelist as constants.
+    recom: object = None
 
     @staticmethod
     def defaults() -> "Params":
@@ -156,6 +159,6 @@ tree_util.register_dataclass(
     Params,
     data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
                  "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn", "gm_nn",
-                 "surface_adj", "forcing_adj", "ice_pstar", "ice_cd"],
+                 "surface_adj", "forcing_adj", "ice_pstar", "ice_cd", "recom"],
     meta_fields=[],
 )

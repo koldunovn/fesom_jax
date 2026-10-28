@@ -196,6 +196,30 @@ def scatter_add(vals, seg, num_segments: int, inv=None):
     return jax.ops.segment_sum(safe_vals, safe_seg, num_segments=num_segments)
 
 
+
+def segment_extreme(vals, seg, num_segments: int, kind: str, inv=None):
+    """``jax.ops.segment_max`` / ``segment_min`` (``kind`` "max" / "min") of ``vals`` ``[n, *rest]`` by ``seg``
+    ``[n]``; a segment without entries holds -inf / +inf. With ``inv`` (``seg``'s :func:`inverse_map`) and
+    :func:`ordered_sums_enabled` it is a chain of gathers over the ``D`` slots, ``max``/``min`` of each slot in
+    turn, instead of the scatter a GPU runs with atomic max/min (slow for float64 3-D fields: the FCT limiter's
+    node clusters of the 31-tracer REcoM stack took 15 ms a step on 4 GH200, job 28430158). Max and min are
+    exact in any order, so both give the same values (up to which zero a tie of -0 and +0 keeps)."""
+    if kind not in ("max", "min"):
+        raise ValueError(f"segment_extreme: kind must be 'max' or 'min', got {kind!r}")
+    if inv is not None and ordered_sums_enabled():
+        if tuple(inv.shape[:1]) != (num_segments,):
+            raise ValueError(f"segment_extreme: inv rows {inv.shape[0]} != num_segments {num_segments}")
+        inv = jnp.asarray(inv)
+        fill = -jnp.inf if kind == "max" else jnp.inf
+        op = jnp.maximum if kind == "max" else jnp.minimum
+        out = None
+        for j in range(inv.shape[1]):
+            g = jnp.take(vals, inv[:, j], axis=0, mode="fill", fill_value=fill)
+            out = g if out is None else op(out, g)
+        return out
+    fn = jax.ops.segment_max if kind == "max" else jax.ops.segment_min
+    return fn(vals, seg, num_segments=num_segments)
+
 def scatter_add_edges_to_nodes(vals, edges, num_nodes: int, inv=None):
     """Edge→node scatter: add each edge's two endpoint contributions
     ``vals[e,0]``→node ``edges[e,0]`` and ``vals[e,1]``→node ``edges[e,1]``.

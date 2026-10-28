@@ -37,7 +37,11 @@ import os
 
 PRECISIONS = ("double", "single")
 STATE_F64 = ("hnode", "hnode_new")          # WP_full storage upstream (MOD_MESH.F90:140-145)
-CARRY_FIELDS = ("carry_T", "carry_S")      # the SP-only rounding carry (MOD_TRACER.F90:42), WP
+# full REcoM's own carried arrays: REcoM's module sets its own WP = 8 (recom_modules.F90:24), so they stay float64 in a
+# single-precision run (plan 20261026-recom-lane-sp, S1 design)
+STATE_F64_RECOM = ("bgc_benthos", "bgc_alk_surf", "bgc_carb", "bgc_diag", "bgc_budget")
+# the SP-only rounding carry (MOD_TRACER.F90:42), WP: T, S and (full REcoM) the BGC stack (nod2D, nl, ntr)
+CARRY_FIELDS = ("carry_T", "carry_S", "bgc_carry")
 
 
 def check(precision: str) -> str:
@@ -94,6 +98,19 @@ def lit(c):
         return c
     import numpy as np
     return float(np.float32(c))
+
+
+def log10(x):
+    """``jnp.log10``, also for a float64 ``x`` inside a single-precision trace: JAX's ``log10`` multiplies by a numpy
+    float64 constant that ``lax.mul`` narrows to float32 when x64 is off and then refuses the dtype pair. In double
+    precision ``jnp.log10`` itself (the double-precision trace is unchanged); in single precision the same product
+    with the constant in ``x``'s dtype."""
+    import jax.numpy as jnp
+    if not sp():
+        return jnp.log10(x)
+    from jax import lax
+    x = jnp.asarray(x)
+    return lax.mul(lax.log(x), jnp.asarray(0.4342944819032518, x.dtype))
 
 
 def full_tree(tree):
@@ -186,20 +203,25 @@ def cast_tree(tree, keep64: bool = False):
 
 
 def cast_state(state):
-    """The State of a single-precision run: float32 except :data:`STATE_F64` (float64); the carry zero when absent
-    (a cold start, or a restart written in double precision)."""
+    """The State of a single-precision run: float32 except :data:`STATE_F64` and :data:`STATE_F64_RECOM` (float64);
+    the carry zero when absent (a cold start, or a restart written in double precision). The BGC carry exists for
+    full REcoM only (a State with ``bgc_alk_surf``; the passive mode has none)."""
     import numpy as np
     import jax
     vals = {}
     for f in dataclasses.fields(state):
-        vals[f.name] = _cast_leaf(getattr(state, f.name), keep64=f.name in STATE_F64)
+        vals[f.name] = _cast_leaf(getattr(state, f.name), keep64=f.name in STATE_F64 + STATE_F64_RECOM)
+    full_recom = getattr(state, "bgc_alk_surf", None) is not None
     for name in CARRY_FIELDS:
+        if name == "bgc_carry" and not full_recom:
+            vals[name] = None
+            continue
         if vals.get(name) is None:
-            T = state.T
-            if isinstance(T, jax.Array):
-                vals[name] = jax.numpy.zeros_like(T, dtype=np.float32)
+            like = state.bgc if name == "bgc_carry" else state.T
+            if isinstance(like, jax.Array):
+                vals[name] = jax.numpy.zeros_like(like, dtype=np.float32)
             else:
-                vals[name] = np.zeros(np.shape(T), np.float32)
+                vals[name] = np.zeros(np.shape(like), np.float32)
     return state.__class__(**vals)
 
 

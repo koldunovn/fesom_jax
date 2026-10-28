@@ -234,7 +234,8 @@ def reconstruct_global(out_dir, field: str):
 # --------------------------------------------------------------------------
 def _all_state_fields() -> tuple[str, ...]:
     """Every REQUIRED :class:`~fesom_jax.state.State` leaf name, in pytree order: every field
-    except the optional ``State.ICE_AVG_FIELDS`` (None unless ``ice_ave_steps > 1``) and ``State.SE_FIELDS``
+    except the optional ``State.ICE_AVG_FIELDS`` (None unless ``ice_ave_steps > 1``), ``State.BGC_FIELDS`` (None
+    without REcoM) and ``State.SE_FIELDS``
     (None unless ``ssh.split_explicit``): the restart writes them when present and :func:`read_restart` reads them
     when the store has them.
 
@@ -244,8 +245,8 @@ def _all_state_fields() -> tuple[str, ...]:
     ``uv_rhsAB`` / ``sigma*`` / ``tke``). Every reader that loops over it to rebuild a State
     (``core2_adj.load_state``, ...) keeps working on restarts with and without the optional
     fields."""
-    from .state import ICE_AVG_FIELDS, SE_FIELDS, State
-    return tuple(f.name for f in dataclasses.fields(State) if f.name not in ICE_AVG_FIELDS + SE_FIELDS)
+    from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS, State
+    return tuple(f.name for f in dataclasses.fields(State) if f.name not in ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS)
 
 
 def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_stage,
@@ -272,10 +273,11 @@ def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_st
     restart was written at — persisted so a resumed run knows whether it is mid-dt-ramp
     (a dt change across a restart invalidates the AB2 history; the driver re-bootstraps).
     Returns the store path."""
-    if fields is None:      # every present leaf: the SP carry, ICE_AVG_FIELDS and SE_FIELDS only when they exist
-        from .state import ICE_AVG_FIELDS, SE_FIELDS
-        fields = tuple(n for n in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS
-                       if getattr(state_folded, n) is not None)
+    if fields is None:      # every present leaf: the SP carry, ICE_AVG_FIELDS, SE_FIELDS and BGC_FIELDS only when they exist
+        from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+        from .state import RESTART_SKIP
+        fields = tuple(n for n in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS
+                       if getattr(state_folded, n) is not None and n not in RESTART_SKIP)
     fields = tuple(fields)
     # On disk always float64 (FESOM2: netCDF restarts are double in both builds); a single-precision
     # State is widened exactly. A double-precision State is returned unchanged by the cast.
@@ -363,14 +365,15 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     sharding = NamedSharding(jmesh, PartitionSpec("p"))
 
     from .precision import CARRY_FIELDS
-    from .state import ICE_AVG_FIELDS, SE_FIELDS
+    from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
     out = {}
-    for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS:
-        if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS and name not in root:
+    for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS:
+        if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS and name not in root:
             # written by single-precision runs only (the carry), or an ice_ave_steps field the writer did not
             # use (ice_ave_steps == 1, or a restart from before Task 12): None; ice_step.init_ice_avg gives
             # the latter the upstream init values. The split-explicit rings: only an SE run writes them
-            # (ssh_se.init_state then decides: flat rings for a CG restart into SE)
+            # (ssh_se.init_state then decides: flat rings for a CG restart into SE). The REcoM fields: only a REcoM run
+            # writes them
             out[name] = None
             continue
         g = reconstruct_global(out_dir, name)            # [n_global, …] host numpy

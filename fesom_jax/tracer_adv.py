@@ -146,13 +146,14 @@ def flux2dtracer(mesh: Mesh, flux_h, flux_v, *, dt: float = DT_DEFAULT):
 def ale_reconstruct_carry(mesh: Mesh, T, del_ttf, hnode, hnode_new, carry):
     """Single-precision ALE reconstruction with the rounding carry (FESOM2 #1206, ``oce_ale_tracer.F90:864-869``):
     ``acc = T·hnode + del_ttf + carry`` (float64), ``T' = f32(acc/hnode_new)``, ``carry = f32(acc − T'·hnode_new)``
-    on valid layers; elsewhere T and the carry are unchanged. Returns ``(T', carry)``."""
+    on valid layers; elsewhere T and the carry are unchanged. Returns ``(T', carry)``. ``T`` may be float64 (full
+    REcoM's modified values ``vmod``, the content REcoM's float64 code adds before the rounding); ``T'`` is WP."""
     safe_hn = jnp.where(hnode_new > 0.0, hnode_new, 1.0)
     upd = mesh.node_layer_mask & (hnode_new > 0.0)
     acc = PR.full(T) * hnode + del_ttf + PR.full(carry)
     Tn = PR.wp(acc / safe_hn)
     cn = PR.wp(acc - PR.full(Tn) * hnode_new)
-    return jnp.where(upd, Tn, T), jnp.where(upd, cn, carry)
+    return jnp.where(upd, Tn, PR.wp(T)), jnp.where(upd, cn, carry)
 
 
 def ale_reconstruct(mesh: Mesh, T, del_ttf, hnode, hnode_new):
@@ -452,8 +453,9 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     e3 = mesh.elem2D * 3
     cmax = jnp.broadcast_to(aux_max[:, None], (mesh.elem2D, 3, nl)).reshape(e3, nl)
     cmin = jnp.broadcast_to(aux_min[:, None], (mesh.elem2D, 3, nl)).reshape(e3, nl)
-    tvert_max = jax.ops.segment_max(cmax, seg, num_segments=mesh.nod2D)
-    tvert_min = jax.ops.segment_min(cmin, seg, num_segments=mesh.nod2D)
+    inv = getattr(mesh, "inv_elem_nodes", None)          # gathers instead of atomic max/min under ordered sums
+    tvert_max = ops.segment_extreme(cmax, seg, mesh.nod2D, "max", inv=inv)
+    tvert_min = ops.segment_extreme(cmin, seg, mesh.nod2D, "min", inv=inv)
 
     # a4: admissible increment relative to LO; the interior also clusters over the
     # 3 vertical neighbours (nz-1, nz, nz+1); surface & bottom layer use own level

@@ -70,6 +70,8 @@ def test_fold_forcing_seq_delivers_per_step():
     base = {name: ((i + 1) * 1e6 + np.arange(T)[:, None] * 1e3
                    + np.arange(nod2D)[None, :]).astype(float)
             for i, name in enumerate(fields)}
+    for i, name in enumerate(surface_forcing.STEP_SCALARS):   # per-step scalars (REcoM calendar): [T], replicated
+        base[name] = (np.arange(T) + 100 * (i + 1)).astype(np.int32)
     stack = StepForcing(**{name: base[name] for name in fields})
 
     seq_p = shard_mesh.partition_step_forcing(stack, part)        # [P, T, Lmax]
@@ -126,6 +128,9 @@ def test_host_forcing_stack_equals_device(core2_forced_seq):
     dev = fx["stack"]                                  # xp=jnp default (device)
     for fld in host._fields:
         h = getattr(host, fld)
+        if h is None:                                  # an optional field that is off (press_air)
+            assert getattr(dev, fld) is None, fld
+            continue
         assert isinstance(h, np.ndarray), f"{fld} is not host numpy under xp=np"
         np.testing.assert_array_equal(h, np.asarray(getattr(dev, fld)))
 
@@ -370,6 +375,9 @@ def test_fold_forcing_tables_places_nodes():
     for p in range(npes):
         lst = part.myList_nod2D[p]
         for name in ft._fields:
+            if getattr(ft, name) is None:              # an optional table that is off (REcoM dust)
+                assert getattr(folded, name) is None and getattr(spec, name) is None
+                continue
             g = np.asarray(getattr(ft, name))
             f = np.asarray(getattr(folded, name))
             slab = f[..., p * L:(p + 1) * L][..., :len(lst)]

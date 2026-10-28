@@ -17,7 +17,8 @@ host builds each chunk's forcing while the device runs the previous one, exactly
 so ``steady_ms_per_step`` is the production loop's steady cost. Also recorded: the host time
 between chunk calls (forcing build; if it exceeds the device time the run is host-bound), the time
 inside the calls (dispatch, or a host sync), peak device memory, and whether the final State is
-finite (a run gone NaN looks fast).
+finite (a run gone NaN looks fast). ``time`` also runs on several nodes: JDIST=1 under ``srun`` with one
+process per node (run_from_config's import initialises jax.distributed); each process prints its own line.
 
 noise: R runs from the cold start, each final State saved as OUT/state_<i>.npz (the FOLDED sharded
 State: same partition ⇒ same layout, padding lanes stay 0), and per field the largest relative
@@ -27,7 +28,7 @@ a change passes when its difference to the base is within this floor (``compare`
 Never writes model output: a configuration with a restart or output stream is refused (several
 production configs point restart_out at a production run directory; use the ``*_full_bench.yaml``
 twins). FESOM_REUSE_EXE is forced on (without it every chunk recompiles and the timing is
-meaningless). Single process only (one node).
+meaningless). prof and noise: single process only (one node).
 """
 
 from __future__ import annotations
@@ -51,7 +52,8 @@ _OUTPUT_KW = ("out_dir", "checkpoint_every", "restart_archive_out", "daily_out",
 
 
 def say(msg):
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    proc = f" p{os.environ.get('SLURM_PROCID', '?')}" if os.environ.get("JDIST") else ""
+    print(f"[{time.strftime('%H:%M:%S')}{proc}] {msg}", flush=True)
 
 
 def sypd(ms_per_step: float, dt: float) -> float:
@@ -235,6 +237,9 @@ def busy_from_sqlite(path, steps, devices) -> dict:
 # ------------------------------------------------------------------------------------------------
 # the production run, instrumented
 # ------------------------------------------------------------------------------------------------
+_RFC_EARLY = None      # under JDIST: run_from_config loaded before any jax call (its import initialises jax.distributed)
+
+
 def _rfc_module():
     spec = importlib.util.spec_from_file_location("run_from_config_cli",
                                                   ROOT / "scripts" / "run_from_config.py")
@@ -252,7 +257,7 @@ def run_production(rfc_args, total_steps, chunk_steps, timer=None):
         if any(a == flag or a.startswith(flag + "=") for a in rfc_args):
             raise SystemExit(f"gpu_profile: {flag} is set by the tool or refused, not passed through")
     import fesom_jax.run as R
-    mod = _rfc_module()
+    mod = _RFC_EARLY or _rfc_module()
     inner, got = mod.run_from_config, {}
 
     def instrumented(cfg, **kw):
@@ -424,8 +429,13 @@ def main():
     if not rfc:
         p.error("pass the run_from_config arguments after --")
     os.environ["FESOM_REUSE_EXE"] = "1"            # read at fesom_jax.run import time
+    if os.environ.get("JDIST"):
+        if a.what != "time":
+            raise SystemExit("gpu_profile: only `time` runs on several processes (JDIST)")
+        global _RFC_EARLY
+        _RFC_EARLY = _rfc_module()
     import jax
-    if jax.process_count() != 1:
+    if jax.process_count() != 1 and not os.environ.get("JDIST"):
         raise SystemExit("gpu_profile: single process only")
     import fesom_jax.run as R
     assert R._REUSE_EXE, "FESOM_REUSE_EXE must be on before fesom_jax.run is imported"
@@ -440,7 +450,8 @@ def main():
     if a.steps % a.chunk_steps:
         p.error("--steps must be a multiple of --chunk-steps")
     rec = cmd_time(a, profile=a.what == "prof")
-    (out / f"{a.what}.json").write_text(json.dumps(rec, indent=1))
+    suffix = f".p{jax.process_index()}" if jax.process_count() > 1 else ""
+    (out / f"{a.what}{suffix}.json").write_text(json.dumps(rec, indent=1))
     sys.exit(0 if rec["finite"] else 1)
 
 

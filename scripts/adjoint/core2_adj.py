@@ -333,14 +333,14 @@ def load_state(path):
     :func:`~fesom_jax.zarr_output.write_restart` store (any layout, any device count)."""
     import zarr
     from fesom_jax.precision import CARRY_FIELDS
-    from fesom_jax.state import ICE_AVG_FIELDS, SE_FIELDS
+    from fesom_jax.state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
     root = zarr.open_group(str(path), mode="r")
     # as zarr_output.read_restart: the single-precision carry, the ice-cycle fields and the SE rings are in the
     # store only when the writing run used them (None otherwise; build_model sets them for its own physics)
-    optional = CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS
+    optional = CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS
     st = State(**{f: None if f in optional and f not in root
                   else np.asarray(zarr_output.reconstruct_global(path, f))
-                  for f in zarr_output._all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS})
+                  for f in zarr_output._all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS})
     meta = dict(root.attrs)
     return st, meta
 
@@ -616,7 +616,8 @@ class Model:
                 if i == 0 or int(d[0]) != int(dates[i - 1][0]):
                     self.forcing.jra.read_ahead([e for e in dates[i:] if int(e[0]) == int(d[0])])
                 steps.append(self.forcing.step_forcing(*d, xp=np))
-            out = surface_forcing.StepForcing(*[np.stack(leaves, axis=0) for leaves in zip(*steps)])
+            out = surface_forcing.StepForcing(*[None if leaves[0] is None else np.stack(leaves, axis=0)
+                                                for leaves in zip(*steps)])
             self.forcing_seconds += time.time() - t0
         return out
 
@@ -822,7 +823,7 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
     # single precision as run.py: the SP preconditioner variant (FESOM2 #995; the CG only), the forcing's per-step
     # values in the point-slope form (#940)
     op = ssh.build_ssh_operator(mesh, dt=cfg.dt, **({"precond_variant": 1} if sp else {}))
-    forcing = surface_forcing.build_surface_forcing(mesh, start.year, dt=cfg.dt,
+    forcing = surface_forcing.build_surface_forcing(mesh, start.year, dt=cfg.dt, mslp=cfg.forcing_mslp(),
                                                    **cfg.forcing_paths())
     if sp:
         forcing.point_slope = True

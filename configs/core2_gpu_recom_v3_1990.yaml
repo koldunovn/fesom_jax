@@ -1,0 +1,118 @@
+# configs/core2_gpu_recom.yaml for a run from the v3 1990 restart (core2_hindcast_v3/restart_archive/fesom.1990.001.00000,
+# written at dt 1800 after 561024 steps): the calendar is n*dt from 1958, so dt stays 1800 for the calendar and the
+# ramp switches to 2700 s at the restart step (as the se10/sp10 runs, job 28323053); every step of the run is 2700 s.
+# Without the ramp the run would read 2006 forcing (job 28430160). Used by the REcoM CORE2 year (job 28431153) and the
+# k-error month (runs/recom/kerr_1990_01).
+# REcoM plan Task 15: CORE2 + full REcoM (bin_2p3z2d, 31 tracers) on the fast GPU stack of configs/core2_gpu_fast.yaml,
+# in DOUBLE precision, the default and the production mode (FESOM2 refuses USE_SINGLE_PRECISION with RECOM_COUPLED).
+# Single precision is an opt-in deviation since STOP 4 (2026-10-26, plan docs/plans/20261026-recom-lane-sp.md): add
+# `precision: single` or `--precision single` (96.6 against 61.6 SYPD; the CORE2 year in docs/recom/VALIDATION.md). Inputs as configs/core2_recom.yaml (read only, a colleague's directory): the 1-degree IC set
+# (recom.ic_dir) and the Albani dust (forcing.dust_file, in our CORE2 node order: lesson 2026-10-25, lane I).
+# A physics-only restart (e.g. the v3 1990 restart) starts the BGC from the IC. recom.bgc_every k > 1 is the stated
+# every-k deviation (one BGC step of k*dt on the interval-mean transport). Everything below the recom block equals
+# configs/core2_gpu_fast_bgc31.yaml without its precision line (so double) plus forcing.mslp and forcing.dust_file.
+recom:
+  namelist: scripts/recom/fortran/namelists_jaxphys/namelist.recom
+  ic_set: core2
+  ic_dir: /work/ab0246/a270092/input/fesom2/recom
+  bgc_every: 1
+
+# CORE2 on 4 GH200, the fastest measured stack (2026-10-22: 7.39 ms/step = 1001 SYPD steady at dt 2700, job 28323629;
+# 7.56-7.59 ms/step in the production loop with monthly output, jobs 28322172/28323381; a 10-year job 897 SYPD without
+# its compiles, job 28323053; run with CMDBUF=on in scripts/perf/run_core2_gpu*.sbatch). Split-explicit SSH accepted
+# (user 2026-10-22, plan docs/plans/20261021-core2-split-explicit.md: the 10-year twin is the CG's within the SP - DP
+# spread, job 28318591). For runs of a few years `--chunk-steps 32` is faster (one compiled length fewer, job 28323381).
+# Single precision accepted (STOP 4, 2026-10-21: the 10-year SP vs DP pair 28304114/5, plan
+# docs/plans/20261020-core2-single-precision.md), ice_ave_steps 2 approved (2026-10-21); dt 2700 ran 10 years
+# stable in DP (28291189) and in SP (28304114). Everything else equals configs/core2_gpu.yaml.
+# CORE2 (~1°, 127 k nodes) — the GPU PRODUCTION configuration (CORE2 GPU speed plan,
+# docs/plans/20261020-core2-gpu-speed.md, Task 3): core2_full.yaml's physics + the two speed options
+# that passed the combined 1-year climate certification against a pooled rerun floor (July 2026):
+#   * ssh.cheb_degree 3 / cheb_kappa 30 — the Chebyshev CG preconditioner (~3x fewer CG iterations;
+#     solver-tolerance-equivalent, NOT byte-identical);
+#   * forcing.on_device — the JRA time interpolation inside the jitted step (VALUE-equivalent: XLA
+#     contracts a*x+y into an FMA in jit).
+# and the two layout/transport options of Task 7 (jobs 28286769, 28287270; values at round-off, GPU
+# compare within the noise floor): together 73.9 -> 56.9 ms/step on 4 A100:
+#   * gpu.halo_compact — the all_gather halo ships only the lanes other devices read;
+#   * gpu.column_unroll — the level sweeps (tdma, TKE scans) unrolled, so XLA keeps the step node-major;
+# and (user 2026-10-20: "everything on for speed, but all optional") the mEVP wide halo (gpu.mevp_wide) and the
+# gathered SSH solve (ssh.gathered, small meshes only). Every one of these is off by default in the code.
+# core2_full.yaml stays the bit-level reference AND the adjoint's configuration
+# (scripts/adjoint/core2_adj.py refuses the preconditioner) — never put speed options there.
+# restart_out is null on purpose: give --restart-out on the command line (core2_full.yaml's default
+# points into a production run directory).
+
+ale: {}            # zstar vertical coordinate
+gm: {}             # GM on (CORE2 ~1° needs the mesoscale-eddy parameterization)
+                   # TODO: confirm k_gm / Redi_Kmax against the matched-Fortran namelist.oce
+kpp: null          # vertical mixing: the existing JAX CORE2 used TKE — TODO confirm KPP vs TKE
+tke: {}            # classical-TKE prognostic mixing (the JAMES-paper all-on default)
+ice: {whichEVP: 1, ice_ave_steps: 2}  # mEVP sea-ice rheology (Bouillon 2013). whichEVP=1 = mEVP; the default 0 is
+                    # STANDARD EVP. Matches the validated JAMES all-on run IceConfig(whichEVP=1)
+                    # (core2_kpp_climate_run.py:268); ice_dt stays the 500 default as those runs used.
+
+visc: {}           # CORE2 default γ's (gamma1 = 0.1)
+
+tracer: {}         # ⚠️ TODO: confirm CORE2's num_ord/scheme == the implemented (0,1);
+                   #     if not, this needs a kernel change (new reconstruction), not a toggle.
+
+dt: 1800.0         # the v3 restart's dt; the calendar runs n*1800 s up to it
+dt_ramp: {after_step: 561024, dt: 2700.0}   # then 2700 s (as runs/se10 28323053): the 1990 calendar stays exact
+
+# --- run orchestration (defaults; the hindcast sbatch overrides mesh/partition/steps/restart via CLI) ---
+mesh: data/mesh_core2     # the staged CORE2 mesh (proven by run_core2_e2e)
+partition: dist_4         # CORE2 ANTI-scales past 4 GPU (halo-bound) ⇒ dist_4 / 1 node is OPTIMAL
+forcing:
+  kind: core2
+  start_year: 1958
+  on_device: true    # −12 % on this config; 1-yr climate-certified (job 26280985), VALUE-equivalent
+  mslp: true         # FESOM2's l_mslp: REcoM's CO2/O2 solubility read press_air
+  dust_file: /work/ab0246/a270092/input/fesom2/recom/CORE2/DustClimMonthlyAlbani.nc
+ssh:
+  # Sergey Danilov's SM AB3-AM4 barotropic subcycling instead of the CG (a stated deviation from upstream FESOM2,
+  # whose SE is the forward-backward scheme): M 60 = the CFL guard's minimum at dt 2700 and chi 0.1 (job 28310231);
+  # the barotropic drag in the substeps (his answer of 2026-10-18): without it dt 2700 blew up within a month in 3 of
+  # 4 screens, with it every screen held (job 28315629). For the CG: cheb_degree 3, cheb_kappa 30, gathered true.
+  split_explicit: {M: 60, chi: 0.1, bt_drag: true}
+gpu:
+  halo_transport: padded  # slot-padded all_to_all: 7.77 ms/step against 7.86-8.20 for the compact all_gather in the
+                        # SE production loop (job 28320507); values as the compact all_gather (test_transport_driver)
+  halo_compact: false   # (the compact all_gather: NCCL 34 -> 13 ms/step on 4 A100, job 28286769; not with padded)
+  column_unroll: true   # without it the compact build flips level-major (293 transposes); -23 % together
+  mevp_wide: 12         # mEVP exchanges every 12 subcycles: -10.9 % on 4 GH200 (job 28290740); bitwise on CPU,
+                        # round-off only on GPU by the owned-lane pair test (job 28290759)
+  # ssh_ell, cg_batch, ssh_inc_ell below are the CG's options: idle with ssh.split_explicit, kept for a CG run
+  ssh_ell: true         # SSH matvecs on the ELL layout, no atomics: -4.1 % on 4 A100 (job 28291288); round-off
+  cg_batch: 4           # 4 masked CG iterations per while trip: the same iterate, fewer host syncs (job 28291790)
+  mevp_unroll: 12       # mEVP subcycles unrolled 12 per trip: -1.1 % on 4 A100 (job 28291809); round-off
+  column_kernel: true   # Pallas column kernels for tdma / TKE sweeps (GPU only): -17 % on 4 A100 (job 28291852);
+                        # round-off by the owned-lane pair test (job 28292399)
+  ssh_inc_ell: true     # the gathered solve's zstar increment as explicit entries: -3.5 % on 4 A100 (job 28292208);
+                        # solver-tolerance equivalent
+  lane_order: rcm       # the lanes inside the shards in reverse Cuthill-McKee order (global ids, restarts, output
+                        # unchanged): -2.1 % on 4 GH200 (job 28298963); round-off
+  output_async: true    # daily/monthly output on a background writer thread: the month-end writes leave the loop
+                        # (job 28299731); the same stores; single process only
+  restart_async: true   # the calendar archival restarts on a writer thread of their own (2-40 s each on /work, jobs
+                        # 28304114, 28321119); the same stores; single process only
+  ordered_sums: true    # ordered gathers instead of atomic scatter-adds: SP -16 % on 4 GH200 (job 28295508);
+                        # DP +14 % there, so only with single precision
+                        # (with 31 BGC tracers in DP they are faster: 110 against 88 SYPD, REcoM plan STOP 1)
+  forcing_ahead: 4      # the forcing prefetch four chunks ahead: no wait after a month end's short chunk (2: job
+                        # 28299884) and through the /work read stalls (4: host wait 16 -> 2 s a year, job 28323381);
+                        # bitwise
+  forcing_procs: 8      # JRA decode in 8 read-ahead processes: -0.5 ms/step in the split-explicit production loop
+                        # (job 28319459, the forcing thread's GIL); nothing on the CG stack (28298963); bitwise
+  se_wide: 10           # the SE substeps exchange once every 10 substeps on 11-ring lanes: 8.54-8.73 against 9.73
+                        # ms/step for two exchanges a substep (job 28313318); bitwise on CPU (test_se_sharded.py);
+                        # 15/20/30 slower with longer compiles (job 28322503)
+  se_unroll: 10         # 10 substeps a loop trip: 7.59 against 8.68 ms/step without, +9 s a compile (job 28322172)
+  chunk_steps: 96       # 96 steps a chunk (3 days); the month ends leave 32 or 64
+  chunk_tail: 32        # ... and 64 runs as two 32-chunks: one compiled length fewer (leap Februaries)
+output_dir: /work/ab0995/a270088/port_jax/runs/core2
+snapshot_every: 32        # steps (~1/day at dt=2700)
+checkpoint_every: 960     # steps (~1 month)
+restart_in: null
+restart_out: null         # give --restart-out on the command line
+duration: 10yr            # overridden by --steps (the per-job budget) from run_core2_hindcast.sbatch

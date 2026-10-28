@@ -63,6 +63,28 @@ def test_core2_ordered_sum_vs_segment_sum(mesh, seg_name, count, rest, monkeypat
     assert u.max() <= 1.0
 
 
+
+@avail
+@pytest.mark.parametrize("kind", ["max", "min"])
+@pytest.mark.parametrize("rest", [(), (48,), (48, 3)])
+def test_core2_segment_extreme_vs_segment_max(mesh, kind, rest, monkeypatch):
+    """``ops.segment_extreme`` (the FCT limiter's node clusters) through ``inv_elem_nodes``: the gather chain gives
+    jax.ops.segment_max / segment_min exactly (max and min are exact in any order), the empty segment's -inf/+inf
+    included (a CORE2 node with no element does not exist, so a padded one is appended)."""
+    seg = mesh.elem_nodes.reshape(-1)
+    inv = mesh.inv_elem_nodes
+    N = mesh.nod2D
+    rng = np.random.default_rng(11)
+    vals = jnp.asarray(rng.standard_normal(seg.shape + rest) * 10.0 ** rng.integers(-6, 6, size=seg.shape + (1,) * len(rest)))
+    inv_pad = jnp.concatenate([jnp.asarray(inv), jnp.full((1, inv.shape[1]), seg.shape[0], inv.dtype)], axis=0)
+    f = lambda v, iv: ops.segment_extreme(v, seg, N + 1, kind, inv=iv)          # noqa: E731
+    monkeypatch.delenv("FESOM_ORDERED_SUMS", raising=False)
+    ref = np.asarray(jax.jit(f)(vals, inv_pad))
+    monkeypatch.setenv("FESOM_ORDERED_SUMS", "1")
+    got = np.asarray(jax.jit(f)(vals, inv_pad))
+    np.testing.assert_array_equal(got, ref)
+    assert np.all(np.isinf(got[N])) and (got[N] < 0).all() == (kind == "max")
+
 @avail
 @pytest.mark.parametrize("seg_name,count", ASSEMBLIES)
 def test_core2_ordered_sum_gradient(mesh, seg_name, count, monkeypatch):

@@ -671,3 +671,100 @@ mEVP unroll 12 + ordered sums + SE unroll 10: 132.8 (-39 %; leaving out the colu
 forward; the profile without options (job 28350488): NCCL 54 % of the kernel time (950 launches a step), the SE
 divergence's gather transpose (an atomic scatter) the largest compute item (25 ms of 352). The year rows above ran
 without the options: with them the year is ~0.65 h (one chunk measured, not a year).
+
+## REcoM: the BGC tracer stage, 31 passive tracers (plan 20261025-recom-port.md, Task 2)
+
+31 passive tracers (REcoM's bin_2p3z2d count) through the BGC tracer stage (FCT, Redi + K33, implicit vertical
+diffusion; no sources or sinks), `configs/core2_gpu_fast_bgc31.yaml` = the fast stack + `recom: {passive_tracers:
+31}`, from the v3 1990 restart, dt 2700, 4 GPUs, `ab_time` (2 warm + 4 timed chunks of 96 steps).
+
+| date | commit | job | machine | variant | steady ms/step | SYPD | per added tracer | note |
+|---|---|---|---|---|---|---|---|---|
+| 2026-10-25 | 9a4a5e8 | 28417245 | GH200 | SP fast stack (no BGC) | 7.48 | 988 | — | the reference |
+| 2026-10-25 | 9a4a5e8 | 28417245 | GH200 | DP, ordered sums off (no BGC) | 16.72 | 442 | — | |
+| 2026-10-25 | 9a4a5e8 | 28417245 | GH200 | DP + 31, one tracer at a time (`loop`) | 137.49 | 54 | 3.9 ms | peak 11.0 GB/GPU |
+| 2026-10-25 | 9a4a5e8 | 28417245 | GH200 | DP + 31, batched (`vmap`) | 84.42 | 88 | 2.2 ms | peak 13.9 GB/GPU |
+| 2026-10-25 | 9a4a5e8 | 28417245 | GH200 | SP + 31 (`loop`, `vmap`) | — | — | — | failed: the Pallas column kept a float64 result in a float32 loop (fixed c7f4863, b02b100) |
+| 2026-10-25 | c7f4863 | 28417425 | A100 | DP, no BGC / + 31 vmap / + 31 vmap, column kernel off / + 8 vmap | 29.91 / 156.61 / 175.14 / 68.06 | 247 / 47 / 42 / 109 | 4.1 / 4.7 / 4.8 ms | linear in the tracer count; the Pallas column kernel helps (+12 % without) |
+| 2026-10-25 | b02b100 | 28417702 | GH200 | SP fast stack (no BGC) | 7.63 | 969 | — | same node as the next three |
+| 2026-10-25 | b02b100 | 28417702 | GH200 | **SP + 31 vmap, ordered sums on** (the fast stack's setting) | **47.34** | **156** | 1.28 ms | SP cost ESTIMATE (the rounding carry dropped); peak 9.5 GB/GPU |
+| 2026-10-25 | b02b100 | 28417702 | GH200 | SP + 31 vmap, ordered sums off | 51.32 | 144 | 1.41 ms | |
+| 2026-10-25 | b02b100 | 28417702 | GH200 | **DP + 31 vmap, ordered sums on** | **67.18** | **110** | 1.6 ms vs DP 16.7 | -20 % against ordered sums off (84.42): the batched sums favour the ordered gathers in DP too |
+
+nsys of the GH200 DP + 31 vmap step (job 28417424, kernels 88.4 ms/step): ops helpers (the FCT and Redi scatter-adds,
+sums, halo glue) 33.8 ms, tracer advection 28.4 ms (0.92 ms per tracer, as for T and S), GM/Redi 9.0 ms, NCCL 8.0 ms
+(68 launches), halo packing 2.4 ms, vertical diffusion 0.6 ms. No pathology: a BGC tracer costs what a T/S tracer
+costs, the batched pass saves ~45 % against one at a time, and the step is memory- and scatter-bound.
+
+BGC every k-th step (Task 2b, `recom.bgc_every`, the k-step mean transport; job 28420153, 742d5c7, one GH200
+node, vmap, ordered sums on): SP + 31 k = 1 / 2 / 4: 47.32 / 26.78 / 17.22 ms/step = 156 / 276 / 430 SYPD; DP + 31
+k = 2 / 4: 44.02 / 32.56 ms/step = 168 / 227 SYPD (k = 1: 67.18 = 110). Each step costs 7.6 + 39.7/k ms in SP, as
+the k = 1 split predicts: the interval sums and the lax.cond cost nothing visible.
+
+STOP 1 reading (2026-10-25): the transport of REcoM's 31 tracers alone takes CORE2 on 4 GH200 at dt 2700 from 969 to
+~156 SYPD in SP (estimate) and to ~110 SYPD in DP with ordered sums, before the sources and sinks. The plan's guess of
+350-450 SP assumed the batched pass would amortise far more than the measured ~45 %.
+
+## REcoM: full REcoM on CORE2 (plan 20261025-recom-port.md, Task 15)
+
+`configs/core2_gpu_recom.yaml` = the fast stack in double precision (full REcoM refuses single precision) + full
+REcoM (bin_2p3z2d, 31 tracers, BGC from the 1-degree IC) + `forcing.mslp` + the Albani dust; 4 GH200, dt 2700, the
+v3 1990 restart.
+
+| date | commit | job | variant | ms/step | SYPD | note |
+|---|---|---|---|---|---|---|
+| 2026-10-26 | 77c9cd4 | 28424908 | full REcoM, k = 1 | **120.06** | **61.6** | peak 14.8 GB/GPU |
+| 2026-10-26 | 77c9cd4 | 28424908 | full REcoM, `bgc_every` 4 | 47.08 | 157.1 | the every-k deviation |
+| 2026-10-26 | 77c9cd4 | 28424908 | 31 passive tracers, DP (reference) | 67.09 | 110.3 | = STOP 1 |
+| 2026-10-26 | b8ff45c | 28430160 | full REcoM, k = 1, one year in the production loop | 137.9 | 53.6 | 1611 s for 11680 steps with monthly output, CMDBUF on; finite; forcing year 2006 (see below) |
+| 2026-10-26 | 91b8210 | 28431153 | the same year with the dt ramp (1990 forcing) | 146.2 | 50.6 | 1708 s for 11680 steps, CMDBUF on; finite |
+| 2026-10-26 | 73e2171 | 28439576 | full REcoM, k = 1, DP (A of the A/B, same node) | 120.43 / 119.84 | 61.4 / 61.7 | 2 reps; peak 14.8 GB/GPU |
+| 2026-10-26 | 73e2171 | 28439576 | full REcoM, k = 1, **single precision** (opt-in deviation, plan 20261026-recom-lane-sp) | **76.49 / 76.69** | **96.7 / 96.5** | 2 reps alternating with DP; SP/DP 0.64; peak 9.3 GB/GPU |
+| 2026-10-26 | a4c4051 | 28446572 | **two nodes, 8 GH200** (dist_8, one process per node, `scripts/perf/time_2node_gh200.sbatch`, CMDBUF on, async writers off): physics only (`core2_gpu_fast.yaml`), padded | 7.36 | 1004.7 | against 7.39 on one node: the second node buys nothing; first try 28446432 7.49 |
+| 2026-10-26 | a4c4051 | 28446572 | the same, coloured exchange | 7.95 | 930.7 | slower than padded across two nodes |
+| 2026-10-26 | a4c4051 | 28446572 | two nodes, full REcoM, k = 1, DP, padded | **67.13** | **110.2** | 1.79x the one-node 120.1 ms; peak 7.3 GB/GPU; coloured 67.79 (109.1) |
+| 2026-10-26 | a4c4051 | 28446572 | two nodes, full REcoM, k = 1, SP, padded | **43.09** | **171.7** | 1.78x the one-node 76.6 ms; peak 4.7 GB/GPU; coloured 43.16 (171.4) |
+| 2026-10-26 | cd3ee9c | 28447462 | **one GH200 node**, one process per GPU pinned to its Grace (`proc_per_gpu.sh`) against one process: physics only | 7.13 / 7.30 | 1037 / 1013 | -2.3 %; `nvidia-smi topo`: GPU i on cores 72i..72i+71 |
+| 2026-10-26 | cd3ee9c | 28447462 | the same, full REcoM DP | 120.05 / 119.95 | 61.6 / 61.7 | no gain |
+| 2026-10-26 | cd3ee9c | 28447462 | one GH200 node without halo exchanges (`FESOM_HALO_NONE=1`, timing only): physics only / full REcoM DP | 6.73 / 117.08 | 1099 / 63.2 | the exchanges cost 0.57 ms (8 %) / 2.9 ms (2.4 %) on NVLink: the one-node REcoM step is computation |
+| 2026-10-26 | 9373786 | 28447542-4 | **A100 scaling** (`time_nodes_a100.sbatch`, padded, one process a node, CMDBUF on), 1 / 2 / 4 nodes = 4 / 8 / 16 A100: physics only | 14.14 / 14.04 / 13.93 | 523 / 527 / 531 | without exchanges 12.37 / 8.41 / 5.36: the exchanges take 1.8 / 5.6 / 8.6 ms |
+| 2026-10-26 | 9373786 | 28447542-4 | the same, full REcoM DP | 233.7 / 129.2 / 80.6 | 31.7 / 57.3 / 91.8 | without exchanges 226.5 / 117.8 / 55.6 (compute 1.92x / 4.08x); exchanges 7 / 11 / 25 ms |
+| 2026-10-26 | 9373786 | 28447542-4 | the same, full REcoM SP | 187.0 / 101.7 / 61.2 | 39.6 / 72.7 / 120.9 | SP/DP 0.80 on one A100 node (0.64 on GH200) |
+| 2026-10-26 | 10d28d6 | 28456284 | **one GH200 node, full REcoM**: REcoM's tracer-loop terms as per-slot columns (no full-stack rewrite per group) + the FCT limiter's node-cluster max/min as gathers (`ops.segment_extreme`, no atomic float64 max/min) | **105.3 / 105.4** | **70.2** | DP, against 119.8 (job 28455642); peak 11.9 GB/GPU (14.8); SP 66.4 (111.4 SYPD) |
+| 2026-10-26 | 0445a5f | 28458068 | the same + **the BGC transport tracer-major in memory** (`FESOM_BGC_LAYOUT=major`: the stack moved to [ntr, entity, level] under a row-major `with_layout_constraint`) | **67.3 / 65.9** | **110-112** | DP; the same job's old layout 106.9 / 107.1; peak 12.6 GB/GPU |
+| 2026-10-26 | 0445a5f | 28458068 | the same, single precision | **39.5 / 39.5** | **187.3** | against 76.6 at the start of the day (job 28439576): 5.3x the physics-only step |
+| 2026-10-26 | 0445a5f | 28457954 | ncu on ONE GH200 (`ncu_gh200.sbatch`, P=1, DP): old layout (job 28456722) against tracer-major | kernels 530.6 -> 232.4 | | DRAM 1099 -> 584 GB a step; the HO-LO advection flux 106 -> 14.5 ms, ordered sums 91 -> 30, horizontal Redi 65 -> 22, limiter max/min 55 -> 16; the transposes themselves 19 ms at 0.9 TB/s |
+| 2026-10-27 | a70b24a | 28470089-91 | **A100 scaling again** with the three fixes (1 / 2 / 4 nodes = 4 / 8 / 16 A100, as 28447542-4): physics only | 12.61 / 13.27 / 13.51 | 587 / 558 / 548 | without exchanges 11.15 / 7.21 / 5.04: the exchanges take 1.5 / 6.1 / 8.5 ms; one node -11 % (the limiter max/min) |
+| 2026-10-27 | a70b24a | 28470089-91 | the same, full REcoM DP | **103.5 / 64.5 / 50.5** | **71.5 / 114.7 / 146.6** | against 233.7 / 129.2 / 80.6; without exchanges 98.8 / 51.4 / 26.5: the exchanges take 5 / 13 / 24 ms, half the 4-node step |
+| 2026-10-27 | a70b24a | 28470089-91 | the same, full REcoM SP | **80.0 / 48.3 / 36.0** | **92.5 / 153.3 / 205.4** | against 187.0 / 101.7 / 61.2 |
+| 2026-10-27 | 6037ca2 | 28470553 | **one GH200 node, full REcoM**: stage 3 holds the stage-1 stack and each group's T* input tracer-major (`transport.hold_major`, `FESOM_BGC_HOLD`), stage 1 reads `State.bgc` tracer-major | **62.34 / 62.39** | **118.7** | DP, against 65.41 / 65.47 in the same job (`FESOM_BGC_HOLD=0`); peak 11.5 GB/GPU (12.6) |
+| 2026-10-27 | 6037ca2 | 28470553 | the same, single precision | **35.36 / 35.36** | **209.2** | against 36.28 / 36.20 (hold off; the SP carry assembled once from its columns is in both: 39.5 yesterday) |
+| 2026-10-27 | 6037ca2 | 28470554 | ncu on ONE GH200 (P=1, DP) with the holds | kernels 232.4 -> 218.1 | | the 23-tracer T* copy (13.0 + 4.3 ms at 0.68 TB/s) is gone; the T* fusion 6.6 ms at 2.66 TB/s (it reads the advection and both Redi terms fused); stage 1's result stack still tracer-minor, 14.0 ms at 0.42 TB/s, then transposed |
+| 2026-10-27 | 009ab2a | 28471929 | + stage 1's result stack held tracer-major (inside the wet select) | 62.36 / 62.34 | 118.7 | no change (A 65.49 / 65.43); ncu 28473168: the stack fusion still `f64[126858,47,31]{2,1,0}`, 14.0 ms at 0.42 TB/s: the constraint is a copy after it, its layout does not reach the producer |
+| 2026-10-27 | b9a916e | 28473598 | instead: stage 1's 31 updated columns each its own kernel before the stack (`optimization_barrier`, with the holds) | **60.05 / 60.06** | **123.2** | DP, against 65.73 / 65.78 in the same job (`FESOM_BGC_HOLD=0`); peak 11.5 GB/GPU |
+| 2026-10-27 | b9a916e | 28473598 | the same, single precision | **32.54 / 32.61** | **227.1** | against 36.32 / 36.39; 4.5x the physics-only step (7.2 ms) |
+| 2026-10-27 | b9a916e | 28473599 | ncu on ONE GH200 (P=1, DP) | kernels 218.1 -> 208.3 | | stage 1's stack 14.0 -> 6.2 ms (the columns 3.7 at 1.4-1.8 TB/s, the stack 2.5); left on top: ordered sums 30.1, horizontal Redi 21.9, limiter max/min 16.2, HO-LO flux 14.4 (all at 2.6-3.0 TB/s) |
+| 2026-10-27 | caf9c2d | 28476249 | full REcoM with the ordered sums OFF (`FESOM_ORDERED_SUMS=0`: atomic scatter-adds, and the limiter's max/min back to atomic `segment_max/min`) | 90.18 / 90.18 | 82.0 | DP +50 % against 60.01 / 60.06 in the same job; SP 46.33 / 46.41 against 32.57 / 32.57 (+42 %): unlike the physics in DP (+14 % for the ordered sums, job 28295452) they stay on for REcoM; the two parts not separated |
+| 2026-10-27 | c4b3b18 | 28486583 | **16 A100 (4 nodes), halo transports** (`time_nodes_a100.sbatch`, one allocation): full REcoM DP, padded / coloured / no exchanges | 47.71 / **40.17** / 24.41 | 155.0 / 184.1 / 303 | the exchanges cost 23.3 ms padded, 15.8 coloured: the BGC stack's exchanges (31 tracers a call) are bound by their bytes, and padded ships 1648 rows a shard per nod exchange where coloured ships 323 |
+| 2026-10-27 | c4b3b18 | 28486583 | the same, physics only, padded / coloured | **13.65** / 19.50 | 542 / 379 | the physics' small exchanges are bound by their latency: coloured's 6 rounds per exchange (6 ppermutes) lose to one all_to_all |
+| 2026-10-27 | 537339e | 28487014 | **the grouped transport** (`halo_transport: grouped`, `fesom_jax/halo_grouped.py`: the coloured rounds in one NCCL group, real rows only; fesom3_jax's), 16 A100, one allocation: full REcoM DP, padded / grouped / coloured | 47.59 / **32.72** / 39.66 | 155.4 / **226.1** / 186.5 | -31 % against padded; bitwise the coloured exchange forward on 16 A100 (`scripts/perf/grouped_check.py`; its vjp to 8.9e-16, the atomic scatter-add) |
+| 2026-10-27 | 537339e | 28487014 | the same, full REcoM SP, grouped | **30.53** | **242.3** | (padded SP 36.0 in job 28470091 at a70b24a) |
+| 2026-10-27 | 537339e | 28487014 | the same, physics only, padded / grouped | **13.60** / 15.06 | 544 / 491 | grouped +11 %: still slower than padded on the physics' small exchanges (coloured 19.5) |
+| 2026-10-27 | 81e7949 | 28489084 | 16 A100, one allocation: full REcoM DP, padded / grouped for the BGC exchanges only (`gpu.bgc_halo: grouped`) / grouped | 47.53 / 37.37 / **33.34** | 155.6 / 197.9 / **221.9** | in DP the physics' own exchanges (twice SP's bytes) gain from grouped too: every exchange grouped is best |
+| 2026-10-27 | 81e7949 | 28489084 | the same, full REcoM SP, padded / grouped for the BGC exchanges only | 32.92 / **28.72** | 224.7 / **257.6** | all grouped 30.53 (job 28487014): in SP the physics' small exchanges stay faster padded |
+| 2026-10-27 | 81e7949 | 28490129 | **one GH200 node** (NVLink, 1990 restart), A/B in one allocation: full REcoM DP, padded / grouped | **60.47 / 60.10** / 62.28 / 61.63 | 122.3 / 123.1 / 118.8 / 120.0 | grouped +2.8 % on one node: padded stays the one-node DP setting |
+| 2026-10-27 | 81e7949 | 28490129 | the same, SP: padded / grouped for the BGC exchanges only / grouped | 32.76 / 32.69, **32.15 / 32.09**, 32.62 / 32.54 | 225.8 / 226.3, **230.1 / 230.5**, 226.8 / 227.3 | BGC-only grouped -1.8 % on one node too; the library builds and runs on aarch64 |
+| 2026-10-26 | 73e2171 | 28439582 | the 1990 year with the dt ramp, DP (the SP twin's reference) | 143.8 | 51.5 | 1679 s for 11680 steps, monthly output, CMDBUF on; repeat 28439750: 1677 s, physics bitwise |
+| 2026-10-26 | 73e2171 | 28439583 | the same year, **single precision** | **102.4** | **72.3** | 1196 s; SP/DP 0.71 in the production loop |
+
+nsys of the k = 1 step (job 28430158, b8ff45c; kernels 122.3 ms/step per GPU, against 88.4 for the 31 passive
+tracers, job 28417424): ops helpers 40.0 ms (the ordered sums `ops.py:139 _ordered_chain` 31.6), tracer advection
+35.2 (the Zalesak limiter 24.4 of it), GM/Redi 15.4, `recom/sinking.py` 9.2 (`recom_tracer_loop_terms` 6.4),
+NCCL 6.0, `recom/sms.py` 4.2, halo packing 3.6, `recom/transport.py` 2.0, `recom/wiring.py` 0.8,
+`recom/carbonate.py` 0.4; an unmapped concatenate-transpose fusion 4.0. Reading: the carbonate system is cheap
+(0.4 ms); REcoM's own kernels (sources/sinks, sinking, benthos, glue) are ~17 ms; the rest of the increment over the
+passive profile is in the transport areas (advection +6.8, Redi +6.4, helpers +6.2; not yet attributed). The step
+stays transport-bound: the levers are `bgc_every` (k = 4: 157 SYPD) and the single-precision opt-in (Task 16), not
+the biology. ⚠️ The one-year job 28430160 ran with dt 2700 from the dt-1800 restart without `dt_ramp`, so its calendar
+was n*2700 s from 1958 (forcing year 2006, not 1990); its timing stands, its dates do not (rerun 28430951 with
+`dt: 1800` + `dt_ramp: {after_step: 561024, dt: 2700}`, as the se10 runs).

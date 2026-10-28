@@ -1,0 +1,46 @@
+# pi + REcoM verification physics (plan docs/plans/20261025-recom-port.md, Tasks 4b/5; lane P).
+#
+# The CORE2 production physics of configs/core2_full.yaml on the pi mesh (3140 nodes, 48 levels), forced by
+# JRA55-do from 1958-01-01 with FESOM2's l_mslp on. Its physics-matched Fortran FESOM2 + REcoM twin is the run
+# /work/ab0995/a270088/recom_ref/pi_30d_jan_jaxphys (namelists scripts/recom/fortran/namelists_jaxphys/,
+# docs/recom/FORTRAN_REFERENCE.md); the REcoM gates G4b/G5 compare against it.
+#
+# Physics choices that differ from core2_full.yaml, and why:
+#   mesh/partition  the packaged pi mesh (= FESOM2's test/meshes/pi), one device; FESOM2's pi dist_4 for sharded tests
+#   dt 2700         step_per_day 32, the REcoM pi setup's step (bin_2p3z2d runs 36; the parent plan fixed 32);
+#                   core2_full runs 1800 on CORE2
+#   forcing.mslp    on: REcoM's gas solubility reads the sea-level pressure, and l_mslp also adds its gradient to
+#                   the momentum equation (oce_ale_vel_rhs.F90:208), as bin_2p3z2d does. core2_full runs without it
+#   outputs         none by default (snapshot/checkpoint 0, no restart_out)
+# Everything else is core2_full's: zstar without w_split, GM/Redi with the JAX defaults (K_GM_max 1000, Redi_Kmax
+# 1000, ...), classical TKE (cvmix_TKE), mEVP (whichEVP 1, 120 subcycles, alpha = beta = 250, ice_diff 10),
+# opt_visc 7 with gamma0/1/2 = 0.003/0.1/0.285, MFCT/QR4C/FCT tracer advection with weights (0, 1), the CG SSH
+# solver (no split-explicit), no speed options, Sweeney chlorophyll, CORE2 runoff, PHC2 SSS restoring.
+#
+# The initial state: run_from_config cold-starts pi from the packaged pi T/S IC. The Fortran twin starts from the
+# 5-degree WOA18 T/S of FESOM2's test/input/recom, so the verification scripts start JAX from the Fortran step-0
+# state read from the dumps instead (scripts/recom/physics_floor.py).
+
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 2700.0
+
+mesh: null                # the packaged pi mesh (fesom_jax/data/mesh_pi)
+partition: null
+forcing:
+  kind: core2             # = JRA55-do (core2 is the historical name of the JRA55-do driver)
+  start_year: 1958
+  mslp: true              # FESOM2 l_mslp: JRA55-do psl -> press_air + the SLP gradient in the momentum RHS
+
+output_dir: runs/pi_recom
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+duration: 960step         # 30 days

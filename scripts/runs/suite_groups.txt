@@ -99,6 +99,7 @@ sharding fesom_jax/tests/test_forcing_sharded.py
 sharding fesom_jax/tests/test_gm_nn_sharded.py
 sharding fesom_jax/tests/test_gradient_sharded.py
 sharding fesom_jax/tests/test_halo.py
+sharding fesom_jax/tests/test_halo_grouped.py
 sharding fesom_jax/tests/test_mevp_frozen_sweep_sharded.py
 sharding fesom_jax/tests/test_mevp_wide_sharded.py
 sharding fesom_jax/tests/test_place_cache.py
@@ -180,3 +181,40 @@ ice fesom_jax/tests/test_precision.py
 unit fesom_jax/tests/test_precision_gpu.py
 sharding fesom_jax/tests/test_precision_shard.py
 scripts scripts/tests/test_compare_precision.py
+unit fesom_jax/tests/test_k33_weights.py
+unit fesom_jax/tests/test_physics_twin_pi.py
+# Classified 2026-10-25 (physics/upstream-944-1116, for the full-suite run): files merged without a manifest line
+core2 fesom_jax/tests/test_forcing_adj.py
+unit fesom_jax/tests/test_ice_static.py
+unit fesom_jax/tests/test_lane_order.py
+sharding fesom_jax/tests/test_mslp.py
+unit fesom_jax/tests/test_ops_ordered_vjp.py
+unit fesom_jax/tests/test_output_async.py
+unit fesom_jax/tests/test_recom_carbonate.py
+unit fesom_jax/tests/test_recom_dump_io.py
+unit fesom_jax/tests/test_recom_ic.py
+unit fesom_jax/tests/test_recom_params.py
+unit fesom_jax/tests/test_recom_sinking.py
+unit fesom_jax/tests/test_recom_sms.py
+unit fesom_jax/tests/test_recom_stage1.py
+sharding fesom_jax/tests/test_recom_transport.py
+core2 fesom_jax/tests/test_se_div_vjp.py
+sharding fesom_jax/tests/test_se_sharded.py
+core2 fesom_jax/tests/test_ssh_se.py
+unit fesom_jax/tests/test_transport_driver.py
+core2 scripts/tests/test_core2_adj_fast.py
+sharding scripts/tests/test_core2_adj_sharded.py
+core2 scripts/tests/test_fd_dirs.py
+sharding scripts/tests/test_fram_cost.py
+scripts scripts/tests/test_xs_ahead.py
+# Classified 2026-10-26 (recom/port, for the Task 17 full-suite run): the REcoM and forcing-ramp files added since
+# 2026-10-25; test_recom_step.py and test_recom_sp.py hold a dist_4 test each, so they run in `sharding`
+unit fesom_jax/tests/test_forcing_ramp.py
+core2 fesom_jax/tests/test_recom_core2.py
+unit fesom_jax/tests/test_recom_grad.py
+unit fesom_jax/tests/test_recom_inputs.py
+unit fesom_jax/tests/test_recom_co2.py
+unit fesom_jax/tests/test_recom_restart.py
+sharding fesom_jax/tests/test_recom_sp.py
+unit fesom_jax/tests/test_recom_stage3.py
+sharding fesom_jax/tests/test_recom_step.py

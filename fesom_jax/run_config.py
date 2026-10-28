@@ -70,6 +70,7 @@ from .config import DT_DEFAULT, TracerConfig, ViscConfig
 from .gm import GMConfig
 from .ice import IceConfig
 from .kpp import KppConfig
+from .recom.config import RecomConfig
 from .tke import TkeConfig
 
 
@@ -89,7 +90,7 @@ class DtRamp(NamedTuple):
 # Map each physics slot name → its sub-config type (the (de)serialization registry).
 _SUBCONFIGS = {
     "ale": AleConfig, "gm": GMConfig, "kpp": KppConfig,
-    "tke": TkeConfig, "ice": IceConfig,
+    "tke": TkeConfig, "ice": IceConfig, "recom": RecomConfig,
 }
 # Non-physics scalar/spec fields that pass through YAML verbatim.
 _SPEC_FIELDS = ("dt", "mesh", "partition", "precision", "forcing", "ssh", "gpu", "output_dir",
@@ -102,8 +103,15 @@ _ARCHIVE_PERIODS = ("year", "month", "day")
 # files live. The four path keys are optional overrides of the env var / Levante default
 # (:mod:`fesom_jax.paths`); absent ⇒ the reader resolves them itself. Strict-keyed like every
 # other block: an unknown key raises rather than being silently ignored.
+# `mslp` (bool, default false) is FESOM2's l_mslp: read the JRA55-do sea-level pressure (psl) and add its
+# gradient to the momentum equation (oce_ale_vel_rhs.F90:208); REcoM reads the same pressure for its gas
+# solubility, so a REcoM run requires it (validate).
+# `dust_file` (full REcoM): the Albani DustClim(months, nod2d) file of the mesh; absent ⇒ the REcoM namelist's
+# nm_fe_data_file when that is an absolute path (FESOM2 reads it from ClimateDataPath, which a run YAML does not have).
+# `co2_file` (full REcoM with constant_CO2 off): the AtmCO2_<year> monthly time series; absent ⇒ the namelist's
+# nm_co2_data_file when that is an absolute path (as dust_file).
 _FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path",
-                 "on_device")
+                 "on_device", "mslp", "dust_file", "co2_file")
 _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 # The `ssh:` mapping — SSH CG solver options. `cheb_degree` (int ≥1) enables the degree-k
 # Chebyshev polynomial preconditioner (CGPOLY, ssh.enable_cheb_precond) in place of the
@@ -137,7 +145,11 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "forcing_procs": "FESOM_FORCING_PROCS", "output_async": "FESOM_OUTPUT_ASYNC",
             "forcing_ahead": "FESOM_FORCING_AHEAD", "restart_async": "FESOM_RESTART_ASYNC",
             "se_wide": "FESOM_SE_WIDE", "se_unroll": "FESOM_SE_UNROLL", "step_unroll": "FESOM_STEP_UNROLL",
-            "ice_static": "FESOM_ICE_STATIC", "chunk_tail": "FESOM_CHUNK_TAIL"}
+            "ice_static": "FESOM_ICE_STATIC", "chunk_tail": "FESOM_CHUNK_TAIL", "bgc_layout": "FESOM_BGC_LAYOUT",
+            "bgc_halo": "FESOM_BGC_HALO"}
+# `bgc_layout`: how the REcoM tracer stage runs over the tracer axis (a string): "major" (default: one batched pass
+# over the stack held tracer-major in memory, one halo exchange per FCT stage), "vmap" (the batched pass over the
+# trailing tracer axis, XLA's layout) or "loop" (one tracer at a time, the reference; fesom_jax.recom.transport).
 # `se_wide` (an integer K >= 0): the sharded split-explicit substeps exchange once every K substeps on K+1-ring lanes
 # (fesom_jax.se_wide, FESOM_SE_WIDE; owned lanes bitwise the per-substep exchange on CPU); 0/1 = two exchanges per
 # substep. `se_unroll` (an integer u >= 1): u substeps per loop trip (ssh_se.se_unroll, FESOM_SE_UNROLL; round-off).
@@ -150,11 +162,15 @@ _GPU_INT = ("mevp_wide", "cg_batch", "mevp_unroll", "forcing_procs", "forcing_ah
             "step_unroll", "chunk_tail")
 # `chunk_tail` (an integer q >= 0): a chunk shorter than the chunk length whose length is a multiple of q runs as
 # q-chunks (run.split_tails, FESOM_CHUNK_TAIL): one compiled length less where month ends leave 2q.
+_GPU_STR = ("bgc_layout", "bgc_halo")        # string-valued switches, passed through as written
+_GPU_STR_VALUES = {"bgc_layout": ("major", "vmap", "loop"), "bgc_halo": ("grouped",)}
+# `bgc_halo`: "grouped" sends the BGC stack's halo exchanges by the grouped transport (fesom_jax.halo_grouped, GPU
+# only), the rest of the step's by `halo_transport`; unset: all by `halo_transport`.
 _GPU_HOST = ("lane_order", "halo_transport", "chunk_steps")   # applied by the driver itself, not environment switches
-# `halo_transport`: "all_gather" (default; `halo_compact` compacts it), "padded", "coloured" or "ragged" (the
-# --padded / --coloured / --ragged flags, which win). `chunk_steps` (an integer > 0): the chunk length (--chunk-steps
-# wins; 240 when neither is given).
-_HALO_TRANSPORTS = ("all_gather", "padded", "coloured", "ragged")
+# `halo_transport`: "all_gather" (default; `halo_compact` compacts it), "padded", "coloured", "grouped" (the coloured
+# rounds in one NCCL group, GPU only: fesom_jax.halo_grouped) or "ragged" (the --padded / --coloured / --ragged flags,
+# which win). `chunk_steps` (an integer > 0): the chunk length (--chunk-steps wins; 240 when neither is given).
+_HALO_TRANSPORTS = ("all_gather", "padded", "coloured", "grouped", "ragged")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -165,6 +181,7 @@ class RunConfig:
     kpp: Optional[KppConfig] = None        # None = PP mixing; KppConfig() = KPP
     tke: Optional[TkeConfig] = None        # None = no TKE (mutually exclusive with kpp)
     ice: Optional[IceConfig] = None        # None = no sea ice; IceConfig() = mEVP
+    recom: Optional[RecomConfig] = None    # None = no REcoM biogeochemistry (fesom_jax.recom)
     # --- promoted run-dependent scalars ---
     visc: ViscConfig = ViscConfig()        # the horizontal-viscosity γ's (NG5: gamma1=0.2)
     tracer: TracerConfig = TracerConfig()  # the tracer scheme selector (implemented = NG5)
@@ -204,6 +221,46 @@ class RunConfig:
         reader resolves it via ``$FESOM_*`` / the Levante default, :mod:`fesom_jax.paths`)."""
         f = self.forcing or {}
         return {k: f.get(k) for k in _FORCING_PATH_KEYS}
+
+    def bgc_dust_path(self):
+        """The Albani dust file for REcoM's per-step inputs (:class:`fesom_jax.surface_forcing.BgcForcing`), or None
+        unless full REcoM is on: ``forcing.dust_file``, else the namelist's ``nm_fe_data_file`` if it is an absolute
+        path. Asserts the ported dust switches (Albani dust, no aeolian N)."""
+        if self.recom is None or self.recom.mode != "full":
+            return None
+        sw, _ = self.recom.load()
+        if sw.fe_data_source != "Albani" or sw.useAeolianN:
+            raise NotImplementedError("REcoM's per-step inputs are ported for fe_data_source 'Albani' and "
+                                      "useAeolianN off only")
+        from pathlib import Path
+        path = (self.forcing or {}).get("dust_file") or sw.nm_fe_data_file
+        if not path or not Path(path).is_absolute():
+            raise ValueError(f"full REcoM needs the Albani dust file: set forcing.dust_file (the namelist's "
+                             f"nm_fe_data_file {sw.nm_fe_data_file!r} is relative to FESOM2's ClimateDataPath)")
+        return str(path)
+
+    def bgc_co2(self):
+        """REcoM's atmospheric CO2 time series (:class:`fesom_jax.surface_forcing.AtmCO2Series`) when full REcoM runs
+        with ``constant_CO2`` off, else None (``CO2_for_spinup``): the file ``forcing.co2_file``, else the namelist's
+        ``nm_co2_data_file`` if it is an absolute path; the cycle years from the namelist."""
+        if self.recom is None or self.recom.mode != "full":
+            return None
+        sw, _ = self.recom.load()
+        if sw.constant_CO2:
+            return None
+        from pathlib import Path
+        from .surface_forcing import AtmCO2Series
+        path = (self.forcing or {}).get("co2_file") or sw.nm_co2_data_file
+        if not path or not Path(path).is_absolute():
+            raise ValueError(f"constant_CO2 off needs the CO2 time series: set forcing.co2_file (the namelist's "
+                             f"nm_co2_data_file {sw.nm_co2_data_file!r} is relative to FESOM2's ClimateDataPath)")
+        return AtmCO2Series(path, first_year=sw.firstyearoffesomcycle, last_year=sw.lastyearoffesomcycle,
+                            n_cycles=sw.numofCO2cycles, cycle=sw.currentCO2cycle)
+
+    def forcing_mslp(self) -> bool:
+        """``forcing.mslp`` (FESOM2's ``l_mslp``): the sea-level pressure read and its momentum term on.
+        False when absent or the run is unforced."""
+        return bool((self.forcing or {}).get("mslp", False))
 
     def load_params(self):
         """The differentiable :class:`~fesom_jax.params.Params` this run's ``params_file``
@@ -255,7 +312,7 @@ class RunConfig:
         """The environment switches the ``gpu:`` block turns on, ``{name: "1"}`` (empty when off).
         :func:`fesom_jax.run.run_from_config` sets them for the run; an explicit environment
         setting wins, so ``FESOM_HALO_COMPACT=0`` still A/B-tests a config that turns it on."""
-        return {_GPU_ENV[k]: (str(int(v)) if k in _GPU_INT else "1")
+        return {_GPU_ENV[k]: (str(int(v)) if k in _GPU_INT else str(v) if k in _GPU_STR else "1")
                 for k, v in (self.gpu or {}).items() if v and k not in _GPU_HOST}
 
     def lane_order(self):
@@ -274,6 +331,30 @@ class RunConfig:
     def validate(self) -> None:
         """Cross-field validity (mirrors the in-kernel guards, fail-fast at config load)."""
         from .precision import PRECISIONS
+        if isinstance(self.forcing, dict) and not isinstance(self.forcing.get("mslp", False), bool):
+            raise TypeError(f"forcing.mslp must be true or false, got {self.forcing['mslp']!r}")
+        # REcoM's CO2 and O2 solubility read press_air, which is zero without l_mslp, and a zero air pressure
+        # outgasses CO2 and O2 without limit (recom_main.F90:326-336). The passive-tracer transport mode
+        # (recom.passive_tracers > 0) runs no chemistry and keeps the physics of the run as it is.
+        if (self.recom is not None and getattr(self.recom, "passive_tracers", 0) <= 0
+                and not self.forcing_mslp()):
+            raise ValueError("recom needs forcing.mslp: true (FESOM2's l_mslp): REcoM's CO2 and O2 solubility read "
+                             "the sea-level pressure, which is zero without it, and a zero air pressure outgasses "
+                             "CO2 and O2 without limit (recom_main.F90:326-336). l_mslp also adds the SLP gradient "
+                             "to the momentum equation, as in FESOM2-REcoM (bin_2p3z2d)")
+        if self.recom is not None:
+            self.recom.validate()
+            if self.recom.mode == "full":
+                if self.ale is None:
+                    raise NotImplementedError("full REcoM is ported for zstar (ale: {}) only")
+                # single precision + full REcoM: an opt-in deviation (FESOM2 refuses USE_SINGLE_PRECISION with
+                # RECOM_COUPLED), the #1207 tracer scheme for the BGC stack, REcoM in float64; bgc_every 1 only
+                # (plan 20261026-recom-lane-sp). The production-physics guard below applies as for every SP run.
+                if self.precision != "double" and int(self.recom.bgc_every) != 1:
+                    raise NotImplementedError("precision: single with full REcoM needs recom.bgc_every: 1 (the "
+                                              "BGC-every-k sums and k-step stage have no single-precision scheme)")
+                if self.forcing is None:
+                    raise ValueError("full REcoM needs the forced path (forcing: with mslp: true)")
         if self.precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {self.precision!r}")
         if self.precision == "single":
@@ -333,6 +414,9 @@ class RunConfig:
                 if k in _GPU_INT:
                     if isinstance(v, bool) or not isinstance(v, int) or v < 0:
                         raise TypeError(f"gpu.{k} must be an integer >= 0, got {v!r}")
+                elif k in _GPU_STR:
+                    if v not in _GPU_STR_VALUES[k]:
+                        raise ValueError(f"gpu.{k} must be one of {_GPU_STR_VALUES[k]}, got {v!r}")
                 elif not isinstance(v, bool):
                     raise TypeError(f"gpu.{k} must be true or false, got {v!r}")
         if self.ice is not None:
@@ -364,8 +448,11 @@ class RunConfig:
         """The per-step physics config kwargs for :func:`fesom_jax.step.step` /
         :func:`fesom_jax.integrate.integrate` / ``run_steps_sharded`` (everything but ``dt``,
         which the driver ramps via :meth:`dt_at`)."""
-        return dict(ice_cfg=self.ice, gm_cfg=self.gm, kpp_cfg=self.kpp, tke_cfg=self.tke,
-                    ale_cfg=self.ale_cfg(), visc_cfg=self.visc, tracer_cfg=self.tracer)
+        kw = dict(ice_cfg=self.ice, gm_cfg=self.gm, kpp_cfg=self.kpp, tke_cfg=self.tke,
+                  ale_cfg=self.ale_cfg(), visc_cfg=self.visc, tracer_cfg=self.tracer)
+        if self.recom is not None:      # only when on: a runner without REcoM support then refuses it loudly
+            kw["recom_cfg"] = self.recom
+        return kw
 
     def dt_at(self, step: int) -> float:
         """The timestep at absolute ``step`` index, honoring :attr:`dt_ramp`."""
@@ -404,6 +491,8 @@ class RunConfig:
         kw: dict = {}
         for name, sub_cls in _SUBCONFIGS.items():
             kw[name] = _build_sub(d.get(name), sub_cls, name)
+        if kw.get("recom") is not None and isinstance(kw["recom"].output, list):   # YAML list -> hashable tuple
+            kw["recom"] = kw["recom"]._replace(output=tuple(kw["recom"].output))
         if d.get("visc") is not None:
             kw["visc"] = _build_sub(d["visc"], ViscConfig, "visc")
         if d.get("tracer") is not None:
