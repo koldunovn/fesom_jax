@@ -387,8 +387,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
 
     ``cycle_start`` (OMIP forcing cycles, as fesom3-jax's tools/run_cycles.py): the state of
     ``cfg.restart_in`` with the clock set back to step 0 (1 January of ``year``), the AB2 history,
-    the ice counters and the split-explicit rings carried on as in any restart. The restart must
-    have been written at ``cfg.dt``; a ``dt_ramp`` is refused (its step would restart the ramp)."""
+    the ice counters and the split-explicit rings carried on as in any restart. A restart written at another
+    dt (a cycle run at a smaller dt, or the cycle after it) re-bootstraps AB2 on the first step, as after a
+    ``dt_ramp``; a ``dt_ramp`` is refused (its step would restart the ramp)."""
     cfg.validate()
     _t_entry = time.perf_counter()          # progress prints are relative to entry, not node uptime
     # Working precision (fesom_jax.precision): "double" leaves every program as it was; "single" repeats FESOM2's
@@ -520,6 +521,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         state0 = _rw.with_bgc_state(state0, _rw.cold_ic(mesh, cfg.recom), cfg.recom)
         if jax.process_index() == 0:
             print(f"[run] recom: cold-start BGC state from the {cfg.recom.ic_set} IC ({cfg.recom.ic_dir})", flush=True)
+    ab2_carried = True          # False only for a cycle start from a restart written at another dt
     if state0 is not None:
         state_p = shard_mesh.partition_state(state0, part)   # [P, Lmax] HOST
         folded_in = False
@@ -533,12 +535,13 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if cycle_start:
             if cfg.dt_ramp:
                 raise ValueError("cycle_start with a dt_ramp: the ramp's step would count from the cycle start")
-            if float(meta.get("dt_stage", cfg.dt)) != float(cfg.dt):
-                raise ValueError(f"cycle_start: the restart was written at dt {meta.get('dt_stage')}, the run "
-                                 f"has dt {cfg.dt}; its AB2 history belongs to the other dt")
+            # the AB2 history was formed at the restart's dt: at another dt the first step re-bootstraps it
+            ab2_carried = float(meta.get("dt_stage", cfg.dt)) == float(cfg.dt)
             if jax.process_index() == 0:
                 print(f"[run] cycle_start: the state of {cfg.restart_in} (step {start_step}, "
-                      f"{meta.get('calendar_date')}) with the clock at 1 January {year}, AB2 carried on",
+                      f"{meta.get('calendar_date')}) with the clock at 1 January {year}, "
+                      + ("AB2 carried on" if ab2_carried else
+                         f"written at dt {meta.get('dt_stage')}, run at dt {cfg.dt}: AB2 re-bootstrapped"),
                       flush=True)
             start_step = 0
     else:
@@ -626,7 +629,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         raise ValueError("run_from_config: set cfg.n_steps or cfg.duration")
     cs = int(chunk_steps) if chunk_steps else max(1, n_steps)
     _archive_targets = set()
-    _restarted = state0 is None and cfg.restart_in is not None   # a restart never re-bootstraps AB2 at step 0
+    # a restart does not re-bootstrap AB2 at step 0, unless it is a cycle start from a restart written at another dt
+    _restarted = state0 is None and cfg.restart_in is not None and ab2_carried
     if unforced:
         # No forcing reader to roll and no calendar streams ⇒ no boundary splits; and the bare
         # runner has no folded-chaining/bootstrap plumbing, so an unforced run is ONE chunk

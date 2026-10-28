@@ -442,7 +442,8 @@ def test_cycle_start(core2_setup, tmp_path):
     the clock at step 0 and AB2 carried on. With the forcing injected, the clock only names the steps, so the cycle
     start must be BITWISE the plain continuation of the same restart over the same forcing; a restart whose step is
     rewritten to 0 without ``cycle_start`` cold-bootstraps AB2 instead and must differ. The run counts its steps from
-    0 (``res.step``) and names its archival restart by the cycle's calendar."""
+    0 (``res.step``) and names its archival restart by the cycle's calendar. A cycle start at another dt re-bootstraps
+    AB2, so it must be bitwise that step-0 restart at the same dt."""
     import json
     import shutil
     from fesom_jax import zarr_output
@@ -476,9 +477,14 @@ def test_cycle_start(core2_setup, tmp_path):
     worst_boot = _owned_worst(a, unfold_state(boot.state_p, 1), fx["part"], fx["sm"], 1)
     assert worst_boot > 0.0, "a step-0 restart without cycle_start must re-bootstrap AB2"
 
-    with pytest.raises(ValueError, match="dt"):           # AB2 history of another dt
-        run_from_config(RunConfig(n_steps=m, restart_in=str(r), kpp=KppConfig(), dt=2 * DT), forcing=fx["cf"],
-                        forcing_stack=stack0, cycle_start=True, **common)
+    kw2 = dict(kpp=KppConfig(), dt=2 * DT)                # a restart of another dt: AB2 re-bootstrapped
+    stack2 = fx["cf"].stack(_chunk_dates(YEAR, 2 * DT, 0, m, None))
+    cyc2 = run_from_config(RunConfig(n_steps=m, restart_in=str(r), **kw2), forcing=fx["cf"], forcing_stack=stack2,
+                           cycle_start=True, **common)
+    boot2 = run_from_config(RunConfig(n_steps=m, restart_in=str(r0), **kw2), forcing=fx["cf"], forcing_stack=stack2,
+                            **common)
+    worst2 = _owned_worst(unfold_state(cyc2.state_p, 1), unfold_state(boot2.state_p, 1), fx["part"], fx["sm"], 1)
+    assert worst2 == 0.0, f"a cycle start at another dt != the step-0 restart at that dt ({worst2:.2e})"
     print(f"CYCLE_START_OK (bitwise the continuation; the bootstrap differs by {worst_boot:.2e})")
 
 
