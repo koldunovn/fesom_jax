@@ -129,6 +129,17 @@ twin loader. Nothing in the physics reads a BGC tracer. REcoM requires zstar, th
 `forcing.mslp: true` (sea-level pressure feeds gas solubility), and `with_recom_static` constants.
 `bgc_every > 1` and single precision are stated deviations from FESOM2, not faithful modes.
 
+**The spectral fork (branch `recom-spectral`).** The port of `sveta-loza/fesom2`
+`fesom2.6_recom_tra_diags_spectral` (4 phytoplankton groups, CDOM, 13-band OASIM light) lives next to the 692f804
+code and is selected by the namelist: a `namelist.recom` with an `&spectral` group is the fork flavour
+(`params.RecomSwitches.spectral_fork`, `layout.layout_of` gives its 22-37-tracer layouts), `wiring.full_bgc_step`
+then runs `sms_fork.py`/`stage1.recom_sources_sinks_fork`, the layout-aware `sinking.py`, and with
+`RecomConfig.spectral` the light of `spectral.py` from the OASIM fields `oasim.py` reads (`forcing.oasim_dir`).
+Configs `configs/albedo/pi_recom_spectral.yaml`, `core2_recom_spectral.yaml`; gates `test_recom_*_fork.py`,
+`test_recom_spectral_*.py` against the fork's own twins (`docs/recom/VALIDATION.md`, the plan
+`docs/plans/20261028-recom-spectral-port.md`). The fork's FESOM2 base needs `legacy_k33_weights`,
+`legacy_fct_bounds` and its own level files in a twin gate. The 692f804 programs stay byte-identical.
+
 **Adjoint toolkit.** `adjoint.py`, `adjoint_sharded.py`, `adjoint_check.py`, `adjoint_costs.py`,
 `longwindow.py`, `calibrate.py`, `eki.py`, `tke_nn.py`, `gm_nn.py`; drivers under
 `scripts/adjoint/` and `scripts/paper/`. Gradients are trustworthy only over hours to days (chaos);
