@@ -233,14 +233,19 @@ def reconstruct_global(out_dir, field: str):
 # Device-count-portable restart (Task A1) — the FULL prognostic State, gid-keyed
 # --------------------------------------------------------------------------
 def _all_state_fields() -> tuple[str, ...]:
-    """Every :class:`~fesom_jax.state.State` leaf name, in pytree order.
+    """Every REQUIRED :class:`~fesom_jax.state.State` leaf name, in pytree order: every field
+    except the optional ``State.ICE_AVG_FIELDS`` (None unless ``ice_ave_steps > 1``) and ``State.SE_FIELDS``
+    (None unless ``ssh.split_explicit``): the restart writes them when present and :func:`read_restart` reads them
+    when the store has them.
 
     Derived from the dataclass (the State pytree is flat — every field is one array
     leaf) so a newly-added leaf is captured automatically: this is the no-silent-drop
     guarantee the restart needs (NOT a ``*_old`` name-glob, which would miss
-    ``uv_rhsAB`` / ``sigma*`` / ``tke``)."""
-    from .state import State
-    return tuple(f.name for f in dataclasses.fields(State))
+    ``uv_rhsAB`` / ``sigma*`` / ``tke``). Every reader that loops over it to rebuild a State
+    (``core2_adj.load_state``, ...) keeps working on restarts with and without the optional
+    fields."""
+    from .state import ICE_AVG_FIELDS, SE_FIELDS, State
+    return tuple(f.name for f in dataclasses.fields(State) if f.name not in ICE_AVG_FIELDS + SE_FIELDS)
 
 
 def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_stage,
@@ -267,7 +272,15 @@ def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_st
     restart was written at — persisted so a resumed run knows whether it is mid-dt-ramp
     (a dt change across a restart invalidates the AB2 history; the driver re-bootstraps).
     Returns the store path."""
-    fields = tuple(fields) if fields is not None else _all_state_fields()
+    if fields is None:      # every present leaf: the SP carry, ICE_AVG_FIELDS and SE_FIELDS only when they exist
+        from .state import ICE_AVG_FIELDS, SE_FIELDS
+        fields = tuple(n for n in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS
+                       if getattr(state_folded, n) is not None)
+    fields = tuple(fields)
+    # On disk always float64 (FESOM2: netCDF restarts are double in both builds); a single-precision
+    # State is widened exactly. A double-precision State is returned unchanged by the cast.
+    from .precision import cast_tree
+    state_folded = cast_tree(state_folded, keep64=True)
     meta = {"is_restart": 1, "step": int(step),
             "calendar_date": str(calendar_date), "dt_stage": float(dt_stage)}
     if attrs:
@@ -349,8 +362,17 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     jmesh = halo.device_mesh("p", devices=devs)
     sharding = NamedSharding(jmesh, PartitionSpec("p"))
 
+    from .precision import CARRY_FIELDS
+    from .state import ICE_AVG_FIELDS, SE_FIELDS
     out = {}
-    for name in _all_state_fields():
+    for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS:
+        if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS and name not in root:
+            # written by single-precision runs only (the carry), or an ice_ave_steps field the writer did not
+            # use (ice_ave_steps == 1, or a restart from before Task 12): None; ice_step.init_ice_avg gives
+            # the latter the upstream init values. The split-explicit rings: only an SE run writes them
+            # (ssh_se.init_state then decides: flat rings for a CG restart into SE)
+            out[name] = None
+            continue
         g = reconstruct_global(out_dir, name)            # [n_global, …] host numpy
         n0 = g.shape[0]
         if n0 == new_part.nod2D:

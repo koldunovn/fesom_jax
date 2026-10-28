@@ -153,6 +153,50 @@ def mld_field(state, mesh, *, invalid: str = "column", ref_depth: float = 10.0,
 
 
 # ---------------------------------------------------------------------------
+# sea-ice export through a latitude band (the Fram Strait cost)
+
+#: the Fram Strait band: latitude and longitude limits [deg], the band width [m] (1 degree of latitude)
+FRAM_BAND = dict(lat=(78.5, 79.5), lon=(-20.0, 12.0), width=111.2e3)
+#: 1 m3/s as km3 per year (365.25 days)
+M3S_TO_KM3YR = 365.25 * 86400.0 / 1e9
+
+
+def south_vector(mesh):
+    """``(sx, sy)`` per node: the geographic SOUTHWARD unit vector in the model's rotated frame (``jra55._vector_g2r``
+    of (0, -1), the forcing's wind rotation, with jnp trig so a sharded run builds it from its local lanes inside
+    the shard_map)."""
+    from .jra55 import _rotation_matrix, _vector_g2r
+    glon, glat = mesh.geo_coord_nod2D[:, 0], mesh.geo_coord_nod2D[:, 1]
+    rlon, rlat = mesh.coord_nod2D[:, 0], mesh.coord_nod2D[:, 1]
+    trig = tuple(f(x) for x in (glat, glon, rlat, rlon) for f in (jnp.sin, jnp.cos))    # jra55._g2r_trig's order
+    return _vector_g2r(0.0, -1.0, glon, glat, rlon, rlat, _rotation_matrix(), trig=trig)
+
+
+def band_flux_weights(mesh, *, lat, lon, width):
+    """``(wx, wy)`` per node: the southward export through a latitude band as a node sum. A node in the band (its
+    geographic position) gets ``area / width`` (its share of the band's length) times :func:`south_vector` (a pad
+    lane's coordinates, 1 rad (the shard pad value), lie outside any polar band), 0 elsewhere. ``wx u + wy v`` of a
+    model-frame node velocity times a thickness is then the node's export [m3/s]."""
+    from .config import RAD
+    glon, glat = mesh.geo_coord_nod2D[:, 0], mesh.geo_coord_nod2D[:, 1]
+    lat_d = glat / RAD
+    lon_d = jnp.mod(glon / RAD + 180.0, 360.0) - 180.0
+    inb = (lat_d >= lat[0]) & (lat_d <= lat[1]) & (lon_d >= lon[0]) & (lon_d <= lon[1])
+    sx, sy = south_vector(mesh)
+    w = jnp.where(inb, mesh.area[:, 0] / width, 0.0)
+    return w * sx, w * sy
+
+
+def ice_export_field(state, mesh, band=None):
+    """``[nod2D]`` southward sea-ice VOLUME export through ``band`` (default :data:`FRAM_BAND`) per node [m3/s]: the
+    ice volume per area ``m_ice`` times the node velocity's component along the band's southward normal, times the
+    node's share of the band (:func:`band_flux_weights`); 0 off the band. Its node sum is the band's export."""
+    b = FRAM_BAND if band is None else band
+    wx, wy = band_flux_weights(mesh, **b)
+    return state.m_ice * (wx * state.u_ice + wy * state.v_ice)
+
+
+# ---------------------------------------------------------------------------
 # running accumulators
 
 
@@ -180,6 +224,35 @@ def with_running_costs(step_fn: Callable[[Any, Any], Any],
         state, acc = carry
         new = step_fn(state, x)
         return new, {k: acc[k] + fn(new) for k, fn in accs.items()}
+
+    return wrapped
+
+
+def month_params(params, month):
+    """``params`` whose ``forcing_adj`` maps carry a leading window-month axis (``[M, …]``, the monthly atmospheric
+    controls) cut to ``month`` (a traced int): the ``[…]`` anomaly the step adds. Without maps, ``params``."""
+    adj = getattr(params, "forcing_adj", None)
+    if adj is None:
+        return params
+    import dataclasses
+    return dataclasses.replace(params, forcing_adj={k: jnp.take(v, month, axis=0) for k, v in adj.items()})
+
+
+def with_schedule(step_fn: Callable[[Any, Any, Any], Any], accumulators: Mapping[str, Callable[[Any], Any]]):
+    """Like :func:`with_running_costs` for a chunk whose ``xs`` are ``(step_forcing, sched)`` per step, ``sched =
+    {"month": int, "cost_w": float}`` (the window month of the step and the cost weight): ``step_fn(state,
+    step_forcing, month) -> state``; each accumulator adds ``cost_w * fn(new_state)`` (a cost over part of the
+    window: weight 0 outside it). Without accumulators the carry is the State."""
+    accs = dict(accumulators)
+
+    def wrapped(carry, x):
+        sf, sch = x
+        if not accs:
+            return step_fn(carry, sf, sch["month"])
+        state, acc = carry
+        new = step_fn(state, sf, sch["month"])
+        w = sch["cost_w"]
+        return new, {k: acc[k] + w * fn(new) for k, fn in accs.items()}
 
     return wrapped
 

@@ -508,6 +508,36 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
     )
 
 
+def with_inverse_maps(sm: ShardedMesh) -> ShardedMesh:
+    """``sm`` with the ordered-sum inverse maps (``gpu.ordered_sums``; :data:`fesom_jax.mesh.INVERSE_MAP_FIELDS`)
+    added to ``fields``: per device from its LOCAL connectivity (``-1`` = not on the device, pad lanes
+    ``-1``), ``[P, Lmax_target, D]`` with one ``D`` for all devices, and the sentinel position
+    ``Lmax_row * 2|3`` (the flattened local index array's length, the same on every device). They fold and
+    shard like the other entity fields (``integrate_sharded.folded_mesh``). Already present ⇒ ``sm``."""
+    from .mesh import INVERSE_MAP_FIELDS
+    from .ops import inverse_map
+    if all(name in sm.fields for name, _, _ in INVERSE_MAP_FIELDS):
+        return sm
+    fields = dict(sm.fields)
+    for name, src, tgt in INVERSE_MAP_FIELDS:
+        conn = sm.fields[src]                                   # [P, Lmax_row, k] local ids
+        per = [inverse_map(conn[d], sm.Lmax[tgt]) for d in range(sm.P)]
+        D = max(m.shape[1] for m in per)
+        fields[name] = np.stack([np.pad(m, ((0, 0), (0, D - m.shape[1])), constant_values=conn[d].size)
+                                 for d, m in enumerate(per)])
+    return dataclasses.replace(sm, fields=fields)
+
+
+def with_se_tables(sm: ShardedMesh, mesh: Mesh, partition: Partition) -> ShardedMesh:
+    """``sm`` with the split-explicit SSH tables (:data:`fesom_jax.ssh_se.TABLE_FIELDS`) on each device's local lanes
+    (:func:`fesom_jax.ssh_se.shard_tables`), ``[P, Lmax_kind, …]``; they fold and shard like the other entity fields.
+    Needed only by a run with ``ssh.split_explicit``; already present ⇒ ``sm``."""
+    from .ssh_se import TABLE_FIELDS, shard_tables
+    if all(name in sm.fields for name in TABLE_FIELDS):
+        return sm
+    return dataclasses.replace(sm, fields={**sm.fields, **shard_tables(mesh, partition, sm.Lmax)})
+
+
 def build_serial_sharded_mesh(mesh: Mesh) -> ShardedMesh:
     """Convenience: the ``npes==1`` sharded mesh (uses :func:`synth_serial`)."""
     return build_sharded_mesh(mesh, synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D))
@@ -550,6 +580,9 @@ def partition_state(state, partition: Partition):
     _, Lmax = local_sizes(partition)
     out = {}
     for f in dataclasses.fields(State):
+        if getattr(state, f.name) is None:          # the SP carry in a double State, an unused ICE_AVG_FIELDS
+            out[f.name] = None
+            continue
         arr = np.asarray(getattr(state, f.name))
         n0 = arr.shape[0]
         if n0 == partition.nod2D:
@@ -600,10 +633,15 @@ def partition_step_forcing(sf, partition: Partition):
     return StepForcing(**out)
 
 
-def partition_forcing_tables(ft, partition: Partition):
+def partition_forcing_tables(ft, partition: Partition, *, folded: bool = False):
     """Gather a :class:`~fesom_jax.surface_forcing.ForcingTables` to per-device padded
     form: every leaf's (last) ``nod2D`` axis is sharded (``[…, nod2D]`` →
-    ``[P, …, Lmax_nod]``), the small table axes are preserved."""
+    ``[P, …, Lmax_nod]``), the small table axes are preserved.
+
+    ``folded`` ⇒ the leaves come out as the sharded runner's input ``[…, P*Lmax_nod]`` (what
+    ``integrate_sharded._fold_forcing_tables`` makes of the ``[P, …]`` form, the same values), each
+    device's lanes taken straight into place: one copy of the ~0.2 GB a CORE2 chunk's tables hold
+    instead of four (take, pad, stack, and the fold's moveaxis copy on the main thread)."""
     from .surface_forcing import ForcingTables
 
     _, Lmax = local_sizes(partition)
@@ -611,8 +649,18 @@ def partition_forcing_tables(ft, partition: Partition):
     for name in ft._fields:
         arr = np.asarray(getattr(ft, name))
         ax = _node_axis(arr.shape, partition.nod2D)
-        out[name] = _shard_along_axis(arr, partition.myList_nod2D, Lmax["nod"],
-                                      ax, _default_pad(arr.dtype))
+        if folded:
+            if ax != arr.ndim - 1:
+                raise ValueError(f"folded tables need the node axis last, {name} has shape {arr.shape}")
+            P, L = len(partition.myList_nod2D), Lmax["nod"]
+            buf = np.full(arr.shape[:-1] + (P, L), _default_pad(arr.dtype), dtype=arr.dtype)
+            for p, ml in enumerate(partition.myList_nod2D):
+                ml = np.asarray(ml)
+                np.take(arr, ml, axis=-1, out=buf[..., p, :ml.size], mode="clip")
+            out[name] = buf.reshape(arr.shape[:-1] + (P * L,))
+        else:
+            out[name] = _shard_along_axis(arr, partition.myList_nod2D, Lmax["nod"],
+                                          ax, _default_pad(arr.dtype))
     return ForcingTables(**out)
 
 

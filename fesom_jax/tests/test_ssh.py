@@ -409,3 +409,61 @@ def test_grad_flows_du_to_eta_n(mesh, chain):
     g = np.asarray(jax.grad(loss)(du))
     assert np.all(np.isfinite(g))
     assert np.max(np.abs(g)) > 0
+
+
+@pytest.mark.parametrize("k", [2, 4, 7])
+def test_cg_batch_same_iterate_count_and_gradient(mesh, chain, k, monkeypatch):
+    """``FESOM_CG_BATCH=k`` (k masked iterations per while-loop trip) returns the one-at-a-time CG's iterate
+    and iteration count bit for bit, and the same solve and gradient through ``solve_ssh``."""
+    from fesom_jax.config import MAXITER, SOLTOL
+    _, _, ssh_rhs, op = chain
+    x0 = jnp.zeros_like(ssh_rhs)
+
+    def run():
+        pcg = jax.jit(lambda b: ssh._pcg(lambda x: ssh.ssh_matvec(op, x), lambda r: ssh.ssh_precond(op, r),
+                                         b, x0, SOLTOL, MAXITER, return_iters=True))(ssh_rhs)
+        sol = jax.jit(lambda b: ssh.solve_ssh(op, b, dt=DT))(ssh_rhs)
+        grad = jax.jit(jax.grad(lambda b: jnp.sum(ssh.solve_ssh(op, b, dt=DT) ** 2)))(ssh_rhs)
+        return pcg, sol, grad
+
+    monkeypatch.setenv("FESOM_CG_BATCH", "1")
+    (x1, *_, it1), sol1, g1 = run()
+    monkeypatch.setenv("FESOM_CG_BATCH", str(k))
+    (xk, *_, itk), solk, gk = run()
+    assert int(itk) == int(it1) > 1      # pi converges in 3: k > 3 masks inside the first trip
+    np.testing.assert_array_equal(np.asarray(xk), np.asarray(x1))
+    np.testing.assert_array_equal(np.asarray(solk), np.asarray(sol1))
+    np.testing.assert_array_equal(np.asarray(gk), np.asarray(g1))
+
+
+def test_cg_batch_rejects_zero(monkeypatch):
+    monkeypatch.setenv("FESOM_CG_BATCH", "0")
+    with pytest.raises(ValueError, match="FESOM_CG_BATCH"):
+        ssh.cg_batch()
+
+
+_POWER_LAM_SCRIPT = """
+import numpy as np, scipy.sparse as sp
+from fesom_jax.ssh import _power_lam
+n = 126858                                    # the CORE2 node count: large enough for a threaded BLAS
+d = np.random.default_rng(1).uniform(1.0, 3.0, n)
+A = sp.diags([-np.ones(n - 1), 2.0 * d, -np.ones(n - 1)], [-1, 0, 1], format="csr")
+print(_power_lam(A, n, 20).hex())
+"""
+
+
+def test_cheb_power_lam_independent_of_host_threads():
+    """``lam_max`` (baked into the program as the Chebyshev coefficients) is the same float with 1
+    and 16 host BLAS/OpenMP threads; with BLAS ``nrm2`` it moved by an ulp between 32- and 64-CPU
+    jobs (the SP branch's DP-lock hash mismatch)."""
+    import os
+    import subprocess
+    import sys
+    out = []
+    for t in ("1", "16"):
+        env = dict(os.environ, OMP_NUM_THREADS=t, OPENBLAS_NUM_THREADS=t, MKL_NUM_THREADS=t,
+                   JAX_PLATFORMS="cpu")
+        r = subprocess.run([sys.executable, "-c", _POWER_LAM_SCRIPT], env=env, capture_output=True,
+                           text=True, check=True)
+        out.append(r.stdout.strip().splitlines()[-1])
+    assert out[0] == out[1], out

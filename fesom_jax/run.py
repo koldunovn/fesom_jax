@@ -29,15 +29,18 @@ noted, not yet wired (de-risk on the smaller meshes first per the run plan).
 from __future__ import annotations
 
 import datetime
+import functools
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 import jax
 import numpy as np
 
-from . import shard_mesh, ssh, ushow_output, zarr_output
+from . import ops, shard_mesh, ssh, ushow_output, zarr_output
+from . import ice_wide
 from .integrate_sharded import folded_state, run_steps_sharded, run_steps_sharded_forced
 from .run_config import RunConfig
 
@@ -110,6 +113,24 @@ def plan_chunks(n_steps: int, chunk_steps: int, *, start_step: int = 0, dt_ramp=
         chunks.append(Chunk(start=s, count=stop - s, dt=float(cdt), bootstrap_ab2=boot))
         s = stop
     return chunks
+
+
+def split_tails(chunks: list, chunk_steps: int, tail: int) -> list:
+    """``gpu.chunk_tail`` (``FESOM_CHUNK_TAIL=q``; 0 = off): a chunk shorter than ``chunk_steps`` whose length is a
+    multiple of ``q`` runs as chunks of ``q``, so a run compiles at most the lengths ``chunk_steps`` and ``q`` (and the
+    others a boundary leaves). CORE2 at dt 2700 has 32 steps a day: month ends leave 32 or 64 steps after the
+    96-chunks, and with ``q = 32`` the leap February's 64 runs as two 32-chunks, one compile less (~1 min). A chain of
+    chunks is the continuous run (the restart-seam invariant); output means add their sums in another order."""
+    if tail <= 0:
+        return chunks
+    out = []
+    for c in chunks:
+        if c.count < chunk_steps and c.count > tail and c.count % tail == 0:
+            out += [Chunk(start=c.start + i * tail, count=tail, dt=c.dt, bootstrap_ab2=c.bootstrap_ab2 and i == 0)
+                    for i in range(c.count // tail)]
+        else:
+            out.append(c)
+    return out
 
 
 def _elapsed_seconds(n: int, dt0: float, dt_ramp=None) -> float:
@@ -201,6 +222,14 @@ def _period_boundaries(year: int, dt: float, start_step: int, n_steps: int,
     return bounds
 
 
+def _first_lane_int(a) -> int:
+    """The first lane of a lane-replicated integer State field (``ice_steps_since_upd``) on the host: from this
+    process's first shard when the array is device-sharded (multi-process safe), else from the host array."""
+    if isinstance(a, jax.Array):
+        a = a.addressable_shards[0].data
+    return int(np.asarray(a).ravel()[0])
+
+
 def _archive_tag(yr: int, doy: int, sec: float) -> str:
     """``fesom.<YYYY>.<DDD>.<SSSSS>`` — mirrors FESOM3's archival-checkpoint folder name
     (``mod_io_restart.F90``) exactly: year, day-of-year, second-of-day, all zero-padded, so
@@ -285,6 +314,29 @@ class RunResult(NamedTuple):
     dt_stage: float     # the dt the run ended at (persisted for resume)
 
 
+def _with_gpu_env(fn):
+    """Run ``fn(cfg, ...)`` with the config's ``gpu:`` switches (:meth:`RunConfig.gpu_env`) in the
+    environment, where the step reads them at trace time, and restore the environment afterwards
+    so one run's options never leak into the next in the same process. A switch already set in
+    the environment is left as it is (an explicit A/B setting wins over the config)."""
+    @functools.wraps(fn)
+    def wrapped(cfg, *args, **kw):
+        env = cfg.gpu_env()
+        old = {k: os.environ.get(k) for k in env}
+        for k, v in env.items():
+            os.environ.setdefault(k, v)
+        try:
+            return fn(cfg, *args, **kw)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    return wrapped
+
+
+@_with_gpu_env
 def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=None,
                     params=None,
                     state0=None, forcing_stack=None, start_step=0, year=1958,
@@ -296,7 +348,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                     restart_archive_length=1,
                     daily_out=None, daily_start_step=0,
                     monthly_out=None, monthly_start_step=0, chunk_diagnostics=False,
-                    output_layout="global"):
+                    output_layout="global", budget=False):
     """Run a configured forward integration: load → chunked forced steps → write restart.
 
     Components may be **injected** (the test path / a pre-building driver) or built from ``cfg``.
@@ -327,6 +379,18 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     restart (if also set) is unaffected."""
     cfg.validate()
     _t_entry = time.perf_counter()          # progress prints are relative to entry, not node uptime
+    # Working precision (fesom_jax.precision): "double" leaves every program as it was; "single" repeats FESOM2's
+    # single-precision build — the forcing in point-slope form (#940), the SP preconditioner variant (#995), the
+    # chunk programs in float32 with the WP_full islands (run_steps_sharded_forced).
+    precision = cfg.precision
+    _precond_variant = 1 if precision == "single" else 0
+    if precision == "single":
+        for _f in (forcing, getattr(local_forcing, "cf", None)):
+            if _f is not None:
+                _f.point_slope = True
+        if jax.process_index() == 0:
+            print("[run] precision=single (FESOM2 #1207 policy; forcing point-slope, SSH precond variant 1)",
+                  flush=True)
     npes = part.npes
     # Differentiable parameters: injected, else read from cfg.params_file (trained gm_nn weights),
     # else None ⇒ the runners' own Params.defaults() path, byte-identical to a pre-seam run. Read
@@ -379,6 +443,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                              "plain restart_out.")
         if local_forcing is not None:
             raise ValueError("local_forcing needs cfg.forcing (a calendar forcing)")
+        if cfg.ssh_gathered():
+            raise ValueError("ssh.gathered is wired into the forced runner only; the unforced "
+                             "demo runner keeps the sharded CG.")
         if cfg.restart_in is not None:
             raise ValueError("forcing: null supports cold starts only — the unforced runner "
                              "has no restart-continuation path (it would re-bootstrap AB2)")
@@ -387,6 +454,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                              "is a forced-path feature)")
     if sm is None:
         sm = shard_mesh.build_sharded_mesh(mesh, part)
+    if ops.ordered_sums_enabled():          # gpu.ordered_sums: per-device inverse maps, built once
+        sm = shard_mesh.with_inverse_maps(sm)
 
     # The SSH operator is dt-DEPENDENT (the implicit-solve matrix), so a dt-ramp run needs a fresh
     # operator for the post-ramp dt — cache one per dt (the injected `sop` covers cfg.dt).
@@ -394,14 +463,39 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
 
     def _sop_for(d):
         if sop is not None and d == cfg.dt:
+            if ssh.ssh_ell_enabled() and not sop.ell:       # an injected operator, re-laid once
+                if "injected" not in _sop_cache:
+                    _sop_cache["injected"] = ssh.to_ell_sharded(sop)
+                return _sop_cache["injected"]
             return sop
         if d not in _sop_cache:
-            op_d = ssh.build_ssh_operator(mesh, dt=d)
+            op_d = ssh.build_ssh_operator(mesh, dt=d, precond_variant=_precond_variant)
             deg, kap = cfg.ssh_cheb()
             if deg:                       # CGPOLY (ssh.cheb_degree): Chebyshev precond
                 op_d = ssh.enable_cheb_precond(op_d, deg, kappa_guess=kap)
             _sop_cache[d] = ssh.partition_ssh_operator(op_d, part)
+            if ssh.ssh_ell_enabled():
+                _sop_cache[d] = ssh.to_ell_sharded(_sop_cache[d])
         return _sop_cache[d]
+
+    # ssh.gathered (opt-in): the global operator + lane tables of the gathered solve, per dt
+    # like _sop_for (same Chebyshev setting ⇒ the same operator the sharded CG would use).
+    _gather_cache = {}
+
+    def _gather_for(d):
+        if not cfg.ssh_gathered():
+            return None
+        if d not in _gather_cache:
+            op_d = ssh.build_ssh_operator(mesh, dt=d, precond_variant=_precond_variant)
+            deg, kap = cfg.ssh_cheb()
+            if deg:
+                op_d = ssh.enable_cheb_precond(op_d, deg, kappa_guess=kap)
+            if cfg.ale is not None and ssh.ssh_inc_ell_enabled():
+                op_d = ssh.with_increment(op_d, mesh)
+            if ssh.ssh_ell_enabled():
+                op_d = ssh.to_ell(op_d)
+            _gather_cache[d] = ssh.build_ssh_gather(op_d, mesh, part)
+        return _gather_cache[d]
 
     # --- initial State: cold = HOST [P,Lmax]; resume = FOLDED [P*Lmax] device (read_restart) ---
     # The State is kept FOLDED through the chunk loop + restart (no [P,Lmax]↔[P*Lmax] reshape, which
@@ -412,10 +506,45 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         folded_in = False
     elif cfg.restart_in is not None:
         state_p, meta = zarr_output.read_restart(cfg.restart_in, mesh, part, devices=devices)
+        if precision == "double":       # a restart written in single precision carries the rounding carry
+            from .precision import drop_carry
+            state_p = drop_carry(state_p)
         folded_in = True                                     # read_restart returns folded [P*Lmax]
         start_step = int(meta.get("step", start_step))
     else:
         raise ValueError("run_from_config: provide state0 (cold IC) or cfg.restart_in")
+    # ice_ave_steps > 1: the ice counter, running means and held fluxes — from the restart when it
+    # carries them (resume mid-cycle), else the upstream init values; None when ice_ave_steps == 1
+    from .ice_step import init_ice_avg
+    state_p = init_ice_avg(state_p, cfg.ice)
+    # ssh.split_explicit (fesom_jax.ssh_se): the CG/SE restart guard (an SE restart into a CG run is refused), the
+    # rings (kept from an SE restart = the exact resume; flat for a cold start or a CG restart, announced), the
+    # per-device SE tables, and the CFL guard (power iteration on the 2-D operator; raises below M_min).
+    _se_cfg = cfg.split_explicit()
+    if _se_cfg is not None or getattr(state_p, "se_eta", None) is not None:
+        from . import ssh_se
+        from .integrate_sharded import _fold
+        _lm = sm.fields["elem_layer_mask"]
+        state_p = ssh_se.init_state(state_p, _fold(_lm) if folded_in else _lm, _se_cfg,
+                                    restart=state0 is None,
+                                    log=(lambda s: print(s, flush=True)) if jax.process_index() == 0 else
+                                    (lambda s: None))
+    if _se_cfg is not None:
+        sm = shard_mesh.with_se_tables(sm, mesh, part)
+        for _d in sorted({float(cfg.dt)} | ({float(cfg.dt_ramp.dt)} if cfg.dt_ramp else set())):
+            _line = ssh_se.cfl_guard(mesh, _d, _se_cfg)[3]
+            if jax.process_index() == 0:
+                print(f"[run] {_line}", flush=True)
+    # gpu.ice_static (FESOM_ICE_STATIC=1, ice_ave_steps > 1): each chunk's ice update steps are fixed at trace time
+    # from the counter the State carries in (read here once, then advanced on the host chunk by chunk), so the
+    # forced scan has no lax.cond and no per-step host sync (integrate_sharded.run_steps_sharded_forced ice_phase)
+    ice_phase = None
+    if (os.environ.get("FESOM_ICE_STATIC", "0").strip() not in ("", "0") and cfg.ice is not None
+            and int(cfg.ice.ice_ave_steps) > 1):
+        ice_phase = _first_lane_int(state_p.ice_steps_since_upd)
+        if jax.process_index() == 0:
+            print(f"[run] ice_static: the ice branch at trace time, counter {ice_phase} of "
+                  f"{int(cfg.ice.ice_ave_steps)} at the start", flush=True)
 
     # --- run length + chunk plan ------------------------------------------
     if cfg.n_steps is not None:
@@ -452,6 +581,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             _split += list(_archive_targets)
         chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt,
                              split_at=sorted(set(_split)))
+        chunks = split_tails(chunks, cs, int(os.environ.get("FESOM_CHUNK_TAIL", "0") or 0))
 
     fs_p = None if unforced else shard_mesh.partition_forcing_static(forcing.static, part)
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)
@@ -466,6 +596,35 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         bn = np.asarray(ice_evp.boundary_node_mask(mesh))   # GLOBAL [nod2D] bool (device→host, ~MB)
         boundary_node_p = shard_mesh._shard_along_axis(
             bn, part.myList_nod2D, sm.Lmax["nod"], 0, False)
+
+    # gpu.mevp_wide (FESOM_MEVP_WIDE, set from the config by _with_gpu_env; an explicit environment
+    # value wins): the sharded mEVP exchanges once every K subcycles on K-ring ice lanes
+    # (fesom_jax.ice_wide; owned lanes bitwise the per-subcycle exchange on CPU). Built once per run.
+    mevp_wide = None
+    _K_wide = ice_wide.mevp_wide_from_env()
+    if _K_wide >= 2 and npes >= 2:
+        if cfg.ice is None or cfg.ice.whichEVP != 1:
+            raise ValueError(f"gpu.mevp_wide={_K_wide} needs the mEVP sea ice (ice.whichEVP: 1)")
+        if unforced:
+            raise ValueError("gpu.mevp_wide is wired into the forced runner only")
+        mevp_wide = ice_wide.build_mevp_wide(mesh, part, sm, _K_wide)
+        if jax.process_index() == 0:
+            print(f"[run] mevp_wide: K={_K_wide} (one mEVP exchange every {_K_wide} subcycles)",
+                  flush=True)
+
+    # gpu.se_wide (FESOM_SE_WIDE): the sharded split-explicit substeps exchange once every K substeps on K+1-ring
+    # lanes (fesom_jax.se_wide; owned lanes bitwise the per-substep exchange on CPU). Built once per run.
+    se_wide = None
+    from . import se_wide as se_wide_mod
+    _K_se = se_wide_mod.se_wide_from_env()
+    if _K_se >= 2 and npes >= 2:
+        if _se_cfg is None:
+            raise ValueError(f"gpu.se_wide={_K_se} needs the split-explicit SSH (ssh.split_explicit)")
+        if unforced:
+            raise ValueError("gpu.se_wide is wired into the forced runner only")
+        se_wide = se_wide_mod.build_se_wide(mesh, part, sm, _K_se)
+        if jax.process_index() == 0:
+            print(f"[run] se_wide: K={_K_se} (one SE exchange every {_K_se} substeps)", flush=True)
 
     # --- chunk loop -------------------------------------------------------
     # `progress` (diagnostic, default off ⇒ no behavior change): flushed per-chunk timing split
@@ -510,13 +669,63 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # node order (write_global_zarr; xarray/ushow read it directly, byte-identical at any device
     # count); 'folded' = the gather-free sharded [P*Lmax] write (write_ushow_sharded) — the multi-
     # node / output-OOM path. Both take the same (path, {name: folded field}, sm, part, mesh).
-    def _emit_ushow(path, fields_dict, attrs, time_days=None):
+    def _emit_now(path, fields_dict, attrs, time_days=None):
         if output_layout == "folded":
             ushow_output.write_ushow_sharded(path, fields_dict, sm, part, mesh, attrs=attrs,
                                              time_days=time_days)
         else:
             ushow_output.write_global_zarr(path, fields_dict, sm, part, mesh, attrs=attrs,
                                            time_days=time_days)
+
+    # Output on one background thread (gpu.output_async / FESOM_OUTPUT_ASYNC=1, CORE2 GPU speed plan; fesom3-jax
+    # b5d6ca2): the period mean is formed on the main thread (an elementwise device op, no collective); the thread
+    # copies it to the host and writes the store, in order, while the next chunks run. The same bytes on disk.
+    # gpu.restart_async (FESOM_RESTART_ASYNC=1) puts the calendar archival restarts on a thread of their own (the
+    # State's arrays are not donated, so the thread reads the chunk's result while the next chunks run): a restart
+    # store takes 2-40 s on /work, and the month's output must not queue behind it (one shared thread held the loop
+    # 10-28 s at every year end, job 28321119). restart.latest moves only after its store is complete, and the
+    # end-of-run restarts wait for the restart thread first. Single process only (a multi-process write synchronises
+    # the processes). At most two writes in flight per thread (each holds a host copy).
+    def _env_on(name):
+        return os.environ.get(name, "0").strip() not in ("", "0")
+    _output_async, _restart_async = _env_on("FESOM_OUTPUT_ASYNC"), _env_on("FESOM_RESTART_ASYNC")
+    if (_output_async or _restart_async) and jax.process_count() > 1:
+        raise ValueError("gpu.output_async / gpu.restart_async (FESOM_OUTPUT_ASYNC / FESOM_RESTART_ASYNC) "
+                         "are single-process only")
+
+    class _WriteQueue:
+        """One background writer thread; its writes run in order, at most two in flight."""
+
+        def __init__(self):
+            self.pool, self.inflight = ThreadPoolExecutor(max_workers=1), []
+
+        def submit(self, fn, *args):
+            while self.inflight and (self.inflight[0].done() or len(self.inflight) >= 2):
+                self.inflight.pop(0).result()                # in order; re-raises a failed write
+            self.inflight.append(self.pool.submit(fn, *args))
+
+        def drain(self):
+            while self.inflight:
+                self.inflight.pop(0).result()
+
+        def close(self):
+            self.pool.shutdown(wait=True)
+            self.drain()
+    _out_q = _WriteQueue() if _output_async else None
+    _rst_q = _WriteQueue() if _restart_async else None
+
+    def _emit_ushow(path, fields_dict, attrs, time_days=None):
+        if _out_q is None:
+            return _emit_now(path, fields_dict, attrs, time_days)
+        _out_q.submit(_emit_now, path, fields_dict, attrs, time_days)
+
+    def _archive_in_background(sp, step, dtv):
+        tw = time.perf_counter()
+        # the global layout gathers on the host anyway: fetch here, no device work from this thread
+        tag = _write_archive_restart(jax.device_get(sp) if restart_layout == "global" else sp, step, dtv)
+        if progress:
+            print(f"[run.progress] archival restart @ step {step} -> {restart_archive_out}/{tag} "
+                  f"({time.perf_counter() - tw:.1f}s, background)", flush=True)
 
     # TRUE time-mean output streams (daily / monthly). Each names the fields to average; the chunk scan
     # sums them over EVERY step (out_sample_fn below) and the mean divides by the step count — a real
@@ -612,8 +821,13 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
 
     t_loop0 = time.perf_counter()
     cur_year = int(year)                     # the year the forcing reader was built for
-    for ci, ch in enumerate(chunks):
-        tc0 = time.perf_counter()
+
+    def _build_forcing(ch):
+        """This chunk's forcing input ``(seq_p, tab_p, sched)`` (``tab_p``/``sched`` only for the
+        on-device tables, ``seq_p`` otherwise). Rolls the reader's year, so calls must come in
+        chunk order."""
+        nonlocal cur_year
+        seq_p = tab_p = sched = None
         # Roll the forcing reader to this chunk's CALENDAR YEAR if it changed (calendar paths only;
         # chunks never straddle a year boundary — plan_chunks split_at=_year_boundaries). reopen_year
         # swaps only the per-year file handles and KEEPS the interpolation stencil (year-independent).
@@ -642,7 +856,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 tab_p, sched = local_forcing.stack_tables_partitioned(_dates, nb=nb)
             else:
                 tables, sched = forcing.stack_tables(_dates, nb=nb)
-                tab_p = shard_mesh.partition_forcing_tables(tables, part)
+                tab_p = shard_mesh.partition_forcing_tables(tables, part, folded=True)
             seq_p = None
         elif local_forcing is not None:
             # LOCAL forcing build (the NG5 host-forcing fix): interpolate ONLY this process's
@@ -656,6 +870,27 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             # partition_step_forcing can shard it (the forcing analog of the host-IC fix).
             seq = forcing.stack(_chunk_dates(year, cfg.dt, ch.start, ch.count, cfg.dt_ramp), xp=np)
             seq_p = shard_mesh.partition_step_forcing(seq, part)
+        return seq_p, tab_p, sched
+
+    # Forcing PREFETCH (CORE2 GPU speed plan A6): chunk i+1's forcing is built on ONE worker thread
+    # while chunk i runs. The chunk call blocks the host (the CG's while loop syncs it every
+    # iteration), so the serial build sat between chunks: 13 ms/step of 84 on CORE2 4 A100. One
+    # worker ⇒ the same reads in the same order (year roll included) ⇒ bitwise the serial run.
+    # FESOM_FORCING_PREFETCH=0 turns it off.
+    # FESOM_FORCING_AHEAD / gpu.forcing_ahead = N chunks in preparation (default 1; fesom3-jax 4d53de6 uses 2): a
+    # long chunk after a month end's short one no longer waits for its forcing. Still one worker, in chunk order.
+    prefetch = os.environ.get("FESOM_FORCING_PREFETCH", "1") != "0" and len(chunks) > 1
+    ahead = max(1, int(os.environ.get("FESOM_FORCING_AHEAD", "1") or 1))
+    pool = ThreadPoolExecutor(max_workers=1) if prefetch else None
+    pending = [pool.submit(_build_forcing, c) for c in chunks[:ahead]] if prefetch else None
+    for ci, ch in enumerate(chunks):
+        tc0 = time.perf_counter()
+        if prefetch:
+            seq_p, tab_p, sched = pending.pop(0).result()
+            if ci + ahead < len(chunks):
+                pending.append(pool.submit(_build_forcing, chunks[ci + ahead]))
+        else:
+            seq_p, tab_p, sched = _build_forcing(ch)
         tc_host = time.perf_counter()
         if unforced:
             # The bare (unforced) sharded runner: single chunk (asserted above), cold [P,Lmax]
@@ -669,7 +904,8 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 boundary_node_p=boundary_node_p, **cfg.physics_kwargs())
             state_p, acc_sum = folded_state(_out)[0], None
         else:
-            _fkw = (dict(forcing_tables=tab_p, forcing_sched=sched, forcing_const=fdc_p)
+            _fkw = (dict(forcing_tables=tab_p, forcing_sched=sched, forcing_const=fdc_p,
+                         forcing_tables_folded=local_forcing is None)
                     if (forcing_on_device and seq_p is None) else {})
             _chunk_out = run_steps_sharded_forced(
                 sm, state_p, _sop_for(ch.dt), stress_p, seq_p, fs_p, ch.count, dt=ch.dt, npes=npes,
@@ -677,17 +913,22 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 bootstrap_ab2=ch.bootstrap_ab2, state_is_folded=folded_in, return_folded=True,
                 use_ragged=use_ragged, use_padded=use_padded, use_coloured=use_coloured,
                 boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
-                sample_fn=out_sample_fn, **_fkw, **cfg.physics_kwargs())
+                sample_fn=out_sample_fn, ssh_gather=_gather_for(ch.dt), mevp_wide=mevp_wide,
+                precision=precision, se_wide=se_wide, **({} if ice_phase is None else {"ice_phase": ice_phase}),
+                **_fkw,
+                **cfg.physics_kwargs())
             # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else the final state.
             state_p, acc_sum = _chunk_out if out_sample_fn is not None else (_chunk_out, None)
         folded_in = True                                     # the scan output is folded [P*Lmax]
+        if ice_phase is not None:
+            ice_phase = (ice_phase + ch.count) % int(cfg.ice.ice_ave_steps)
         step_now = ch.start + ch.count
         if progress:
             jax.block_until_ready(state_p)
             now = time.perf_counter()
             print(f"[run.progress] chunk {ci + 1}/{len(chunks)} step{ch.start}->{ch.start+ch.count} "
-                  f"host={tc_host - tc0:.1f}s device={now - tc_host:.1f}s "
-                  f"(loop elapsed {now - t_loop0:.0f}s)", flush=True)
+                  f"host={tc_host - tc0:.3f}s device={now - tc_host:.3f}s "
+                  f"(loop elapsed {now - t_loop0:.2f}s)", flush=True)
         # per-chunk health TRAJECTORY (diagnostic, default off ⇒ no behavior change). Gather-free
         # scalar reductions on the FOLDED sharded State after each chunk ⇒ with small chunks this is
         # a max|uv|/max|eta| curve over the run, so a slow blow-up (e.g. the dars dt=180 2Δx velocity
@@ -710,6 +951,14 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                       f"max|eta|={d['max_abs_eta']:.4g} T[{d['T_min']:.3g},{d['T_max']:.3g}] "
                       f"|T|max@k={klev}({Tk:.3g}) |T|surf={Tsurf:.3g} max_cfl_z={cflz:.3g} "
                       f"n_nonfinite={d['n_nonfinite']}", flush=True)
+        if budget:
+            # the single-precision conservation gate: float64 global volume / salt / heat content after every
+            # chunk (host gather of the folded State — a diagnostic for gate runs, not for speed runs)
+            from .diagnostics import budget_sums
+            bs = budget_sums(state_p, sm, cfg.ice)
+            if jax.process_index() == 0:
+                print(f"[budget] step {step_now} " + " ".join(f"{k}={v:.17e}" for k, v in bs.items()),
+                      flush=True)
         if accumulate_stats:
             leaves = {k: getattr(state_p, k) for k in stats_fields}   # already folded [P*Lmax]
             stats = (zarr_output.OnlineStats.init(leaves) if stats is None
@@ -742,16 +991,23 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         # once, avoiding a redundant double-write at the same step).
         if (restart_archive_out is not None and ci < len(chunks) - 1
                 and step_now in _archive_targets):
-            if progress:
-                jax.block_until_ready(state_p)
-            tw = time.perf_counter()
-            tag = _write_archive_restart(state_p, step_now, ch.dt)
-            if progress:
-                print(f"[run.progress] archival restart @ step {step_now} -> "
-                      f"{restart_archive_out}/{tag} ({time.perf_counter() - tw:.1f}s)", flush=True)
+            if _restart_async:
+                _rst_q.submit(_archive_in_background, state_p, step_now, ch.dt)
+            else:
+                if progress:
+                    jax.block_until_ready(state_p)
+                tw = time.perf_counter()
+                tag = _write_archive_restart(state_p, step_now, ch.dt)
+                if progress:
+                    print(f"[run.progress] archival restart @ step {step_now} -> "
+                          f"{restart_archive_out}/{tag} ({time.perf_counter() - tw:.1f}s)", flush=True)
+    if pool is not None:
+        pool.shutdown(wait=True)
 
     end_step = start_step + n_steps
     end_dt = chunks[-1].dt if chunks else cfg.dt
+    if _restart_async:
+        _rst_q.drain()               # the archival restarts in flight land before the final ones move restart.latest
 
     # --- write the final portable restart (state_p is already folded [P*Lmax]) ---
     if target is not None:
@@ -779,4 +1035,10 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # flush the final (partial) calendar period so the last day/month of the run/job is written too
     for _stream in streams:
         _stream.flush()
+    for _q in (_out_q, _rst_q):
+        if _q is not None:
+            _q.close()
+    if ice_phase is not None and _first_lane_int(state_p.ice_steps_since_upd) != ice_phase:
+        raise RuntimeError(f"ice_static: the State's ice counter {_first_lane_int(state_p.ice_steps_since_upd)} "
+                           f"is not the host's {ice_phase} at the end of the run")
     return RunResult(state_p=state_p, stats=stats, step=end_step, dt_stage=float(end_dt))

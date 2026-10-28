@@ -66,7 +66,7 @@ def test_serial_noop_array_equal(mesh):
     assert sm.Lmax == {"nod": mesh.nod2D, "elem": mesh.elem2D, "edge": mesh.edge2D}
     for f in dataclasses.fields(Mesh):
         name = f.name
-        if f.metadata.get("static") or name in _DENSE_SKIP:
+        if f.metadata.get("static") or name in _DENSE_SKIP or getattr(mesh, name) is None:
             continue
         dense = np.asarray(getattr(mesh, name))
         got = sm.fields[name] if name in shard_mesh.REPLICATED_FIELDS else sm.fields[name][0]

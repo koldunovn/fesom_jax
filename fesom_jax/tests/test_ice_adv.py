@@ -103,3 +103,47 @@ def test_fct_ad_finite(fct):
         return jnp.sum(ao + mo + mso)
     g2 = np.asarray(jax.grad(loss_u)(u))
     assert np.all(np.isfinite(g2)) and np.any(g2 != 0.0)
+
+
+def test_fct_derivative_options(fct):
+    """The derivative-only FCT options (``IceConfig.adjoint_cuts`` "fct_limiter", "fct_flux")
+    leave the forward bitwise unchanged. With ``freeze_limited_flux`` the tangent of every
+    tracer, in m_in and in u_ice, is the tangent of the low-order solution; with
+    ``freeze_limiter`` it differs from the full one only where the limiter is active."""
+    import jax
+    import jax.numpy as jnp
+    from fesom_jax.ice import IceConfig
+    from fesom_jax import ice_adv
+    mesh, col, _outs = fct
+    cfg = IceConfig(scale_area=2.0e8)        # the dump's value (see test_fct_ad_finite)
+    a_in = jnp.asarray(col["a_in"]); m_in = jnp.asarray(col["m_in"])
+    ms_in = jnp.asarray(col["ms_in"]); u = jnp.asarray(col["u_ice"]); v = jnp.asarray(col["v_ice"])
+    rng = np.random.default_rng(5)
+    dm = jnp.asarray(rng.standard_normal(mesh.nod2D)) * 1e-2
+    du = jnp.asarray(rng.standard_normal(mesh.nod2D)) * 1e-2
+    prim = (a_in, m_in, ms_in, u, v)
+    tan = (jnp.zeros_like(a_in), dm, jnp.zeros_like(ms_in), du, jnp.zeros_like(v))
+
+    def jvp(**kw):
+        f = lambda a, m, ms, uu, vv: ice_adv.fct_solve(cfg, mesh, a, m, ms, uu, vv, **kw)  # noqa: E731
+        return jax.jvp(f, prim, tan)
+
+    def low(a, m, ms, uu, vv):
+        rm, ra, rms = ice_adv._tg_rhs(cfg, mesh, uu, vv, a, m, ms)
+        return ice_adv._solve_low_order(cfg, mesh, a, m, ms, ra, rm, rms)
+
+    out0, t0 = jvp()
+    out1, t1 = jvp(freeze_limited_flux=True)
+    out2, t2 = jvp(freeze_limiter=True)
+    _, t_low = jax.jvp(low, prim, tan)
+    for x, y, z in zip(out0, out1, out2):
+        assert np.asarray(x).tobytes() == np.asarray(y).tobytes() == np.asarray(z).tobytes()
+    for name, x, y in zip(("a", "m", "ms"), t1, t_low):
+        assert np.all(np.isfinite(np.asarray(x)))
+        np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=0, atol=1e-15, err_msg=name)
+    m_full, m_frz = np.asarray(t0[1]), np.asarray(t2[1])
+    changed = m_full != m_frz
+    print(f"[fct options] freeze_limiter changes the m tangent on {changed.sum()} of "
+          f"{mesh.nod2D} nodes; low-order tangent max |dm| {np.abs(np.asarray(t1[1])).max():.3e} "
+          f"vs full {np.abs(m_full).max():.3e}")
+    assert np.all(np.isfinite(m_frz)) and changed.any() and not changed.all()

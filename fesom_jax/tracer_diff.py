@@ -51,6 +51,7 @@ from __future__ import annotations
 import jax.numpy as jnp
 
 from . import ops
+from . import precision as PR
 from .config import DT_DEFAULT
 from .mesh import Mesh
 
@@ -66,15 +67,25 @@ def _shift_up(x):
 
 
 def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT,
-                       bc_surf=None, sw_3d=None, Z3d=None):
+                       bc_surf=None, sw_3d=None, Z3d=None, carry=None):
     """Per-node implicit vertical diffusion of one tracer. Returns the updated
     tracer ``[nod2D, nl]`` (``diff_ver_part_impl_ale``, ``fesom_tracer_diff.c:85``).
 
     ``bc_surf`` (``[nod2D]`` or ``None``) is the surface forcing increment added to the
     surface layer's RHS (``bc_surface``, ``:290``). ``sw_3d`` (``[nod2D, nl]`` or
     ``None``) is the shortwave flux whose per-layer divergence is added to every valid
-    layer's RHS (T tracer only, ``:298-308``). Both ``None`` ⇒ the Phase-2 path."""
+    layer's RHS (T tracer only, ``:298-308``). Both ``None`` ⇒ the Phase-2 path.
+
+    ``carry`` (single precision, FESOM2 #1206): the column — coefficients, rhs and the Thomas sweep — runs in
+    float64 (``oce_ale_tracer.F90:1074-1082``; ``Z3d`` and ``hnode_new`` are float64 here), the tracer is rounded
+    once, ``T' = f32(T + dT)``, and the residual returns through the carry, ``carry += f32((T + dT − T')·hnode_new)``
+    (``:1615-1622``). Returns ``(T', carry)`` then."""
     nl = mesh.nl
+    T_in = T
+    if carry is not None:
+        T, Kv = PR.full(T), PR.full(Kv)
+        bc_surf = None if bc_surf is None else PR.full(bc_surf)
+        sw_3d = None if sw_3d is None else PR.full(sw_3d)
     # Layer-center spacings dZ. Static column-uniform ``mesh.Z`` or — under zstar (JZ.6) —
     # the per-node live mid-depths ``Z3d`` (the C builds zbar_n/Z_n from hnode_new,
     # ``tracer_diff.c:148-158``). ``Z3d=None`` ⇒ static, byte-identical.
@@ -91,8 +102,10 @@ def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT,
     dZ_up = jnp.where(dZ_up == 0.0, 1.0, dZ_up)
     dZ_dn = jnp.where(dZ_dn == 0.0, 1.0, dZ_dn)
 
-    area = mesh.area
+    area = mesh.area if carry is None else PR.full(mesh.area)
     safe_av = jnp.where(mesh.areasvol > 0.0, mesh.areasvol, 1.0)
+    if carry is not None:
+        safe_av = PR.full(safe_av)
 
     a_full = -Kv * dt / dZ_up * (area / safe_av)
     c_full = -_shift_up(Kv) * dt / dZ_dn * (_shift_up(area) / safe_av)
@@ -125,11 +138,16 @@ def impl_vert_diff_one(mesh: Mesh, T, Kv, hnode_new, *, dt: float = DT_DEFAULT,
         rhs = rhs + jnp.where(valid, sw_div, 0.0)
 
     dT = ops.tdma(a, b, c, rhs)
+    if carry is not None:
+        acc = T + ops.mask_below_bottom(dT, valid)
+        Tn = PR.wp(acc)
+        carry = carry + jnp.where(valid, PR.wp((acc - PR.full(Tn)) * hnode_new), 0.0)
+        return jnp.where(valid, Tn, T_in), carry
     return T + ops.mask_below_bottom(dT, valid)
 
 
 def impl_vert_diff(mesh: Mesh, T, S, Kv, hnode_new, *, dt: float = DT_DEFAULT,
-                   bc_T=None, bc_S=None, sw_3d=None, Z3d=None):
+                   bc_T=None, bc_S=None, sw_3d=None, Z3d=None, carry_T=None, carry_S=None):
     """Diffuse both tracers with the same ``Kv`` (``fesom_impl_vert_diff_tracers``,
     ``fesom_tracer_diff.c:338``). Returns ``(T_new, S_new)``.
 
@@ -137,5 +155,10 @@ def impl_vert_diff(mesh: Mesh, T, S, Kv, hnode_new, *, dt: float = DT_DEFAULT,
     is the shortwave flux applied to **T only** (``None`` ⇒ off). All ``None`` ⇒ the
     Phase-2 pi path (bit-identical). ``Z3d`` (zstar live mid-depths from ``hnode_new``;
     ``None`` ⇒ static, byte-identical) re-points the layer-center spacings (JZ.6)."""
+    if carry_T is not None:        # single precision: ((T', carry_T), (S', carry_S))
+        return (impl_vert_diff_one(mesh, T, Kv, hnode_new, dt=dt, bc_surf=bc_T, sw_3d=sw_3d, Z3d=Z3d,
+                                   carry=carry_T),
+                impl_vert_diff_one(mesh, S, Kv, hnode_new, dt=dt, bc_surf=bc_S, sw_3d=None, Z3d=Z3d,
+                                   carry=carry_S))
     return (impl_vert_diff_one(mesh, T, Kv, hnode_new, dt=dt, bc_surf=bc_T, sw_3d=sw_3d, Z3d=Z3d),
             impl_vert_diff_one(mesh, S, Kv, hnode_new, dt=dt, bc_surf=bc_S, sw_3d=None, Z3d=Z3d))

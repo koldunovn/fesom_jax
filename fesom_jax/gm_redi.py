@@ -45,7 +45,7 @@ def tr_xy_elem(mesh: Mesh, T_old):
 
 
 def diff_ver_part_redi_expl(mesh: Mesh, T_old, slope_tapered, Ki, hnode_new,
-                            *, dt: float = DT_DEFAULT, zbar3=None, Z3d=None):
+                            *, dt: float = DT_DEFAULT, zbar3=None, Z3d=None, content: bool = False):
     """G7a — the Redi vertical-explicit flux's contribution to T.
 
     Returns ``delta`` ``(N, nl)`` to ADD to the post-advection T. Per node:
@@ -64,7 +64,7 @@ def diff_ver_part_redi_expl(mesh: Mesh, T_old, slope_tapered, Ki, hnode_new,
     cy = jnp.where(mesh.elem_layer_mask, area_e * gy, 0.0)
     stacked = jnp.stack([cx, cy], axis=-1)                     # (E,nl,2)
     vals = jnp.broadcast_to(stacked[:, None, :, :], (E, 3, nl, 2))
-    txn_sum = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D)   # (N,nl,2)
+    txn_sum = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)   # (N,nl,2)
     asv = mesh.areasvol
     inv3 = jnp.where(asv > 0.0, 1.0 / (3.0 * jnp.where(asv > 0.0, asv, 1.0)), 0.0)
     txn = txn_sum * inv3[..., None]                            # (N,nl,2)
@@ -103,6 +103,9 @@ def diff_ver_part_redi_expl(mesh: Mesh, T_old, slope_tapered, Ki, hnode_new,
     vd_dn = jnp.concatenate([vd_flux[:, 1:], vd_flux[:, :1]], axis=1)   # vd_flux[nz+1]
     divergence = vd_flux - vd_dn
     layer = mesh.node_layer_mask
+    if content:      # single precision: the content increment (flux·dt/areasvol) added to del_ttf (#1206)
+        safe = jnp.where(asv > 0.0, asv, 1.0)
+        return jnp.where(layer, divergence * dt / safe, 0.0)
     denom = asv * hnode_new
     safe = jnp.where(denom > 0.0, denom, 1.0)
     return jnp.where(layer, divergence * dt / safe, 0.0)      # (N,nl)
@@ -114,7 +117,7 @@ def _shift_down(x):
 
 
 def diff_part_hor_redi(mesh: Mesh, T_old, slope_tapered, Ki, hnode, hnode_new,
-                       helem, *, dt: float = DT_DEFAULT):
+                       helem, *, dt: float = DT_DEFAULT, content: bool = False):
     """G7b — the horizontal Redi edge flux's contribution to T (``(N, nl)`` delta).
 
     Per edge, the C's 5 partial-cell branches A/B/C/D/E (level mismatch between the
@@ -173,8 +176,11 @@ def diff_part_hor_redi(mesh: Mesh, T_old, slope_tapered, Ki, hnode, hnode_new,
 
     # antisymmetric edge→node scatter (+c→e1, −c→e2), then ÷(areasvol·hnode_new).
     vals = jnp.stack([c, -c], axis=1)                        # (Ed,2,nl1)
-    rhs = ops.scatter_add(vals, mesh.edges, mesh.nod2D)      # (N,nl1)
+    rhs = ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)      # (N,nl1)
     rhs = jnp.pad(rhs, ((0, 0), (0, 1)))                     # (N,nl)
+    if content:      # single precision: the content increment added to del_ttf (oce_ale_tracer.F90:1904)
+        safe = jnp.where(mesh.areasvol > 0.0, mesh.areasvol, 1.0)
+        return jnp.where(mesh.node_layer_mask, rhs * dt / safe, 0.0)
     denom = mesh.areasvol * hnode_new
     safe = jnp.where(denom > 0.0, denom, 1.0)
     return jnp.where(mesh.node_layer_mask, rhs * dt / safe, 0.0)   # (N,nl)

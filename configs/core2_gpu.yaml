@@ -1,0 +1,72 @@
+# CORE2 (~1°, 127 k nodes) — the GPU PRODUCTION configuration (CORE2 GPU speed plan,
+# docs/plans/20261020-core2-gpu-speed.md, Task 3): core2_full.yaml's physics + the two speed options
+# that passed the combined 1-year climate certification against a pooled rerun floor (July 2026):
+#   * ssh.cheb_degree 3 / cheb_kappa 30 — the Chebyshev CG preconditioner (~3x fewer CG iterations;
+#     solver-tolerance-equivalent, NOT byte-identical);
+#   * forcing.on_device — the JRA time interpolation inside the jitted step (VALUE-equivalent: XLA
+#     contracts a*x+y into an FMA in jit).
+# and the two layout/transport options of Task 7 (jobs 28286769, 28287270; values at round-off, GPU
+# compare within the noise floor): together 73.9 -> 56.9 ms/step on 4 A100:
+#   * gpu.halo_compact — the all_gather halo ships only the lanes other devices read;
+#   * gpu.column_unroll — the level sweeps (tdma, TKE scans) unrolled, so XLA keeps the step node-major;
+# and (user 2026-10-20: "everything on for speed, but all optional") the mEVP wide halo (gpu.mevp_wide) and the
+# gathered SSH solve (ssh.gathered, small meshes only). Every one of these is off by default in the code.
+# core2_full.yaml stays the bit-level reference AND the adjoint's configuration
+# (scripts/adjoint/core2_adj.py refuses the preconditioner) — never put speed options there.
+# restart_out is null on purpose: give --restart-out on the command line (core2_full.yaml's default
+# points into a production run directory).
+
+ale: {}            # zstar vertical coordinate
+gm: {}             # GM on (CORE2 ~1° needs the mesoscale-eddy parameterization)
+                   # TODO: confirm k_gm / Redi_Kmax against the matched-Fortran namelist.oce
+kpp: null          # vertical mixing: the existing JAX CORE2 used TKE — TODO confirm KPP vs TKE
+tke: {}            # classical-TKE prognostic mixing (the JAMES-paper all-on default)
+ice: {whichEVP: 1}  # mEVP sea-ice rheology (Bouillon 2013). whichEVP=1 = mEVP; the default 0 is
+                    # STANDARD EVP. Matches the validated JAMES all-on run IceConfig(whichEVP=1)
+                    # (core2_kpp_climate_run.py:268); ice_dt stays the 500 default as those runs used.
+
+visc: {}           # CORE2 default γ's (gamma1 = 0.1)
+
+tracer: {}         # ⚠️ TODO: confirm CORE2's num_ord/scheme == the implemented (0,1);
+                   #     if not, this needs a kernel change (new reconstruction), not a toggle.
+
+dt: 1800.0         # CORE2 timestep [s] (127 k / 48 levels)
+
+# --- run orchestration (defaults; the hindcast sbatch overrides mesh/partition/steps/restart via CLI) ---
+mesh: data/mesh_core2     # the staged CORE2 mesh (proven by run_core2_e2e)
+partition: dist_4         # CORE2 ANTI-scales past 4 GPU (halo-bound) ⇒ dist_4 / 1 node is OPTIMAL
+forcing:
+  kind: core2
+  start_year: 1958
+  on_device: true    # −12 % on this config; 1-yr climate-certified (job 26280985), VALUE-equivalent
+ssh:
+  cheb_degree: 3     # −21 % at CORE2-8; combined 1-yr cert with on_device (jobs 26312994/26314418)
+  cheb_kappa: 30.0
+  gathered: true     # the 2-D solve on every GPU after one all-gather: -8 % on 4 GH200 (job 28288669).
+                     # SMALL MESHES ONLY (every GPU holds the whole 2-D system) — never in a big-mesh config
+gpu:
+  halo_compact: true    # NCCL 34 -> 13 ms/step on 4 A100 (job 28286769)
+  column_unroll: true   # without it the compact build flips level-major (293 transposes); -23 % together
+  mevp_wide: 12         # mEVP exchanges every 12 subcycles: -10.9 % on 4 GH200 (job 28290740); bitwise on CPU,
+                        # round-off only on GPU by the owned-lane pair test (job 28290759)
+  ssh_ell: true         # SSH matvecs on the ELL layout, no atomics: -4.1 % on 4 A100 (job 28291288); round-off
+  cg_batch: 4           # 4 masked CG iterations per while trip: the same iterate, fewer host syncs (job 28291790)
+  mevp_unroll: 12       # mEVP subcycles unrolled 12 per trip: -1.1 % on 4 A100 (job 28291809); round-off
+  column_kernel: true   # Pallas column kernels for tdma / TKE sweeps (GPU only): -17 % on 4 A100 (job 28291852);
+                        # round-off by the owned-lane pair test (job 28292399)
+  ssh_inc_ell: true     # the gathered solve's zstar increment as explicit entries: -3.5 % on 4 A100 (job 28292208);
+                        # solver-tolerance equivalent
+  lane_order: rcm       # the lanes inside the shards in reverse Cuthill-McKee order (global ids, restarts, output
+                        # unchanged): -2.1 % on 4 GH200 (job 28298963); round-off
+  output_async: true    # daily/monthly output on a background writer thread: the month-end writes leave the loop
+                        # (job 28299731); the same stores; single process only
+  restart_async: true   # the calendar archival restarts on the same thread (7-16 s each on 4 GH200, job 28304114);
+                        # the same stores; single process only
+  forcing_ahead: 2      # the forcing prefetch two chunks ahead: no wait after a month end's short chunk
+                        # (job 28299884); bitwise
+output_dir: /work/ab0995/a270088/port_jax/runs/core2
+snapshot_every: 48        # steps (~1/day at dt=1800)
+checkpoint_every: 1440    # steps (~1 month)
+restart_in: null
+restart_out: null         # give --restart-out on the command line
+duration: 10yr            # overridden by --steps (the per-job budget) from run_core2_hindcast.sbatch

@@ -75,6 +75,8 @@ def test_partition_state_serial_noop(mesh, state):
     p1 = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
     ss = shard_mesh.partition_state(state, p1)
     for f in dataclasses.fields(State):
+        if getattr(state, f.name) is None:   # unused optional field
+            continue
         dense = np.asarray(getattr(state, f.name))
         got = np.asarray(getattr(ss, f.name))
         assert got.shape == (1,) + dense.shape, f"{f.name}: {got.shape}"

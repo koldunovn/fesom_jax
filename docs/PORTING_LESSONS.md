@@ -7310,6 +7310,240 @@ plain relative mismatch along `ln_tke_c_k` is 1.3e-8 with the no-folding tangent
 with the adjoint to 2.1e-8 at h = 0.1 K). The test bounds `rel_norm` ≤ 1e-9 and the plain
 mismatch only ≤ 1e-6: a wrong transpose is O(1).
 
+### 2026-09-27 (TKE adjoint, task A2) — cut points inside the column core; a masked cut must not be a `select`
+
+Twelve named derivative cuts now sit inside the classical-TKE column core
+(`fesom_jax/cvmix_tke.py`, `integrate_tke_column(..., cuts=frozenset())` and `mixing_length`),
+registered in `adjoint_stab.KNOWN_CUTS` and passed down from `step()` as
+`AdjointConfig.diag_cuts` (`step.py` → `tke.mixing_tke(cuts=...)` → the core): `tke.km_e` (√tke in
+KappaM), `tke.ml_e` / `tke.ml_n2` (√tke / N² in the unconstrained length), `tke.shear` / `tke.n2`
+(S² / N² in production resp. buoyancy AND in Ri), `tke.pr`, `tke.prod`, `tke.buoy`, `tke.diss`,
+`tke.ke_diff`, `tke.surf`, and `tke.deep` (every output below 500 m, a negative control). The
+convective-adjustment increment and the carried tke already have flags (`freeze_convection`,
+`freeze_tke_state`); they are documented in the `KNOWN_CUTS` docstring instead of being given a
+second name.
+
+- `dcut` now also accepts a plain set of names, so the column core (which has no
+  `AdjointConfig`) calls the same helper; an unknown name passed straight to the core raises.
+- A cut restricted to a mask (`tke.deep`) is `adjoint_stab.dcut_where`: a `custom_jvp` whose
+  primal output is `x` itself and whose tangent is `where(mask, 0, dx)`. The obvious
+  `where(mask, stop_gradient(x), x)` is a `select` in the forward program; it is value-identical,
+  but after the task-9 lesson (a changed consumer changes XLA:CPU's FMA grouping upstream) a
+  forward-only identity should not rely on the simplifier removing `select(p, x, x)`. The mask is
+  built lazily (only when the cut is active) and once.
+- "Empty set ⇒ identical jaxpr" needs a reference that predates the change. The tests pin the
+  sha256 of the jaxpr text of the column core (with and without diagnostics) and of
+  `mixing_tke` on pi, computed at the parent commit cd2ba05 by the same functions
+  (`fesom_jax/tests/test_tke_cuts.py` `PINNED`, `test_tke_cuts_pi.py` `PINNED_PI`, jax 0.10.1).
+  All three matched on the first try.
+- Effect table (column VJP, synthetic columns, all ten differentiable inputs): each cut changes
+  the cotangent of the inputs it acts on, and the cuts that sever an input's only path zero it
+  exactly (`tke.surf` → forc, cd; `tke.diss` → c_eps; `tke.ke_diff` → alpha; `tke.shear` → S²;
+  `tke.ml_n2` + `tke.n2` → N²). One table entry was wrong in the first draft and the test caught
+  it: `tke.km_e` does NOT change d/dc_k — c_k multiplies √tke, so cutting √tke's derivative
+  leaves c_k's own partial untouched.
+- On the CORE2 step the full `tke.*` set adds exactly 12 `stop_gradient` (11 cut sites + the
+  thickness input of the depth mask) and 3 `custom_jvp_call`: the count is asserted, so a cut
+  site that falls off the model path fails a test instead of silently cutting nothing.
+- On the CORE2 one-step VJP `tke.km_e` changes the state cotangent (1.6e-1 relative) but leaves
+  the params cotangent exactly unchanged: c_k multiplies √tke, the cut removes only the path to
+  the incoming tke, and within one step no parameter reaches the incoming tke. `tke.deep`
+  changes both (9.0e-1 / 2.4e-1).
+- Suite groups: `test_suite_groups.py` requires more `ci` files than `core2` files, and the
+  new core2 file made them equal (36/36). The column-core file (`test_tke_cuts.py`, mesh-free)
+  therefore goes to `ci` — 22 s on 2 pinned cores including the task-A3 regime tests, once
+  their one-hot JVPs are vmapped into one compiled program (10 s of eager JVPs before) — and
+  the pi-mesh driver tests to a separate
+  `unit` file `test_tke_cuts_pi.py`.
+
+### 2026-09-27 (TKE adjoint, task A3 library part) — the model's own column inputs; regime labels must not use `==` on a recomputed value
+
+`tke.tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, *, Z3d)` is the
+column-input assembly factored out of `mixing_tke` (`fesom_jax/tke.py`), and `mixing_tke` itself
+calls it; `tke.COLUMN_INPUTS` names the keys that are the core's positional inputs, so a
+diagnostic runs `integrate_tke_column(*(d[k] for k in COLUMN_INPUTS), ...)` on exactly the
+model's inputs instead of a re-implemented assembly. Moving the code into a function adds no
+equation: the jaxpr of `mixing_tke` on pi keeps the sha256 pinned at the parent commit, and the
+core on these inputs reproduces `mixing_tke`'s `tke_new` bitwise.
+
+`cvmix_tke.tke_regimes(...)` (same signature as the core, inputs `stop_gradient`-ed) logs per
+interface: tke, tke − tke_min, the floor flag, the mixing-length regime (`REGIMES` = free,
+wall_top, wall_other, floor), the analytic dKm/dtke, S², N², Ri, Pr, and the stiffness
+F = dt·dKm/dtke·|S² − N²/Pr|.
+
+- The floor flag comes from the core's own `Tbck` diagnostic (`tke_new − tke_solve > 0` ⇔ the
+  floor binds), and is checked independently against a run with `tke_min = −inf` (which returns
+  the pre-floor solve).
+- ⚠️ The first version labelled a cell `free` by `mxl == mxl0` with `mxl0 = √2·√tke/N`
+  recomputed in the logger. Eagerly that was exact; under `jax.jit` about half of the free cells
+  became `wall_other` and their analytic derivative came out exactly 0.5× the Jacobian (the
+  wall formula c_k·mxl/(2√tke) evaluated at mxl = mxl0 is half of √2·c_k/N). XLA evaluates the
+  recomputed x/√y differently from the copy inside the scans (by an ulp), so a bitwise equality
+  between two copies of the same expression in one jitted program is not reliable. `free` now
+  means |mxl − mxl0| ≤ 1e-13·mxl0 (a wall bound that close is a tie whose label does not matter).
+  Exact comparisons against values the core itself selected (`mxl == mxl_min`, `mxl == dzw[0]`)
+  are safe: `max`/`min`/`where` copy bits.
+- Measured on the synthetic columns (`fesom_jax/tests/test_tke_cuts.py`): analytic dKm/dtke vs
+  the Jacobian diagonal (one-hot JVPs) max relative error free 3.4e-16 (n = 96), wall_top 1.2e-16
+  (n = 3), wall_other 2.2e-16 (n = 58), floor 2.1e-16 (n = 19), 0 at the KappaM cap (n = 8). The
+  off-diagonal term of a wall_other length that inherits the upper neighbour's free length,
+  ∂KappaM[2]/∂tke[1] = c_k·√tke[2]·√2/(2·N[1]·√tke[1]), matches to 2e-16 and is LARGER than the
+  diagonal there (69.9 vs 57.6): the diagonal alone is not the whole one-step tke self-coupling.
+
+### 2026-09-27 (TKE adjoint, derivative-only forms) — keep a value, swap its derivative: straight-through, not increment
+
+`adjoint_stab.freeze_increment(base, out)` (`fesom_jax/adjoint_stab.py:513`) — the operator behind
+`freeze_convection` (`pp.mo_convect(freeze_increment=True)`, `fesom_jax/pp.py:147`, used by the
+TKE, KPP and PP drivers) — was written in the increment form `base + stop_gradient(out − base)`.
+Its derivative is right (d base), but its value is `out` only when `out − base` is exact: for
+`base = 0.03046625406612638`, `out = 0.3` the round trip returns `out` off by one ulp. It is now
+the straight-through form `stop_gradient(out) + (base − stop_gradient(base))`: the forward is
+`out + 0.0`, exact for every finite `base` (only a `−0.0` in `out` becomes `+0.0`), and the
+derivative is the same d base. It was never visibly wrong in the model because at the configured
+bump `INSTABMIX_KV = 0.1` the round trip happens to be exact for every coefficient below it (no
+failure in 2·10⁶ random bases), which is exactly why a planted case is needed: the unit tests raise
+the bump to 0.3 by monkeypatch and pick bases whose increment rounds (the old form is off at every
+bumped cell; the new one is bitwise), and the closure-level (pi) and one-step CORE2 VJPs under
+`freeze_convection` are bitwise the old form's. The same rule holds for every derivative-only
+setting still to come (FCT "differentiate as unlimited", mask-based cuts): write the value first
+under `stop_gradient` and add the zero-valued derivative carrier `(base − sg(base))`.
+
+### 2026-09-27 (TKE adjoint, task A3 driver part) — the step's own column inputs: record them inside the step, compare inside one program
+
+`scripts/adjoint/tke_diag.py:110` `step_tke_inputs(model, state, x)` returns the inputs the TKE
+column core gets in a CORE2 all-on step (zstar + TKE + GM + mEVP, prescribed ice, 2013-01-01
+restart) by running `step.step` itself with a stand-in `tke` module (`:46`) whose `mixing_tke`
+records `tke_column_inputs(...)` of exactly the arguments the step passes and then calls the real
+one. Two versions were measured before this one stuck (CPU, job 27737886):
+* Aborting the step at the mixing call (raise from the stand-in, catch in the jitted function)
+  gives a SHORTER program; its `forc_tke_surf` differs from the full step's at 4 nodes by one ulp —
+  what XLA fuses depends on what comes after, so "the same ops up to here" is not the same bits.
+* The full jitted step (plain `jax.jit(step)`, or the recording one) and the driver's chunk
+  program (the same step inside `scan_steps` with remat) differ in `tke_new` at 11 914 of
+  6 089 184 interfaces by at most 5.0e-16 (max tke 4.6e-2); the remat and no-remat chunk
+  programs agree bitwise with each other. The column core on the recorded inputs reproduces the
+  RECORDING step's `tke_new` bitwise, and the recording step's State equals a plain jitted step's
+  bitwise, so the inputs are exact; the comparison with the chunk program is round-off
+  (bounded at 1e-12 of the field maximum in the test).
+Rule: "bitwise" is a property of one compiled program. Get the diagnostic quantity out of the
+program whose output you compare with, and state the cross-program spread as a measurement.
+An eager (un-jitted) core differs from the jitted one at 4.7e-15 relative for the same reason.
+The negative control needed care too: the forcing of the NEXT step is identical to this step's
+(JRA55-do is 3-hourly and held within the interval), so the planted error uses a step 6 h later.
+
+### 2026-09-27 (TKE adjoint, task A4) — the diagnosis driver; the surface `uvnode` does carry a cotangent
+
+`scripts/adjoint/tke_diag.py` adds `screen` (terminal seed, per-field growth, column-norm maps of
+the cotangent of tke/T/S/uv/eta_n), `svd` (power iteration on pinned States, `tke` or `prog`
+norm, seeded in a box, top cells logged with their tke regime), `cuts` (singles, then pairs
+among ≤ 4 terms that moved σ₁ by > 10 %, all on the exact model's pinned States), `column` and
+`fdlin`, all on the shared driver's model and JSONL provenance.
+* The one-step tke → tke_new map is block-diagonal by column (tke enters a step only through its
+  own column core), so the full model's column blocks of ANY set of columns come from nl
+  tangent-linear steps, one per level, seeded at every column at once (`full_column_blocks`,
+  `:551`); against `jax.jacfwd` of the core on the recorded inputs they agree to ≤ 1e-12.
+* The premise "the incoming `uvnode` cotangent is identically zero" holds only below the surface:
+  the forced step's bulk formulae and ice-ocean stress read the previous step's surface current
+  `state.uvnode[:, 0]`, so a one-step VJP has a small, real surface `uvnode` cotangent (≈ 5e-14
+  per entry for the box-T cost, 253 716 nonzero entries). Norms and maps still use `uv`.
+* A setting that cuts the whole map (e.g. `freeze_tke_state` in a tke-only norm) makes `M v = 0`
+  exactly; the power iteration then cannot normalise `Mᵀ W M v` and raises, which `run_svd`
+  (`:450`) records as σ = 0 ("zero map") instead of failing the sweep.
+* A cut that acts only through interior rows is invisible where the floor `max(tke_solve,
+  tke_min)` binds (zero derivative): the column negative control first picked shallow columns
+  with tke > 10 tke_min at the START of the step only and saw a `tke.diss` cut change nothing
+  (1e-16); it now requires tke above the floor before and after the step.
+* The CPU forward is deterministic but NOT smooth at small perturbations — most likely because
+  the SSH solve stops at a relative residual (`soltol = 1e-5`, `fesom_jax/ssh.py:513`), so its
+  iteration count, and the solution, jumps with the perturbation. On the 2-step window the FD error along the leading tke
+  vector grows as 1/h (1.7e-2 at h = 1e-4, 3.9e-3 at 1e-6, 0.37 at 1e-8) and along a single-cell
+  1 K T perturbation in the global prognostic norm it is 23 at h = 1e-4; in a norm on the
+  perturbed column alone the same direction matches to 7e-8. `run_fdlin` therefore measures a
+  CPU "roughness" floor, the part of a central difference at h₀ = min(h)/100 the tangent does not
+  explain (the GPU floor is a repeat, as before), and marks the rows it explains
+  "noise-limited" — it accounts for 94-99 % of the tke-vector errors at h ≤ 1e-6 (3.6e-3 of
+  3.9e-3, 0.364 of 0.365), while the own-column T rows stay "linear" (floor 1e-8 of 7e-8). A first
+  version took the raw half-difference at h₀ and so called its own linear part noise.
+
+### 2026-09-27 (TKE adjoint, task A1) — the 2013 two-day baseline: a burst at lags beyond a day, and repeats that agree until it
+
+Exact adjoint (prescribed ice), CORE2 all-on, 2-day window from the 2013-01-01 hindcast restart,
+box-mean T seed (50-60N 40-20W 0-500 m), 3-h chunks, one A100 (job 27738864,
+`tke_diag.py screen --repeats 3 --also long_window`). Per-step growth of the state-cotangent
+norm, three repeats: overall (end/seed)^(1/96) 1.104 / 1.083 / 1.165 (×1.3e4 / ×2.2e3 / ×2.4e6
+over two days), median of the 16 chunk rates 1.023 / 1.017 / 1.027, log-spread 0.15 / 0.14 /
+0.31, worst 4-chunk stretch 1.37 / 1.36 / 1.70. `long_window()`: overall 1.005, median 1.004,
+clean. The chunk rates of the three repeats agree to 3-4 digits over the first 15-24 h of lag
+(≈ 1.0 per step) and separate after it, where all the growth sits (chunk rates 1.2-2.2): the
+reverse sweep reads the same GPU forward differently each time (the losses differ at 4e-11
+relative), and the loop amplifies that difference only in the bursts. The median of the chunk
+rates (≈ 1.02) hides this entirely: judge a window by the overall rate and the worst stretch,
+never by the median alone. The 1960-seed figure (1.21-1.55 overall) is a different state and
+season; 2013-01 grows less but just as irregularly.
+
+### 2026-09-27 (TKE adjoint, task A5) — the stage-1 experiments: attribute on the screens, not on the tke norm
+
+`scripts/adjoint/tke_diag.py` gained the actions `locate` (scan → sites → cuts in one set of
+compiled programs), `sites`, `colcensus`, the `ts` norm, `--ssh-tol`, `--also 'setting*k,=setting'`
+and `--stride`; tables and figures in `tke_diag_summary.py` / `plot_tke_diag.py`. What was not
+obvious:
+
+* **The decisive attribution came from screens with single cuts** (2 repeats each, 2-day window,
+  job 27743266), not from power iteration: `tke.pr`, `tke.n2` and `mix.kv_out` each take the
+  reverse pass from 1.112 [1.083, 1.165] per step to 1.005 (as `freeze_mixing`); every other cut
+  stays inside the exact spread. The loop is N² → Ri → Pr → KappaH → T, S → N².
+* **The tke-norm leading vector is a different mechanism.** Seeded everywhere, the 6-h power
+  iteration always finds the first interior interface of a fresh, strongly stratified surface
+  layer (tke at the floor, free mixing length) feeding the surface interface through the TKE
+  diffusivity (σ₁ 1.6e3-9.1e3 per 6 h). The screens never excite it (`freeze_tke_state`, which
+  removes it, leaves them unchanged). A norm picks a mode; check that the mode is the one the
+  gradient suffers from.
+* **The `prog` norm grows at the quiet control too** (1-step σ₁ 10-12, 6 h up to 66): the fast
+  barotropic `uv`/`eta_n` response. `ts` (T and S only) isolates the tracer loop.
+* **Pinned maps on 1-step chunks cost 8 s per tangent+adjoint step** on the A100, 3-4× the plan's
+  estimate: every chunk call moves a 2 GB pinned State between host and device. A 1-day power
+  iteration (6-10 iterations) takes 40-60 min; the first `locate` job ran into its 11-h limit.
+* **The column census is cheap and global**: ∂tke_new/∂tke_old of every column at once by one
+  tangent per level (the core is block-diagonal by column; `column_jacobians_all`), then the
+  spectral radius per column: 2.6-4.3 % of the columns are unstable at any time; `tke.km_e`
+  stabilises 93-99 % of them.
+* **fdlin**: a one-step tke → tke map does not read the step's SSH solve, so `--ssh-tol` changes
+  nothing there (identical rows); for T/S vectors in near-neutral deep cells the linear range is
+  ≈ 1e-10 in the volume-mean norm (≈ 4e-8 K). `switch_distances` knows only the tke switches and
+  the State's own `bvfreq` tangent (a T/S seed reaches it a step later), so it reports no bound
+  for a one-step T/S map.
+* **Job plumbing**: a GPU job without `--mem` gets 1.9 GB (one CPU's default) — fixed with
+  `scontrol update ... MinMemoryNode` before the jobs started; an argparse value that starts with
+  `-` needs `--box-bounds=-67.9,...` (two CPU jobs died on it); screen maps stored as float32
+  overflow above 3.4e38 on 10-day exact windows (now float64); with the GPU account's fairshare
+  at 0, pending GPU jobs start only by backfill, so short time limits matter.
+
+### 2026-09-27 (TKE adjoint, task A6) — the stage-1 report: a loop in the Prandtl number, a recursion in the TKE diffusivity
+
+`docs/ADJOINT_TKE.md` (with `docs/figures/adjoint_tke/`) records the diagnosis. What a later reader
+would not guess:
+
+* **Two instabilities, two norms.** The gradient-destroying growth (screens seeded by a box-mean T
+  cost) is the Prandtl loop N² → Pr → KappaH → T, S → N²: `tke.pr` alone takes the 2-day rate from
+  1.112 [1.083, 1.165] to 1.005 per step, and at its fastest site (the Tyrrhenian Sea, 600-2000 m,
+  N² within ±1e-6) the one-step T/S σ₁ from 24.2 to 3.85. The tke-norm leading mode is a
+  different, TKE-internal recursion in fresh surface lenses (the first interface's tke → KappaM →
+  TKE diffusivity → surface tke flux); `tke.ke_diff` removes it (×1.3e-4 in 6 h at Hudson Bay) but
+  it does not drive the screens (`freeze_tke_state` leaves them unchanged).
+* **Where the Prandtl loop grows, no finite difference can follow it.** One step: FD → TL to 1e-4
+  at h = 1e-11 (≈ 4e-8 K). Six hours: the tangent predicts ×5390, the nonlinear map follows at no
+  h, because near-neutral cells cross the convective switch within h = 5e-14 and the forward is
+  rough at that scale even with a 1e-12 SSH solve. Cutting the Prandtl derivative is therefore not
+  a loss of real sensitivity at resolvable perturbations.
+* **For a parametric-only adjoint** the census answers the question in minutes: the kept TKE
+  recursion is stable where the Prandtl loop grows (Tyrrhenian ρ ≤ 1.00) but unstable in 2.6-4.3 %
+  of the columns, including 54 columns of the cost box on 1 January (ρ ≤ 1.55); partial cuts move
+  the 2-day TKE-constant gradients by 50-500 % (c_k, c_eps, cd) and ≤ 15 % (α), so its bias will be
+  O(1).
+* **The A100-40 development nodes cannot run the CORE2 reverse step**: a single-step chunk asks for
+  25.6 GB in `jit_bwd` beyond the rest of the pool (34 GB at the default 0.85 fraction), and a 0.97
+  fraction leaves no room to load the CUDA modules.
+
 ### 2026-09-27 (adjoint foundation, task 13) — on the GPU the all-on model is not one trajectory, so the chunk length is part of every dot test
 
 Task 13 measured the Phase-0 toolkit on an A100 (`scripts/adjoint/p0_acceptance.py`: `dot`,
@@ -7445,3 +7679,1876 @@ other field well inside, and the strict `<=` reported `pass: false` (the 5-repea
 a zero spread (CPU) still needs a bitwise match, and a NaN difference never passes
 (`not diff <= bound`). `scripts/tests/test_core2_adj.py::test_restartcheck_tie_margin` pins the
 two measured ties (pass at 1.05, flagged at 1.0) and a planted field 6 % over (fails).
+
+### 2026-09-28 (TKE adjoint, task A7) — candidate settings: a live fixture needs shear, and the field registry has four copies
+
+The stage-2 candidates are derivative-only `AdjointConfig` fields: `tke_pr_cut` / `tke_pr_mode`
+(the Prandtl-number cut: no dPr/dRi where N² < N²*, `inf` = everywhere, or with `"at"` the Pr
+derivative taken at `max(N², N²*)`, `fesom_jax/cvmix_tke.py:261`), `tke_kme_tke` /
+`tke_kme_scope` / `tke_kme_term` (the near-floor km_e cut in columns whose first interior
+interface has `tke_old < tke*`, any mixing-length regime, `cvmix_tke.py:251`) and the flag
+`freeze_mixing_state` (the parametric-only adjoint: the column inputs S², N², dzw, dzt and the
+surface flux enter the closure as constants, `fesom_jax/tke.py:211`). Non-obvious points:
+
+* **From rest the Prandtl cut is dead.** The CORE2 test fixtures start from PHC with `uv = 0`, so
+  S² = 0, Ri = N²/1e-12 is far above the clip band and dPr/dRi = 0 everywhere: a Pr-cut effect
+  test on them passes vacuously or fails for the wrong reason. `test_tke_candidates_core2.py`
+  seeds a random velocity (and near-floor first interfaces on every second node); the
+  forward-identity cases in `test_adjoint_config_tke.py` stay on the old fixture.
+* **The `"at"` variant with N²* = inf would make NaN in the backward**: Ri at the regularised point
+  is inf, the clip selects the constant branch, but the transposed tangent still multiplies a zero
+  cotangent by an infinite coefficient. `validate()` requires a finite N²* for `"at"`
+  (`adjoint_stab.py:388`); `+inf` is the plain cut's "everywhere".
+* **The ke_diff variant is not bitwise in unflagged columns.** It keeps a second copy of KappaM
+  (same arithmetic, same value) for the TKE diffusivity, so the cotangent of KappaM is accumulated
+  in two parts; unflagged columns differ from the exact VJP at round-off (the km_e term, one copy,
+  is bitwise there).
+* **Family 6 does not switch on `freeze_convection`.** The convective switch has no derivative;
+  the straight-through bump would give c_k a path through a Kv value the forward overrides
+  (instabmix). The stage-1 proxy used it; the flag leaves the adjustment exact.
+* **A fourth registry.** Besides the three files the plan names, `test_adjoint_diag_cuts.py::
+  test_freeze_flags_and_known_cuts` asserts `FREEZE_FLAGS` = every field but `diag_cuts`; it
+  failed on the new non-boolean fields (gate 27751870) and now excludes `TKE_CANDIDATE_FIELDS`.
+* **A new core2 file tips `ci > core2`** (`test_suite_groups.py`): the column-core tests went to
+  `ci` (`test_tke_candidates.py`), the pi `mixing_tke` tests to `unit`
+  (`test_tke_candidates_pi.py`), the CORE2 step to `core2`.
+
+### 2026-09-28 (TKE adjoint, task A8) — the unstable TKE recursion is not a near-floor effect, and a regularised Pr derivative adds growth
+
+Thresholds from the column census and one-step maps (CPU, 2013 States): `tke_diag.py colcensus`
+now takes candidate settings and a two-step product `J(t1)·J(t0)` (`scripts/adjoint/
+tke_diag.py:1345-1367`), and `prcensus` (`:1431`) measures where the Prandtl derivative lives:
+the wet interior interfaces with `1 < 6.6·Ri < 10` and their `G = |∂KappaH/∂N²|` at fixed KappaM.
+
+* **tke\***: the first-interface tke of the columns whose TKE-only recursion is unstable is NOT
+  concentrated at the floor — median 4e-6 to 1e-5, 90 % quantile 1.3-1.8e-4 m²/s² (1 Jan,
+  2 Jan 12:00, 1 Jul). A near-floor threshold (3e-6) stabilises only 29-43 % of them; the share
+  reaches the km_e-everywhere value (92-99 %) only at tke* = 1e-3, which flags 93-97 % of the
+  columns. The "near-floor" family-1 idea therefore reduces to the km_e cut almost everywhere.
+  The first-interface-only scope stops at 50-73 % and the ke_diff term at 49-71 % while making
+  up to 333 stable columns unstable: the column scope and the km_e term are the ones to keep.
+* **N²\***: `G` is concentrated at tiny N² (half of it below 1e-12 s⁻², 98-99.6 % below 1e-8)
+  where S² is equally tiny. At the Tyrrhenian growth site the one-step T/S σ₁ is 24.2 (exact),
+  24.2 / 16.0 / 16.0 / 3.85 / 3.85 / 3.85 for N²* = 1e-11 … 1e-6: N²* = 1e-8 reproduces the full
+  cut while touching 0.5-0.7 % of the Pr-live cells.
+* **The `"at"` variant (Pr differentiated at max(N², N²*)) is WORSE than exact** at N²* = 1e-10
+  and 1e-9 (σ₁ 839 and 118 against 24): moving N² up moves cells with Ri below the clip band
+  (dPr/dRi = 0 exactly) INTO the band, where the derivative is 6.6/S² with a tiny S². A
+  regularisation of the linearisation point can create derivatives the exact model does not
+  have; at 1e-8 it happens to equal the plain cut.
+* **Resumable CPU bar runs** (`scripts/adjoint/tke_cbar.py`): every window starts at the same
+  instant, so one base forward with its boundaries on disk serves every window and every
+  derivative-only setting (bitwise forward); an adjoint run links the boundaries
+  (`link_base`, `:243`) and runs only the reverse sweep under a wall-clock budget
+  (`DiskCheckpoint`). A 10-day CPU forward is 6.9 s/step.
+
+### 2026-10-06 (TKE adjoint, step C1) — the pr8 burst is one column whose smoothed N² is a cancellation residual
+
+The `tke_pr_cut=1e-8` (pr8) 5-day box-T reverse sweep from 2013-01-01 jumps ×2.7e4 while
+reversing forward chunk 7 (2013-01-04 12:00 to 2013-01-05 00:00). Locating it needed no new
+reverse sweep: the resumable driver's `reverse_<c>_cot.npz` files are the full carry cotangent
+entering the reverse of chunk c, so `reverse_7` (before) against `reverse_6` (after) gives the
+site, and one 12-h pinned reverse with one step per chunk, seeded with `reverse_7`, gives the
+per-step maps (`runs/tke/c1/c1_burst.py`, 0.34 CPU node-hours).
+
+* **Site:** one column, node 95302 (168.4E 69.9N, East Siberian Sea shelf), 4 layers / 29.6 m,
+  ice-covered (a_ice 1, 1.8 m), near freezing, 27 psu over 30.4 psu below 20 m. 96 % of the tke
+  cotangent norm is in this column, at interface 2 (9.8 m). The growth is not one step: about
+  ×2 per step for 16 consecutive steps (6e-5 → 372 in the column's tke cotangent).
+* **The forward there oscillates:** N² at interface 2 swings between 6e-8 and 9e-7 every 3-4
+  steps, Ri between 0.3 and 5, Pr between its clip (10) and 2-7, KappaH between 8e-5 and 1.1e-3.
+  Interface 1 is unstable (N² ≈ −2e-7, Pr = 1), interface 3 strongly stable (2.7e-3).
+* **The diffusion-number hypothesis is wrong for this site:** D = dt·KappaH/Δz² ≤ 0.04 at the
+  burst interface, so a "cut the Pr derivative where D > D*" criterion would not touch it.
+* **What the TKE sees is a residual:** the raw N² at interface 2 is −8.0e-5 (layer 2 is
+  0.062 kg/m³ lighter than layer 1), the patch neighbours' raw values are +8.1e-5, +4.0e-5,
+  +4.8e-5, −1.9e-7, −1.9e-5, and the one-sweep area-weighted smoother (`eos.smooth_nod3D`,
+  recomputation matches the step's `bvfreq` to 4e-16) returns +3.3e-7: R = |raw|/|smoothed| = 240.
+  In the unclipped Prandtl range dKappaH/dN² = −KappaH/N² is taken at the residual, while a
+  change of the column's own T/S moves the smoothed N² by a share of the raw value, so the
+  one-step loop gain is roughly 2D·(self weight)·R, of order 1-10 instead of 0.05. The stage-1
+  Tyrrhenian site shows the same structure (raw ≈ −1e-8, smoothed ±1e-11 to 1e-9, R up to 3e3)
+  but below 1e-8, which is why pr8 cured it and not this one.
+* **How common:** at that instant 51,616 of 3.7 M wet interior interfaces are masked inversions
+  (raw < 0, smoothed > 0), 15,072 of them with Pr unclipped and smoothed N² > 1e-8 (the class
+  pr8 keeps); R > 100 at 1,483 interfaces, of which 108 are unclipped with N² > 1e-8.
+  (`runs/tke/c1/c1_smooth.py`, `c1_smooth.json`.)
+* **Reproducibility:** rerunning the chunk with one step per chunk instead of 24 changes the
+  forward by up to 6.5e-3 K / 1.4e-2 psu after 24 steps (where is not yet located), and the
+  adjoint ends at norm 379 against the saved 119 — same site and the same order of growth.
+
+Lesson: before choosing the variable of a derivative cut, look at what the closure actually
+reads. A smoothed field that is a near-cancellation of large raw values makes any 1/field
+derivative large by the cancellation ratio, whatever the field's own size; a threshold on the
+smoothed value (pr8) or on a diffusion number cannot see that, the ratio raw/smoothed can.
+
+### 2026-10-06 (TKE adjoint, step C2) — the smoothing-cancellation Prandtl cut, and a raw field the step did not keep
+
+`AdjointConfig.tke_pr_ratio = R*` omits the Prandtl-number derivative where
+`|raw N²| > R*·|smoothed N²|` (forward values), joined with the `tke_pr_cut` N²* mask when both
+are set. The C1 diagnosis decided the variable: the closure reads the smoothed N², and the cut has
+to see how much of it is a cancellation residual.
+
+* The step never kept the raw N²: `eos.compute_pressure_bv` returns only the smoothed field. When
+  the option is on, `step.py` calls the same two functions itself (`pressure_bv`, then
+  `smooth_nod3D(…, 1)`) and keeps both; off, the original call is traced, so the default program
+  is unchanged (pinned jaxpr tests) and the forward is bitwise either way (CORE2 step test). The
+  raw field is a per-node function of halo-complete T/S, so unlike the smoothed one it needs no
+  halo exchange.
+* It flows as a forward value only: `stop_gradient` in the step, `bvfreq_raw` →
+  `tke_column_inputs` (`Nsqr_raw`, zeroed where `Nsqr` is) → `integrate_tke_column(n2_raw=…)`.
+  The core raises if the ratio cut is on and the raw field is missing, so a caller that forgets
+  it cannot silently get the plain pr8 adjoint.
+* Limits checked on the column core: R* → ∞ exact, R* → 0 the `tke.pr` cut, the mask acts
+  point-wise. On the CORE2 one-step fixture R* = 2 changes the state cotangent by 1.3e-6
+  relative on top of N²* = 1e-6.
+* Test time: `test_adjoint_config_tke.py`'s CORE2 non-boolean cases build a multi-step TKE
+  fixture (~5 min each), so they and `test_tke_candidates_core2.py` do not fit one 30-min job
+  together; run them as separate jobs.
+
+### 2026-10-07 (TKE adjoint, step C3) — the ratio cut removes the burst; what is left of the J_T error is not the burst
+
+The bar (`tke_cbar.py`, 2013-01-01, central FDs over h = 3e-3, 1e-2, 3e-2 from the A8 runs) for
+`tke_pr_cut=1e-8` joined with `tke_pr_ratio` R* = 3, 10, 100, 2 and 5 days, CPU, 24-step chunks
+(`runs/tke/a8/cbar/bar_table_4.json`).
+
+* **The burst is gone.** The 5-day reverse traces of the three R* agree to 3 digits with each
+  other and with `pr_all`'s smooth growth (J_T ×2.3 over 8 chunks), where pr8 alone jumps ×2.7e4
+  in chunk 7. pr8 alone is off by 1e3-5e4 at 5 d, pr_all by O(1) except J_T alpha.
+* **J_MLD passes for every R*** at 5 d: R* = 100 gives c_k 0.2 %, c_eps 0.2 %, cd 3.1 %,
+  alpha 0.13 %; the 2-day values are within 0.3 %.
+* **J_T passes only c_k** (R* = 100: 1.1 %); c_eps 20 %, cd 14 %, alpha 11 % are outside the
+  FD range over h. The J_T FDs have no plateau (spread over h 24 % for c_eps, 11 % for cd) and
+  each perturbed run flips 15-33k mixing switches, so the reference itself is uncertain at the
+  10-20 % level. The errors fall monotonically as R* grows (c_eps 29 → 24 → 20 %), so the
+  cancellation cut is not what costs accuracy.
+* **J_T alpha is a separate offset:** ~11 % for every R* and already at 2 d, i.e. present in
+  pr8 before any burst, while pr_all gives 0.4 %. Cutting the Prandtl derivative where N² > 1e-8
+  as well fixes alpha and breaks everything else, so the offset sits in the kept Prandtl
+  derivative of stable, uncancelled cells, not in the cancellation class.
+* **Cost:** a 30-min CPU leg reverses one 24-step chunk (~32 s/step, 0.26 node-h), so a 5-day
+  gradient is ~10 legs and a 10-day one ~21; the C3 set as first submitted was ~53 node-h, not
+  the 7-8 estimated from forward step times. Time a reverse leg before sizing a sweep.
+
+Lesson: a derivative cut aimed at one instability should be judged on the functional it was
+meant to save (J_MLD here, which it fixes completely) and checked for side effects separately;
+a residual error on another functional that is independent of the cut's parameter and present
+before the instability is a different problem, and the FD spread over h says how far the bar
+can be trusted to tell. 10-day rows for R* = 100: pending (chains 27935445/6).
+
+### 2026-10-07 (TKE adjoint, step C3 at 10 days) — a second burst class, and what MITgcm's GGL90 reads instead
+
+The 10-day sweeps of `tke_pr_cut=1e-8` + `tke_pr_ratio=100` burst again: J_Tfull ×490 while
+reversing chunk 9 (2013-01-05 12:00 to 01-06 00:00) and ×8.6 in chunk 6; J_MLD ×46 in chunk 9,
+and its 10-day gradient came out wrong (c_k −0.22 against FD +0.77, c_eps ×58). The 5-day windows
+could not see it: their reverse starts at chunk 9 with only the cost seed in it.
+
+* **Site** (column maps from the saved `reverse_10` against `reverse_9`, `runs/tke/c1b`): a
+  cluster of neighbouring Norwegian-shelf columns at ~16-17E 69N, 13-15 levels (135-200 m),
+  weakly stratified and strongly mixed, full of masked inversions (raw N² < 0 under a positive
+  smoothed N², raw mostly −2e-5 to −1e-6) whose ratio R is only 1-30, so no useful R* reaches
+  them; Pr flips between its clips there.
+* **Attribution in one chunk:** reversing chunk 9 alone from the saved `reverse_10` (one leg per
+  variant instead of a full sweep): as before ×490; + `tke.ml_n2` ×645; + `tke.ml_wall` (no
+  derivative of wall-bound mixing lengths) ×486; + `tke.kh_floor` (no derivative of KappaH below
+  1e-5) ×491; `pr_all` ×1.19. Neither the mixing length nor the missing background is it; the
+  Prandtl loop is, at cells both earlier cuts keep.
+* **MITgcm's GGL90 for comparison** (its source, and a GGL90 adjoint setup that runs long
+  windows with mxlMaxFlag 2-3 in forward and adjoint alike and diffKr = 1e-5):
+  (1) GGL90 forms Ri from the local N², so an inverted cell has Ri < 0, Pr = 1 and no Prandtl
+  derivative, while FESOM's TKE reads the horizontally smoothed N², which hands an inverted cell a
+  positive residual and an unclipped Pr; both burst sites are such cells. (2) GGL90's background
+  is a floor, `max(KappaM/Pr, diffKr)`; FESOM's TKE adds none. (3) TAF's "store the previous
+  level" in the Blanke-Delecluse scans is bookkeeping for a correct adjoint; `lax.scan` needs none.
+* **`AdjointConfig.tke_pr_raw_cut = N²_raw*`** (97054b0): no Prandtl derivative where the raw
+  N² < N²_raw*, i.e. GGL90's local-N² behaviour in the derivative only (forward bitwise). With 0:
+  chunk 9 ×1.19, the same as `pr_all`, and no further jump over the 10 days.
+* **Bar** (`bar_table_5`, the three cuts joined, raw* = 0): J_MLD passes at 5 days (c_k 1.9 %,
+  c_eps 0.3 %, cd 5.9 %, alpha 0.3 %) and at 10 days for c_k 4.8 %, cd 4.2 %, alpha 8.0 %. The
+  10-day c_eps sensitivity is near zero (FD −0.007 with a 67 % spread over h, adjoint +0.028: an
+  absolute miss of 5 % of the c_k gradient). J_T is worse than with R* = 100 alone (5 d: 6 / 46 /
+  23 / 17 %; 10 d: 93 / 15 / 52 / 15 %): the Prandtl derivative of inverted cells carries real
+  box-T sensitivity, so the cut trades J_T accuracy for stability. Next: a threshold below zero.
+* **GPU (Levante GH200 partition):** the chunked reverse runs at 0.69 s/step against 37 s/step on
+  16 CPU cores, so a 10-day gradient takes ~6 min in one job instead of ~21 half-hour legs. With the
+  CPU forward's boundaries the chunk values equal the CPU ones to 5e-10. GPU runs are not
+  bit-reproducible (atomic scatter-adds in the assembly): repeated gradients differ by ≤ 1e-4
+  relative, three orders under the bar. `--xla_gpu_deterministic_ops` did not finish compiling a
+  6-step CORE2 forward in 2 h, and `--xla_gpu_deterministic_reductions` no longer exists in the
+  XLA of jax 0.10.1.
+
+Lesson: a longer window can expose another instance of the same loop below the threshold that
+fixed the first one. Comparing with a scheme whose adjoint is known to work over long windows
+pointed straight at the variable (which N² the closure reads). Localize from the saved reverse
+checkpoints and test each candidate on the one chunk that bursts before paying for full sweeps.
+
+### 2026-10-08 (sea-ice adjoint, task I2) — a tangent scaling must take its factor as a primal argument
+
+`adjoint_stab.scale_tangent(x, f)` (`fesom_jax/adjoint_stab.py:606`) returns `x` in the forward and
+`f·dx` as the tangent: the per-sub-cycle factor of a Newtonian friction term in the tangent stress
+equations (Panteleev et al. 2020, The Cryosphere 14, 4427-4451, doi:10.5194/tc-14-4427-2020).
+
+* `f` is a primal argument of the `custom_jvp` whose own tangent is dropped
+  (`_scaled_tangent_jvp`, :649), not a `nondiff_argnums` entry. As a non-differentiated argument it
+  would have to be hashable, so an array factor could not be passed and every damping time T_N
+  would compile its own program. As a primal it can be a jit argument: one compiled 120-sweep
+  program serves every T_N and every per-element pattern.
+* A `custom_jvp` is enough for both modes: scaling by a diagonal factor is its own transpose, so
+  reverse mode transposes the linear rule into `f·g`. `cotangent_op` (a `custom_vjp`) has no
+  forward mode and could not serve the tangent-linear and Arnoldi runs of the mode study.
+* The rule broadcasts `f·dx`; a factor wider than `x` would return a tangent of the wrong shape,
+  so the shape check (:637) refuses it at trace time. Integer and bool inputs return before the
+  `custom_jvp`.
+* Gates (`test_adjoint_stab.py:452-`): forward bitwise, JVP/VJP = f×, f = 1 bitwise plain autodiff,
+  a per-step factor in a checkpointed 10-step scan gives the product of the factors. Each was
+  checked against a planted error (factor ignored, primal off by 1e-15, no shape check, f² in
+  the rule): all four caught (job 27982790).
+
+### 2026-10-08 (sea-ice adjoint, task I3) — where a stress-tangent hook sits in the mEVP sweep decides which damping it is
+
+`ice_mevp.mevp_iterate(..., sigma_in_f=None, sigma_out_f=None)` (`fesom_jax/ice_mevp.py:147`,
+`:175`) scales the tangent of the incoming σ (explicit form, δσ' = det1·f·δσ + det2·δS(u)) or of
+the new σ (implicit form, δσ' = f·(det1·δσ + det2·δS(u))) with `scale_tangent`.
+
+* The implicit hook must act after the element skip and BEFORE `stress_div_scatter`. Placed
+  after the scatter it would only damp the σ carried into the next sweep, while this sweep's
+  velocity update still sees the undamped δσ', so the stress-velocity loop gain per sweep would
+  not drop, which is the whole point of the implicit form (the two-variable model in the plan).
+  The gate: the one-sweep velocity tangent must be affine in a scalar f and must move with it
+  (`test_mevp_hooks.py`); a planted "hook after the scatter" fails it (job 27982791, with three
+  other plants: hook ignored, hook traced when None, explicit hook moved onto the new σ).
+* `None` traces nothing: the one-step jaxpr of all four `adjoint_mode`s, primal and JVP, keeps
+  the 2fc07c2 hashes (`runs/ice/baseline/jaxpr_hashes.py`, job 27982792).
+* The factor applies to the σ of skipped (ice-free) elements too, which is only carried; callers
+  pass a per-element factor of 1 there.
+* Test grouping: a file that loads the CORE2 mesh belongs to `core2`, but one more `core2` file
+  makes `ci` and `core2` both 39 and trips `test_the_cost_split_is_still_worth_having`; the file
+  is in `ice` (sea-ice kernels on the CORE2 mesh, like `test_ice_evp.py`).
+* `test_mevp.py::test_evp_graph_identity` skips in every worktree: its baseline
+  `fesom_jax/tests/data/evp_baseline_jm1.npz` is git-ignored (`*.npz`) and exists only in the
+  main checkout; link it like `data` before reading a skip there as a gate result.
+
+### 2026-10-08 (sea-ice adjoint, task I4) — a bitwise replay of the mEVP needs its inputs as jit arguments, because the forward amplifies one ulp
+
+`scripts/adjoint/ice_modes.py` captures the inputs of one model step's `mevp_dynamics` call (a spy
+on the module attribute while `step.step` is traced) and replays the 120 sweeps in its own loop.
+On CPU the replay is bitwise equal to the step's `u_ice` only with three precautions, each found
+by a diagnostic that compared one ingredient at a time against the captured output:
+
+* The captured fields (a, m, m_snow, SSH, ocean velocity, wind) must be jit ARGUMENTS
+  (`ice_modes.py:349`). Closed over, they are compile-time constants and XLA's constant folding
+  evaluates `mevp_setup` (an `exp` per element) with different rounding: max |Δu| 4.8e-8 m/s.
+  This is the mechanism behind `core2_adj.TL_COMPILER_OPTIONS = NO_CONSTANT_FOLDING`.
+* The controls go in as multipliers that are exactly 1 at c = 0: P* on `pressure_fac`
+  (linear in it), C_d on `inv_thickness`, with the air-stress term divided back (`:372`).
+  A traced `cfg.cd_oce_ice` changes how XLA rounds the drag product.
+* The wind stress on the ice is recomputed from the entry velocity; it matches the step bitwise
+  standalone, and inside the replay it is passed in for the bitwise check.
+The dense step hands `mevp_dynamics` an identity `exch` (`step.py:150`), not `None`.
+
+Why a rounding difference matters at all: the forward 120-sweep map itself amplifies a one-ulp
+change of P* to 1.2e-7 m/s at one Arctic node (76.2N, 170.6W, a = 0.997, m = 1.7 m), growing about
+x10 per 10 sweeps. So the nonlinear map has no useful derivative at small scales: the drift
+functional D responds to relative P* changes of 1e-12 / 1e-9 / 1e-6 / 1e-3 with slopes
++43 / −14 / +0.09 / −0.0023. Only h ≥ 1e-3 gives a consistent slope (h = 1e-3 and 1e-2 agree
+to 4 % for ln P* and 0.2 % for ln C_d at 2013-01-01), so the go/no-go compares the tangent with
+that coarse-grained FD. Gates: synthetic eigen/SVD/Arnoldi tests on the two-variable sweep model
+and the CORE2 bitwise replay (`scripts/tests/test_ice_modes.py`), each checked against a planted
+error (Ritz values unsorted, eigen type swapped, SVD with the JVP twice, no zero-start check, a
+table row dropped, the rhs anchor moved to the current iterate, the local-γ cut inverted, γ
+without the mass): 8/8 caught (jobs 27983660, 27985617, 27985607). A negative control is only
+evidence if the plant applied and the unplanted gate passes: two earlier "caught" runs of the
+anchor plant were a gate that failed anyway and a plant whose pattern no longer matched.
+
+### 2026-10-08 (sea-ice adjoint, task I5) — the mEVP tangent blows up in single near-rigid elements at 6-18 per sweep, so no fixed Newtonian damping time can work
+
+Mode study (`scripts/adjoint/ice_modes.py`, GH200 jobs 27985709/27985710, tables and figures in
+`runs/ice/modes/`, decision table `modes_decision_20261008.md`) on the 2013-01-01 and 2013-03-01
+states, 120 sweeps, the ice-only step map with the model's frozen-entry anchor:
+
+* The dominant eigenvalue of the single-sweep tangent is real and negative (a sign flip per sweep)
+  with |λ| = 6.5-12 (January) and 10-18 (March) at sweeps 1/30/60/120, not the 1.18 per sweep
+  that was inferred in August from 4e8 per ice step. Its eigenvector sits entirely in the stress
+  (σ share of the energy 1.00) of a handful of elements (top 10 hold ~100 %), never at the
+  ice-mask edge, in compact (a ≈ 1) near-rigid ice (Δ = 2-35 δmin) where the local mEVP stability
+  number γ = P/(Δ+δmin)·Δt·M/(1+M²)/A exceeds αβ by 6-130 (top 0.1 % of ice elements). It
+  moves between elements as Δ evolves within the step (Canadian Archipelago, Baffin Bay, the
+  Bering coast). This is the mEVP pseudo-time iteration violating αβ ≫ γ locally (the reason
+  aEVP sets α, β per element), seen through the linearization; the nonlinear iteration stays
+  bounded but is itself ulp-sensitive there (task I4).
+* Hence the failure of every fixed-T_N variant of Panteleev et al. (2020): a per-sweep factor of
+  0.75 (T_N = 3) or more cannot touch |λ| ≈ 7-18. Implicit T_N = 3 leaves 3 per ice step
+  (1e23 per day); T_N ≥ 7 and all explicit forms blow up within the day; explicit is worse than
+  implicit, as the two-variable model predicted for an oscillating mode. The thick-and-converging
+  switch selects 56 of 63819 ice elements and not the mode's (1.2-3.5 m, mostly not converging),
+  so no choice of div* helps: the selector should be γ/αβ.
+* The August verdict: what was tested (one global factor on the whole sweep carry) does
+  annihilate the tangent at T_N = 4 (8e-94 per day) and blows up at T_N = 7, as recorded, but it
+  also keeps only 5 % of the C_d response and 0.3 % of the P* response; the reason a global
+  constant cannot be right is the local strength of the mode, not a uniform 1.18/sweep growth.
+* What survives: C_d acts mainly through the drag, so any stable stress damping keeps it (the
+  zero-stress tangent: r = 0.99, corr 0.85 at one step). P* acts only through the stress and is
+  lost by every stable approved variant (r ≤ 0.12). A local damping from the per-sweep stability
+  number, f = min(1, κ/(γ/αβ)) on the new-stress tangent, is stable at κ = 0.25 (0.10 and 0.007
+  per day) and keeps the size of both responses (r P* 0.76/0.74 at one step, 0.78/0.77 over a
+  day; r C_d 1.00), but not the P* pattern; κ = 1 has the pattern (corr 0.87 in January against
+  the h = 1e-2 FD field) and is unstable.
+* The FD reference FIELD for P* is not well defined at h = 1e-3: the FD fields at h = 1e-3 and
+  1e-2 correlate at only 0.27 (January) and 0.13 (March), against 0.93/0.82 between 1e-2 and 3e-2,
+  because the forward amplifies small perturbations at many nodes. The scalar dD/d ln P* is fine
+  (4 % and 19 % spread over h), so a pattern criterion needs the larger h.
+* Cost: the unrolled 120-sweep mEVP backward is 0.025 s per ice step on a GH200 (forward
+  0.006 s), small next to the 0.69 s/step model adjoint.
+
+### 2026-10-08 (sea-ice adjoint, task I8) — ice controls ln P*, ln C_d: a traced constant is not the same program
+
+`Params.ice_pstar` / `Params.ice_cd` (default `None`, no leaves) replace `IceConfig.pstar` /
+`cd_oce_ice` inside `ice_surface_step` by `cfg._replace` (`fesom_jax/ice_step.py:100`). Nothing
+downstream needs those two fields static (P* only in the mEVP/EVP pressure, C_d only at the four
+drag sites), so the traced value goes straight through.
+
+* **Not bitwise at the configured values.** The controls set to exactly 30000 and 5.5e-3 give the
+  constant-config step to rounding only: each control alone moves the jitted ice step by ulps,
+  and the 120 mEVP sweeps carry that to u_ice 2.4e-11 and σ11 1.2e-8 relative after one step
+  (P*; C_d alone 7.8e-12 / 4.0e-9; job 27984560, CPU). A compile-time constant lets XLA fold
+  and reassociate; a jit argument does not. The gate is now a calibrated rounding bound
+  (`test_ice_controls.py`), and every run that is compared with another (base, repeat, replay,
+  full FD) carries the controls, so they share one program. Unset, the ice step traces the same
+  jaxpr as a call without `params`.
+* **Testing an intermediate exactly.** The mEVP and EVP drag products are not outputs. A probe
+  object monkeypatched in for the module's `DENSITY_0` (`test_ice_controls.py:178`) receives the
+  operand `rdt·C_d·|Δu|` through `__rmul__`, so `d(site)/d ln C_d = site` is checked bitwise
+  at the site.
+* **The negative control has to be traced.** Planting `pstar = jnp.asarray(cfg.pstar)` in the
+  dead branch did NOT change the jaxpr: operations on a concrete array evaluate eagerly at trace
+  time and fold to the same literal. Only a plant that touches a traced value
+  (`cfg.pstar + 0·a_ice[0]`) shows that the jaxpr comparison can fail.
+* 2-step drift tangent vs central FD under "exact" with 4 sweeps (cold-start ice): ln P* agrees
+  to 1.5e-9 and ln C_d to 3.5e-10 at h = 1e-4. One such CORE2 JVP test takes ~20 min on CPU,
+  so the two controls run as separate jobs.
+
+Lesson: "a parameter at its default value gives the same program" holds for the jaxpr but not for
+the compiled numbers. When a comparison needs bitwise equality, both sides must hold the value
+as a jit argument, or both must hold it as a constant.
+
+### 2026-10-08 (sea-ice adjoint, task I9) — `ice_cbar.py`: one compiled forward for base, replay and full FD
+
+`scripts/adjoint/ice_cbar.py` adds the Arctic drift cost (box `arctic`, lat ≥ 70N; per step
+Σ w·a·|u_ice| / Σ w·a, `J_drift(n) = S(n)/n`), the opt-in controls `ln_ice_pstar` /
+`ln_ice_cd`, and the replay FD that the stage-1 bar is measured against.
+
+* **One program for every forward** (`fwd_program`, `ice_cbar.py:281`). Replay on/off is a
+  traced boolean and the base ice fields are a per-step scan input (zeros when off), so the base,
+  its repeat, the replay runs and the full-model runs all run the same compiled chunk; the
+  per-step ice state the replay needs leaves the scan as its `ys`. On CPU a replay at h = 0
+  reproduces the base bitwise and saving the ice state changes nothing (CORE2 smoke). The
+  overwrite happens before the accumulator, so the replay's drift is weighted by the base
+  concentration, the nonlinear counterpart of an ice-state cut; a test against a plain Python
+  loop fails if the two are swapped.
+* **A no-ice guard that hid NaN.** `where(Σ w·a > 0, num/den, 0)` returns 0 for a NaN state,
+  so a blown FD run would have entered the table as a zero drift. The guard now tests `== 0`
+  (`ice_cbar.py:128`); the synthetic NaN-run test found it on its first run.
+* **The bar's rule at every window.** `tke_cbar.bar_verdict` returns no verdict below 5 days, so
+  `ice_cbar.verdict` reimplements the same rule (plateau median or middle-h reference, 10 % or
+  inside the FD range) for 1 and 2 days, drops non-finite FDs, and a test checks that it agrees
+  with `bar_verdict` field by field at every window.
+* **Prescribed is a structural zero.** Under `adjoint_mode="prescribed"` the drift gradient
+  w.r.t. ln P* and ln C_d (and every other control) is exactly 0.0 on CORE2. With `exact` and
+  `evp_rheol_steps=4` passed through `--ice-settings`, a 4-step adjoint agrees with the central
+  FD to 4e-5 (P*) and 1.3e-7 (C_d), also when the reverse sweep is cut into legs and resumed.
+* **Naming.** A test file named `test_ice_*` must be in the `ice` group and anything under
+  `scripts/tests/` in the `scripts` group (`test_suite_groups.py`), so the driver's tests are
+  `test_cbar_ice*.py`.
+
+Lesson: when an FD reference needs a variant of the model (here: the ice state replayed), put the
+variant inside the same compiled program as a traced switch instead of building a second
+program, so differences between runs cannot come from compilation.
+
+### 2026-10-08 (sea-ice adjoint, task I5b) — local stability-number damping of the mEVP tangent: the stable κ window and the P* pattern do not overlap
+
+* Scan of f = min(1, κ/(γ/αβ)) per sweep, κ = 0.25-1, on the GH200 at 2013-01-01 and 2013-03-01.
+  The reverse chain is stable (≤ 10 per day) only up to κ = 0.3 in January (κ = 0.35 gives 20 per
+  day, 0.4 gives 6e5) and up to κ = 0.5 in March (0.6 gives 2e6). The edge is sharp.
+* The one-step P* pattern correlation against the h = 1e-2 FD field rises steadily with κ
+  (January 0.58 at κ = 0.25 to 0.85 at κ = 0.8; March 0.42 to 0.65). It reaches 0.8 only where
+  the chain is unstable, so no κ passes. The C_d tangent passes everywhere (r ≈ 1, corr 0.99).
+* Two identical GPU runs disagree. The 1-day FD reference at h = 1e-3 moves by 7-8 %, while the
+  tangent moves by less than 1 %. So a 1-day ratio measured against the h = 1e-3 FD has ±8 % noise.
+  Near the stability edge the reverse growth also moves (January κ = 0.25: 0.10 and 0.012 per day).
+  Use the h = 1e-2 FD for 1-day ratios, and repeat a run before trusting a borderline κ.
+
+### 2026-10-09 (sea-ice adjoint, tasks I6/I7) — `adjoint_mode="dynamics"` and the local mEVP tangent damping
+
+`IceConfig` gains `adjoint_damping` ("none"/"local"), `adjoint_kappa` (κ, default 0.25) and
+`adjoint_sweeps` (−1 = all). "local" scales the tangent of each differentiated sweep's new stress
+by f = min(1, κ/(γ/αβ)), computed from that sweep's input iterate
+(`ice_mevp.mevp_local_damping`). The new mode "dynamics" cuts a_ice, m_ice, m_snow and t_skin at
+entry. At exit it cuts only the carried copies, after the step's own stress blend and shortwave
+gate.
+
+* **The exit cut goes after the in-step uses.** Inside a step, the live ice velocity moves
+  a_out through advection, and a_out then feeds the ice-ocean stress blend and the shortwave
+  gate. The replay FD overwrites the ice state only after the step, so it keeps that path.
+  Cutting before the blend, as "prescribed" does, would have built a derivative that the
+  reference does not measure.
+* **Validation at trace time.** The drivers build the config with `_replace`, which skips the
+  validating `__new__`. So `ice_step.validate_adjoint_settings` runs inside `ice_surface_step`
+  before anything else and raises ValueError for:
+  - an unknown damping form;
+  - κ < 0 or a non-finite κ;
+  - `adjoint_sweeps` < −1;
+  - "dynamics", damping or `adjoint_sweeps` with standard EVP;
+  - damping or `adjoint_sweeps` under a mode that does not unroll the sweeps.
+
+  The last case would otherwise be a silent no-op.
+* **Same program when inactive, same signature.** The damping fields live in `IceConfig`, so
+  `mevp_dynamics` keeps `evp_dynamics`' parameter names (the dispatch-parity gate). With
+  "none", the hook is not traced at all: the jaxpr hashes of the four old modes are unchanged
+  (27987614, against the 2fc07c2 baseline).
+* **Forward unchanged.**
+  - Every "dynamics" setting gives the "prescribed" step bitwise on CPU (27987616).
+  - On a synthetic mesh, the damped one-sweep stress tangent is exactly f times the undamped one.
+* **The coefficient is equal to the mode study's only to rounding.** `ice_modes.py` computes
+  the per-call coefficient rdt·M/(1+M²)/(A·det2·αβ) in numpy, the library under jit: 12.5 % of
+  the elements differ, by at most 7.3e-16 relative. Given the same coefficient, the factor is
+  bitwise the script's.
+* **Cost on GH200 (27987630).** A one-day "dynamics" + local κ = 0.25 drift gradient from the
+  GPU base takes 29 s of run time (0.61 s/step, all 120 sweeps unrolled with remat) plus 116 s
+  of compilation.
+* **First numbers.** C_d is −0.03084 against the replay FD −0.0309 (0.2 %). P* comes out at
+  +3.7e-4 against −0.0282: the local damping removes almost all of the P* response in the
+  coupled model, and with the wrong sign. That is far from the 0.77 one-day ratio of the
+  ice-only mode-study chain.
+
+Lesson: an FD reference that freezes part of the model defines the derivative to build. Put the
+adjoint's cut exactly where the reference freezes, not where an older mode put its cut.
+
+### 2026-10-09 (sea-ice adjoint, diagnostic) — the "dynamics" + local κ = 0.25 blow-up is an ice-ocean loop with two parallel channels each way
+
+`IceConfig.adjoint_cuts` adds diagnostic stop_gradients inside the "dynamics" step. The names are
+`advect` (new ice velocity into fct_solve and the friction velocity), `fct`, `ssh` (hbar into
+the mEVP tilt), `ocean_vel` (ocean surface velocity into the mEVP) and `ice2ocean` (ice velocity
+into the ice-ocean stress). Measured with 2-day drift gradients on the GH200 from 2013-01-01
+(jobs 27988134, 27988135, 27989176; replay FD ln P* −0.0268, ln C_d −0.0343):
+
+* Uncut, κ = 0.25 grows ×1e4-1e6 per 24 steps, carried by u_ice / v_ice, then hbar / eta_n.
+  κ = 0 (zero stress) is stable, with C_d at 0.95 of the FD and P* = 0. So the loop needs the
+  live stress tangent and the ocean.
+* No single cut stops it. `ocean_vel` comes closest (one ×1.4e5 burst in the first 24 steps
+  after the restart). `advect`, `fct`, `ssh`, `ice2ocean` and `advect+ssh` blow up by 1e5-1e10.
+* Two cuts on the same side are enough: both ocean → ice inputs (`ocean_vel+ssh`: P* 1.28,
+  C_d 1.09 of the FD) or both ice → ocean outputs (`ice2ocean+advect`: P* 1.17, C_d 0.76). All
+  four cuts give P* 0.75 / C_d 1.08 at 2 d and 0.62 / 1.08 at 5 d, stable apart from a ×5-20
+  bump in a single chunk.
+* The cuts buy back part of P* but bias C_d, because the replay FD keeps the coupled paths.
+  No cut set puts both controls within 10 %.
+
+Lesson: an instability that survives every single cut can still be a loop. When each direction
+of a coupling has two parallel channels, cut one whole side, not one channel.
+
+### 2026-10-09 (sea-ice adjoint, task I5c) — aEVP does not tame the mEVP tangent, and a tangent-only α from the entry state is not enough
+
+* aEVP (FESOM2 whichEVP=2) sets α = β = sqrt(ice_dt·c·P/(Δ+δmin)/ρ_ice/A), with a floor of 50. That
+  caps the local stability number γ/(αβ) at about ρm/M / c ≈ 6.7 at the step's entry state; it does
+  not bring it below 1. The floor puts 60-72 % of the CORE2 ice elements at α = 50, five times less
+  relaxation than mEVP's 250.
+* Result on CORE2 (GH200, 2013-01-01 and 2013-03-01): the exact aEVP tangent grows faster than
+  mEVP's: |λ| ≈ 18 per sweep at both dates, σ1 ≈ 1e16-1e18 per step. Holding α fixed in the
+  tangent changes nothing. The forward also converges worse: the last sweep's RMS change is 2.7-6
+  times mEVP's. The P* FD field stays inconsistent between h = 1e-3 and 1e-2 (correlation 0.07-0.14).
+* The mode moves to elements whose γ/(αβ), measured at the sweep-60 iterate, is 45-73: well above
+  the entry value, because Δ falls during the iteration while α stays fixed for the whole step.
+* The same thing defeats the tangent-only variant (TLa: the mEVP forward, linearized with
+  α_t = max(250, 250·sqrt(s/κ0)) from the entry state). It cuts the one-step growth from 1e12 to
+  1e5-1e9, but the chain still grows 600-1e5 per step at κ0 = 0.1-0.5. Local damping from the
+  CURRENT iterate (Bloc) was stable. A stability coefficient has to follow the iterate.
+
+### 2026-10-09 (sea-ice adjoint, task I5d) — raising α in the tangent from each sweep's iterate keeps the P* pattern, but the 1-day chain still grows
+
+* TLai: the mEVP forward, linearized with α_t = max(250, 250·sqrt(s/κ0)) per element, where s is
+  γ/(αβ) at each sweep's input, and β_t is the maximum over the node's elements. Unlike damping,
+  this leaves the tangent's fixed point unchanged. It gives the best one-step P* pattern measured
+  so far: against the h = 1e-2 FD field, January 0.80-0.91 and March 0.68-0.74, with r 0.53-0.83.
+* The chain still grows. Per step it is 6.7 (January) and 9.5 (March) at κ0 = 0.05, rising to
+  420-570 at κ0 = 0.25. Lowering κ0 helps only slowly. With γ/(α_t β_t) ≤ κ0 already guaranteed at
+  every sweep, the remaining growth cannot come from the local stability number alone.
+* Bloc κ = 0.25 repeated on the GH200 gave a reverse growth of 77 per day for January 2013. The
+  same setting gave 0.10 and 0.012 per day in earlier runs. Its stability is not reproducible.
+
+### 2026-10-09 (sea-ice adjoint, task I5e) — freezing the sweep tangent at the final iterate does not make it contracting
+
+* TLf: one mEVP sweep, linearized once at the step's final iterate x_N with TLa coefficients
+  evaluated there, then applied 120 times with the anchor and control forcing each time. The
+  transposed iteration provides the adjoint. Measured on CORE2 (GH200, 2013-01-01 and 2013-03-01).
+* Frozen with the plain coefficients (α = β = 250), the one-sweep map is still unstable:
+  λ = −8.0 and −9.5, real and negative, located in single near-rigid elements. So the main mode is
+  not a parametric effect of the forward iterates' sweep-to-sweep oscillation: the stiff
+  linearization is unstable at any single iterate.
+* With raised α_t (κ0 = 0.05-1), the frozen map's dominant eigenvalues form a complex pair at
+  |λ| = 1.02-1.03 (0.99 for March at κ0 = 1). The pair is spread over many elements, not localized.
+  The step map's |λ| is about 1, but the 1-day chain still grows 1.2-1.7 per step (3e3-3e11 per day).
+  Lowering κ0 does not move the pair inside the unit circle.
+* The expectation that a positive semi-definite VP tangent gives a contracting relaxation does not
+  hold for this map. Plausible reasons, not separated here: the replacement-pressure term
+  −P·Δ/(Δ+δmin) acts only on the divergence component, so the stress Jacobian is not symmetric;
+  and the momentum half of the sweep adds Coriolis and drag.
+* Bloc κ = 0.25 for January has now given 0.10, 0.012, 77 and 3.2e3 per day in four GH200 runs. It
+  is at the stability edge, and GPU round-off decides which side it lands on.
+
+### 2026-10-09 (sea-ice adjoint, task I5f) — the Picard (frozen-viscosity) sweep tangent, frozen at the final iterate with raised α, is stable
+
+* TLfP: one mEVP sweep, linearized at the step's final iterate x_N, with ζ, η and the replacement
+  pressure all taken from stop_gradient(Δ). P* keeps its live dependence. The coefficients are
+  α_t = max(250, 250·sqrt(s(x_N)/κ0)), with β_t the maximum over each node's elements. The sweep
+  is applied 120 times. On CORE2 (GH200) the 1-day reverse chain contracts at both dates:
+  0.76-0.86 per step, 1e-6 to 1e-3 per day.
+* Against the h = 1e-2 FD field at one step:
+  - January passes for κ0 = 0.1-1: r P* 0.72-0.87, corr 0.86-0.89; r C_d 0.89-0.98, corr 0.99.
+  - March passes at κ0 = 1: r P* 0.77, corr 0.81. κ0 = 0.1 and 0.25 just miss (corr 0.75 and
+    0.79), while the March FD field's own consistency is about 0.8.
+  - At one day: r P* 0.56-0.68, corr P* 0.87 (January) and 0.92 (March); r C_d 0.80-0.87, corr
+    0.98. These one-day numbers are the same for every κ0. α and β set only the pseudo-time
+    path, not where the tangent converges, so this shows the tangent reaching that end point.
+* Freezing the replacement pressure alone (TLfS) changes nothing: it grows like TLf, 1.05-1.67 per
+  step. So the destabilizing term is the derivative of the viscosity ζ(Δ), even though the
+  symmetrized Newton stress Jacobian is symmetric positive semi-definite (tested). The non-symmetry
+  explanation of I5e is refuted. The frozen one-sweep spectrum, |λ| about 1.02 with Arnoldi
+  residuals of about 1e-2, does not separate the stable P from the unstable S. Only the 120-fold
+  step map over the chain does.
+* With the plain coefficients (α = 250) every frozen variant is unstable (λ = −8 to −15), and
+  per-sweep coefficients (TLaiS) grow 40-870 per step. Both ingredients are needed: freezing at
+  x_N and raising α.
+* Contrast with docs/ADJOINT_HORIZON.md: freeze_viscosity was "measured ineffective" on the
+  UNROLLED exact tangent. That flag also leaves the −Δ term live. It becomes effective only
+  together with freezing at x_N and raising α.
+
+### 2026-10-09 (sea-ice adjoint, task I5g) — Picard needs the freeze at x_N; part of the viscosity derivative can be restored
+
+* Per-sweep coefficients with the Picard stress (TLaiP, α_t from the current iterate) are unstable
+  at both dates: the chain grows 7-18 per step at κ0 = 0.1-0.25 and about 1e6 at κ0 = 1. So a
+  per-sweep tangent change inside mevp_iterate is not enough. Linearizing once at the final iterate
+  x_N is the essential ingredient.
+* TLfθ (frozen at x_N, κ0 = 1, P_r frozen, viscosity derivative scaled by θ) is stable at both
+  dates for θ = 0.25-0.75. The chain contracts at about 0.75 per step in January and 0.86 in March,
+  unchanged by θ. The one-day magnitude rises steadily with θ:
+  - r P* in January: 0.56 at θ = 0, 0.61, 0.68, then 0.77 at θ = 0.75. In March 0.69 rising to 0.89.
+  - r C_d: 0.85 to 0.95 (January) and 0.81 to 0.93 (March).
+  - The pattern also improves: one-day corr P* rises from 0.87 to 0.94 (January) and from 0.92 to
+    0.96 (March).
+  θ = 1 (TLfS) was unstable (11 and 1.9e3 per day), so the edge lies between 0.75 and 1.
+  The missing plastic softening is what made the Picard tangent too stiff.
+
+### 2026-10-09 (sea-ice adjoint, stage-1 bar, I10) — the zero-stress mEVP tangent gives a working ice adjoint for C_d, with the ice state given or live; κ > 0 is not robust in the coupled model
+
+`IceConfig(adjoint_damping="local", adjoint_kappa=0.0)` sets f = 0 on every ice element: the
+stress tangent is off, while the ice velocity, drag, Coriolis, wind and the ocean coupling stay
+differentiated. Measured on CORE2 (GH200, TKE setting `tke_pr_cut=1e-8+tke_pr_ratio=100+
+tke_pr_raw_cut=-1e-6`) with the Arctic drift cost (window-mean a-weighted ice speed north of
+70N). FD over h ∈ {3e-3, 1e-2, 3e-2}: spread ≤ 0.8 %, GPU noise ≤ 0.6 % of the smallest
+signal. Ratio of the adjoint ln C_d gradient to the FD, at 2 / 5 / 10 d:
+
+| start | mode (FD reference) | ln C_d adjoint / FD |
+|---|---|---|
+| 2013-01-01 | "dynamics" (replay FD) | 0.953 / 0.955 / 0.961 |
+| 2013-01-01 | "exact" (full FD) | 0.954 / 0.951 / 0.948 |
+| 2013-03-01 | "dynamics" (replay FD) | 0.939 / 0.958 / 0.954 |
+| 2013-03-01 | "exact" (full FD) | 0.938 / 0.940 / 0.934 |
+
+* The amplification screen is clean everywhere. The one exception is a single TKE-switch spike
+  at January 10 d, which pushes the log-spread to 0.021.
+* TKE no-harm: J_T 5 d, J_MLD 5 d, J_Tfull 10 d and J_MLD 10 d, against the prescribed-ice
+  gradients of the same setting. No verdict gets worse in either mode.
+* The 4-7 % low bias is the stress's share of the drag response: with κ = 0.25 over 1 d the
+  ratio is 0.998.
+* "exact" here means the full ice adjoint (advection, thermodynamics and the ice-state
+  recurrence) with the zero-stress tangent. It stays stable for 10 d at both dates.
+* In thick March ice the full-model ln P* FD differs from the replay FD by up to −13.5 % at
+  10 d. So for P* the ice-state path matters there; for C_d the gap is ≤ 3 %.
+* κ > 0 keeps part of the stress tangent and is not robust in the coupled model:
+  * At 2 d the scan κ = 0.05 / 0.1 / 0.15 gives P* 0.76 / 0.86 / 0.90.
+  * κ = 0.1 then swings to 0.74 / 1.08 at 5 / 10 d. Under "exact" it ranges from −0.39 to 2.6,
+    and in March from 0.45 to 2.1.
+  * κ = 0.15 blows up within 5 d, and κ = 0.25 within 2 d, through the ice-ocean loop of the
+    diagnostic entry.
+
+Lesson: when one part of a coupled tangent cannot be made stable (here the near-rigid mEVP
+stress), switching off only that part can leave a working adjoint for the controls that act
+elsewhere (C_d, through the drag). Measure the bias against FD at more than one window rather
+than cutting the whole component out, as the old "prescribed" ice did.
+
+### 2026-10-09 (sea-ice adjoint, task I5h) — the frozen-sweep backward in the library: a custom_vjp, and what it must not close over
+
+* `IceConfig.adjoint_damping="frozen_sweep"` (fesom_jax/ice_mevp_frozen.py) wraps the mEVP solve
+  in a custom_vjp. The forward is unchanged and bitwise. The backward linearizes one sweep once, at
+  the final iterate, with raised α_t / β_t (κ0 = 1) and softening θ = 0.95, and runs the transposed
+  frozen map 120 times, accumulating the anchor and input cotangents. On a captured CORE2 step it
+  equals the mode harness's TLfT vjp to 4e-15 relative. The jaxpr of the other modes is unchanged.
+* Gotcha: the first coupled GH200 runs died after 30 s with UnexpectedTracerError on a bool
+  [nod2D]. The model computes the coastal mask inside its jit, and the custom_vjp backward had
+  closed over it. Every traced value the solve reads must be an explicit custom_vjp argument:
+  the traced P* / C_d config fields, and also masks built inside the model's trace. A synthetic
+  test passes when the mask is a constant, so the regression test builds the mask inside the jit.
+* Coupled CORE2 drift gradients, January, 2/5/10 d, GH200. Against the replay FD ("dynamics"):
+  ln P* 0.926-0.928 and ln C_d 0.995. Against the full FD ("exact"): ln P* 0.93-0.94 and ln C_d
+  0.997-0.999. The cost is 0.57-0.59 s per step, the same as the unrolled local-damping backward.
+
+### 2026-10-09 (sea-ice adjoint, stage-1 bar, I11) — `frozen_sweep` at both windows, and the TKE gradients with the full ice adjoint
+
+The completed bar for `adjoint_damping="frozen_sweep"` (θ 0.95, κ0 1) on CORE2, GH200 drift
+gradients. Tables: `bar_table_final_jan.json` and `bar_table_final_mar.json` under the ice runs
+directory. Ratio = adjoint / FD at 2 / 5 / 10 d.
+
+| start | mode (FD reference) | ln P* | ln C_d |
+|---|---|---|---|
+| 2013-01-01 | "dynamics" (replay) | 0.926 / 0.926 / 0.928 | 0.995 / 0.995 / 0.995 |
+| 2013-01-01 | "exact" (full) | 0.935 / 0.934 / 0.929 | 0.997 / 0.997 / 0.999 |
+| 2013-03-01 | "dynamics" (replay) | 0.950 / 0.940 / 0.947 | 0.992 / 1.000 / 1.003 |
+| 2013-03-01 | "exact" (full) | 0.936 / **0.886 / 0.885** | 0.994 / 1.000 / 1.002 |
+
+* Every row passes the 10 % bar except "exact" ln P* in March at 5 and 10 d, which is 11.4-11.5 %
+  low.
+* That miss is the ice-state path:
+  * Against the replay FD the same gradients are 0.975 / 1.004.
+  * In thick March ice the full-model FD sits 10-13.5 % below the replay FD.
+  * So the dynamics part of P* is right, and most of the extra P* sensitivity carried by the
+    live ice state (strength → drift → advection / thickness) is not.
+* The amplification screen is clean everywhere except January 10 d. There the flag is one
+  TKE-cotangent transient in chunk 12, which is also present with the zero-stress tangent; the
+  ice fields stay smooth.
+* TKE no-harm with "exact" + `frozen_sweep`, for J_T 5 d, J_MLD 5 d, J_Tfull 10 d and J_MLD 10 d
+  against the prescribed-ice gradients:
+  * no verdict gets worse;
+  * J_Tfull 10 d c_k goes from fail to pass (0.136 → 0.091);
+  * most changes above 1 % move towards the FD.
+
+Lesson: when a full-model FD and a replay FD (ice state given) differ, check the adjoint against
+both. Here that separated an accurate dynamics part from a missing state-path part. A single
+reference would only have said "11 % off".
+
+### 2026-10-08 (TKE adjoint, step C4) — the raw-N² threshold has a cliff, and below it the TKE adjoint holds to 30 days in two seasons
+
+* **Threshold scan** (`tke_pr_cut=1e-8` + `tke_pr_ratio=100` + `tke_pr_raw_cut=raw*`, January,
+  against the CPU FD references): raw* = 0, −1e-7, −1e-6, −3e-6 improve monotonically (J_T at
+  10 days, c_k: 93, 69, 42, 38 %); raw* = −1e-5 bursts again in chunk 10 (×500 in one chunk, J_T
+  10-day errors of 1e3-1e5 %). The burst cells sit between −1e-5 and −3e-6. We chose −1e-6: a
+  factor 10 from the cliff for 0.3-3 points of accuracy.
+* **FD on the GPU.** The GH200 forward is not bit-reproducible, but J_T differs from the CPU
+  forward by 1e-11 (5 days) to 1e-9 (10 days) against FD signals ≥ 3.4e-8, and the January FDs
+  on GPU equal the CPU ones to ≤ 1 % (worst 3.9 %; a near-zero c_eps J_MLD aside). The 30-day and
+  July references were therefore made on GPU: 48 perturbed forwards in ~50 min on three GPUs.
+* **The reference has to be checked too.** Spread of the FD over h ∈ {3e-3, 1e-2, 3e-2}: July
+  ≤ 10 % at every window, January J_MLD ≤ 1 % at 15-30 days, but January J_Tfull for c_k and cd
+  22-1150 % at 15-30 days (a small, nonlinear winter box-T response). A pass or a fail there is
+  weak evidence either way.
+* **Bar at raw* = −1e-6.** July: J_T and J_Tfull pass at 5, 10, 20 and 30 days (1.7-4.7 %);
+  J_MLD passes except at 10 days for cd (20 %) and 20 days for c_eps (13 %); at 30 days all eight
+  cells are within 4.4 %. January: J_MLD within 1.3 % at 20 and 30 days, J_Tfull passes at 20
+  days, at 30 days alpha 3.9 % and c_eps 10.0 % (at the bar), c_k and cd 71 and 46 % against the
+  noisy FDs. The January J_T at 5 days stays 23 / 15 / 11 % for c_eps / cd / alpha at every
+  threshold: that error is not the Prandtl cut.
+* **No blow-up to 30 days:** the largest one-chunk cotangent growth is ×1.2 for J_Tfull and ×2.1
+  for J_MLD, apart from the first reverse chunk, where the window-mean MLD seed enters.
+* **Host memory.** The bar driver loaded every linked base boundary: 61 × 1.93 GB = 118 GB per
+  30-day job. Four such jobs on one 877 GB GH200 node left 5 GB free, and the XLA compile took
+  46 min instead of 2. `chunked_grad(boundary_stride=…)` exists for exactly this; the driver now
+  passes `--stride` (7b31efd), and its checkpoint loads only every Nth file of the fully saved
+  shared base: 46-50 GB per job, a 30-day reverse in 18 min.
+
+Lesson: scan a threshold cut until it fails and choose a setting at a distance from the cliff,
+not the best number. A forward saved at every boundary for sharing changes what a loader reads;
+a driver that reuses it must choose the stride explicitly. Before reading a failed bar, look at
+the spread of the FD reference itself.
+
+### 2026-10-09 (TKE adjoint, step C5) — beyond 30 days the burst is the mixing length's N² derivative in deep near-neutral water
+
+* **Bar at 30, 60 and 90 days** for `long_window_tke()` (C4's FD setup on 90-day bases from 2013-01-01 and
+  2013-07-01): July passes at 30 days and J_Tfull at 60, but J_MLD is 51 % to ×37 off at 60 days and both costs
+  ×1e2-1e7 at 90. January J_MLD passes at 30 and 60 days and misses at 90 (57/25/99/7 %, one event on day
+  16.5). January J_Tfull misses at every window; at 30 days c_k and cd are 62 and 87 % off with an FD spread
+  of 2.5 % on the merged code, so C4's "noisy FD" reading of that number was wrong: it is an adjoint error.
+* **`freeze_gm_slope`**, the slope freeze that made the frozen-mixing adjoint usable at 60 days, does not help:
+  the July burst stays or grows, January J_MLD at 90 days passes, the January J_Tfull bias grows.
+* **Locating it.** A hook on the reverse sweep kept per-column cotangent norms for every chunk and the full
+  cotangent at five boundaries. The July J_MLD 60-day sweep grows ×1e3 over 6-14 August in five deep
+  Tyrrhenian columns (15.5°E 39.3°N, 27-31 levels); one column holds 92 % of the tke cotangent. Below about
+  400 m the raw N² is −1e-8 to −4e-7 and the smoothed one ±1e-10: free mixing lengths of 100-490 m, KappaH up
+  to 0.55 m²/s and a Prandtl number flipping between 1 and 10 up to 23 times in half a day at one
+  interface. The Prandtl cuts already act on those cells.
+* **Segment tests.** Reversing only chunks 89..79 from the saved cotangent costs ~6 min per setting on a
+  GH200: preset ×2906; `freeze_convection`, `tke.km_e`, `tke.diss`, `freeze_tke_state` ×1e3;
+  `mix.av_out` ×5e12; `freeze_mixing` and `mix.kv_out` ×0.38; `tke.ml_n2` ×0.92; `tke.ml_wall` ×1.12. The
+  loop is N² → mxl0 = √2·√tke/N → KappaH → Kv → T, S → N², and dmxl0/dN² = −mxl0/(2N²) has no bound as
+  N² → 0. MITgcm's GGL90 warns the same about the adjoint of its Blanke-Delecluse length (`adMxlMaxFlag`).
+* **Blanket cuts fail the bar.** `tke.ml_wall` cures July (within 15 %) but moves January J_MLD at 60 days
+  from 0.8 % to 14-20 %; `tke.ml_n2` has no burst at all and is 20-90 % off already at 30 days. Wherever N²
+  is not tiny, the free length's N² derivative is a large, real part of the gradient.
+* **Targeted cut** `tke_ml_cut` = N²* (only where the smoothed N² < N²*). Segment 89..72: ×8.9 at 1e-9 and
+  1e-8, ×7.2 at 1e-7, ×1.22 at 1e-6. At 1e-8 the sustained growth is gone; a second event on 8 August in the
+  same columns (cells with N² between 1e-8 and 1e-6) spikes ×11 and decays. On the bar, 1e-8 passes J_MLD at
+  30/60/90 days in both seasons (within 7.7 %) and July J_Tfull (within 2.2 %), and leaves January J_Tfull
+  where the preset had it. 1e-6 also passes, with clean traces, but raises the January J_Tfull error (c_k 62
+  → 84 % at 30 days). The preset takes 1e-8, the threshold the Prandtl cut already uses.
+* **GPU scatter of a burst.** The same preset segment grew ×2906 and ×199 in two runs: round-off flips the
+  closure's switches. Stopping the gradient of the FCT limiter factors (the cure of a March ice-cost burst
+  in near-tied deep cells) gave ×173, inside that scatter, so the limiter is not part of this loop.
+
+Lesson: when a closure derivative has no bound at a state the ocean visits (N² → 0 in deep homogeneous
+water), cutting it in every cell removes a large part of the true gradient; cut it only near the
+singularity, and judge the cut on the full bar as well as on the burst. Reproduce a burst from a saved
+cotangent over a few chunks: one setting in minutes instead of an hour-long sweep. Compare against more
+than one baseline: a single GPU run of a burst segment can be off by ×15.
+
+### 2026-10-10 (TKE adjoint, steps C6-C7) — the January box-T error is not one cut, and the preset holds its shape over 180 days
+
+* **What the January J_Tfull miss is not.** Without `tke_pr_cut` the 30-day c_k is −2.25e-5 against −2.37e-5
+  with it, and identical at 60 days. With the FCT limiter factors frozen, c_k moves further from the FD
+  (−1.80e-5 vs FD −6.35e-5) and the other constants change by at most 6 %. The adjoint with no cuts bursts by
+  day 6, so there is no cut-free reference to compare against.
+* **Judge the vector, not the worst constant.** Over the four constants, |adj − fd|/|fd| is 6.2, 8.5, 12.7,
+  19.6 and 13.4 % at 6, 12, 30, 60 and 90 days (projections 0.996, 0.931, 1.063, 0.829, 0.869). The 63 % c_k
+  error at 30 days is on a small component: its FD swings from −1.4e-5 to −7.4e-5 to −2.3e-5 between 2, 6
+  and 12 days.
+* **The bar driver held the ice as given** (`IceConfig.adjoint_mode="prescribed"`), chosen 2026-09-14 after a
+  ×462 a_ice tangent jump at the Okhotsk ice edge. With `"rheology"` (ice thermodynamics, advection and
+  coupling differentiated, ice velocity not) and no other change, the January vector error falls from
+  19.6 to 14.7 % at 60 days (c_k 14 → 8 %, cd 17 → 4 %) and from 13.4 to 12.8 % at 90 days; July J_MLD at 60
+  days drops from ≤5.4 % to ≤1.2 % and its reverse-trace maximum from 91 to 13. The ice mode should follow
+  whatever the ice adjoint can carry, not stay at the setting of a month-old burst.
+* **Screen without FDs (C7).** One reverse sweep per case, window-mean MLD, preset unchanged: 90 days from
+  2013-04-01 and 2013-10-01 grow smoothly (largest one-chunk growth ×1.7 and ×2.0, against ×4.9 and ×11
+  for the January and July 90-day runs that pass the bar). 180 days from 2013-01-01: the salinity cotangent
+  rises ×43 over 16-17 March and settles ×2.2 above its earlier level. 180 days from 2013-07-01: the TKE
+  cotangent rises ×187 in one chunk on 8 July and is gone a day later; the 8 August transient of C5 returns
+  at ×10.5. Neither runs away; whether they bias the gradient needs a 180-day FD.
+* **Cost on a GH200:** 90-day sweep 47 min, 180-day sweep 92 min, forward bases 29 min for 90 + 180 days.
+
+Lesson: a relative error on one small gradient component can read as failure while the gradient vector
+is within 13 %; report the vector error and the projection next to the per-constant table. Hardcoded
+choices in the measuring script (here the ice adjoint mode) are part of what is measured; revisit them
+when the parts they protected against change. A sweep without FDs settles stability cheaply but not
+accuracy: isolated spikes that decay are only harmless once an FD says so.
+
+### 2026-10-09 (sea-ice adjoint, task I18) — the frozen-sweep backward under shard_map: a pad node has no element, and the max over no elements is −inf
+
+`adjoint_damping="frozen_sweep"` had only run dense. New gate
+`fesom_jax/tests/test_mevp_frozen_sweep_sharded.py`: CORE2, PHC IC with the ice seed, one dense
+forced step, then the second step differentiated dense and on 2 CPU fake devices (default
+all_gather transport), loss = area-weighted mean ice speed² over owned nodes.
+
+* **First run (27995039): NaN.** Loss sharded vs dense rel 4.5e-16, d/dP* rel 2.6e-13, the live
+  lanes of the u_ice / m_ice cotangents matched, but d/dC_d was NaN and every pad lane of the field
+  cotangents was NaN.
+* **Cause.** `raised_coefficients` (`fesom_jax/ice_mevp_frozen.py:114`) takes β_t per node as
+  `jax.ops.segment_max` of α_t over the node's elements. A pad lane of a sharded mesh belongs to
+  no element, and segment_max returns its identity, −inf. The pad node's solve then has
+  obd = 1 + β_t + drag = −inf and β_t·u = −inf·0 = NaN. The forward value is masked by
+  `where(ice_nod, …)`, but the backward multiplies the zero cotangent by NaN, and C_d's
+  cotangent sums over all node lanes, pad lanes included. Every node of the dense mesh has an
+  element, which is why the dense tests could not see it. The other suspects (halo nodes missing
+  elements, a closed-over tracer, stale halo values in the stability number) were not involved.
+* **Fix:** `be = jnp.maximum(be, α)`. Since α_t ≥ α, nothing changes at a node that has
+  elements, so the dense backward is unchanged. The regression test is
+  `test_a_node_without_elements_gets_a_finite_backward` in test_ice_frozen_sweep.py: the
+  synthetic mesh plus one node without elements. Before the fix that node's cotangent was NaN;
+  after it, the cotangent is finite and the real lanes match the unpadded mesh to 1e-13.
+* **After the fix (27995348):** d/dP* sharded −2.287154580508e-10 vs dense −2.287154580509e-10
+  (rel 2.6e-13); d/dC_d −3.441293239172e-2 vs −3.441293239173e-2 (rel 5.1e-14). The
+  reconstructed u_ice / m_ice cotangents (owner + halo copies scatter-added) match dense to
+  max|Δ|/max|g| = 1.3e-10 / 8.7e-12. All lanes are finite and the pad lanes are exactly 0.
+  test_ice_frozen_sweep.py and scripts/tests/test_frozen_sweep_core2.py still pass (27995349).
+* **Negative control (27995038).** With the halo exchange dropped from the backward's linearized
+  sweep (the forward untouched), the errors become 3.0e-2 (P*), 5.3e-2 (u_ice) and 1.1e-1
+  (m_ice), seven to eight orders above the floor. The tolerances are 1e-9 (controls) and 1e-8
+  (fields).
+* The plan's name, test_ice_frozen_sweep_sharded.py, breaks the suite-group convention:
+  test_ice_* belongs in the 'ice' group and *_sharded.py in 'sharding'. The file is therefore
+  named test_mevp_* and registered in 'sharding'.
+
+Lesson: a reduction over a node's elements has an identity value. In a sharded mesh, pad lanes
+reach that identity, and in a dense mesh no node ever does. A max (−inf), min (+inf) or mean (0/0)
+computed only for the forward still enters the backward through a masked branch. Clamp it to a
+finite value that cannot change a real node. A dense gate cannot find this; a sharded run with a
+scalar control whose cotangent sums over all lanes finds it at once.
+
+### 2026-10-09 (sea-ice adjoint, task I19) — the March P* gap came from the plastic softening θ, not from a missing ice-state adjoint
+
+With `frozen_sweep` at θ = 0.95 (adjoint-ice 5f70a9b, TKE adjoint live), the "exact" adjoint, which keeps the ice
+state live, gave ln P* at 0.886 / 0.885 of the full-model FD in March at 5 / 10 d. Against the replay FD it gave
+0.975 / 1.004.
+
+* **The full FD is clean.** Its central values agree to 0.5 % across h ∈ {3e-3, 1e-2, 3e-2}, and the ±h one-sided
+  slopes differ by ≤ 3 %, so the forward has no kink there.
+* **Path split.** Comparing (exact − dynamics adjoint) with (full − replay FD), the ice-state path carries 98-100 %
+  of its true size for C_d, but only 51 / 35 / 42 % for P* at 2 / 5 / 10 d. The sign is right; the size is too
+  small.
+* **Knob scan** (March, 5 d, "exact", 0.31 GPU-h, `runs/ice/bar_table_knob_mar.json`):
+
+  | setting | ln P* vs full FD | ln C_d vs full FD |
+  |---|---|---|
+  | θ 0.95, κ0 1 | 0.886 | 1.000 |
+  | κ0 2 | 0.887 | 1.001 |
+  | κ0 4 | NaN: the transposed iteration diverges | NaN |
+  | θ 0.97 | 0.943 (1.038 of replay) | 1.004 |
+  | θ 0.99 | 1.084 (overshoot) | 1.010 |
+
+  Every finite row passes the amplification screen.
+* **Confirmed on the drift-fixed physics** (adjoint-ice-df 8f2e0f5, TKE and GM adjoint frozen, Task 17a; full FD
+  for Jan and Mar at 2 / 5 / 10 d):
+  * θ 0.97 puts all 12 rows inside the bar: P* 0.954-0.995, C_d 0.997-1.003.
+  * θ 0.95 gives P* 0.897-0.948 and misses March 5 d at 0.897.
+  * All 24 rows pass the amplification screen (median per step ≤ 1.0007, sustained ≤ 1.0013).
+
+**Reading.** The two knobs act on different things:
+* θ is the share of dζ/dΔ that the backward keeps. It moves the fixed point of the stress tangent, and with it
+  the size of the P* response that reaches the ice state.
+* κ0 only sets how far α_t, β_t are raised. That changes the pseudo-time path of the transposed iteration but not
+  its fixed point, so accuracy stays flat and only the stability margin moves.
+
+C_d acts through the drag term and hardly depends on θ. θ 0.99 overshooting shows that θ is a calibrated setting,
+not a step towards the exact derivative: the forward's 120 sweeps do not reach the viscous-plastic fixed point
+either.
+
+Lesson: when a stabilized tangent misses a feedback path, first scan the knob that moves the tangent's fixed point.
+A knob that only changes the iteration path cannot fix the size of a response. The P* gap looked like a missing
+state-path adjoint, but the path was there and only too stiff.
+
+### 2026-10-09 (sea-ice adjoint, task I17) — the frozen-sweep ice adjoint on the drift-fixed physics: 2-30 days, both hemispheres, θ 0.97 the default; one salinity burst in March
+
+Setup:
+* Code: adjoint-ice-df, i.e. adjoint-ice + adjoint-tke, which carries main's drift fixes (ice FCT scale_area,
+  top-of-step uvnode, mid-step forcing).
+* Ice adjoint: "exact" (ice state live) + `frozen_sweep`, κ0 1.
+* TKE and GM adjoint frozen (`--setting freeze_mixing+freeze_gm_slope` = `AdjointConfig.long_window()`), so that
+  a miss belongs to the ice. The full FD still runs the whole nonlinear model.
+* Cost and reference: drift cost over the Arctic box (lat ≥ 70N) or, for the Southern Hemisphere, the Antarctic
+  box (`ice_cbar --box antarctic`, lat ≤ 60S), against the full-model central FD over h ∈ {3e-3, 1e-2, 3e-2}. The
+  Arctic cost's adjoint never reaches the Antarctic ice within a month, so the Arctic rows say nothing about the
+  south.
+* Machine: GH200.
+
+Adjoint / full FD:
+
+| start | θ | windows | ln P* | ln C_d |
+|---|---|---|---|---|
+| 2013-01-01 | 0.95 | 2 / 5 / 10 d | 0.947 / 0.947 / 0.948 | 0.996 / 0.997 / 0.998 |
+| 2013-03-01 | 0.95 | 2 / 5 / 10 d | 0.948 / **0.897** / 0.904 | 0.992 / 0.998 / 0.998 |
+| 2013-01-01 | 0.97 | 2 / 5 / 10 / 30 d | 0.978 / 0.977 / 0.983 / 1.020 | 1.000 / 1.001 / 1.003 / 0.996 |
+| 2013-03-01 | 0.97 | 2 / 5 / 10 d | 0.995 / 0.954 / 0.972 | 0.997 / 1.003 / 1.003 |
+| 2013-07-01 | 0.97 | 2 / 5 / 10 / 30 d | 0.992 / 1.003 / 0.986 / 0.986 | 0.987 / 0.990 / 0.989 / 0.987 |
+| 2013-03-01 | 0.97 | 30 d | 1.025 | 0.988 |
+| 2013-07-01, Antarctic box | 0.97 | 2 / 5 / 10 / 30 d | 0.980 / 0.986 / 0.955 / 0.965 | 1.001 / 1.000 / 0.999 / 1.003 |
+
+* **Verdict.** θ 0.95 misses March 5 d (outside 10 %). θ 0.97 passes every row on the value, and the amplification
+  screen in every row except March 30 d.
+* **Amplification screen.** The per-step median is 1.0002-1.0022 everywhere. The sustained growth is ≤ 1.0056 in
+  the Arctic rows and ≤ 1.018 at Antarctic 30 d.
+* **March 30 d is not clean** (sustained 1.054/step, bar 1.030). Read back in time (`field_trace`), the
+  salinity cotangent ‖λ_S‖ jumps:
+  * ×43 within one half-day chunk, days 16.5 → 16.0 (2013-03-17, 00-12 UTC);
+  * ×3 more to day 15.5;
+  * then ×0.054 down to day 14.5, leaving the total norm ×2.4 above its pre-burst level.
+
+  During the burst S carries the whole norm (S_old likewise). The ice cotangents stay flat: u, v, a and m within
+  ×1.1, σ within ×2.6. So it is not the mEVP rheology.
+  * The gradient is still within 2.5 % of the FD, but the source is open: the brine / freezing-point loop of the
+    ice thermodynamics, or the under-ice ocean with TKE and GM frozen.
+* **The Antarctic FD in P*** spreads 4 % across h, well above the repeat noise (≤ 0.5 % of the signal). The
+  response is not smooth there (plastic switching), which is why the bar takes the plateau / middle-h
+  reference.
+* **FD quality.** Central values agree across h to ≤ 1 %. The GPU repeat noise (base vs repeat) is 1e-6-1e-5
+  relative, which is ≤ 1 % of the smallest FD difference.
+  * The noise job takes `--windows`. Left at its 1-10 d default, it skipped the 30-d window, so the 30-d floor
+    was added afterwards (`noise_floor_w30.json`).
+* **30-d storage.** The base keeps every 6th (Jan, 30 d only) or every 2nd (Jul) boundary
+  (`fwd --save-every`), and the gradient recomputes the forward between kept boundaries (`grad --stride`). That
+  is 21 / 60 GB instead of 116 GB each.
+* **Cost.** 6.0 GPU-h in total:
+  * 17a 1.5 h: two dates, 12 FD forwards each, two θ × three windows of adjoint;
+  * 17b 2.3 h;
+  * 17d 2.25 h: March 30 d and the Antarctic.
+* **The ice-state path.** With the TKE and GM adjoint frozen, the "exact" adjoint stays within 3.5 % of the full
+  FD at 30 d. For the drift cost, the mixing and eddy feedback on P* and C_d within a month is that small.
+* **Default.** θ is now 0.97 (Nikolay: "if 17b passes, change the default to 0.97"), commit e0ce694. CPU tests:
+  * 28006081: 35 passed, including library == harness at θ 0.97.
+  * 28006082: sharded == dense at the new default — loss 4.5e-16, P* 2.6e-13, C_d 4.9e-14 (relative).
+
+Lesson: a stabilized adjoint with a calibrated knob has to be checked away from where the knob was set. θ was
+picked from one March 5-day scan on the old physics. It then held to 0.95-1.03 for P* on the new physics, at
+2-30 d, in three seasons and both hemispheres, with the other adjoints frozen so that a miss would have been the
+ice's. Two further points:
+* A cost confined to one region tests only the adjoint it reaches. The southern ice needed its own cost.
+* Read the amplification trace even when the values pass. March 30 d matches the FD to 2.5 %, yet carries a
+  ×44 salinity burst that a longer window may not come back from.
+
+### 2026-10-09 (sea-ice adjoint, task I17e) — the March salinity burst was the FCT limiter's subgradient on near-tied deep cells in the Bismarck Sea, not the ice
+
+Setup:
+* The March 30 d gradient of I17 again: "exact" + `frozen_sweep` θ 0.97, TKE and GM adjoint frozen, Arctic drift
+  cost, the same base.
+* New option `ice_cbar grad --dump-cot 28-34 --dump-primal` (5765f75). It writes the carry cotangent at those
+  chunk boundaries, and the forward carry re-run from the nearest base boundary.
+* Three variants of the same gradient (GH200, 18-20 min each).
+
+Where:
+* **Location.** At the peak (boundary 32, 2013-03-17 00 UTC), 99.9 % of ‖λ_S‖² sits in four entries on two
+  adjacent nodes in the Bismarck Sea, 149.1-149.5E, 2.2-2.4S, bottom 1920 m.
+  * The four entries are levels 27, 28 and the bottom level 29 of one node, and the bottom level 29 of its
+    neighbour, 1.4-1.9 km deep.
+  * Their signs alternate (−, +, −, +). λ_T there is 1e5 smaller.
+* **The forward S comes in near-tied pairs on exactly those cells.** The two bottom cells hold a local S maximum
+  (34.5936) and differ by 5e-8 psu. Levels 27 and 28 of the first node differ by 4e-6 psu.
+* **How it grows.** In the cut variants below, λ_S on the four cells stays at a background of ~5e-9. In the
+  plain gradient it is already ×80 above that at day 17 (boundary 34). From there it grows ×30 to day 16.5, ×600
+  to day 16.0 and ×3 to day 15.5, then decays.
+* **Run-to-run.** Two identical GPU runs give the same gradient to 1.2e-4 (P*) and 3e-5 (C_d), but burst peaks
+  4 % apart: the derivative switches at round-off.
+
+March 30 d, adjoint / full FD (`df/bar_table_mar30_17e.json`):
+
+| variant | ln P* | ln C_d | worst 12 h | sustained (bar ≤ 1.030) | clean |
+|---|---|---|---|---|---|
+| I17 as before | 1.025 | 0.988 | ×13.9 (chunk 32) | 1.0536 | no |
+| repeat with the dumps | 1.025 | 0.988 | ×13.4 | 1.0530 | no |
+| ice `dynamics` (ice-state recurrence cut) | 0.966 | 0.925 | ×12.0 | 1.0518 | no |
+| + `freeze_advection` (whole limited antidiffusive flux cut) | 1.025 | 0.988 | ×1.07 (chunk 55) | 1.0020 | yes |
+| `FESOM_FCT_STOPGRAD_AE=1` (only the limiter factors frozen) | 1.025 | 0.988 | ×1.07 | 1.0021 | yes |
+
+* **The amplifier is the derivative of the Zalesak limiter factors.** Freezing them alone removes the burst. Both
+  cuts move the ice gradients by ≤ 0.05 % (P* −2.9665e-2 → −2.9668e-2 with the factors frozen).
+* **The ice is not involved.** `dynamics` keeps the burst, and at 30 d it is itself 7.5 % low in C_d.
+* **Mechanism.**
+  * In `zalesak_limit` the per-node bounds are max/min selections, and the factor is min(1, Q/P) with
+    Q = bound − LO.
+  * Where the limiter is active, ∂Q/∂S is a selection with weight 1, and P is made of the same small
+    differences. So the limited flux's derivative with respect to the tracer is O(1) per step, not O(CFL).
+  * On two cells tied to round-off, the selections hand the cotangent back and forth between the twins: an
+    alternating mode that grows.
+* **This overturns the expectation in ADJOINT_HORIZON.md §3** that freezing the factors deletes the stabilizing
+  term. Here their derivative was the destabilizing one.
+* **Provenance.** The factor switch is a process-wide environment variable read at import, and an inert copy of it
+  once voided an A/B. Every `ice_cbar` row now records `fct_stopgrad_ae` as the library read it (95111da). The
+  run above shows `true`.
+* **Cost.** 1.25 GPU-h (four 30-d gradients), plus two CPU unit jobs (45 and 37 passed) and four CPU analysis
+  jobs.
+
+Lesson: a cotangent norm is a sum over the globe, and the cost's region says nothing about where the
+cotangent grows. I17 named two ice-side suspects for a burst that sat 1.9 km deep at the equator. Dump the field
+before naming a mechanism. And the exact subgradient of a limiter is a selection: where the forward ties two
+values to round-off, it routes the cotangent between them with weight one. That is a growing mode, not a
+sensitivity.
+
+### 2026-10-09 (sea-ice adjoint, task I20) — the FCT limiter freeze as an `AdjointConfig` flag, and a test premise the limiter broke
+
+Setup:
+* I17e found the cure as a process-wide environment variable read at import (`FESOM_FCT_STOPGRAD_AE`).
+* Task 20 makes it a per-config flag (37b76a9):
+  * `AdjointConfig.freeze_fct_limiter` → `advect_one_fct(freeze_limiter=)` → `zalesak_limit(freeze_factors=)`.
+  * There it puts `stop_gradient` on the vertical and horizontal factors `ae`. The forward is unchanged.
+* The environment variable stays as the process-wide spelling of the same operation.
+
+Results:
+* **Registries.** Both flag registries pick the flag up (CPU 28011111, 28011112). On pi the forward is
+  bit-identical and the gradient changes.
+* **Kernel test on a sharp front.** The forward is bitwise, the gradient changes, and the flag equals the
+  environment switch.
+* **A test premise was wrong.** A second kernel test assumed the limiter is off on a smooth Gaussian blob, so the
+  frozen-factor gradient should equal the plain one. It failed: 3981 of 150 720 entries differ, by up to 4.6. The
+  limiter binds at a few % of the entries even there, and at those entries the factor derivative moves the
+  gradient by O(1). The rewrite (a484946) checks two things instead:
+  * the frozen-factor gradient against central FD at probes where the limiter is off;
+  * that it moves only a few % of the entries, by O(1) (CPU 28011936: 37 passed).
+* **End to end.** March 30 d with `--setting freeze_mixing+freeze_gm_slope+freeze_fct_limiter` (GH200 28011790,
+  18 min):
+  * P* 1.0252 and C_d 0.9882 of the full FD; the screen is clean (sustained 1.0020).
+  * The environment-switch run of I17e gave 1.0250 / 0.9882 / 1.0021.
+  * The 2e-4 difference in P* is the GPU run-to-run noise measured in I17e (1.2e-4).
+
+Lesson: "the limiter is off on a smooth field" is a guess about a forward branch. A gradient test built on it
+tests the guess, not the code. A test that needs a branch to be inactive should count the cells where the branch
+is taken before it compares gradients.
+
+### 2026-10-09 (sea-ice adjoint, task I22) — a larger α = β in the forward mEVP does not make the exact adjoint stable
+
+Setup:
+* The suggestion: raise α = β in the forward (1000 or more; a CD-grid discretization uses 1500), so that the mEVP
+  stability condition αβ ≫ γ holds everywhere.
+* The mode-study harness with a constant α = β = A field, through the aEVP code path with c_aevp = 0 and α_min = A.
+  * Settings: 120 sweeps, the captured steps of 2013-01-01 and 2013-03-01, A = 1000 / 1500 / 3000 / 10000.
+  * Cost: GH200 28013118, 5 min.
+  * The exact tangent is the row `afrozen`.
+
+Results (`runs/ice/modes/alpha_scan/summary.md`):
+* **γ/αβ over the ice elements, maximum:**
+  * January: 5.1 / 2.3 / 0.56 / 0.05.
+  * March: 3.2 / 1.4 / 0.36 / 0.03.
+  * At α = 250, about 10 % of the ice elements exceed 1, and the worst reach 30-130.
+* **The exact tangent still grows at every A.** Largest |λ| of the one-step map:
+  * 10^10-10^11 at 250;
+  * 10^2-10^3 at 1000 and 1500;
+  * 15-190 at 3000;
+  * ≈ 4 at 10000.
+* **The tangent-linear 1-day chain** (48 steps):
+  * It passes 1e200 at step 30-33 for A = 1000 and at step 45-46 for A = 1500.
+  * At 3000 it ends 10^40-10^55 times the FD.
+  * At 10000 it is still −53× (Jan) and 21× (Mar) the FD of ln P*.
+* **The forward, over one day of ice dynamics with the ice state held.** The ln P* sensitivity of the drift falls by:
+  * 1-4 % at 1000, 9-13 % at 1500, 38-45 % at 3000, 86-87 % at 10000.
+  * For ln C_d: ≤ 0.4 %, 1-3.5 %, 10-16 % and 41-48 %.
+  * One step from the same entry state moves the velocity by 3-5 % rms at 1000-1500.
+  * With 120 sweeps, a larger α means the stress relaxes less per step.
+* **Reading.** αβ ≫ γ stabilizes the pseudo-time iteration, not the linearization: with γ/αβ ≤ 0.05 everywhere the
+  exact tangent still grows about 4× per step.
+  * This agrees with the frozen-sweep studies (I5e-I5g). There the full plastic term dζ/dΔ (θ = 1) was unstable
+    at every raised α_t, and θ ≤ 0.97 was needed.
+  * The forward stays bounded because the yield curve caps the stress. The linearization has no such cap.
+* **Harness pitfall.** c_aevp = 0 puts sqrt(0) under jnp.maximum / jnp.where.
+  * Forward mode only selects, so it is fine.
+  * The VJP multiplies the zero cotangent by sqrt'(0) = inf, so the reverse 1-day chain was NaN from its first
+    step in every run.
+  * The tangent-linear chain carries the same growth (‖J_n…J_1‖ = ‖J_1ᵀ…J_nᵀ‖), and the table reports it.
+
+Lesson: the mEVP stability condition is a property of the iteration, not of its derivative. A forward setting that
+makes the iteration behave does not make the linearization contract when the linearized physics, the plastic
+softening, has growing directions. And a constant written as a degenerate case of a formula (c = 0 in a sqrt)
+carries that formula's derivative with it. Write the constant.
+
+### 2026-10-09 (sea-ice adjoint, task I23) — the full plastic derivative breaks the mEVP iteration, not the VP problem; but stabilized it overshoots
+
+Setup:
+* Danilov's reading of I22: the problem is the derivative with respect to Δ. Then VP would share it, and the finding
+  is "keep slightly less than 100 %". His question: is it partly the forward-backward pseudo-time stepping of
+  EVP/mEVP, which has no built-in dissipation?
+* Two tests at the captured steps of 2013-01-01 and 2013-03-01 (adjoint-ice-df f3b99b7, GH200 28014747, 5 min).
+* T1, `ice_modes.py operator`: positivity of the linearized implicit VP operator at the step's final iterate u_N,
+  A = C·(I − G').
+  * Element level: the symmetric part of the stress Jacobian in the σ:ε pairing.
+  * Global level: Lanczos on A's mass-weighted symmetric part.
+  * Modes: θ 1 with P_r live, θ 1 with P_r frozen, θ 0.97, θ 0.
+* T2: the frozen backward at θ = 1 with a fixed-point-preserving damped iteration,
+  x ← (1−ω)·x + ω·F(x) with ω 0.5 and 0.8 (`frozen_tangent(omega)`, variants TLf*w).
+
+Results (`runs/ice/modes/t23/summary.md`):
+* **The VP problem is fine at θ = 1.**
+  * No ice element has a negative symmetric part in any mode, including the exact derivative with P_r live
+    (63 819 and 61 779 elements).
+  * The divergence scatter is minus the transpose of the strain rate, metric term included (tested). So the
+    mass-weighted symmetric part of A is ≥ 1 + drag: positive definite.
+  * The implicit step's tangent is non-expansive in the mass norm. Lanczos finds nothing below 1.8.
+  * The softest stiffness at θ = 1 is ~1e-9 ζ, along the plastic flow direction. At θ 0.97 it is 0.0075 ζ.
+* **Damping the iteration makes θ = 1 stable.** Chain growth drops from 1.08-1.26 per step to 0.80-0.94, with P_r
+  frozen or live. The instability is the undamped forward-backward iteration, as Danilov suspected.
+* **But the stable θ = 1 adjoint is inaccurate.**
+  * One-day P* is 1.29-1.36 (Jan) and 1.41-1.49 (Mar) of the FD, with pattern correlation 0.75-0.94.
+  * θ 0.97 gives 0.99 / 1.03 with correlation 0.98-0.99, damped or not.
+  * The FD itself is linear over h 1e-3 to 3e-2 (within 1 %), so this is not FD smoothing a kink.
+  * Damping costs one-step C_d (0.69 at ω 0.5, 0.86-0.90 at ω 0.8); it recovers over the day.
+* **Reading.** The full derivative leaves almost no stiffness along the plastic flow direction. The frozen
+  linearization at the end of a 120-sweep, non-converged step then responds more strongly than the forward does.
+  3 % of the viscous stiffness restores the forward's response.
+
+Lesson: "the adjoint is unstable" and "the adjoint is wrong" were two problems with the same knob. Separate them
+before reading a knob as a physical regularization. Here θ < 1 started as a stability fix. Damping shows that
+stability does not need it, but accuracy does. And a positivity check of the linearized problem (element pairing
+matrices plus the transpose identity of the discrete divergence) is cheap. It answers "would an implicit solver have
+this problem too?" without writing one.
+
+### 2026-10-10 (sea-ice adjoint, task I24a) — more sweeps cure the full derivative's instability, not its bias; θ ≈ 0.97 does not depend on the sweep count
+
+Setup:
+* Danilov after I23: the main reason is how EVP time stepping is organized, but extra steps are needed to keep
+  the accuracy.
+* The question: is θ < 1 a correction for the non-converged 120-sweep forward?
+* Test: the one-day dynamics-only chain at 120, 500 and 1000 sweeps (α = β = 250), each against the FD of the same
+  N-sweep forward. Rows: θ 0.9 / 0.97 / 0.99, θ 1 (P_r frozen) undamped and damped. GH200 28016284, 18 min.
+
+Results (`runs/ice/modes/t24/summary.md`; ratio to the FD at h = 1e-2):
+* **Stability comes back with sweeps.** θ 1 undamped blows up at 120 sweeps (1.23 / 1.13 per step). From 500
+  sweeps on it decays like every other row (0.75 / 0.76).
+* **Accuracy does not come back.**
+  * θ 1 overestimates the one-day P* sensitivity by 23 % (Jan) and 37 % (Mar) at 500 and 1000 sweeps alike.
+  * Its pattern correlation is 0.92 / 0.77, against 0.99 / 0.98 for θ 0.97.
+  * θ 0.97 gives 0.98 (Jan) and 1.02-1.03 (Mar) at all three sweep counts; θ 0.99 gives 1.06-1.12.
+  * C_d does not care about θ (0.98-1.00).
+* **The FD itself.**
+  * The forward's one-step P* response grows 5× from 120 to 1000 sweeps (the step converges further), but the
+    one-day FD stays the same (−0.0262 Jan, −0.0209 Mar).
+  * h 1e-2 and 3e-2 agree within 0.5 %. h 1e-3 is up to 6 % off, which is ulp noise of the forward. The harness's
+    own reference picks h 1e-3 when the spread is ≤ 10 %, so ratios should be read against h 1e-2.
+
+Lesson: separate a knob's two jobs by varying the thing it supposedly corrects. θ < 1 looked like a fix for 120
+non-converged sweeps. With 1000 sweeps the instability is gone, but the best θ stays at 0.97-0.98, so θ is a
+property of linearizing the plastic rheology, not of the solver. A converged VP solver whose adjoint uses the full
+Newton derivative would overshoot the same way. A frozen-viscosity (θ = 0) adjoint undershoots.
+
+### 2026-10-10 (sea-ice adjoint, task I24b) — the frozen-viscosity (Picard, θ = 0) ice adjoint loses half the P* sensitivity over 1-3 months
+
+Setup:
+* θ 0 freezes the viscosities in the adjoint (Picard). This is the usual simplification of VP adjoints.
+* Coupled CORE2, Jan 2013, Arctic drift cost, exact + frozen_sweep. Setting
+  freeze_mixing+freeze_gm_slope+freeze_fct_limiter.
+* Gradients from the 21A base at 30/60/90 d (GH200 28016294-98, ≈ 1.9 GPU-h), against the 21B full FD
+  (`df/bar_table_jan90_theta.md`).
+
+Results, adjoint / full FD (all three h agree within 0.5 %; reverse traces clean in both):
+
+| window | θ 0 P* | θ 0 C_d | θ 0.97 P* | θ 0.97 C_d |
+|---|---|---|---|---|
+| 30 d | 0.61 | 0.81 | 1.02 | 1.00 |
+| 60 d | 0.55 | 0.77 | 1.05 | 0.98 |
+| 90 d | 0.54 | 0.76 | 1.05 | 0.97 |
+
+* **Picard's bias grows with the window and is not small for C_d.** In the one-day dynamics-only chain C_d was at
+  0.80-0.87. In the coupled model it is 0.76 at 90 d, because the stress response feeds back through the ice
+  state and the ocean.
+* **A cross-check from independent runs.** The 21A gradients against the year-long FD runs of 21D give the same
+  ratios at 30/60/90 d, to 0.004. The FD is reproducible.
+
+Lesson: a "frozen viscosity" adjoint is stable for free, but at 1-3 months it reports about half the ice-strength
+sensitivity and three quarters of the drag sensitivity of the model it differentiates. Its gradients point the
+right way and are too small, by a factor that depends on the window. That is harmless for a descent direction and
+harmful for any quantitative use (sensitivity maps, uncertainty, step sizes).
+
+### 2026-10-10 (sea-ice adjoint, task I21) — the frozen-sweep ice adjoint holds for a year; the screen trips on one ice-thickness spike in October
+
+Setup:
+* Coupled CORE2 (zstar + TKE + GM + mEVP, dt 1800 s, float64), from 2013-01-01, Arctic ice-drift cost (window mean).
+* Ice adjoint: exact + frozen_sweep θ 0.97. Setting freeze_mixing+freeze_gm_slope+freeze_fct_limiter.
+* One GH200 per job:
+  * 21A/B: 90-d base, grads, full FD.
+  * 21C: 365-d base, every 10th boundary, 134 GB; grads at 180 and 365 d.
+  * 21D: year-long FD runs at h 3e-3 / 1e-2 / 3e-2. They record the cost at 30/60/90/180/365 d, so they also re-check the
+    90-d bar from independent runs. Plus one repeat of the base for the noise floor.
+* Cost: 21C 5.1 GPU-h, 21D 6.5 GPU-h.
+
+Results, adjoint / full FD at h 3e-3 / 1e-2 / 3e-2:
+
+| window | P* | C_d | reverse trace (median / worst 3-chunk per step) |
+|---|---|---|---|
+| 60 d | 1.052 / 1.047 / 1.044 | 0.987 / 0.982 / 0.982 | 1.0003 / 1.009, clean |
+| 90 d | 1.045 / 1.047 / 1.044 | 0.973 / 0.972 / 0.975 | 1.0002 / 1.009, clean |
+| 180 d | 1.021 / 1.027 / 1.027 | 0.959 / 0.962 / 0.967 | 1.0001 / 1.008, clean |
+| 365 d | 1.059 / 1.049 / 1.050 | 0.980 / 0.972 / 0.980 | 1.0003 / **1.055, flagged** |
+
+* **The gradient passes at every window to a year.** The FD agrees across h to 0.8 %. A repeat of the year base
+  differs by 1.4e-5 relative to the cost (GPU non-determinism), about 1 % of the smallest-h FD signal.
+* **One flag at 365 d, in the ice-thickness cotangent.** The total-norm screen's worst 3-chunk stretch is 1.055 per step,
+  around 2013-10-03.
+  * The per-field trace puts it in the ice-thickness cotangent m_ice. In the half-day chunk that ends at
+    2013-10-04 00:00 it jumps ×220 (×37 in the total norm).
+  * One chunk further back, half a day earlier, the total norm is back at its level before the spike (1.35e-4 vs
+    1.55e-4).
+  * Smaller spikes of the same kind, all during the autumn freeze-up: m_ice on 2013-09-19 (×37), m_snow on
+    2013-10-18 (×14) and on 2013-11-16 (×7.5).
+  * Over the whole year the norm grows ×520 (10^2.7, 1.0003 per step). The net change over October is negative.
+  * In that chunk the ice velocity cotangents change by ×0.99-1.00 and the stress cotangents by ×0.7-1.04.
+    The spike is in m_ice alone; at the next boundary back m_ice is at 2.9e-5 again (2.6e-5 before).
+  * The cell has not been located yet. Two candidates:
+    * the ice advection's own Zalesak limiter (`ice_adv._fem_fct`, on m_ice, a_ice and m_snow). freeze_fct_limiter
+      cuts only the ocean tracer FCT, so this limiter's derivative is live;
+    * the thermodynamics at a freezing edge (cf. the ×462 one-day jump of the a_ice tangent at the advancing
+      Okhotsk ice edge, 2014-01-04).
+* **How the screen's sustained statistic sees a spike.** The statistic is the maximum over all 3-chunk windows, and
+  the window that ends at the spike sees the jump without its recovery. So any single-boundary jump larger than
+  1.03^72 ≈ 8.4× (24-step chunks) trips it, even when the norm recovers at the next boundary. The docstring says
+  such a spike "cancels inside the window"; that holds only for the windows that straddle it.
+  * Per field, apart from the spikes: S_old and T_old cross 1.03 only in the first reverse chunks (the ocean
+    cotangent spinning up from zero, as at 60 d). t_skin and the stresses fail the log-spread test with isolated
+    switches; none of these shows in the total norm.
+* **Cost of a one-year adjoint.**
+  * The reverse pass takes 2.98 h on one GH200: 17,520 steps at 0.61 s per step, the forward recompute from the
+    stride-10 boundaries included. 180 d take 1.47 h.
+  * The 365-d forward base takes 35 min; its boundaries take 134 GB on /work.
+
+Lesson: once the plastic softening is right (θ ≈ 0.97, I19 and I24a), the mEVP ice adjoint of the coupled model is
+stable and accurate for a full annual cycle. A year-mean drift sensitivity to P* comes out 5 % high and to C_d 2 %
+low against FD, at 3 GPU-h. The one thing a year adds that 180 days do not is the autumn freeze-up. There the
+ice-thickness and snow cotangents spike for half a day at a time, and the sustained statistic flags them. The spikes
+do not compound and do not move the gradient. A spike the norm recovers from at the next boundary is a
+switch-like event to localize, not a horizon.
+
+### 2026-10-10 (sea-ice adjoint, task I25) — the full plastic derivative is exact for the converged VP step; θ ≈ 0.97 pays for linearizing at the unconverged mEVP iterate
+
+Setup:
+* One ice step on the stand of I23/I24a, Jan + Mar 2013, Arctic drift D, controls ln P* and ln C_d.
+* Forwards:
+  * the model's mEVP (α = β = 250) at 1000 sweeps;
+  * the same sweep with a constant α = β = 3000 at 24000 and 48000 sweeps;
+  * the same sweep with α = β = 10000 at 80000 sweeps.
+* They share the fixed point, the implicit VP step. The large-α iteration is stable everywhere. FESOM's aEVP is not a
+  converged control (I5c).
+* Per forward we measured:
+  * GPU repeat noise and the residual of one more sweep;
+  * central and one-sided FD over h 3e-2 … 1e-6;
+  * the one-step frozen-sweep tangent at θ 1 (S and live, undamped and damped), 0.99, 0.97, 0.9 and 0;
+  * the θ = 1 excess over the FD, per node.
+* The mEVP runs were repeated on CPU, which is deterministic.
+* Code `ice_modes.py why` (9caea3b); GH200 28024620 (25 min), CPU 28024621/22.
+
+One-step tangent / central FD of the same forward at h 1e-2, ln P*:
+
+| forward | Jan θ 1 | θ 0.99 | θ 0.97 | θ 0 | Mar θ 1 | θ 0.99 | θ 0.97 | θ 0 |
+|---|---|---|---|---|---|---|---|---|
+| mEVP 250, 1000 sweeps, GPU | 1.28 | 1.11 | 1.03 | 0.71 | 1.50 | 1.18 | 1.08 | 0.82 |
+| mEVP 250, 1000 sweeps, CPU | 1.43 | 1.13 | 1.04 | 0.71 | 1.65 | 1.20 | 1.09 | 0.82 |
+| α 3000 (24000, 48000) and 10000 (80000) | 1.00 | 0.98 | 0.96 | 0.69 | 1.00 | 0.99 | 0.98 | 0.79 |
+
+* **On the converged step the full derivative is exact.**
+  * θ = 1 gives 1.00 in all three converged runs, in Jan and Mar. This is the form with P_r frozen, the stable form of
+    the frozen iteration.
+  * The damped live form also gives 1.00 once it has converged (48000 sweeps).
+  * The converged FD is flat over h 3e-2 … 3e-4 (within 1.5 %) and noise-limited below 1e-4, so the linear regime is
+    wide. The plasticity explanation (a linear regime narrower than the FD amplitudes) is refuted.
+  * On the converged step θ 0.97 is 2-4 % low and Picard 21-31 % low.
+  * C_d is 0.99-1.00 throughout.
+* **The model's own sensitivity barely depends on convergence.** FD of the converged forward / FD of mEVP-250: P*
+  1.04 (Jan) and 1.06 (Mar), C_d 1.00.
+* **The overshoot comes from the linearization point.**
+  * θ = 1 at the mEVP-250 iterate is 1.23 (Jan) / 1.41 (Mar) × θ = 1 at the converged state.
+  * It depends on the round-off realization of that iterate: against the same FD, GPU gives 1.28 / 1.50 and CPU
+    1.43 / 1.65.
+  * θ 0.97 gives 1.03-1.04 / 1.08-1.09 on both.
+* **Where: nearly rigid ice that the α = 250 iteration leaves deforming.**
+  * In the converged solution, 28 % (Jan) / 31 % (Mar) of the box nodes touch an element with Δ < 10 δmin.
+  * In the mEVP-250 iterate those nodes show Δ/δmin 70-420 (median 183-194).
+  * They carry 63 % / 56 % of the θ = 1 excess, but only 7 % / 11 % of the FD response.
+  * By the stability number at α 250, 87-90 % of the excess sits at γ/αβ 0.1-5 and 2 % above 5. These are not the few
+    unstable elements of I5.
+  * At a spurious Δ ≫ δmin the plastic tangent has almost no stiffness along the flow, where the converged ice is rigid
+    with viscosity P/δmin. The linear response leaks through.
+* **The mEVP-250 forward is not differentiable at small amplitude.**
+  * Two GPU repeats differ by 7e-4 m/s. The large-α runs differ by 2-6e-5 at 24000-80000 sweeps and by 6e-16 at 120.
+  * On CPU (bitwise repeatable) the central FD of D is flat over h 3e-2 … 1e-3 and erratic below 3e-4. The one-sided
+    differences split by ±0.25 at h 1e-5 (Jan).
+  * This is a deterministic but non-smooth dependence on P* below δ ln P* ≈ 3e-4, and it comes from the unconverged
+    elements.
+* **The live replacement-pressure derivative diverges undamped on the converged forward** (1e40-1e285). There the
+  frozen iteration needs P_r frozen (S) or damping; once converged, live = S.
+
+Lesson: θ < 1 is not a property of plastic rheology. For the VP step solved to convergence, the full (Newton)
+derivative reproduces the FD to 1 % in both months, and the linear regime is wide.
+
+The mEVP iteration at α = 250 is FESOM's setting, and its 120 or 1000 sweeps leave the nearly rigid part of the pack
+deforming at 70-420 δmin. That barely changes the model's own sensitivity (4-6 %). But linearizing there makes those
+elements plastically soft, and the full derivative overshoots by 25-65 %. Keeping 3 % of the viscous stiffness
+re-stiffens them about enough.
+
+So θ ≈ 0.97 is the price of differentiating a solver that has not converged. A converged forward could use θ = 1:
+a large α with ~10^4 sweeps, or a Newton-type VP solver. At α = 250, more sweeps do not converge it (I24a).
+
+### 2026-10-10 (sea-ice adjoint, task I21b) — the autumn cotangent spikes of the year adjoint sit on ice-free and snow-free nodes
+
+Setup: the year reverse was rerun (GH200 28024222; a 1.3-h budget, so it stops after boundary ~470 by design). It
+dumped the cotangents and the forward state at boundaries 521-523, 549-553, 580-582 and 637-639.
+
+* **2013-10-03 (boundary 551).**
+  * 84 % of |λ_m|² sits on one node and 99.98 % on ten. They form a cluster at 74.0°N 15.3°W, at the East Greenland
+    ice edge.
+  * The nodes are ice-free at 550, 551 and 552 (a = m = m_snow = 0).
+  * λ_m there is 1e-7 at 550 and 552 and 5e-3 at 551. The node's other cotangents (a, snow, t_skin, u, v, T, S) do not
+    change.
+* **2013-09-19 (522), m_ice:** the same, at 74.0°N 16.7°W, ice-free.
+* **2013-10-18 (581), m_snow:** at 72.3°N 157.7°W, on ice with a = 0.84 and m = 1.23 m but no snow.
+* **2013-11-16 (638), m_snow:** at 70.3°N 62.9°E, on new ice with a = 0.02 and no snow.
+
+Lesson: the spikes are the cotangent of a tracer at a node where that tracer is exactly zero.
+
+* The zero is re-imposed every step (cut_off, clipping), so the spike does not travel further back.
+* The parameter gradient gets nothing from it, because the tracer's sensitivity to the parameters is zero there. This
+  is consistent with the year gradient matching the FD.
+* The sustained statistic of the screen flags it anyway (I21).
+* Not pinned: which operation inside the half-day chunk makes the derivative at the m = 0 or m_snow = 0 boundary
+  (thermodynamics or advection).
+
+### 2026-10-10 (combined adjoint, branch adjoint-combined) — the TKE preset and the frozen-sweep ice adjoint run together to 90 days; freezing the GM slope is what costs accuracy
+
+Setting `comb`: `long_window_tke()` cuts + `freeze_gm_slope`, ice `adjoint_mode="exact"` with
+`adjoint_damping="frozen_sweep"`, θ 0.97, α-κ 1. TKE costs (J_MLD, J_Tfull, North Atlantic subpolar box)
+on the C5 bases and FDs; ice drift costs on the ice-session bases and FDs. GH200, ≈15 GPU-h for 10, 30,
+60 and 90 days.
+
+* **The merge does not change the forward.** One CPU day from 2013-01-01 on adjoint-tke and on the merged
+  branch: all 42 carry leaves at both boundaries, the MLD and the box-T sums are bitwise equal. On GPU the
+  merged forward differs from the old bases by drift 1e-6 to 4e-6 relative and T sums 2e-9, the same as a
+  repeat of the same code (7e-6 to 1.2e-5, 2e-9). A GPU bitwise check cannot tell a code change from
+  atomic-add noise; the CPU check can.
+* **The ice adjoint barely moves the TKE gradients, the GM slope freeze does.** At 10 days `comb` and
+  "preset + GM slope freeze, ice prescribed" agree to a few %, and both miss where the preset with GM live
+  passes: July J_MLD c_k 44 / 53 % against 3.8 %, January J_MLD alpha 28 % against 6.9 %. At 30 days the
+  July c_k miss is gone (4 %) and January J_Tfull c_k is better frozen (32 % against 63 %). At 90 days
+  January J_MLD c_k and cd miss (12 and 15 %; preset with GM live 3.5 and 7.7 %) and January J_Tfull is
+  about twice the reference error (28-57 % against 11-22 %). July passes every constant at 90 days.
+* **Ice gradients stay inside the bar with TKE live.** Adjoint/FD for P* and C_d: 10 d Jan 0.970 / 1.003,
+  Mar 0.955 / 1.007, Jul 0.992 / 0.987; 30 d Jan 1.008 / 0.997, Mar 1.011 / 0.996, Jul 0.985 / 0.989,
+  Antarctic 0.918 / 1.008; Jan 60 d 1.035 / 0.988, 90 d 1.031 / 0.983. The frozen-TKE references are
+  1.020-1.047 for P*, so live TKE is as close or closer.
+* **What the traces show.** No runaway anywhere. January ice drift: one shallow Beaufort-shelf column
+  (134.6°W 69.4°N, 5 levels) holds 100 % of the TKE cotangent at day 6 (×80-×111 for half a day, gone the
+  next); it reproduces on a repeat and the gradient does not change. The March 30-day and January 90-day
+  salinity spikes (×10, ×12) are the FCT-limiter event of I17e: with `freeze_fct_limiter` the traces are
+  clean (max/final 1.9 and 1.35) and the gradients identical to four digits.
+* **GM live with the ice adjoint, one window.** January 30-day drift with the GM slope live: the first run
+  burst ×327 at day 22.5 (TKE cotangent 0.36), P* 0.958. A repeat of the same job did not burst
+  (max/final 1.47) and gave P* 1.007, C_d 0.998. The burst is a switch decided at round-off, not a
+  property of the setting; one run says nothing about how often it fires.
+
+Lesson: when two fixes were each validated with the other part frozen, run the combination with each
+freeze toggled on its own, so the cost can be attributed. Here the expected risk (ice and TKE adjoints
+interacting) was small, and the measurable loss came from a freeze carried over as a precaution. A
+burst seen once on GPU needs a repeat before it counts against a setting.
+
+### 2026-10-11 (combined adjoint, branch adjoint-gm4) — the GM-live burst was the mixing length's N² derivative in one inverted shelf cell; masking it as the Prandtl derivative is masked lets GM stay live
+
+Setting `gmlm`: `long_window_tke()` + `tke_ml_ratio=100` + `tke_ml_raw_cut=-1e-6` + `freeze_fct_limiter`, GM/Redi
+differentiated in full, ice frozen-sweep as in the 2026-10-10 entry; now `AdjointConfig.long_window_combined()`. GH200,
+≈ 40 GPU-h for the GM stages 4-10.
+
+* **Where the burst sits.** January 30-day ice drift with GM live burst in two of four runs (P* 0.958 and 1.525 of the
+  FD); a repeat of the same job gives 1.007, so GPU round-off decides which run fires. Cotangent dumps at boundaries
+  38-47 put both stages in one cell: node 44012 (14.7°W 80.2°N, Northeast Greenland shelf, 13 levels), interface 10.
+  The TKE cotangent jumps ×1000 there at boundary 45 and is kicked again ×77 at boundary 41, after which the salinity
+  and TKE cotangents stay high for the rest of the window. The cell is inverted (raw N² −3.7e-5 … −6.9e-5) while the
+  smoothed N² is a small positive residual (4.7e-6 → 1.5e-7 → 9e-8), above `tke_ml_cut` = 1e-8, so dmxl0/dN² =
+  −mxl0/(2N²) is live and large. The Prandtl cuts already covered the cell; the mixing length did not.
+* **Every GM-side fix missed.** Masking the GM N² inputs at inverted / residual interfaces: three of four runs burst.
+  An ECCO-like steep-slope cut (|s| > 2e-3): one of three runs 9 % off. Cutting only the slope's N² path: clean in five
+  runs, but as inaccurate as `freeze_gm_slope` (January box T at 90 days 23.5 % vector error, July MLD 12.9 %).
+  Freezing the K33 term: all three runs ×1e6 from the window start (K33 = Ki s² ∝ 1/N⁴ is anti-diffusive in the
+  tangent once its derivative is dropped from the rest).
+* **The fix and its accuracy.** Three January 30-day ice runs: P* 1.007, C_d 0.999, equal to four digits. Ice adj/FD − 1
+  (P*/C_d): January 60 d −3.1/+0.4 %, 90 d −2.8/+1.1 %, March 30 d −0.9/+0.2 %, July 30 d +1.6/+1.1 %, Antarctic
+  30 d −8.2/+0.8 % (the same with GM frozen). TKE: window-mean MLD within 8.4 % for every constant at 30, 60 and 90 days
+  in January and July, July box T within 2.3 %, January box T within 5.1 % at 90 days (vector 4.6 %; unmasked GM
+  live 8.8 %, slope frozen 33 %) and missing at 30 and 60 days (vector 26 / 28 %; unmasked 15 / 18 %), the January box-T
+  error every setting has.
+* **Milder masks.** R* = 100 with raw* −1e-5: clean in three runs, January box T at 30 / 60 days 19.7 / 19.8 %. R* = 100
+  alone: clean in two runs, 14.5 / 18.2 %, i.e. the unmasked accuracy. The raw mask is what costs January accuracy; it
+  is kept in the preset until R* alone has the full 30-90-day check.
+
+Lesson: when a burst sits in one cell, list every derivative that cell feeds before cutting a whole scheme. GM was the
+switch that let round-off pick the run, so the GM fixes treated a symptom; the amplifier was a TKE derivative whose
+sibling, the Prandtl number, had been masked days earlier for the same reason. A mask added to one derivative of a
+quantity belongs on every derivative of that quantity.
+
+### 2026-10-11 (combined adjoint, branches adjoint-gm5 / adjoint-gm6 / adjoint-fwd) — the January box-T error sits on the convective switch, and neither a smooth convection nor the unsmoothed N² in the forward model fixes it
+
+Setting `gmlm` / `gmlmr` as in the previous entry, ice frozen-sweep θ 0.97, GH200. Cost: January J_Tfull (box mean of
+full-depth temperature in the subpolar North Atlantic) against central differences at h = 0.01 (h = 0.03 within a few %);
+6-day values come from the difference runs' running sums. About 12 GPU-h for stages 11-15. Every forward change below is
+an opt-in `TkeConfig` field; the defaults stay FESOM2, bitwise.
+
+* **Ratio-only masks (`gmlmr` = `gmlm` without `tke_ml_raw_cut`).** No burst. January J_Tfull vector error at 30 / 60 /
+  90 days goes from 26.0 / 27.7 / 4.6 % to 14.5 / 18.2 / 8.2 %; at 90 days alpha goes from 4.6 to 18.5 %. January MLD
+  stays within 6.6 %, July MLD alpha is 10.2 % at 30 days. The preset keeps the raw mask.
+* **Where the switch acts.** In the box interior (0-500 m), smoothed N² < 0 at 11-44 % of the January interfaces over
+  days 0-45 (July 0.3-10 %). At 80-95 % of those the bump to 0.1 m²/s binds, so Kv has no N² derivative there. Over the
+  whole mesh about 250k of the 300k interfaces with N² < 0 have |N²| < 1e-6 s⁻².
+* **The switch differentiated as a ramp, backward only (`AdjointConfig.conv_surrogate`).** A centred ramp
+  w = clip(1/2 − N²/(2d), 0, 1) blows the reverse sweep up in its first chunk (×1e15 to ×1e30 for d = 1e-5 to 1e-7). On
+  the stable half of the band the forward Kv is the closure's (1e-5 to 1e-3), so the linearised flux Kv·N² has the
+  diffusivity Kv_in − 0.1·N²/(2d), which is negative at a depth that does not depend on d. The one-sided ramp
+  w = clip(−N²/d, 0, 1) is stable. Vector error at 6 days: 6.0 % without it, 11.6 % with d = 1e-6, 18.1 % with 1e-5. At
+  30 days: 14.9 % → 4.9 % with d = 1e-6 (c_eps 10.4 → 4.3, c_k 74 → 11, cd 102 → 0.8 %). The onset derivative carries
+  the sensitivity missing at 30 days and costs accuracy at 6. It stays an option, not in the preset.
+* **The same ramp in the forward model (`TkeConfig.convection = "ramp"` / `"ramp_kv"`).** The exact adjoint explodes in
+  every form. Ramp on Kv and Av with smoothed N²: ×1e40 by day 6. With unsmoothed N²: ×2e5 by day 6, ×1e25 by day 30. Kv
+  only, Av on the switch: ×1e5 by day 6, ×6e26 by day 30. With d = 1e-6 about 180k interfaces sit at partial mixing (the
+  switch gives about 232k the full 0.1), each with dKv/dN² = 1e5. The backward-only ramp applies the same slope to cells
+  the forward model mixes fully, which is likely why it survives; that is not measured. The forward model hardly moves:
+  J_Tfull changes by −6.8e-5 to +1.1e-4 of 5.94 at 30 days, and the 30-day mean MLD by 0.7-3.3 % rms.
+* **Unsmoothed N² in the TKE closure (`TkeConfig.n2_source = "local"`).** No TKE masks are needed at 6 days: 9.1 %
+  vector error with only `freeze_fct_limiter`. By 30 days the reverse sweep grows smoothly ×1.5e8, carried by the TKE
+  cotangent. Neither the small-|N²| cuts nor the full `gmlm` masks change that growth (×1.5e8; 12.5 % at 6 days). The
+  ratio and raw masks are idle here, since the N² the closure reads is the raw one. The growth is not located.
+* **The reference moves with the forward model.** The 30-day difference quotient for c_k is −6.3e-5 with the FESOM2
+  forward and +2.8e-5 with unsmoothed N², while h = 0.01 and 0.03 agree within each forward. Part of the January error
+  is a weak sensitivity whose sign depends on the trajectory.
+
+Lesson: a switch with a zero derivative is a mask the forward model applies to itself. Count how many cells sit next to
+its threshold before smoothing it in the forward model: here 85 % of the convecting cells are within 1e-6 of N² = 0, so
+a smooth convection turns that population into a large, real sensitivity, and the exact adjoint follows it. A field the
+forward model smooths (here N²) can be the reason several masks exist, but removing the smoothing exposed a growth that
+none of those masks cover.
+
+### 2026-10-17 (combined adjoint, branch adjoint-yr-y3) — the one-year preset; FDs that perturb from a given date show which months the error comes from
+
+Setup:
+* Cost: the one-year window-mean MLD in box `natl_subpolar`, from 2013-01-01, 2013-07-01 and 2007-07-01.
+* Controls: ln c_k, ln c_eps, ln cd, ln alpha and ln k_gm.
+* Physics: the all-on model with the frozen-sweep ice adjoint (sweep guard 10, thin-ice cut 100, ice cuts `fct_flux`
+  and `strength_conc`).
+* GPU runs: 28176673, 28196034-6, 28201390-3.
+
+Results:
+* **The first year setting missed k_gm.** It cut the mixing length's N² derivative below 1e-6 to stop a 1995 burst.
+  With it, k_gm was 18 % small on both July windows, while the four TKE constants passed.
+* **When the gradient builds up.** A new `tkegrad --grad-trace` option writes the accumulated control gradient after
+  every reverse chunk. Its value at boundary c is the sensitivity to the control over chunks c to the end. A central
+  FD whose perturbation starts at boundary c (from the base run's saved state) measures the same number.
+* **The 1e-6 cut cost k_gm in every month.** It removes the derivative on 33-46 % of the box's interfaces in winter.
+  The k_gm shortfall was already 9 % for perturbations starting in late February. Relaxing that cut to 1e-8 removed it.
+  Relaxing the Prandtl cut or unfreezing the FCT limiter did not.
+* **With 1e-8 (`year_window_combined`), late winter and spring are exact.** For perturbations from late January to
+  mid-April, the adjoint matches the FD within 1 % for cd and k_gm (July 2013). All five gradients rose together over
+  those months, by about 11 %.
+* **The remaining error comes from July to January.**
+  * On July 2013, cd ends 15 % and alpha 14 % too large. The cd excess comes from three periods: +0.12 in July-August
+    (FD +0.005), +0.19 in September-October (FD -0.42) and +0.20 in November-January.
+  * The 1e-6 setting has the same July-January excess. Its TKE pass on July 2013 was a winter shortfall cancelling it.
+  * On July 2007, k_gm is 12 % small, again from July-January.
+  * The window from January 2013 passes all five within 5.8 %.
+* **The FD reference holds.** h = 1e-2 and 3e-2 agree within 0.9 % (cd, July 2013) and 1.6 % (k_gm, July 2007).
+* **A repeat of the run** agrees with the first one to 1.2 % in cd and 4 % in k_gm through the winter.
+
+Lesson: on a year window, check every control, and check when the gradient builds up, not just its final value.
+* A cut can cost one control while the others still pass because errors from different seasons cancel.
+* A per-chunk gradient trace, set against FDs that perturb from a given boundary, shows which months are wrong.
+* Not pinned: the source of the July-January error.
+
+### 2026-10-20 (CORE2 GPU speed, A6) — a chunk call that blocks the host serialises everything the host does between chunks
+
+The production loop builds each chunk's forcing on the host after the previous chunk returns. The
+chunk call blocks: the CG's while loop syncs the host every iteration, so the call does not return
+early and leave the GPU running. On 4 A100 the forcing build was 12.6-13.2 ms of an 84.4 ms step
+(job 28282453), all of it serial. `fesom_jax/run.py` now submits chunk i+1's build to a single
+worker thread before it dispatches chunk i (`FESOM_FORCING_PREFETCH=0` turns it off), and the gap
+fell to 0.08 ms/step: 73.92 ms, -12.4 % (job 28284314). The build itself is unchanged and runs in
+the same order, so the result is bitwise the serial loop on CPU
+(`test_run_entry.py::test_forcing_prefetch_bitwise`, both forcing modes). General rule: measure the
+host time between device calls separately from the time inside them (`gpu_profile.py time` prints
+both); when the call blocks, async dispatch does not hide host work and a thread does.
+
+### 2026-10-20 (CORE2 GPU speed, protocol) — a noise floor measured inside one job is too tight for a run from another job
+
+The GPU judge compares a candidate's state after 96 steps with a base run, field by field, against
+the base's noise floor: the largest relative difference over all pairs of 4 repeat runs in one job.
+A same-code run from another job fails it almost always. Leave-one-out over 5 same-code runs (4 in
+job 28282453, 1 from job 28284314, whose single-chunk noise run never prefetches and so compiles the
+same program) put the held-out run's worst field at 1.12-1.85x the floor in all 20 draws (median
+1.45x, job 28286319), and the cross-job run sat at ~1.75x in `ssh_rhs_old` against every one of the
+four in-job runs. Runs inside one job resemble each other more than runs in different jobs do. The
+compare step now defaults to `--factor 2` (`scripts/perf/gpu_profile.sbatch`, `NOISE_FACTOR`). A
+change that is round-off only should look like that A/A draw: no field consistently above ~1.8x
+against every base run. By that test the gathered SSH solve's uv at 1.54x (job 28283307) is a
+rerun. Compare the 1.05 tie margin of the restart check (2026-09-27 above): that margin covers a
+sampled spread; this one covers a spread sampled in the wrong place.
+
+### 2026-10-20 (CORE2 GPU speed, A5) — a cheaper halo transport made the step slower because XLA re-laid the whole step level-major
+
+On 4 A100 the default all_gather halo spends 34 ms of a 74 ms step in NCCL: each exchange gathers every
+device's whole local array. Two cheaper transports moved far fewer bytes and gained nothing: padded
+all_to_all (NCCL 4.3 ms of cost, step unchanged, job 28283046) and a compact all_gather of only the lanes
+other devices read (NCCL 13.8 ms, step -4 %, job 28286769). In both builds the other kernels grew by 14-23
+ms, single-launch 3-D kernels by 5-10x. An `optimization_barrier` around the exchange did not help (+4 %,
+jobs 28286309-11), so it was not fusion. The optimised HLO showed the cause: the node arrays turned
+level-major (`f64[48,32073]` 4610 times against 1059) and the transposes went from 70 to 205-293. The level
+sweeps (`ops.tdma`, the TKE min-scans and Thomas solve) `moveaxis` the level axis to the front for
+`lax.scan`; under all_gather the full-array all-gathers pin every exchanged field node-major and those
+transposes are materialised, but once the collectives touch only a small buffer, layout assignment makes the
+sweeps' transposes free by laying the whole step out level-major, and the gather-heavy kernels pay.
+`FESOM_COLUMN_UNROLL=1` runs the sweeps unrolled on the `[..., K]` arrays, with no transpose: compact +
+unroll is 56.89 ms, -23 % (job 28287270). fesom3-jax hit the same flip next to a Pallas call (83 -> 142 ms).
+General rules: count transposes and layouts in the optimised HLO whenever a change that should be cheaper
+is not; a `moveaxis` around a scan is a layout decision handed to XLA. The unrolled sweeps are bitwise in
+isolation but 1 ulp off in the full CPU step (XLA:CPU contracts across the now-fused producers), and the
+C-replay gates still pass with them on (job 28287269).
+
+### 2026-10-20 (CORE2 GPU speed, mEVP wide halo) — a redundant halo is bitwise only if the redundant nodes sum in their OWNER's order
+
+The sharded mEVP refreshed its node halo after each of 120 subcycles. The wide halo gives each shard K rings of
+ice lanes and refreshes (u, v | sigma) once every K subcycles (`fesom_jax/ice_wide.py`; 240 instead of 344
+collectives per CORE2 step on 4 A100 at K = 8, -9 to -10 % at K = 4-12). The plan's rule "standard lanes
+first, in the standard order" keeps an OWNED node's `scatter_add` order, but it is not enough: an outer-ring
+node that shard r computes redundantly must also get its owner's bits, and r's lane order is not the
+owner's, so a segment-sum on the ice lanes would round differently and the difference would reach the owned
+lanes K subcycles later. The fix is to not scatter on the ice lanes: each ice node carries its elements'
+`[elem, vertex]` slots in its owner's standard lane order and sums them from zero one add at a time (a
+trailing `+0.0` for a pad slot changes nothing), and the precompute (the ssh-tilt scatter) stays on the
+standard lanes and travels with the inputs. With that the owned lanes are bitwise on CPU at K = 2..60, over
+96 steps of full physics. Two smaller traps: (1) XLA removes a trip-count-1 loop and inlines its body; the
+inlined subcycle rounded differently (K = 7, remainder 1: 1-ulp differences on 8.6 % of owned velocities),
+so no block may be a single subcycle. (2) A negative control is needed and must use a small K: a skipped
+refresh at K = 2 must break the owned lanes; at large K a stale outer ring has decayed before it arrives.
+On GPU the same arithmetic in another order (deterministic gathers instead of atomic scatters) sits above the
+2x noise judge in 5 of 7 draws (worst 10x, under Hudson Bay ice), away from every partition seam; the noise
+floor measures one program's atomics, not a program change in the most amplifying component, which is a
+question for the judge, not a bug in the halo. Also: the noise states are the folded arrays with pad and
+halo lanes, so a change that only touches garbage lanes (here sigma on extended-halo elements) fails the
+folded compare at 15-25x; compare owned lanes before reading a FAIL.
+
+### 2026-10-20 (CORE2 GPU speed, protocol) — a max-based noise judge fails a pure reordering when the noise has rare discrete events; compare pair distributions instead
+
+The mEVP wide halo (one exchange every K subcycles, `ice_wide.py`) is bitwise the per-subcycle mEVP on CPU over 96
+full-physics steps, yet on 4 A100 it failed the single-draw judge in 5 of 7 draws, once at 10x the floor in
+density and salinity at one Hudson Bay node under ice. Its ice lanes sum node contributions by ordered gathers
+instead of atomic scatters, so on the GPU it is another summation order; over 96 steps such round-off grows
+chaotically and sometimes flips a discrete switch at one node, which a floor taken as the maximum over 6 pairs has
+not seen. `scripts/perf/noise_ab.py` runs the right test: 4 runs of each program, every within pair and every cross
+pair per field on owned lanes. On 4 GH200 (job 28290759) the cross pairs looked like the within pairs (largest
+median ratio 1.30, at most 2 of 16 cross pairs above the within maximum, in fields whose within pairs hold the same
+rare events), so the change is round-off only; it is -10 to -11 % (K = 8 / 12, jobs 28290739-40). Rule: a GPU
+fidelity judge for a value-preserving change needs repeats of BOTH programs and a distribution comparison; one
+draw against a max floor is a screen, not a verdict.
+
+### 2026-10-20 (CORE2 GPU speed, A2) — a Python-unrolled level sweep fuses into one kernel that recomputes the recursion O(K²) times; a one-thread-per-column Pallas kernel is O(K)
+
+Unrolling the level sweeps in Python (`ops.unrolled_scan`, `gpu.column_unroll`) fixed the layout flip, but XLA then
+fused each sweep into ONE kernel whose root concatenates the 48 level columns: every output element re-evaluates the
+recursion from the first level (the back-substitution of `impl_vert_visc` on the elements: a fusion of 46 subtracts
+and 46 multiplies feeding a concatenate, 1.35 ms per CORE2 step on 4 GH200, plus 0.65 ms on the nodes; job 28291187).
+`fesom_jax/column_kernel.py` runs the sweeps as Pallas (Triton) kernels instead — one thread per column carrying the
+recursion in registers through all levels, the inputs as level-major copies made by a Pallas transpose kernel (an
+opaque copy, so XLA's layout assignment cannot re-lay the step around it), the tangent taken from the XLA sweep
+(`custom_jvp`). On 4 A100 the step went 45.55 -> 37.85 ms (-17 %, job 28291852) and the host syncs per step 34 ->
+10. The design is fesom3-jax's `ops/column.py` (read, not imported). General rule: when a fused kernel is far slower
+than its byte count, look at its root — a concatenate of a recursion is quadratic.
+
+### 2026-10-21 (single precision) — XLA:GPU folds f64→f32→f64 convert pairs unless told not to; CPU tests cannot see it
+
+The rounding carry of FESOM2 #1206 (`carry = f32(acc − f64(f32(acc/h))·h)`) is exactly such a pair. With XLA's default
+`xla_allow_excess_precision=true`, XLA:GPU removes it on A100 (job 28288484: 3748 of 4096 carries 0, a rounded state
+off by one ulp) as fesom3-jax found on GH200; XLA:CPU keeps it, so every CPU test passes. `reduce_precision` and an
+`optimization_barrier` also survive, but only the per-jit compiler option protects every rounding of a program at once
+(the fold also removes roundings between the two carry sites). The option goes on single-precision programs only, so
+double-precision programs compile exactly as before. Rule: any test of a deliberate float32 rounding needs a GPU run
+with a negative control (default flags), not a CPU run.
+
+### 2026-10-21 (single precision) — an id()-keyed executable cache plus a per-call cast recompiles every chunk
+
+The forced runner's executable cache keys on `id(params)`. The single-precision path cast `params` to float32 on
+every chunk call, a new object each time, so with `FESOM_REUSE_EXE=1` every chunk recompiled: SP looked 13x slower
+than DP on 4 A100 (470 vs 36 ms/step, job 28292758) while the CPU diagnostic (reuse off, both precisions recompiling)
+showed them equal. Fixed by keying on the caller's object (e8f1e77): SP −31 % (job 28295120). Rule: a host-side
+transform inside a cached call path must not change anything the cache key reads; when a speed number is off by an
+order of magnitude, look at compiles per chunk before kernels.
+
+### 2026-10-21 (single precision) — the DP-lock hash depended on the host thread count
+
+The lowered `core2_gpu` program embeds the Chebyshev preconditioner's coefficients, computed on the host by a power
+iteration. BLAS `nrm2` summed in a thread-count-dependent order, so 32- and 64-CPU jobs produced constants one ulp
+apart and different hashes (the program text was otherwise identical). Fixed in the model (2db760b, pairwise numpy
+sums) and in the hash tool (one host thread, one process per program — a second program lowered in the same process
+could also be handed the first one's cached executable through a reused id()). Rule: a program-identity test must
+pin every host input of the trace, including the thread count of host numerics.
+
+### 2026-10-21 (CORE2 GPU speed) — a host-side constant baked into the program inherits the host BLAS's thread count
+
+The Chebyshev preconditioner's bounds (`ssh.enable_cheb_precond`) come from a fixed-seed power iteration in numpy on
+the host, and they enter the compiled program as f64 constants. The norm was `np.linalg.norm`, i.e. OpenBLAS `nrm2`,
+whose summation order depends on the number of host threads: the same CORE2 forward program hashed differently on a
+32-CPU and a 64-CPU job (the SP branch's DP-lock test; the diff was the last digit of the Chebyshev coefficients),
+and on a 127k-node vector the norm differs by 1-3 ulp between 1, 16 and 64 threads. So every `cheb_degree` run
+depended, at round-off, on the node it ran on. Fix (`ssh._power_lam`): numpy's own pairwise `np.sum(w * w)`, which
+is single-threaded and fixed-order; scipy's CSR matvec already was. Test: the same `lam` with 1 and 16 host threads
+in two subprocesses (the old loop fails it). Rule: anything computed on the host and baked into a program as a
+constant must avoid threaded BLAS reductions (norm, dot, matmul) — or be computed with the thread count pinned.
+
+### 2026-10-21 (CORE2 GPU speed, ordered sums) — replacing atomic scatters by ordered gathers needs a barrier on the sum, and "bitwise in isolation" does not carry into the step
+
+`ops.scatter_add` (a masked `segment_sum`, atomic scatter-adds on a GPU) can run as ordered gathers: per target
+row the flattened entry positions in ascending order (`ops.inverse_map`, built on the host per device from the
+LOCAL connectivity), added left to right from 0 with a fill-0 sentinel for short rows (`ops.ordered_sum`). Three
+things were learned. (1) The plain gather chain lets XLA's GPU fusion merge many sums with their consumers: on
+4 A100 about 90 gathers and the PP/TKE column work became one 8.6 ms multi-output kernel, so the change gained
+only 5.9 %; an `optimization_barrier` on each sum's output keeps the chains apart and gives -13.7 %
+(45.9 -> 39.6 ms/step); a barrier on the values as well changes nothing more. The barriers do not change values.
+(2) Every assembly was bitwise the `segment_sum` on CPU in isolation, and one unforced ocean step from rest was
+bitwise too, but the rest state had zero fluxes and so proved nothing; a forced step with real velocities
+differs by a few ulp. The cause is on the default side: XLA rewrites `x + scatter(0, ...)` into a scatter that
+starts from `x`, so the default program does not compute the order the source code writes. A unit test of the
+primitive is not a test of the program; test a step with non-trivial values. (3) Read the per-field rows, not a
+grep of PASS lines: an earlier "bitwise" verdict for the barrier modes came from a grep that dropped every
+`bitwise=False` row. Also: a deterministic program B makes `noise_ab.py`'s pooled within-pair median zero-heavy
+(B's within pairs are 0), so compare the cross pairs with A's within pairs alone. Gradients: the default AD of
+the gathers (a scatter of the cotangent) matches the `segment_sum` gradient to 1e-13 and keeps `jax.jvp`
+working, so no `custom_vjp` (which would break forward mode) was added.
+
+### 2026-10-21 (CORE2 GPU speed, A6) — a fixed per-chunk host cost shows up only once the step is fast; and "deterministic" on the GPU is per process, not per program
+
+With single precision and ordered sums a CORE2 step on 4 GH200 is ~11 ms, and the production loop at chunk 32 (one
+model day at dt 2700) was 13.5 ms/step: chunk 32 against chunk 96 gives a fixed ~67 ms per chunk call INSIDE the call
+(job 28295867). `run_steps_sharded_forced` re-folded, re-cast to float32 and re-placed (`make_array_from_callback`,
+per leaf and per device) the whole mesh, SSH operator, halo arrays and forcing constants on every call; the device
+time for those copies is small (2.3 ms of H2D per chunk in nsys), the cost is the host work. In double precision the
+same cost (~50 ms) was 7 % of a 21 ms step and nobody saw it. Fix: with `reuse_executable` the run-constant inputs are
+built and placed once per run (`integrate_sharded._PLACED_CACHE`, keyed like the executable cache by the identity of
+their source objects, LRU-bounded, `FESOM_PLACE_CACHE=0` off); inside-call time 13.0 -> 11.07 ms/step at chunk 32,
+the production loop 13.5 -> 11.7 ms/step (~630 SYPD at dt 2700). Bitwise: on GPU the cache-on and cache-off runs are
+identical over 3 noise runs (both deterministic) and over 3 model months of the production loop.
+Second lesson from the same check: of four 3-month runs of the same program (same snapshot code, same node type), three
+were bitwise equal and one (the first, job 28295760) differed by up to 0.86 C in T. So a run being deterministic in a
+repeat test does not make every process bitwise reproducible; a likely source is a per-process choice such as XLA
+autotuning. Rule: a bitwise A/B on the GPU needs a rerun of the base, not just one base run.
+
+### 2026-10-21 (CORE2 GPU speed, B1) — FESOM2's sea ice every N steps zeroes the ocean velocity before "averaging" it; the shadow port copies that, and every loop over the State fields had to learn about optional fields
+
+`ice_ave_steps = N` (Task 12) mirrors `fesom_module.F90:1100-1166` (e96a2b13; the same in 4ccdd35a, the R2
+binary's source, `:657-692`). `ocean2ice` runs every step BEFORE the update decision, so it sees the previous
+step's `ice_update` and `ice_steps_since_upd`: after an update step it copies the current surface T, S, hbar and
+velocity, otherwise it forms `(old*k + new)/(k+1)`. The counter starts at `N-1` with `ice_update = .true.`
+(`:600-601`), so step 1 updates; the ice step (EVP/mEVP, FCT, cut-off, thermodynamics) runs on update steps only,
+at `ice_dt = N*dt` (`ice_setup_step.F90:56`); `oce_fluxes_mom` and `oce_fluxes` run every step from the last
+thermodynamics outputs. Three details are easy to miss because with N = 1 the arrays coincide: the bulk formulae
+(`update_atm_forcing`, `gen_bulk_formulae.F90:175-221`) read `srfoce_temp/u/v`, i.e. the running means, every step;
+the SSS relaxation and virtual salt in `oce_fluxes` read the CURRENT `salt(1,n)`, not `srfoce_salt`; and the zstar
+freshwater balance on a step without an update combines the held evaporation / growth / `a_ice_old` with this
+step's precipitation and runoff, so it is exact only on update steps.
+
+**The quirk (verified in both sources).** `ocean2ice` sets `u_w = v_w = 0` on every node (`ice_oce_coupling.F90:169-174`;
+4ccdd35a `:213`) and then "averages" `u_w = (u_w*k + uw)/(k+1)` (`:194-195`; 4ccdd35a `:238`), so a step after a
+non-update step gets `uw/(k+1)`, not a mean. With N = 2 the update step (the second of each pair) gives the EVP
+drag and the thermodynamics half the surface current, and because `oce_fluxes_mom` and the bulk read the same
+`srfoce_u/v` every step, the ice-ocean stress and the atmosphere-ocean stress the OCEAN receives on that step use
+`uw/2` too; with N >= 3 the in-between steps see `uw/(k+1)` as well. `ice_coupling.ocean2ice_avg` copies it line
+by line (a zero array, then the averaging formula) and says so in its docstring; a fix is a FESOM2 change and the
+user's decision.
+
+**Implementation lessons.** (1) The counter, the flag, the five means and eight held thermo outputs are optional
+State fields that are None when N = 1; None is an empty pytree, so the N = 1 programs keep their leaves, and the
+lowered StableHLO of the production chunk (core2_full_bench + the core2_gpu.yaml options, dist_4, 4 fake CPU
+devices) has the same sha256 before and after, with and without the `gpu:` env set (job 28295377). (2) The price is
+that every loop over `dataclasses.fields(State)` must skip None: 27 test loops, the restart writer/reader, the
+partitioner, the diagnostics — and `zarr_output._all_state_fields()`, which several readers use to rebuild a State
+from a restart (`core2_adj.load_state`): with the optional names in it they failed on every old restart, so it lists
+the required fields again and the optional ones are written when present and read when the store has them. A
+`for i, f in enumerate(dataclasses.fields(State))` loop escaped the first sweep (a regex for `for f in`). (3) The
+counter is a node field holding the same value on every lane, so the entity-leading partition / fold / canonical
+restart carry it with no new code path; it is read from lane 0, which is always owned. (4) The update runs under
+`lax.cond` on that replicated value, so all devices take the same branch and the halo exchanges inside it stay
+matched. (5) Restart semantics: a restart written with N > 1 carries the counter and the held fluxes (as FESOM2's
+derived-type restart, `MOD_ICE.F90:468-469, 484-490`) and resumes mid-cycle; one without them starts a new cycle,
+as a FESOM2 run restarted from its netCDF restart does (`io_restart.F90:343-360` has no counter).
+
+**Measured.** CPU gates (`test_ice_ave_steps.py`, the new teacher-forced dist_4 test in `test_step_sharded.py`, the
+restart / suite / ice / step gates; jobs 28295509 and 28295379-82): the means match a numpy copy of the Fortran loop
+bitwise at N = 2 (1 ulp at N = 3, where XLA:CPU divides by `k+1` through its reciprocal); N = 2 at dt equals N = 1 at
+2*dt on a cycle's first step to 1e-16; dense and dist_4 agree bitwise on every ice field at all three steps; the
+restart written at an odd step resumes at 2e-8 and odd chunk lengths differ less than the same comparison at N = 1.
+On 4 A100 the step goes 38.56 -> 35.62 ms (-7.6 %, job 28295418): the ice update is ~5.9 ms, ~15 % of the step, and
+`lax.cond` showed no cost worth a static schedule. But one year of CORE2 at N = 2 is NOT inside the noise: against
+the same code at N = 1 on the same machine the SST differs by 0.18 °C rms after six months (noise 0.005) and the NH ice
+area is +3 % (jobs 28295449/28295530); against the ice-1 dt 1800 twin the SH ice volume is +36 % by December. Rule: a scheme that is "only" a
+cheaper schedule can still be a physics change; certify it like one, and keep it opt-in until the user decides.
+The Fortran pair (R2 binary, namelist only, 1990 from the R2 1989 restart, jobs 28296443/44, 1.9 node-h) answered it:
+FESOM2's own ice-2 minus ice-1 is the same as the port's in every month (December SH ice volume +38 % vs +36 %, SH
+area +33 % vs +32 %, April NH area +3.4 % in both, SST rms 0.17 vs 0.18 °C, volume-mean T +7.4e-4 vs +7.5e-4 °C). A
+mirrored scheme that changes the climate is the scheme's property, and the Fortran pair is the cheap way to show it.
+
+### 2026-10-21 (CORE2 GPU speed, combining SP with ice every second step) — two opt-in options that each pass alone can still clash; an explicit float64 in a mirrored formula is a precision decision
+
+`ice_ave_steps = 2` and `precision: single` each had green gates on their own branches; the first GH200 run with
+both stopped at trace time: the ice update branch of the `lax.cond` returned float64 and the hold branch float32.
+The running-mean weights were `k.astype(jnp.float64)`; in single precision (x64 off, explicit float64 allowed) that
+promoted the means and through them the whole ice update to float64. Upstream writes
+`real(ice%ice_steps_since_upd, WP)` (`ice_oce_coupling.F90:206-208, 240-241`), so the shadow port uses
+`precision.wp_dtype()` (float64 in double, the double program unchanged). Rules: (1) in code that a single-precision
+run traces, an explicit dtype is a precision decision — write the upstream kind (WP or WP_full), never "float64" for a
+counter cast; (2) two options merged on one branch need one run with both on before a speed claim — the
+`lax.cond` dtype check caught this one; a `where` would have run silently in mixed precision. The two branches'
+tests also each counted only their own optional State group (`test_state`); the merged test subtracts both.
+
+### 2026-10-21 (CORE2 GPU speed, host forcing) — once the step is fast the host forcing is the floor; the C reads both bracket ends at every roll
+
+With the ice every second step the chunk calls fell from 10.85 to 9.70 ms/step, but the steady step only from 11.2
+to 10.95: the main loop waited for the forcing prefetch (one thread building the next chunk's on-device tables),
+which needed 10.7 ms of Grace host per model step at dt 2700 (job 28298486). `getcoeffld` (C and port alike) reads and
+bilinearly gathers BOTH slices of the new bracket at every roll, though the new start is the old end; keeping the
+bracket's two gathered slices on the field halves the reads and the gathers (the same arrays, the tables bit for bit
+the same; 10.7 → 7.8 ms/step), and the steady step became 9.75 ms (758 SYPD). The decoding of the netCDF-4 records is
+the next half (300 of 640 ms per chunk); fesom3-jax moved it into spawned processes (HDF5 is not thread-safe), here
+`gpu.forcing_procs` (off by default). Rule: after every device-side gain, re-read the "host between chunks" column —
+a host stage that was hidden behind a slower step becomes the step.
+
+### 2026-10-21 (sharded tracer FCT) — the "FCT flip floor" at the partition seams was a port bug: the halo nodes need their owners' limiter FACTORS, not the sums
+
+The sharded tests have budgeted since Phase 8 for T/S differences of up to 5e-2 (relative) at the owned/halo
+interface after one step ("the documented FCT upwind-flip floor, not a missing exchange"). A lane-order experiment
+(the same partition, only the order of the lanes inside the shards changed) moved T at the seams by 1e-5 after one
+step while uv and eta stayed bitwise, which a pure reordering cannot do. Two cheap checks settled it (pi, dist_4,
+DP, one step): (1) the single-device step perturbed by 1e-15 and 1e-13 relative in T and S moves nothing above
+1e-12 — the scheme is continuous at round-off, there is no flip to amplify; (2) the 4-way step against the
+single-device one: interior bitwise, seams off by 1.5e-5 (T) and 2.1e-6 (S) at 26 / 35 points, with or without GM,
+TKE and every GPU option. `oce_adv_tra_fct.F90:376-401` computes the limiter factors on the OWNED nodes and then
+exchanges the factors ("fct_minus and fct_plus must be known to neighbouring PE"); the port read line 401 as an
+exchange of the antidiffusive sums and computed the factors on every lane, so a halo node's factor came from a
+cluster max/min over only the cells on its device. Exchanging the factors (af5429a) makes the sharded step bitwise
+the single-device one on pi without the GPU options (round-off with them). Rules: (1) a tolerance that "explains" a
+seam-only difference needs the experiment that would refute it — a round-off perturbation of the single-device run
+— before it goes into a gate; seam-only + interior-bitwise is the signature of a halo bug, not of chaos; (2) when
+porting an exchange, check WHAT the Fortran array holds at that line (here `fct_plus` is overwritten in place by the
+factors just above the exchange); (3) reordering the lanes is a cheap halo-bug detector: anything that is not
+round-off under a permutation reads a lane it should not.
+
+### 2026-10-21 (split-explicit SSH, Task 1) — an oracle dump that overwrites itself every step is a determinism check, not an oracle
+
+The Kokkos port's `FESOM_SE_DUMP` writes `step, eta^{n+1}, Ubt^{n+1}` per rank in local lane order and overwrites the
+file every step (`fesom_ssh_se.cpp` @ 29e443b): the four existing dump sets are all step 10 of a 10-step 8-rank run.
+That served its purpose (cross-backend byte comparisons of one state) but cannot gate a port: one step after ten
+coupled steps, on a partition whose partition-dependent C IC fesom-jax does not have. The usable rail was already in
+the binary: the ALE dump (`FESOM_ALE_DUMP_DIR`, gid-keyed `%.17g` text) also fires in SE mode, so its `hbar` tag gives
+eta per step on the exact configuration of the C oracle fesom-jax gates against (z2_cdump: private 2026-05-28 mesh,
+dist_16, KPP+GM+EVP, zstar). Rules: (1) before asking for new oracle runs, list which dump rails the frozen binary
+already has and which of them fire on the new path; (2) the oracle run must use the configuration the existing gate
+uses (mesh levels, partition, IC partition), not the one the dumps happened to be made with.
+
+### 2026-10-21 (split-explicit SSH, Task 2) — the SE invariants close at round-off when the trim weights are the thickness the next substeps read
+
+Sergey's AB3-AM4 subcycling on the FESOM2 path (the Kokkos port's design: velocity predictor reused, R = sum h du/tau,
+r-term with H_e = sum helem, trim with h^n weights, eta_n = hbar = eta^M, the zstar tail reused) gives on 100 wind-driven
+pi steps eta^{n+1} - eta^n - tau T(sum_k h^n u^{n+1}) = 3.0e-16 m, the cumulative layer sum 3.7e-12 m and a volume
+drift of 4.7e-19 relative (job 28310231): the trim makes the 3-D transport exactly <<U>>, and the zstar tail reads that
+transport with the same h^n. What made the gates cheap: the substep algebra is tested on random inputs (eta compatibility
+and the trim to 1e-12 of the change, every switch) separately from the model (where the compatibility is checked through
+the trim, sum_k h^n u^{n+1}). Rule: when a scheme has an exact algebraic invariant, test it on random inputs at the block
+level first; a model run then only has to show the composition does not break it.
+
+### 2026-10-21 (split-explicit SSH, Task 3) — a bitwise resume test has to put the chunk boundary at the restart step in BOTH runs
+
+The driver's restart seam is not bitwise in general (the boundary step is a separately compiled bootstrap call,
+~5.7e-8). Running the continuous reference with `chunk_steps` equal to the restart step makes the only difference the
+disk round trip, and then 26 = 13 + 13 is bitwise on every owned lane of every field, rings included (CORE2, KPP + mEVP +
+zstar + SE). The guards live in one host function (`ssh_se.init_state`): an SE restart into a CG run is refused (the
+carried eta_n = eta^M and the rings mean something else under the CG), a CG restart into SE starts from flat rings and
+says so. Rule: to prove a restart exact, compare against a continuous run with the same chunk boundaries, not a
+single-chunk run.
+
+### 2026-10-21 (split-explicit SSH, Task 4) — the CFL guard on the discrete operator reproduces FESOM_F's numbers on the same mesh
+
+Power iteration on the substeps' own divergence-gradient operator gives CORE2 omega_max = 3.1518e-2 1/s, the value
+FESOM_F's guard reports for its CORE2 (the plan discounted it as "the FESOM3 mesh"; it is the same horizontal mesh,
+FESOM3's vertex-bottom variant, and the 2-D gravity-wave operator evidently agrees to four digits), and
+M_min 40 at dt 1800 / chi 0.1 — the Kokkos port's resolution estimate gave 35 and M 35 blew up. At dt 2700: M_min 60
+(chi 0.1) and 68 (chi 0.2), so the default M 50 is below the guard there. Rule: estimate a stability bound from the
+discrete operator the scheme actually applies, never from a resolution formula; and check whether "the other model's
+mesh" is in fact the same file before discounting its numbers.
+
+### 2026-10-21 (split-explicit SSH, Task 5) — dense vs sharded bitwise needs the mesh as a jit argument; a 1-substep block breaks the wide halo's bits
+
+Two traps on the way to "owned lanes bitwise". (1) A dense reference jitted with the mesh CLOSED OVER is not the program
+the step runs: its arrays become constants and XLA:CPU compiled the 48-level column sum 2.8e-14 off the sequential numpy
+sum, while the same function with the mesh as an argument (and the sharded program) matched numpy exactly (pi probe).
+With the mesh as an argument the per-substep sharded block is bitwise the dense one on every owned lane (CORE2 dist_4).
+(2) The wide halo (K+1 rings, ice_wide's construction) was bitwise for K = 2, 3, 5, 10, 12, 50 but 1 ulp off for K = 7:
+M = 50 left a final block of ONE substep, XLA removes a trip-count-1 scan and inlines its body, which rounds differently
+— the mEVP wide halo had met exactly this; the fix is the same (shorten the first block). And a gradient check of a
+sharded program against the dense one must sum over all lanes that hold a copy of an input: an element owned by two
+devices is two inputs of the sharded program, and the two exchange schemes split its gradient differently between the
+copies (35-70 % per lane) while the sum matches the dense gradient to 1e-16. Rules: (1) never jit a bitwise reference
+with the data closed over; (2) any windowed scan: assert no block of length 1; (3) compare sharded gradients per global
+input, not per lane.
+
+### 2026-10-21/22 (CORE2 GPU speed, split-explicit Tasks 6-8) — once the device step got short, the host and /work set the pace
+
+Split-explicit took ~1.1 ms of kernels off the CORE2 step (the CG 1.75 ms, the SE substeps 0.69), yet `gpu_profile`
+showed only -5 % and the 10-year loop none. The time had moved to the host, in four places, found one after another:
+(1) a `lax.cond` with a device predicate (sea ice every second step) syncs the host every step — real, but removing it
+(`gpu.ice_static`) changed no loop time, because "inside the calls" is dispatch time, not device time; (2) the forcing
+worker thread decoding JRA slices under the GIL slowed the main thread's chunk dispatch (read-ahead processes,
+`gpu.forcing_procs` 8: -0.5 ms/step although the measured forcing wait was already small); (3) the forcing tables
+were copied four times per chunk (take, pad, stack, and the fold's moveaxis on the main thread) — one copy into the
+runner's folded layout, float32 rows written directly, threads per field made it slower; (4) output and restarts
+shared one writer thread with two writes in flight, so a 22-40 s restart store on a slow /work held the loop at every
+year end. With these and the padded transport, SE + the wide halo + the unroll run 7.39 ms/step steady (1001 SYPD) and
+the 10-year job is decided by compiles (3 x 65 s) and /work stalls. The final 10-year run is bitwise the first SE run.
+Rules: (1) once a step is short, time the production loop (`loop_ab.sbatch`), never only the steady benchmark — a
+host gap that the steady number hides or exaggerates decides the loop; (2) a "dispatch got shorter" number is not a
+device gain until the loop shows it; (3) a slow file system is a condition, not an exception: give every writer its
+own thread and the reader a deep prefetch.
+
+### 2026-10-22 (CORE2 fast adjoint, Tasks 0-5) — merging the fast stack into the adjoint line, and what a check is worth
+
+Merging perf/core2-gpu into the year-window adjoint line touched ten files by hand. What decided that the merge was
+right was not the tests passing but four comparisons against the parents: the dense CORE2 adjoint gradient bitwise
+the adjoint line's (CPU), the fast forward bitwise perf's (pi, 4 devices), a 12-day GPU adjoint within the repeat
+spread of the adjoint line's (5e-5 against 3e-5), and the TKE-cut tests' pinned jaxpr hashes, which failed — and the
+failure was benign: perf's column-kernel dispatch moved the scans' `moveaxis` after their `init`, and the merged
+cut-free program hashed exactly to perf's. Two more traps on the way to a sharded adjoint chunk: (1) JAX 0.10.1 embeds a
+closed-over array in the HLO as a constant (a 400 k-float sharded array: 3.2 MB of HLO, one parameter; the flag
+`jax_use_simplified_jaxpr_constants` does not change it), so a chunk function must take its sharded run constants
+as arguments — the dense adjoint closes over the whole CORE2 mesh, which is part of its ~220 s compile; (2) the adjoint
+library frees every chunk's `xs` after use, so constants passed there are marked with `adjoint.keep`. And the first
+"adjoint vs FD" table of the fast pieces was meaningless: a 10-day window of the window-mean MLD with one h fails for
+the reference adjoint too (c_k +14 %, alpha +21 %, c_eps FD ~0), the same as for ice-every-second-step. Rules: (1)
+judge a merge by comparisons against each parent, and a pinned-hash failure by hashing the parent; (2) never close
+over large arrays in a program meant to be sharded or compiled often; (3) validate a changed adjoint with the protocol
+the reference already passed (here 30 days, h 1e-2 and 3e-2), never with a cheaper one invented for the occasion.
+
+### 2026-10-22 (CORE2 fast adjoint, Task 5) — a sharded adjoint pays for every garbage value its forward tolerates
+
+The sharded forward had always been right on the owned lanes, so the pad lanes were never looked at. The adjoint
+looked at them. The pad elements carry the generic float pad 1.0, including the Coriolis parameter, so their split-
+explicit substep is unstable and their barotropic U overflowed within days (every pad lane of the U ring NaN after
+30 days) — invisible in the forward, because nothing reads a pad lane except a dead viscosity slot whose term is
+masked. In the reverse pass the mask is a select, but the partial behind it is a product: the dead slots read lane
+0 as a stand-in neighbour, their coefficient was infinite, and zero cotangent times infinity put NaN into lane 0 and
+from there everywhere — every control gradient NaN while the dense gradient was fine. Found by bisection (P=1 finite,
+coloured transport NaN, viscosity off finite), fixed twice: the dead slots' velocity difference is 0 before the
+coefficient, and a pad lane keeps its U. Two more findings on the way: with the CG, no two compiled programs agree to
+round-off even at the same trip count (the 1e-5 relative stop leaves the unconverged error to the rounding: 2e-5
+after two steps), so a sharded-vs-dense gate needs the explicit SE; and the "s/step" of the adjoint rows included the
+compile (reverse_seconds does), which made 4 GPUs look x1.38 instead of x2.05. Rules: (1) a sharded adjoint needs every
+lane finite in the forward, not only the owned ones — keep pad lanes inert, and mask a value before it enters a
+product, not after; (2) gate sharded against dense on a physics without iterative solves; (3) time the run without
+the compile (run_s), and say which one a number is.
+
+### 2026-10-22/23 (CORE2 fast adjoint, Tasks 6-7) — a window that is too short, a dt that is too long, a comma that set four options
+
+The fast stack passed every 30- and 45-day adjoint-vs-FD check (January windows) at dt 2700, and the year window from
+January 2013 blew up: equal to the dt-1800 reference to ~1 % from day 365 back to day ~255, then the ocean state
+cotangent (S first, then T, tke, w_e, uv; not the ice) grew x10 per 15 days backward, fastest in summer and spring and
+x1.3 in January — so a January window cannot see it. Nikolay had seen the 45-min forward fall apart and chose dt 1800
+for the adjoint ("we would chase its instabilities forever"); the dt-1800 year windows (Jan, Jul 2013) are clean and the
+January one passes its own FD (0.2-7 %). On the way: the split-explicit substep count is tied to dt (dtbt = dt/M at the
+CFL bound, 45 s); the dt-2700 M 60 carried over to dt 1800 made the SE work 1.5x — now M scales with dt. And an A/B of
+GPU options measured nothing at first: `sbatch --export=...,VARIANTS="a:X=1,Y=1 b:..."` splits at the commas and
+exports the pieces job-wide, so every variant ran with four options set (the recorded FESOM_* environment showed it).
+The clean A/B: the five options take one adjoint chunk from 216.5 to 132.8 ms/step (-39 %, the Pallas column kernel
+the largest share); the SE wide halo halves nothing in the reverse pass (forward -12 %, reverse +1 %); without the ice
+derivative the chunk is 105 ms, so the ice adjoint is ~21 %; the reverse pass is ~11x the forward, its largest
+compute item the transpose of the SE divergence's gather (an atomic scatter). Rules: (1) validate a long-window
+adjoint on a window as long as the use, and in the season where it is weakest; a short window passing says nothing
+about months; (2) a timestep change re-derives every count tied to it (SE substeps, mEVP subcycles, chunk lengths);
+(3) never pass a list through sbatch --export with commas, record the environment each variant actually ran with,
+and check a re-chained job has not started before submitting behind it.
+
+### 2026-10-23 (Fram plan, Tasks 1-4) — a NamedTuple is a tuple, and a per-node gradient gate meets the clamps
+
+The monthly forcing maps put a per-step schedule next to the forcing in the chunk's xs, as a pair `(forcing,
+schedule)`, and the sharded chunk told the two apart with `isinstance(seq, tuple)`. A `StepForcing` is a NamedTuple,
+so the plain chunk took the scheduled branch and died in shard_map with an in_specs structure error; the scheduled
+test passed, because it is scheduled. Exact-type test (`type(seq) is tuple`) fixes it. Second: the sharded and dense
+gradients of a monthly Tair map, two steps, agreed in sum (6e-7) and on all 1216 halo nodes of dist_4 (the lanes the
+localize transpose sums), but 3 (Tair) / 7 (u_air) interior nodes differed by up to 1.2e-4 of the map maximum, 51 % and
+190 % of their own ~1e-8 values: compact snow-free Antarctic summer ice at the freezing point, two of them with the
+skin temperature at the 0 C clamp. The forward agrees to 1e-12; the derivative of a forward-continuous clamp
+(min(t, 0)) is 0 on one side and 1 on the other, and round-off picks the side. The scalar gradients, sums over every
+node, never showed it. The end-to-end FD tool (base, ±h forwards, tkegrad, score) then passed four directions on two
+steps: ln C_d 0.986, an Arctic Tair box 1.004, a southward wind over the Fram box 0.999, an initial T box 1.0000.
+Rules: (1) never tell pytree variants apart by isinstance on a container type that NamedTuples and dataclasses share
+— use the exact type or a marker; (2) a per-node map gate compares the paths that can be wrong (the halo lanes, the
+sum) to round-off and allows a counted handful of switch nodes, printed with their location and state; a per-node
+max is not a round-off measure in a model with clamps. (3) The same test's FD of a North Atlantic Tair box against the
+box SST after two steps missed by 9.6 % at h 1 and 13 % at h 0.1 — not the derivative cuts (the exact adjoint is 0.6 %
+from the year setting) but the FD: an h sweep (job 28375980) scatters 9-37 % at h 1e-2..1, the forward and backward
+one-sided differences 2x apart at h 3e-3 (the forward jumps at switches in the winter subpolar box), and lands on the
+AD to 1e-6 at h 1e-4, central, forward and backward. A CPU gate in DP takes h small enough to step over no switch;
+the finite h that a chaotic multi-month FD needs is a different question, judged by its own h dependence.
+
+### 2026-10-24 (Fram plan, Task 5) — a derivative cut tuned on one cost biases another one by its memory
+
+The two-year adjoint of the 2013 Fram Strait ice volume export ran stably through 2013 with the year-window ice
+settings (frozen sweep θ 0.97, sweep guard, thin_mass, and the cuts fct_flux + strength_conc), but its 2013 directions
+missed the FD by 26-40 % (southward wind over Fram Jan-Mar 1.40, ln C_d 1.33, Arctic Tair 0.74). Narrowing the window
+localized it: 30 d passes (1.06 / 0.97), 90 d misses (1.31 / 1.09), 90 d without any ice cut passes (1.04 / 1.01), and
+dropping one cut at a time names "fct_flux" alone (1.002 / 0.996 without it). fct_flux holds the whole limited
+antidiffusive correction of the ice FCT constant, so the ice advection tangent is the low-order one: diffusive, it damps
+the memory of the ice mass, and the export cost has a long memory (a stronger January wind exports ice early and
+starves the later export, a delayed negative response the AD then under-represents). The cut was accepted on farc
+with P* and C_d against an area-mean cost, where that memory hardly matters. Without it the two-year run gives 1.07 /
+1.01 (Tair) / 0.84 (wind), the one-year 2013 window 1.08 / 1.04 / 0.88, and 2013 stays stable; dropping strength_conc
+as well brings back the summer strength loop (x31 by May), as on farc. ln P* moves −50 -> −464 with the cut gone. The
+2012 tropical growing mode (equatorial W Pacific, FD-confirmed artefact) is untouched — a separate problem. Rules: (1)
+a derivative cut is validated per cost family, not once: a cut that is harmless for an area-mean cost can bias a
+transport cost whose answer lives in a delayed response; re-run the FD for each new cost before trusting the cut set;
+(2) localize a long-window miss by shortening the window until it passes, then bisect the cuts at the shortest window
+that fails — the 90-d bisection cost 2 h where a two-year one costs 6; (3) the first stable cut set is not the right
+one: after the year is stable, try removing each cut again, because stability often came from one of them only.

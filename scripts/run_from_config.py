@@ -59,8 +59,9 @@ def main():
                          "pi IC when running the packaged pi mesh, else $FESOM_IC_DIR, else "
                          "data/ic_core2")
     ap.add_argument("--year", type=int, default=1958, help="forcing start year")
-    ap.add_argument("--chunk-steps", type=int, default=240,
-                    help="time-chunk length (steps) for the per-step forcing scan (~few days)")
+    ap.add_argument("--chunk-steps", type=int, default=None,
+                    help="time-chunk length (steps) for the per-step forcing scan (~few days); default "
+                         "gpu.chunk_steps, else 240")
     ap.add_argument("--restart-in", help="override cfg.restart_in (resume here; any device count)")
     ap.add_argument("--restart-out", help="override cfg.restart_out (write the restart here)")
     ap.add_argument("--steps", type=int, help="override cfg.n_steps")
@@ -130,6 +131,25 @@ def main():
                     help="override ssh.cheb_degree=N: the degree-N Chebyshev CG preconditioner "
                          "(CGPOLY — 3x fewer solver iterations at equal tolerance; "
                          "solver-tolerance-equivalent, NOT bit-identical). A/B + cert knob.")
+    ap.add_argument("--precision", choices=["double", "single"], default=None,
+                    help="override cfg.precision: 'single' = FESOM2's single-precision build (#1207 policy; "
+                         "CORE2 production physics only); default: the config's (double)")
+    ap.add_argument("--ic-f32", action="store_true",
+                    help="cold start only: round the initial T and S to float32 (the single-precision gate's "
+                         "envelope: a double-precision run from a float32-sized perturbation)")
+    ap.add_argument("--budget", action="store_true",
+                    help="print float64 global volume/salt/heat content after every chunk ([budget] lines; "
+                         "the single-precision conservation gate; host-gathers the State, not for speed runs)")
+    ap.add_argument("--ssh-gathered", action="store_true",
+                    help="override ssh.gathered=true: solve the SSH system on every device after "
+                         "one all-gather instead of the sharded CG (small meshes only; off by "
+                         "default — CORE2 GPU speed plan A4).")
+    ap.add_argument("--lane-order", choices=["none", "rcm"], default=None,
+                    help="override gpu.lane_order: the order of the lanes inside the shards (fesom_jax.lane_order; "
+                         "'rcm' = reverse Cuthill-McKee nodes, elements and edges after them). A/B knob.")
+    ap.add_argument("--ice-ave-steps", type=int, default=None,
+                    help="override ice.ice_ave_steps=N: the sea-ice step every N ocean steps at "
+                         "ice_dt = N*dt, FESOM2's scheme (plan Task 12; opt-in). A/B knob.")
     ap.add_argument("--output-layout", choices=["global", "folded"], default=None,
                     help="output + restart on-disk layout. 'global' = partition-independent canonical "
                          "node order — xarray/ushow read it directly (no unfold), byte-identical at "
@@ -162,6 +182,18 @@ def main():
         repl["forcing"] = dict(cfg.forcing or {}, on_device=True)
     if args.cheb_degree is not None:
         repl["ssh"] = dict(cfg.ssh or {}, cheb_degree=int(args.cheb_degree))
+    _prec = args.precision if args.precision is not None else os.environ.get("FESOM_PRECISION") or None
+    if _prec is not None:          # CLI --precision, else $FESOM_PRECISION (for the A/B timing wrappers)
+        repl["precision"] = _prec
+    if args.ssh_gathered:
+        repl["ssh"] = dict(repl.get("ssh", cfg.ssh) or {}, gathered=True)
+    if args.lane_order is not None:
+        repl["gpu"] = dict(repl.get("gpu", cfg.gpu) or {}, lane_order=None if args.lane_order == "none"
+                           else args.lane_order)
+    if args.ice_ave_steps is not None:
+        if cfg.ice is None:
+            raise SystemExit("error: --ice-ave-steps needs `ice:` in the config")
+        repl["ice"] = cfg.ice._replace(ice_ave_steps=int(args.ice_ave_steps))
     if repl:
         cfg = dataclasses.replace(cfg, **repl)
 
@@ -178,8 +210,16 @@ def main():
     mesh_dir = args.mesh_dir or cfg.mesh          # None ⇒ the packaged pi mesh (mesh: null)
     mesh = load_mesh(mesh_dir) if mesh_dir is not None else load_mesh(); _lap("load_mesh")
     part = _build_partition(mesh, cfg.partition, args.dist_dir or mesh_dir); _lap("partition")
+    if cfg.lane_order():            # the lanes inside the shards in a cache-friendly order (global ids unchanged)
+        from fesom_jax.lane_order import edge_lane_distance, reorder_lanes
+        _d0 = edge_lane_distance(part, mesh)
+        part = reorder_lanes(part, mesh, cfg.lane_order()); _lap("lane_order")
+        if _IS_LEAD:
+            print(f"[run] lane_order={cfg.lane_order()}: median edge lane distance per shard "
+                  f"{_d0.astype(int).tolist()} -> {edge_lane_distance(part, mesh).astype(int).tolist()}", flush=True)
     sm = shard_mesh.build_sharded_mesh(mesh, part); _lap("sharded_mesh")
-    op = ssh.build_ssh_operator(mesh, dt=cfg.dt)
+    # single precision: upstream FESOM2 switches the preconditioner to the symmetric Jacobi variant (#995)
+    op = ssh.build_ssh_operator(mesh, dt=cfg.dt, precond_variant=1 if cfg.precision == "single" else 0)
     cheb_deg, cheb_kap = cfg.ssh_cheb()
     if cheb_deg:                    # CGPOLY (ssh.cheb_degree): Chebyshev CG preconditioner
         op = ssh.enable_cheb_precond(op, cheb_deg, kappa_guess=cheb_kap)
@@ -205,6 +245,10 @@ def main():
         # xp=np keeps the global State on the host (the big-mesh setup-OOM fix).
         # ic_dir=None resolves $FESOM_IC_DIR → data/ic_core2 (fesom_jax.paths).
         state0 = cold_start_state(mesh, ic_dir, xp=np); _lap("cold_start_state")
+        if args.ic_f32:     # the single-precision gate's envelope run: the cold T and S rounded to float32
+            import dataclasses as _dc
+            state0 = _dc.replace(state0, **{k: np.asarray(getattr(state0, k), np.float32).astype(np.float64)
+                                            for k in ("T", "S", "T_old", "S_old")})
     sst0 = None if state0 is None else np.asarray(state0.T[:, 0])
     if cfg.forcing is None:
         # `forcing: null` = UNFORCED (the documented `null = OFF`). Never fall through to the
@@ -232,15 +276,18 @@ def main():
                                              static=forcing.static, sst_ic=sst0, dt=cfg.dt, **fpaths)
         _lap("local_forcing_setup")
 
+    # the halo transport: a --padded / --coloured / --ragged flag wins over gpu.halo_transport
+    _transport = ("padded" if args.padded else "coloured" if args.coloured else "ragged" if args.ragged
+                  else cfg.halo_transport())
     if _IS_LEAD:
         print(f"[run] mesh={mesh_dir} npes={part.npes} devices={len(jax.devices())} "
               f"dt={cfg.dt} steps={cfg.n_steps or cfg.duration} restart_in={cfg.restart_in} "
-              f"local_forcing={args.local_forcing}", flush=True)
+              f"local_forcing={args.local_forcing} halo={_transport}", flush=True)
     res = run_from_config(cfg, mesh=mesh, part=part, sm=sm, sop=sop, forcing=forcing,
                           state0=state0, start_step=0, year=args.year,
-                          chunk_steps=args.chunk_steps, out_dir=cfg.restart_out,
-                          use_ragged=args.ragged, use_padded=args.padded,
-                          use_coloured=args.coloured,
+                          chunk_steps=args.chunk_steps or cfg.chunk_steps() or 240, out_dir=cfg.restart_out,
+                          use_ragged=_transport == "ragged", use_padded=_transport == "padded",
+                          use_coloured=_transport == "coloured",
                           progress=(args.progress and _IS_LEAD),
                           local_forcing=local_forcing, checkpoint_every=args.checkpoint_every,
                           restart_archive_out=args.restart_archive_out,
@@ -248,7 +295,8 @@ def main():
                           restart_archive_length=args.restart_archive_length,
                           daily_out=args.daily_out, daily_start_step=args.daily_start_step,
                           monthly_out=args.monthly_out, monthly_start_step=args.monthly_start_step,
-                          chunk_diagnostics=args.chunk_diagnostics, output_layout=args.output_layout)
+                          chunk_diagnostics=args.chunk_diagnostics, output_layout=args.output_layout,
+                          budget=args.budget)
     if _IS_LEAD:
         print(f"[run] DONE step={res.step} dt_stage={res.dt_stage} restart_out={cfg.restart_out}")
         print("RUN_DRIVER_OK")

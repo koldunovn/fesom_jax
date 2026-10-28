@@ -118,6 +118,7 @@ class ForcingSched(NamedTuple):
     rdate: jnp.ndarray              # [T] f64 — the reader's Julian step date
     fidx: jnp.ndarray               # [T, N_FLD] i32 — per-field bracket row in the tables
     midx: jnp.ndarray               # [T] i32 — month row in the sss/chl tables
+    elapsed: jnp.ndarray = None     # [T, N_FLD] f32 — single precision only: rdate − t0 per field (#940)
 
 
 class ForcingDeviceConst(NamedTuple):
@@ -149,7 +150,7 @@ def forcing_device_const(sf: "SurfaceForcing") -> ForcingDeviceConst:
 
 
 def combine_step_forcing(tables: ForcingTables, rdate, fidx, midx,
-                         const: ForcingDeviceConst) -> StepForcing:
+                         const: ForcingDeviceConst, elapsed=None) -> StepForcing:
     """ONE step's :class:`StepForcing` from the chunk tables — the device-side twin of
     :meth:`SurfaceForcing.step_forcing`, run INSIDE the scan (all elementwise; fuses
     into the step). Same expression order as the host reader
@@ -162,6 +163,8 @@ def combine_step_forcing(tables: ForcingTables, rdate, fidx, midx,
     the host reader. ``forcing.on_device`` therefore defaults OFF, and the step-level
     gates budget the roundoff-seed growth (`_TABLES_ATOL` in test_forcing_sharded)."""
     def val(fi):
+        if elapsed is not None:   # single precision: point-slope form, coef_b = bracket-start value (#940)
+            return tables.coef_b[fi][fidx[fi]] + elapsed[fi] * tables.coef_a[fi][fidx[fi]]
         return rdate * tables.coef_a[fi][fidx[fi]] + tables.coef_b[fi][fidx[fi]]
 
     u = val(jra55.I_XWIND)
@@ -298,6 +301,9 @@ class SurfaceForcing:
     sss: sss_runoff.SSSRunoffReader
     chl_clim: "object"              # np.ndarray [12, nod2D]
     static: ForcingStatic
+    # single precision (fesom_jax.precision, FESOM2 #940): per-step values in the point-slope form, float32.
+    # Set by the run driver for a precision: single run; False (default) keeps every double-precision value.
+    point_slope: bool = False
 
     def step_forcing(self, year: int, day: int, sec: float, month: int,
                      *, xp=jnp) -> StepForcing:
@@ -310,7 +316,7 @@ class SurfaceForcing:
         HOST. The readers already return host numpy, so ``xp=np`` is a pure host op — used by
         the run driver so a big-mesh per-chunk stack is never staged on GPU 0 (the NG5 forcing
         OOM: a global ``[n_steps, nod2D]`` stack is ~2.65 GB/field at 7.4 M × 48 steps)."""
-        f = self.jra.step(int(year), int(day), float(sec))
+        f = self.jra.step(int(year), int(day), float(sec), point_slope=self.point_slope)
         return StepForcing(
             u_air=xp.asarray(f.u_wind), v_air=xp.asarray(f.v_wind),
             shum=xp.asarray(f.shum), shortwave=xp.asarray(f.shortwave),
@@ -344,7 +350,11 @@ class SurfaceForcing:
         (chunk length, dt) so the compiled chunk executable is reusable. A chunk is a
         few days ⇒ ``nm=2`` covers any single month roll (asserted)."""
         dates = list(dates)
-        coef_a, coef_b, rdates, fidx = self.jra.bracket_schedule(dates, nb)
+        elapsed = None
+        if self.point_slope:
+            coef_a, coef_b, rdates, fidx, elapsed = self.jra.bracket_schedule(dates, nb, point_slope=True)
+        else:
+            coef_a, coef_b, rdates, fidx = self.jra.bracket_schedule(dates, nb)
         N = coef_a.shape[-1]
         months: list[int] = []
         midx = np.empty(len(dates), dtype=np.int32)
@@ -366,7 +376,7 @@ class SurfaceForcing:
             sss_tab[j] = sss_rows[j]
             chl_tab[j] = chl_rows[j]
         return (ForcingTables(coef_a=coef_a, coef_b=coef_b, sss=sss_tab, chl=chl_tab),
-                ForcingSched(rdate=rdates, fidx=fidx, midx=midx))
+                ForcingSched(rdate=rdates, fidx=fidx, midx=midx, elapsed=elapsed))
 
     def reopen_year(self, year: int):
         """Roll the JRA reader to ``year`` IN PLACE (keeps the year-independent interpolation

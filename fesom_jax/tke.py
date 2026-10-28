@@ -23,14 +23,20 @@ on the pi path (it needs ``stress_node_surf`` — the KPP precedent).
 
 from __future__ import annotations
 
+import math
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 
+from . import precision as PR
 from . import ops, pp
 from . import tke_nn as _tke_nn
 from .config import DENSITY_0, DT_DEFAULT
 from .cvmix_tke import _safe_sqrt, _shift_down, integrate_tke_column
+
+
+N2_SOURCES = ("smoothed", "local")   #: TkeConfig.n2_source (FESOM2: "smoothed")
 
 
 class TkeConfig(NamedTuple):
@@ -70,6 +76,13 @@ class TkeConfig(NamedTuple):
     # --- test-only diagnostics (the 13 budget/aux terms; never in model State) ---
     with_diags: bool = False      # compute + return the budget diagnostics (JT.1 gate)
 
+    # --- forward options that are NOT in FESOM2 (defaults = FESOM2, bitwise) ---
+    n2_source: str = "smoothed"   # the N² TKE and its convective adjustment read: "smoothed" (FESOM2,
+    #                               one sweep of eos.smooth_nod3D) or "local" (the unsmoothed node N²)
+    convection: str = "switch"    # the shared convective adjustment: "switch" (FESOM2), "ramp",
+    #                               "ramp_kv" (Kv ramp, Av switch), "off"
+    conv_ramp_dn2: float = 1.0e-6  # "ramp"/"ramp_kv": N² width (s⁻²) of the one-sided ramp (pp.mo_convect)
+
     # NOTE: how the BACKWARD pass treats this closure is NOT set here — it is one flag of
     # :class:`fesom_jax.adjoint_stab.AdjointConfig` (``freeze_mixing=True``), passed to ``step`` as
     # ``adjoint_cfg``, so that every backward-only simplification lives in one object rather
@@ -88,6 +101,15 @@ class TkeConfig(NamedTuple):
                 "IDEMIX / Langmuir / Dirichlet BCs / mxl_choice!=2 are gate-only, not "
                 "ported (no C reference run ⇒ no oracle). Use tke_cfg=None for the "
                 "KPP/PP path. (fesom_tke.c:247-253 abort parity)")
+        if self.n2_source not in N2_SOURCES:
+            raise ValueError(f"TkeConfig.n2_source must be one of {N2_SOURCES}, "
+                             f"got {self.n2_source!r}")
+        if self.convection not in pp.CONVECTION_MODES:
+            raise ValueError(f"TkeConfig.convection must be one of {pp.CONVECTION_MODES}, "
+                             f"got {self.convection!r}")
+        if not (math.isfinite(self.conv_ramp_dn2) and self.conv_ramp_dn2 > 0.0):
+            raise ValueError(f"TkeConfig.conv_ramp_dn2 must be finite and > 0, "
+                             f"got {self.conv_ramp_dn2!r}")
         return self
 
 
@@ -133,20 +155,29 @@ def _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch):
     return Kv, Av
 
 
-def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
-               params, *, dt: float = DT_DEFAULT, exch=None, Z3d=None,
-               freeze_convection: bool = False):
-    """Assembled classical-TKE vertical-mixing driver — the mirror of ``fesom_tke_mixing``
-    (``fesom_tke.c:270-505``) followed by the shared ``mo_convect`` (``fesom_step.c:264``).
-    Returns ``(Kv, Av, uvnode, tke_new)`` — the ``(Kv, Av, uvnode)`` triple PP/KPP return
-    PLUS the advanced prognostic ``tke_new`` (the structural difference: TKE is stateful).
+COLUMN_INPUTS = ("tke_old", "Ssqr", "Nsqr", "dzw", "dzt", "forc_tke_surf", "nlev")
+"""The keys of :func:`tke_column_inputs` that are the positional inputs of
+:func:`fesom_jax.cvmix_tke.integrate_tke_column`, in its order."""
 
-    Assembles the per-column inputs from mesh/state, pushes them through the pure column
-    core (:func:`fesom_jax.cvmix_tke.integrate_tke_column`), wires ``Kv``/``Av``, and applies
-    ``mo_convect`` — a drop-in at the ``step.py`` mixing seam. ``exch`` is REQUIRED for the
-    internal node-``Av`` exchange (see :func:`_wire_kv_av`); ``Z3d`` is the live zstar
-    layer-center geometry (``None`` ⇒ the static mesh, byte-identical under linfs).
-    """
+
+def tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, *, Z3d=None,
+                      bvfreq_raw=None):
+    """Assemble the per-column inputs of the TKE column core from mesh/state
+    (``fesom_tke.c:330-373``) — the part of :func:`mixing_tke` before the column solve.
+
+    Returns a dict: the column-core inputs ``tke_old`` (= ``tke``), ``Ssqr`` (vertical shear²
+    of the node velocity over the live layer-centre spacing, interior interfaces only),
+    ``Nsqr`` (``bvfreq`` zeroed at the surface and bottom interfaces), ``dzw`` (= ``hnode``),
+    ``dzt`` (interface spacing with ``hnode/2`` end caps), ``forc_tke_surf``
+    (``|stress_node_surf|/ρ₀``), ``nlev`` (per-node layer count); plus ``uvnode`` (the
+    element→node velocity the step reuses) and the interface masks ``is_surf``, ``is_bot``,
+    ``is_interior``. ``integrate_tke_column(*(d[k] for k in COLUMN_INPUTS), ...)`` is
+    exactly the solve :func:`mixing_tke` performs, so diagnostics that re-run the column core
+    on these inputs see the model's own column state, not a re-implementation of it.
+
+    ``bvfreq_raw`` (the unsmoothed N², only when a ``tke_pr_ratio`` / ``tke_pr_raw_cut``
+    Prandtl or ``tke_ml_ratio`` / ``tke_ml_raw_cut`` mixing-length cut is on) adds
+    ``Nsqr_raw``, zeroed where ``Nsqr`` is."""
     nl = mesh.nl
     k = jnp.arange(nl)[None, :]
     nzmin = (mesh.ulevels_nod2D - 1)[:, None]                   # surface interface (0, no cavity)
@@ -176,6 +207,55 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
     dz_trr = jnp.where(is_surf, hnode[:, :1] / 2.0, dz_trr)    # dz_trr[uln0]=hnode[uln0]/2
     hnode_bot = jnp.take_along_axis(hnode, (nlev - 1)[:, None], axis=-1)   # hnode[nln0]
     dz_trr = jnp.where(is_bot, hnode_bot / 2.0, dz_trr)        # dz_trr[nln0+1]=hnode[nln0]/2
+    out = dict(tke_old=tke, Ssqr=vshear2, Nsqr=bvfreq2, dzw=hnode, dzt=dz_trr,
+               forc_tke_surf=forc_tke_surf, nlev=nlev, uvnode=uvnode,
+               is_surf=is_surf, is_bot=is_bot, is_interior=is_interior)
+    if bvfreq_raw is not None:
+        out["Nsqr_raw"] = jnp.where(is_interior, bvfreq_raw, 0.0)
+    return out
+
+
+def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
+               params, *, dt: float = DT_DEFAULT, exch=None, Z3d=None,
+               freeze_convection: bool = False, cuts=frozenset(), tke_adj=None,
+               freeze_state: bool = False, bvfreq_raw=None, conv_surrogate=None,
+               ice_conc=None, turner=None):
+    """Assembled classical-TKE vertical-mixing driver — the mirror of ``fesom_tke_mixing``
+    (``fesom_tke.c:270-505``) followed by the shared ``mo_convect`` (``fesom_step.c:264``).
+    Returns ``(Kv, Av, uvnode, tke_new)`` — the ``(Kv, Av, uvnode)`` triple PP/KPP return
+    PLUS the advanced prognostic ``tke_new`` (the structural difference: TKE is stateful).
+
+    Assembles the per-column inputs from mesh/state (:func:`tke_column_inputs`), pushes them
+    through the pure column core (:func:`fesom_jax.cvmix_tke.integrate_tke_column`), wires
+    ``Kv``/``Av``, and applies ``mo_convect`` — a drop-in at the ``step.py`` mixing seam.
+    ``exch`` is REQUIRED for the internal node-``Av`` exchange (see :func:`_wire_kv_av`);
+    ``Z3d`` is the live zstar layer-center geometry (``None`` ⇒ the static mesh,
+    byte-identical under linfs). ``cuts``: the ``tke.*`` diagnostic derivative cuts of
+    ``AdjointConfig.diag_cuts``, passed to the column core (empty ⇒ the identical program).
+    ``tke_adj``: ``AdjointConfig.tke_options()`` (the column core's candidate settings).
+    ``freeze_state`` (``AdjointConfig.freeze_mixing_state``): the column inputs that carry the
+    ocean state — shear², N², the layer/interface thicknesses and the surface flux — enter
+    the closure as given constants in the backward; ``tke`` and the constants stay live.
+    ``bvfreq_raw``: the unsmoothed N² the ``tke_pr_ratio`` / ``tke_pr_raw_cut`` Prandtl and
+    ``tke_ml_ratio`` / ``tke_ml_raw_cut`` mixing-length cuts read (as a forward value only;
+    ``None`` unless one of them is on). ``conv_surrogate``: ``AdjointConfig.conv_surrogate``,
+    the backward-only ramp of the convective-adjustment switch (:func:`fesom_jax.pp.mo_convect`).
+    ``ice_conc``: the sea-ice concentration ``[N]`` the ``tke_pr_ice_cut`` Prandtl cut reads (as a
+    forward value only; ``None`` unless it is on). The ``tke_pr_lat_cut`` cut reads the
+    geographic latitude from ``mesh``. ``turner``: the interface Turner angle ``[N, nl]`` the
+    ``tke_pr_tu_cut`` cut reads (:func:`fesom_jax.eos.turner_angle`; ``None`` unless it is on).
+    ``cfg.convection`` / ``cfg.conv_ramp_dn2``: the forward convective-adjustment mode (default
+    ``"switch"`` = FESOM2).
+    """
+    inp = tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, Z3d=Z3d,
+                            bvfreq_raw=bvfreq_raw)
+    if freeze_state:
+        sg = jax.lax.stop_gradient
+        inp = {**inp, **{n: sg(inp[n]) for n in ("Ssqr", "Nsqr", "dzw", "dzt", "forc_tke_surf")}}
+        hnode = inp["dzw"]
+    uvnode, forc_tke_surf = inp["uvnode"], inp["forc_tke_surf"]
+    vshear2, bvfreq2, dz_trr, nlev = inp["Ssqr"], inp["Nsqr"], inp["dzt"], inp["nlev"]
+    is_surf, is_bot, is_interior = inp["is_surf"], inp["is_bot"], inp["is_interior"]
 
     # --- optional structure-preserving NN multiplier on c_k/c_eps/c_d (the §3 hybrid-ML hook,
     # Phase A5). ``params.tke_nn is None`` ⇒ the scalar constants pass through UNCHANGED
@@ -195,13 +275,23 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
         cd = params.tke_cd * m[:, 2:3]
 
     # --- column core (fesom_tke.c:421-442) ---
+    # single precision: CVMix runs in cvmix_r8 upstream — WP inputs copied into real64 buffers, WP namelist
+    # constants widened, the outputs copied back to WP (cvmix_driver/gen_modules_cvmix_tke.F90:290-298).
+    _f, _l = PR.full, PR.lit
+    _f_opt = lambda x: None if x is None else _f(x)       # noqa: E731  (the adjoint's optional inputs)
     tke_new, KappaM, KappaH = integrate_tke_column(
-        tke, vshear2, bvfreq2, hnode, dz_trr, forc_tke_surf, nlev,
-        c_k=c_k, c_eps=c_eps, cd=cd,
-        alpha_tke=params.tke_alpha, mxl_min=cfg.mxl_min, tke_min=cfg.tke_min,
-        kappaM_max=cfg.kappaM_max, dt=dt, with_diags=False)
+        _f(tke), _f(vshear2), _f(bvfreq2), _f(hnode), _f(dz_trr), _f(forc_tke_surf), nlev,
+        c_k=_f(c_k), c_eps=_f(c_eps), cd=_f(cd),
+        alpha_tke=_f(params.tke_alpha), mxl_min=_l(cfg.mxl_min), tke_min=_l(cfg.tke_min),
+        kappaM_max=_l(cfg.kappaM_max), dt=dt, with_diags=False, cuts=cuts, adj=tke_adj,
+        n2_raw=_f_opt(inp.get("Nsqr_raw")), ice_conc=_f_opt(ice_conc),
+        lat=(None if tke_adj is None or tke_adj.pr_lat is None
+             else _f(mesh.geo_coord_nod2D[:, 1])), turner=turner)
+    tke_new, KappaM, KappaH = PR.wp(tke_new), PR.wp(KappaM), PR.wp(KappaH)
 
     # --- Kv/Av wiring (fesom_tke.c:484-505, pre-mo_convect) + the shared mo_convect ---
     Kv, Av = _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch)
-    Kv, Av = pp.mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection)
+    Kv, Av = pp.mo_convect(mesh, Kv, Av, bvfreq, freeze_increment=freeze_convection,
+                           surrogate_dn2=conv_surrogate, mode=cfg.convection,
+                           ramp_dn2=cfg.conv_ramp_dn2)
     return Kv, Av, uvnode, tke_new

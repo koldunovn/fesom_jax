@@ -640,3 +640,66 @@ def test_FCT_gradient_finite_in_uv(mesh, fct_chain):
 
     g = np.asarray(jax.grad(loss)(fct_chain["uv"]))
     assert np.all(np.isfinite(g)) and np.max(np.abs(g)) > 0
+
+
+def _sharp_case(mesh, fct_chain):
+    """The limiter-active case of test_FCT_limiter_active_vs_numpy_reference."""
+    k = np.arange(mesh.nl)[None, :]
+    m = np.asarray(mesh.node_layer_mask)
+    Tin = jnp.asarray(np.where(m, 10.0 + 5.0 * np.sin(np.arange(mesh.nod2D)[:, None] * 0.7)
+                               * np.cos(k * 1.3), 0.0))
+    Told = jnp.asarray(np.where(m, 10.0, 0.0))
+    return Tin, Told, fct_chain["uv"] * 5e3, fct_chain["w"] * 5e3
+
+
+def _fct_vjp(mesh, fct_chain, Tin, Told, uv, w, **kw):
+    st = fct_chain["st"]
+    wv = jnp.asarray(np.random.RandomState(17).randn(mesh.nod2D, mesh.nl))
+
+    def f(T):
+        return tracer_adv.advect_one_fct(mesh, uv, w, st.helem, st.hnode,
+                                         fct_chain["hnode_new"], T, Told, dt=DT, **kw)[0]
+
+    out, vjp = jax.vjp(f, Tin)
+    return np.asarray(out), np.asarray(vjp(wv)[0])
+
+
+def test_FCT_frozen_limiter_keeps_the_forward_and_cuts_only_the_factor_derivative(
+        mesh, fct_chain, monkeypatch):
+    """``freeze_limiter`` (AdjointConfig.freeze_fct_limiter): the forward is bit-identical;
+    with the limiter active the gradient changes, and equals the process-wide
+    FESOM_FCT_STOPGRAD_AE switch (the same operation)."""
+    Tin, Told, uv, w = _sharp_case(mesh, fct_chain)
+    out0, g0 = _fct_vjp(mesh, fct_chain, Tin, Told, uv, w)
+    out1, g1 = _fct_vjp(mesh, fct_chain, Tin, Told, uv, w, freeze_limiter=True)
+    np.testing.assert_array_equal(out1, out0)
+    assert np.all(np.isfinite(g1)) and not np.array_equal(g1, g0)
+    monkeypatch.setattr(tracer_adv, "FCT_STOP_GRADIENT_AE", True)
+    _, g_env = _fct_vjp(mesh, fct_chain, Tin, Told, uv, w)
+    np.testing.assert_array_equal(g_env, g1)
+
+
+def test_FCT_frozen_limiter_is_the_derivative_where_the_limiter_is_off(mesh, fct_chain):
+    """Where the limiter does not bind, its factors are the constant 1 and freezing them
+    leaves the derivative: at the probes of test_FCT_gradient_finite_and_fd the frozen-limiter
+    gradient matches FD. Even on the smooth blob the limiter binds at a few % of the entries;
+    there the gradient moves by up to O(1), because the factors' derivative is a selection,
+    not a CFL-sized term (PORTING_LESSONS I17e)."""
+    st = fct_chain["st"]
+    wv = jnp.asarray(np.random.RandomState(11).randn(mesh.nod2D, mesh.nl))
+
+    def loss(Tin, **kw):
+        Tn, _ = tracer_adv.advect_one_fct(mesh, fct_chain["uv"], fct_chain["w"], st.helem,
+                                          st.hnode, fct_chain["hnode_new"], Tin, st.T_old,
+                                          dt=DT, **kw)
+        return jnp.sum(wv * Tn)
+
+    g0 = np.asarray(jax.grad(loss)(st.T))
+    g1 = np.asarray(jax.grad(lambda T: loss(T, freeze_limiter=True))(st.T))
+    h = 1e-3
+    for idx in [(1000, 5), (2000, 10), (1001, 8)]:
+        gf = float((loss(st.T.at[idx].add(h)) - loss(st.T.at[idx].add(-h))) / (2 * h))
+        assert abs(g1[idx] - gf) <= 1e-6 * max(abs(gf), 1.0) + 1e-9
+    moved = ~np.isclose(g1, g0, rtol=1e-9, atol=1e-12)
+    assert 0.0 < moved.mean() < 0.1
+    assert np.max(np.abs(g1 - g0)) > 0.1

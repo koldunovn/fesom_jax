@@ -56,6 +56,43 @@ def ocean2ice(state: State) -> SrfOce:
                   u=state.uvnode[:, 0, 0], v=state.uvnode[:, 0, 1])
 
 
+def ocean2ice_avg(state: State, k, update) -> SrfOce:
+    """``ocean2ice`` with ``ice_ave_steps > 1`` — a line-by-line mirror of FESOM2's
+    ``ocean2ice`` (``ice_oce_coupling.F90:146-196``, e96a2b13; the same in 4ccdd35a, the R2
+    binary's source, ``:154-245`` with the zeroing at ``:213`` and the averaging at ``:238``).
+
+    ``k`` is ``ice%ice_steps_since_upd`` and ``update`` ``ice%ice_update`` as the PREVIOUS step
+    left them (ocean2ice runs before the update decision, ``fesom_module.F90:1100`` vs
+    ``:1129-1135``). On ``update`` the ice surface fields are the current values; otherwise
+    T, S and ssh are the running means ``(old*k + new)/(k+1)`` since the last ice update.
+
+    ⚠️ **Upstream quirk, mirrored, not fixed.** ``u_w``/``v_w`` are set to 0 on every node
+    first (``:170-174``) and only then "averaged" (``:194-195``), so a non-update step gives
+    ``(0*k + uw)/(k+1) = uw/(k+1)``, not the running mean. With ``ice_ave_steps = 2`` the ice
+    update step (the second step of each pair) sees HALF the ocean surface velocity in the
+    ice-ocean drag of the EVP and the thermodynamics. The same ``srfoce_u/v`` are read EVERY step
+    by ``oce_fluxes_mom`` (the ice-ocean stress the ocean receives, ``:55-56, 81-83``) and by the
+    bulk formulae (``gen_bulk_formulae.F90:175-221``, ``gen_forcing_couple.F90:737-738``), so
+    with N = 2 the ocean sees ``uw/2`` there on the update steps and ``uw`` on the others; with
+    N >= 3 the in-between steps see ``uw/(k+1)`` too. Fixing it is a FESOM2 change and the user's
+    decision; this port copies the Fortran (``docs/PORTING_LESSONS.md``, 2026-10-21)."""
+    from .precision import wp_dtype
+    cur = ocean2ice(state)
+    kf = jnp.asarray(k).astype(wp_dtype())          # real(ice%ice_steps_since_upd, WP): float32 in single precision
+    k1 = (jnp.asarray(k) + 1).astype(wp_dtype())
+
+    def mean(old, new):
+        return (old * kf + new) / k1
+
+    temp = jnp.where(update, cur.temp, mean(state.srfoce_temp, cur.temp))
+    salt = jnp.where(update, cur.salt, mean(state.srfoce_salt, cur.salt))
+    ssh = jnp.where(update, cur.ssh, mean(state.srfoce_ssh, cur.ssh))
+    zero = jnp.zeros_like(cur.u)        # u_w(n) = 0, v_w(n) = 0 for every node (:170-174)
+    u = jnp.where(update, cur.u, mean(zero, cur.u))
+    v = jnp.where(update, cur.v, mean(zero, cur.v))
+    return SrfOce(temp=temp, salt=salt, ssh=ssh, u=u, v=v)
+
+
 # --------------------------------------------------------------------------
 # ice→ocean heat/freshwater fluxes (the runoff handoff) — :125-179
 # --------------------------------------------------------------------------

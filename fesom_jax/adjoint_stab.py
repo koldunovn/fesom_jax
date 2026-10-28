@@ -52,6 +52,7 @@ Nothing in this module is on by default anywhere. It is opt-in, assembled by the
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from functools import partial
 from typing import NamedTuple
@@ -66,7 +67,8 @@ from .mesh import Mesh
 __all__ = [
     "cotangent_op", "freeze", "freeze_increment", "cotangent_norm",
     "make_nodal_smoother", "make_discounter", "make_clipper", "make_state_stabilizer",
-    "StabConfig", "AdjointConfig", "FREEZE_FLAGS", "KNOWN_CUTS", "dcut", "differentiate_at",
+    "StabConfig", "AdjointConfig", "FREEZE_FLAGS", "KNOWN_CUTS", "dcut", "dcut_where",
+    "differentiate_at", "cut_where", "scale_tangent", "TKE_CANDIDATE_FIELDS", "TkeAdjoint",
     "Amplification", "amplification", "amplification_by_field", "field_norms", "AMP_CLEAN_MAX", "AMP_SPREAD_MAX", "AMP_SUSTAINED_MAX", "AMP_SUSTAINED_W",
 ]
 
@@ -246,7 +248,30 @@ class AdjointConfig(NamedTuple):
     """The limited antidiffusive tracer flux, so the backward sees plain monotone upwind
     advection while the forward keeps the full flux-corrected scheme. This is the NWP
     incremental-4D-Var practice of running more diffusive numerics in the adjoint than in
-    the nonlinear forward. Measured: not the amplifier here."""
+    the nonlinear forward. Measured: not the amplifier in the 60-day table above. On the
+    sea-ice drift gradient it removes the FCT burst (PORTING_LESSONS I17e), but
+    ``freeze_fct_limiter`` is the narrower cut that does."""
+
+    freeze_fct_limiter: bool = False
+    """The Zalesak limiter factors of the ocean tracer FCT (``tracer_adv.zalesak_limit``: the
+    fraction ``ae`` of each antidiffusive flux the limiter lets through) as constants. The
+    backward keeps the high-order antidiffusive flux and the limiting the forward applied,
+    but not how the limiting would change with the state.
+
+    The exact derivative of the factors is a selection (the per-node max/min bounds) divided by
+    sums of the same small flux differences, so it is O(1) per step, not O(CFL). Where the
+    forward ties two values to round-off, it hands the cotangent back and forth between them:
+    a growing mode, not a sensitivity.
+
+    Measured (PORTING_LESSONS I17e): on the 30-day March 2013 sea-ice drift gradient, a
+    salinity-cotangent burst on near-tied deep cells (Bismarck Sea, 1.4-1.9 km, ×600 in
+    12 h) disappears when only the factors are frozen. The sustained growth goes from 1.054
+    to 1.002 per step, and the ice gradients move by ≤ 0.05 %.
+
+    Narrower than ``freeze_advection``, which also drops the antidiffusive flux. The same
+    operation as the older process-wide switch ``FESOM_FCT_STOPGRAD_AE=1``
+    (``tracer_adv.FCT_STOP_GRADIENT_AE``). Unlike that switch, this flag is part of the static
+    config, so :meth:`describe` records it and it keys the compiled chunk."""
 
     freeze_pgf: bool = False
     """The baroclinic pressure-gradient force. Cuts the tracer-to-momentum coupling
@@ -273,14 +298,226 @@ class AdjointConfig(NamedTuple):
     ``tuple`` is coerced to a ``frozenset`` (hashable), and an unknown name raises
     ``ValueError``."""
 
+    # --- classical-TKE candidate settings (derivative-only; ``None`` = off) --------------
+    # The TKE adjoint diagnosis (docs/ADJOINT_TKE.md) found the loop that destroys the exact
+    # gradient beyond about a day: N^2 -> Richardson number -> Prandtl number -> KappaH (Kv)
+    # -> T, S -> N^2, and, separately, a transient TKE-only recursion at near-floor first
+    # interior interfaces below fresh surface lenses. The fields below are the candidate
+    # cures. Each keeps the forward bitwise and each, when ``None``, traces nothing.
+
+    freeze_mixing_state: bool = False
+    """The parametric-only TKE adjoint: every derivative of the classical-TKE closure with
+    respect to the OCEAN STATE is omitted, every derivative with respect to its four constants
+    (``tke_c_k``, ``tke_c_eps``, ``tke_cd``, ``tke_alpha``) is kept, and so is the TKE's own
+    recursion ``tke_old -> tke_new`` that carries ``c_eps``, ``cd`` and ``alpha`` into the
+    next step's diffusivities (they reach KappaM only through the next step's tke, so a cut
+    of ``tke_old`` would zero those three gradients).
+
+    Cut in :func:`fesom_jax.tke.mixing_tke`: the column inputs ``Ssqr`` (shear from the
+    velocity and the live layer depths), ``Nsqr`` (also inside the mixing length), the layer
+    and interface thicknesses ``dzw``/``dzt`` (zstar geometry) and the surface flux
+    ``forc_tke_surf`` (the ice-blended stress, which depends on the surface current). The
+    surface flux value is kept, so ``d/d cd`` survives; the wind stress no longer reaches the
+    TKE in the backward, so a surface-forcing control loses its mixing pathway under this
+    flag. The convective adjustment is left exact (its ``N^2 < 0`` switch has no derivative;
+    add ``freeze_convection`` explicitly for the straight-through bump derivative).
+
+    The gradient is BIASED (the ocean-state feedback on mixing is neglected), not approximate
+    in the sense of noise: it is the exact gradient of a model whose closure reads a
+    prescribed ocean state. Only the TKE closure reads it (no effect under PP or KPP)."""
+
+    tke_pr_cut: float | None = None
+    """N^2* of the Prandtl-number cut (``None`` = off). The derivative of the Prandtl number
+    ``clip(6.6 Ri, 1, 10)`` with respect to Ri (hence N^2 and S^2) is omitted where the
+    column-input N^2 < N^2* (``math.inf`` = everywhere, the same derivative as the diagnostic
+    cut ``tke.pr``); every other closure derivative, including every path of the TKE
+    constants (Pr does not depend on them), is kept. With ``tke_pr_mode="at"`` the Pr
+    derivative is instead taken at ``max(N^2, N^2*)`` (see there)."""
+
+    tke_pr_mode: str | None = None
+    """How :attr:`tke_pr_cut` acts: ``None`` or ``"cut"`` — no Pr derivative where N^2 < N^2*;
+    ``"at"`` — the Pr derivative evaluated at the regularised point ``(max(N^2, N^2*), S^2)``
+    (:func:`differentiate_at`, straight-through form): exact where N^2 >= N^2*, zero where the
+    regularised Ri leaves the clip band, finite everywhere. ``"at"`` needs a finite N^2*."""
+
+    tke_pr_ratio: float | None = None
+    """R* of the smoothing-cancellation Prandtl cut (``None`` = off). The N^2 the closure reads
+    is the horizontally smoothed one (``eos.smooth_nod3D``, one sweep). Where a locally
+    inverted column sits among stable neighbours, the smoothed value is the small residual of
+    a cancellation, and ``dKappaH/dN^2 = -KappaH/N^2`` taken at that residual turns the
+    N^2 -> Pr -> KappaH -> T, S -> N^2 loop unstable even where the residual is well above
+    any N^2 threshold (measured: one ice-covered East Siberian shelf column, raw N^2 -8.0e-5,
+    smoothed +3.3e-7, docs/PORTING_LESSONS.md 2026-10-06). The derivative of the Prandtl number
+    is omitted where ``|raw N^2| > R* * |smoothed N^2|`` (forward values; the raw N^2 is the
+    unsmoothed ``eos.pressure_bv`` field the step computes when this is set). Combined with
+    :attr:`tke_pr_cut` the two masks are joined (a cut where either holds). Needs the
+    ``"cut"`` mode; a finite R* > 0."""
+
+    tke_pr_raw_cut: float | None = None
+    """N^2_raw* of the unsmoothed-N^2 Prandtl cut (``None`` = off). The derivative of the
+    Prandtl number is omitted where the UNSMOOTHED N^2 (the ``eos.pressure_bv`` field the step
+    computes when this is set; forward values) is below N^2_raw*: with 0 or a small positive
+    value, every locally inverted or neutral cell, whatever the smoothed N^2 the closure reads
+    there. A TKE closure that reads the local N^2 (MITgcm's GGL90) has Ri < 0 in such a cell,
+    Pr clipped at 1 and no Prandtl derivative; the horizontal smoother hands FESOM's closure a
+    positive residual instead, with Pr unclipped, also where |raw| / |smoothed| is only 1-30
+    (Norwegian-shelf columns in the 10-day 2013-01 sweep, where :attr:`tke_pr_ratio` = 100
+    misses them). Joined with :attr:`tke_pr_cut` / :attr:`tke_pr_ratio` (a cut where any
+    holds). Needs the ``"cut"`` mode; finite."""
+
+    tke_kme_tke: float | None = None
+    """tke* of the near-floor km_e cut (``None`` = off). In columns whose first interior
+    interface has ``tke_old < tke*`` (forward values, any mixing-length regime) the derivative
+    of KappaM = c_k·mxl·sqrt(tke) with respect to the ``sqrt(tke)`` factor is omitted (the
+    ``tke.km_e`` term, masked); the mixing length's own tke dependence and every constant
+    path are kept. Where and on which uses: :attr:`tke_kme_scope`, :attr:`tke_kme_term`.
+    ``tke* -> 0`` is exact; ``math.inf`` with scope ``"column"`` and term ``"km_e"`` equals
+    the diagnostic cut ``tke.km_e``."""
+
+    tke_kme_scope: str | None = None
+    """Where the near-floor km_e cut acts in a flagged column: ``None`` or ``"column"`` — every
+    interface of the column (no mask edge inside the implicit TKE diffusion, which couples the
+    surface and first interfaces); ``"iface1"`` — the first interior interface only."""
+
+    tke_kme_term: str | None = None
+    """Which uses of KappaM the near-floor km_e cut acts on: ``None`` or ``"km_e"`` — every use
+    (KappaH, production, buoyancy, the TKE diffusivity, Kv/Av); ``"ke_diff"`` — only the TKE
+    self-diffusivity ``ke = alpha·(KappaM[k+1]+KappaM[k])/2`` (the narrower variant)."""
+
+    tke_ml_cut: float | None = None
+    """N^2* of the mixing-length cut (``None`` = off). The derivative of the free Blanke-
+    Delecluse length ``mxl0 = sqrt(2)·sqrt(tke)/sqrt(max(N^2, 1e-12))`` with respect to N^2 is
+    omitted where the column-input (smoothed) N^2 < N^2* (forward values); its sqrt(tke)
+    dependence, the walls / min-scans and every constant path are kept. ``dmxl0/dN^2 =
+    -mxl0/(2 N^2)`` grows without bound as N^2 -> 0, and in near-neutral deep cells (smoothed
+    N^2 ~ 1e-10, mxl0 of hundreds of metres) the N^2 -> mxl -> KappaH -> T, S -> N^2 loop is
+    unstable: the 60-day July 2013 sweep bursts x1e3 in deep Tyrrhenian columns, which the
+    Prandtl cuts do not touch and the diagnostic cut ``tke.ml_n2`` removes (docs/
+    PORTING_LESSONS.md, step C5). ``math.inf`` equals ``tke.ml_n2``."""
+
+    tke_ml_ratio: float | None = None
+    """R* of the smoothing-cancellation mask on the mixing-length cut (``None`` = off): the
+    :attr:`tke_pr_ratio` mask, ``|raw N^2| > R* * |smoothed N^2|`` (forward values), applied
+    to the N^2 derivative of the free length as :attr:`tke_ml_cut` does below N^2*. In a
+    locally inverted cell the smoothed N^2 can be a small positive residual (raw -7e-5,
+    smoothed 1.5e-7 on the Northeast Greenland shelf in the January 2013 window), above any useful
+    N^2* but with ``dmxl0/dN^2 = -mxl0/(2 N^2)`` as large as in a neutral cell. Joined with
+    :attr:`tke_ml_cut` / :attr:`tke_ml_raw_cut` (a cut where any holds). A finite R* > 0."""
+
+    tke_ml_raw_cut: float | None = None
+    """N^2_raw* of the unsmoothed-N^2 mask on the mixing-length cut (``None`` = off): the
+    :attr:`tke_pr_raw_cut` mask, raw N^2 < N^2_raw* (forward values), with the same effect as
+    :attr:`tke_ml_ratio`. Finite."""
+
+    tke_pr_ice_cut: float | None = None
+    """a* of the sea-ice mask on the Prandtl-number cut (``None`` = off): the whole Pr
+    derivative (what ``tke.pr`` cuts everywhere) is omitted in the columns whose sea-ice
+    concentration at the start of the step exceeds a* (forward value). Joined with the N^2
+    masks above (a cut where any holds). Under ice the ML-base Richardson number can sit in
+    the live band 1 < 6.6 Ri < 10 with small shear, where dPr/dN^2 = 6.6/S^2 drives a slow
+    two-level tke/w_e mode (Canadian Archipelago, December 2013, in the July-2013 year
+    window); a global N^2* that removes it (1e-5) costs 11-47 % of J_MLD on the ice-free
+    2013 30-day windows. a* in [0, 1)."""
+
+    tke_pr_lat_cut: float | None = None
+    """phi* (degrees) of the latitude mask on the Prandtl-number cut (``None`` = off): the
+    whole Pr derivative is omitted in the columns poleward of phi* (geographic
+    ``|lat| > phi*``), forward bitwise. Joined with the masks above. The same two-level
+    tke/w_e mode at the mixed-layer base also grows in ice-free polar columns (West
+    Spitsbergen, 79N, December 2013: one 12-h step x26), which the sea-ice mask misses, while
+    the default cost box (50-60N) lies well equatorward of it. A geographic stand-in for a
+    state criterion: it drops a real derivative path wherever it applies, so it is valid only
+    for costs far from phi* (the 50-60N box: year windows from January and July 2013 within
+    0.5-7 % of finite differences), never for an Arctic or Southern Ocean cost or one that
+    depends on polar mixing. phi* in (0, 90)."""
+
+    tke_pr_tu_cut: float | None = None
+    """Tu* (degrees) of the diffusive-regime mask on the Prandtl-number cut (``None`` = off):
+    the Pr derivative is omitted at the interfaces whose Turner angle lies in
+    ``-90 < Tu < Tu*`` (:func:`fesom_jax.eos.turner_angle`, forward values), i.e. stably
+    stratified with the temperature increasing downward and salinity holding the
+    stratification: cold fresh water over warm salty water. Both polar mixed-layer-base
+    events (Canadian Archipelago under ice and ice-free West Spitsbergen, December 2013) sit
+    at Tu ~ -60, where the shear is weak and the Richardson number in the live Pr band; the
+    thermally stratified North Atlantic summer interfaces (Tu > -45) keep the derivative.
+    Joined with the masks above. Tu* = -45 is the regime boundary; Tu* in (-90, 0)."""
+
+    gm_n2_ratio: float | None = None
+    """R* of the smoothing-cancellation cut on the N^2 the eddy-parameterization block reads
+    (``None`` = off): the :attr:`tke_pr_ratio` mask, ``|raw N^2| > R* * |smoothed N^2|``
+    (forward values), applied to the GM/Redi input instead of the Prandtl number. Where it
+    holds, the derivative of every N^2 use in the block (neutral slope and taper, wave speed,
+    the streamfunction solve) is omitted, as :attr:`freeze_gm_slope` does everywhere; the
+    rest of the ocean keeps the live slope. Joined with :attr:`gm_n2_raw_cut` (a cut where
+    either holds). Not combinable with ``freeze_gm_slope``; a finite R* > 0."""
+
+    gm_n2_raw_cut: float | None = None
+    """N^2_raw* of the unsmoothed-N^2 cut on the GM/Redi input (``None`` = off): the
+    :attr:`tke_pr_raw_cut` mask, raw N^2 < N^2_raw* (forward values), with the same effect as
+    :attr:`gm_n2_ratio`. Not combinable with ``freeze_gm_slope``; finite."""
+
+    gm_slope_cut: float | None = None
+    """S* of the steep-slope cut (``None`` = off): the N^2 derivative of the neutral slope, and
+    so of the ODM95 taper and the Redi diffusivity built from it, is omitted where the forward
+    slope ``|s| > S*`` (``gm.compute_neutral_slope``). The adjoint-only counterpart of the
+    slope clipping MITgcm's ECCO configurations use for a stable GM adjoint, where the clipped
+    slope has no magnitude derivative beyond the clip. Not combinable with
+    ``freeze_gm_slope``; a finite S* > 0."""
+
+    conv_surrogate: float | None = None
+    """N^2 half-width (s^-2) of the convective-adjustment surrogate (``None`` = off). Where the
+    smoothed N^2 < 0 the convective adjustment raises the node Kv to ``INSTABMIX_KV``
+    (:func:`fesom_jax.pp.mo_convect`); the switch itself has no derivative, so the adjoint
+    cannot see that a perturbation moves where and when a column convects. With this set the
+    forward is unchanged and the backward differentiates the ramp-smoothed switch
+    ``Kv_in + w·(max(Kv_in, INSTABMIX_KV) − Kv_in)``, ``w = clip(−N^2/d, 0, 1)``: an N^2
+    derivative ``−(max(Kv_in, INSTABMIX_KV) − Kv_in)/d`` in the band ``−d < N^2 < 0``, the
+    exact derivative outside it. The ramp is one-sided: on the stable side the linearised flux
+    ``Kv·N^2`` would fall as N^2 rises (anti-diffusive), and a centred ramp
+    (``|N^2| < d``) blew the 30-day January reverse sweep up ×1e30 in its first chunk.
+    ``Av`` keeps the exact switch. Not combinable with ``freeze_convection``; a finite d > 0."""
+
     @property
     def active(self) -> bool:
-        return any(bool(getattr(self, f)) for f in FREEZE_FLAGS) or bool(self.diag_cuts)
+        return (any(bool(getattr(self, f)) for f in FREEZE_FLAGS) or bool(self.diag_cuts)
+                or any(getattr(self, f) is not None for f in TKE_CANDIDATE_FIELDS))
+
+    @property
+    def gm_n2_cut(self) -> bool:
+        """True when the GM/Redi input N^2 has a masked cut (:attr:`gm_n2_ratio` /
+        :attr:`gm_n2_raw_cut`)."""
+        return self.gm_n2_ratio is not None or self.gm_n2_raw_cut is not None
+
+    def tke_options(self) -> "TkeAdjoint | None":
+        """The candidate settings the TKE column core reads (``None`` when all are off, so the
+        core traces nothing extra). Call on a :meth:`validate`-d config."""
+        if (self.tke_pr_cut is None and self.tke_pr_ratio is None
+                and self.tke_pr_raw_cut is None and self.tke_kme_tke is None
+                and self.tke_ml_cut is None and self.tke_ml_ratio is None
+                and self.tke_ml_raw_cut is None and self.tke_pr_ice_cut is None
+                and self.tke_pr_lat_cut is None and self.tke_pr_tu_cut is None):
+            return None
+        return TkeAdjoint(
+            pr_n2_star=None if self.tke_pr_cut is None else float(self.tke_pr_cut),
+            pr_mode=self.tke_pr_mode or "cut",
+            kme_tke=None if self.tke_kme_tke is None else float(self.tke_kme_tke),
+            kme_scope=self.tke_kme_scope or "column",
+            kme_term=self.tke_kme_term or "km_e",
+            pr_ratio=None if self.tke_pr_ratio is None else float(self.tke_pr_ratio),
+            pr_raw_cut=None if self.tke_pr_raw_cut is None else float(self.tke_pr_raw_cut),
+            ml_n2_star=None if self.tke_ml_cut is None else float(self.tke_ml_cut),
+            ml_ratio=None if self.tke_ml_ratio is None else float(self.tke_ml_ratio),
+            ml_raw_cut=None if self.tke_ml_raw_cut is None else float(self.tke_ml_raw_cut),
+            pr_ice=None if self.tke_pr_ice_cut is None else float(self.tke_pr_ice_cut),
+            pr_lat=None if self.tke_pr_lat_cut is None else float(self.tke_pr_lat_cut),
+            pr_tu=None if self.tke_pr_tu_cut is None else float(self.tke_pr_tu_cut))
 
     def describe(self) -> str:
         on = [f.removeprefix("freeze_") for f in FREEZE_FLAGS if getattr(self, f)]
         if self.diag_cuts:
             on.append("cuts=" + ",".join(sorted(self.diag_cuts)))
+        on += [f"{f}={getattr(self, f)!r}" for f in TKE_CANDIDATE_FIELDS
+               if getattr(self, f) is not None]
         return "+".join(on) if on else "none"
 
     def validate(self) -> "AdjointConfig":
@@ -302,9 +539,85 @@ class AdjointConfig(NamedTuple):
         if unknown:
             raise ValueError(f"unknown AdjointConfig.diag_cuts {unknown}; known cut points: "
                              f"{sorted(KNOWN_CUTS)}")
+        self._validate_tke_candidates()
         if type(cuts) is frozenset:
             return self
         return self._replace(diag_cuts=names)
+
+    def _validate_tke_candidates(self) -> None:
+        def number(name, *, finite=False):
+            v = getattr(self, name)
+            if v is None:
+                return None
+            if isinstance(v, bool) or not isinstance(v, (int, float)):
+                raise TypeError(f"AdjointConfig.{name} must be a float or None, got "
+                                f"{type(v).__name__} {v!r}")
+            if math.isnan(v) or (finite and not math.isfinite(v)):
+                raise ValueError(f"AdjointConfig.{name} must be {'finite' if finite else 'a number'}"
+                                 f", got {v!r}")
+            return float(v)
+
+        def choice(name, allowed, needs):
+            v = getattr(self, name)
+            if v is None:
+                return
+            if v not in allowed:
+                raise ValueError(f"AdjointConfig.{name} must be one of {allowed} or None, got {v!r}")
+            if getattr(self, needs) is None:
+                raise ValueError(f"AdjointConfig.{name}={v!r} has no effect without {needs}")
+
+        number("tke_pr_cut")
+        choice("tke_pr_mode", TKE_PR_MODES, "tke_pr_cut")
+        if self.tke_pr_mode == "at":
+            number("tke_pr_cut", finite=True)
+        ratio = number("tke_pr_ratio", finite=True)
+        if ratio is not None and ratio <= 0.0:
+            raise ValueError(f"AdjointConfig.tke_pr_ratio must be > 0, got {ratio!r}")
+        if ratio is not None and self.tke_pr_mode == "at":
+            raise ValueError("AdjointConfig.tke_pr_ratio is a cut; it cannot be combined with "
+                             "tke_pr_mode='at'")
+        raw = number("tke_pr_raw_cut", finite=True)
+        if raw is not None and self.tke_pr_mode == "at":
+            raise ValueError("AdjointConfig.tke_pr_raw_cut is a cut; it cannot be combined with "
+                             "tke_pr_mode='at'")
+        kme = number("tke_kme_tke")
+        if kme is not None and kme < 0.0:
+            raise ValueError(f"AdjointConfig.tke_kme_tke must be >= 0, got {kme!r}")
+        choice("tke_kme_scope", TKE_KME_SCOPES, "tke_kme_tke")
+        choice("tke_kme_term", TKE_KME_TERMS, "tke_kme_tke")
+        number("tke_ml_cut")
+        ml_ratio = number("tke_ml_ratio", finite=True)
+        if ml_ratio is not None and ml_ratio <= 0.0:
+            raise ValueError(f"AdjointConfig.tke_ml_ratio must be > 0, got {ml_ratio!r}")
+        number("tke_ml_raw_cut", finite=True)
+        ice = number("tke_pr_ice_cut", finite=True)
+        if ice is not None and not 0.0 <= ice < 1.0:
+            raise ValueError(f"AdjointConfig.tke_pr_ice_cut must be in [0, 1), got {ice!r}")
+        lat = number("tke_pr_lat_cut", finite=True)
+        if lat is not None and not 0.0 < lat < 90.0:
+            raise ValueError(f"AdjointConfig.tke_pr_lat_cut must be in (0, 90), got {lat!r}")
+        tu = number("tke_pr_tu_cut", finite=True)
+        if tu is not None and not -90.0 < tu < 0.0:
+            raise ValueError(f"AdjointConfig.tke_pr_tu_cut must be in (-90, 0), got {tu!r}")
+        gm_ratio = number("gm_n2_ratio", finite=True)
+        if gm_ratio is not None and gm_ratio <= 0.0:
+            raise ValueError(f"AdjointConfig.gm_n2_ratio must be > 0, got {gm_ratio!r}")
+        number("gm_n2_raw_cut", finite=True)
+        sc = number("gm_slope_cut", finite=True)
+        if sc is not None and sc <= 0.0:
+            raise ValueError(f"AdjointConfig.gm_slope_cut must be > 0, got {sc!r}")
+        if sc is not None and self.freeze_gm_slope:
+            raise ValueError("AdjointConfig.gm_slope_cut cuts part of what freeze_gm_slope "
+                             "freezes everywhere; set one or the other")
+        if self.gm_n2_cut and self.freeze_gm_slope:
+            raise ValueError("AdjointConfig.gm_n2_ratio / gm_n2_raw_cut cut part of what "
+                             "freeze_gm_slope freezes everywhere; set one or the other")
+        cs = number("conv_surrogate", finite=True)
+        if cs is not None and cs <= 0.0:
+            raise ValueError(f"AdjointConfig.conv_surrogate must be > 0, got {cs!r}")
+        if cs is not None and self.freeze_convection:
+            raise ValueError("AdjointConfig.conv_surrogate replaces the convective-adjustment "
+                             "derivative that freeze_convection removes; set one or the other")
 
     @classmethod
     def exact(cls) -> "AdjointConfig":
@@ -315,24 +628,199 @@ class AdjointConfig(NamedTuple):
     def long_window(cls) -> "AdjointConfig":
         """Preset: ``freeze_mixing`` + ``freeze_gm_slope``, the combination measured to give a
         usable 60-day gradient (see the table above and ``examples/06_long_window_adjoint``).
-        It is today's recommendation for windows beyond about a day; the TKE-adjoint work
-        may replace it with a narrower preset."""
+        It is today's recommendation for windows beyond about a day. ``freeze_mixing`` zeroes
+        the gradients with respect to the TKE constants; :meth:`long_window_tke` keeps them."""
         return cls(freeze_mixing=True, freeze_gm_slope=True)
+
+    @classmethod
+    def long_window_tke(cls) -> "AdjointConfig":
+        """Preset (opt-in): the classical-TKE closure differentiated in full, ocean-state
+        feedback included, except two derivatives with respect to N^2 at near-neutral and
+        inverted cells. The Prandtl-number derivative is omitted at N^2 < 1e-8
+        (:attr:`tke_pr_cut`), where the smoothed N^2 is a cancellation residual of the raw one
+        (|raw| > 100 |smoothed|, :attr:`tke_pr_ratio`) and where the raw N^2 < -1e-6
+        (:attr:`tke_pr_raw_cut`); the derivative of the free mixing length is omitted at
+        N^2 < 1e-8 (:attr:`tke_ml_cut`). The gradients with respect to the TKE constants are
+        kept, which :meth:`long_window` cannot do.
+
+        Measured 2026-10-09 on CORE2 (prescribed ice, GM on and not frozen, 24-step chunks; box
+        ``natl_subpolar``; central FDs in ln c_k, ln c_eps, ln cd, ln alpha at h = 3e-3, 1e-2,
+        3e-2) over 30, 60 and 90 days from 2013-01-01 and 2013-07-01: window-mean MLD within
+        7.7 % for all four constants at every window in both seasons; July window-mean box T
+        within 2.2 %. A July cotangent transient (x11 in half a day, deep Tyrrhenian Sea,
+        2013-08-08) decays without spoiling the gradient; ``tke_ml_cut=1e-6`` removes it too but
+        adds bias to the January box T. The January window-mean box T misses the 10 % bar at
+        every window (c_k 63 % and cd 88 % at 30 days, alpha 517 % at 60 days, 11-22 % at 90
+        days), with or without the mixing-length cut and with ``freeze_gm_slope``: a separate,
+        open error. Without :attr:`tke_ml_cut` the July sweeps burst from 60 days on (errors
+        x10 to x1e6). With ``IceConfig.adjoint_mode="rheology"`` the January box-T vector error
+        falls from 19.6 to 14.7 % at 60 days and from 13.4 to 12.8 % at 90 days.
+
+        Reverse-sweep screen 2026-10-10 (window-mean MLD, prescribed ice, no FDs): 90 days from
+        2013-04-01 and 2013-10-01 grow smoothly (largest one-chunk growth x2). 180 days from
+        2013-01-01 and 2013-07-01 each show one isolated spike that does not run away: the
+        salinity cotangent x43 over one day on 2013-03-16 (afterwards x2.2 above its level
+        before), and the TKE cotangent x187 in half a day on 2013-07-08 (gone a day later). The
+        180-day gradients are not checked against FDs.
+        docs/PORTING_LESSONS.md, steps C3-C7."""
+        return cls(tke_pr_cut=1e-8, tke_pr_ratio=100.0, tke_pr_raw_cut=-1e-6, tke_ml_cut=1e-8)
+
+    @classmethod
+    def long_window_combined(cls) -> "AdjointConfig":
+        """Preset (opt-in): :meth:`long_window_tke` plus ``tke_ml_ratio=100``,
+        ``tke_ml_raw_cut=-1e-6`` and ``freeze_fct_limiter``, for the all-on model with the
+        sea-ice adjoint live: ``IceConfig(adjoint_mode="exact", adjoint_damping="frozen_sweep")``
+        with ``adjoint_alpha_kappa`` 1 and ``adjoint_theta`` 0.97 (the defaults). GM/Redi is
+        differentiated in full.
+
+        Measured 2026-10-11 on CORE2 (24-step chunks; central FDs at h = 3e-3, 1e-2, 3e-2).
+        Ice drift cost (Arctic box; ln P*, ln C_d): adjoint within 3.1 % of the FD at 30 days
+        from January (three runs, equal to four digits), March and July and at 60 and 90 days
+        from January; in the Antarctic from July P* is 8.2 % small in magnitude (C_d 0.8 %),
+        as with the GM slope frozen. TKE costs (box ``natl_subpolar``; ln c_k, ln c_eps, ln cd, ln alpha):
+        window-mean MLD within 8.4 % at 30, 60 and 90 days from January and July; July box T
+        within 2.3 %; January box T within 5.1 % at 90 days, and missing at 30 days (c_k 134 %,
+        cd 188 %) and 60 days (alpha 780 %, c_eps 57 %), as every setting tried does there.
+
+        The two mixing-length masks are what allows GM live. Without them two of four January
+        30-day ice runs burst (P* 0.96 and 1.53 of the FD), the run decided by GPU round-off:
+        one inverted cell on the Northeast Greenland shelf (raw N^2 -7e-5, smoothed 1.5e-7, above
+        :attr:`tke_ml_cut`) where the free mixing length's N^2 derivative is large. Freezing the
+        GM slope hid it at the price of the January accuracy (box T at 90 days 33 % off).
+        ``freeze_fct_limiter`` removes the salinity cotangent spikes of the FCT limiter (x10 at
+        30 days from March, x12 at 90 days from January) and moves the ice gradients by less
+        than 1e-3 relative. docs/PORTING_LESSONS.md, combined adjoint, 2026-10-10 and
+        2026-10-11."""
+        return cls.long_window_tke()._replace(tke_ml_ratio=100.0, tke_ml_raw_cut=-1e-6,
+                                              freeze_fct_limiter=True)
+
+    @classmethod
+    def year_window_combined(cls) -> "AdjointConfig":
+        """Preset (opt-in): :meth:`long_window_combined` for one-year windows, with the
+        Prandtl-number derivative also omitted at N^2 < 1e-6 (:attr:`tke_pr_cut`, not 1e-8) and
+        poleward of 70 degrees (:attr:`tke_pr_lat_cut`); the mixing-length cut stays at 1e-8.
+        The latitude cut is valid only for costs far from 70 degrees. Use it with
+        ``IceConfig(adjoint_mode="exact", adjoint_damping="frozen_sweep")`` at
+        ``adjoint_alpha_kappa`` 1 and ``adjoint_theta`` 0.97, plus ``adjoint_sweep_guard=10``,
+        ``adjoint_thin_mass=100`` and ``adjoint_cuts=("fct_flux", "strength_conc")``. As a
+        ``tke_diag.parse_setting`` spec: ``tke_pr_cut=1e-6+tke_pr_ratio=100+
+        tke_pr_raw_cut=-1e-6+tke_ml_cut=1e-8+freeze_fct_limiter+tke_ml_ratio=100+
+        tke_ml_raw_cut=-1e-6+tke_pr_lat_cut=70``.
+
+        Measured 2026-10-17 on CORE2 (24-step chunks; one-year window-mean MLD in box
+        ``natl_subpolar``; central FDs at h = 1e-2 and, where given, 3e-2) for ln c_k, ln c_eps,
+        ln cd, ln alpha and ln k_gm. Window from 2013-01-01: within 2.9-5.8 % for all five.
+        From 2013-07-01: c_k 6 %, c_eps 8 %, k_gm 2 %, cd 15 % and alpha 14 % too large. From
+        2007-07-01: c_k, c_eps and cd within 2.1 %, alpha 9.5 %, k_gm 12 % too small.
+
+        FDs perturbing a control only from a given date to the window end show where the
+        July-start errors come from. Perturbing from late January to mid-April, the adjoint is
+        within 1 % of the FD (cd and k_gm, July 2013). The excess of cd builds up between July
+        and January. The k_gm shortfall on the 2007 window comes from the same months.
+        With ``tke_ml_cut=1e-6``, k_gm is 18 % small on both July windows, because 33-46 % of the
+        box's interfaces lose the mixing-length N^2 derivative in winter. The other four
+        constants then pass, but on July 2013 only because a winter shortfall cancels the
+        July-January excess.
+
+        A year reverse sweep on a GPU can, from round-off alone, contain a cotangent burst that
+        a repeat of the same run does not. Read the per-field cotangent trace, not just the
+        total. docs/PORTING_LESSONS.md, year-window combined adjoint, 2026-10-13 to
+        2026-10-17."""
+        return cls.long_window_combined()._replace(tke_pr_cut=1e-6, tke_pr_lat_cut=70.0)
 
 
 FREEZE_FLAGS: tuple = tuple(f for f in AdjointConfig._fields if f.startswith("freeze_"))
 """The boolean ``freeze_*`` fields of :class:`AdjointConfig`, in declaration order. Enumerate
 these (not ``AdjointConfig._fields``) when iterating over flags: ``diag_cuts`` is a set."""
 
+TKE_CANDIDATE_FIELDS: tuple = ("tke_pr_cut", "tke_pr_mode", "tke_pr_ratio", "tke_pr_raw_cut",
+                               "tke_kme_tke", "tke_kme_scope", "tke_kme_term", "tke_ml_cut",
+                               "tke_ml_ratio", "tke_ml_raw_cut", "tke_pr_ice_cut", "tke_pr_lat_cut",
+                               "tke_pr_tu_cut",
+                               "gm_n2_ratio", "gm_n2_raw_cut", "gm_slope_cut",
+                               "conv_surrogate")
+"""The non-boolean candidate settings of :class:`AdjointConfig` (``None`` = off): the
+classical-TKE ones, the two masked GM/Redi input cuts, the steep-slope cut and the
+convective-adjustment surrogate."""
+TKE_PR_MODES = ("cut", "at")
+TKE_KME_SCOPES = ("column", "iface1")
+TKE_KME_TERMS = ("km_e", "ke_diff")
+
+
+class TkeAdjoint(NamedTuple):
+    """The static candidate settings the TKE column core reads (:meth:`AdjointConfig.
+    tke_options`); ``None`` entries are off."""
+    pr_n2_star: float | None
+    pr_mode: str
+    kme_tke: float | None
+    kme_scope: str
+    kme_term: str
+    pr_ratio: float | None = None
+    pr_raw_cut: float | None = None
+    ml_n2_star: float | None = None
+    ml_ratio: float | None = None
+    ml_raw_cut: float | None = None
+    pr_ice: float | None = None
+    pr_lat: float | None = None
+    pr_tu: float | None = None
+
 KNOWN_CUTS: dict = {
     "mix.kv_out": "Kv after the mixing closure and its halo exchange, before freeze_mixing "
                   "and before the GM/Redi K33 augmentation (step.py)",
     "mix.av_out": "Av after the mixing closure and its halo exchange, before freeze_mixing "
                   "(step.py)",
+    # --- the classical-TKE column core (cvmix_tke.integrate_tke_column / mixing_length) ---
+    "tke.km_e": "sqrt(tke) in KappaM = c_k*mxl*sqrt(tke) (every use of KappaM: KappaH, "
+                "production, buoyancy, TKE diffusivity, Kv/Av) (cvmix_tke.py)",
+    "tke.ml_e": "sqrt(tke) in the unconstrained mixing length mxl0 = sqrt(2)*sqrt(tke)/N "
+                "(cvmix_tke.mixing_length)",
+    "tke.ml_n2": "N^2 in the unconstrained mixing length mxl0 (cvmix_tke.mixing_length)",
+    "tke.ml_wall": "the mixing length where the walls / Blanke-Delecluse min-scans set it below "
+                   "mxl0: treated as a fixed length (cvmix_tke.mixing_length)",
+    "tke.shear": "S^2 in shear production and in the Richardson number (cvmix_tke.py)",
+    "tke.n2": "N^2 in the buoyancy term and in the Richardson number (not in mxl0: that is "
+              "tke.ml_n2) (cvmix_tke.py)",
+    "tke.pr": "the Prandtl number clip(6.6*Ri, 1, 10) (cvmix_tke.py)",
+    "tke.prod": "the shear production S^2*KappaM (cvmix_tke.py)",
+    "tke.buoy": "the buoyancy term N^2*KappaH (cvmix_tke.py)",
+    "tke.diss": "the Patankar dissipation dt*c_eps*sqrt(tke)/mxl on the diagonal of the "
+                "implicit TKE solve (cvmix_tke.py)",
+    "tke.ke_diff": "the TKE self-diffusivity ke = alpha*(KappaM[k+1]+KappaM[k])/2 "
+                   "(cvmix_tke.py)",
+    "tke.surf": "the surface Neumann flux cd*forc_tke_surf^1.5/dzt[0] (cvmix_tke.py)",
+    "tke.kh_floor": "KappaH where it leaves the closure for Kv, at interfaces with KappaH < "
+                    "TKE_KH_FLOOR = 1e-5 m^2/s (the derivative a background-diffusivity floor "
+                    "max(KappaH, 1e-5) would have; cvmix_tke.py)",
+    "tke.deep": "every closure output (tke_new, KappaM, KappaH) at interfaces deeper than "
+                "TKE_DEEP_CUT_Z = 500 m (depth from the layer thicknesses; a negative "
+                "control) (cvmix_tke.py)",
+    # --- the eddy-parameterization block (gm.gm_diagnostics): the three uses of N^2 ---
+    "gm.slope_n2": "N^2 in the neutral slope sigma_xy/N^2, the ODM95 taper and the Redi "
+                   "diffusivity built from it (gm.compute_neutral_slope)",
+    "gm.cm_n2": "N^2 in the baroclinic wave speed cm = int sqrt(N^2) dz / 3 pi "
+                "(gm.init_redi_gm)",
+    "gm.bvp_n2": "N^2 on the diagonal of the streamfunction solve (gm.fer_solve_gamma)",
 }
 """Registry of the derivative cut points that :func:`dcut` call sites in the model use,
 ``{name: where it sits}``. A new cut point is added here and at its call site together;
-``{"mix.kv_out", "mix.av_out"}`` together equal ``freeze_mixing``."""
+``{"mix.kv_out", "mix.av_out"}`` together equal ``freeze_mixing``.
+
+Two TKE-path cuts are NOT registered here because a flag already performs exactly that
+operation (one operation, one name): the convective-adjustment increment of ``mo_convect``
+is cut by ``freeze_convection`` (``pp.mo_convect(freeze_increment=True)``, used by the TKE,
+KPP and PP drivers alike), and the prognostic TKE handed to the next step is cut by
+``freeze_tke_state`` (``stop_gradient`` on ``tke_new`` in ``step.py``). Use those flags
+together with ``tke.*`` cuts to cut the whole closure piece by piece."""
+
+
+def _cut_names(cfg):
+    """The active cut names of ``cfg``: ``None`` -> none; an :class:`AdjointConfig` -> its
+    ``diag_cuts``; a set/frozenset of names (what the TKE column core receives) -> itself."""
+    if cfg is None:
+        return ()
+    if isinstance(cfg, (set, frozenset)):
+        return cfg
+    return cfg.diag_cuts
 
 
 def dcut(cfg, name: str, x):
@@ -340,12 +828,13 @@ def dcut(cfg, name: str, x):
     is in ``cfg.diag_cuts``, else ``x`` itself.
 
     The decision is made in Python at trace time, so an inactive cut adds nothing to the
-    traced program. ``cfg`` may be ``None``. ``name`` must be registered in
+    traced program. ``cfg`` may be ``None``, an :class:`AdjointConfig`, or a set of cut
+    names (the form passed down to the column cores). ``name`` must be registered in
     :data:`KNOWN_CUTS` (a misspelled call site would otherwise be a cut that can never
     fire)."""
     if name not in KNOWN_CUTS:
         raise ValueError(f"cut point {name!r} is not registered in adjoint_stab.KNOWN_CUTS")
-    if cfg is None or name not in cfg.diag_cuts:
+    if name not in _cut_names(cfg):
         return x
 
     def one(leaf):
@@ -354,6 +843,106 @@ def dcut(cfg, name: str, x):
             return lax.stop_gradient(leaf)
         return leaf
     return jax.tree.map(one, x)
+
+
+def dcut_where(cfg, name: str, mask_fn, x):
+    """Named derivative cut restricted to a mask: where ``mask`` is True the derivative of
+    ``x`` (one floating array) is cut, elsewhere it passes; the value is ``x`` everywhere.
+
+    ``mask_fn`` is a zero-argument callable returning the boolean mask (broadcastable to
+    ``x``); it is called only when the cut is active, so an inactive cut traces nothing.
+    Build the mask from forward values (``stop_gradient``-ed inputs). The cut is a
+    ``custom_jvp`` whose primal output is ``x`` itself and whose tangent is
+    ``where(mask, 0, dx)``, so the forward is bitwise the uncut one (no ``select`` on the
+    value) and reverse mode transposes the masked tangent."""
+    if name not in KNOWN_CUTS:
+        raise ValueError(f"cut point {name!r} is not registered in adjoint_stab.KNOWN_CUTS")
+    if name not in _cut_names(cfg):
+        return x
+    return _masked_cut(x, jnp.broadcast_to(mask_fn(), jnp.shape(x)))
+
+
+def n2_cancel_mask(n2, n2_raw, ratio=None, raw_cut=None):
+    """Forward-value mask of the cells whose smoothed ``n2`` is a cancellation residual
+    (``|n2_raw| > ratio * |n2|``) or whose unsmoothed ``n2_raw`` is below ``raw_cut``, joined;
+    ``None`` turns a test off. The two masks of :attr:`AdjointConfig.tke_pr_ratio` /
+    :attr:`~AdjointConfig.tke_pr_raw_cut`, here for the GM/Redi input cuts."""
+    n2 = jax.lax.stop_gradient(n2)
+    n2_raw = jax.lax.stop_gradient(n2_raw)
+    mask = jnp.zeros(jnp.shape(n2), bool)
+    if ratio is not None:
+        mask = mask | (jnp.abs(n2_raw) > ratio * jnp.abs(n2))
+    if raw_cut is not None:
+        mask = mask | (n2_raw < raw_cut)
+    return mask
+
+
+def cut_where(x, mask):
+    """``x`` in the forward; its derivative omitted where ``mask`` (boolean, built from forward
+    values, broadcastable to ``x``) is True. The primal output is ``x`` itself (a
+    ``custom_jvp``), so the forward is bitwise the uncut one."""
+    return _masked_cut(x, jnp.broadcast_to(mask, jnp.shape(x)))
+
+
+@jax.custom_jvp
+def _masked_cut(x, mask):
+    return x
+
+
+@_masked_cut.defjvp
+def _masked_cut_jvp(primals, tangents):
+    x, mask = primals
+    dx, _dmask = tangents                    # mask is boolean: no tangent of its own
+    return x, jnp.where(mask, jnp.zeros_like(dx), dx)
+
+
+def scale_tangent(x, f):
+    """``x`` in the forward; its tangent multiplied by ``f`` (Newtonian damping of a tangent).
+
+    Panteleev, Yaremchuk, Stroh, Francis and Allard (2020), The Cryosphere 14, 4427-4451,
+    doi:10.5194/tc-14-4427-2020, stabilise the tangent-linear and adjoint models of an
+    elastic-viscoplastic sea-ice rheology by adding a friction term ``eps_N * delta_sigma`` to
+    the TANGENT stress equations only, the forward model being left as it is. One sub-cycle of
+    such a term multiplies the stress tangent by a factor ``f < 1``; this primitive is that
+    multiplication, applied wherever the caller places it.
+
+    Contract:
+      * the primal output is ``x`` itself (a ``custom_jvp`` whose primal rule returns its
+        input), so the forward is bitwise unchanged for every ``f``;
+      * the tangent is ``f * dx`` with ``f`` cast to ``dx``'s dtype; ``f`` is a primal
+        argument whose own tangent is ignored (build it from forward values); reverse mode
+        transposes this linear rule, so the cotangent is ``f * g``;
+      * ``f`` (scalar or array) must broadcast to ``x``'s shape WITHOUT widening it: a
+        per-element ``f`` on a per-element field is fine, an ``f`` that would make the tangent
+        larger than ``x`` raises ``ValueError`` at trace time;
+      * ``f = 1`` is plain autodiff (``1 * dx == dx`` bitwise); ``f = 0`` acts as a derivative
+        cut; integer/bool ``x`` is returned unchanged (its tangent is float0 anyway).
+    Inside a ``lax.scan`` the factors compound step by step, so a per-step ``f`` gives the
+    product of the per-step factors, not a closed form."""
+    dtype = jnp.result_type(x)
+    if not jnp.issubdtype(dtype, jnp.inexact):
+        return x
+    xs, fs = tuple(jnp.shape(x)), tuple(jnp.shape(f))
+    try:
+        bs = tuple(jnp.broadcast_shapes(fs, xs))
+    except ValueError:
+        bs = None
+    if bs != xs:
+        raise ValueError(f"scale_tangent: factor shape {fs} does not broadcast to the value "
+                         f"shape {xs} without widening it")
+    return _scaled_tangent(x, f)
+
+
+@jax.custom_jvp
+def _scaled_tangent(x, f):
+    return x
+
+
+@_scaled_tangent.defjvp
+def _scaled_tangent_jvp(primals, tangents):
+    x, f = primals
+    dx, _df = tangents                       # f's own tangent is deliberately ignored
+    return x, jnp.asarray(f, dtype=dx.dtype) * dx
 
 
 # ---------------------------------------------------------------------------
@@ -445,13 +1034,19 @@ def freeze(x):
 def freeze_increment(base, out):
     """Keep ``out``'s value but differentiate only through ``base``.
 
-    ``base + stop_gradient(out - base)`` equals ``out`` exactly in the forward while the
-    backward sees only ``base``. Use it to freeze *one stage's contribution* rather than
-    the whole quantity — e.g. the convective-adjustment bump on top of a mixing
-    coefficient, where you want the closure's own state-dependence kept and only the
-    ``N^2 < 0`` switch removed.
+    Use it to freeze *one stage's contribution* rather than the whole quantity — e.g. the
+    convective-adjustment bump on top of a mixing coefficient, where you want the closure's own
+    state-dependence kept and only the ``N^2 < 0`` switch removed.
+
+    Written in the straight-through form ``stop_gradient(out) + (base - stop_gradient(base))``:
+    the forward is ``out + 0.0``, which is ``out`` exactly for every finite ``base`` (only the
+    sign of a ``-0.0`` in ``out`` becomes ``+0.0``), and the derivative is ``d base``. The
+    increment form ``base + stop_gradient(out - base)`` has the same derivative but is NOT exact
+    in floating point: ``out - base`` rounds, and adding ``base`` back need not return ``out``
+    (e.g. ``base = 0.03046625406612638``, ``out = 0.3``).
     """
-    return jax.tree.map(lambda b, o: b + lax.stop_gradient(o - b), base, out)
+    sg = lax.stop_gradient
+    return jax.tree.map(lambda b, o: sg(o) + (b - sg(b)), base, out)
 
 
 # ---------------------------------------------------------------------------

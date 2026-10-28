@@ -194,6 +194,10 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
 
     # CORE2 path: step 1 eager with step_forcings[0]; scan the rest as xs.
     # ``ice_cfg`` (an IceConfig) ⇒ the prognostic sea-ice step runs each step (Phase 6).
+    if ice_cfg is not None and int(ice_cfg.ice_ave_steps) > 1:
+        # the ice counter + running means at the upstream init values unless the State has them
+        from .ice_step import init_ice_avg
+        state = init_ice_avg(state, ice_cfg)
     sf0 = jax.tree.map(lambda x: x[0], step_forcings)
     state = step(state, mesh, op, stress_surf, params, dt=dt, is_first_step=True,
                  step_forcing=sf0, forcing_static=forcing_static, ice_cfg=ice_cfg,

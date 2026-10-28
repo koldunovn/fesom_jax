@@ -51,6 +51,7 @@ need4 = pytest.mark.skipif(
 # --------------------------------------------------------------------------
 # Helpers
 # --------------------------------------------------------------------------
+
 def _signature_state(mesh) -> State:
     """A State whose EVERY leaf carries a distinct, gid-encoding signature so the
     round-trip catches a dropped leaf (its value would be zero/pad), a swapped leaf
@@ -59,6 +60,8 @@ def _signature_state(mesh) -> State:
     st = State.zeros(mesh)
     out = {}
     for i, f in enumerate(dataclasses.fields(State)):
+        if getattr(st, f.name) is None:    # an unused optional field (ICE_AVG_FIELDS)
+            continue
         a = np.asarray(getattr(st, f.name))
         lead = a.shape[0]                                  # nod2D- or elem2D-leading
         gid = np.arange(lead, dtype=np.float64)
@@ -86,7 +89,8 @@ def _to_folded_sharded(global_state, mesh, npes):
 def _unfold_host(folded_state, npes):
     """Folded sharded device State → ``[P, Lmax, …]`` host numpy dict."""
     uf = ish.unfold_state(folded_state, npes)
-    return {f.name: np.asarray(getattr(uf, f.name)) for f in dataclasses.fields(State)}
+    return {f.name: np.asarray(getattr(uf, f.name)) for f in dataclasses.fields(State)
+            if getattr(uf, f.name) is not None}
 
 
 def _roundtrip(tmp_path, mesh, global0, p_save, p_load):
@@ -102,6 +106,8 @@ def _roundtrip(tmp_path, mesh, global0, p_save, p_load):
     ref = shard_mesh.partition_state(global0, part_l)      # [P_load, Lmax, …] host numpy
     got = _unfold_host(loaded, p_load)
     for f in dataclasses.fields(State):
+        if getattr(ref, f.name) is None:   # unused optional field
+            continue
         a = np.asarray(getattr(ref, f.name))
         b = got[f.name]
         assert b.shape == a.shape, f"{f.name}: shape {b.shape} != {a.shape}"
@@ -123,6 +129,8 @@ def test_full_state_roundtrip_same_P(tmp_path):
     d = tmp_path / "rt_same"
     zo.write_restart(d, saved, sm, part, step=7, calendar_date="1958-01-02", dt_stage=1800.0)
     for f in dataclasses.fields(State):
+        if getattr(g0, f.name) is None:   # unused optional field
+            continue
         g = zo.reconstruct_global(d, f.name)
         orig = np.asarray(getattr(g0, f.name))
         assert g.shape == orig.shape, f"{f.name}: {g.shape} != {orig.shape}"
@@ -142,9 +150,14 @@ def test_no_leaf_dropped(tmp_path):
     zo.write_restart(d, saved, sm, part, step=0, calendar_date="1958-01-01", dt_stage=1800.0)
     on_disk = set(zarr.open_group(str(d), mode="r").array_keys())
     for f in dataclasses.fields(State):
+        if getattr(g0, f.name) is None:    # an unused optional field is not written
+            assert f.name not in on_disk, f.name
+            continue
         assert f.name in on_disk, f"State leaf {f.name!r} missing from restart store"
     # the field list is derived from the dataclass (pytree-flatten-equivalent), not a glob
-    assert set(zo._all_state_fields()) == {f.name for f in dataclasses.fields(State)}
+    from fesom_jax.state import ICE_AVG_FIELDS, SE_FIELDS
+    assert set(zo._all_state_fields()) | set(ICE_AVG_FIELDS) | set(SE_FIELDS) == \
+        {f.name for f in dataclasses.fields(State)}
 
 
 # --------------------------------------------------------------------------
@@ -198,6 +211,8 @@ def test_restart_folded_layout_roundtrip(tmp_path):
     root = zarr.open_group(str(d), mode="r")
     assert "gid_nod" in root and root.attrs.get("layout") != "canonical_global"
     for f in dataclasses.fields(State):
+        if getattr(g0, f.name) is None:   # unused optional field
+            continue
         g = zo.reconstruct_global(d, f.name)
         assert np.array_equal(g, np.asarray(getattr(g0, f.name))), f"{f.name}: folded roundtrip"
 
@@ -219,6 +234,8 @@ def test_restart_canonical_partition_independent(tmp_path):
     r4 = zarr.open_group(str(d4), mode="r"); r2 = zarr.open_group(str(d2), mode="r")
     assert r4.attrs["layout"] == "canonical_global" and "gid_nod" not in r4
     for f in dataclasses.fields(State):
+        if getattr(g0, f.name) is None:    # unused optional field
+            continue
         assert np.array_equal(np.asarray(r4[f.name]), np.asarray(r2[f.name])), \
             f"{f.name}: canonical restart differs across source partition (not partition-independent)"
     # the canonical restart reloads bit-exactly onto a DIFFERENT device count
@@ -226,5 +243,7 @@ def test_restart_canonical_partition_independent(tmp_path):
     ref = shard_mesh.partition_state(g0, p2)
     got = _unfold_host(loaded, 2)
     for f in dataclasses.fields(State):
+        if getattr(ref, f.name) is None:   # unused optional field
+            continue
         assert np.array_equal(np.asarray(getattr(ref, f.name)), got[f.name]), f"{f.name}: P4->P2 reload"
     print("RESTART_PARTITION_INDEPENDENT_OK")

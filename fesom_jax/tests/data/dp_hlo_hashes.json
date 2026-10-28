@@ -1,0 +1,24 @@
+{
+ "commit": "1a45534fa03062eaf8b8398b03b06e21dea15747",
+ "jax": "0.10.1",
+ "programs": {
+  "fwd_core2_full": {
+   "sha256": "344023b4c1d2b3d4119543ee59c018bef3c5997eb7c0b8a726194f06b0deeaa0",
+   "f32_types": 0,
+   "f64_types": 40760,
+   "chars": 3421000
+  },
+  "fwd_core2_gpu": {
+   "sha256": "89b35ed7c0fcf3184c802d5f88d62e0cd4f3cedffb81fd955e3d87587bc1a22b",
+   "f32_types": 0,
+   "f64_types": 77396,
+   "chars": 5475702
+  },
+  "adj_core2": {
+   "sha256": "7c10df37712113b623dffd9a806063390c5c4780ae393ad8956e33ef0a11f5f1",
+   "f32_types": 0,
+   "f64_types": 70032,
+   "chars": 1148669189
+  }
+ }
+}

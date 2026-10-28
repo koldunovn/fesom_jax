@@ -189,3 +189,100 @@ def test_pp_gradient_ad_vs_fd(mesh):
         g_fd = float((loss(up) - loss(um)) / (2 * h))
         best = min(best, abs(g_ad - g_fd) / max(abs(g_fd), 1e-300))
     assert best < 1e-6, f"AD vs FD rel err {best:.2e}"
+
+
+def test_pp_convective_surrogate_keeps_the_forward_and_ramps_the_switch(mesh):
+    """``surrogate_dn2`` (AdjointConfig.conv_surrogate): Kv and Av bitwise; d Kv/d N² =
+    −(max(Kv_in, instabmix_kv) − Kv_in)/d on interior interfaces with −d < N² < 0 and 0
+    elsewhere (the stable side included); d Kv/d Kv_in and every Av derivative as the exact
+    switch outside the band."""
+    uvnode, bvfreq = _synthetic_inputs(mesh, with_convection=True)
+    Kv_in, Av_in = pp.pp_mixing(mesh, uvnode, bvfreq)
+    d = 2.5e-5        # in band: N² = -1e-6 (k = 3); out: every stable interface, 1e-5 and up
+    exact = lambda kv, av, b: pp.mo_convect(mesh, kv, av, b)
+    surr = lambda kv, av, b: pp.mo_convect(mesh, kv, av, b, surrogate_dn2=d)
+    (Kv0, Av0), vjp0 = jax.vjp(exact, Kv_in, Av_in, bvfreq)
+    (Kv1, Av1), vjp1 = jax.vjp(surr, Kv_in, Av_in, bvfreq)
+    assert np.array_equal(np.asarray(Kv0), np.asarray(Kv1))
+    assert np.array_equal(np.asarray(Av0), np.asarray(Av1))
+
+    ones, zeros = jnp.ones_like(Kv0), jnp.zeros_like(Av0)
+    gkv0, gav0, gb0 = (np.asarray(x) for x in vjp0((ones, zeros)))
+    gkv1, gav1, gb1 = (np.asarray(x) for x in vjp1((ones, zeros)))
+    nmask = np.asarray(pp._interior_iface_mask(mesh.ulevels_nod2D, mesh.nlevels_nod2D, mesh.nl))
+    b, kv = np.asarray(bvfreq), np.asarray(Kv_in)
+    band = nmask & (b > -d) & (b < 0.0)
+    want = np.where(band, -(np.maximum(kv, INSTABMIX_KV) - kv) / d, 0.0)
+    assert np.all(gb0 == 0.0)                         # the exact switch has no N² derivative
+    np.testing.assert_allclose(gb1, want, rtol=1e-12, atol=0.0)
+    assert np.any(gb1[band] != 0.0) and np.all(gb1[~band] == 0.0)
+    np.testing.assert_array_equal(gkv1[~band], gkv0[~band])
+    assert np.all(gav1 == 0.0) and np.all(gav0 == 0.0)
+
+    _, gav0, _ = vjp0((jnp.zeros_like(Kv0), jnp.ones_like(Av0)))
+    _, gav1, gb1a = vjp1((jnp.zeros_like(Kv0), jnp.ones_like(Av0)))
+    np.testing.assert_array_equal(np.asarray(gav1), np.asarray(gav0))
+    assert np.all(np.asarray(gb1a) == 0.0)            # Av keeps the exact switch
+
+
+def test_pp_convection_off_and_ramp_forward_modes(mesh):
+    """The forward convection modes (TkeConfig.convection): "off" returns Kv/Av as given;
+    "ramp" is the switch's value where N² <= -d (and exactly where w = 1), the closure's where
+    N² >= 0, the linear blend in between (Av: the largest vertex weight), with the N²
+    derivative -(max(Kv_in, instabmix_kv) - Kv_in)/d inside the band."""
+    uvnode, bvfreq = _synthetic_inputs(mesh, with_convection=True)      # N² = -1e-6 at k = 3
+    Kv_in, Av_in = pp.pp_mixing(mesh, uvnode, bvfreq)
+    Kv_s, Av_s = pp.mo_convect(mesh, Kv_in, Av_in, bvfreq)
+    Kv_o, Av_o = pp.mo_convect(mesh, Kv_in, Av_in, bvfreq, mode="off")
+    assert np.array_equal(np.asarray(Kv_o), np.asarray(Kv_in))
+    assert np.array_equal(np.asarray(Av_o), np.asarray(Av_in))
+
+    # d well inside |N²|: every unstable interface gets w = 1 -> the switch, bitwise
+    Kv_r, Av_r = pp.mo_convect(mesh, Kv_in, Av_in, bvfreq, mode="ramp", ramp_dn2=1e-7)
+    assert np.array_equal(np.asarray(Kv_r), np.asarray(Kv_s))
+    assert np.array_equal(np.asarray(Av_r), np.asarray(Av_s))
+
+    d = 4e-6                                                            # w = 0.25 at k = 3
+    ramp = lambda b: pp.mo_convect(mesh, Kv_in, Av_in, b, mode="ramp", ramp_dn2=d)
+    Kv_r, Av_r = ramp(bvfreq)
+    nmask = np.asarray(pp._interior_iface_mask(mesh.ulevels_nod2D, mesh.nlevels_nod2D, mesh.nl))
+    b, kv = np.asarray(bvfreq), np.asarray(Kv_in)
+    w = np.where(nmask, np.clip(-b / d, 0.0, 1.0), 0.0)
+    np.testing.assert_allclose(np.asarray(Kv_r), (1 - w) * kv + w * np.maximum(kv, INSTABMIX_KV),
+                               rtol=1e-14, atol=0.0)
+    assert np.array_equal(np.asarray(Kv_r)[~(nmask & (b < 0))], kv[~(nmask & (b < 0))])
+    gb = np.asarray(jax.grad(lambda x: jnp.sum(ramp(x)[0]))(bvfreq))
+    band = nmask & (b > -d) & (b < 0)
+    np.testing.assert_allclose(gb[band], -(np.maximum(kv, INSTABMIX_KV) - kv)[band] / d,
+                               rtol=1e-12, atol=0.0)
+    assert np.all(gb[~band] == 0.0)
+
+    # "ramp_kv": the same node Kv, the switch's Av
+    Kv_k, Av_k = pp.mo_convect(mesh, Kv_in, Av_in, bvfreq, mode="ramp_kv", ramp_dn2=d)
+    assert np.array_equal(np.asarray(Kv_k), np.asarray(Kv_r))
+    assert np.array_equal(np.asarray(Av_k), np.asarray(Av_s))
+
+    with pytest.raises(ValueError, match="mode"):
+        pp.mo_convect(mesh, Kv_in, Av_in, bvfreq, mode="soft")
+    with pytest.raises(ValueError, match="ramp_dn2"):
+        pp.mo_convect(mesh, Kv_in, Av_in, bvfreq, mode="ramp")
+    with pytest.raises(ValueError, match="convective switch"):
+        pp.mo_convect(mesh, Kv_in, Av_in, bvfreq, mode="off", surrogate_dn2=1e-6)
+
+
+def test_tke_config_convection_options_validate():
+    """TkeConfig.n2_source / convection / conv_ramp_dn2: defaults are FESOM2's (smoothed N²,
+    the switch); bad values raise."""
+    from fesom_jax.tke import TkeConfig
+    assert TkeConfig().convection == "switch" and TkeConfig().n2_source == "smoothed"
+    TkeConfig(n2_source="local").validate()
+    with pytest.raises(ValueError, match="n2_source"):
+        TkeConfig(n2_source="raw").validate()
+    TkeConfig(convection="ramp", conv_ramp_dn2=1e-6).validate()
+    TkeConfig(convection="ramp_kv", conv_ramp_dn2=1e-6).validate()
+    TkeConfig(convection="off").validate()
+    with pytest.raises(ValueError, match="convection"):
+        TkeConfig(convection="soft").validate()
+    for bad in (0.0, -1e-6, float("inf"), float("nan")):
+        with pytest.raises(ValueError, match="conv_ramp_dn2"):
+            TkeConfig(convection="ramp", conv_ramp_dn2=bad).validate()

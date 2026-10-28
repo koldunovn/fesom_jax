@@ -36,6 +36,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from . import precision as PR
 from . import (adjoint_stab, ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh,
                tke, tracer_adv, tracer_diff)
 from .config import DT_DEFAULT, VCPW
@@ -54,7 +55,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          step_forcing=None, forcing_static=None, ice_cfg=None, gm_cfg=None,
          kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
          halo_ctx=None, boundary_node=None, adjoint_cfg=None,
-         remat_blocks: bool = False, bulk_uvnode_lag: bool = False) -> State:
+         remat_blocks: bool = False, bulk_uvnode_lag: bool = False, ice_update=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -78,7 +79,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     path ``uvnode`` is recomputed from the carried ``state.uv`` at the top of the step (the
     Fortran's top-of-step ``compute_vel_nodes``), so the bulk and ``ocean2ice`` see the
     current surface velocity, not the previous step's ``state.uvnode``;
-    ``bulk_uvnode_lag=True`` restores the legacy tap (the pre-fix C dumps).
+    ``bulk_uvnode_lag=True`` restores the legacy tap (the pre-fix C dumps). ``ice_update`` (static
+    ``True``/``False``, ``ice_ave_steps > 1`` only) chooses the ice update branch at trace time
+    (:func:`ice_step.ice_surface_step`); ``None`` ⇒ the device decision under ``lax.cond``.
 
     **GM/Redi (Phase 6B).** ``gm_cfg`` (a :class:`fesom_jax.gm.GMConfig`, static/hashable —
     the ``ice_cfg`` precedent) turns on the mesoscale eddy parameterization: after EOS the
@@ -125,7 +128,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     Validated at the seam (the C ``fesom_ale_mode_init`` abort parity)."""
     st = state
     if params is None:
-        params = Params.defaults()
+        params = PR.wp_tree(Params.defaults())       # WP leaves in single precision (identity in double)
     # Backward-only simplifications, one flag per term. None ⇒ all off ⇒ every `if _adj.x`
     # below is a dead branch and the traced graph is exactly the pre-existing one.
     _adj = adjoint_cfg if adjoint_cfg is not None else adjoint_stab.AdjointConfig()
@@ -184,6 +187,17 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # shchepetkin PGF (JZ.5), vert_vel distribute (JZ.4), and the JZ.6 consumer re-points
     # (EOS/PP/dbsfc/KPP/GM/QR4C/vert-Redi/momentum). At cold start (hbar=0) live == static;
     # linfs ⇒ all None (the consumers keep the static mesh geometry ⇒ byte-identical).
+    # Single precision (fesom_jax.precision; FESOM2 #1207): hnode/hnode_new are WP_full (float64), every other
+    # reader takes the WP copy (h_wp); the tracer content path keeps float64 and the rounding carry. Both are the
+    # identity in double precision, so the double-precision trace is unchanged.
+    _sp = PR.sp()
+    h_wp = PR.wp(st.hnode)
+    if _sp and (ale_cfg is None or tke_cfg is None or kpp_cfg is not None or ice_cfg is None
+                or ice_cfg.whichEVP != 1 or ale_cfg.use_wsplit):
+        raise NotImplementedError(
+            "single precision supports the CORE2 production physics only (zstar without w_split, "
+            "classical TKE, mEVP sea ice); got ale/tke/kpp/ice = "
+            f"{ale_cfg}/{tke_cfg}/{kpp_cfg}/{ice_cfg}")
     zbar3_live = Z3d_live = elem_geo_live = None
     if ale_cfg is not None:
         zbar3_live, Z3d_live = ale.live_geometry(mesh, st.hnode)
@@ -198,6 +212,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     heat_flux = water_flux = stress_node_surf = None
     ice_out = None
     if step_forcing is not None:
+        # Atmospheric-forcing seam (Params.forcing_adj): the anomalies enter the forcing itself, ahead of every consumer
+        # (bulk formulae, ice-atmosphere stress, ice thermodynamics)
+        _fadj = getattr(params, "forcing_adj", None)
+        if _fadj is not None:
+            step_forcing = _apply_forcing_adj(step_forcing, _fadj)
         # Drift fix 1 (2026-09-18, = fesom2_port_drift@c4881f3): the Fortran runloop calls
         # compute_vel_nodes at the top of EVERY step, so everything in the surface block (the
         # bulk formulae AND ocean2ice's ice-ocean drag) sees the surface current of the
@@ -213,7 +232,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             ice_out = _ice_step.ice_surface_step(
                 ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt,
                 owned_mask=_red_mask, axis_name=_red_axis, exch=_exch,
-                boundary_node=boundary_node, use_virt_salt=use_virt_salt, zbar3=zbar3_live)
+                boundary_node=boundary_node, use_virt_salt=use_virt_salt, zbar3=zbar3_live,
+                params=params, ice_update=ice_update,
+                **({} if halo_ctx is None or halo_ctx.mevp_wide is None
+                   else {"mevp_wide": halo_ctx.mevp_wide}))
             # Frozen-ice adjoint (paper §2): run the FULL mEVP ice in the forward but
             # stop_gradient the whole ice update so the backward never enters the (unstable)
             # mEVP rheology adjoint. stop_gradient is the identity in the forward ⇒ forward
@@ -227,13 +249,14 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             # exit).
             if ice_cfg.adjoint_mode == "frozen":
                 ice_out = jax.tree.map(jax.lax.stop_gradient, ice_out)
-            elif ice_cfg.adjoint_mode not in ("exact", "rheology", "prescribed"):
-                # "rheology" and "prescribed" are handled inside ice_surface_step; nothing to
-                # do to the ice output here.
+            elif ice_cfg.adjoint_mode not in ("exact", "rheology", "prescribed", "dynamics"):
+                # "rheology", "prescribed" and "dynamics" are handled inside ice_surface_step;
+                # nothing to do to the ice output here.
                 raise NotImplementedError(
                     f"IceConfig.adjoint_mode={ice_cfg.adjoint_mode!r} not implemented; use "
                     "'exact', 'rheology' (freeze only the momentum solve — recommended), "
-                    "'prescribed' (ice state given, fluxes differentiated) or 'frozen' "
+                    "'prescribed' (ice state given, fluxes differentiated), 'dynamics' (mEVP: "
+                    "ice velocity and stress differentiated, ice state given) or 'frozen' "
                     "(freeze the whole ice update, fluxes included).")
             stress_surf = ice_out.stress_surf
             bc_T, bc_S, sw_3d = ice_out.bc_T, ice_out.bc_S, ice_out.sw_3d
@@ -261,8 +284,29 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 1 — EOS / hydrostatic pressure / N² (zstar: density compressibility + N² spacing on
     #     live geometry; hpressure unused under zstar). Z3d_live=None ⇒ static (byte-identical).
-    density, hpressure, bvfreq = _ckpt(
-        lambda: eos.compute_pressure_bv(mesh, st.T, st.S, st.hnode, Z3d=Z3d_live))()
+    bvfreq_raw = None
+    bvfreq_local = None          # TkeConfig.n2_source="local": the unsmoothed N², differentiated
+    _tke_local = tke_cfg is not None and tke_cfg.n2_source == "local"
+    if (_tke_local or (tke_cfg is not None and (_adj.tke_pr_ratio is not None
+                                  or _adj.tke_pr_raw_cut is not None
+                                  or _adj.tke_ml_ratio is not None
+                                  or _adj.tke_ml_raw_cut is not None))
+            or (gm_cfg is not None and _adj.gm_n2_cut)):
+        # The tke_pr_ratio / tke_pr_raw_cut Prandtl cuts, the tke_ml_ratio / tke_ml_raw_cut
+        # mixing-length cuts and the gm_n2_ratio / gm_n2_raw_cut GM-input cuts also read the
+        # UNSMOOTHED N² (forward value only): the same two calls compute_pressure_bv makes
+        # (raw EOS/N², then the one-sweep smoother), so the forward is bitwise. The raw field is a per-node map of halo-complete T/S, so it needs no
+        # halo exchange (the smoothed one does, below).
+        def _eos_with_raw():
+            d, h, b = eos.pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live)
+            return d, h, eos.smooth_nod3D(mesh, b, 1), b
+        density, hpressure, bvfreq, bvfreq_raw = _ckpt(_eos_with_raw)()
+        if _tke_local:
+            bvfreq_local = bvfreq_raw
+        bvfreq_raw = jax.lax.stop_gradient(bvfreq_raw)
+    else:
+        density, hpressure, bvfreq = _ckpt(
+            lambda: eos.compute_pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live))()
     # ---- backward-only simplifications (adjoint_cfg) -----------------------------------
     # Every flag below replaces "differentiate this term as written" with "use the value it
     # computes, but omit its dependence on the ocean state in the adjoint". stop_gradient is
@@ -272,6 +316,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # effect of each one. Sea ice has its own equivalent switch, IceConfig.adjoint_mode.
     if _adj.freeze_stratification:
         bvfreq = jax.lax.stop_gradient(bvfreq)
+        if bvfreq_local is not None:
+            bvfreq_local = jax.lax.stop_gradient(bvfreq_local)
     density = _exch(density, "nod")
     hpressure = _exch(hpressure, "nod")
     bvfreq = _exch(bvfreq, "nod")
@@ -287,11 +333,20 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     from params = the 2nd ML-hook). GM/Redi is stateless ⇒ recomputed from T/S/N².
     gm_diag = None
     if gm_cfg is not None:
-        _bv_gm = jax.lax.stop_gradient(bvfreq) if _adj.freeze_gm_slope else bvfreq
-        gm_diag = _ckpt(lambda: gm.gm_diagnostics(mesh, st.T, st.S, _bv_gm, hnode_new, st.helem,
+        if _adj.freeze_gm_slope:
+            _bv_gm = jax.lax.stop_gradient(bvfreq)
+        elif _adj.gm_n2_cut:
+            # the masked GM-input cut: no N² derivative inside the eddy block where the
+            # smoothed N² is a cancellation residual / the raw N² is low (forward bitwise)
+            _bv_gm = adjoint_stab.cut_where(bvfreq, adjoint_stab.n2_cancel_mask(
+                bvfreq, bvfreq_raw, _adj.gm_n2_ratio, _adj.gm_n2_raw_cut))
+        else:
+            _bv_gm = bvfreq
+        gm_diag = _ckpt(lambda: gm.gm_diagnostics(mesh, st.T, st.S, _bv_gm, PR.wp(hnode_new), st.helem,
                                                   params, gm_cfg, exch=_exch,
                                                   Z3d=Z3d_live, zbar3=zbar3_live,
-                                                  freeze_nn_features=_adj.freeze_nn_features))()
+                                                  freeze_nn_features=_adj.freeze_nn_features,
+                                                  adj=_adj))()
 
     # 3 — pressure-gradient force. zstar ⇒ the shchepetkin density-Jacobian on live geometry
     #     (NO hpressure under zstar — the C uses none); linfs ⇒ the hpressure gradient (byte-identical).
@@ -329,10 +384,22 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 "cd·|stress_node_surf|^{3/2} needs the ice-blended nodal wind stress. Build it "
                 "with fesom_jax.surface_forcing.build_surface_forcing, or keep tke_cfg=None "
                 "for an unforced run.")
+        # n2_source="local": the closure and its convective adjustment read the unsmoothed
+        # node N² (a per-node map of halo-complete T/S: no exchange); GM, the state's bvfreq
+        # and the Kv/Av wiring keep the smoothed field
+        _bv_tke = bvfreq_local if _tke_local else bvfreq
+        # tke_pr_tu_cut: the interface Turner angle, a forward value for the Prandtl mask
+        _turner = None
+        if _adj.tke_pr_tu_cut is not None:
+            _sa, _sb = eos.compute_sw_alpha_beta(mesh, st.T, st.S, Z3d=Z3d_live)
+            _turner = jax.lax.stop_gradient(eos.turner_angle(st.T, st.S, _sa, _sb))
         Kv, Av, uvnode, tke_new = _ckpt(lambda: tke.mixing_tke(
-            mesh, st.uv, bvfreq, st.tke, stress_node_surf, st.hnode, tke_cfg, params,
-            freeze_convection=_adj.freeze_convection,
-            dt=dt, exch=_exch, Z3d=Z3d_live))()
+            mesh, st.uv, _bv_tke, st.tke, stress_node_surf, h_wp, tke_cfg, params,
+            freeze_convection=_adj.freeze_convection, cuts=_adj.diag_cuts,
+            tke_adj=_adj.tke_options(), freeze_state=_adj.freeze_mixing_state,
+            bvfreq_raw=bvfreq_raw, conv_surrogate=_adj.conv_surrogate, dt=dt, exch=_exch,
+            Z3d=Z3d_live,
+            ice_conc=None if _adj.tke_pr_ice_cut is None else st.a_ice, turner=_turner))()
     elif kpp_cfg is not None:
         if heat_flux is None:
             raise ValueError(
@@ -346,12 +413,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         Kv, Av, uvnode = _ckpt(lambda: kpp.mixing_kpp(
             mesh, st.uv, bvfreq, dbsfc, sw_alpha, sw_beta, st.S,
             heat_flux, water_flux, stress_node_surf, sw_3d, st.hnode, kpp_cfg, exch=_exch,
-            freeze_convection=_adj.freeze_convection,
+            freeze_convection=_adj.freeze_convection, conv_surrogate=_adj.conv_surrogate,
             Z3d=Z3d_live, zbar3=zbar3_live))()
     else:
         Kv, Av, uvnode = pp.mixing_pp(mesh, st.uv, bvfreq, k_ver=params.k_ver,
                                       a_ver=params.a_ver, Z3d=Z3d_live,
-                                      freeze_convection=_adj.freeze_convection)
+                                      freeze_convection=_adj.freeze_convection,
+                                      conv_surrogate=_adj.conv_surrogate)
     uvnode = _exch(uvnode, "nod")
     Kv = _exch(Kv, "nod")
     Av = _exch(Av, "elem")
@@ -373,7 +441,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # 5 — momentum RHS (lagged eta_n, w_e, uv; shifts the OLD AB slot). Embeds
     #     momentum_adv_scalar, which exchanges its node uvnode_rhs internally (S.7).
     uv_rhs, uv_rhsAB = _ckpt(lambda: momentum.compute_vel_rhs(
-        mesh, st.uv, st.uv_rhsAB, st.eta_n, pgf_x, pgf_y, st.w_e, st.hnode,
+        mesh, st.uv, st.uv_rhsAB, st.eta_n, pgf_x, pgf_y, st.w_e, h_wp,
         is_first_step=is_first_step, dt=dt, exch=_exch))()
     uv_rhs = _exch(uv_rhs, "elem")
     uv_rhsAB = _exch(uv_rhsAB, "elem")
@@ -404,31 +472,51 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     wf_ssh = water_flux if ale_cfg is not None else None
     hbar_ssh = st.hbar if ale_cfg is not None else None
 
-    # 8 — SSH RHS (transport divergence of uv + du; zstar adds −α·wf·areasvol)
-    ssh_rhs = ssh.compute_ssh_rhs(mesh, st.uv, du, st.helem, water_flux=wf_ssh)
-    ssh_rhs = _exch(ssh_rhs, "nod")
+    # Split-explicit SSH (AleConfig.split_explicit, fesom_jax.ssh_se): substeps 8-12 become the barotropic
+    # forcing from du, M explicit AB3-AM4 substeps of (eta, U), the trim of uv to the mean transport and
+    # eta_n = hbar = eta^M (Sergey Danilov's scheme as the Kokkos port built it; a stated deviation from upstream
+    # FESOM2). d_eta / ssh_rhs / ssh_rhs_old are not computed (carried unchanged). None ⇒ the CG (a dead branch).
+    _se = ale_cfg.split_explicit if ale_cfg is not None else None
+    se_out = None
+    if _se is not None:
+        from . import ssh_se                      # lazy: the CG program never imports it
+        if st.se_eta is None:
+            raise ValueError("split-explicit SSH needs its rings in the State: state = "
+                             "ssh_se.cold_start(state, mesh) (a cold start, or a CG state entering SE)")
+        se_out = ssh_se.se_block(mesh, st, du, wf_ssh, _se, dt=dt, is_first_step=is_first_step, exch=_exch,
+                                 wide=None if halo_ctx is None else halo_ctx.se_wide)
+        uv, eta_n, hbar, hbar_old = se_out.uv, se_out.eta_n, se_out.hbar, se_out.hbar_old
+        d_eta, ssh_rhs, ssh_rhs_old = st.d_eta, st.ssh_rhs, st.ssh_rhs_old
+    else:
+        # 8 — SSH RHS (transport divergence of uv + du; zstar adds −α·wf·areasvol)
+        ssh_rhs = ssh.compute_ssh_rhs(mesh, st.uv, du, st.helem, water_flux=wf_ssh)
+        ssh_rhs = _exch(ssh_rhs, "nod")
 
-    # 9 — CG solve, warm-started from the previous step's d_eta (0 at step 1). The CG
-    #     exchanges pp/rr internally per iteration (S.6, via _ssh_halo); refresh d_eta after.
-    #     zstar: mesh+hbar add ΔA(mean₃(hbar)) to the matvec (no-op at cold start).
-    d_eta = ssh.solve_ssh(op, ssh_rhs, x0=st.d_eta, halo=_ssh_halo,
-                          mesh=mesh, hbar=hbar_ssh, dt=dt)
-    d_eta = _exch(d_eta, "nod")
+        # 9 — CG solve, warm-started from the previous step's d_eta (0 at step 1). The CG
+        #     exchanges pp/rr internally per iteration (S.6, via _ssh_halo); refresh d_eta after.
+        #     zstar: mesh+hbar add ΔA(mean₃(hbar)) to the matvec (no-op at cold start).
+        #     ``ssh.gathered`` (opt-in): one all-gather, then the dense solve on every device.
+        if halo_ctx is not None and halo_ctx.ssh_gather is not None:
+            d_eta = ssh.solve_ssh_gathered(halo_ctx.ssh_gather, ssh_rhs, st.d_eta, hbar_ssh, dt=dt)
+        else:
+            d_eta = ssh.solve_ssh(op, ssh_rhs, x0=st.d_eta, halo=_ssh_halo,
+                                  mesh=mesh, hbar=hbar_ssh, dt=dt)
+        d_eta = _exch(d_eta, "nod")
 
-    # 10 — velocity update (du + barotropic SSH-gradient correction)
-    uv = momentum.update_vel(mesh, st.uv, du, d_eta, dt=dt)
-    uv = _exch(uv, "elem")
+        # 10 — velocity update (du + barotropic SSH-gradient correction)
+        uv = momentum.update_vel(mesh, st.uv, du, d_eta, dt=dt)
+        uv = _exch(uv, "elem")
 
-    # 11 — hbar (save hbar_old first); 12 — eta_n blend. zstar: compute_hbar subtracts
-    #      wf·areasvol from ssh_rhs_old before the hbar update (so hbar + the next step's
-    #      (1−α) term read the wf-modified value).
-    hbar_old = st.hbar
-    ssh_rhs_old, hbar = ssh.compute_hbar(mesh, uv, st.helem, hbar_old, dt=dt,
-                                         water_flux=wf_ssh)
-    ssh_rhs_old = _exch(ssh_rhs_old, "nod")
-    hbar = _exch(hbar, "nod")
-    eta_n = ssh.eta_n_update(mesh, st.eta_n, hbar, hbar_old)
-    eta_n = _exch(eta_n, "nod")
+        # 11 — hbar (save hbar_old first); 12 — eta_n blend. zstar: compute_hbar subtracts
+        #      wf·areasvol from ssh_rhs_old before the hbar update (so hbar + the next step's
+        #      (1−α) term read the wf-modified value).
+        hbar_old = st.hbar
+        ssh_rhs_old, hbar = ssh.compute_hbar(mesh, uv, st.helem, hbar_old, dt=dt,
+                                             water_flux=wf_ssh)
+        ssh_rhs_old = _exch(ssh_rhs_old, "nod")
+        hbar = _exch(hbar, "nod")
+        eta_n = ssh.eta_n_update(mesh, st.eta_n, hbar, hbar_old)
+        eta_n = _exch(eta_n, "nod")
 
     # 13 — ALE: vertical velocity; vertical CFL + explicit/implicit split. use_wsplit=0 in the
     #      reference config ⇒ the split is the identity (w_e=w, w_i=0); cfl_z is computed every
@@ -444,7 +532,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             mesh, w, st.hnode, zbar3_live, hbar, hbar_old, wf_ssh, dt=dt)
         hnode_new = _exch(hnode_new, "nod")    # the C's zstar-only exchange_nod(hnode_new)
     w = _exch(w, "nod")
-    cfl_z = ale.compute_cfl_z(mesh, w, hnode_new, dt=dt)
+    cfl_z = ale.compute_cfl_z(mesh, w, PR.wp(hnode_new), dt=dt)
     cfl_z = _exch(cfl_z, "nod")
     # w_split (oce_ale.F90:2500): move the vertical-CFL excess to the implicit part (config above).
     w_e, w_i = ale.compute_wvel_split(mesh, w, cfl_z, use_wsplit=_use_wsplit, maxcfl=_wsplit_maxcfl)
@@ -457,6 +545,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     zbar3_new = Z3d_new = None
     if ale_cfg is not None:
         zbar3_new, Z3d_new = ale.live_geometry(mesh, hnode_new)
+    # single precision: the implicit vertical-diffusion column builds its geometry in WP_full from hnode_new
+    # (oce_ale_tracer.F90:1081); everything else reads the WP geometry.
+    Z3d_diff = ale.live_geometry(mesh, hnode_new, keep_f64=True)[1] if _sp else Z3d_new
 
     # 13a — GM bolus wrap (fesom_step.c:422-438): feed the bolus-augmented velocity to the
     #       tracer advection. fer_w reuses compute_w driven by fer_uv. In functional JAX the
@@ -469,52 +560,60 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         w_e_adv = w_e + fer_w          # w_e (exch nod) + fer_w (exch nod) ⇒ halo-complete
 
     # 15 — FCT tracer advection (T then S) + Redi explicit terms + implicit vert diffusion.
-    #      advect_one_fct exchanges fct_LO + fct_plus/minus internally (S.7 splits).
+    #      advect_one_fct exchanges fct_LO + the limiter factors internally (S.7 splits).
     # w_split (FRESH w_i from substep 13): the FCT LO flux used the explicit w_e (in w_e_adv),
     # the implicit w_i advection is applied to the LO solution, and the antidiffusive HO flux uses
     # the full w_e_adv+w_i. use_wsplit off ⇒ w_i=None ⇒ byte-identical. (w_i is the EULERIAN
     # implicit part; the GM bolus stays explicit in w_e_adv.)
     _wi_adv = w_i if _use_wsplit else None
-    T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
-        mesh, uv_adv, w_e_adv, st.helem, st.hnode,
-        hnode_new, st.T, st.T_old, dt=dt, exch=_exch,
-        Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
-        freeze_limited_flux=_adj.freeze_advection))()
-    S_adv, S_old = _ckpt(lambda: tracer_adv.advect_one_fct(
-        mesh, uv_adv, w_e_adv, st.helem, st.hnode,
-        hnode_new, st.S, st.S_old, dt=dt, exch=_exch,
-        Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
-        freeze_limited_flux=_adj.freeze_advection))()
-    T_adv = _exch(T_adv, "nod")
-    S_adv = _exch(S_adv, "nod")
+    carry_T = carry_S = None
+    if _sp:
+        T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff = _tracers_advect_sp(
+            mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live, zbar3_new,
+            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj)
+    else:
+        T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
+            mesh, uv_adv, w_e_adv, st.helem, st.hnode,
+            hnode_new, st.T, st.T_old, dt=dt, exch=_exch,
+            Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
+            freeze_limited_flux=_adj.freeze_advection,
+                freeze_limiter=_adj.freeze_fct_limiter))()
+        S_adv, S_old = _ckpt(lambda: tracer_adv.advect_one_fct(
+            mesh, uv_adv, w_e_adv, st.helem, st.hnode,
+            hnode_new, st.S, st.S_old, dt=dt, exch=_exch,
+            Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
+            freeze_limited_flux=_adj.freeze_advection,
+                freeze_limiter=_adj.freeze_fct_limiter))()
+        T_adv = _exch(T_adv, "nod")
+        S_adv = _exch(S_adv, "nod")
 
-    # 15a/b — Redi neutral diffusion (fesom_step.c:468-499). The G7a (vertical-explicit) +
-    #         G7b (horizontal-edge) gradients read the PRE-step tracer (st.T/st.S = the C
-    #         `valuesold` saved during advection), and the deltas apply to the post-advection
-    #         T_adv/S_adv. K33 augments Kv before the vertical diffusion (no diffusion-kernel
-    #         change — impl_vert_diff already builds a∝Kv[nz], c∝Kv[nz+1]).
-    Kv_eff = Kv
-    if gm_diag is not None:
-        slope_tap, Ki = gm_diag.slope_tapered, gm_diag.Ki
-        # zstar (JZ.6): vertical Redi geometry on the OLD (st.hnode) side (zbar3/Z3d_live, the ÷
-        # hnode_new divisor stays the new side); horizontal Redi already on st.hnode/helem/hnode_new
-        # (no static geom); K33 on the NEW (hnode_new) side (zbar3/Z3d_new — matches impl_vert_diff).
-        T_adv = (T_adv
-                 + _ckpt(lambda: gm_redi.diff_ver_part_redi_expl(
-                     mesh, st.T, slope_tap, Ki, hnode_new, dt=dt, zbar3=zbar3_live, Z3d=Z3d_live))()
-                 + _ckpt(lambda: gm_redi.diff_part_hor_redi(
-                     mesh, st.T, slope_tap, Ki, st.hnode, hnode_new, st.helem, dt=dt))())
-        S_adv = (S_adv
-                 + _ckpt(lambda: gm_redi.diff_ver_part_redi_expl(
-                     mesh, st.S, slope_tap, Ki, hnode_new, dt=dt, zbar3=zbar3_live, Z3d=Z3d_live))()
-                 + _ckpt(lambda: gm_redi.diff_part_hor_redi(
-                     mesh, st.S, slope_tap, Ki, st.hnode, hnode_new, st.helem, dt=dt))())
-        _k33 = _ckpt(lambda: gm_redi.k33_augmentation(
-            mesh, slope_tap, Ki, zbar3=zbar3_new, Z3d=Z3d_new))()
-        # NOTE this one is unlike the others: K33 is how the eddy coefficients reach the
-        # vertical diffusion, so freezing it cuts part of the gradient path of the very
-        # parameter being trained. Off unless you are deliberately isolating that term.
-        Kv_eff = Kv + (jax.lax.stop_gradient(_k33) if _adj.freeze_k33 else _k33)
+        # 15a/b — Redi neutral diffusion (fesom_step.c:468-499). The G7a (vertical-explicit) +
+        #         G7b (horizontal-edge) gradients read the PRE-step tracer (st.T/st.S = the C
+        #         `valuesold` saved during advection), and the deltas apply to the post-advection
+        #         T_adv/S_adv. K33 augments Kv before the vertical diffusion (no diffusion-kernel
+        #         change — impl_vert_diff already builds a∝Kv[nz], c∝Kv[nz+1]).
+        Kv_eff = Kv
+        if gm_diag is not None:
+            slope_tap, Ki = gm_diag.slope_tapered, gm_diag.Ki
+            # zstar (JZ.6): vertical Redi geometry on the OLD (st.hnode) side (zbar3/Z3d_live, the ÷
+            # hnode_new divisor stays the new side); horizontal Redi already on st.hnode/helem/hnode_new
+            # (no static geom); K33 on the NEW (hnode_new) side (zbar3/Z3d_new — matches impl_vert_diff).
+            T_adv = (T_adv
+                     + _ckpt(lambda: gm_redi.diff_ver_part_redi_expl(
+                         mesh, st.T, slope_tap, Ki, hnode_new, dt=dt, zbar3=zbar3_live, Z3d=Z3d_live))()
+                     + _ckpt(lambda: gm_redi.diff_part_hor_redi(
+                         mesh, st.T, slope_tap, Ki, st.hnode, hnode_new, st.helem, dt=dt))())
+            S_adv = (S_adv
+                     + _ckpt(lambda: gm_redi.diff_ver_part_redi_expl(
+                         mesh, st.S, slope_tap, Ki, hnode_new, dt=dt, zbar3=zbar3_live, Z3d=Z3d_live))()
+                     + _ckpt(lambda: gm_redi.diff_part_hor_redi(
+                         mesh, st.S, slope_tap, Ki, st.hnode, hnode_new, st.helem, dt=dt))())
+            _k33 = _ckpt(lambda: gm_redi.k33_augmentation(
+                mesh, slope_tap, Ki, zbar3=zbar3_new, Z3d=Z3d_new))()
+            # NOTE this one is unlike the others: K33 is how the eddy coefficients reach the
+            # vertical diffusion, so freezing it cuts part of the gradient path of the very
+            # parameter being trained. Off unless you are deliberately isolating that term.
+            Kv_eff = Kv + (jax.lax.stop_gradient(_k33) if _adj.freeze_k33 else _k33)
     # zstar bc_T surface term −dt·sval·water_flux (is_nonlinfs=1): sval = the POST-advection
     # (+Redi) surface T, the C's `trarr[surface]` at the diffusion (fesom_tracer_diff.c:292) —
     # NOT the start-of-step T, so it lands HERE, not in the forcing-step bc_T. bc_S has no such
@@ -524,9 +623,14 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # zstar: the impl vert diff layer-center spacings come from the NEW (about-to-commit)
     # thickness hnode_new (Z3d_new, hoisted after vert_vel above) — the dual-geometry's "new"
     # side (vs QR4C on the committed st.hnode). linfs ⇒ None (static).
-    T_new, S_new = _ckpt(lambda: tracer_diff.impl_vert_diff(
-        mesh, T_adv, S_adv, Kv_eff, hnode_new, dt=dt,
-        bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d, Z3d=Z3d_new))()
+    if _sp:
+        (T_new, carry_T), (S_new, carry_S) = _ckpt(lambda: tracer_diff.impl_vert_diff(
+            mesh, T_adv, S_adv, Kv_eff, hnode_new, dt=dt,
+            bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d, Z3d=Z3d_diff, carry_T=carry_T, carry_S=carry_S))()
+    else:
+        T_new, S_new = _ckpt(lambda: tracer_diff.impl_vert_diff(
+            mesh, T_adv, S_adv, Kv_eff, hnode_new, dt=dt,
+            bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d, Z3d=Z3d_new))()
     # salinity floor on wet layers only (below-bottom stays 0)
     S_new = jnp.where(mesh.node_layer_mask, jnp.maximum(S_new, S_FLOOR), S_new)
     T_new = _exch(T_new, "nod")        # refresh halo for next step's EOS/FCT/Redi reads
@@ -547,6 +651,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         density=density, hpressure=hpressure, bvfreq=bvfreq, Kv=Kv, Av=Av,
         pgf_x=pgf_x, pgf_y=pgf_y,
     )
+    if _sp:
+        new = dataclasses.replace(new, carry_T=carry_T, carry_S=carry_S)
+    if se_out is not None:
+        new = dataclasses.replace(new, se_eta=se_out.se_eta, se_ubt=se_out.se_ubt,
+                                  se_sbar_old=se_out.se_sbar_old)
     # Phase 9b: carry the advanced prognostic TKE (a conditional replace keyed on the cfg —
     # the ice precedent — so the tke_cfg=None path never touches state.tke ⇒ byte-identical).
     if tke_cfg is not None:
@@ -557,11 +666,70 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             new, a_ice=ice_out.a_ice, m_ice=ice_out.m_ice, m_snow=ice_out.m_snow,
             u_ice=ice_out.u_ice, v_ice=ice_out.v_ice, t_skin=ice_out.t_skin,
             sigma11=ice_out.sigma11, sigma12=ice_out.sigma12, sigma22=ice_out.sigma22)
+        # ice_ave_steps > 1: the ice counter, the running means and the held thermo outputs
+        # (None otherwise ⇒ nothing traced, the State keeps its None fields)
+        if ice_out.ice_steps_since_upd is not None:
+            from .state import ICE_AVG_FIELDS
+            new = dataclasses.replace(new, **{f: getattr(ice_out, f) for f in ICE_AVG_FIELDS})
     return new
+
+
+def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live,
+                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj):
+    """Single-precision tracer advection + explicit Redi + ALE reconstruction (FESOM2 #1054/#1056/#1206/#1207).
+
+    Upstream order (``oce_ale_tracer.F90``): the FCT advection fills the WP_full ``del_ttf`` (low-order tendency in
+    flux form plus the float64 antidiffusive divergences), the explicit Redi terms add their WP increments to it
+    (``:1715-1720``, ``:1904``), and the ALE reconstruction rounds ``T·hnode + del_ttf + carry`` once, the residual
+    going back into the carry (``:864-869``). Deviation D3 (user, 2026-10-20): the double-precision path of
+    :func:`step` adds Redi after its reconstruction; only this single-precision path follows upstream's order.
+    Returns ``(T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff)``."""
+    hn_wp = PR.wp(hnode_new)
+
+    def one(X, X_old, carry):
+        d, X_old_new = ckpt(lambda: tracer_adv.advect_one_fct(
+            mesh, uv_adv, w_e_adv, st.helem, st.hnode, hnode_new, X, X_old, dt=dt, exch=exch,
+            Z3d=Z3d_live, zbar3=zbar3_live, w_i=None, freeze_limited_flux=adj.freeze_advection,
+            freeze_limiter=adj.freeze_fct_limiter,
+            content=True))()
+        if gm_diag is not None:
+            sl, Ki = gm_diag.slope_tapered, gm_diag.Ki
+            d = (d + PR.full(ckpt(lambda: gm_redi.diff_ver_part_redi_expl(
+                     mesh, X, sl, Ki, hn_wp, dt=dt, zbar3=zbar3_live, Z3d=Z3d_live, content=True))())
+                 + PR.full(ckpt(lambda: gm_redi.diff_part_hor_redi(
+                     mesh, X, sl, Ki, h_wp, hn_wp, st.helem, dt=dt, content=True))()))
+        Xn, carry = tracer_adv.ale_reconstruct_carry(mesh, X, d, st.hnode, hnode_new, carry)
+        return exch(Xn, "nod"), X_old_new, carry
+
+    T_adv, T_old, carry_T = one(st.T, st.T_old, st.carry_T)
+    S_adv, S_old, carry_S = one(st.S, st.S_old, st.carry_S)
+    Kv_eff = Kv
+    if gm_diag is not None:
+        k33 = ckpt(lambda: gm_redi.k33_augmentation(mesh, gm_diag.slope_tapered, gm_diag.Ki, zbar3=zbar3_new,
+                                                    Z3d=Z3d_new))()
+        Kv_eff = Kv + (jax.lax.stop_gradient(k33) if adj.freeze_k33 else k33)
+    return T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff
 
 
 # Jitted entry point (the Task-2.11 deliverable; also what Phase 3's lax.scan wraps).
 SURFACE_ADJ_KEYS = ("heat", "stress_x", "stress_y")
+
+#: Params.forcing_adj names: the StepForcing fields an anomaly may be added to (the wind in the model frame, Tair in
+#: degC, the radiation in W/m2, shum in kg/kg, the precipitation in m/s)
+FORCING_ADJ_KEYS = ("u_air", "v_air", "Tair", "shum", "longwave", "shortwave", "prec_rain", "prec_snow")
+
+
+def _apply_forcing_adj(step_forcing, adj):
+    """``step_forcing`` with ``Params.forcing_adj`` added: ``{name: anomaly}``, ``name`` from :data:`FORCING_ADJ_KEYS`,
+    each anomaly the shape of the field (dense or local lanes; no halo exchange needed, the forcing is per node).
+    Unknown names raise, so a misspelt key cannot be a silent no-op. Nothing is clipped: a negative humidity or
+    radiation from a large anomaly is the caller's to avoid (the gradient is taken at a zero anomaly)."""
+    if not isinstance(adj, dict):
+        raise TypeError(f"Params.forcing_adj must be a dict, got {type(adj).__name__}")
+    unknown = sorted(set(adj) - set(FORCING_ADJ_KEYS))
+    if unknown:
+        raise ValueError(f"Params.forcing_adj: unknown keys {unknown}; allowed {list(FORCING_ADJ_KEYS)}")
+    return step_forcing._replace(**{k: getattr(step_forcing, k) + v for k, v in adj.items()})
 
 
 def _apply_surface_adj(mesh, adj, *, bc_T, heat_flux, stress_surf, stress_node_surf, dt,

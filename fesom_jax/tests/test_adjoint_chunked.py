@@ -272,6 +272,57 @@ class _FakeCheckpoint:
         return self.stop_after is not None and self.done >= self.stop_after
 
 
+class _LazyStore(dict):
+    """A lazy boundary store as :meth:`~fesom_jax.adjoint.ReverseCheckpoint.load_boundaries`
+    may return one: a mapping that is not a pytree, reports ``resident_bytes``, and counts reads."""
+
+    def __init__(self, states):
+        super().__init__(states)
+        self.reads = {c: 0 for c in states}
+
+    def __getitem__(self, c):
+        self.reads[c] += 1
+        return super().__getitem__(c)
+
+    def resident_bytes(self):
+        return 0
+
+
+class _StoringCheckpoint(_FakeCheckpoint):
+    """Keeps the forward's boundaries; on the next call serves them lazily (``have_boundaries``)."""
+
+    def __init__(self):
+        super().__init__()
+        self.stored = {}
+
+    def put_boundary(self, c, state):
+        self.stored[c] = state
+        return False
+
+    def finish_forward(self, loss):
+        super().finish_forward(loss)
+        self.have_boundaries = True
+
+    def load_boundaries(self, like):
+        self.boundaries = _LazyStore(self.stored)
+        return self.boundaries
+
+
+def test_lazy_boundary_store_reads_each_once(fixture, baseline, capsys):
+    """A store that reads on ``[c]`` gives the same gradient, and the reverse walk asks for each
+    stored boundary exactly once: per span at stride 2, so the host holds one span."""
+    ck = _StoringCheckpoint()
+    _chunked(fixture, KVER, stride=2, checkpoint=ck)           # forward stores {0, 2, 4}
+    ck.saved = None
+    res = _chunked(fixture, KVER, stride=2, checkpoint=ck)     # served lazily
+    g_ref, g = float(baseline.grad.k_ver), float(res.grad.k_ver)
+    rel = abs(g - g_ref) / max(abs(g_ref), 1e-300)
+    print(f"\nlazy stride 2: rel={rel:.3e}  reads {ck.boundaries.reads}")
+    assert rel < 1e-12
+    assert sorted(ck.stored) == [0, 2, 4] and ck.boundaries.reads == {0: 1, 2: 1, 4: 1}
+    assert res.host_gb == 0.0
+
+
 def test_resumed_sweep_equals_a_single_pass(fixture, baseline, capsys):
     """Stop the reverse walk mid-window, resume, and land on the same gradient.
 

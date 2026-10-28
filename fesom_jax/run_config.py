@@ -73,6 +73,9 @@ from .kpp import KppConfig
 from .tke import TkeConfig
 
 
+_ALE_SE: dict = {}       # RunConfig.ale_cfg's objects, one per (AleConfig, SeConfig) value
+
+
 class DtRamp(NamedTuple):
     """A single cold→prod timestep change: switch to ``dt`` once ``step >= after_step``.
 
@@ -89,7 +92,8 @@ _SUBCONFIGS = {
     "tke": TkeConfig, "ice": IceConfig,
 }
 # Non-physics scalar/spec fields that pass through YAML verbatim.
-_SPEC_FIELDS = ("dt", "mesh", "partition", "forcing", "ssh", "output_dir", "snapshot_every",
+_SPEC_FIELDS = ("dt", "mesh", "partition", "precision", "forcing", "ssh", "gpu", "output_dir",
+                "snapshot_every",
                 "checkpoint_every", "restart_in", "restart_out",
                 "restart_archive_out", "restart_archive_period", "restart_archive_length",
                 "n_steps", "duration", "params_file")
@@ -105,7 +109,52 @@ _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 # Chebyshev polynomial preconditioner (CGPOLY, ssh.enable_cheb_precond) in place of the
 # MITgcm M⁻¹ — a many-node comm lever (fewer CG iterations ⇒ fewer psums); absent/0 ⇒ the
 # byte-identical default. `cheb_kappa` tunes the assumed condition number (default 30).
-_SSH_KEYS = ("cheb_degree", "cheb_kappa")
+# `gathered` (bool, default false) solves the 2-D system on every device after one all-gather
+# instead of the sharded CG (ssh.solve_ssh_gathered) — an option for small meshes only.
+# `split_explicit` (a mapping of fesom_jax.ssh_se.SeConfig fields, {} = the defaults M 50, chi 0.1): replace the CG
+# by the split-explicit barotropic subcycling (a PHYSICS change, Sergey Danilov's AB3-AM4 scheme as the Kokkos port
+# built it — a stated deviation from upstream FESOM2; zstar only). It rides on the step as
+# AleConfig.split_explicit (:meth:`RunConfig.ale_cfg`). Absent/null ⇒ the CG.
+_SSH_KEYS = ("cheb_degree", "cheb_kappa", "gathered", "split_explicit")
+# The `gpu:` mapping — layout/transport options for GPU runs (CORE2 GPU speed plan, Task 7). Each
+# key maps to the trace-time environment switch that implements it; the values move by round-off
+# at most. `halo_compact`: the all_gather halo ships only the lanes other devices read
+# (halo.halo_exchange_compact, FESOM_HALO_COMPACT); `column_unroll`: the level sweeps run unrolled
+# on the [..., K] arrays (ops.unrolled_scan, FESOM_COLUMN_UNROLL). Off when absent.
+# `mevp_wide` (an integer K >= 0, not a bool): the sharded mEVP exchanges once every K subcycles on
+# K-ring ice lanes (fesom_jax.ice_wide, FESOM_MEVP_WIDE; owned lanes bitwise the per-subcycle
+# exchange on CPU); 0/1 = the per-subcycle exchange. `ssh_ell`: the SSH matvecs on the operator's ELL
+# layout (ssh.to_ell, FESOM_SSH_ELL; the segment_sum to round-off, no atomics on a GPU).
+# `cg_batch` (an integer k >= 1): the CG runs k masked iterations per while-loop trip, the same iterate
+# with k times fewer host syncs (ssh.cg_batch, FESOM_CG_BATCH); 0/1 = one iteration per trip.
+# `ordered_sums`: the element/edge -> node/element assemblies (ops.scatter_add on mesh.elem_nodes /
+# edges / edge_tri) as ordered gathers over per-device inverse maps (ops.ordered_sum,
+# FESOM_ORDERED_SUMS; the segment_sum to round-off, no atomics on a GPU, deterministic).
+_GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN_UNROLL",
+            "mevp_wide": "FESOM_MEVP_WIDE", "ssh_ell": "FESOM_SSH_ELL", "cg_batch": "FESOM_CG_BATCH",
+            "mevp_unroll": "FESOM_MEVP_UNROLL", "column_kernel": "FESOM_COLUMN_KERNEL",
+            "ssh_inc_ell": "FESOM_SSH_INC_ELL", "ordered_sums": "FESOM_ORDERED_SUMS",
+            "forcing_procs": "FESOM_FORCING_PROCS", "output_async": "FESOM_OUTPUT_ASYNC",
+            "forcing_ahead": "FESOM_FORCING_AHEAD", "restart_async": "FESOM_RESTART_ASYNC",
+            "se_wide": "FESOM_SE_WIDE", "se_unroll": "FESOM_SE_UNROLL", "step_unroll": "FESOM_STEP_UNROLL",
+            "ice_static": "FESOM_ICE_STATIC", "chunk_tail": "FESOM_CHUNK_TAIL"}
+# `se_wide` (an integer K >= 0): the sharded split-explicit substeps exchange once every K substeps on K+1-ring lanes
+# (fesom_jax.se_wide, FESOM_SE_WIDE; owned lanes bitwise the per-substep exchange on CPU); 0/1 = two exchanges per
+# substep. `se_unroll` (an integer u >= 1): u substeps per loop trip (ssh_se.se_unroll, FESOM_SE_UNROLL; round-off).
+# Both need ssh.split_explicit.
+# `step_unroll` (an integer u >= 1): the forced runner's step scan runs u steps per loop trip, so the host syncs on the
+# loop predicate u times less often (integrate_sharded.step_unroll, FESOM_STEP_UNROLL; round-off). `ice_static`
+# (ice_ave_steps > 1): each step's ice update branch is fixed at trace time from the cycle's phase, no lax.cond and
+# no host sync a step (run_steps_sharded_forced ice_phase, FESOM_ICE_STATIC).
+_GPU_INT = ("mevp_wide", "cg_batch", "mevp_unroll", "forcing_procs", "forcing_ahead", "se_wide", "se_unroll",
+            "step_unroll", "chunk_tail")
+# `chunk_tail` (an integer q >= 0): a chunk shorter than the chunk length whose length is a multiple of q runs as
+# q-chunks (run.split_tails, FESOM_CHUNK_TAIL): one compiled length less where month ends leave 2q.
+_GPU_HOST = ("lane_order", "halo_transport", "chunk_steps")   # applied by the driver itself, not environment switches
+# `halo_transport`: "all_gather" (default; `halo_compact` compacts it), "padded", "coloured" or "ragged" (the
+# --padded / --coloured / --ragged flags, which win). `chunk_steps` (an integer > 0): the chunk length (--chunk-steps
+# wins; 240 when neither is given).
+_HALO_TRANSPORTS = ("all_gather", "padded", "coloured", "ragged")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -126,6 +175,7 @@ class RunConfig:
     partition: Optional[str] = None
     forcing: Optional[dict] = None
     ssh: Optional[dict] = None             # SSH solver options (_SSH_KEYS); None = defaults
+    gpu: Optional[dict] = None             # GPU layout/transport options (_GPU_ENV); None = off
     output_dir: Optional[str] = None
     snapshot_every: int = 0
     checkpoint_every: int = 0
@@ -137,6 +187,9 @@ class RunConfig:
     n_steps: Optional[int] = None
     duration: Optional[str] = None
     params_file: Optional[str] = None   # .npz of trained gm_nn weights; None ⇒ default GM
+    # working precision: "double" (default, every program unchanged) or "single" — FESOM2's single-precision build
+    # (#1207 policy, fesom_jax.precision; CORE2 production physics only)
+    precision: str = "double"
 
     # ----------------------------------------------------------------------
     @classmethod
@@ -173,8 +226,69 @@ class RunConfig:
         s = self.ssh or {}
         return int(s.get("cheb_degree", 0) or 0), float(s.get("cheb_kappa", 30.0))
 
+    def ssh_gathered(self) -> bool:
+        """``ssh.gathered``: the SSH solve gathered onto every device (off by default)."""
+        return bool((self.ssh or {}).get("gathered", False))
+
+    def split_explicit(self):
+        """``ssh.split_explicit`` as a :class:`~fesom_jax.ssh_se.SeConfig` (``{}`` = its defaults), ``None`` when
+        absent or null (the CG)."""
+        se = (self.ssh or {}).get("split_explicit")
+        if se is None:
+            return None
+        from .ssh_se import SeConfig
+        if not isinstance(se, dict):
+            raise TypeError(f"ssh.split_explicit must be a mapping or null, got {type(se).__name__}")
+        _check_keys(se, SeConfig._fields, "ssh.split_explicit")
+        return SeConfig(**se)
+
+    def ale_cfg(self):
+        """The step's :class:`~fesom_jax.ale.AleConfig`: :attr:`ale` with ``split_explicit`` from the ``ssh:`` block
+        (``ale`` itself when the CG runs, so a CG config passes the identical object)."""
+        se = self.split_explicit()
+        if se is None or self.ale is None:
+            return self.ale
+        # one object per (ale, se) value: the sharded runner keys its executable cache on id(ale_cfg)
+        return _ALE_SE.setdefault((self.ale, se), self.ale._replace(split_explicit=se))
+
+    def gpu_env(self) -> dict:
+        """The environment switches the ``gpu:`` block turns on, ``{name: "1"}`` (empty when off).
+        :func:`fesom_jax.run.run_from_config` sets them for the run; an explicit environment
+        setting wins, so ``FESOM_HALO_COMPACT=0`` still A/B-tests a config that turns it on."""
+        return {_GPU_ENV[k]: (str(int(v)) if k in _GPU_INT else "1")
+                for k, v in (self.gpu or {}).items() if v and k not in _GPU_HOST}
+
+    def lane_order(self):
+        """``gpu.lane_order``: the order of the lanes inside the shards (:mod:`fesom_jax.lane_order`), None = the
+        partition's own (global-id) order."""
+        return (self.gpu or {}).get("lane_order") or None
+
+    def halo_transport(self) -> str:
+        """``gpu.halo_transport``: the ocean halo exchange (``"all_gather"`` when absent)."""
+        return (self.gpu or {}).get("halo_transport") or "all_gather"
+
+    def chunk_steps(self):
+        """``gpu.chunk_steps``: the chunk length in steps, None when absent."""
+        return (self.gpu or {}).get("chunk_steps") or None
+
     def validate(self) -> None:
         """Cross-field validity (mirrors the in-kernel guards, fail-fast at config load)."""
+        from .precision import PRECISIONS
+        if self.precision not in PRECISIONS:
+            raise ValueError(f"precision must be one of {PRECISIONS}, got {self.precision!r}")
+        if self.precision == "single":
+            bad = []
+            if self.ale is None or self.ale.use_wsplit:
+                bad.append("zstar without w_split")
+            if self.tke is None or self.kpp is not None:
+                bad.append("classical TKE")
+            if self.ice is None or self.ice.whichEVP != 1:
+                bad.append("mEVP sea ice")
+            if self.forcing is None:
+                bad.append("forcing")
+            if bad:
+                raise NotImplementedError("precision: single supports the CORE2 production physics only; "
+                                          "missing: " + ", ".join(bad))
         if self.forcing is not None:
             if not isinstance(self.forcing, dict):
                 raise TypeError(f"forcing must be a mapping or null, "
@@ -186,6 +300,45 @@ class RunConfig:
             _check_keys(self.ssh, _SSH_KEYS, "ssh")
             if int(self.ssh.get("cheb_degree", 0) or 0) < 0:
                 raise ValueError(f"ssh.cheb_degree must be >= 0, got {self.ssh['cheb_degree']}")
+            se = self.split_explicit()
+            if se is not None:
+                if self.ale is None:
+                    raise ValueError("ssh.split_explicit needs zstar (ale: {}): the subcycling's thickness law is z*, "
+                                     "as the Kokkos port's FESOM_SSH_MODE=se requires FESOM_ALE=zstar")
+                if self.ssh_gathered() or int(self.ssh.get("cheb_degree", 0) or 0):
+                    raise ValueError("ssh.split_explicit replaces the CG: ssh.gathered / ssh.cheb_degree do not apply")
+                se.validate()
+        for _k in ("se_wide", "se_unroll"):
+            if (self.gpu or {}).get(_k) and self.split_explicit() is None:
+                raise ValueError(f"gpu.{_k} needs the split-explicit SSH (ssh.split_explicit)")
+        if self.gpu is not None:
+            if not isinstance(self.gpu, dict):
+                raise TypeError(f"gpu must be a mapping or null, got {type(self.gpu).__name__}")
+            _check_keys(self.gpu, tuple(_GPU_ENV) + _GPU_HOST, "gpu")
+            if self.gpu.get("lane_order"):
+                from .lane_order import METHODS
+                if self.gpu["lane_order"] not in METHODS:
+                    raise ValueError(f"gpu.lane_order must be one of {METHODS} or null, got {self.gpu['lane_order']!r}")
+            if self.halo_transport() not in _HALO_TRANSPORTS:
+                raise ValueError(f"gpu.halo_transport must be one of {_HALO_TRANSPORTS}, got {self.halo_transport()!r}")
+            if self.halo_transport() != "all_gather" and self.gpu.get("halo_compact"):
+                raise ValueError("gpu.halo_compact compacts the all_gather transport; it cannot be combined with "
+                                 f"gpu.halo_transport {self.halo_transport()!r}")
+            cs = self.gpu.get("chunk_steps")
+            if cs is not None and (isinstance(cs, bool) or not isinstance(cs, int) or cs <= 0):
+                raise TypeError(f"gpu.chunk_steps must be an integer > 0, got {cs!r}")
+            for k, v in self.gpu.items():
+                if k in _GPU_HOST:
+                    continue
+                if k in _GPU_INT:
+                    if isinstance(v, bool) or not isinstance(v, int) or v < 0:
+                        raise TypeError(f"gpu.{k} must be an integer >= 0, got {v!r}")
+                elif not isinstance(v, bool):
+                    raise TypeError(f"gpu.{k} must be true or false, got {v!r}")
+        if self.ice is not None:
+            n = self.ice.ice_ave_steps
+            if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+                raise ValueError(f"ice.ice_ave_steps must be an integer >= 1, got {n!r}")
         if self.kpp is not None and self.tke is not None:
             raise ValueError(
                 "kpp and tke are both set — the model runs exactly one vertical-mixing scheme "
@@ -212,7 +365,7 @@ class RunConfig:
         :func:`fesom_jax.integrate.integrate` / ``run_steps_sharded`` (everything but ``dt``,
         which the driver ramps via :meth:`dt_at`)."""
         return dict(ice_cfg=self.ice, gm_cfg=self.gm, kpp_cfg=self.kpp, tke_cfg=self.tke,
-                    ale_cfg=self.ale, visc_cfg=self.visc, tracer_cfg=self.tracer)
+                    ale_cfg=self.ale_cfg(), visc_cfg=self.visc, tracer_cfg=self.tracer)
 
     def dt_at(self, step: int) -> float:
         """The timestep at absolute ``step`` index, honoring :attr:`dt_ramp`."""

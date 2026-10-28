@@ -73,9 +73,9 @@ def node_stress(mesh: Mesh, raw):
     e = mesh.elem2D
     area = mesh.elem_area[:, None]                         # (elem2D,1)
     num = ops.scatter_add(jnp.broadcast_to((area * raw)[:, None], (e, 3, 2)),
-                          mesh.elem_nodes, mesh.nod2D)      # (nod2D,2)
+                          mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)      # (nod2D,2)
     den = ops.scatter_add(jnp.broadcast_to(mesh.elem_area[:, None], (e, 3)),
-                          mesh.elem_nodes, mesh.nod2D)      # (nod2D,)
+                          mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)      # (nod2D,)
     safe = jnp.where(den > 0.0, den, 1.0)[:, None]
     return num / safe
 

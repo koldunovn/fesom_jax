@@ -29,6 +29,8 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+
+from . import precision as PR
 from jax import lax
 
 from . import ops
@@ -63,7 +65,7 @@ def bc_index_nod2D(boundary_node: jnp.ndarray) -> jnp.ndarray:
     (``fesom_ice_maevp.c:304``). ⚠️ Sharding: pass the GLOBAL boundary mask (partitioned in),
     never a local-mesh recompute — a partition-seam edge mis-flags an interior node as coastal
     (the C reads ``partit->myList_edge2D``; the same trap the std-EVP ``boundary_node`` guards)."""
-    return 1.0 - boundary_node.astype(jnp.float64)
+    return 1.0 - boundary_node.astype(PR.wp_dtype())
 
 
 # --------------------------------------------------------------------------
@@ -91,11 +93,14 @@ def strain_rates(mesh: Mesh, u_ice, v_ice):
     return eps11, eps22, eps12
 
 
-def stress_div_scatter(mesh: Mesh, s11, s12, s22, act):
+def stress_div_scatter(mesh: Mesh, s11, s12, s22, act, node_sum=None):
     """Element→node scatter of the σ divergence — the RAW scatter (``fesom_ice_evp.c:159-166``
     / ``fesom_ice_maevp.c:265-272``), BEFORE the per-module ``·mass/inv_areamass + tilt`` tail.
     ``act`` (per-element bool) zeroes ice-free element contributions (the C ``continue``):
-    EVP passes ``ice_strength>0``, mEVP passes ``ice_el``. Returns ``(u_rhs, v_rhs)``."""
+    EVP passes ``ice_strength>0``, mEVP passes ``ice_el``. Returns ``(u_rhs, v_rhs)``.
+    ``node_sum`` (``None`` ⇒ ``ops.scatter_add``) replaces the scatter by a sum of the
+    ``[elem, vertex]`` terms in a given per-node order (the mEVP wide halo,
+    :meth:`fesom_jax.ice_wide.MevpWide.node_sum`)."""
     gs = mesh.gradient_sca
     mfac = mesh.metric_factor
     en = mesh.elem_nodes
@@ -110,8 +115,10 @@ def stress_div_scatter(mesh: Mesh, s11, s12, s22, act):
     cv = jnp.stack(
         [-a * (sx12 * gs[:, k] + sx22 * gs[:, k + 3] - sx11 * val3 * mfac) for k in range(3)],
         axis=1)
-    u_rhs = ops.scatter_add(cu, en, mesh.nod2D)
-    v_rhs = ops.scatter_add(cv, en, mesh.nod2D)
+    if node_sum is not None:
+        return node_sum(cu), node_sum(cv)
+    u_rhs = ops.scatter_add(cu, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
+    v_rhs = ops.scatter_add(cv, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
     return u_rhs, v_rhs
 
 
@@ -158,8 +165,8 @@ def evp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation) -> EV
     edy = gs[:, 3] * e_v[:, 0] + gs[:, 4] * e_v[:, 1] + gs[:, 5] * e_v[:, 2]
     cu = jnp.where(has_ice, -aa * edx, 0.0)[:, None] * jnp.ones((1, 3))   # [elem,3] (same/vertex)
     cv = jnp.where(has_ice, -aa * edy, 0.0)[:, None] * jnp.ones((1, 3))
-    tilt_u = ops.scatter_add(cu, en, nod2D) / jnp.where(area_n > 0, area_n, 1.0)  # ÷area (:348)
-    tilt_v = ops.scatter_add(cv, en, nod2D) / jnp.where(area_n > 0, area_n, 1.0)
+    tilt_u = ops.scatter_add(cu, en, nod2D, inv=getattr(mesh, "inv_elem_nodes", None)) / jnp.where(area_n > 0, area_n, 1.0)  # ÷area (:348)
+    tilt_v = ops.scatter_add(cv, en, nod2D, inv=getattr(mesh, "inv_elem_nodes", None)) / jnp.where(area_n > 0, area_n, 1.0)
     return EVPStatic(inv_areamass=inv_areamass, inv_mass=inv_mass, ice_strength=strength,
                      tilt_u=tilt_u, tilt_v=tilt_v)
 
@@ -238,7 +245,7 @@ def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
                  a_ice, m_ice, m_snow,
                  u_ice, v_ice, sigma11, sigma12, sigma22,
                  srfoce_u, srfoce_v, elevation, stress_ax, stress_ay,
-                 boundary_node=None, exch=None):
+                 boundary_node=None, exch=None, wide=None):
     """Run the EVP momentum solver (setup + 120 subcycles). Returns the updated
     ``(u_ice, v_ice, sigma11, sigma12, sigma22)``. ``stress_ax/ay`` = the atm-ice wind stress
     (``forcing.atm_ice_stress``); ``elevation`` = ``srfoce_ssh`` (``hbar``).
@@ -252,7 +259,14 @@ def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
     error propagates into owned nodes over 120 subcycles (``fesom_ice_evp.c:446``,
     ``SYNC_MAP`` M4.3b). ``boundary_node`` MUST be the GLOBAL coastal mask (partitioned in),
     NOT the local-mesh recompute: a partition-boundary edge has ``edge_tri[:,1]==-1`` locally
-    and would mis-flag an interior node as coastal (the C uses ``partit->myList_edge2D``)."""
+    and would mis-flag an interior node as coastal (the C uses ``partit->myList_edge2D``).
+
+    ``wide`` exists for the dispatch's signature parity with
+    :func:`fesom_jax.ice_mevp.mevp_dynamics` only: the mEVP wide halo has no standard-EVP
+    counterpart, so anything but ``None`` is refused."""
+    if wide is not None:
+        raise ValueError("the wide halo (wide=) is an mEVP option; the standard EVP "
+                         "(whichEVP=0) has no wide path")
     if boundary_node is None:
         boundary_node = boundary_node_mask(mesh)
     st = evp_setup(cfg, mesh, a_ice, m_ice, m_snow, elevation)

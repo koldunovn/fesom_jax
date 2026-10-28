@@ -38,7 +38,9 @@ import os
 import jax
 import jax.numpy as jnp
 
+from . import precision as PR
 from . import ops
+from .halo import exchange_pair
 from .config import DT_DEFAULT, R_EARTH
 from .mesh import Mesh
 
@@ -136,9 +138,21 @@ def flux2dtracer(mesh: Mesh, flux_h, flux_v, *, dt: float = DT_DEFAULT):
     lm = mesh.node_layer_mask
     dttf_v = jnp.where(lm, (flux_v - _shift_up(flux_v)) * dt / safe, 0.0)
     vals = jnp.stack([flux_h, -flux_h], axis=1)          # (edge, 2, nl)
-    raw = ops.scatter_add(vals, mesh.edges, mesh.nod2D)  # (nod2D, nl)
+    raw = ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)  # (nod2D, nl)
     dttf_h = jnp.where(lm, raw * dt / safe, 0.0)
     return dttf_h + dttf_v
+
+
+def ale_reconstruct_carry(mesh: Mesh, T, del_ttf, hnode, hnode_new, carry):
+    """Single-precision ALE reconstruction with the rounding carry (FESOM2 #1206, ``oce_ale_tracer.F90:864-869``):
+    ``acc = T·hnode + del_ttf + carry`` (float64), ``T' = f32(acc/hnode_new)``, ``carry = f32(acc − T'·hnode_new)``
+    on valid layers; elsewhere T and the carry are unchanged. Returns ``(T', carry)``."""
+    safe_hn = jnp.where(hnode_new > 0.0, hnode_new, 1.0)
+    upd = mesh.node_layer_mask & (hnode_new > 0.0)
+    acc = PR.full(T) * hnode + del_ttf + PR.full(carry)
+    Tn = PR.wp(acc / safe_hn)
+    cn = PR.wp(acc - PR.full(Tn) * hnode_new)
+    return jnp.where(upd, Tn, T), jnp.where(upd, cn, carry)
 
 
 def ale_reconstruct(mesh: Mesh, T, del_ttf, hnode, hnode_new):
@@ -298,13 +312,28 @@ def adv_flux_ver_ho(mesh: Mesh, w_e, ttf, Z3d=None, zbar3=None):
 
 
 def compute_fct_lo(mesh: Mesh, flux_h, flux_v, T, hnode, hnode_new,
-                   *, dt: float = DT_DEFAULT):
+                   *, dt: float = DT_DEFAULT, return_tend: bool = False):
     """The low-order (upwind) ALE solution advanced one step
     (``fesom_tracer_compute_fct_LO``, ``fesom_tracer_adv.c:109``):
     ``LO = (T·hnode + (div_h + (f_top−f_bot))·dt/areasvol) / hnode_new``.
-    The LO fluxes are the upwind fluxes evaluated on **values** (T)."""
+    The LO fluxes are the upwind fluxes evaluated on **values** (T).
+
+    ``return_tend`` (single precision, FESOM2 #1054/#1056): also return the low-order tendency in flux form
+    ``fct_LO_tend = (Σ_edges f64(flux_h) + f64(flux_v[nz]) − flux_v[nz+1])·dt/areasvol`` (float64), with
+    ``LO = f32((T·hnode + fct_LO_tend)/hnode_new)`` (``oce_adv_tra_driver.F90:124, 219``)."""
+    if return_tend:
+        vals = PR.full(jnp.stack([flux_h, -flux_h], axis=1))
+        div_h = ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)
+        div_v = PR.full(flux_v) - PR.full(_shift_up(flux_v))
+        areasvol = mesh.areasvol
+        safe_a = jnp.where(areasvol > 0.0, areasvol, 1.0)
+        safe_hn = jnp.where(hnode_new > 0.0, hnode_new, 1.0)
+        valid = mesh.node_layer_mask & (hnode_new > 0.0) & (areasvol > 0.0)
+        tend = jnp.where(valid, (div_h + div_v) * dt / PR.full(safe_a), 0.0)
+        lo = PR.wp((PR.full(T) * hnode + tend) / safe_hn)
+        return jnp.where(valid, lo, 0.0), tend
     vals = jnp.stack([flux_h, -flux_h], axis=1)          # (edge, 2, nl)
-    div_h = ops.scatter_add(vals, mesh.edges, mesh.nod2D)
+    div_h = ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)
     div_v = flux_v - _shift_up(flux_v)
     areasvol = mesh.areasvol
     safe_a = jnp.where(areasvol > 0.0, areasvol, 1.0)
@@ -338,8 +367,8 @@ def _node_avg_grad(mesh: Mesh, tr_xy):
     e3 = (mesh.elem2D, 3)
     cb = jnp.broadcast_to(contrib[:, None], e3 + tr_xy.shape[1:])
     wb = jnp.broadcast_to(aw[:, None], e3 + (mesh.nl,))
-    num = ops.scatter_add(cb, en, mesh.nod2D)            # (nod, nl, 2)
-    den = ops.scatter_add(wb, en, mesh.nod2D)            # (nod, nl)
+    num = ops.scatter_add(cb, en, mesh.nod2D, inv=mesh.inv_elem_nodes)            # (nod, nl, 2)
+    den = ops.scatter_add(wb, en, mesh.nod2D, inv=mesh.inv_elem_nodes)            # (nod, nl)
     return num / jnp.where(den > 0.0, den, 1.0)[:, :, None]
 
 
@@ -375,12 +404,15 @@ def fill_up_dn_grad(mesh: Mesh, tr_xy):
 # forward is untouched, so results are bit-identical; only the gradient changes, and it
 # becomes a BIASED gradient that ignores how the limiter itself responds to the state.
 # Off by default. Enable per-process with FESOM_FCT_STOPGRAD_AE=1 (an env switch rather
-# than a config field so it cannot silently change a production run's gradients).
+# than a config field so it cannot silently change a production run's gradients). The same
+# operation per config is AdjointConfig.freeze_fct_limiter (zalesak_limit's freeze_factors),
+# which describe() records; prefer it. Measured on the sea-ice drift gradient (PORTING_LESSONS
+# I17e): the factors' derivative is what amplified a burst on near-tied deep cells.
 FCT_STOP_GRADIENT_AE = os.environ.get("FESOM_FCT_STOPGRAD_AE", "0") == "1"
 
 
 def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
-                  dt: float = DT_DEFAULT, exch=None):
+                  dt: float = DT_DEFAULT, exch=None, freeze_factors: bool = False):
     """Zalesak flux limiter (``oce_tra_adv_fct``, ``fesom_tracer_adv.c:851``).
     Limits the antidiffusive fluxes ``adf_h``/``adf_v`` so ``T_new = LO + limited``
     introduces no new local extrema. Returns ``(adf_h_lim, adf_v_lim)``.
@@ -389,11 +421,19 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     ``jnp`` VJP); the ``flux_eps`` floor keeps every ratio finite so the backward
     pass is NaN-free. See ``docs/LIMITER_GRADIENTS.md``.
 
-    ``exch`` (Phase 8, S.7): the node antidiffusive sums ``fct_plus``/``fct_minus`` are
-    edge→node scatters, so the **halo** sums are incomplete until refreshed; the C
-    exchanges them before the per-node limiter ratios (``oce_adv_tra_fct.F90:401``).
-    ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``."""
-    _exch = exch if exch is not None else (lambda f, kind: f)
+    ``exch`` (Phase 8, S.7): the halo nodes take their owners' limiter FACTORS. FESOM2 computes the
+    factors on the owned nodes and then exchanges them (``oce_adv_tra_fct.F90:376-401``, "fct_minus
+    and fct_plus must be known to neighbouring PE", after b2). A halo node's own factor would be
+    wrong: its cluster max/min (a3) sees only the cells on this device, so the edges between owned
+    and halo nodes were limited with a wrong bound (until 2026-10-21 the port exchanged the SUMS
+    before b2 instead: T off the single-device step by ~1e-5 relative at the partition seams after
+    one step, pi dist_4). The owned sums are complete without an exchange (every edge of an owned
+    node is on the device). ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``.
+
+    ``freeze_factors`` (``AdjointConfig.freeze_fct_limiter``; or the process-wide
+    :data:`FCT_STOP_GRADIENT_AE`): the factors ``ae`` are constants in the backward. The
+    forward is unchanged."""
+    freeze = FCT_STOP_GRADIENT_AE or freeze_factors
     nl = mesh.nl
     nlm = mesh.node_layer_mask
 
@@ -442,12 +482,8 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     neg_v = jnp.where(nlm, neg_v, 0.0)
     ph = jnp.stack([jnp.maximum(adf_h, 0.0), jnp.maximum(-adf_h, 0.0)], axis=1)
     nh = jnp.stack([jnp.minimum(adf_h, 0.0), jnp.minimum(-adf_h, 0.0)], axis=1)
-    fct_plus = pos_v + ops.scatter_add(ph, mesh.edges, mesh.nod2D)
-    fct_minus = neg_v + ops.scatter_add(nh, mesh.edges, mesh.nod2D)
-
-    # S.7 intra-kernel exchange: refresh halo fct_plus/fct_minus before the limiter.
-    fct_plus = _exch(fct_plus, "nod")
-    fct_minus = _exch(fct_minus, "nod")
+    fct_plus = pos_v + ops.scatter_add(ph, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)
+    fct_minus = neg_v + ops.scatter_add(nh, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)
 
     # b2: per-node limiter factors in [0, 1]
     a = mesh.areasvol
@@ -460,6 +496,8 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     valid = nlm & (a > 0.0) & (hnode_new > 0.0)
     plus_fac = jnp.where(valid, plus_fac, 1.0)
     minus_fac = jnp.where(valid, minus_fac, 1.0)
+    # the halo nodes' factors are their owners' (oce_adv_tra_fct.F90:399-401), one exchange for the pair
+    plus_fac, minus_fac = exchange_pair(exch, plus_fac, minus_fac, "nod")
 
     # b3: apply limits — vertical (surface vs interior), then horizontal
     ae_surf = jnp.where(adf_v >= 0.0, plus_fac, minus_fac)
@@ -467,7 +505,7 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
                        jnp.minimum(_shift_down(minus_fac), plus_fac),
                        jnp.minimum(_shift_down(plus_fac), minus_fac))
     ae_v = jnp.where(k == nzmin, ae_surf, ae_int)
-    if FCT_STOP_GRADIENT_AE:
+    if freeze:
         ae_v = jax.lax.stop_gradient(ae_v)
     adf_v_lim = ops.mask_below_bottom(ae_v * adf_v, mesh.node_iface_mask)
 
@@ -475,26 +513,39 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     ae_h = jnp.where(adf_h >= 0.0,
                      jnp.minimum(plus_fac[n1], minus_fac[n2]),
                      jnp.minimum(minus_fac[n1], plus_fac[n2]))
-    if FCT_STOP_GRADIENT_AE:
+    if freeze:
         ae_h = jax.lax.stop_gradient(ae_h)
     adf_h_lim = ae_h * adf_h
     return adf_h_lim, adf_v_lim
 
 
 def flux2dtracer_fct(mesh: Mesh, T, LO, adf_h, adf_v, hnode, hnode_new, *,
-                     dt: float = DT_DEFAULT):
+                     dt: float = DT_DEFAULT, lo_tend=None):
     """Assemble ``del_ttf`` for the FCT path (``flux2dtracer_fct``,
     ``fesom_tracer_adv.c:1141``): the LO transition ``-T·hnode + LO·hnode_new``
     plus the limited antidiffusive divergence (vertical ``(adf_v[nz]−adf_v[nz+1])``
-    + the horizontal edge→node scatter), each ``·dt/areasvol``."""
+    + the horizontal edge→node scatter), each ``·dt/areasvol``.
+
+    ``lo_tend`` (single precision): the float64 flux-form low-order tendency of :func:`compute_fct_lo` replaces the
+    transition ``−T·hnode + LO·hnode_new``, and the antidiffusive divergences are formed from float64 fluxes
+    (``oce_adv_tra_driver.F90:514, 549``); the result is the float64 ``del_ttf``."""
     nlm = mesh.node_layer_mask
+    if lo_tend is not None:
+        a = mesh.areasvol
+        safe_a = PR.full(jnp.where(a > 0.0, a, 1.0))
+        vdiv = jnp.where(a > 0.0, (PR.full(adf_v) - PR.full(_shift_up(adf_v))) * dt / safe_a, 0.0)
+        dttf_v = jnp.where(nlm, lo_tend + vdiv, 0.0)
+        hsc = ops.scatter_add(PR.full(jnp.stack([adf_h, -adf_h], axis=1)), mesh.edges, mesh.nod2D,
+                              inv=mesh.inv_edges)
+        dttf_h = jnp.where(nlm, hsc * dt / safe_a, 0.0)
+        return dttf_h + dttf_v
     a = mesh.areasvol
     safe_a = jnp.where(a > 0.0, a, 1.0)
     lo_trans = -T * hnode + LO * hnode_new
     vdiv = jnp.where(a > 0.0, (adf_v - _shift_up(adf_v)) * dt / safe_a, 0.0)
     dttf_v = jnp.where(nlm, lo_trans + vdiv, 0.0)
     hvals = jnp.stack([adf_h, -adf_h], axis=1)
-    hsc = ops.scatter_add(hvals, mesh.edges, mesh.nod2D)
+    hsc = ops.scatter_add(hvals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)
     dttf_h = jnp.where(nlm, hsc * dt / safe_a, 0.0)
     return dttf_h + dttf_v
 
@@ -546,7 +597,7 @@ def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
 
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
                    *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None, w_i=None,
-                   freeze_limited_flux: bool = False):
+                   freeze_limited_flux: bool = False, freeze_limiter: bool = False, content: bool = False):
     """One tracer's FCT advection + ALE reconstruction
     (``fesom_tracer_advect_one_fct``, ``fesom_tracer_adv.c:1199``). Returns
     ``(T_new, T_old_new)`` with ``T_old_new = T`` (the AB2 ``valuesold`` save).
@@ -560,14 +611,28 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
     ``exch`` (Phase 8, S.7): the Zalesak FCT has two intra-kernel halo exchanges (the C
     ``oce_adv_tra_*.F90``): the low-order field ``LO`` after the LO solve (read at the
     halo by the limiter's per-node cluster max/min), and ``fct_plus/fct_minus`` inside
-    :func:`zalesak_limit`. ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``."""
+    :func:`zalesak_limit`. ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``.
+
+    Backward-only: ``freeze_limited_flux`` (``AdjointConfig.freeze_advection``) drops the
+    whole limited antidiffusive flux; ``freeze_limiter`` (``AdjointConfig.freeze_fct_limiter``)
+    freezes only the limiter factors."""
     _exch = exch if exch is not None else (lambda f, kind: f)
     ttfAB, T_old_new = tracer_ab(T, T_old)
     # 2 — LO upwind fluxes from values
     flux_h_lo = adv_flux_hor(mesh, uv, helem, T)
     flux_v_lo = adv_flux_ver(mesh, w_e, T)
     # 3 — low-order ALE solution (its vertical flux used the EXPLICIT w_e)
-    LO = compute_fct_lo(mesh, flux_h_lo, flux_v_lo, T, hnode, hnode_new, dt=dt)
+    # single precision (``content=True``, the SP path of step.py): the flux-form low-order tendency (#1054/#1056),
+    # the WP hnode_new for the limiter, and the float64 del_ttf returned for the carry reconstruction.
+    lo_tend = None
+    if content:
+        if w_i is not None:
+            raise NotImplementedError("single precision does not support w_split (the w-split implicit column "
+                                      "of #1206 is not ported)")
+        LO, lo_tend = compute_fct_lo(mesh, flux_h_lo, flux_v_lo, T, hnode, hnode_new, dt=dt,
+                                     return_tend=True)
+    else:
+        LO = compute_fct_lo(mesh, flux_h_lo, flux_v_lo, T, hnode, hnode_new, dt=dt)
     # w_split: add back the IMPLICIT w_i vertical advection on the LO solution
     # (oce_adv_tra_driver.F90:173). w_i=None ⇒ skipped ⇒ byte-identical.
     if w_i is not None:
@@ -586,19 +651,23 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
         w_full = w_e + w_i
         adf_v = (adv_flux_ver_ho(mesh, w_full, ttfAB, Z3d=Z3d, zbar3=zbar3)
                  - adv_flux_ver(mesh, w_full, T))
-    # 5 — Zalesak limit (exchanges fct_plus/fct_minus internally)
-    adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, hnode_new, dt=dt, exch=exch)
+    # 5 — Zalesak limit (exchanges the limiter factors internally)
+    adf_h, adf_v = zalesak_limit(mesh, T, LO, adf_h, adf_v, PR.wp(hnode_new), dt=dt, exch=exch,
+                                 freeze_factors=freeze_limiter)
     # Backward-only (AdjointConfig.freeze_advection): drop the whole limited antidiffusive
     # correction from the adjoint, so the backward sees plain monotone upwind advection
     # while the forward keeps full FCT. The NWP incremental-4D-Var practice of running
     # more diffusive numerics in the tangent-linear/adjoint model than in the nonlinear
-    # forward. Distinct from FCT_STOP_GRADIENT_AE, which freezes only the limiter FACTOR
-    # and leaves the antidiffusive flux live -- that deletes the limiter's own stabilizing
-    # negative feedback (as the tracer steepens, ae falls) while keeping the term it damps.
+    # forward. Distinct from freeze_limiter, which freezes only the limiter FACTOR and
+    # leaves the antidiffusive flux live. The factor's derivative was expected to be a
+    # stabilizing feedback (as the tracer steepens, ae falls); on near-tied cells it is the
+    # amplifier instead (PORTING_LESSONS I17e).
     if freeze_limited_flux:
         adf_h = jax.lax.stop_gradient(adf_h)
         adf_v = jax.lax.stop_gradient(adf_v)
     # 6-7 — assemble del_ttf  8 — reconstruct (T_new = LO + limited antidiff)
-    del_ttf = flux2dtracer_fct(mesh, T, LO, adf_h, adf_v, hnode, hnode_new, dt=dt)
+    del_ttf = flux2dtracer_fct(mesh, T, LO, adf_h, adf_v, hnode, hnode_new, dt=dt, lo_tend=lo_tend)
+    if content:
+        return del_ttf, T_old_new
     T_new = ale_reconstruct(mesh, T, del_ttf, hnode, hnode_new)
     return T_new, T_old_new

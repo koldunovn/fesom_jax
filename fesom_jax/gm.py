@@ -33,6 +33,8 @@ from __future__ import annotations
 from typing import NamedTuple, Optional
 
 import jax.numpy as jnp
+
+from . import precision as PR
 from jax import lax
 
 from . import gm_nn as _gm_nn
@@ -122,7 +124,7 @@ def compute_sigma_xy(mesh: Mesh, T, S, sw_alpha, sw_beta, cfg: GMConfig):
         [area * gradTx, area * gradTy, area * gradSx, area * gradSy, one], axis=-1)
     contribs = jnp.where(mesh.elem_layer_mask[..., None], contribs, 0.0)  # (E,nl,5)
     vals = jnp.broadcast_to(contribs[:, None, :, :], (E, 3, nl, 5))
-    acc = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D)             # (N,nl,5)
+    acc = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)             # (N,nl,5)
     tx, ty, sx, sy, vol = (acc[..., k] for k in range(5))
 
     inv_vol = jnp.where(vol > 0.0, 1.0 / jnp.where(vol > 0.0, vol, 1.0), 0.0)
@@ -136,19 +138,27 @@ def compute_sigma_xy(mesh: Mesh, T, S, sw_alpha, sw_beta, cfg: GMConfig):
 # ============================================================================
 # G.2 — compute_neutral_slope (fesom_gm.c:223-310)
 # ============================================================================
-def compute_neutral_slope(mesh: Mesh, sigma_xy, bvfreq, cfg: GMConfig):
+def compute_neutral_slope(mesh: Mesh, sigma_xy, bvfreq, cfg: GMConfig, steep_cut=None):
     """Neutral slopes from ``sigma_xy`` / N², the ODM95 tanh taper ``c1``, and the
     tapered slope. Active config: ``scaling_ODM95=T``, ``LDD97=F`` (c2≡1).
 
     Returns ``(neutral_slope, slope_tapered, fer_tapfac)``:
     ``neutral_slope``/``slope_tapered`` are ``(N, nl-1, 3)`` (comp 0=x, 1=y, 2=|s|);
     ``fer_tapfac`` is ``(N, nl)`` (= c1 at the layer levels). ``fesom_gm.c:223``.
+
+    ``steep_cut`` (S*, derivative only; ``AdjointConfig.gm_slope_cut``): the N² derivative of
+    the slope (and so of the taper) is omitted where the forward ``|s| > S*``.
     """
     nl = mesh.nl
     eps_sq = cfg.slope_eps ** 2
     bv0 = bvfreq[:, : nl - 1]                               # bvfreq[nz]   (N,nl-1)
     bv1 = bvfreq[:, 1:nl]                                   # bvfreq[nz+1]
     denom = jnp.maximum(bv0 + bv1, eps_sq)
+    if steep_cut is not None:
+        from .adjoint_stab import cut_where
+        r0 = 2.0 * cfg.g / cfg.rho_ref / lax.stop_gradient(denom)
+        sg = lax.stop_gradient(sigma_xy[:, : nl - 1, :2]) * r0[..., None]
+        denom = cut_where(denom, sg[..., 0] ** 2 + sg[..., 1] ** 2 > steep_cut ** 2)
     ro_z_inv = 2.0 * cfg.g / cfg.rho_ref / denom
     sx = sigma_xy[:, : nl - 1, 0] * ro_z_inv
     sy = sigma_xy[:, : nl - 1, 1] * ro_z_inv
@@ -330,7 +340,7 @@ def gm_nn_features(mesh: Mesh, slope_tapered, sigma_xy, bvfreq, cfg: GMConfig, Z
     # strain: 0.0 for now — the invariant needs the element velocities, which this block does
     # not receive. The column stays in the layout so weights trained now survive if strain
     # lands at the D2 screen; see gm_nn.column_features.
-    strain = jnp.zeros((N, nl - 1), jnp.float64)
+    strain = jnp.zeros((N, nl - 1), PR.wp_dtype())
 
     # Mask the PHYSICAL fields, not the assembled features: a dry lane holds whatever the
     # masked kernels left there, and while `multiplier` is bounded for any finite input, a NaN
@@ -443,7 +453,7 @@ class GMDiag(NamedTuple):
 
 def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
                    cfg: GMConfig, exch=None, Z3d=None, zbar3=None,
-                   freeze_nn_features: bool = False) -> GMDiag:
+                   freeze_nn_features: bool = False, adj=None) -> GMDiag:
     """Run the full GM/Redi diagnostic chain (G.2-G.4) from the ocean state:
     ``sw_alpha_beta → sigma_xy → neutral_slope → init_redi_gm → fer_solve_gamma →
     fer_gamma2vel``. Returns the fields the bolus advection (G.5) and Redi terms
@@ -482,9 +492,14 @@ def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
     # call hnode_new ≡ st.hnode, so Z3d/zbar3 are live_geometry(st.hnode). None ⇒ static.
     sw_alpha, sw_beta = compute_sw_alpha_beta(mesh, T, S, Z3d=Z3d)
     sigma_xy = compute_sigma_xy(mesh, T, S, sw_alpha, sw_beta, cfg)
-    _, slope_tapered, fer_tapfac = compute_neutral_slope(mesh, sigma_xy, bvfreq, cfg)
-    fer_K, Ki, fer_C, _ = init_redi_gm(mesh, bvfreq, hnode_new, fer_tapfac, params, cfg,
-                                       zbar3=zbar3)
+    # derivative-only cuts of the N² uses (``adj``: an AdjointConfig or None; the named cuts
+    # gm.slope_n2 / gm.cm_n2 / gm.bvp_n2 and the steep-slope cut gm_slope_cut)
+    from .adjoint_stab import dcut
+    _, slope_tapered, fer_tapfac = compute_neutral_slope(
+        mesh, sigma_xy, dcut(adj, "gm.slope_n2", bvfreq), cfg,
+        steep_cut=getattr(adj, "gm_slope_cut", None))
+    fer_K, Ki, fer_C, _ = init_redi_gm(mesh, dcut(adj, "gm.cm_n2", bvfreq), hnode_new,
+                                       fer_tapfac, params, cfg, zbar3=zbar3)
 
     # --- the Arm-A NN seam (NN-GM plan Task 7). ``params.gm_nn is None`` ⇒ a PYTHON-level
     # branch, so the default path has no trace change whatsoever and stays byte-identical to the
@@ -505,8 +520,8 @@ def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
         fer_K = fer_K * m_gm
         Ki = Ki * m_redi
 
-    fer_gamma = fer_solve_gamma(mesh, sigma_xy, bvfreq, fer_K, fer_C, cfg,
-                                zbar3=zbar3, Z3d=Z3d)
+    fer_gamma = fer_solve_gamma(mesh, sigma_xy, dcut(adj, "gm.bvp_n2", bvfreq), fer_K, fer_C,
+                                cfg, zbar3=zbar3, Z3d=Z3d)
     fer_gamma = exch(fer_gamma, "nod")                 # INTRA: gathered at HALO vertices below
     fer_uv = fer_gamma2vel(mesh, fer_gamma, helem)
     fer_uv = exch(fer_uv, "elem")                      # read at HALO elems (compute_w / FCT)

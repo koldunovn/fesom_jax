@@ -118,3 +118,23 @@ The blob probe column stays smooth, so the FD plateau is undamaged by the limite
 (its active set does not flip under the FD perturbation at a generic point). This
 confirms (a) is finite and FD-consistent where smooth on the assembled model — the
 Task-4.1 AD-hard item is retired the same way the CG was.
+
+## Update 2026-10-09: option (c) is now a flag, measured as the cure for one long-window burst
+
+`AdjointConfig.freeze_fct_limiter` is option (c): the limiter factors `ae` are constants in the
+backward, and the forward is unchanged. It existed before only as the process-wide
+`FESOM_FCT_STOPGRAD_AE=1`, which the flag supersedes. The default stays (a).
+
+The measurement that motivates it (docs/PORTING_LESSONS.md I17e):
+* **The burst.** On CORE2, the 30-day sea-ice drift gradient from 2013-03-01 carried a
+  salinity-cotangent burst. It grew ×600 in 12 h on four deep cells in the Bismarck Sea, whose
+  forward values come in pairs tied to 5e-8 and 4e-6 psu.
+* **Why the subgradient grows there.** The subgradient of the a1-a4 selections is a weight-one
+  routing. On a tie, it hands the cotangent back and forth between the twins, and Q/P in b2 does
+  not scale it down.
+* **The cure.** Freezing `ae` alone removes the burst: sustained growth 1.054 → 1.002 per step.
+  The ice gradients move by ≤ 0.05 %.
+
+So the "real signal" that (c) discards is, at round-off ties, a growing mode rather than a
+sensitivity. (a) is still FD-consistent where the limiter is smooth; (c) is the measured choice
+for long windows.

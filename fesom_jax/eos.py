@@ -223,9 +223,9 @@ def smooth_nod3D(mesh: Mesh, arr, n_smooth: int = 1, exch=None):
         area_lev = jnp.where(mesh.elem_iface_mask, jnp.broadcast_to(area, (e, nl)), 0.0)
 
         vals = jnp.broadcast_to(contrib[:, None, :], (e, three, nl))
-        work = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D)    # (nod2D, nl)
+        work = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)    # (nod2D, nl)
         avals = jnp.broadcast_to(area_lev[:, None, :], (e, three, nl))
-        vol = ops.scatter_add(avals, mesh.elem_nodes, mesh.nod2D)    # (nod2D, nl)
+        vol = ops.scatter_add(avals, mesh.elem_nodes, mesh.nod2D, inv=mesh.inv_elem_nodes)    # (nod2D, nl)
 
         denom = 3.0 * vol
         safe = jnp.where(denom > 0.0, denom, 1.0)
@@ -307,6 +307,19 @@ def compute_sw_alpha_beta(mesh: Mesh, T, S, Z3d=None):
     sw_beta = ops.mask_below_bottom(beta, mesh.node_layer_mask)
     sw_alpha = ops.mask_below_bottom(a_over_b * beta, mesh.node_layer_mask)
     return sw_alpha, sw_beta
+
+
+def turner_angle(T, S, sw_alpha, sw_beta):
+    """Turner angle (degrees) at the interfaces, ``[nod2D, nl]``: ``atan2(a + b, a - b)`` with
+    ``a = alpha (T_up - T_dn)`` and ``b = beta (S_up - S_dn)`` across interface ``k`` (layers
+    ``k-1`` and ``k``, :func:`shift_down`; ``alpha``/``beta`` the mean of the two layers), so
+    ``a - b`` has the sign of N^2. Regimes: ``|Tu| < 45`` both components stable,
+    ``45 < Tu < 90`` salt fingering, ``-90 < Tu < -45`` diffusive (cold fresh over warm salty),
+    ``|Tu| > 90`` statically unstable. The surface interface is 0. Diagnostic only: the TKE
+    adjoint's ``tke_pr_tu_cut`` mask reads it as a forward value."""
+    a = 0.5 * (shift_down(sw_alpha) + sw_alpha) * (shift_down(T) - T)
+    b = 0.5 * (shift_down(sw_beta) + sw_beta) * (shift_down(S) - S)
+    return jnp.degrees(jnp.arctan2(a + b, a - b))
 
 
 # --- dbsfc (surface-buoyancy difference) — KPP bldepth input, Phase 6C K.5 --------

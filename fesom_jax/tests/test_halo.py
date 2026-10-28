@@ -428,3 +428,137 @@ def test_coloured_ships_less_than_padded(npes):
         col = sm.exchange_coloured[kind].total
         pad = npes * sm.exchange_ragged[kind].pad_slot
         assert col < pad, f"{kind}: coloured {col} lanes !< padded {pad}"
+
+
+# --------------------------------------------------------------------------
+# FESOM_HALO_BARRIER — an optimization_barrier around HaloCtx.exchange is the identity
+# --------------------------------------------------------------------------
+def _ctx_exchange_fn(sm, kind, jmesh, transport):
+    """``[P, Lmax, *rest]`` → the same field refreshed through :meth:`HaloCtx.exchange` (the
+    step's entry point, where the barrier lives), with the all_gather or the padded maps."""
+    src_dev, src_lane = sm.exchange[kind]
+    rmap = sm.exchange_ragged[kind]
+    fold0 = lambda a: halo._fold(np.asarray(a))[0]     # noqa: E731
+    maps = (fold0(src_dev).astype(jnp.int32), fold0(src_lane).astype(jnp.int32),
+            fold0(rmap.pad_src).astype(jnp.int32), fold0(rmap.pad_valid),
+            fold0(rmap.pad_slotpos).astype(jnp.int32), fold0(rmap.halo_mask))
+    spec = halo.PartitionSpec("p")
+
+    def body(fld, sd, sl, ps, pv, pp, hm):
+        ctx = halo.HaloCtx(
+            exch={kind: (sd, sl)}, axis_name="p", ssh_halo=None, owned_mask=None,
+            exch_ragged={kind: {"pad_src": ps, "pad_valid": pv, "pad_slotpos": pp,
+                                "halo_mask": hm}},
+            use_padded=transport == "padded")
+        return ctx.exchange(fld, kind)
+
+    fn = jax.shard_map(body, mesh=jmesh, in_specs=(spec,) * 7, out_specs=spec)
+
+    def run(field):
+        f, P, Lmax = halo._fold(field)
+        return halo._unfold(fn(f, *maps), P, Lmax)
+    return run
+
+
+@avail
+@pytest.mark.parametrize("transport", ["allgather", "padded"])
+@pytest.mark.parametrize("mode", ["out", "both"])
+def test_halo_barrier_is_identity(transport, mode, monkeypatch):
+    """``FESOM_HALO_BARRIER=out|both`` only fences the exchange off from XLA fusion: the
+    exchanged field and its gradient are bit-identical to the unfenced exchange."""
+    _need(2)
+    sm, Lmax, jmesh, valid, field, rng = _ragged_setup(2, "nod")
+    w = jnp.asarray(rng.standard_normal((2, Lmax, sm.nl)) * valid[:, :, None])
+    results = {}
+    for m in ("0", mode):
+        monkeypatch.setenv("FESOM_HALO_BARRIER", m)
+        run = _ctx_exchange_fn(sm, "nod", jmesh, transport)
+        results[m] = (np.asarray(jax.jit(run)(field)),
+                      np.asarray(jax.jit(jax.grad(lambda f: jnp.sum(w * run(f))))(field)))
+    np.testing.assert_array_equal(results[mode][0], results["0"][0])
+    np.testing.assert_array_equal(results[mode][1], results["0"][1])
+
+
+def test_halo_barrier_mode_rejects_unknown(monkeypatch):
+    monkeypatch.setenv("FESOM_HALO_BARRIER", "yes")
+    with pytest.raises(ValueError, match="FESOM_HALO_BARRIER"):
+        halo.halo_barrier_mode()
+    monkeypatch.delenv("FESOM_HALO_BARRIER")
+    assert halo.halo_barrier_mode() == "off"
+
+
+# --------------------------------------------------------------------------
+# FESOM_HALO_COMPACT — all_gather of only the lanes other devices read
+# --------------------------------------------------------------------------
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_compact_forward_matches_allgather(npes, kind):
+    """The compact exchange gives EVERY lane (interior, halo and pad) exactly the all_gather
+    exchange's value, and ships far fewer lanes than the whole local array."""
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, _ = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    send, read = halo.compact_exchange_maps(src_dev, src_lane)
+    assert send.shape[1] < Lmax // 4, f"compact sends {send.shape[1]} of {Lmax} lanes"
+    ref = np.asarray(halo.run_halo_exchange(field, src_dev, src_lane, jmesh))
+    got = np.asarray(halo.run_halo_exchange_compact(field, send, read, jmesh))
+    np.testing.assert_array_equal(got, ref)
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_compact_grad_matches_allgather(npes, kind):
+    """Its gradient (all_gather → reduce-scatter, gather → scatter-add) matches the all_gather
+    exchange's on the valid lanes."""
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, rng = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    send, read = halo.compact_exchange_maps(src_dev, src_lane)
+    w = jnp.asarray(rng.standard_normal((npes, Lmax, sm.nl)) * valid[:, :, None])
+    g_ref = np.asarray(jax.grad(lambda f: jnp.sum(
+        w * halo.run_halo_exchange(f, src_dev, src_lane, jmesh)))(field))
+    g_cmp = np.asarray(jax.grad(lambda f: jnp.sum(
+        w * halo.run_halo_exchange_compact(f, send, read, jmesh)))(field))
+    vm = valid[:, :, None]
+    dif = np.abs(np.where(vm, g_cmp - g_ref, 0.0)).max()
+    scale = max(np.abs(g_ref).max(), 1e-300)
+    assert dif / scale < 1e-12, \
+        f"compact grad != all_gather grad ({kind}, npes={npes}); rel max|Δ|={dif/scale:.3e}"
+
+
+def test_compact_maps_small_example():
+    """Two devices, three lanes each: device 0 owns lanes 0-1 and has lane 2 as a halo copy of
+    device 1's lane 0; device 1 owns lanes 0-1, its lane 2 is a halo copy of device 0's lane 1."""
+    src_dev = np.array([[0, 0, 1], [1, 1, 0]])
+    src_lane = np.array([[0, 1, 0], [0, 1, 1]])
+    send, read = halo.compact_exchange_maps(src_dev, src_lane)
+    np.testing.assert_array_equal(send, [[1], [0]])
+    # [own 3 lanes ; dev0's sent lane ; dev1's sent lane] -> halo reads 3 + d*1 + 0
+    np.testing.assert_array_equal(read, [[0, 1, 4], [0, 1, 3]])
+
+
+@avail
+@pytest.mark.parametrize("npes", [2, 4])
+@pytest.mark.parametrize("kind", ["nod", "elem", "edge"])
+def test_compact_scatter_receive_matches_allgather(npes, kind):
+    """``FESOM_HALO_COMPACT=2``: the receive scattered into the halo and pad lanes only gives every lane the
+    all_gather exchange's value, and the same gradient."""
+    _need(npes)
+    sm, Lmax, jmesh, valid, field, rng = _ragged_setup(npes, kind)
+    src_dev, src_lane = sm.exchange[kind]
+    send, read = halo.compact_exchange_maps(src_dev, src_lane)
+    upd, src = halo.compact_update_maps(read)
+    fold0 = lambda a: halo._fold(np.asarray(a))[0].astype(jnp.int32)     # noqa: E731
+    spec = halo.PartitionSpec("p")
+    fn = jax.shard_map(lambda f, s_, u, v: halo.halo_exchange_compact_scatter(f, s_, u, v),
+                       mesh=jmesh, in_specs=(spec,) * 4, out_specs=spec)
+    run = lambda f: halo._unfold(fn(halo._fold(f)[0], fold0(send), fold0(upd), fold0(src)), npes, Lmax)  # noqa
+    ref = np.asarray(halo.run_halo_exchange(field, src_dev, src_lane, jmesh))
+    np.testing.assert_array_equal(np.asarray(run(field)), ref)
+    w = jnp.asarray(rng.standard_normal((npes, Lmax, sm.nl)) * valid[:, :, None])
+    g_ref = np.asarray(jax.grad(lambda f: jnp.sum(w * halo.run_halo_exchange(f, src_dev, src_lane, jmesh)))(field))
+    g_new = np.asarray(jax.grad(lambda f: jnp.sum(w * run(f)))(field))
+    vm = valid[:, :, None]
+    assert np.abs(np.where(vm, g_new - g_ref, 0.0)).max() <= 1e-12 * max(np.abs(g_ref).max(), 1e-300)

@@ -89,6 +89,38 @@ def test_model_is_the_reference_configuration(model):
         C.build_model(START, 3, 2)
 
 
+def test_the_driver_builds_and_validates_the_dynamics_mode():
+    """``ice_mode="dynamics"`` with the stage-1 damping merges into the IceConfig via
+    ``_replace`` and is validated at build time; unknown fields and damping under a mode that
+    does not unroll the sweeps are refused; the CLI options map onto ``ice_adjoint``."""
+    assert "dynamics" in C.ICE_MODES
+    m = C.build_model(START, n_steps=1, chunk_steps=1, restart=RESTART, ice_mode="dynamics",
+                      ice_adjoint={"adjoint_damping": "local", "adjoint_kappa": 0.25})
+    ic = m.phys["ice_cfg"]
+    assert (ic.adjoint_mode, ic.adjoint_damping, ic.adjoint_kappa, ic.adjoint_sweeps) == \
+        ("dynamics", "local", 0.25, -1)
+    assert ic.whichEVP == 1 and m.ice_mode == "dynamics"
+    with pytest.raises(ValueError, match="unknown field"):
+        C.build_model(START, 1, 1, RESTART, ice_mode="dynamics", ice_adjoint={"adjoint_tn": 7})
+    with pytest.raises(ValueError, match="does not"):
+        C.build_model(START, 1, 1, RESTART, ice_mode="prescribed",
+                      ice_adjoint={"adjoint_damping": "local"})
+    with pytest.raises(ValueError, match="adjoint_kappa"):
+        C.build_model(START, 1, 1, RESTART, ice_mode="dynamics",
+                      ice_adjoint={"adjoint_damping": "local", "adjoint_kappa": -1.0})
+    args = C._parse(["grad", "--ice", "dynamics", "--ice-damping", "local",
+                     "--ice-kappa", "0.3", "--ice-sweeps", "16"])
+    assert C._ice_adjoint_args(args) == {"adjoint_damping": "local", "adjoint_kappa": 0.3,
+                                         "adjoint_sweeps": 16}
+    assert C._ice_adjoint_args(C._parse(["grad"])) == {}
+    assert C._ice_adjoint_args(C._parse(["grad", "--ice-cuts", "advect+ssh"])) == \
+        {"adjoint_cuts": ("advect", "ssh")}
+    assert C._ice_adjoint_args(C._parse(["grad", "--ice-cuts", "none"])) == {"adjoint_cuts": ()}
+    with pytest.raises(ValueError, match="dynamics"):
+        C.build_model(START, 1, 1, RESTART, ice_mode="prescribed",
+                      ice_adjoint={"adjoint_cuts": ("ssh",)})
+
+
 def test_boxes_and_directions(model):
     for name in C.BOXES:
         node, level = C.box_masks(model.mesh, name)
@@ -213,6 +245,18 @@ def test_resumed_sweep_equals_the_uninterrupted_one(model, grad_row, tmp_path):
     assert _eq_tree(rows[-1]["_result"]["state_cot"], grad_row["_result"]["state_cot"])
     print(f"\n[core2_adj resume] {len(rows)} legs: "
           + ", ".join(f"{r.get('leg_phase', 'done')}@{r.get('leg_chunk', '')}" for r in rows))
+
+
+def test_xs_built_ahead_equal_the_plain_build(model, monkeypatch):
+    """The chunk forcing built ahead on the worker thread (``core2_adj._XsAhead``) is bit for bit the plain build,
+    in the forward order and in the reverse walk's (chunks repeated and taken backwards)."""
+    monkeypatch.setenv("FESOM_FORCING_PREFETCH", "0")
+    plain = model.xs_fn()
+    monkeypatch.delenv("FESOM_FORCING_PREFETCH")
+    ahead = model.xs_fn()
+    assert isinstance(ahead, C._XsAhead) and not isinstance(plain, C._XsAhead)
+    for c in (0, 1, 1, 0, 1):
+        assert _eq_tree(ahead(c), plain(c)), c
 
 
 def test_a_second_window_compiles_nothing(model):
