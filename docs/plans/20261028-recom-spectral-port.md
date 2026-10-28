@@ -229,6 +229,8 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   `FINITE n_nonfinite=0`, 1.28 s/step (the 692f804 configuration: 0.9), monthly output and a restart under
   `fesom_jax_runs/pi_recom_spectral/`. Lane W's run step is done; a CORE2 spectral smoke on one GPU
   (`configs/albedo/core2_recom_spectral.yaml`, 96 steps) submitted next.
+- 2026-10-28 22:29, CORE2 + the spectral fork on one A100: job 48603697, 96 steps, `FINITE`, 2.50 s/step (the 692f804
+  configuration: 2.63), from `configs/albedo/core2_recom_spectral.yaml` through `scripts/albedo/run_core2_gpu.sbatch`.
 
 ## Rules (as the parent REcoM port)
 
