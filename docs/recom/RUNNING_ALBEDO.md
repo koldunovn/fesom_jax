@@ -109,6 +109,7 @@ restarts are as in RUNNING.md ("What comes out"); the monthly zarr stores open w
 | CORE2 + REcoM, double precision (job 48595512) | 1x A100 80 GB PCIe (gpu-004) | 2.63 | 1.9 | ~13 h: split into two 12 h-QOS segments via `--restart-in` |
 | CORE2 + REcoM, `--precision single` (job 48595567) | same | 1.75 | 2.8 | ~8.5 h |
 | pi + REcoM, double precision, CPU (job 48595511) | 32 cores of an mpp node | ~0.9 | — | 30 days in ~15 min |
+| pi + the spectral REcoM fork (37 tracers, 13-band light), CPU (job 48603201) | 32 cores of an mpp node | ~1.28 | — | 30 days in 21 min, `FINITE n_nonfinite=0` |
 
 For comparison, Levante's 4x GH200 do the double-precision CORE2 + REcoM step in 0.060 s (RUNNING.md). A single
 PCIe A100 is the wrong hardware for production hindcasts; it is enough for development, gates and short tests.

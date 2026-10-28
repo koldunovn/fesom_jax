@@ -120,7 +120,7 @@ the fork is first rebased onto the submodule REcoM, a Fortran task outside this 
       interpolated to nodes once on the host (the JRA bilinear machinery of `jra55.py`/`read_other_NetCDF` port),
       held per month in the per-step input tables like the dust (`didx` row), `(1 - a_ice)` shading in the step,
       NaN fill. Run-YAML keys `forcing.oasim_dir`, `forcing.oasim_pattern`.
-- [ ] **Lane W, wiring.** `stage1.py`/`wiring.py`: light before growth, `alpha_I` into the growth terms, the
+- [x] **Lane W, wiring.** `stage1.py`/`wiring.py`: light before growth, `alpha_I` into the growth terms, the
       no-OASIM `surfspec` path, outputs (`edz3d` etc. in the mean streams, `recom.output`), budget terms for CDOM;
       configs `configs/pi_recom_spectral.yaml`, `configs/albedo/core2_recom_spectral.yaml`. Gates G4b/G5 on pi
       against the lane-0 spectral twin (one step, 30 days: inventories, CO2 flux, NPP per PFT); sharded = dense;
@@ -224,6 +224,11 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   spectral config on the packaged pi mesh is finite, 48603144; the 692f804 config on the fork bundle is not,
   48603145): the packaged pi IC has T = S = 0 in the layers the fork's `elvls.out` adds at nodes 0/1/9/10/11.
   `fesom_jax_data/ic_pi_fork` (PHC on the fork bundle) fixes the IC; resubmitted as job 48603201.
+
+- 2026-10-28 22:21, THE SPECTRAL REcoM RUNS IN FESOM-JAX: job 48603201, 30 days of pi on one CPU node, 960 steps,
+  `FINITE n_nonfinite=0`, 1.28 s/step (the 692f804 configuration: 0.9), monthly output and a restart under
+  `fesom_jax_runs/pi_recom_spectral/`. Lane W's run step is done; a CORE2 spectral smoke on one GPU
+  (`configs/albedo/core2_recom_spectral.yaml`, 96 steps) submitted next.
 
 ## Rules (as the parent REcoM port)
 
