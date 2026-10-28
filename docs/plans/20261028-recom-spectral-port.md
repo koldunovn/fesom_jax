@@ -157,6 +157,16 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   (`surface_bc`, `finish`), `wiring.py` (budget shape, output fields, `POC_IDS`) and `ic.py`, replacing the
   `tracers.py` constants (kept as the 692f804 default).
 
+- 2026-10-28 evening, lane 0 debugging: the fork on ONE rank never reaches its first time step: the first forcing
+  read (`getcoeffld`, `next_io_rank`) calls `next_io_rank_helper`, which recurses forever when rank 0 is the only
+  rank (`io_netcdf_workaround_module.F90`, its own `todo` says so). Symptom: 99 % CPU, no I/O, the log ends after
+  the nine `found calendar attr` lines; jobs 48596037 (Debug, 30 min), 48596399 (Release, 2 h), 48602196 all
+  timed out there. Fixed on the dumps branch (d9e613f0: `partit%npes == 1` -> serial I/O on rank 0). Not the
+  build type and not the spectral code. Along the way: `FORT_BUFFERED=false` in the job (unbuffered log),
+  Release builds `install_rel/` and `install_nowb_rel/` (the Debug ones stay for the user's own runs), a `LAUNCH`
+  override in the job script, and the non-spectral twin's namelist set `namelists_albedo_spectral_nowb/` (36
+  tracers: a WAVEBANDS=OFF build has no CDOM, `validate_recom_tracers` stops otherwise; job 48602195).
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.

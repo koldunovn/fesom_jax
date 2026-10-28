@@ -75,7 +75,9 @@ export OMP_NUM_THREADS=1
 export FORT_BUFFERED=false            # unbuffered stdout: progress lines appear in fesom2.0.out as they are written
 ulimit -s unlimited
 date
-srun --mpi=pmi2 "$RD/exe_seg$SEG/bin/fesom.x" > "fesom2.0.out.seg$SEG" 2>&1
+LAUNCH=${LAUNCH-srun --mpi=pmi2}                 # LAUNCH="" runs the binary directly (1-rank singleton, e.g. a diagnostic outside SLURM)
+case "$LAUNCH" in srun*) ;; *) unset I_MPI_PMI I_MPI_PMI_LIBRARY ;; esac   # outside a SLURM step do not look for its PMI2
+$LAUNCH "$RD/exe_seg$SEG/bin/fesom.x" > "fesom2.0.out.seg$SEG" 2>&1
 rc=$?
 date
 tail -5 "fesom2.0.out.seg$SEG"
