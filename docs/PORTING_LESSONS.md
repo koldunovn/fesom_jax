@@ -9986,3 +9986,14 @@ port keys it on the fork flavour. Lessons: (a) gate the cold start against the t
 any step gate: it is one load, and it catches every "the model reads something else" surprise at once; (b) grep the
 host model for every REcoM switch the port lists as "no effect" (`NO_EFFECT`): `DIC_PI` was there because REcoM's
 own sources never read it, but FESOM's setup does.
+
+### 2026-10-28 (branch recom-spectral, lane W) — a cached per-node IC is tied to the level structure it was built on
+
+The first JAX spectral run went non-finite after 960 steps in T, S and velocity, not only in the BGC. The spectral
+code was innocent: the same config on the packaged pi mesh is finite after 32 steps, and the 692f804 config on the
+rebuilt fork bundle is not. The bundle has three polar elements with deeper levels than the repo's (the fork's own
+`elvls.out`), and the packaged `T_ic.npy`/`S_ic.npy` cache has zeros in exactly those layers: three cells of 0 degC,
+0 psu at 500 m. Rules: (a) a cached IC (`fesom_jax/data/ic_pi`, `$FESOM_IC_DIR`) belongs to one `nlevels` per node;
+rebuild it (`phc_ic.build_and_cache_ic`) whenever the bundle's levels change, and check `S[wet] > 0` before a run;
+(b) when a long run ends non-finite everywhere, bisect by configuration pairs with 32-step runs (A on mesh 1, A on
+mesh 2, B on mesh 2) before reading any code: three jobs, ten minutes.

@@ -19,7 +19,7 @@ source scripts/albedo/env.sh
 OUT=/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/pi_recom_spectral
 mkdir -p $OUT
 echo "=== $(hostname) $(date) job $SLURM_JOB_ID ==="
-# --ic-dir: the mesh is the fork's pi bundle (not the packaged pi), so the packaged pi PHC IC must be named
-$PY scripts/run_from_config.py configs/albedo/pi_recom_spectral.yaml --ic-dir fesom_jax/data/ic_pi --progress --diagnostics \
+# --ic-dir: the mesh is the fork's pi bundle (not the packaged pi), so the PHC IC built on that bundle (fesom_jax.phc_ic.build_and_cache_ic -> fesom_jax_data/ic_pi_fork) must be named: the packaged pi IC has zero T/S in the layers its levels lack
+$PY scripts/run_from_config.py configs/albedo/pi_recom_spectral.yaml --ic-dir /albedo/work/projects/p_specbic/sloza/fesom_jax_data/ic_pi_fork --progress --diagnostics \
     --restart-out $OUT/restart --monthly-out $OUT/monthly "$@"
 echo "=== exit $? $(date) ==="

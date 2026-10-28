@@ -219,6 +219,12 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   is never read when `DIC_PI` is on). Config `configs/albedo/pi_recom_spectral.yaml`, job
   `scripts/albedo/run_pi_recom_spectral.sbatch` (first submission: job 48602583, 30 days of pi on one CPU node).
 
+- 2026-10-28 night, the first JAX spectral run: job 48602595 (30 days of pi, 20 min) ended non-finite in the
+  physics too; three 32-step smoke runs isolated it to the mesh bundle + IC pair, not the spectral code (the
+  spectral config on the packaged pi mesh is finite, 48603144; the 692f804 config on the fork bundle is not,
+  48603145): the packaged pi IC has T = S = 0 in the layers the fork's `elvls.out` adds at nodes 0/1/9/10/11.
+  `fesom_jax_data/ic_pi_fork` (PHC on the fork bundle) fixes the IC; resubmitted as job 48603201.
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.

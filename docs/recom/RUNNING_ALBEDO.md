@@ -76,6 +76,12 @@ fork's partition directory (`fesom_jax_data/mesh_pi_fork`, the levels the Fortra
 sbatch scripts/albedo/run_pi_recom_spectral.sbatch
 ```
 
+The job names `--ic-dir fesom_jax_data/ic_pi_fork`, the PHC physics IC built on that bundle
+(`fesom_jax.phc_ic.build_and_cache_ic(load_mesh(.../mesh_pi_fork), None, .../ic_pi_fork)`): the packaged pi IC
+(`fesom_jax/data/ic_pi`) has zero T and S in the three layers the fork's levels add at the polar nodes, and a run
+from it goes non-finite within 32 steps (jobs 48602595, 48603145/46; the same config on the packaged pi mesh is
+finite, job 48603144).
+
 `recom.spectral_co2lim: true` applies the CO2 limitation in the spectral growth (the fork does not; the user's
 decision of 2026-10-28). `recom.spectral: false` with the same namelist (`bgc_num 36`, no CDOM:
 `namelists_albedo_spectral_nowb/`) is the fork's broadband build. The gates behind this run are the
