@@ -219,3 +219,4 @@ sharding fesom_jax/tests/test_recom_sp.py
 unit fesom_jax/tests/test_recom_stage3.py
 sharding fesom_jax/tests/test_recom_step.py
 unit fesom_jax/tests/test_recom_layout.py
+unit fesom_jax/tests/test_recom_sms_fork.py

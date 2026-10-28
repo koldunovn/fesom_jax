@@ -99,3 +99,39 @@ def recom_sources_sinks(bgc, carb: CarbCache, benthos, alk_surf, temp, salt, geo
                                                             relax_alk.shape),
         GlodecayBenthos=r.decay_benthos / SECONDS_PER_DAY)
     return Stage1Result(bgc=r.state, carb=r.carb, sfc=sfc, benthos=r.benthos, sms=r)
+
+
+def recom_sources_sinks_fork(bgc, carb: CarbCache, benthos, alk_surf, temp, salt, geom: RecomGeometry,
+                             inputs: BgcStepInputs, dt_bgc, params: RecomParams, switches, layout, *,
+                             reduce_sum: Callable = jnp.sum, n_iter: int = cb.PH_MAXITER, nc_clamp: bool = False):
+    """:func:`recom_sources_sinks` for the spectral fork's REcoM (:mod:`fesom_jax.recom.sms_fork`, lane E of
+    ``docs/plans/20261028-recom-spectral-port.md``): the same ``recom()`` order, the fork's ``REcoM_sms`` with the
+    switches and the tracer :class:`~fesom_jax.recom.layout.Layout` (static), no DICremin reset unless the layout
+    has that tracer. The base-22 slots the surface fluxes read are the same in every layout."""
+    from .sms_fork import recom_sms_fork
+    p = params
+    f64 = jnp.float64
+    bgc, benthos, alk_surf, temp, salt = (jnp.asarray(a, f64) for a in (bgc, benthos, alk_surf, temp, salt))
+    lat_deg = geom.lat_rad / (jnp.pi / 180.0)
+    relax_alk = bio_fluxes(bgc[:, 0, ialk], alk_surf, geom.area_top, geom.ocean_area, p.surf_relax_Alk,
+                           reduce_sum=reduce_sum)
+    if layout.dicremin:
+        bgc = bgc.at[:, 0, layout.idicremin].set(0.0)
+    gas = surface_gas_exchange(bgc[:, 0, :], temp[:, 0], salt[:, 0], inputs.u_wind, inputs.v_wind,
+                               inputs.a_ice, inputs.press_air, inputs.co2_atm, lat_deg, n_iter=n_iter)
+    surf_sr = surface_shortwave(inputs.shortwave, inputs.a_ice, p)
+    cos_ai = cobeta(inputs.daynew, inputs.ndpyr, geom.lat_rad)
+    dt_b = dt_bgc / SECONDS_PER_DAY / 1.0
+    r = recom_sms_fork(bgc, temp, salt, carb, geom.hnode, geom.zbar, geom.nlev, surf_sr, cos_ai, lat_deg,
+                       geom.lat_rad, inputs.press_air, benthos, inputs.mstep, inputs.daynew, dt_b, p, switches,
+                       layout, nc_clamp=nc_clamp, n_iter=n_iter)
+    fe_in, n_in = deposition(inputs.fe_dust, inputs.n_dust, inputs.a_ice, p)
+    sfc = SurfaceFluxes(
+        GloCO2flux_seaicemask=gas["GloCO2flux_seaicemask"], GloO2flux_seaicemask=gas["GloO2flux_seaicemask"],
+        AtmFeInput=fe_in, AtmNInput=n_in, relax_alk=relax_alk,
+        GloCO2flux=gas["GloCO2flux"], GloO2flux=gas["GloO2flux"], GloPCO2surf=gas["GloPCO2surf"],
+        GlodPCO2surf=gas["GlodPCO2surf"], GloHplus=gas["GloHplus"], PistonVelocity=gas["PistonVelocity"],
+        alphaCO2=gas["alphaCO2"], x_co2atm=jnp.broadcast_to(jnp.asarray(inputs.co2_atm, jnp.float64),
+                                                            relax_alk.shape),
+        GlodecayBenthos=r.decay_benthos / SECONDS_PER_DAY)
+    return Stage1Result(bgc=r.state, carb=r.carb, sfc=sfc, benthos=r.benthos, sms=r)

@@ -171,8 +171,21 @@ def layout_for(*, enable_3zoo2det: bool, enable_coccos: bool, cdom: bool = False
 def layout_of(switches) -> Layout:
     """The layout of a :class:`fesom_jax.recom.params.RecomSwitches` (``spectral_fork`` selects the flavour)."""
     fork = bool(getattr(switches, "spectral_fork", False))
-    return layout_for(enable_3zoo2det=switches.enable_3zoo2det, enable_coccos=switches.enable_coccos,
-                      cdom=fork and bool(getattr(switches, "RECOM_CDOM", False)), dicremin=not fork)
+    if not fork:
+        return layout_for(enable_3zoo2det=switches.enable_3zoo2det, enable_coccos=switches.enable_coccos,
+                          dicremin=True)
+    # the fork: RECOM_CDOM adds the CDOM tracer in a spectral build only; a non-spectral build of the same
+    # namelist (the broadband twin) has none, and bgc_num says which build the namelist is for
+    kw = dict(enable_3zoo2det=switches.enable_3zoo2det, enable_coccos=switches.enable_coccos)
+    with_cdom = layout_for(cdom=True, **kw)
+    without = layout_for(cdom=False, **kw)
+    n = int(switches.bgc_num)
+    if bool(getattr(switches, "RECOM_CDOM", False)) and n == with_cdom.ntr:
+        return with_cdom
+    if n == without.ntr:
+        return without
+    raise ValueError(f"bgc_num {n} fits neither the fork layout with CDOM ({with_cdom.ntr}) nor without "
+                     f"({without.ntr}) for enable_3zoo2det={kw['enable_3zoo2det']} enable_coccos={kw['enable_coccos']}")
 
 
 # REcoM 692f804 bin_2p3z2d: the layout every existing program and test uses.
