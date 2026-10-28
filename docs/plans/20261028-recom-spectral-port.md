@@ -131,6 +131,32 @@ Rough size: lanes P+E are of the order of the original `recom-lane-sources` work
 lines); lane L is ~2200 Fortran lines but structurally simple (columns x bands); lane 0 is a Fortran build and
 dump exercise. Expect several sessions per lane; do not start lane E or L without lane 0's dumps.
 
+## Progress log
+
+- 2026-10-28, lane 0 setup: fork branch `fesom2.6_recom_tra_diags_spectral_recom692` = e1e62886 + the 11 upstream
+  REcoM commits (cherry-picked; conflicts were the fork's `use REcoM_spectral` lines, its phaeo-ID keying and
+  Fe-dependent Phaeocystis sinking, all resolved for the fork; the ballasting fix's detritus-only guard landed).
+  Branch `..._recom692_dumps` on top: the fesom-jax dump hooks placed by hand (the patches assume FESOM2 e96a2b13;
+  hunks applied with fuzz landed in wrong places), `recom_out` extended with the per-PFT diagnostics and the
+  spectral planes `Edz3D..Estop3D`, `Ed0/Es0/Eu0_2D`, `oasim_ed2D/es2D`; `fesom_ini` accepts `n_part=1`
+  (`fvom_init.F90`: a trivial partition, METIS skipped). Builds: `build/` (spectral ON) -> `bin/fesom.x`;
+  `build_nowb/` (OFF) -> `install_nowb/bin/fesom.x`. Both are `CMAKE_BUILD_TYPE=Debug` as the user's runs.
+  Worktree `/albedo/work/user/sloza/SPECTRAL/recom_spectral_r692`.
+- pi inputs: `fesom_jax_data/recom_pi/` (upstream FESOM2's committed `test/input/recom`), `mesh_pi_part/` (the
+  fork's `test/meshes/pi` + `dist_1`), `recom_pi/optics/` (the five `.dat` tables of `tmp_run_kdind15`). The
+  fork's pi mesh equals the packaged pi to round-off (coordinates 9e-16 rad; `fesom_jax_data/mesh_pi_fork` is its
+  prepared bundle, to be used by the JAX twin runs).
+- Namelist set `scripts/recom/fortran/namelists_albedo_spectral/` = `tmp_run_kdind15` with the pi inputs, JRA55-do
+  1958 (+psl), no partial cells, leap years, `opt_visc 7` (the one physics change: fesom-jax has no opt_visc 5),
+  everything else the user's (KPP, EVP, GM 2000/bvref 2/order 1). The fork (FESOM 2.6) lacks the GM/ice/forcing
+  keys of the JAX-physics set, so the physics floor of the connected gates will be measured by a physics-only
+  pair, not matched by namelist. Job `scripts/albedo/run_pi_recom_fork.sbatch` (1 rank, `mpp`).
+- Lane P done (commit 41013f0): `fesom_jax/recom/layout.py`, the fork keys in `params.py`, `RecomConfig.layout`.
+  Finding: the fork has NO DICremin; its ID 1037 is CDOM (692f804's 1037 is DICremin), and its 2p3z2d is 30
+  tracers (+1 CDOM = 1031). Lane E must thread `Layout` through `sms.py`, `sinking.py`, `transport.py`
+  (`surface_bc`, `finish`), `wiring.py` (budget shape, output fields, `POC_IDS`) and `ic.py`, replacing the
+  `tracers.py` constants (kept as the 692f804 default).
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.
