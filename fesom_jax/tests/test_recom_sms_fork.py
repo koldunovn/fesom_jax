@@ -24,15 +24,20 @@ jax.config.update("jax_enable_x64", True)
 from fesom_jax.io_dump import load_recom_dump                                      # noqa: E402
 from fesom_jax.recom import layout as LY                                           # noqa: E402
 from fesom_jax.recom import params as P                                            # noqa: E402
+from fesom_jax.recom import spectral as SP                                         # noqa: E402
+from fesom_jax.recom.forcing import cobeta                                         # noqa: E402
 from fesom_jax.recom.sms import CARB_FIELDS, CarbCache                             # noqa: E402
 from fesom_jax.recom.sms_fork import DIAG2D_BASE, DIAG2D_COCCO, DIAG3D_BASE, DIAG3D_COCCO   # noqa: E402
 from fesom_jax.recom.stage1 import BgcStepInputs, RecomGeometry, recom_sources_sinks_fork  # noqa: E402
 
 REF = Path(os.environ.get("FESOM_RECOM_FORK_REF", "/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/recom_ref"))
 REPO = Path(__file__).resolve().parents[2]
-NML = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb" / "namelist.recom"
 RUN = os.environ.get("FESOM_RECOM_FORK_RUN", "pi_30d_nowb_adv01")
+SPECTRAL = "spectral" in RUN                      # the spectral twin: 37 tracers (CDOM), the spectral light
+NML = REPO / "scripts" / "recom" / "fortran" / ("namelists_albedo_spectral" if SPECTRAL else
+                                                "namelists_albedo_spectral_nowb") / "namelist.recom"
 STEPS = (1, 2, 3, 17, 224, 960)
+OPTICS = Path(os.environ.get("FESOM_RECOM_OPTICS_DIR", "/albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi/optics"))
 TOL = 1e-11
 LOOSE: dict = {}
 
@@ -44,12 +49,18 @@ pytestmark = pytest.mark.skipif(not (REF / RUN / "dumps").is_dir(),
 def _setup():
     sw, par = P.load_namelist(NML, check=False)
     lay = LY.layout_of(sw)
+    tab = SP.load_tables(sw, par, OPTICS) if SPECTRAL else None
 
     @jax.jit
-    def run(bgc, carb, benthos, alk_surf, temp, salt, geom, inputs, params):
+    def run(bgc, carb, benthos, alk_surf, temp, salt, geom, inputs, params, spectral):
+        # the spectral build: the N:C clamp, the fork's own (no) CO2 limitation in the spectral growth
         return recom_sources_sinks_fork(bgc, carb, benthos, alk_surf, temp, salt, geom, inputs, 2700.0, params,
-                                        sw, lay)
-    return run, par, sw, lay
+                                        sw, lay, nc_clamp=SPECTRAL, spectral=spectral, spectral_co2lim=False)
+
+    @jax.jit
+    def light(bgc, hnode, cos_ai, Edsf, Essf, params):
+        return SP.spectral_step(bgc, hnode, cos_ai, Edsf, Essf, tab, params, sw, lay).light
+    return run, par, sw, lay, (light if SPECTRAL else None)
 
 
 def _inputs(f, lay):
@@ -80,12 +91,19 @@ def _err(a, b, mask):
 
 
 def gate_errors(step) -> dict:
-    run, par, sw, lay = _setup()
+    run, par, sw, lay, light = _setup()
     f, meta = load_recom_dump(REF / RUN / "dumps", step)
     x, out_tr = _inputs(f, lay)
     assert x["dt"] == 2700.0
+    spec = None
+    if SPECTRAL:          # the light of this step from recom_in and the OASIM fields the step read (lane L's gate)
+        _, tab = _setup()[2], SP.load_tables(sw, par, OPTICS)
+        cos_ai = cobeta(x["inputs"].daynew, x["inputs"].ndpyr, x["geom"].lat_rad)
+        Edsf, Essf = SP.surface_irradiance(np.asarray(f["recom_out.oasim_ed2D"]).T,
+                                           np.asarray(f["recom_out.oasim_es2D"]).T, x["inputs"].a_ice, None, tab, sw)
+        spec = light(x["bgc"], x["geom"].hnode, cos_ai, Edsf, Essf, par)
     r = jax.device_get(run(x["bgc"], x["carb"], x["benthos"], x["alk_surf"], x["temp"], x["salt"], x["geom"],
-                           x["inputs"], par))
+                           x["inputs"], par, spec))
     nl1 = x["bgc"].shape[1]
     wet = np.arange(nl1)[None, :] < x["geom"].nlev[:, None]
     allnodes = np.ones(wet.shape[0], bool)
@@ -95,7 +113,8 @@ def gate_errors(step) -> dict:
     d3 = DIAG3D_BASE + (DIAG3D_COCCO if sw.enable_coccos else ())
     d2 = DIAG2D_BASE + (DIAG2D_COCCO if sw.enable_coccos else ())
     for n in d3:
-        key = {"TqLF_phyto": "TqlimitFac_phyto"}.get(n, n)
+        if SPECTRAL and n.startswith("TCphotLigLim"):      # unset by the fork in a spectral build
+            continue
         if f"recom_out.{n}" in f:
             e[n] = _err(r.sms.diag3d[n], f[f"recom_out.{n}"], wet)
     for n in d2:

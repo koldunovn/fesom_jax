@@ -575,17 +575,30 @@ class Ballast(NamedTuple):
     scaling_density2: jax.Array   # (nod2D, nl)
 
 
-def ballast(rho_particle1, rho_particle2, rho_seawater, visc, nlev, params: RecomParams) -> Ballast:
+def ballast(rho_particle1, rho_particle2, rho_seawater, visc, nlev, params: RecomParams,
+            layout: Layout = DEFAULT_LAYOUT) -> Ballast:
     """The scaling factors of the ballasted sinking speed, ``recom_sinking.F90:928-1043``
     (``use_density_scaling``, ``use_viscosity_scaling``, ``enable_3zoo2det`` all on): density
     ``(rho_particle - rho_seawater)/(rho_ref_part - rho_ref_water)`` (no positivity guard), viscosity
-    ``visc_ref_water/visc`` (1 where ``visc = 0``); on the wet layers and copied to the bottom interface."""
+    ``visc_ref_water/visc`` (1 where ``visc = 0``); on the wet layers and copied to the bottom interface.
+
+    The fork flavour (``layout.dicremin`` False) adds REcoM's whole-array reset (fork K:858-861, upstream d5f9f8ac
+    2024-05-30): ``if (any(scaling_density1_3D <= tiny)) scaling_density1_3D = 1`` (and ``..2`` with 3zoo2det), an
+    ``any`` over the rank's array, i.e. one layer with particles lighter than the in-situ seawater (``rho_POC = 1033``
+    against ``rho > 1033`` at depth) switches the density scaling off everywhere on that rank for that tracer's
+    call (the broadband twin: step 224, day 7). Here: any over this device's wet layers (the pad lanes are dry).
+    REcoM 692f804 carries the same lines; its port predates this finding and its programs stay as gated, so the
+    reset is keyed on the fork layout (``docs/PORTING_LESSONS.md`` 2026-10-28)."""
     p = params
     k = jnp.arange(visc.shape[1])[None, :]
     wet = k < jnp.asarray(nlev)[:, None]
     sd1 = (rho_particle1 - rho_seawater) / (p.rho_ref_part - p.rho_ref_water)
     sd2 = (rho_particle2 - rho_seawater) / (p.rho_ref_part - p.rho_ref_water)
     sv = jnp.where(visc != 0.0, p.visc_ref_water / jnp.where(visc != 0.0, visc, 1.0), 1.0)
+    if not layout.dicremin:
+        sd1 = jnp.where(jnp.any(wet & (sd1 <= TINY)), 1.0, sd1)
+        if layout.enable_3zoo2det:
+            sd2 = jnp.where(jnp.any(wet & (sd2 <= TINY)), 1.0, sd2)
     sd1, sd2, sv = (jnp.where(wet, x, 1.0) for x in (sd1, sd2, sv))
     return Ballast(scaling_visc=_extend_bottom(sv, nlev, 1.0),
                    scaling_density1=_extend_bottom(sd1, nlev, 1.0),
@@ -854,7 +867,7 @@ def tracer_terms(tracer_id: int, current, ctx: LoopContext, geom: SinkingGeometr
             need_ballast = tid in layout.det_ids or tid in layout.det2_ids
         if need_ballast:
             rho = particle_densities(current, geom.nlev, params, layout)
-            bal = ballast(rho[0], rho[1], ctx.rho_seawater, ctx.visc, geom.nlev, params)
+            bal = ballast(rho[0], rho[1], ctx.rho_seawater, ctx.visc, geom.nlev, params, layout)
         fe = current[..., layout.ife] if tid in layout.phaeo_ids else None    # Fortran reads DFe's current values
         wsink = sinking_velocity(tid, bal, geom, dt, params, switches, layout=layout, fe=fe)
         vert_sink = ver_sinking_recom(tid, v, wsink, geom, dt, params, layout)

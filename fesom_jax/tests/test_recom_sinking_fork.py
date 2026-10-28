@@ -45,8 +45,10 @@ from fesom_jax.recom.sms import check_no_cavities                               
 REF = Path(os.environ.get("FESOM_RECOM_FORK_REF", "/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/recom_ref"))
 MESH = Path(os.environ.get("FESOM_RECOM_FORK_MESH", "/albedo/work/projects/p_specbic/sloza/fesom_jax_data/mesh_pi_part"))
 REPO = Path(__file__).resolve().parents[2]
-NML = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb" / "namelist.recom"
 RUN = os.environ.get("FESOM_RECOM_FORK_RUN", "pi_30d_nowb_adv01")
+SPECTRAL = "spectral" in RUN                      # the spectral twin: 37 tracers (CDOM), the spectral light
+NML = REPO / "scripts" / "recom" / "fortran" / ("namelists_albedo_spectral" if SPECTRAL else
+                                                "namelists_albedo_spectral_nowb") / "namelist.recom"
 STEPS = [(RUN, s) for s in (1, 2, 3, 17, 224, 960) if (REF / RUN / "dumps" / f"step_{s:06d}").is_dir()] or [(RUN, 1)]
 TOL = 1e-12
 LOOSE: dict = {}        # field -> (tolerance, reason)

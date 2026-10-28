@@ -9962,3 +9962,16 @@ the BGC; the fixes with a date (#944, 18346243, 9afdae7b, #1116) each want a `le
 the dumped `mesh.nlevels`/`nlevels_nod2D` with the JAX bundle before anything else — a level mismatch looks like an
 advection bug at the bottom of a few columns; (d) a near-zero tracer (DetN at 1e-14 in the IC) has a meaningless
 relative error; rank the misses by the error over the step's own change instead.
+
+### 2026-10-28 (branch recom-spectral, lanes E/L) — a whole-array `any(...)` reset is physics too, and it fires on day 7
+
+REcoM's ballasting ends with `if (any(scaling_density1_3D(:,:) <= tiny)) scaling_density1_3D(:,:) = 1.0_WP`
+(recom_sinking.F90, upstream d5f9f8ac 2024-05-30, the fork K:858-861): one layer anywhere on the rank whose detritus is
+lighter than the in-situ seawater (`rho_POC = rho_PON = 1033 kg m-3`, the deep ocean is denser) switches the density
+scaling off for every node and layer of that rank for that tracer's call. The port had read it as a guard and left it
+out (the docstring said "no positivity guard"); the gates at steps 1, 2, 3, 17 of a January start never trigger it, step
+224 (day 7) does, with `scaling_density` off by a factor 8 everywhere. Lessons: (a) an `any`/`all` over a whole array
+followed by a whole-array assignment is a global (rank-wide) branch, not a per-cell guard; port it as a reduction + a
+`where`, and say which domain the reduction runs over (here the rank: owned + halo, including the stale entries below
+the bottom, which is why the very first call of a run also resets); (b) gate at a step late enough for the slow
+quantities (particle composition at depth) to have moved: steps 1-17 see the IC, day 7 sees the model.

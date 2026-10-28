@@ -132,10 +132,21 @@ def _nfix(temp, thick, pmax, limfac, nassim_base, cphot, phyc, v_cm, p: RecomPar
 
 def recom_sms_fork(state, temp, sali, carb: CarbCache, thick, zbar, nlev, surf_sr, cos_ai, lat_deg, lat_rad,
                    loc_slp, benthos, mstep, daynew, dt_b, p: RecomParams, sw: RecomSwitches, lay: Layout, *,
-                   nc_clamp: bool = False, n_iter: int = cb.PH_MAXITER) -> SmsForkResult:
+                   nc_clamp: bool = False, n_iter: int = cb.PH_MAXITER, spectral=None,
+                   spectral_co2lim: bool = False) -> SmsForkResult:
     """One biology step of the fork's REcoM for every column (``REcoM_sms`` + the update and clip of
     ``REcoM_Forcing``). Arguments as :func:`fesom_jax.recom.sms.recom_sms`, plus the switches ``sw`` and the
-    layout ``lay`` (both static) and ``nc_clamp`` (the spectral build's N:C quota clamp)."""
+    layout ``lay`` (both static) and ``nc_clamp`` (the spectral build's N:C quota clamp).
+
+    ``spectral`` (a :class:`fesom_jax.recom.spectral.SpectralLight`, lane L): the ``__RECOM_WAVEBANDS`` build. The
+    broadband attenuation is replaced by its ``PARave`` (S:1457-1465), and the growth, chlorophyll degradation and
+    synthesis take the spectral forms ``Cphot_X = pMax_X (1 - exp(-alpha_I_X Chl2C_X / pMax_X))`` (S:2502-2550,
+    2564-2734; no ``Cphot < tiny`` reset), ``KOchl_X = deg_Chl_X (1 - exp(-alpha_I_X Chl2C_X / pMax_X))`` on the
+    plain ``Chl2C`` (S:2785-2840) and ``chlSynth_X = N_assim_X Chl2N_max_X min(1, Cphot_X / (alpha_I_X Chl2C_X))``
+    gated by ``PARlocal`` (S:3072-3133). The fork applies no CO2 limitation in those branches even with ``CO2lim``;
+    ``spectral_co2lim=True`` multiplies ``Cphot_X`` by the CO2 factor as the broadband build does (the user's stated
+    deviation, 2026-10-28; off for the twin gate). ``TCphotLigLim_X`` is ``Cphot_X / pMax_X`` before that factor (the
+    fork leaves the diagnostic unset in a spectral build)."""
     check_fork_switches(sw, lay)
     coccos = bool(sw.enable_coccos)
     cdom = bool(lay.cdom)
@@ -223,11 +234,13 @@ def recom_sms_fork(state, temp, sali, carb: CarbCache, thick, zbar, nlev, surf_s
     reminSiT = jnp.maximum(0.023 * 2.6 ** ((temp - 10.0) / 10.0), p.reminSi)
     O2Func = O2 / (p.k_o2_remin + O2)
 
-    # light (S:1466-1567): the attenuating chlorophyll is every group's
+    # light (S:1466-1567): the attenuating chlorophyll is every group's; a spectral build brings its own PARave
     chl = PhyChl + DiaChl
     if coccos:
         chl = chl + CoccoChl + PhaeoChl
-    if sw.par_layer_mean:
+    if spectral is not None:
+        PARave = jnp.asarray(spectral.PARave, f64)
+    elif sw.par_layer_mean:
         kappa = p.k_w + p.a_chl * chl                                     # Chlave of the layer itself
         kappastar = kappa / cos_ai[:, None]
         inc = kappastar * thick
@@ -294,22 +307,49 @@ def recom_sms_fork(state, temp, sali, carb: CarbCache, thick, zbar, nlev, surf_s
         on = (beta > 0.0) & (cphot >= TINY) & (pmax >= TINY)
         safe = jnp.where(pmax >= TINY, pmax, 1.0)
         return jnp.where(on, cphot * jnp.exp(-beta * chl2c * PARave / safe), cphot)
-    Cphot, lightlim = photosynthesis_rate(pMax, PARave, Chl2C, PhyCO2, p.alfa)
+    if spectral is None:
+        Cphot, lightlim = photosynthesis_rate(pMax, PARave, Chl2C, PhyCO2, p.alfa)
+        Cphot_dia, lightlim_dia = photosynthesis_rate(pMax_dia, PARave, Chl2C_dia, DiaCO2, p.alfa_d)
+        if coccos:
+            Cphot_cocco, lightlim_cocco = photosynthesis_rate(pMax_cocco, PARave, Chl2C_cocco, CoccoCO2, p.alfa_c)
+            Cphot_phaeo, lightlim_phaeo = photosynthesis_rate(pMax_phaeo, PARave, Chl2C_phaeo, PhaeoCO2, p.alfa_p)
+    else:
+        def spec_phot(pmax, alpha_i, chl2c, co2fac):                     # S:2502-2510 (and :2564, :2628, :2690)
+            ok = (pmax >= TINY) & (alpha_i >= TINY) & (chl2c >= TINY)
+            pm = jnp.where(ok, pmax, 1.0)
+            cphot = jnp.where(ok, pm * (1.0 - jnp.exp(-alpha_i * chl2c / pm)), 0.0)
+            lightlim = jnp.where(ok, cphot / pm, 0.0)
+            if spectral_co2lim:
+                cphot = cphot * co2fac
+            return cphot, lightlim
+        Cphot, lightlim = spec_phot(pMax, spectral.alpha_I, Chl2C, PhyCO2)
+        Cphot_dia, lightlim_dia = spec_phot(pMax_dia, spectral.alpha_I_dia, Chl2C_dia, DiaCO2)
+        if coccos:
+            Cphot_cocco, lightlim_cocco = spec_phot(pMax_cocco, spectral.alpha_I_cocco, Chl2C_cocco, CoccoCO2)
+            Cphot_phaeo, lightlim_phaeo = spec_phot(pMax_phaeo, spectral.alpha_I_phaeo, Chl2C_phaeo, PhaeoCO2)
     Cphot = inhibit(Cphot, p.beta_inh, Chl2C, pMax)
-    Cphot_dia, lightlim_dia = photosynthesis_rate(pMax_dia, PARave, Chl2C_dia, DiaCO2, p.alfa_d)
     Cphot_dia = inhibit(Cphot_dia, p.beta_inh_d, Chl2C_dia, pMax_dia)
     if coccos:
-        Cphot_cocco, lightlim_cocco = photosynthesis_rate(pMax_cocco, PARave, Chl2C_cocco, CoccoCO2, p.alfa_c)
         Cphot_cocco = inhibit(Cphot_cocco, p.beta_inh_c, Chl2C_cocco, pMax_cocco)
-        Cphot_phaeo, lightlim_phaeo = photosynthesis_rate(pMax_phaeo, PARave, Chl2C_phaeo, PhaeoCO2, p.alfa_p)
         Cphot_phaeo = inhibit(Cphot_phaeo, p.beta_inh_p, Chl2C_phaeo, pMax_phaeo)
 
     # chlorophyll degradation with photodamage (S:2777-2890)
-    KOchl = chlorophyll_degradation(pMax, PARave, CHL2C_plast, p.deg_Chl, p.alfa)
-    KOchl_dia = chlorophyll_degradation(pMax_dia, PARave, CHL2C_plast_dia, p.deg_Chl_d, p.alfa_d)
-    if coccos:
-        KOchl_cocco = chlorophyll_degradation(pMax_cocco, PARave, CHL2C_plast_cocco, p.deg_Chl_c, p.alfa_c)
-        KOchl_phaeo = chlorophyll_degradation(pMax_phaeo, PARave, CHL2C_plast_phaeo, p.deg_Chl_p, p.alfa_p)
+    if spectral is None:
+        KOchl = chlorophyll_degradation(pMax, PARave, CHL2C_plast, p.deg_Chl, p.alfa)
+        KOchl_dia = chlorophyll_degradation(pMax_dia, PARave, CHL2C_plast_dia, p.deg_Chl_d, p.alfa_d)
+        if coccos:
+            KOchl_cocco = chlorophyll_degradation(pMax_cocco, PARave, CHL2C_plast_cocco, p.deg_Chl_c, p.alfa_c)
+            KOchl_phaeo = chlorophyll_degradation(pMax_phaeo, PARave, CHL2C_plast_phaeo, p.deg_Chl_p, p.alfa_p)
+    else:
+        def spec_deg(pmax, alpha_i, chl2c, deg):                         # S:2785-2790 (and :2800, :2815, :2829)
+            ok = (pmax >= TINY) & (alpha_i >= TINY) & (PARave >= TINY) & (chl2c >= TINY)
+            pm = jnp.where(ok, pmax, 1.0)
+            return jnp.where(ok, deg * (1.0 - jnp.exp(-alpha_i * chl2c / pm)), 0.0)
+        KOchl = spec_deg(pMax, spectral.alpha_I, Chl2C, p.deg_Chl)
+        KOchl_dia = spec_deg(pMax_dia, spectral.alpha_I_dia, Chl2C_dia, p.deg_Chl_d)
+        if coccos:
+            KOchl_cocco = spec_deg(pMax_cocco, spectral.alpha_I_cocco, Chl2C_cocco, p.deg_Chl_c)
+            KOchl_phaeo = spec_deg(pMax_phaeo, spectral.alpha_I_phaeo, Chl2C_phaeo, p.deg_Chl_p)
 
     # nitrogen assimilation, N fixation, silicate (S:2976-3044)
     V_cm = p.V_cm_fact
@@ -332,15 +372,27 @@ def recom_sms_fork(state, temp, sali, carb: CarbCache, thick, zbar, nlev, surf_s
     FreeFe = iron_chemistry(Fe, p.totalligand, p.ligandStabConst)
 
     # chlorophyll synthesis (S:3078-3140)
-    okpar = (PARave >= TINY) & ~jnp.isnan(PARave)
-    def synth(nassim, chl2n_max, cphot, alfa, chl2c):
-        den = jnp.where(okpar, alfa * chl2c * PARave, 1.0)
-        return jnp.where(okpar, nassim * chl2n_max * jnp.minimum(1.0, cphot / den), 0.0)
-    chlSynth = synth(N_assim, p.Chl2N_max, Cphot, p.alfa, Chl2C)
-    ChlSynth_dia = synth(N_assim_dia, p.Chl2N_max_d, Cphot_dia, p.alfa_d, Chl2C_dia)
-    if coccos:
-        ChlSynth_cocco = synth(N_assim_cocco, p.Chl2N_max_c, Cphot_cocco, p.alfa_c, Chl2C_cocco)
-        ChlSynth_phaeo = synth(N_assim_phaeo, p.Chl2N_max_p, Cphot_phaeo, p.alfa_p, Chl2C_phaeo)
+    if spectral is None:
+        okpar = (PARave >= TINY) & ~jnp.isnan(PARave)
+        def synth(nassim, chl2n_max, cphot, alfa, chl2c):
+            den = jnp.where(okpar, alfa * chl2c * PARave, 1.0)
+            return jnp.where(okpar, nassim * chl2n_max * jnp.minimum(1.0, cphot / den), 0.0)
+        chlSynth = synth(N_assim, p.Chl2N_max, Cphot, p.alfa, Chl2C)
+        ChlSynth_dia = synth(N_assim_dia, p.Chl2N_max_d, Cphot_dia, p.alfa_d, Chl2C_dia)
+        if coccos:
+            ChlSynth_cocco = synth(N_assim_cocco, p.Chl2N_max_c, Cphot_cocco, p.alfa_c, Chl2C_cocco)
+            ChlSynth_phaeo = synth(N_assim_phaeo, p.Chl2N_max_p, Cphot_phaeo, p.alfa_p, Chl2C_phaeo)
+    else:
+        PARl = jnp.asarray(spectral.PARl, f64)
+        def spec_synth(nassim, chl2n_max, cphot, alpha_i, chl2c):        # S:3072-3077 (and :3086, :3099, :3112)
+            ok = (PARl >= TINY) & (alpha_i >= TINY) & (chl2c >= TINY)
+            den = jnp.where(ok, alpha_i * chl2c, 1.0)
+            return jnp.where(ok, nassim * chl2n_max * jnp.minimum(1.0, cphot / den), 0.0)
+        chlSynth = spec_synth(N_assim, p.Chl2N_max, Cphot, spectral.alpha_I, Chl2C)
+        ChlSynth_dia = spec_synth(N_assim_dia, p.Chl2N_max_d, Cphot_dia, spectral.alpha_I_dia, Chl2C_dia)
+        if coccos:
+            ChlSynth_cocco = spec_synth(N_assim_cocco, p.Chl2N_max_c, Cphot_cocco, spectral.alpha_I_cocco, Chl2C_cocco)
+            ChlSynth_phaeo = spec_synth(N_assim_phaeo, p.Chl2N_max_p, Cphot_phaeo, spectral.alpha_I_phaeo, Chl2C_phaeo)
 
     # phytoplankton respiration (S:3154-3175)
     if sw.res_phy_const:

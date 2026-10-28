@@ -194,6 +194,18 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   With the three: G4a on `pi_30d_nowb_adv01` <= 3.2e-14 at steps 1, 2, 3, 17 (`FESOM_RECOM_FORK_RUN` selects
   the run; all three fork gates default to the adv01 run). Steps 224/960 once the reruns write them.
 
+- 2026-10-28 night, lane L DONE: `fesom_jax/recom/spectral.py` (band tables, the `.dat` readers, the IOPs, the
+  direct 3-stream solver with the pivoting tridiagonal solve as two `lax.scan` sweeps over padded rows, the scalar
+  irradiance, `sms_light`) and the spectral growth terms in `sms_fork.py` (`spectral=`, `spectral_co2lim=`; the
+  N:C clamp `nc_clamp`). Gates on the spectral twin `pi_30d_spectral_adv01` (job 48602453): `test_recom_spectral_light`
+  (Edz/Esz/Euz/Eutop/Estop x 13 bands, PAR3D) <= 1.5e-12 and `test_recom_sms_fork` with the spectral light (37
+  tracers incl. CDOM, `spectral_co2lim=False`, TCphotLigLim_* skipped: the fork leaves them unset) <= 1.3e-13 at steps
+  1, 2, 3, 17, 224. The three fork gates select the namelist set and the light by the run name (`FESOM_RECOM_FORK_RUN`);
+  on the spectral twin sinking and stage 3 pass too (12 + 12). Step 224 exposed REcoM's whole-array ballast reset
+  (`any(scaling_density <= tiny) -> 1` on the rank's array, recom_sinking.F90 K:858-861, upstream d5f9f8ac): mirrored
+  for the fork layout in `sinking.ballast` (a per-device `any` over the wet layers; 692f804's programs unchanged).
+  Open: steps 960 once the reruns finish; the first-call reset at step 1 stays a documented skip.
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.
