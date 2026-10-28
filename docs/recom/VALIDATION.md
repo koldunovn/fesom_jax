@@ -168,3 +168,31 @@ Open: the SP budget residual above 1e-12 sits in the five tracers that grow by o
 initial value in the first steps (DetCalc, DICremin, PhyCalc, DOC, DON), always a small loss (~1e-11 of the step's
 content change) that does not grow from 4 to 30 steps; stage 3 alone conserves to <= 3e-13 on the G4a inputs (with
 GM off ~1e-14: the WP Redi increments, as upstream's), so it enters where stage 1 meets the tracer step. Not isolated.
+
+## The spectral fork (branch `recom-spectral`, Albedo, 2026-10-28)
+
+The port of `sveta-loza/fesom2` `fesom2.6_recom_tra_diags_spectral` (4 phytoplankton groups, CDOM, 13-band OASIM
+light; `docs/plans/20261028-recom-spectral-port.md`), gated against two 1-rank pi twins of the fork's own executable
+built with the 11 upstream REcoM commits cherry-picked (`/albedo/work/user/sloza/SPECTRAL/recom_spectral_r692`):
+`pi_30d_nowb_adv01` (the broadband build, 36 tracers, job 48602452) and `pi_30d_spectral_adv01` (the spectral build,
+37 tracers with CDOM, job 48602453), dumps at steps 1, 2, 3, 17, 224, 960 under
+`/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/recom_ref/`. The twins run with namelist.tra advection weights
+`0., 1.` (the implemented reconstruction) and the JAX side with the fork's FESOM2 base in mind:
+`legacy_k33_weights`, `legacy_fct_bounds` and the mesh bundle built from the twin's own `elvls.out`
+(`fesom_jax_data/mesh_pi_fork`).
+
+| gate | test | twin | steps | result |
+|---|---|---|---|---|
+| G2, sources and sinks (recom_in -> recom_out, every tracer, diagnostic, flux and cache field) | `test_recom_sms_fork.py` | broadband | 1, 2, 3, 17, 224 | <= 2.4e-13 |
+| G2 with the spectral light (TCphotLigLim_* skipped: unset by the fork) | `test_recom_sms_fork.py` | spectral | 1, 2, 3, 17, 224 | <= 1.3e-13 |
+| the light planes Edz/Esz/Euz/Eutop/Estop x 13 bands and PAR3D | `test_recom_spectral_light.py` | spectral | 1, 2, 3, 17, 224 | <= 1.5e-12 |
+| G3, per-tracer loop terms (benthic return, ballasting, sinking, benthos, the whole loop) | `test_recom_sinking_fork.py` | both | 1, 2, 3, 17, 224 | <= 4.6e-15 |
+| G4a, stage 3 fed with the twin's transport | `test_recom_stage3_fork.py` | both | 1, 2, 3, 17, 224 | <= 3.2e-14 |
+| the cold start (the twin's recom_in at step 1, 37 tracers) | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
+| the OASIM January fields on the nodes | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
+
+Known skips: the fork's first-call ballast reset (step 1, tracer 1004: `any(scaling_density <= tiny)` on the
+never-written entries below the bottom) and its bottom-interface ballast diagnostics, both documented in
+`test_recom_sinking_fork.py`. Step 960 is pending the reruns. No full-step (G4b) gate: the twins run the user's
+experiment physics (`namelists_albedo_spectral/namelist.oce`, opt_visc 7, KPP), not the JAX-matched
+`namelists_jaxphys` set; a G4b would need a twin rerun with that set.
