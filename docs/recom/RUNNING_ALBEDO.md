@@ -143,3 +143,17 @@ rebuilds the layer thicknesses from `hbar` (fesom-jax has no partial cells; the 
 `Alk_surf` from the IC set as REcoM does at setup, and fills the few cells below the Fortran bottom with the
 column's deepest value (2 nodes on CORE2). `PROVENANCE.json` in the store records all of it. Note that the 1997
 benthos pools are huge (median benthic C 1e11 mmol m-2 in the Fortran restart itself); the model carries them.
+
+## A multi-year CORE2 run and the comparison with a Fortran run
+
+```bash
+scripts/albedo/chain_core2_gpu.sh configs/albedo/core2_recom_spectral_kdind15.yaml <ROOT> 4 5840 1958   # 2 years, 4 segments
+scripts/albedo/link_monthly.sh <ROOT>                                                                     # ROOT/monthly/<YYYY_MM>
+python scripts/recom/compare_fortran_jax.py --jax <ROOT>/monthly \
+    --fortran /albedo/work/projects/p_specbic/sloza/tmp_recom-fesom_output/fesom2.6_spectral_kdind15 \
+    --mesh /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/mesh_core2 --out <ROOT>/compare
+```
+One half-year segment of CORE2 + the spectral fork takes ~5.2 h on one PCIe A100 (3.2 s/step), inside the 12 h qos;
+`chain_core2_gpu.sh` sequences the segments with `--dependency=afterok`. The comparison script prints a monthly table
+(global NPP and CO2 flux [Pg C yr-1], surface Chl, pCO2, SST, ice area, the six inventories, pattern correlations)
+and draws `compare_<YYYY_MM>.png` (surface Chl, NPP, CO2 flux: fesom-jax, Fortran, difference).

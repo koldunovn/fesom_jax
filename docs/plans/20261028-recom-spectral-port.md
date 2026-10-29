@@ -268,6 +268,19 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   the Fortran state are huge (median BenC 1e11 mmol m-2) and are carried as they are. Open: the CORE2 comparison
   figures against `tmp_run_kdind15`, the merge.
 
+- 2026-10-29, the CORE2 comparison started: `configs/albedo/core2_recom_spectral_kdind15.yaml` (the cold start of
+  the user's reference run: clim61 repeat-year forcing, pool runoff/SSS, chl 0.1, OASIM, the CORE2 IC with DIC_PI),
+  two years 1958-1959 as four half-year one-GPU segments (`scripts/albedo/chain_core2_gpu.sh`, jobs 48617112-48617115,
+  ~5.2 h each at 3.2 s/step; `scripts/albedo/link_monthly.sh` joins the segments' monthly stores).
+  `scripts/recom/compare_fortran_jax.py` compares the monthly stores with the Fortran `<var>.fesom.<year>.nc` means
+  (global NPP, CO2 flux, surface Chl/pCO2/SST/ice, the six inventories, pattern correlations, tripcolor maps);
+  exercised on the warm smoke's first day against `fesom2.6_spectral_kdind15w` January (job 48617116: the
+  inventories agree to 1e-4 as they must from one restart; the rates are a 1-day mean against a month and say
+  nothing yet). When the chain is done: `link_monthly.sh ROOT` then `compare_fortran_jax.py --jax ROOT/monthly
+  --fortran .../fesom2.6_spectral_kdind15 --mesh .../mesh_core2 --out ROOT/compare`. A full warm year against
+  kdind15w (both from the 1997 restart) is the cleaner comparison and runs with the warm config the same way.
+  Open after that: the figures' reading, the merge into `main`.
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.
