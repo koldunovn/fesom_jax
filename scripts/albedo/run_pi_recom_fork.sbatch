@@ -45,7 +45,8 @@ fi
 SEG=$((SEG + 1))
 cd "$RD"
 for f in namelist.config namelist.oce namelist.dyn namelist.ice namelist.icepack namelist.tra namelist.forcing \
-         namelist.io namelist.recom; do
+         namelist.io namelist.recom namelist.cvmix; do
+    [ -f "$NML/$f" ] || continue           # namelist.cvmix only in the physics-matched sets (else the fork's TKE defaults)
     sed -e "s|@MESH@|$MESH|g" -e "s|@CLIM@|$CLIM|g" -e "s|@RESULT@|$RD/|g" \
         -e "s|@RUN_LENGTH@|$DAYS|g" -e "s|@RECOM_RESTART@|$RECOM_RESTART|g" \
         "$NML/$f" > "$RD/$f"

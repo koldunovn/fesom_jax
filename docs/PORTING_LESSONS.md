@@ -9997,3 +9997,23 @@ rebuilt fork bundle is not. The bundle has three polar elements with deeper leve
 rebuild it (`phc_ic.build_and_cache_ic`) whenever the bundle's levels change, and check `S[wet] > 0` before a run;
 (b) when a long run ends non-finite everywhere, bisect by configuration pairs with 32-step runs (A on mesh 1, A on
 mesh 2, B on mesh 2) before reading any code: three jobs, ten minutes.
+
+### 2026-10-29 (branch recom-spectral, lane W) — a twin's first three hours are not its physics: the host model's cold-start bugs are in the dumps too
+
+The fork's full-step gate (G4b) first came out at a physics floor of 3.5e-3 on T after one step, 1000x worse than any
+BGC gate, on a pair whose namelists matched as far as the fork's FESOM2 base allows. `scripts/recom/physics_floor.py`
+(now with `--mesh`, `--legacy`, `--no-recom`) put it in one line: the twin's `recom_in.u_wind` differed from the JAX
+wind by 70 % while shortwave and pressure agreed to 1e-14. On a rotated grid FESOM2 rotates the wind interpolation
+coefficients only when it refreshes them, and the cold start never refreshes inside the first forcing window, so the
+first three hours of every cold-started run of the fork's base push the ocean and the ice with winds in the
+geographic frame (upstream fix 66658357, 2026-05-25, after the fork's base cda35117). fesom-jax rotates always.
+Cherry-picking the fix into the twin's dump branch (63283bc9 there) brought the floor to 5.4e-5 (T), 1.6e-5 (S),
+3.2e-4 (a_ice); every BGC tracer is below the T floor. The 692f804 pair sits at 4.1e-8 because its base has the
+fix. Lessons: (a) before reading a single BGC number of a full-step gate, print the floor script's forcing rows:
+a forcing field that disagrees at step 1 is a host-model bug or convention, never a port error, and it is the only
+thing that can make every tracer miss by the same amount; (b) a twin built from an older host base reproduces that
+base's cold-start bugs in its dumps; fixing them in the twin (a cherry-pick with `-x`, recorded in the run's
+`seg_1.info` by its git SHA) is legitimate as long as the fix is upstream's and the plan says so; (c) when the
+host base has no namelist keys for a parameterisation the port implements (the fork's `oce_dyn` has no
+`scaling_GMzexp`, `scaling_ODM95`, `Redi_Ktaper`: its GM/Redi is the FESOM 1.4-style `init_Redi_GM`), switch it off
+on both sides for the gate rather than approximate it; a G4b tests the BGC coupling through the transport, not GM.

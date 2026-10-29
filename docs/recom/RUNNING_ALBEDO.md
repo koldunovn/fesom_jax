@@ -52,6 +52,7 @@ the sbatch scripts source it, and an interactive session should too.
 
 ```bash
 sbatch scripts/albedo/run_ci_group.sbatch      # the data-free `ci` group on one CPU node (~10 min)
+sbatch scripts/albedo/run_pytest.sbatch fesom_jax/tests/test_recom_step_fork.py [-k expr]   # one test file on a CPU node
 ```
 
 ## pi + REcoM (CPU, 30 days)

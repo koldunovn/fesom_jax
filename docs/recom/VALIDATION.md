@@ -190,9 +190,26 @@ built with the 11 upstream REcoM commits cherry-picked (`/albedo/work/user/sloza
 | G4a, stage 3 fed with the twin's transport | `test_recom_stage3_fork.py` | both | 1, 2, 3, 17, 224, 960 | <= 3.2e-14 |
 | the cold start (the twin's recom_in at step 1, 37 tracers) | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
 | the OASIM January fields on the nodes | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
+| G4b, one full JAX step from the twin's step-0 state (every tracer, Benthos, the surface diagnostics) | `test_recom_step_fork.py` | both, physics-matched (`pi_1d_*_jaxphys`) | 1 | every tracer <= 2.0e-5, below the pair's T floor 5.4e-5 (S 1.6e-5, a_ice 3.2e-4); Benthos <= 1.6e-10, pCO2 1e-13, pH 6e-15 |
 
 Known skips: the fork's first-call ballast reset (step 1, tracer 1004: `any(scaling_density <= tiny)` on the
 never-written entries below the bottom) and its bottom-interface ballast diagnostics, both documented in
-`test_recom_sinking_fork.py`. No full-step (G4b) gate: the twins run the user's
-experiment physics (`namelists_albedo_spectral/namelist.oce`, opt_visc 7, KPP), not the JAX-matched
-`namelists_jaxphys` set; a G4b would need a twin rerun with that set.
+`test_recom_sinking_fork.py`.
+
+### G4b for the fork (2026-10-29)
+
+The 30-day twins run the user's experiment physics (KPP, the fork's GM/Redi), so the full-step gate has its own
+one-day twins, `pi_1d_spectral_jaxphys` (job 48606105) and `pi_1d_nowb_jaxphys` (48606106), dumps at steps 1, 2,
+3, 17, 32, from the namelist sets `scripts/recom/fortran/namelists_albedo_spectral{,_nowb}_jaxphys/` (their README:
+cvmix TKE with the 692f804 twin's `namelist.cvmix`, mEVP, `ice_diff` 10, no Monin-Obukhov mixing, and GM/Redi
+**off on both sides**, since the fork's `init_Redi_GM` is the FESOM 1.4-style builder without the ODM95 taper, depth
+scaling and Redi tapering fesom-jax implements). The JAX side is `configs/albedo/pi_recom_spectral_g4b.yaml` (`gm:
+null`, `spectral_co2lim: false`) with the three legacy settings of the fork's base as step kwargs
+(`legacy_fct_bounds`, `legacy_sw_depth`, `legacy_k33_weights`). The twins' executables carry upstream FESOM2
+66658357 cherry-picked (63283bc9 on the dump branch): without it the fork's base leaves the first forcing window's
+winds unrotated on the rotated grid and the pair's T floor is 3.5e-3 (runs `pi_1d_*_jaxphys_nofix`, jobs
+48605353/48605354); `legacy_sw_depth` takes the floor from 3.6e-4 to 5.4e-5 (`scripts/recom/physics_floor.py
+--mesh ... --legacy --no-recom`, job 48606112). The residual floor sits in the sea ice (a_ice 3.2e-4 at one node,
+the surface velocity under it 1.9e-3) and the surface T of ice-free polar columns (1.6e-3 degC): the fork's
+2025-10 ice code against the one fesom-jax follows; the 692f804 pair, whose base has both fixes, sits at 4.1e-8.
+Gate (job 48606115): each BGC tracer <= 100 x the T/S floor and the floor itself <= 1.1e-4.

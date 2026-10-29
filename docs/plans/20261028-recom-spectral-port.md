@@ -235,6 +235,19 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   both twins (broadband: sms, sinking, stage 3; spectral: those plus the light planes). The gate table is in
   `docs/recom/VALIDATION.md`.
 
+- 2026-10-29, the fork's G4b: `fesom_jax/tests/test_recom_step_fork.py` on one-day physics-matched twins
+  (`pi_1d_spectral_jaxphys` 48606105, `pi_1d_nowb_jaxphys` 48606106; namelist sets `namelists_albedo_spectral{,_nowb}_jaxphys/`
+  with GM/Redi off on both sides, cvmix TKE + the 692f804 `namelist.cvmix`, mEVP, `ice_diff` 10; JAX
+  `configs/albedo/pi_recom_spectral_g4b.yaml` + the three legacy step kwargs; the job scripts
+  `scripts/albedo/run_pi_recom_fork.sbatch` now copies `namelist.cvmix`, `scripts/albedo/run_pytest.sbatch` runs a
+  test file on a compute node). First result: T floor 3.5e-3 (jobs 48605353/48605354, kept as `_nofix`);
+  `physics_floor.py --mesh --legacy --no-recom` showed the twin's winds 70 % off at step 1: the fork's base lacks
+  upstream 66658357 (the first forcing window's wind coefficients never rotated on a rotated grid). Cherry-picked
+  into the dump branch (63283bc9), release builds rebuilt, twins rerun: floor T 5.4e-5 / S 1.6e-5 / a_ice 3.2e-4,
+  every BGC tracer <= 2.0e-5 on both twins (gate job 48606115). The residual is the fork's older sea ice
+  (`docs/recom/VALIDATION.md`, `docs/PORTING_LESSONS.md` 2026-10-29). Lane W's gate G4b is done; G5 (30 days
+  against a twin) would need a 30-day physics-matched twin and inherits the ice floor.
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.
