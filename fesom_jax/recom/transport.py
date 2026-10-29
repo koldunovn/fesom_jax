@@ -208,7 +208,7 @@ def surface_bc(sfc, dt, tracer_layout=None):
 def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_new, zbar3_live, Z3d_live, Z3d_new,
                  gm_diag, Kv_eff, temp, salt, sfc, benthos, geom_sink, params, switches, dt, exch, ckpt, adj,
                  helem_flux=None, return_terms: bool = False, carry=None, tracer_layout=None,
-                 legacy_fct_bounds: bool = False):
+                 legacy_fct_bounds: bool = False, reduce_sum=None):
     """Full REcoM's stage 3: FESOM2's tracer loop for the 31 BGC tracers (``solve_tracers_ale``,
     ``oce_ale_tracer.F90:725-930``). ``X1`` is stage 1's output (the tracers at the start of the loop, ``(nod2D, nl,
     31)``), ``temp``/``salt`` the step's final T and S (S before ``S_FLOOR``), ``sfc``/``benthos`` stage 1's
@@ -257,7 +257,7 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
 
     res = sinking.recom_tracer_loop_terms(X1[:, :nl1], temp[:, :nl1], salt[:, :nl1], geom_sink,
                                           sfc.GlodecayBenthos, benthos, dt, params, finish, switches=switches,
-                                          layout=tracer_layout)
+                                          layout=tracer_layout, reduce_sum=reduce_sum)
     X_new = exch(jnp.concatenate([res.bgc, X1[:, nl1:]], axis=1), "nod")
     if return_terms:
         return X_new, X_old_new, exch(res.benthos, "nod"), res

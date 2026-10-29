@@ -576,7 +576,7 @@ class Ballast(NamedTuple):
 
 
 def ballast(rho_particle1, rho_particle2, rho_seawater, visc, nlev, params: RecomParams,
-            layout: Layout = DEFAULT_LAYOUT) -> Ballast:
+            layout: Layout = DEFAULT_LAYOUT, reduce_sum=None) -> Ballast:
     """The scaling factors of the ballasted sinking speed, ``recom_sinking.F90:928-1043``
     (``use_density_scaling``, ``use_viscosity_scaling``, ``enable_3zoo2det`` all on): density
     ``(rho_particle - rho_seawater)/(rho_ref_part - rho_ref_water)`` (no positivity guard), viscosity
@@ -586,9 +586,13 @@ def ballast(rho_particle1, rho_particle2, rho_seawater, visc, nlev, params: Reco
     2024-05-30): ``if (any(scaling_density1_3D <= tiny)) scaling_density1_3D = 1`` (and ``..2`` with 3zoo2det), an
     ``any`` over the rank's array, i.e. one layer with particles lighter than the in-situ seawater (``rho_POC = 1033``
     against ``rho > 1033`` at depth) switches the density scaling off everywhere on that rank for that tracer's
-    call (the broadband twin: step 224, day 7). Here: any over this device's wet layers (the pad lanes are dry).
-    REcoM 692f804 carries the same lines; its port predates this finding and its programs stay as gated, so the
-    reset is keyed on the fork layout (``docs/PORTING_LESSONS.md`` 2026-10-28)."""
+    call (the broadband twin: step 224, day 7). Here: any over the wet layers of the WHOLE mesh when ``reduce_sum``
+    (the step's global sum over the owned nodes, :func:`fesom_jax.reductions.global_sum`) is given, else over this
+    device's (the pad lanes are dry). Fortran's domain is the rank, so its result depends on the partition; the
+    global domain reproduces the 1-rank twins every gate uses and keeps the model device-count independent (a
+    4-device run equalled the dense one except in the sinking tracers, 2.6e-2 on DetC after two steps, before this;
+    the stated deviation, 2026-10-29). REcoM 692f804 carries the same lines; its port predates this finding and its
+    programs stay as gated, so the reset is keyed on the fork layout (``docs/PORTING_LESSONS.md`` 2026-10-28)."""
     p = params
     k = jnp.arange(visc.shape[1])[None, :]
     wet = k < jnp.asarray(nlev)[:, None]
@@ -596,9 +600,12 @@ def ballast(rho_particle1, rho_particle2, rho_seawater, visc, nlev, params: Reco
     sd2 = (rho_particle2 - rho_seawater) / (p.rho_ref_part - p.rho_ref_water)
     sv = jnp.where(visc != 0.0, p.visc_ref_water / jnp.where(visc != 0.0, visc, 1.0), 1.0)
     if not layout.dicremin:
-        sd1 = jnp.where(jnp.any(wet & (sd1 <= TINY)), 1.0, sd1)
+        def _any(flag):                                  # (nod, nl-1) -> the mesh-wide any (owned nodes suffice)
+            col = jnp.any(flag, axis=1)
+            return jnp.any(col) if reduce_sum is None else reduce_sum(col.astype(jnp.float64)) > 0.0
+        sd1 = jnp.where(_any(wet & (sd1 <= TINY)), 1.0, sd1)
         if layout.enable_3zoo2det:
-            sd2 = jnp.where(jnp.any(wet & (sd2 <= TINY)), 1.0, sd2)
+            sd2 = jnp.where(_any(wet & (sd2 <= TINY)), 1.0, sd2)
     sd1, sd2, sv = (jnp.where(wet, x, 1.0) for x in (sd1, sd2, sv))
     return Ballast(scaling_visc=_extend_bottom(sv, nlev, 1.0),
                    scaling_density1=_extend_bottom(sd1, nlev, 1.0),
@@ -846,7 +853,8 @@ def loop_context(temp, salt, geom: SinkingGeometry) -> LoopContext:
 
 def tracer_terms(tracer_id: int, current, ctx: LoopContext, geom: SinkingGeometry, decay_benthos, dt,
                  params: RecomParams, switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True), *,
-                 need_ballast: Optional[bool] = None, layout: Layout = DEFAULT_LAYOUT) -> TracerTerms:
+                 need_ballast: Optional[bool] = None, layout: Layout = DEFAULT_LAYOUT,
+                 reduce_sum=None) -> TracerTerms:
     """Steps 2-3 of the module docstring for ONE BGC tracer. ``current`` (nod2D, nl-1, ntr) is the BGC stack
     as Fortran holds it when this tracer's turn comes (finished tracers final, the rest at the start of the
     loop); this tracer's own column is its start-of-loop value. ``need_ballast`` (default: detritus only)
@@ -867,7 +875,7 @@ def tracer_terms(tracer_id: int, current, ctx: LoopContext, geom: SinkingGeometr
             need_ballast = tid in layout.det_ids or tid in layout.det2_ids
         if need_ballast:
             rho = particle_densities(current, geom.nlev, params, layout)
-            bal = ballast(rho[0], rho[1], ctx.rho_seawater, ctx.visc, geom.nlev, params, layout)
+            bal = ballast(rho[0], rho[1], ctx.rho_seawater, ctx.visc, geom.nlev, params, layout, reduce_sum=reduce_sum)
         fe = current[..., layout.ife] if tid in layout.phaeo_ids else None    # Fortran reads DFe's current values
         wsink = sinking_velocity(tid, bal, geom, dt, params, switches, layout=layout, fe=fe)
         vert_sink = ver_sinking_recom(tid, v, wsink, geom, dt, params, layout)
@@ -920,7 +928,7 @@ def recom_tracer_loop_terms(bgc, temp, salt, geom: SinkingGeometry, decay_bentho
                             params: RecomParams, finish: Finish, *,
                             switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True),
                             batched: bool = True, diagnostics: bool = False,
-                            layout: Layout = DEFAULT_LAYOUT) -> LoopTermsResult:
+                            layout: Layout = DEFAULT_LAYOUT, reduce_sum=None) -> LoopTermsResult:
     """REcoM's part of FESOM2's tracer loop for the whole BGC stack, in Fortran's order.
 
     Inputs (stage 3 hands them over):
@@ -959,7 +967,7 @@ def recom_tracer_loop_terms(bgc, temp, salt, geom: SinkingGeometry, decay_bentho
         for tid in group:
             tt = tracer_terms(tid, cur, ctx, geom, decay_benthos, dt, params, switches,
                               need_ballast=(True if diagnostics and tid in layout.sinking_ids else None),
-                              layout=layout)
+                              layout=layout, reduce_sum=reduce_sum)
             vm.append(tt.values_mod)
             if tt.benthos_tr is not None:
                 btr_cols[layout.slot(tid)] = tt.benthos_tr

@@ -191,6 +191,8 @@ built with the 11 upstream REcoM commits cherry-picked (`/albedo/work/user/sloza
 | the cold start (the twin's recom_in at step 1, 37 tracers) | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
 | the OASIM January fields on the nodes | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
 | G4b, one full JAX step from the twin's step-0 state (every tracer, Benthos, the surface diagnostics) | `test_recom_step_fork.py` | both, physics-matched (`pi_1d_*_jaxphys`) | 1 | every tracer <= 2.0e-5, below the pair's T floor 5.4e-5 (S 1.6e-5, a_ice 3.2e-4); Benthos <= 1.6e-10, pCO2 1e-13, pH 6e-15 |
+| sharded (pi dist_4, 4 host devices) equals dense, 2 steps of the production spectral config from the 30-day state | `test_recom_sharded_fork.py` | JAX alone | 2 | every tracer <= 3.2e-13 (median 4.5e-16), Benthos 5.6e-18, physics 1.1e-14 (job 48611814) |
+| G6, `jax.grad` of the 1-day NPP cost vs central FD (expon_phy, expon_cocco, rho_N, deg_Chl, cdomcoeff; graz_max numerically zero) | `test_recom_grad_fork.py` | JAX alone, from the 30-day state | 32 | rel 4.4e-6, 6.6e-7, 8.2e-5, 6.0e-8, 1.2e-7 (job 48611817, 22 min on 16 cores) |
 
 Known skips: the fork's first-call ballast reset (step 1, tracer 1004: `any(scaling_density <= tiny)` on the
 never-written entries below the bottom) and its bottom-interface ballast diagnostics, both documented in
@@ -213,3 +215,17 @@ winds unrotated on the rotated grid and the pair's T floor is 3.5e-3 (runs `pi_1
 the surface velocity under it 1.9e-3) and the surface T of ice-free polar columns (1.6e-3 degC): the fork's
 2025-10 ice code against the one fesom-jax follows; the 692f804 pair, whose base has both fixes, sits at 4.1e-8.
 Gate (job 48606115): each BGC tracer <= 100 x the T/S floor and the floor itself <= 1.1e-4.
+
+### Sharded and gradient gates of the fork (2026-10-29)
+
+`test_recom_sharded_fork.py` first differed in the sinking tracers only (DetC 2.6e-2, DetSi 2.3e-2 after two steps
+from the 30-day state; the physics 1e-14): the fork's whole-array ballast reset (`any(scaling_density <= tiny)`,
+`sinking.ballast`) ran per device, Fortran's per-rank domain, so four devices reproduced a four-rank Fortran and one
+device a one-rank one. **Stated deviation:** the reset now reduces over the whole mesh (the step's global sum
+threaded to `ballast(reduce_sum=)`); fesom-jax reproduces the one-rank twins and is device-count independent. The
+twin gates and the DP lock are unchanged (job 48611804: 36 passed). `test_recom_grad_fork.py` first returned nan for
+every parameter that acts through the light: `sqrt(Etop * Ebot)` of the 3-stream solver is 0 in dark cells, its
+derivative infinite; `spectral._safe_sqrt` (the double `where`, forward-identical: the light gate is unchanged, job
+48611818) fixes it. The fork's 4-PFT build takes the photosynthesis maximum from its `Temp_*` functions and the
+spectral growth from the band absorption, so `P_cm*` and `alfa*` are dead parameters there (finite differences
+exactly 0); the gate differentiates the temperature exponents instead (`docs/PORTING_LESSONS.md` 2026-10-29).

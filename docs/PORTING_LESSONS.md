@@ -10017,3 +10017,32 @@ base's cold-start bugs in its dumps; fixing them in the twin (a cherry-pick with
 host base has no namelist keys for a parameterisation the port implements (the fork's `oce_dyn` has no
 `scaling_GMzexp`, `scaling_ODM95`, `Redi_Ktaper`: its GM/Redi is the FESOM 1.4-style `init_Redi_GM`), switch it off
 on both sides for the gate rather than approximate it; a G4b tests the BGC coupling through the transport, not GM.
+
+### 2026-10-29 (branch recom-spectral, lane W) — a per-rank `any` is partition-dependent physics; a dead parameter is not a plumbing bug; `sqrt(0)` in a dark cell is the adjoint's nan
+
+Three findings from the spectral fork's sharded and gradient gates, one afternoon.
+
+1. **The whole-array ballast reset's domain.** The 4-device run equalled the dense run to 1e-14 in the physics and
+   1e-13 in every non-sinking tracer, and differed by 2.6e-2 in DetC and 2.3e-2 in DetSi after two steps from a grown
+   state. Not round-off: REcoM's `if (any(scaling_density <= tiny)) scaling_density = 1` runs over the rank's array,
+   and the port mirrored it as a per-device `any`, so four devices reproduce a four-rank Fortran and one device a
+   one-rank Fortran, which legitimately differ. The reset now reduces over the whole mesh through the step's global
+   sum (`sinking.ballast(reduce_sum=)`, threaded from `full_bgc_step` through `recom_stage3` and the tracer loop):
+   fesom-jax reproduces the one-rank twins every gate uses and is device-count independent, a stated deviation
+   from Fortran's rank dependence. Lesson: any reduction over "the rank's array" in the host model is physics that
+   changes with the partition; port it over the mesh and say so, never per device. My first reading, a `<= tiny`
+   branch flip on round-off at the floor, was wrong: the differences were in cells far above the floor, which the
+   per-tracer table with `max|dense|` showed at once. Print that column before explaining anything.
+2. **Dead parameters.** The fork's 4-PFT build takes the photosynthesis maximum from its `Temp_*` functions
+   (`exp(ord + expon * T)`), not `P_cm * arrFunc`, and the spectral growth uses the band absorption `alpha_I`, not
+   `alfa`: `P_cm`, `P_cm_c`, `P_cm_d`, `alfa*` have exactly zero finite differences in that build. A zero adjoint
+   next to a nan one is not a threading bug (a parameter that never enters gives a symbolic zero, a parameter that
+   enters through a broken path gives nan); check the one-step finite differences of every parameter first, they
+   cost one forward each. The fork's G6 gate differentiates `expon_phy`, `expon_cocco`, `graz_max`, `rho_N`,
+   `deg_Chl`, `cdomcoeff`.
+3. **`jnp.sqrt` of a product that is exactly zero.** The geometric-mean irradiance of the 3-stream solver,
+   `sqrt(Etop * Ebot)`, is 0 in every dark cell (night, under ice, below the euphotic depth); its derivative is
+   infinite there and the backward pass multiplies it by a zero cotangent: nan in every parameter whose path
+   crosses the light, including `graz_max` and `rho_N` through the state. `jax_debug_nans` on a one-step cost,
+   un-jitted, names the line (`spectral.py:494`). The fix is the forward-identical double `where`
+   (`_safe_sqrt`), as `ice.py` does for the EVP delta; `jnp.maximum(x, tiny)` would have moved the light gate.

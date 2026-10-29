@@ -315,7 +315,7 @@ def full_bgc_step(mesh, st, rcfg, *, params, h0, zbar0, Z0, helem, helem_flux, u
         zbar3_live=zbar0, Z3d_live=Z0, Z3d_new=Z3d_new, gm_diag=gm_diag, Kv_eff=Kv_eff, temp=T_fin, salt=S_fin,
         sfc=r1.sfc, benthos=r1.benthos, geom_sink=geom_sink, params=p, switches=sw, dt=dt_bgc, exch=exch, ckpt=ckpt,
         adj=adj, helem_flux=helem_flux, return_terms=True, legacy_fct_bounds=legacy_fct_bounds,
-        tracer_layout=lay, **({"carry": st.bgc_carry} if _sp else {}))
+        tracer_layout=lay, reduce_sum=reduce_sum, **({"carry": st.bgc_carry} if _sp else {}))
     X_new, X_old_new, benthos_new, res = out3[:4]
 
     # ---- 2-D diagnostics ----

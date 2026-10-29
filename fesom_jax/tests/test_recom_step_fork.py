@@ -40,6 +40,7 @@ from fesom_jax.run_config import load_yaml  # noqa: E402
 REPO = Path(__file__).resolve().parents[2]
 REF = Path(os.environ.get("FESOM_RECOM_FORK_REF", "/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/recom_ref"))
 CFG = REPO / "configs" / "albedo" / "pi_recom_spectral_g4b.yaml"
+RUN_CFG = REPO / "configs" / "albedo" / "pi_recom_spectral.yaml"      # the production spectral config (gm on, no legacy)
 NML_NOWB = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb_jaxphys" / "namelist.recom"
 # the physics-matched twins: the spectral build (37 tracers, the spectral light) and the broadband build (36)
 RUNS = [r for r in os.environ.get("FESOM_RECOM_FORK_G4B_RUNS", "pi_1d_spectral_jaxphys,pi_1d_nowb_jaxphys").split(",")
@@ -58,16 +59,18 @@ FLOOR_MAX = 1.1e-4
 EXTRA = ("recom_out.NPPc", "recom_out.NPPp", "recom_out.GloO2flux", "recom_in.a_ice")
 
 
-def _config(run: str):
-    cfg = load_yaml(CFG)
+def _config(run: str, yaml=CFG):
+    cfg = load_yaml(yaml)
     if "spectral" not in run:                 # the broadband build: the 36-tracer namelist, no spectral light
         cfg = dataclasses.replace(cfg, recom=cfg.recom._replace(namelist=str(NML_NOWB), spectral=False))
     return cfg
 
 
-@lru_cache(maxsize=2)
-def _setup(run: str):
-    cfg = _config(run)
+@lru_cache(maxsize=4)
+def _setup(run: str, yaml=CFG):
+    """The twin ``run``'s step-0 state, forcing and operators under the config ``yaml`` (the gate's by default; the
+    sharded and gradient gates pass the production spectral config)."""
+    cfg = _config(run, yaml)
     phys = cfg.physics_kwargs()
     lay = cfg.recom.layout
     mesh = load_mesh(cfg.mesh)
@@ -81,18 +84,53 @@ def _setup(run: str):
     return dict(cfg=cfg, phys=phys, lay=lay, mesh=mesh, d1=d1, st=st, cf=cf, fs=fs, op=op)
 
 
-def _one_step(fx):
+# the fork's FESOM2 base (cda35117, 2025-10): the FCT limiter bounds without the thickness (before FESOM2
+# 18346243 / 9afdae7b), the absolute shortwave attenuation depth (before #1116, 4aab0efd) and the pre-#944 K33
+# weights (dead with gm null); step.py's docstring: "the REcoM spectral fork needs all three". Twin gates only.
+LEGACY = dict(legacy_fct_bounds=True, legacy_sw_depth=True, legacy_k33_weights=True)
+
+
+def _run(fx, n: int, legacy: bool = True):
+    """``n`` dense steps from the twin's step 0; the states after each step (index 0: the start)."""
     mesh = fx["mesh"]
-    date = surface_forcing.dates_for_steps(1958, fx["cfg"].dt, 1)[0]
+    dates = surface_forcing.dates_for_steps(1958, fx["cfg"].dt, n)
     st = jax.tree.map(jnp.asarray, fx["st"])
-    sf = fx["cf"].step_forcing(*date)
-    # the fork's FESOM2 base (cda35117, 2025-10): the FCT limiter bounds without the thickness (before FESOM2
-    # 18346243 / 9afdae7b), the absolute shortwave attenuation depth (before #1116, 4aab0efd) and the pre-#944 K33
-    # weights (dead here: gm null); step.py's docstring: "the REcoM spectral fork needs all three"
-    st = stepmod.step_jit(st, mesh, fx["op"], jnp.zeros((mesh.elem2D, 2)), dt=fx["cfg"].dt, is_first_step=True,
-                          step_forcing=sf, forcing_static=fx["fs"], legacy_fct_bounds=True, legacy_sw_depth=True,
-                          legacy_k33_weights=True, **fx["phys"])
-    return jax.device_get(st)
+    states = [st]
+    for i in range(n):
+        sf = fx["cf"].step_forcing(*dates[i])
+        st = stepmod.step_jit(st, mesh, fx["op"], jnp.zeros((mesh.elem2D, 2)), dt=fx["cfg"].dt,
+                              is_first_step=(i == 0), step_forcing=sf, forcing_static=fx["fs"],
+                              **(LEGACY if legacy else {}), **fx["phys"])
+        states.append(st)
+    return states
+
+
+def _one_step(fx):
+    return jax.device_get(_run(fx, 1)[1])
+
+
+RESTART = os.environ.get("FESOM_G6_FORK_RESTART",
+                         "/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/pi_recom_spectral/restart")
+
+
+def warm_start(fx, restart=RESTART):
+    """``(state, forcing, start day)`` for the gates that want a grown ecosystem: the 30-day spectral run's restart
+    (``restart``; the lane-W run of job 48603201: a bloom with grazers and detritus above REcoM's ``tiny`` floor)
+    as a new run segment (mstep 1), else the twin's step 0 (day 1)."""
+    mesh, cfg = fx["mesh"], fx["cfg"]
+    if not Path(restart, "zarr.json").exists() and not Path(restart, ".zgroup").exists():
+        return jax.tree.map(jnp.asarray, fx["st"]), fx["cf"], 1
+    from fesom_jax import partit
+    from fesom_jax import zarr_output as zo
+    ser = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
+    st, meta = zo.read_restart(restart, mesh, ser)
+    st = wiring.start_segment(jax.tree.map(lambda a: jnp.asarray(np.asarray(a)), st), cfg.recom)
+    assert st.T.shape == fx["st"].T.shape and st.bgc.shape == fx["st"].bgc.shape
+    day = 1 + int(meta["step"]) * int(cfg.dt) // 86400
+    cf = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=np.asarray(fx["st"].T[:, 0]), dt=cfg.dt,
+                                               mslp=True, bgc_dust_path=cfg.bgc_dust_path(),
+                                               bgc_oasim=cfg.bgc_oasim(), **cfg.forcing_paths())
+    return st, cf, day
 
 
 def _rel(a, b, mask):

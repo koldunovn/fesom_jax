@@ -248,6 +248,16 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   (`docs/recom/VALIDATION.md`, `docs/PORTING_LESSONS.md` 2026-10-29). Lane W's gate G4b is done; G5 (30 days
   against a twin) would need a 30-day physics-matched twin and inherits the ice floor.
 
+- 2026-10-29, the fork's sharded and gradient gates: `test_recom_sharded_fork.py` (pi dist_4 of the packaged pi,
+  the fork bundle shares its nodes/elements/edges; 2 steps of the production spectral config from the 30-day
+  restart; worst tracer 3.2e-13, physics 1.1e-14, job 48611814) and `test_recom_grad_fork.py` (G6: the 1-day NPP cost
+  vs FD, expon_phy 4.4e-6, expon_cocco 6.6e-7, rho_N 8.2e-5, deg_Chl 6.0e-8, cdomcoeff 1.2e-7, graz_max numerically
+  zero; job 48611817). Two fixes on the way: the ballast reset's `any` reduces over the whole mesh (was per
+  device = Fortran's per-rank domain: DetC 2.6e-2 sharded vs dense; the stated deviation, `sinking.ballast(reduce_sum=)`),
+  and `spectral._safe_sqrt` for the dark-cell `sqrt(0)` whose infinite derivative made every light-crossing gradient
+  nan. `P_cm*`/`alfa*` are dead in the fork's 4-PFT spectral build (`Temp_*`, `alpha_I`). Lane W's gates are complete
+  (`docs/recom/VALIDATION.md`). Open: `forcing.repeat_year`, the warm-start converter, the CORE2 comparison, the merge.
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.

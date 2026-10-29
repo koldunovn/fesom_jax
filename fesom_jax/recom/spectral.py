@@ -78,6 +78,15 @@ DARWIN_PART_SIZE_P = 1.06e-13                        # M:2617 [mmol C particle-1
 AP_MISSING = (9.9e2, 8.9e2, 8.9e2, 8.9e2)            # M:3527-3570 sentinel spectra of a group the file lacks
 
 
+
+def _safe_sqrt(x):
+    """``sqrt(x)`` for ``x >= 0`` with a finite derivative at 0: the value is ``jnp.sqrt`` (0 at 0, and 0 for a
+    negative round-off argument where ``jnp.sqrt`` gives nan), the derivative 0 at ``x <= 0`` instead of
+    ``inf`` (``jax.grad`` of a dark cell's geometric-mean irradiance multiplied ``0 * inf`` into nan: the fork's G6
+    gate, 2026-10-29). The double ``where`` keeps the unselected branch's derivative finite."""
+    ok = x > 0.0
+    return jnp.where(ok, jnp.sqrt(jnp.where(ok, x, 1.0)), 0.0)
+
 def _band_edges():
     """``darwin_wavebands`` (M:2884-2897): the first and last edges at the first and last band values, the others
     half-way; ``wb_width`` and ``wb_totalWidth`` (M:2901-2905)."""
@@ -422,7 +431,8 @@ def radtrans_direct(H, rmud, Edsf, Essf, a_k, bt_k, bb_k) -> RadTrans:
     Bd = bb_k * rmud
     Fd = (bt_k - bb_k) * rmud
     bquad = Cs + Cu
-    D = 0.5 * (bquad + jnp.sqrt(jnp.maximum(bquad * bquad - 4.0 * Bs * Bu, 0.0)))
+    disc = jnp.maximum(bquad * bquad - 4.0 * Bs * Bu, 0.0)
+    D = 0.5 * (bquad + _safe_sqrt(disc))
     kappa1 = D - Cs
     kappa2 = Cs - Bs * Bu / D
     r1 = Bu / D
@@ -491,7 +501,7 @@ def radtrans_direct(H, rmud, Edsf, Essf, a_k, bt_k, bb_k) -> RadTrans:
     W = jnp.asarray(WTOUEINS, f64)[None, None, :]
     Etopwq = (rmud * Edtop + rmus * Estop + rmuu * Eutop) * W
     Ebotwq = (rmud * Edbot + rmus * Esbot + rmuu * Eubot) * W
-    tirrwq = jnp.sqrt(Etopwq * Ebotwq)
+    tirrwq = _safe_sqrt(Etopwq * Ebotwq)                     # a dark cell: sqrt(0), its derivative finite (0)
     tirrq = jnp.zeros((N, nl1), f64)
     for nl in range(TLAM):                                                              # darwin_PAR_ilamLo..Hi = 1..13
         tirrq = tirrq + tirrwq[..., nl]
@@ -512,7 +522,7 @@ def beer_lambert(H, Edsf, Essf, a_k):
         hk, ak = xs
         wetk = (hk > 0.0)[:, None]
         dn = up * jnp.exp(-ak * hk[:, None])
-        parw = jnp.where(wetk, jnp.sqrt(up * dn), 0.0)
+        parw = jnp.where(wetk, _safe_sqrt(up * dn), 0.0)
         return jnp.where(wetk, dn, up), parw
     _, parw = jax.lax.scan(step, up0, (jnp.moveaxis(H, 1, 0), jnp.moveaxis(a_k, 1, 0)))
     parw = jnp.moveaxis(parw, 0, 1)

@@ -138,7 +138,9 @@ then runs `sms_fork.py`/`stage1.recom_sources_sinks_fork`, the layout-aware `sin
 Configs `configs/albedo/pi_recom_spectral.yaml`, `core2_recom_spectral.yaml`; gates `test_recom_*_fork.py`,
 `test_recom_spectral_*.py` against the fork's own twins (`docs/recom/VALIDATION.md`, the plan
 `docs/plans/20261028-recom-spectral-port.md`). The fork's FESOM2 base needs `legacy_k33_weights`,
-`legacy_fct_bounds` and its own level files in a twin gate. The 692f804 programs stay byte-identical.
+`legacy_fct_bounds`, `legacy_sw_depth` and its own level files in a twin gate; its GM/Redi is not matchable (the
+physics-matched one-day twins run GM/Redi off). Stated deviation: the fork's whole-array ballast reset reduces over
+the whole mesh, not the rank. The 692f804 programs stay byte-identical.
 
 **Adjoint toolkit.** `adjoint.py`, `adjoint_sharded.py`, `adjoint_check.py`, `adjoint_costs.py`,
 `longwindow.py`, `calibrate.py`, `eki.py`, `tke_nn.py`, `gm_nn.py`; drivers under
