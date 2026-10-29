@@ -110,8 +110,13 @@ _ARCHIVE_PERIODS = ("year", "month", "day")
 # nm_fe_data_file when that is an absolute path (FESOM2 reads it from ClimateDataPath, which a run YAML does not have).
 # `co2_file` (full REcoM with constant_CO2 off): the AtmCO2_<year> monthly time series; absent ⇒ the namelist's
 # nm_co2_data_file when that is an absolute path (as dust_file).
+# `repeat_year` (FESOM2's y_perpetual): the tag of the repeat-year JRA files, `{var}.{tag}.nc` for every model year
+# (`clim61` for the JRA55-do climatology of the REcoM spectral runs); absent ⇒ `{var}.{year}.nc`.
+# `chl_const` (FESOM2's chl_data_source 'None' + chl_const): a constant chlorophyll [mg/m3] for the shortwave
+# penetration instead of the Sweeney climatology file.
 _FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path",
-                 "on_device", "mslp", "dust_file", "co2_file", "oasim_dir", "oasim_pattern")
+                 "on_device", "mslp", "dust_file", "co2_file", "oasim_dir", "oasim_pattern",
+                 "repeat_year", "chl_const")
 _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 # The `ssh:` mapping — SSH CG solver options. `cheb_degree` (int ≥1) enables the degree-k
 # Chebyshev polynomial preconditioner (CGPOLY, ssh.enable_cheb_precond) in place of the
@@ -220,7 +225,12 @@ class RunConfig:
         :func:`fesom_jax.surface_forcing.build_surface_forcing` (absent key ⇒ ``None`` ⇒ the
         reader resolves it via ``$FESOM_*`` / the Levante default, :mod:`fesom_jax.paths`)."""
         f = self.forcing or {}
-        return {k: f.get(k) for k in _FORCING_PATH_KEYS}
+        out = {k: f.get(k) for k in _FORCING_PATH_KEYS}
+        if f.get("repeat_year") is not None:                      # the repeat-year file tag (jra55.JRA55Reader)
+            out["jra_tag"] = str(f["repeat_year"])
+        if f.get("chl_const") is not None:
+            out["chl_const"] = float(f["chl_const"])
+        return out
 
     def bgc_dust_path(self):
         """The Albani dust file for REcoM's per-step inputs (:class:`fesom_jax.surface_forcing.BgcForcing`), or None

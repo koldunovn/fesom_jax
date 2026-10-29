@@ -193,7 +193,8 @@ def test_off_adds_no_leaf(mesh):
     d = _dates((YEAR, 1, 0.0), 3)
     sf = cf.step_forcing(*d[0])
     assert sf.fe_dust is None and sf.daynew is None and sf.ndpyr is None and sf.co2_atm is None
-    assert len(jax.tree.leaves(sf)) == len(surface_forcing.StepForcing._fields) - 5     # + press_air off
+    # off: press_air, the four REcoM inputs (fe_dust, daynew, ndpyr, co2_atm) and the two OASIM tables (lane F)
+    assert len(jax.tree.leaves(sf)) == len(surface_forcing.StepForcing._fields) - 7
     tables, sched = cf.stack_tables(d, nb=3)
     assert tables.dust is None and sched.didx is None and sched.daynew is None
     with pytest.raises(ValueError, match="needs dt"):

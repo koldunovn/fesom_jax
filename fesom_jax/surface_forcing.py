@@ -511,7 +511,7 @@ def build_surface_forcing(mesh: Mesh, year: int, *, sst_ic=None,
                        forcing_midstep: bool = True,
                        mslp: bool = False,
                        bgc_dust_path: str | None = None,
-                       dt_ramp=None, bgc_co2=None, bgc_oasim=None) -> SurfaceForcing:
+                       dt_ramp=None, bgc_co2=None, bgc_oasim=None, jra_tag=None) -> SurfaceForcing:
     """Build the surface-forcing driver for a JRA55-do ``year`` (host setup, ~seconds).
     Mesh-agnostic: works on any :class:`~fesom_jax.mesh.Mesh` (pi, farc, dars, CORE2, NG5).
 
@@ -543,8 +543,10 @@ def build_surface_forcing(mesh: Mesh, year: int, *, sst_ic=None,
     ``year``). None (the default) adds nothing. ``dt_ramp`` also sets the
     forcing's mid-step offset after the switch (:func:`set_midstep`). ``bgc_oasim`` (the spectral fork with OASIM,
     :meth:`fesom_jax.run_config.RunConfig.bgc_oasim`): ``dict(path, pattern, ed_var, es_var)`` of the OASIM
-    climatology, read on the mesh by :func:`fesom_jax.recom.oasim.read_oasim_clim` and held with the dust."""
-    jra = jra55.JRA55Reader(mesh, year, jra_dir, mslp=mslp)
+    climatology, read on the mesh by :func:`fesom_jax.recom.oasim.read_oasim_clim` and held with the dust.
+    ``jra_tag`` (``forcing.repeat_year``): the repeat-year JRA files ``{var}.{tag}.nc`` for every model year
+    (:class:`fesom_jax.jra55.JRA55Reader`)."""
+    jra = jra55.JRA55Reader(mesh, year, jra_dir, mslp=mslp, tag=jra_tag)
     set_midstep(jra, dt, forcing_midstep, dt_ramp, year)
     sss = sss_runoff.build_reader(mesh, sss_path, runoff_path)
     if chl_const is None:

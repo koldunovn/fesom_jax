@@ -258,6 +258,16 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   nan. `P_cm*`/`alfa*` are dead in the fork's 4-PFT spectral build (`Temp_*`, `alpha_I`). Lane W's gates are complete
   (`docs/recom/VALIDATION.md`). Open: `forcing.repeat_year`, the warm-start converter, the CORE2 comparison, the merge.
 
+- 2026-10-29, lane W's tail: `forcing.repeat_year` (the JRA reader's file tag, `jra55.JRA55Reader(tag=)`, FESOM2's
+  `y_perpetual`: the clim61 climatology's 365-day axis rebased to every model year; `test_repeat_year.py` on the
+  Maresys files, job 48617080) and `forcing.chl_const`; `scripts/recom/fortran_restart_to_jax.py` converts the user's
+  1997 4-PFT Fortran restart (positional tracer files, the AB2 histories, the ice, the benthos and HPlus; thicknesses
+  rebuilt from hbar since fesom-jax has no partial cells; Alk_surf from the IC) into
+  `fesom_jax_runs/restart_1997_4pft_jax` (job 48617062, 95 s); `configs/albedo/core2_recom_spectral_warm1998.yaml`
+  runs from it with the user's forcing: 32 steps on one A100, job 48617081, 3.2 s/step. The 1997 benthos pools of
+  the Fortran state are huge (median BenC 1e11 mmol m-2) and are carried as they are. Open: the CORE2 comparison
+  figures against `tmp_run_kdind15`, the merge.
+
 ## Rules (as the parent REcoM port)
 
 - Mirror the fork exactly, quirks included; anything not mirrored goes into the plan and `docs/PORTING_LESSONS.md`.

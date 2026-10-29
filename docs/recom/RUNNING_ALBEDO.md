@@ -116,3 +116,30 @@ restarts are as in RUNNING.md ("What comes out"); the monthly zarr stores open w
 For comparison, Levante's 4x GH200 do the double-precision CORE2 + REcoM step in 0.060 s (RUNNING.md). A single
 PCIe A100 is the wrong hardware for production hindcasts; it is enough for development, gates and short tests.
 Both CORE2 runs ended `FINITE n_nonfinite=0` and wrote a restart.
+
+## CORE2 + the spectral fork warm-started from the 1997 4-PFT Fortran restart (GPU)
+
+The user's experiment setup: the spun-up 1997 state of `/albedo/work/projects/p_specbic/sloza/restart_1997_4pft`
+(its README: the colleague's 2-PFT 1997 restart plus the cocco/phaeo and CDOM fields of the kdind15 run), the
+JRA55-do repeat-year climatology `clim61` (FESOM2 `y_perpetual`), CORE2 runoff and PHC2 SSS from the FESOM2 pool,
+a constant chlorophyll 0.1 for the shortwave penetration, the OASIM climatology.
+
+```bash
+# 1. the Fortran restart -> a fesom-jax restart store (a CPU node, ~2 min, 120 GB requested)
+python scripts/recom/fortran_restart_to_jax.py --restart /albedo/work/projects/p_specbic/sloza/restart_1997_4pft \
+    --year 1997 --config configs/albedo/core2_recom_spectral_warm1998.yaml \
+    --out /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/restart_1997_4pft_jax --date 1998-doy001
+# 2. the run (one GPU), --year = the config's start_year (run_from_config defaults to 1958)
+OUT=<new dir> CONFIG=configs/albedo/core2_recom_spectral_warm1998.yaml \
+    sbatch --export=ALL,OUT,CONFIG scripts/albedo/run_core2_gpu.sbatch --steps 11680 --year 1998 \
+    --restart-out $OUT/restart --monthly-out $OUT/monthly
+```
+
+`forcing.repeat_year: clim61` makes the JRA reader open `{var}.clim61.nc` for every model year and rebase its
+365-day axis to that year (the 366th day of a leap year holds the last record, as FESOM2); `forcing.chl_const: 0.1`
+replaces the Sweeney file. The converter maps the positional `tra00NN` files (positions 6/12/14/39 are `sf6`,
+`cfc12`, `r14c`, `r39ar`) onto the config's layout, carries the AB2 histories (`_M1`, `urhs_AB`, `ssh_rhs_old`),
+rebuilds the layer thicknesses from `hbar` (fesom-jax has no partial cells; the user's run has them), takes
+`Alk_surf` from the IC set as REcoM does at setup, and fills the few cells below the Fortran bottom with the
+column's deepest value (2 nodes on CORE2). `PROVENANCE.json` in the store records all of it. Note that the 1997
+benthos pools are huge (median benthic C 1e11 mmol m-2 in the Fortran restart itself); the model carries them.

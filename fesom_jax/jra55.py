@@ -341,13 +341,23 @@ class JRA55Reader:
             return self.midstep_days_after
         return self.midstep_days
 
-    def __init__(self, mesh, year: int, jra_dir: str | Path | None = None, *, mslp: bool = False):
+    def __init__(self, mesh, year: int, jra_dir: str | Path | None = None, *, mslp: bool = False,
+                 tag: str | None = None):
         """``jra_dir=None`` ⇒ resolved from ``$FESOM_JRA_DIR``, else the Levante default
         (:func:`fesom_jax.paths.require`, which raises an actionable ``FileNotFoundError``
         if the directory is absent). ``mslp`` (FESOM2's ``l_mslp``) adds ``psl`` as a ninth field
-        (:data:`I_MSLP`); off, the reader opens and returns exactly the eight fields it always did."""
+        (:data:`I_MSLP`); off, the reader opens and returns exactly the eight fields it always did.
+
+        ``tag`` (FESOM2's ``y_perpetual``, the run YAML's ``forcing.repeat_year``): the files are
+        ``{var}.{tag}.nc`` for every model year instead of ``{var}.{year}.nc`` (``tag="clim61"`` for the
+        JRA55-do repeat-year climatology ``uas.clim61.nc`` ...). The file's time axis, days from the start
+        of ITS year, is rebased to the model year as every year is (``_Field``), so the same year of data
+        drives every model year; the model date uses the file's calendar (a ``365_day`` file: a 365-day
+        year, as FESOM2's ``julday`` with ``y_perpetual``), and the 366th day of a leap model year holds
+        the last record (the no-future-extrapolation clamp of ``getcoeffld``, FESOM2's too)."""
         self.year = int(year)
         self.mslp = bool(mslp)
+        self.tag = None if tag is None or str(tag) == "" else str(tag)
         self.vars = JRA_VARS + ((MSLP_VAR,) if self.mslp else ())
         self.N = int(mesh.nod2D)
         self.jra_dir = Path(paths.require("jra_dir", jra_dir))
@@ -379,7 +389,8 @@ class JRA55Reader:
     def _open_fields(self, year: int) -> "list[_Field]":
         """Open the 8 JRA fields (9 with ``mslp``) for ``year`` (``{var}.{year:04d}.nc``) and verify they share
         one (lon,lat) grid — the precondition for the single shared bilinear stencil."""
-        fields = [_Field(var, str(self.jra_dir / f"{var}.{int(year):04d}.nc"), int(year))
+        suffix = f"{int(year):04d}" if self.tag is None else self.tag
+        fields = [_Field(var, str(self.jra_dir / f"{var}.{suffix}.nc"), int(year))
                   for var in self.vars]
         f0 = fields[0]
         for f in fields[1:]:
