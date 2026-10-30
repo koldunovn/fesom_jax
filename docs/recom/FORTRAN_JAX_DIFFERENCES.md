@@ -19,16 +19,21 @@ differences can be read as the sensitivity of the biology to the host physics.
 Run directories under `/albedo/work/user/sloza/SPECTRAL/`, output under `/albedo/work/projects/p_specbic/sloza/`. The
 cold and warm Fortran runs have identical `namelist.oce/tra/ice/dyn/forcing`.
 
-## Biology: the same, except one switch
+## Biology: two differences
 
-`namelist.recom` is identical apart from the input paths. The one difference is the CO2 limitation of the spectral
-photosynthesis:
+`namelist.recom` is identical apart from the input paths. The REcoM code differs in two places:
 
-- The fork applies `CO2lim` only in the broadband (`#else`) branches of `recom_sms.F90` (2544, 2605, 2665, 2723).
-  With `CO2lim = .true.` (both user runs) the spectral `Cphot` is still not CO2-limited.
-- fesom-jax's `RecomConfig.spectral_co2lim` (default `True`, the user's stated deviation of 2026-10-28) applies it.
-  The cold 1958-59 run had it on, so its comparison mixes this biology difference with the physics. The warm 1998
-  run has `spectral_co2lim: false`, the fork's behaviour.
+1. **The upstream REcoM commits.** The fesom-jax port was gated against the branch
+   `fesom2.6_recom_tra_diags_spectral_recom692` = the fork's `e1e62886` plus 11 upstream REcoM commits cherry-picked
+   (plan, lane 0). The user's production builds (`recom_tra_diags_spectral`) do not have them. Most are refactors or
+   crash/NaN fixes, but `1cc2d0d3` "Bugfixes related to ballasting" changes the result: it removes the detritus-C
+   threshold (0.001) under which the ballasted sinking was adjusted, which its message says gave a large air-sea CO2
+   uptake. The user runs have `use_ballasting = .true.`, so fesom-jax carries the fix and the production runs do not.
+   Whether the benthos "deduplicate" commits (`fd834980`, `663b467c`) change values was not checked.
+2. **CO2 limitation of the spectral photosynthesis.** The fork applies `CO2lim` only in the broadband (`#else`)
+   branches of `recom_sms.F90` (2544, 2605, 2665, 2723). With `CO2lim = .true.` (both user runs) the spectral `Cphot`
+   is still not CO2-limited. fesom-jax's `RecomConfig.spectral_co2lim` (default `True`, the user's stated deviation
+   of 2026-10-28) applies it. The cold 1958-59 run had it on; the warm 1998 runs have `spectral_co2lim: false`.
 
 Stated fesom-jax deviations that remain (VALIDATION.md): the ballast reset reduces over the whole mesh, not per
 rank; the first-call ballast reset at step 1 is skipped.
@@ -48,9 +53,9 @@ rank; the first-call ballast reset at step 1 is skipped.
 | sea-ice code | the fork's 2025-10 ice | current FESOM2 ice | not by namelist; it sets the residual floor of the one-day pair (a_ice 3.2e-4) |
 | partial cells | `use_partial_cell .true.` | none (layer thicknesses from `hbar`) | Fortran `.false.` |
 | tracer advection weights | `tra_adv_ph/pv 1., 1.` | `0., 1.` only | Fortran `0., 1.` |
-| FCT limiter bounds | without the thickness (before upstream 18346243 / 9afdae7b) | with `/hnode` | fesom-jax `legacy_fct_bounds` (a step kwarg, not yet a YAML key) |
-| Redi K33 weights | before upstream #944 | current | fesom-jax `legacy_k33_weights` (step kwarg) |
-| shortwave attenuation depth | absolute (before upstream #1116) | relative | fesom-jax `legacy_sw_depth` (step kwarg) |
+| FCT limiter bounds | without the thickness (before upstream 18346243 / 9afdae7b) | with `/hnode` | fesom-jax `legacy: {fct_bounds: true}` |
+| Redi K33 weights | before upstream #944 | current | fesom-jax `legacy: {k33_weights: true}` |
+| shortwave attenuation depth | absolute (before upstream #1116) | relative | fesom-jax `legacy: {sw_depth: true}` |
 | first forcing window winds | left unrotated on the rotated grid (fixed upstream in 66658357) | rotated | the fork with 66658357 cherry-picked (the G4b twins' executable); one forcing window only |
 
 ## Forcing and setup
@@ -63,14 +68,25 @@ partial cells, and fills 2 nodes below the Fortran bottom).
 
 ## Reading the comparison
 
-- With `spectral_co2lim: false` (the warm 1998 run) the remaining differences are the physics table above, so the
-  Fortran - fesom-jax difference is the response of the biology to that set of physics changes taken together. It
-  does not attribute the response to one of them.
+- Against the user's production run (kdind15w), the warm 1998 fesom-jax run with `spectral_co2lim: false` still
+  differs by the physics table and by the upstream REcoM fixes (the ballasting fix above). The difference is the
+  response to both taken together; it does not attribute it to one of them.
 - The one-day pair with the physics matched by namelist (G4b: TKE, mEVP, `ice_diff 10`, no momix, GM/Redi off, the
-  three legacy flags, 66658357) agrees to 5.4e-5 in T and every BGC tracer to 2.0e-5. A CORE2 run of that pair
-  would isolate what is left (the fork's ice code, chaos) and leave GM/Redi out of the comparison.
+  three legacy flags, 66658357) agrees to 5.4e-5 in T and every BGC tracer to 2.0e-5.
 - Even with matched physics, two runs drift apart node by node within months (chaos). Compare multi-year runs by
   global NPP, CO2 flux, inventories, seasonal cycles and patterns, not pointwise.
+
+## The physics-matched CORE2 pair (warm 1998, submitted 2026-10-30)
+
+| | Fortran | fesom-jax |
+|---|---|---|
+| setup | `tmp_run_kdind15wjp` (README.jaxphys), the G4b twins' executable (fork + upstream REcoM fixes + 66658357), kdind15w with cvmix TKE, no momix, GM/Redi off, `opt_visc 7`, mEVP, `ice_diff 10`, weights `0., 1.`, no partial cells | `configs/albedo/core2_recom_spectral_warm1998_jaxphys.yaml`: `gm: null`, `legacy: {}`, `spectral_co2lim: false` |
+| job | 48627143 -> `fesom2.6_spectral_kdind15wjp` | 48627146-47 -> `fesom_jax_runs/core2_recom_spectral_warm1998_jaxphys` |
+
+Same REcoM code and the physics matched as far as the fork's base allows, so what this pair still differs by is the
+fork's sea-ice code and chaos. Together with kdind15w vs kdind15wjp (both Fortran) it splits the production
+comparison into the physics part and the rest: kdind15w - kdind15wjp is the response to the physics settings plus
+the REcoM fixes, kdind15wjp - fesom-jax is the residual.
 
 ## The cold 1958-59 run (co2lim on, all physics differences), for the record
 

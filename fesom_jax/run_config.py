@@ -26,6 +26,7 @@ YAML schema (every key optional; absent ⇒ the bit-identical default)::
     ice:   {}            # mEVP sea ice (needed for NG5 LKFs)
     visc:  {gamma1: 0.2} # only the NON-default γ's (NG5)
     tracer: {}           # the implemented MFCT/QR4C/FCT (0,1); other schemes raise
+    legacy: null         # {} = the spectral fork base's K33 weights, FCT bounds, sw depth (LegacyConfig)
     dt: 180.0
     dt_ramp: {after_step: 480, dt: 240.0}   # cold 180 → prod 240 (a dt-CHANGE across restart)
     mesh: /work/.../ng5
@@ -87,10 +88,25 @@ class DtRamp(NamedTuple):
     dt: float
 
 
+class LegacyConfig(NamedTuple):
+    """The older FESOM2 behaviours of the REcoM spectral fork's base (cda35117), for runs matched to it
+    (docs/recom/FORTRAN_JAX_DIFFERENCES.md): the :func:`fesom_jax.step.step` kwargs ``legacy_k33_weights`` (the
+    Redi K33 interface weights before #944), ``legacy_fct_bounds`` (the FCT limiter bounds without the thickness,
+    before 18346243) and ``legacy_sw_depth`` (the absolute shortwave attenuation depth, before #1116). ``legacy:
+    null`` (the default) passes none of them, so the program is unchanged; ``legacy: {}`` turns all three on."""
+    k33_weights: bool = True
+    fct_bounds: bool = True
+    sw_depth: bool = True
+
+    def step_kwargs(self) -> dict:
+        return dict(legacy_k33_weights=bool(self.k33_weights), legacy_fct_bounds=bool(self.fct_bounds),
+                    legacy_sw_depth=bool(self.sw_depth))
+
+
 # Map each physics slot name → its sub-config type (the (de)serialization registry).
 _SUBCONFIGS = {
     "ale": AleConfig, "gm": GMConfig, "kpp": KppConfig,
-    "tke": TkeConfig, "ice": IceConfig, "recom": RecomConfig,
+    "tke": TkeConfig, "ice": IceConfig, "recom": RecomConfig, "legacy": LegacyConfig,
 }
 # Non-physics scalar/spec fields that pass through YAML verbatim.
 _SPEC_FIELDS = ("dt", "mesh", "partition", "precision", "forcing", "ssh", "gpu", "output_dir",
@@ -187,6 +203,7 @@ class RunConfig:
     tke: Optional[TkeConfig] = None        # None = no TKE (mutually exclusive with kpp)
     ice: Optional[IceConfig] = None        # None = no sea ice; IceConfig() = mEVP
     recom: Optional[RecomConfig] = None    # None = no REcoM biogeochemistry (fesom_jax.recom)
+    legacy: Optional[LegacyConfig] = None  # None = current FESOM2; {} = the spectral fork base's older behaviours
     # --- promoted run-dependent scalars ---
     visc: ViscConfig = ViscConfig()        # the horizontal-viscosity γ's (NG5: gamma1=0.2)
     tracer: TracerConfig = TracerConfig()  # the tracer scheme selector (implemented = NG5)
@@ -384,6 +401,8 @@ class RunConfig:
                                               "BGC-every-k sums and k-step stage have no single-precision scheme)")
                 if self.forcing is None:
                     raise ValueError("full REcoM needs the forced path (forcing: with mslp: true)")
+        if self.legacy is not None and self.forcing is None:
+            raise NotImplementedError("legacy: is threaded through the forced runner only (forcing: needed)")
         if self.precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {self.precision!r}")
         if self.precision == "single":
@@ -481,6 +500,8 @@ class RunConfig:
                   ale_cfg=self.ale_cfg(), visc_cfg=self.visc, tracer_cfg=self.tracer)
         if self.recom is not None:      # only when on: a runner without REcoM support then refuses it loudly
             kw["recom_cfg"] = self.recom
+        if self.legacy is not None:     # likewise: the forced runner takes it, validate() refuses it elsewhere
+            kw["legacy_cfg"] = self.legacy
         return kw
 
     def dt_at(self, step: int) -> float:
