@@ -19,9 +19,13 @@ from typing import NamedTuple, Optional
 PASSIVE_BC = ("zero", "salt")
 IC_SETS = ("pi", "pi_present", "core2", "core2_present")
 # The BGC fields a run can write into its mean-output streams (fesom_jax.recom.wiring.output_fields): 3-D tracers
-# (Chl = PhyChl + DiaChl) and the 2-D diagnostics of State.bgc_diag
+# (Chl = the sum of the groups' chlorophyll; the per-group carbon and chlorophyll) and the 2-D diagnostics of
+# State.bgc_diag (npp = the sum of the groups' column NPP; npp_<group> one group's). Cocco and Phaeo fields need
+# enable_coccos.
 OUTPUT_FIELDS = ("DIC", "Alk", "DIN", "DSi", "DFe", "O2", "Chl", "co2flux", "pco2surf", "npp", "export100", "ph",
-                 "o2flux")
+                 "o2flux", "PhyC", "PhyChl", "DiaC", "DiaChl", "CoccoC", "CoccoChl", "PhaeoC", "PhaeoChl",
+                 "npp_phy", "npp_dia", "npp_cocco", "npp_phaeo")
+_COCCO_OUTPUT = ("CoccoC", "CoccoChl", "PhaeoC", "PhaeoChl", "npp_cocco", "npp_phaeo")
 
 
 class RecomConfig(NamedTuple):
@@ -128,6 +132,9 @@ class RecomConfig(NamedTuple):
             bad = sorted(set(self.output) - set(OUTPUT_FIELDS))
             if bad:
                 raise ValueError(f"recom.output: unknown fields {bad}; allowed {list(OUTPUT_FIELDS)}")
+            cocco = sorted(set(self.output) & set(_COCCO_OUTPUT))
+            if cocco and not self.layout.enable_coccos:
+                raise ValueError(f"recom.output: {cocco} need the coccolithophores and Phaeocystis (enable_coccos)")
             return self
         if self.passive_tracers <= 0:
             raise NotImplementedError(

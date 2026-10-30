@@ -70,6 +70,16 @@ from .tracers import NTR, SLOT
 RAD = math.pi / 180.0                      # FESOM2 rad (oce_modules.F90:34-35)
 SECONDS_PER_DAY = 86400.0
 DIAG2D = ("co2flux", "pco2surf", "npp", "export100", "ph", "o2flux")
+# the per-group column NPP [mmol C m-2 d-1] (stage 1's NPPn/NPPd/NPPc/NPPp): extra State.bgc_diag columns after DIAG2D,
+# present only when recom.output names them (diag2d_names), so a run that asks for none keeps its program
+NPP_GROUPS = (("npp_phy", "NPPn"), ("npp_dia", "NPPd"), ("npp_cocco", "NPPc"), ("npp_phaeo", "NPPp"))
+# the per-group phytoplankton carbon and chlorophyll tracers recom.output can name (3-D, by the layout's names)
+PHYTO_OUT = ("PhyC", "PhyChl", "DiaC", "DiaChl", "CoccoC", "CoccoChl", "PhaeoC", "PhaeoChl")
+
+
+def diag2d_names(rcfg) -> tuple:
+    """The columns of ``State.bgc_diag``: :data:`DIAG2D`, then the :data:`NPP_GROUPS` ``rcfg.output`` names."""
+    return DIAG2D + tuple(n for n, _ in NPP_GROUPS if n in rcfg.output)
 BUDGET_TERMS = ("surface", "stage1", "loop", "clip")
 POC_IDS = (1005, 1008, 1014, 1026)         # PhyC, DetC, DiaC, DetZ2C (+ CoccoC, PhaeoC in the fork's 4-PFT layout)
 EXPORT_DEPTH = 100.0                       # [m]
@@ -165,7 +175,7 @@ def segment_fields(n: int, nl1: int, rcfg, xp=jnp, ntr: int = NTR) -> dict:
     """The fields that restart with every run segment: ``bgc_mstep`` 0, the carbonate cache, the diagnostics and the
     budget sums zero (``ntr`` the tracer count of the State's stack; the layout's, not read from the namelist here)."""
     out = dict(bgc_carb=xp.zeros((n, nl1, len(CARB_FIELDS))), bgc_mstep=xp.zeros((n,), np.int32),
-               bgc_diag=xp.zeros((n, len(DIAG2D))))
+               bgc_diag=xp.zeros((n, len(diag2d_names(rcfg)))))
     if rcfg.budget:
         out["bgc_budget"] = xp.zeros((n, len(BUDGET_TERMS), int(ntr)))
     return out
@@ -186,7 +196,7 @@ def start_segment(state, rcfg):
     z3 = T[..., :-1] * 0
     out = dict(bgc_mstep=z2.astype(np.int32),
                bgc_carb=xp.stack([z3] * len(CARB_FIELDS), axis=-1),
-               bgc_diag=xp.stack([z2] * len(DIAG2D), axis=-1))
+               bgc_diag=xp.stack([z2] * len(diag2d_names(rcfg)), axis=-1))
     if rcfg.budget:
         ntr = int(state.bgc.shape[-1])
         out["bgc_budget"] = xp.stack([xp.stack([z2] * ntr, axis=-1)] * len(BUDGET_TERMS), axis=-2)
@@ -330,7 +340,8 @@ def full_bgc_step(mesh, st, rcfg, *, params, h0, zbar0, Z0, helem, helem_flux, u
     npp = d2["NPPn"] + d2["NPPd"]
     if lay.enable_coccos:
         npp = npp + d2["NPPc"] + d2["NPPp"]
-    diag = jnp.stack([s.GloCO2flux, s.GloPCO2surf, npp, export, s.GloHplus, s.GloO2flux], axis=-1)
+    groups = [d2[src] for name, src in NPP_GROUPS if name in rcfg.output]
+    diag = jnp.stack([s.GloCO2flux, s.GloPCO2surf, npp, export, s.GloHplus, s.GloO2flux] + groups, axis=-1)
     out = dict(bgc=X_new, bgc_old=X_old_new, bgc_benthos=benthos_new,
                bgc_carb=jnp.stack([getattr(r1.carb, f) for f in CarbCache._fields], axis=-1),
                bgc_mstep=st.bgc_mstep + 1, bgc_diag=diag)
@@ -376,10 +387,12 @@ _TRACER_OUT = {"DIC": 1002, "Alk": 1003, "DIN": 1001, "DSi": 1018, "DFe": 1019, 
 
 def output_fields(s, rcfg) -> dict:
     """The BGC fields ``rcfg.output`` names, from a State ``s`` (inside the chunk scan's per-step sum): 3-D tracers
-    ``(nod, nl)`` (``Chl`` = PhyChl + DiaChl) and the 2-D diagnostics of ``State.bgc_diag``."""
+    ``(nod, nl)`` (``Chl`` = PhyChl + DiaChl, + CoccoChl + PhaeoChl with coccos; the :data:`PHYTO_OUT` groups) and the
+    2-D diagnostics of ``State.bgc_diag`` (:func:`diag2d_names`)."""
     out = {}
     lay = rcfg.layout
     slot = lay.slot_map
+    cols = diag2d_names(rcfg)
     for name in rcfg.output:
         if name in _TRACER_OUT:
             out[name] = s.bgc[..., slot[_TRACER_OUT[name]]]
@@ -387,8 +400,10 @@ def output_fields(s, rcfg) -> dict:
             out[name] = s.bgc[..., slot[1006]] + s.bgc[..., slot[1015]]
             if lay.enable_coccos:
                 out[name] = out[name] + s.bgc[..., slot[lay.cocco_ids[2]]] + s.bgc[..., slot[lay.phaeo_ids[2]]]
+        elif name in PHYTO_OUT:
+            out[name] = s.bgc[..., lay.names.index(name)]
         else:
-            out[name] = s.bgc_diag[..., DIAG2D.index(name)]
+            out[name] = s.bgc_diag[..., cols.index(name)]
     return out
 
 

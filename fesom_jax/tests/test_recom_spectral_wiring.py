@@ -87,6 +87,35 @@ def test_spectral_config_validates():
     assert cfg.bgc_dust_path().endswith("DustClimMonthlyAlbani_pimesh.nc")
 
 
+def test_per_group_outputs():
+    """recom.output can name the four groups' carbon, chlorophyll and column NPP; the NPP columns join State.bgc_diag
+    only when named, so a run that names none keeps the DIAG2D shape."""
+    from types import SimpleNamespace
+    from fesom_jax.recom import wiring as W
+    nowb = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb" / "namelist.recom"
+    r692 = REPO / "scripts" / "recom" / "fortran" / "namelists" / "namelist.recom"
+    assert W.diag2d_names(RecomConfig(namelist=str(nowb))) == W.DIAG2D
+    out = ("Chl", "PhyC", "CoccoChl", "PhaeoC", "npp", "npp_dia", "npp_cocco")
+    rc = RecomConfig(namelist=str(nowb), output=out).validate()
+    names = W.diag2d_names(rc)
+    assert names == W.DIAG2D + ("npp_dia", "npp_cocco")
+    lay = rc.layout
+    n = 3
+    bgc = np.arange(n * 2 * lay.ntr, dtype=float).reshape(n, 2, lay.ntr)
+    diag = np.arange(n * len(names), dtype=float).reshape(n, len(names))
+    f = W.output_fields(SimpleNamespace(bgc=bgc, bgc_diag=diag), rc)
+    assert np.array_equal(f["PhyC"], bgc[..., lay.slot(1005)])
+    assert np.array_equal(f["CoccoChl"], bgc[..., lay.slot(lay.cocco_ids[2])])
+    assert np.array_equal(f["PhaeoC"], bgc[..., lay.slot(lay.phaeo_ids[1])])
+    chl = sum(bgc[..., lay.slot(i)] for i in (1006, 1015, lay.cocco_ids[2], lay.phaeo_ids[2]))
+    assert np.array_equal(f["Chl"], chl)
+    assert np.array_equal(f["npp"], diag[:, W.DIAG2D.index("npp")])
+    assert np.array_equal(f["npp_cocco"], diag[:, len(W.DIAG2D) + 1])
+    RecomConfig(namelist=str(r692), output=("PhyC", "DiaChl", "npp_phy")).validate()       # no coccos needed
+    with pytest.raises(ValueError, match="enable_coccos"):
+        RecomConfig(namelist=str(r692), output=("CoccoC",)).validate()
+
+
 def test_fork_defaults_off():
     """The 692f804 configuration: no spectral fields set, the same IC constants."""
     rc = RecomConfig()
