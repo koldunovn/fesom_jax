@@ -1,4 +1,4 @@
-# pi + full REcoM (plan docs/plans/20261025-recom-port.md, lane W): configs/pi_recom.yaml's physics with FESOM2-REcoM's
+# pi + full REcoM (plan docs/plans/completed/20261025-recom-port.md, lane W): configs/pi_recom.yaml's physics with FESOM2-REcoM's
 # bin_2p3z2d ecosystem switched on. The physics-matched Fortran twin is /work/ab0995/a270088/recom_ref/pi_30d_jan_jaxphys
 # (docs/recom/FORTRAN_REFERENCE.md); gates G4b/G5 start JAX from the twin's step-0 state (fesom_jax.recom.reference).
 #

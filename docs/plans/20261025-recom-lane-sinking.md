@@ -1,6 +1,6 @@
 # Lane T: REcoM's benthic return flux, ballasting, sinking and benthos (parent plan Task 11)
 
-Parent plan: `docs/plans/20261025-recom-port.md` (read Overview, Context, Task 11 and Task 12, the lane F results
+Parent plan: `docs/plans/completed/20261025-recom-port.md` (read Overview, Context, Task 11 and Task 12, the lane F results
 under Task 4 and the lane S results under Task 10). Branch `recom/sinking` off `recom/port`, worktree
 `/work/ab0995/a270088/fesom_jax_dev/wt_recom_sink`. REcoM source (read-only): `/work/ab0995/a270088/REcoM_src` at
 692f804. Time box: 8 hours wall. Effort: high.

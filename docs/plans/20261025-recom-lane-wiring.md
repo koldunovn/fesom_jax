@@ -1,6 +1,6 @@
 # Lane W: full REcoM in the step and the run (parent plan Tasks 10-wiring, 12-wiring, 13, 14)
 
-Parent plan: `docs/plans/20261025-recom-port.md` — read ALL of it (Context; Tasks 2b, 7, 10, 11, 12, 13, 14 and the
+Parent plan: `docs/plans/completed/20261025-recom-port.md` — read ALL of it (Context; Tasks 2b, 7, 10, 11, 12, 13, 14 and the
 lane results under them). Branch `recom/wiring` off `recom/port` (8ac4a0c), worktree
 `/work/ab0995/a270088/fesom_jax_dev/wt_recom_wire`. Time box: 12 hours wall. Effort: high.
 

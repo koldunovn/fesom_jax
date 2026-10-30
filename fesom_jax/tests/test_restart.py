@@ -155,8 +155,8 @@ def test_no_leaf_dropped(tmp_path):
             continue
         assert f.name in on_disk, f"State leaf {f.name!r} missing from restart store"
     # the field list is derived from the dataclass (pytree-flatten-equivalent), not a glob
-    from fesom_jax.state import ICE_AVG_FIELDS, SE_FIELDS
-    assert set(zo._all_state_fields()) | set(ICE_AVG_FIELDS) | set(SE_FIELDS) == \
+    from fesom_jax.state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+    assert set(zo._all_state_fields()) | set(ICE_AVG_FIELDS) | set(SE_FIELDS) | set(BGC_FIELDS) == \
         {f.name for f in dataclasses.fields(State)}
 
 

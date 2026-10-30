@@ -26,7 +26,7 @@
 #SBATCH --job-name=jax_suite_par
 #SBATCH -p compute
 #SBATCH -A ab0995
-#SBATCH --array=0-5
+#SBATCH --array=0-6
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
@@ -114,15 +114,21 @@ if [ "$GROUP" = "scripts" ]; then
     # These import their target by path and need the repo root on sys.path, which running pytest
     # from the root already provides. Kept as their own group for that reason, not for cost.
     $PY -m pytest $PYTEST_ARGS $FILES
-elif [ "$GROUP" = "sharding" ]; then
+    rc=$?          # read rc immediately: a $(date) in between would overwrite $?
+elif [ "$GROUP" = "sharding" ] || [ "$GROUP" = "sharding_slow" ]; then
     # 4 CPU fake devices; these tests skip cleanly when only 1 device is visible, which is why
     # they must NOT be folded into another group — they would silently pass by skipping.
-    XLA_FLAGS=--xla_force_host_platform_device_count=4 \
-        $PY -m pytest $PYTEST_ARGS $FILES
+    # One pytest process per file: in one process the group's jit caches outgrew the 300 GB
+    # request a quarter of the way through (OOM, 2026-10-28, 24 files).
+    rc=0
+    for f in $FILES; do
+        XLA_FLAGS=--xla_force_host_platform_device_count=4 \
+            $PY -m pytest $PYTEST_ARGS "$f" || rc=1
+    done
 else
     $PY -m pytest $PYTEST_ARGS $FILES
+    rc=$?
 fi
-rc=$?          # read rc immediately: a $(date) in between would overwrite $?
 
 echo ""
 echo "=== GROUP $GROUP rc=$rc  $(date) ==="

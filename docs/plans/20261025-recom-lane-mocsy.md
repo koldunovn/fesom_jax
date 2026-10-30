@@ -1,6 +1,6 @@
 # Lane M: REcoM's carbonate chemistry (mocsy) in JAX, gate G1 (parent plan Task 8)
 
-Parent plan: `docs/plans/20261025-recom-port.md` (read its Overview, Context and Task 8 first).
+Parent plan: `docs/plans/completed/20261025-recom-port.md` (read its Overview, Context and Task 8 first).
 Branch `recom/mocsy` off `recom/port`, worktree `/work/ab0995/a270088/fesom_jax_dev/wt_recom_mocsy`.
 REcoM source (read-only): `/work/ab0995/a270088/REcoM_src` at 692f804. Time box: 6 hours wall. Effort: high.
 

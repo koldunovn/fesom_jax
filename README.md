@@ -331,7 +331,7 @@ phytoplankton groups (nanophytoplankton, diatoms), three zooplankton groups, two
 calcite and oxygen, 31 tracers plus four benthic pools, with mocsy carbonate chemistry and a constant atmospheric CO2.
 It runs on the forced (JRA55-do) zstar path, in the order of FESOM2's step: REcoM's sources and sinks after the ice
 step, then the BGC tracers in the tracer loop with T and S. The port and its decisions are in
-[`docs/plans/20261025-recom-port.md`](docs/plans/20261025-recom-port.md); the numbers in
+[`docs/plans/completed/20261025-recom-port.md`](docs/plans/completed/20261025-recom-port.md); the numbers in
 [`docs/recom/VALIDATION.md`](docs/recom/VALIDATION.md).
 
 **Running it on Levante** (for colleagues: code, inputs, the 2000–2019 job, common changes, output):

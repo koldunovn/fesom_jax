@@ -35,6 +35,10 @@ from pathlib import Path
 for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ[_v] = "1"
 ROOT = Path(os.environ.get("DP_HASH_ROOT") or Path(__file__).resolve().parents[2])
+# fesom_jax from ROOT: a script's sys.path[0] is its own directory, so the import would otherwise go to the env's
+# editable install (/home/a/a270088/port_jax), not to the checkout being hashed (2026-10-29, a worktree's
+# test_dp_lock hashed the main checkout's code and failed on a RunConfig method it does not have)
+sys.path.insert(0, str(ROOT))
 os.environ.setdefault("JAX_PLATFORMS", "cpu")
 _DEV = "--xla_force_host_platform_device_count=4"
 if _DEV not in os.environ.get("XLA_FLAGS", ""):

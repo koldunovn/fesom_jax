@@ -1,6 +1,6 @@
 # Investigation G: the step-1 temperature gap under sea ice against FESOM2 e96a2b13 (user-approved 2026-10-25)
 
-Context: `docs/plans/20261025-recom-port.md` Tasks 4b/5 (lane P results) and `docs/recom/FORTRAN_REFERENCE.md`
+Context: `docs/plans/completed/20261025-recom-port.md` Tasks 4b/5 (lane P results) and `docs/recom/FORTRAN_REFERENCE.md`
 (the physics-matched twin `pi_30d_jan_jaxphys`). Branch `physics/ice-tgap` off `recom/port`, worktree
 `/work/ab0995/a270088/fesom_jax_dev/wt_phys_tgap`. Time box: 6 hours wall. Effort: high.
 

@@ -588,6 +588,7 @@ class _ChunkToy(_Toy):
         super().__init__()
         self.chunk_fn = _chunk
         self.params0 = _u(0.3)
+        self.shard = None          # a dense model
 
 
 def test_dump_primal_reruns_from_the_nearest_base_boundary(tmp_path):

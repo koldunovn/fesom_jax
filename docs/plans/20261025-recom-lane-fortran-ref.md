@@ -1,6 +1,6 @@
 # Lane F: the Fortran FESOM2 + REcoM reference (parent plan Tasks 3-4)
 
-Parent plan: `docs/plans/20261025-recom-port.md` (read its Overview, Context and Tasks 3-4 first).
+Parent plan: `docs/plans/completed/20261025-recom-port.md` (read its Overview, Context and Tasks 3-4 first).
 Branch `recom/fortran-ref` off `recom/port`, worktree `/work/ab0995/a270088/fesom_jax_dev/wt_recom_fref`.
 Fortran tree outside the repo: `/work/ab0995/a270088/fesom2_recom`. Run and dump output:
 `/work/ab0995/a270088/recom_ref/`. Time box: 8 hours wall. Effort: high.
