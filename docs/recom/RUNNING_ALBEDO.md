@@ -153,7 +153,8 @@ python scripts/recom/compare_fortran_jax.py --jax <ROOT>/monthly \
     --fortran /albedo/work/projects/p_specbic/sloza/tmp_recom-fesom_output/fesom2.6_spectral_kdind15 \
     --mesh /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/mesh_core2 --out <ROOT>/compare
 ```
-One half-year segment of CORE2 + the spectral fork takes ~5.2 h on one PCIe A100 (3.2 s/step), inside the 12 h qos;
+One half-year segment of CORE2 + the spectral fork takes ~3.7 h on one PCIe A100 (2.3 s/step, jobs 48621400-03), inside the 12 h qos;
 `chain_core2_gpu.sh` sequences the segments with `--dependency=afterok`. The comparison script prints a monthly table
 (global NPP and CO2 flux [Pg C yr-1], surface Chl, pCO2, SST, ice area, the six inventories, pattern correlations)
-and draws `compare_<YYYY_MM>.png` (surface Chl, NPP, CO2 flux: fesom-jax, Fortran, difference).
+and draws `compare_<YYYY_MM>.png` (surface Chl, NPP, CO2 flux: fesom-jax, Fortran, difference). What differs between
+the two runs (the host physics, and `spectral_co2lim`): `docs/recom/FORTRAN_JAX_DIFFERENCES.md`.
