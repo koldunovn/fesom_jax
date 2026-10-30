@@ -2,14 +2,16 @@
 # Albedo: one CORE2 (+REcoM) run through scripts/run_from_config.py on ONE GPU (docs/recom/RUNNING_ALBEDO.md).
 #   sbatch --export=ALL,OUT=<new dir>,CONFIG=<yaml> scripts/albedo/run_core2_gpu.sbatch [run flags]
 # Run flags go to run_from_config.py unchanged (--restart-in, --steps, --monthly-out, --precision single, ...).
-# Refuses an OUT that already holds a restart or output store. GPU=a100 (default) or a40 picks the node type.
+# Refuses an OUT that already holds a restart or output store. The GPU is an A100 (--gpus=a100:1): gpu-001's A40s
+# run this float64 model 17x slower (55 s/step against 3.2, job 48617112), so a typeless --gpus=1 that lands there
+# loses the whole segment; override on the command line (sbatch --gpus=a40:1 ...) only knowingly.
 #SBATCH --job-name=fj_core2
 #SBATCH -p gpu
 #SBATCH -A clidyn.clidyn
 #SBATCH --qos=12h
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus=1
+#SBATCH --gpus=a100:1
 #SBATCH --cpus-per-task=16
 #SBATCH --hint=nomultithread
 #SBATCH --mem=200G
