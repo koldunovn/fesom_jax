@@ -1,6 +1,6 @@
 # Lane I: REcoM's initial conditions (parent plan Task 13, the IC part)
 
-Parent plan: `docs/plans/20261025-recom-port.md` (read Overview, Context, Task 13 and the lane F / lane S results).
+Parent plan: `docs/plans/completed/20261025-recom-port.md` (read Overview, Context, Task 13 and the lane F / lane S results).
 Branch `recom/ic` off `recom/port`, worktree `/work/ab0995/a270088/fesom_jax_dev/wt_recom_ic`. Sources (read-only):
 FESOM2 `/work/ab0995/a270088/fesom2_sp_zstar/src` (e96a2b13), REcoM `/work/ab0995/a270088/REcoM_src` (692f804).
 Time box: 6 hours wall. Effort: high.

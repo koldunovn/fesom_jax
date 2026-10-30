@@ -1,6 +1,6 @@
 # Lane P, part 2: REcoM's per-step inputs through the forcing paths (parent plan Task 7)
 
-Parent plan: `docs/plans/20261025-recom-port.md` (Task 7; lane S's results under Task 10, which define the inputs).
+Parent plan: `docs/plans/completed/20261025-recom-port.md` (Task 7; lane S's results under Task 10, which define the inputs).
 Branch `recom/inputs` off `recom/port` (after the lane P merge 1b36b26), worktree
 `/work/ab0995/a270088/fesom_jax_dev/wt_recom_inp`. Time box: 6 hours wall. Effort: high.
 

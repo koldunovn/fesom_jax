@@ -729,7 +729,7 @@ def evp_component(fields: dict, meta: dict, point: str, name: str) -> np.ndarray
 
 
 # ---------------------------------------------------------------------------
-# REcoM full-field dumps (lane F of docs/plans/20261025-recom-port.md): the Fortran
+# REcoM full-field dumps (lane F of docs/plans/completed/20261025-recom-port.md): the Fortran
 # FESOM2 + REcoM reference, ``recom_ref_dump`` (FESOM_RECOM_DUMP_DIR /
 # FESOM_RECOM_DUMP_STEPS). One directory per dumped step, ``step_<mstep:06d>/`` with
 #   index.txt   line 1 ``# recom_ref_dump v1 mstep=.. yearnew=.. daynew=.. timenew=..

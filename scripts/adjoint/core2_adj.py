@@ -1704,7 +1704,9 @@ def run_restartcheck(model: Model, states_dir, *, date, repeats: int = 2,
     vs_cont = {k: dmax(outs[0][0][k], cont[k]) for k in DAILY_FIELDS}
     spread = {k: max(dmax(o[0][k], outs[0][0][k]) for o in outs[1:]) if len(outs) > 1 else 0.0
               for k in DAILY_FIELDS}
-    fields = zarr_output._all_state_fields()
+    # the single-precision carry is None in a double-precision run (None vs None compared as NaN)
+    fields = [f for f in zarr_output._all_state_fields()
+              if getattr(outs[0][1], f) is not None or getattr(nxt_state, f, None) is not None]
     state_spread = {f: max((dmax(getattr(o[1], f), getattr(outs[0][1], f)) for o in outs[1:]),
                            default=0.0) for f in fields}
     state_vs = None

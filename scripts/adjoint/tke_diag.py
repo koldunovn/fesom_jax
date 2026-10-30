@@ -828,10 +828,11 @@ def run_fdlin(model, win: Window, v, *, weights="tke", hs=None, noise="auto",
     * ``"repeat"`` (the default on a GPU): the difference of two runs of the unperturbed forward
       (non-deterministic scatter-adds);
     * ``"roughness"`` (the default on a CPU, where repeats are bitwise): the part of the central
-      difference at ``h₀ = min(hs)/100`` that the tangent does not explain,
-      ``‖(J(x+h₀v) − J(x−h₀v))/2 − h₀·TL‖`` — the forward is deterministic but not smooth at
-      that scale (the SSH solve stops at a relative residual, so its iteration count, and the
-      solution, jump; clips and switches);
+      difference at ``h₀`` that the tangent does not explain,
+      ``‖(J(x+h₀v) − J(x−h₀v))/2 − h₀·TL‖``, the larger of ``h₀ = min(hs)/100`` and
+      ``min(hs)/10`` — the forward is deterministic but not smooth at that scale (the SSH solve
+      stops at a relative residual, so its iteration count, and the solution, jump; clips and
+      switches), and one sample of a jump can land low (2026-10-28: 30× below the base branch's);
     * ``None``: no floor.
     """
     hs = [10.0 ** -e for e in range(1, 13)] if hs is None else [float(h) for h in hs]
@@ -855,11 +856,12 @@ def run_fdlin(model, win: Window, v, *, weights="tke", hs=None, noise="auto",
         if noise == "repeat":
             floor = wnorm(win.forward(win.pins[0]), win.forward(win.pins[0]))
         elif noise == "roughness":
-            h0 = min(hs) / 100.0
-            shift = (lambda s: jax.tree.map(lambda a, b: a + s * h0 * b
-                                            if adjoint_check._is_real(a) else a,
-                                            win.pins[0], v))
-            floor = wnorm(win.forward(shift(1.0)), win.forward(shift(-1.0)), 0.5, tl, h0)
+            def rough(h0):
+                shift = (lambda s: jax.tree.map(lambda a, b: a + s * h0 * b
+                                                if adjoint_check._is_real(a) else a,
+                                                win.pins[0], v))
+                return wnorm(win.forward(shift(1.0)), win.forward(shift(-1.0)), 0.5, tl, h0)
+            floor = max(rough(min(hs) / 100.0), rough(min(hs) / 10.0))
         elif noise is not None:
             raise ValueError(f"noise must be 'auto', 'repeat', 'roughness' or None: {noise!r}")
         rows = adjoint_check.fdlin(win.forward, win.pins[0], v, hs, tl, weights=w,
