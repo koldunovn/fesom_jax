@@ -68,6 +68,7 @@ optional::
       params: fesom_operational   # | oe13 | {tau_v, tau_h, gamma, jstar, mu0} (all five)
       surf_file: /pool/.../fourier_smooth_2005_cfsr_inert_rgrid.nc   # } idemix_jax.
       bot_file:  /pool/.../tidal_energy_gx1v6_20090205_rgrid.nc      # } load_idemix_forcing
+      deposit_file: /path/deposit.npz   # optional: static interior dissipation to TKE, W/kg
       sforcusage: 0.2                                                # } (its defaults
       botforc_Etot: 0.0                                              # }  when absent)
 
@@ -233,7 +234,8 @@ _IDEMIX_CFG_KEYS = ("n_hor_iter", "lateral", "lateral_cfl_cap",
                     "lateral_face_mask", "tke_e_iw", "metric",
                     "lateral_face_thickness")                    # IdemixConfig._fields
 _IDEMIX_FORCING_KEYS = ("surf_file", "bot_file", "sforcusage", "botforc_Etot")
-_IDEMIX_KEYS = _IDEMIX_CFG_KEYS + ("params",) + _IDEMIX_FORCING_KEYS
+_IDEMIX_DEPOSIT_KEY = "deposit_file"                             # fesom_jax.idemix.load_deposit
+_IDEMIX_KEYS = _IDEMIX_CFG_KEYS + ("params",) + _IDEMIX_FORCING_KEYS + (_IDEMIX_DEPOSIT_KEY,)
 _IDEMIX_PARAM_PRESETS = ("fesom_operational", "oe13")
 _IDEMIX_PARAM_FIELDS = ("tau_v", "tau_h", "gamma", "jstar", "mu0")  # IdemixParams._fields
 
@@ -390,14 +392,15 @@ class RunConfig:
         energy fluxes from ``idemix_jax.load_idemix_forcing`` on ``geo_coord_nod2D`` (degrees,
         with the block's ``surf_file``/``bot_file``/``sforcusage``/``botforc_Etot``; the
         ``botforc_Etot`` normalization area is each node's top-wet-layer ``areasvol``) and the
-        lateral operator (``None`` when ``lateral: false``). Host NumPy, built once per run.
+        lateral operator (``None`` when ``lateral: false``). With ``deposit_file`` the forcing is
+        an :class:`~fesom_jax.idemix.IdemixForcingDeposit`. Host NumPy, built once per run.
         A cavity mesh (``ulevels_nod2D > 1``) is refused first (``check_no_cavity_mesh``)."""
         if self.idemix is None:
             return None, None
         import numpy as np
         from idemix_jax import load_idemix_forcing
         from .idemix import (build_lateral_operator, check_layer_areas, check_no_cavity_mesh,
-                             check_wet_columns)
+                             check_wet_columns, load_deposit)
         check_no_cavity_mesh(mesh)
         check_wet_columns(mesh)
         if self.idemix_config().metric == "volume":
@@ -408,6 +411,8 @@ class RunConfig:
             kw["node_area"] = np.take_along_axis(np.asarray(mesh.areasvol), top[:, None], 1)[:, 0]
         geo = np.degrees(np.asarray(mesh.geo_coord_nod2D, dtype=np.float64))
         forcing = load_idemix_forcing(geo[:, 0], geo[:, 1], **kw)
+        if self.idemix.get(_IDEMIX_DEPOSIT_KEY) is not None:
+            forcing = load_deposit(mesh, forcing, self.idemix[_IDEMIX_DEPOSIT_KEY])
         lateral = (build_lateral_operator(mesh, metric=self.idemix_config().metric)
                    if self.idemix_config().lateral else None)
         return forcing, lateral
@@ -589,6 +594,9 @@ class RunConfig:
                     "of them to null.")
             self.idemix_config().validate()
             self.idemix_params()
+            if self.idemix.get(_IDEMIX_DEPOSIT_KEY) is not None and self.tke is None:
+                raise ValueError("idemix.deposit_file feeds the TKE: it needs a tke block with "
+                                 "only_tke: false")
         if self.tke is not None and (not self.tke.only_tke) != (self.idemix is not None):
             if self.idemix is None:
                 raise ValueError(

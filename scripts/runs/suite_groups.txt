@@ -269,3 +269,4 @@ unit fesom_jax/tests/test_tke_interface_spacing.py
 unit fesom_jax/tests/test_idemix_tke_coupling.py
 unit fesom_jax/tests/test_idemix_metric.py
 unit fesom_jax/tests/test_idemix_face_thickness.py
+unit fesom_jax/tests/test_idemix_deposit.py

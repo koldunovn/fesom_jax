@@ -68,6 +68,17 @@ dual cell's bottom flux lands at its deepest interface (budget review 2026-10-26
 * ``"prism"``: the column unchanged and the lateral step on the prism cells ``A0 * dzt``:
   both conserve ``sum A0 dzt E`` (cheap closure; keeps the prism's dilution of the deep cells).
 
+**Prescribed interior deposit** (patch 0016, :class:`IdemixForcingDeposit`, yaml ``idemix:
+deposit_file``). Off unless the run's forcing carries one, and then bitwise the series without it.
+A static ``deposit`` ``[nod2D, nl]`` [W/kg], energy the wave field never carries: it reaches the
+closure through :func:`tke_coupling` only, added to ``iw_diss`` in TKE's forcing and to the wave
+dissipation estimate ``alpha_c E_iw^2`` of the Rinum cap. Without the second half the deposit's
+turbulence would mix at the uncapped Prandtl number (up to 10) where the energy comes from
+outside IDEMIX, and the same power would give a much lower diffusivity than ``iw_diss`` does.
+``iwe``, the column step, the lateral step and the closure of the wave-energy budget are
+untouched: :func:`budget_terms` reports it as a separate term ``Dep`` (``sum V deposit``, the
+power, not in ``abs_resid``). It needs the TKE (the Osborn path has no TKE to feed) and one device.
+
 Lateral operator (:func:`build_lateral_operator`, host-side NumPy, once per mesh): the
 two-point flux weight of edge ``(a, b)`` is ``w = cross_len / node_dist`` — the cross-edge
 length (the two ``edge_cross_dxdy`` segments, m; one is zero on a boundary edge) over the
@@ -166,6 +177,46 @@ class IdemixConfig(NamedTuple):
                              "lateral_face_mask=True (the element faces of loops C/D/E); a full "
                              "face takes lateral_face_thickness='node'")
         return self
+
+
+class IdemixForcingDeposit(NamedTuple):
+    """:class:`idemix_jax.IdemixForcing` plus a prescribed interior dissipation (patch 0016, module
+    docstring). A plain ``IdemixForcing`` in the same place is the path without a deposit."""
+
+    fsrf: np.ndarray        # [N] surface near-inertial forcing, m^3/s^3
+    fbot: np.ndarray        # [N] bottom tidal forcing, m^3/s^3
+    deposit: np.ndarray     # [N, nl] prescribed dissipation on the interior wet interfaces, W/kg
+
+
+def forcing_deposit(forcing):
+    """The ``[nod2D, nl]`` deposit of ``forcing``, or ``None`` for a plain ``IdemixForcing``."""
+    return getattr(forcing, "deposit", None)
+
+
+def check_deposit(mesh, deposit) -> None:
+    """Raise ``ValueError`` unless ``deposit`` is ``[nod2D, nl]``, finite, >= 0 and zero outside
+    the interior wet interfaces (the FESOM scheme has no dissipation on the surface and bottom
+    interface). Host-side NumPy, once per run (:func:`load_deposit`)."""
+    d = np.asarray(deposit, dtype=np.float64)
+    if d.shape != (int(mesh.nod2D), int(mesh.nl)):
+        raise ValueError(f"IDEMIX deposit must have shape ({int(mesh.nod2D)}, {int(mesh.nl)}), got "
+                         f"{d.shape}")
+    if not np.all(np.isfinite(d)) or np.any(d < 0.0):
+        raise ValueError("IDEMIX deposit must be finite and >= 0")
+    k = np.arange(int(mesh.nl))[None, :]
+    inter = ((k > (np.asarray(mesh.ulevels_nod2D) - 1)[:, None])
+             & (k < (np.asarray(mesh.nlevels_nod2D) - 1)[:, None]))
+    if np.any(d[~inter] != 0.0):
+        raise ValueError("IDEMIX deposit must be 0 outside the interior wet interfaces")
+
+
+def load_deposit(mesh, forcing, path) -> IdemixForcingDeposit:
+    """``forcing`` plus the deposit of the ``.npz`` file ``path`` (array ``deposit``, W/kg,
+    :func:`check_deposit`)."""
+    with np.load(path) as z:
+        d = np.asarray(z["deposit"], dtype=np.float64)
+    check_deposit(mesh, d)
+    return IdemixForcingDeposit(forcing.fsrf, forcing.fbot, d)
 
 
 class LateralOperator(NamedTuple):
@@ -626,9 +677,12 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
     with ``cfg.lateral`` raises: the neighbor arrays index the global mesh.
     ``params_field`` (:class:`IdemixParamsField`, ``Params.idemix_field``): per-node log
     multipliers of ``mu0`` and of the bottom forcing ``fbot``; ``None`` (default) ⇒ the scalar
-    path, bitwise unchanged; refused with ``sharded=True``. A concrete cavity mesh raises in
-    the column step (:func:`_column_step`); a traced one cannot be read."""
+    path, bitwise unchanged; refused with ``sharded=True``, as is a deposit (``forcing``,
+    module docstring). A concrete cavity mesh raises in the column step (:func:`_column_step`);
+    a traced one cannot be read."""
     cfg.validate()
+    if sharded and forcing_deposit(forcing) is not None:
+        raise NotImplementedError("the IDEMIX deposit is dense/1-device only")
     if sharded and _field_active(params_field):
         raise NotImplementedError(
             "Params.idemix_field (per-node IDEMIX multipliers) is dense/1-device only: its "
@@ -646,19 +700,34 @@ def mixing_idemix(mesh, iwe, bvfreq, hnode, forcing: IdemixForcing,
                      E_iw=res.E_iw, KappaH=res.KappaH, KappaM=res.KappaM)
 
 
-def tke_coupling(out: IdemixOut, cfg: IdemixConfig):
+def tke_coupling(out: IdemixOut, cfg: IdemixConfig, deposit=None):
     """The ``(iw_diss, alpha_c, E_iw)`` triple :func:`fesom_jax.tke.mixing_tke` takes (ruling 2):
     the column step's dissipation and coefficient, and for the Rinum cap the energy after the
     lateral step, ``out.iwe_new`` (``cfg.tke_e_iw = "post_lateral"``, the Fortran's ``iwe_n``,
     ``gen_modules_cvmix_tke.F90:305``), or the column step's ``out.E_iw`` (``"column"``,
-    patches 0001-0012)."""
+    patches 0001-0012). ``deposit`` (``[nod2D, nl]``, :func:`forcing_deposit`): added to
+    ``iw_diss``, and the energy returned is ``sqrt(E^2 + deposit / alpha_c)`` so that the Rinum
+    cap's ``alpha_c E^2`` is the wave dissipation plus the deposit; TKE reads ``E_iw`` nowhere
+    else. ``None`` (default): the arrays above, untouched."""
     e = out.iwe_new if cfg.tke_e_iw == "post_lateral" else out.E_iw
-    return out.iw_diss, out.alpha_c, e
+    if deposit is None:
+        return out.iw_diss, out.alpha_c, e
+    dep = jnp.asarray(deposit)
+    on = (dep > 0.0) & (out.alpha_c > 0.0)
+    e2 = e ** 2 + dep / jnp.where(on, out.alpha_c, 1.0)
+    return (out.iw_diss + dep, out.alpha_c,
+            jnp.where(on, jnp.sqrt(jnp.where(on, e2, 1.0)), e))
 
 
 #: keys of :func:`budget_terms` (the run entry's ``idemix_budget_out`` files)
 BUDGET_TERMS = ("dEdt", "P_surf", "P_bot", "D", "Dif", "Lat", "E", "abs_resid",
                 "n_wet", "n_capped", "cfl_max")
+
+
+def budget_keys(forcing) -> tuple:
+    """The keys of :func:`budget_terms` for ``forcing``: ``BUDGET_TERMS``, plus ``Dep`` when it
+    carries a deposit."""
+    return BUDGET_TERMS + (() if forcing_deposit(forcing) is None else ("Dep",))
 
 
 def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixParams,
@@ -693,7 +762,10 @@ def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixPara
       ``cfl_max`` the column max of the UNCAPPED lateral CFL number
       ``v0^2 tau_h (dt / n_hor_iter) / res^2`` (0 without ``cfg.lateral``) — the cap's
       res-based number, not the sub-step's stability (that depends on the face and the volume,
-      :func:`lateral_stability`).
+      :func:`lateral_stability`);
+    * ``Dep = sum V deposit``, only when ``forcing`` carries one (:func:`budget_keys`): the power of
+      the prescribed interior deposit. It goes to TKE, not through the wave energy, so it is not
+      in ``abs_resid``; the closure's dissipation is ``D + Dep``.
 
     If ``s1`` is the step's output, ``dEdt = P_surf + P_bot - D + Dif + Lat`` per node and
     globally, to roundoff (the column solve's budget identity plus the lateral composition)."""
@@ -710,6 +782,8 @@ def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixPara
              Lat=col(V * (iwe_new - res.E_iw)) / dt, E=col(V * s1.iwe))
     t["abs_resid"] = jnp.abs(t["dEdt"] - (t["P_surf"] + t["P_bot"] - t["D"] + t["Dif"]
                                           + t["Lat"]))
+    if forcing_deposit(forcing) is not None:
+        t["Dep"] = col(V * jnp.asarray(forcing_deposit(forcing)))
     t["n_wet"] = jnp.sum(is_wet, axis=1).astype(s0.iwe.dtype)
     zero = jnp.zeros_like(t["n_wet"])
     if cfg.lateral:
@@ -724,7 +798,7 @@ def budget_terms(mesh, s0, s1, forcing: IdemixForcing, params_idemix: IdemixPara
     else:
         t["n_capped"] = zero
         t["cfl_max"] = zero
-    return {k: t[k] for k in BUDGET_TERMS}
+    return {k: t[k] for k in budget_keys(forcing)}
 
 
 def osborn_kv_av(mesh, out: IdemixOut, bvfreq, *, exch=None, freeze_convection=False,
@@ -770,7 +844,7 @@ def partition_idemix_inputs(forcing: IdemixForcing | None, lateral: LateralOpera
         a = np.asarray(x, dtype=np.float64)
         return _shard_along_axis(a, lists, L, 0, _default_pad(a.dtype))
 
-    forcing_p = None if forcing is None else IdemixForcing(*(_nodes(x) for x in forcing))
+    forcing_p = None if forcing is None else type(forcing)(*(_nodes(x) for x in forcing))
     lateral_p = None
     if lateral is not None:
         nbr = np.asarray(lateral.nbr_idx)

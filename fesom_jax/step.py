@@ -202,6 +202,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             raise ValueError(
                 "idemix_cfg requires idemix_forcing (idemix_jax.load_idemix_forcing on the "
                 "mesh nodes): the surface near-inertial and bottom tidal energy fluxes.")
+        if getattr(idemix_forcing, "deposit", None) is not None and tke_cfg is None:
+            raise ValueError(
+                "an IDEMIX deposit feeds the TKE (fesom_jax.idemix.tke_coupling): the Osborn path "
+                "would silently drop it. Use tke_cfg with only_tke=False, or drop the deposit.")
         if idemix_cfg.lateral and idemix_lateral is None:
             raise ValueError(
                 "idemix_cfg.lateral=True requires idemix_lateral — build it once with "
@@ -514,7 +518,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             _sa, _sb = eos.compute_sw_alpha_beta(mesh, st.T, st.S, Z3d=Z3d_live)
             _turner = jax.lax.stop_gradient(eos.turner_angle(st.T, st.S, _sa, _sb))
         _iw = (None if idemix_out is None                 # ruling 2 (fesom_jax.idemix)
-               else _idemix.tke_coupling(idemix_out, idemix_cfg))
+               else _idemix.tke_coupling(idemix_out, idemix_cfg,
+                                         deposit=_idemix.forcing_deposit(idemix_forcing)))
         Kv, Av, uvnode, tke_new = _ckpt(lambda: tke.mixing_tke(
             mesh, st.uv, _bv_tke, st.tke, stress_node_surf, h_wp, tke_cfg, params,
             freeze_convection=_adj.freeze_convection, cuts=_adj.diag_cuts,

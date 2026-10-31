@@ -429,7 +429,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     and handed to the runner with ``idemix_cfg`` (via :meth:`RunConfig.physics_kwargs`). The
     lateral propagation needs a single device (``part.npes == 1``). IDEMIX is refused
     (``ValueError``) under several JAX processes and on a mesh with ice-shelf cavities
-    (``ulevels_nod2D > 1``, whatever ``cfg.cavity`` says). No ``idemix:`` ⇒ nothing changes.
+    (``ulevels_nod2D > 1``, whatever ``cfg.cavity`` says). With ``idemix.deposit_file`` an
+    injected ``idemix_forcing`` must carry the deposit (an ``IdemixForcingDeposit``, used as
+    given); a plain ``IdemixForcing`` raises ``ValueError``. No ``idemix:`` ⇒ nothing changes.
 
     ``restart_archive_out`` (if set) additionally writes ARCHIVAL restarts: an immutable,
     uniquely-named directory (``_archive_tag`` — mirrors FESOM3's ``fesom.<YYYY>.<DDD>.<SSSSS>``)
@@ -515,6 +517,13 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if params.idemix is None:
             params = _dc.replace(params, idemix=jax.tree.map(
                 lambda v: _jnp.asarray(v, _jnp.float64), cfg.idemix_params()))
+        if (idemix_forcing is not None and cfg.idemix.get("deposit_file") is not None
+                and _idemix.forcing_deposit(idemix_forcing) is None):
+            # the yaml deposit is read only by cfg.idemix_inputs, which a caller-supplied forcing skips
+            raise ValueError(
+                "idemix.deposit_file is set, but the caller-supplied idemix_forcing is a plain "
+                "IdemixForcing without a deposit, so the deposit would be silently ignored: pass "
+                "an IdemixForcingDeposit (fesom_jax.idemix.load_deposit) or drop deposit_file.")
         if idemix_forcing is None:
             idemix_forcing, _lat = cfg.idemix_inputs(mesh)
             idemix_lateral = _lat if idemix_lateral is None else idemix_lateral
@@ -1089,7 +1098,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     if idemix_budget_out is not None:
         from . import ale as _ale
         from . import idemix as _idemix_b
-        _bkeys = tuple(f"iwb_{k}" for k in _idemix_b.BUDGET_TERMS)
+        _bkeys = tuple(f"iwb_{k}" for k in _idemix_b.budget_keys(idemix_forcing))
 
         def _budget_fields(s0, s1, aux):
             m = aux["mesh"]
