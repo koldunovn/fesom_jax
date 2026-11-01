@@ -90,7 +90,8 @@ class OceanStatic:
     _mon_key: Any = None
     _mon_sum: Any = None
     _mon_count: int = 0
-    flux: Any = None          # mode F constants (fesom_jax.coupled.flux.FluxStatic), None in mode B
+    flux: Any = None          # mode F constants (fesom_jax.coupled.flux.FluxConfig), None in mode B
+    _o2a: Any = None          # the jitted ocean_to_atm
 
     @property
     def nod2D(self) -> int:
@@ -385,6 +386,13 @@ def ice_albedo_cpl(h, hsn, t, cfg):
 
 
 def ocean_to_atm(state, static: OceanStatic) -> dict:
+    """The fields FESOM2 sends to OpenIFS (see :func:`_ocean_to_atm`); one jitted program per ``static``."""
+    if static._o2a is None:
+        static._o2a = jax.jit(lambda s: _ocean_to_atm(s, static))
+    return static._o2a(state)
+
+
+def _ocean_to_atm(state, static: OceanStatic) -> dict:
     """The fields FESOM2 sends to OpenIFS (gen_forcing_couple.F90 update_atm_forcing, ``__oifs``), each
     ``(nod2D,)`` in global node order, INSTANT at the call:
 
