@@ -164,3 +164,20 @@ ice_thermo_cpl's `ice_albedo` of it without ponds; mode F sends the coupled ther
   when present.
 * `ice_step.IceStepOut.cpl` (None by default) and `step.step`: the coupled ice step when the forcing is a
   `CplForcing` (a trace-time type check), and the CPL fields carried when `cpl` is set.
+
+## Checks (2026-11-01/02, one A100 80 GB, `configs/core2_cpl.yaml`, single precision, dt 1800, from the v3 1989-01-01 restart)
+
+| check | job | result |
+|---|---|---|
+| standalone month, file-driven (`run_from_config.py`) | 28642826 | finite; 49.0 ms/step steady (2.35 s per 48-step chunk) |
+| mode B bitwise: atmosphere-view JRA55-do arrays, one row a step, 12 intervals (day 1) | 28643885 | forcing stack and State bitwise after every interval; ref-vs-ref control bitwise (the GPU program is deterministic with ordered sums) |
+| mode B, interval means held over the interval, to day 31, against the per-step file run | 28643885 | finite; mean SST +8.6e-4 K, SST rms 0.010 K; NH ice area 15.754 vs 15.750, SH 1.497 vs 1.496 [1e12 m2] |
+| mode B ocean_interval speed | 28643885 | 49.6 ms/step |
+| mode F, one month, offline CORE2-bulk atmosphere | 28643403 | finite; area-mean SST 18.216 vs 18.190 degC (standalone), SST rms 0.085 K; NH ice area 15.76 vs 15.75, SH 1.98 vs 1.50 [1e12 m2] (the coupled zero-layer thermodynamics melts the SH summer ice more slowly); 50.5 ms/step |
+| mode F, 90 days | 28643886 | finite; NH ice area 15.77 / 15.90 / 15.55, SH 2.03 / 1.50 / 3.68 at days 30 / 60 / 90; 50.6 ms/step |
+| restart round trip (modes B and F, with the mode F fields) | 28643885, 28643886 | bitwise |
+| standalone CORE2 path of the branch against main ded5355 (96 steps, run_from_config, GPU) | 28643613 | restart bitwise; main-vs-main control bitwise |
+
+The first mode B attempt (28643087, 28643463) differed at round-off from interval 0 on. The cause was the A100's
+float32 division: it is not correctly rounded, so prec/1000 came out 1 ULP from the reader's numpy, and the single-precision
+model amplified that within an interval. The fix divides in float64 and rounds once (`ocean._div1000`).
