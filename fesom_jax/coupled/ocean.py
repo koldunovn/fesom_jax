@@ -284,6 +284,14 @@ def _rows(forcing: dict, name: str, nsteps: int, n: int):
     raise ValueError(f"forcing[{name!r}] has shape {a.shape}; need ({n},) or ({nsteps}, {n})")
 
 
+def _div1000(x):
+    """``x / 1000`` correctly rounded in ``x``'s precision (the reader's numpy division). The A100's float32 division
+    is not (1 ULP off on ~half the operands, measured, job 28643779), so a float32 ``x`` is divided in float64 (IEEE
+    on the GPU) and rounded once to float32: double rounding is exact for a quotient of float32 operands (53 >= 2*24
+    + 2). The divisor is an array operand, so XLA cannot rewrite the division as a multiplication by 0.001."""
+    return (x.astype(jnp.float64) / jnp.asarray(1000.0, jnp.float64)).astype(x.dtype)
+
+
 def bulk_step_forcing(forcing: dict, static: OceanStatic, dates) -> surface_forcing.StepForcing:
     """Mode B: the :class:`StepForcing` stack ``[nsteps, nod2D]`` of one interval from the atmosphere's fields
     (:data:`MODE_B_FIELDS`, each ``(nod2D,)`` held over the interval or ``(nsteps, nod2D)``), with the conversions
@@ -299,8 +307,6 @@ def bulk_step_forcing(forcing: dict, static: OceanStatic, dates) -> surface_forc
     if jra55.FORCE_ROTATION:
         u, v = g2r(u, v, static.trig, static.M)
     months = np.array([d[3] for d in dates]) - 1
-    # the divisor as an array operand: a literal 1000.0 lets XLA rewrite the division as a multiplication by 0.001
-    # (1 ULP off the reader's numpy division, measured on the A100; surface_forcing.ForcingDeviceConst.prec_div)
     rain, snow = _rows(forcing, "rain", T, n), _rows(forcing, "snow", T, n)
     seq = surface_forcing.StepForcing(
         u_air=u, v_air=v,
@@ -308,8 +314,8 @@ def bulk_step_forcing(forcing: dict, static: OceanStatic, dates) -> surface_forc
         shortwave=_rows(forcing, "swdn", T, n),
         longwave=_rows(forcing, "lwdn", T, n),
         Tair=_rows(forcing, "t2m", T, n) - 273.15,
-        prec_rain=rain / jnp.asarray(1000.0, rain.dtype),
-        prec_snow=snow / jnp.asarray(1000.0, snow.dtype),
+        prec_rain=_div1000(rain),
+        prec_snow=_div1000(snow),
         Ssurf_month=jnp.asarray(static.sss_clim[months]),
         chl=jnp.asarray(static.chl_clim[months]))
     return PR.cast_tree(seq) if static.precision == "single" else seq
