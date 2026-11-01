@@ -10,8 +10,9 @@ Opt-in: nothing in the standalone (file-forced) model imports this package. The 
 * :func:`write_ocean_restart`; the monthly means are written by :func:`ocean_interval` when ``monthly_out`` is set.
 """
 
+from .flux import OASIS_TO_FESOM, oasis_to_fesom
 from .ocean import (MODE_B_FIELDS, MODE_F_FIELDS, OCEAN_TO_ATM, OceanStatic, flush_monthly,
                     init_ocean, ocean_interval, ocean_to_atm, write_ocean_restart)
 
-__all__ = ["MODE_B_FIELDS", "MODE_F_FIELDS", "OCEAN_TO_ATM", "OceanStatic", "flush_monthly", "init_ocean",
+__all__ = ["OASIS_TO_FESOM", "oasis_to_fesom", "MODE_B_FIELDS", "MODE_F_FIELDS", "OCEAN_TO_ATM", "OceanStatic", "flush_monthly", "init_ocean",
            "ocean_interval", "ocean_to_atm", "write_ocean_restart"]

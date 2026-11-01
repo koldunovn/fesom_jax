@@ -98,6 +98,15 @@ the water fluxes by RHOH2O):
 | `hydr_oce, calv_oce` | R_Runoff/Calving_oce | (accepted, not used: the CORE2 runoff climatology) | runoff |
 | `u10w_oce, v10w_oce` | A_WindX/Y | (accepted, not used: FESOM2 reads them only for icebergs) | u_wind, v_wind |
 
+`oasis_to_fesom(fields) -> dict` (`fesom_jax.coupled`) is FESOM2's receive step for the coupler: it takes the remapped
+fields by their namcouple OASIS names (`A_Qns_oce`, `A_Qs_all`, `A_Precip_liquid`, `A_Precip_solid`, `A_Evap`, `A_Subl`,
+`A_Q_ice`, `A_Ice_tskin`, `A_TauX/Y_oce`, `A_TauX/Y_ice`, `A_WindX/Y`, `A_Runoff`, `A_Calving`) or the FESOM2 names above,
+and returns the keys of this table. It renames and does nothing else, because FESOM2 does nothing else on receive
+(`prec_rain(:) = exchange(:)` ...): the units are those the atmosphere puts, and the fork's put
+(`ece_fesom_set_ocean_fluxes.F90`) already divides the water fluxes by RHOH2O (m s-1). A water flux in kg m-2 s-1 at
+the OASIS level is therefore a put-side conversion the atmosphere lane owes, not one FESOM2 makes. Weighting by the
+ice/open-water fraction happens in the thermodynamics (`thermo_cpl`), the g2r stress rotation in `ocean_interval`.
+
 No conservation correction on the FESOM side: under `__oifs` FESOM2's `force_flux_consv` returns at once (the
 OASIS remapping is conservative, GLBPOS/GSSMAR; the coupler lane applies them).
 

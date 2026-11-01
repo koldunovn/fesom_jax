@@ -143,6 +143,47 @@ def flux_step_forcing(state, forcing: dict, static, dates):
     return state, (PR.cast_tree(seq) if static.precision == "single" else seq)
 
 
+#: namcouple (AWI-ESM3 v3.5.1): the atmosphere's OASIS name -> the FESOM2 name it arrives under (cpl_driver cpl_recv)
+OASIS_TO_FESOM = {"A_Qns_oce": "heat_oce", "A_Qs_all": "heat_swo", "A_Precip_liquid": "prec_oce",
+                  "A_Precip_solid": "snow_oce", "A_Evap": "evap_oce", "A_Subl": "subl_oce", "A_Q_ice": "heat_ico",
+                  "A_Ice_tskin": "tsk_ico", "A_TauX_oce": "taux_oce", "A_TauY_oce": "tauy_oce",
+                  "A_TauX_ice": "taux_ico", "A_TauY_ice": "tauy_ico", "A_WindX": "u10w_oce", "A_WindY": "v10w_oce",
+                  "A_Runoff": "hydr_oce", "A_Calving": "calv_oce", "R_Runoff_oce": "hydr_oce",
+                  "R_Calving_oce": "calv_oce"}
+
+
+def oasis_to_fesom(fields: dict) -> dict:
+    """The receive side of FESOM2's coupling (cpl_driver.F90 cpl_oasis3mct_recv + gen_forcing_couple.F90
+    update_atm_forcing, ``__oasis``/``__oifs``) up to the arrays the ocean step reads, for fields given by their
+    namcouple OASIS names (``A_Qns_oce`` ...) or their FESOM2 names (``heat_oce`` ...); returns mode F's keys.
+
+    What FESOM2 does on receive, and so does this function:
+
+    * renames (cpl_recv order; the namcouple pairs in :data:`OASIS_TO_FESOM`);
+    * NO unit or sign change: ``prec_rain(:) = exchange(:)`` etc. FESOM2 uses every field as delivered. The
+      atmosphere's put side (fork ``ece_fesom_set_ocean_fluxes.F90``) already sends the water fluxes in m s-1
+      (``PFPLCL/RHOH2O``, ``PEVAPTI/RHOH2O``, runoff ``/1000``), heat in W m-2 positive down, stresses in N m-2
+      geographic. A field put in kg m-2 s-1 is a put-side bug, not something FESOM2 converts;
+    * no ice/ocean fraction weighting on receive (FESOM2 weights evap by 1 - A and subl by A inside
+      ice_thermo_cpl, i.e. in :func:`thermo_cpl`), no conservation correction (``force_flux_consv`` returns at
+      once under ``__oifs``: OASIS's GLBPOS/GSSMAR do it);
+    * the stress rotation geographic -> model frame happens later in update_atm_forcing, here in
+      :func:`flux_step_forcing` (``ocean_interval``), so the returned stresses stay geographic.
+
+    Unknown names raise; ``hydr_oce``/``calv_oce``/``u10w_oce``/``v10w_oce`` are passed through (accepted and not
+    used by the ocean step, see the module docstring)."""
+    known = set(OASIS_TO_FESOM.values())
+    out = {}
+    for k, v in fields.items():
+        name = OASIS_TO_FESOM.get(k, k)
+        if name not in known:
+            raise KeyError(f"{k!r} is neither a namcouple OASIS name nor a FESOM2 receive name")
+        if name in out:
+            raise KeyError(f"{name!r} given twice (as {k!r})")
+        out[name] = v
+    return out
+
+
 def dummy_seq(nsteps: int, n: int):
     """A host :class:`CplForcing` of zeros ``[1, nsteps, n]`` (the partitioned shape the runner folds) to build the
     interval program."""
