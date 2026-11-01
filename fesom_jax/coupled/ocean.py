@@ -299,14 +299,17 @@ def bulk_step_forcing(forcing: dict, static: OceanStatic, dates) -> surface_forc
     if jra55.FORCE_ROTATION:
         u, v = g2r(u, v, static.trig, static.M)
     months = np.array([d[3] for d in dates]) - 1
+    # the divisor as an array operand: a literal 1000.0 lets XLA rewrite the division as a multiplication by 0.001
+    # (1 ULP off the reader's numpy division, measured on the A100; surface_forcing.ForcingDeviceConst.prec_div)
+    rain, snow = _rows(forcing, "rain", T, n), _rows(forcing, "snow", T, n)
     seq = surface_forcing.StepForcing(
         u_air=u, v_air=v,
         shum=_rows(forcing, "q2m", T, n),
         shortwave=_rows(forcing, "swdn", T, n),
         longwave=_rows(forcing, "lwdn", T, n),
         Tair=_rows(forcing, "t2m", T, n) - 273.15,
-        prec_rain=_rows(forcing, "rain", T, n) / 1000.0,
-        prec_snow=_rows(forcing, "snow", T, n) / 1000.0,
+        prec_rain=rain / jnp.asarray(1000.0, rain.dtype),
+        prec_snow=snow / jnp.asarray(1000.0, snow.dtype),
         Ssurf_month=jnp.asarray(static.sss_clim[months]),
         chl=jnp.asarray(static.chl_clim[months]))
     return PR.cast_tree(seq) if static.precision == "single" else seq
