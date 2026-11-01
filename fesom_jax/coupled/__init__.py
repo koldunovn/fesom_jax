@@ -1,0 +1,17 @@
+"""fesom_jax as the ocean / sea-ice component of the coupled AWI-CM JAX system (awicm_jax).
+
+Opt-in: nothing in the standalone (file-forced) model imports this package. The API (docs/coupling/awicm.md):
+
+* :func:`init_ocean` -> ``(state, static)``: the CORE2 ocean from a restart (or the PHC cold start), on one device;
+* :func:`ocean_interval` -> ``state``: run one coupling interval (``nsteps`` ocean steps) with the atmosphere's
+  fields on the FESOM nodes, ``mode="bulk"`` (B, near-surface state -> fesom_jax's bulk formulae) or ``"flux"``
+  (F, the fluxes as AWI-ESM3's FESOM2 receives them);
+* :func:`ocean_to_atm` -> ``{name: (nod2D,)}``: the eight fields FESOM2's ``cpl_driver`` sends (``sst_feom`` ...);
+* :func:`write_ocean_restart`; the monthly means are written by :func:`ocean_interval` when ``monthly_out`` is set.
+"""
+
+from .ocean import (MODE_B_FIELDS, MODE_F_FIELDS, OCEAN_TO_ATM, OceanStatic, flush_monthly,
+                    init_ocean, ocean_interval, ocean_to_atm, write_ocean_restart)
+
+__all__ = ["MODE_B_FIELDS", "MODE_F_FIELDS", "OCEAN_TO_ATM", "OceanStatic", "flush_monthly", "init_ocean",
+           "ocean_interval", "ocean_to_atm", "write_ocean_restart"]
