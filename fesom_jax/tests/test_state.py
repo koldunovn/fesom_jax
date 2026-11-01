@@ -87,9 +87,9 @@ def test_pytree_roundtrip_and_treemap(mesh):
     st = State.rest(mesh)
     leaves, treedef = tree_util.tree_flatten(st)
     from fesom_jax.precision import CARRY_FIELDS
-    from fesom_jax.state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+    from fesom_jax.state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
     # a set: bgc_carry is in both CARRY_FIELDS and BGC_FIELDS
-    optional = set(ICE_AVG_FIELDS) | set(CARRY_FIELDS) | set(SE_FIELDS) | set(BGC_FIELDS)
+    optional = set(ICE_AVG_FIELDS) | set(CARRY_FIELDS) | set(SE_FIELDS) | set(BGC_FIELDS) | set(CPL_FIELDS)
     assert len(leaves) == len(dataclasses.fields(State)) - len(optional)       # None: no leaf
     st2 = tree_util.tree_unflatten(treedef, leaves)
     np.testing.assert_array_equal(np.asarray(st2.T), np.asarray(st.T))
