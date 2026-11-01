@@ -76,7 +76,7 @@ partial cells, and fills 2 nodes below the Fortran bottom).
 - Even with matched physics, two runs drift apart node by node within months (chaos). Compare multi-year runs by
   global NPP, CO2 flux, inventories, seasonal cycles and patterns, not pointwise.
 
-## The physics-matched CORE2 pair (warm 1998, submitted 2026-10-30)
+## The physics-matched CORE2 pair (warm 1998, run 2026-10-30)
 
 | | Fortran | fesom-jax |
 |---|---|---|
@@ -87,6 +87,38 @@ Same REcoM code and the physics matched as far as the fork's base allows, so wha
 fork's sea-ice code and chaos. Together with kdind15w vs kdind15wjp (both Fortran) it splits the production
 comparison into the physics part and the rest: kdind15w - kdind15wjp is the response to the physics settings plus
 the REcoM fixes, kdind15wjp - fesom-jax is the residual.
+
+### Result (compared 2026-11-01)
+
+1998 annual means, `compare_fortran_jax.py` (`.../core2_recom_spectral_warm1998_{jaxphys,noco2lim}/compare`):
+
+| | NPP [Pg C/yr] | surface Chl [mg m-3] | Chl corr | CO2 flux [Pg C/yr] | pCO2 [uatm] | SST [degC] | ice [Mkm2] |
+|---|---|---|---|---|---|---|---|
+| kdind15wjp (Fortran, matched build) | 110.6 (3 groups) | 0.283 | | -0.05 | 280.38 | 17.945 | 21.80 |
+| fesom-jax jaxphys | 114.9 (4 groups) | 0.283 | 0.999 | -0.05 | 280.43 | 17.945 | 21.83 |
+| kdind15w (Fortran, production build) | 121.0 (3 groups) | 0.362 | | 0.33 | 278.82 | 17.944 | 20.67 |
+| fesom-jax noco2lim | 114.4 (4 groups) | 0.295 | 0.936 | 0.13 | 279.46 | 17.996 | 21.55 |
+
+- **The residual is nil.** fesom-jax and kdind15wjp agree over the whole year in every global number but NPP (Chl,
+  CO2 flux, pCO2, SST, ice, the six inventories to 4-6 digits, monthly Chl and CO2-flux pattern correlations
+  0.99-1.00). The NPP offset (+4 Pg C/yr, +3.9 %, steady from January) has the size of the coccolithophore share:
+  the Fortran run writes no `NPPc` stream, so its total sums three groups and fesom-jax's four; the cold run's
+  per-group output puts `npp_cocco` at ~4 % of the total by 1959. Not yet proven for this pair (the jaxphys run
+  predates the per-group outputs, b178eb6).
+- **The production gap is a Fortran build difference.** kdind15w - kdind15wjp, both Fortran, reproduces the
+  fesom-jax-vs-production pattern: +2 to +15 % NPP from January to December (diatoms +8 to +54 %, nanophytoplankton
+  +1 to +9 %), +10 to +43 % surface Chl, -0.1 to -1.8 Mkm2 ice. fesom-jax noco2lim (its own GM/Redi on, no `legacy:`
+  block) sits within ~1 % of jaxphys in NPP, so GM/Redi and the legacy flags move fesom-jax little; what moves the
+  Fortran is the difference between its
+  two executables and namelists: the 11 upstream REcoM commits (the ballasting fix 1cc2d0d3 among them), 66658357,
+  and the physics namelist (KPP + momix + Ferrari GM/Redi + EVP vs TKE + mEVP + GM/Redi off). Bisecting those
+  needs Fortran runs; fesom-jax cannot.
+- The cold 1958-59 run against kdind15 counted the same way (three groups each; `core2_recom_spectral_kdind15_groups`,
+  jobs 48627186-89): fesom-jax ~20 % low by 1959 (nano -20 %, diatoms -25 to -30 %, Phaeocystis equal), the earlier
+  "~17 %" understated it by the coccolithophores. That comparison also carries `spectral_co2lim: true`.
+- Every July of these chains was a 1.5-day mean until 2026-11-01 (a 5840-step half year ends 1.5 days into July and
+  `link_monthly.sh` linked the first segment's 48-sample store); it now merges the two stores sample-weighted
+  (`merge_monthly.py`). The July blip in the first jaxphys comparison (CO2-flux corr 0.86) was that, not physics.
 
 ## The cold 1958-59 run (co2lim on, all physics differences), for the record
 
