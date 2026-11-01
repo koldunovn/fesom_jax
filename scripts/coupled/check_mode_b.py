@@ -54,6 +54,29 @@ def raw_fields(jra, dates, point_slope):
     return {k: np.stack(v) for k, v in rows.items()}
 
 
+def seq_equal(a, b):
+    """Leaf-wise bitwise comparison of two forcing stacks: [(field, max |difference|)] of the differing ones."""
+    bad = []
+    for f in a._fields:
+        x, y = getattr(a, f), getattr(b, f)
+        if x is None and y is None:
+            continue
+        x, y = np.asarray(x), np.asarray(y)
+        if x.dtype != y.dtype or x.shape != y.shape or not np.array_equal(x.view(np.uint8), y.view(np.uint8)):
+            bad.append((f, float(np.abs(x.astype(np.float64) - y.astype(np.float64)).max())))
+    return bad
+
+
+def diff_stats(a, b, names=("T", "S", "uv", "eta_n", "a_ice", "m_ice")):
+    """{field: (number of differing entries, max |d|, rms d)} for a few State fields."""
+    out = {}
+    for n in names:
+        x, y = np.asarray(getattr(a, n), np.float64), np.asarray(getattr(b, n), np.float64)
+        d = x - y
+        out[n] = (int(np.count_nonzero(d)), float(np.abs(d).max()), float(np.sqrt((d * d).mean())))
+    return out
+
+
 def leaves_equal(a, b):
     la, lb = jax.tree.leaves(a), jax.tree.leaves(b)
     assert len(la) == len(lb)
@@ -106,17 +129,42 @@ def main():
             st.sm, state_ref, st.sop, st.stress_p, seq_p, st.fs_p, st.nsteps, dt=st.dt, npes=1,
             bootstrap_ab2=st.bootstrap, state_is_folded=True, return_folded=True, boundary_node_p=st.bn_p,
             reuse_executable=True, sample_fn=st.sample_fn, ssh_gather=st.gather, precision=st.precision, **st.phys)
+        state_ref_in = state_ref
         state_ref = out[0] if st.sample_fn is not None else out
         raw = raw_fields(jra, dates, sp)
         if i < n_bit:
             forcing = raw                                        # one row a step
+            # the forcing itself: the provider's device stack against the reader's host stack (cast as the runner)
+            from fesom_jax.coupled.ocean import bulk_step_forcing
+            ref_seq = ref_forcing.stack(dates, xp=np)
+            fbad = seq_equal(PR.cast_tree(ref_seq) if sp else ref_seq, bulk_step_forcing(raw, st, dates))
+            # determinism control: the reference chunk call again, from the same input
+            out2 = run_steps_sharded_forced(
+                st.sm, state_ref_in, st.sop, st.stress_p, seq_p, st.fs_p, st.nsteps, dt=st.dt, npes=1,
+                bootstrap_ab2=st.bootstrap, state_is_folded=True, return_folded=True, boundary_node_p=st.bn_p,
+                reuse_executable=True, sample_fn=st.sample_fn, ssh_gather=st.gather, precision=st.precision,
+                **st.phys)
+            state_ref2 = out2[0] if st.sample_fn is not None else out2
+            ctrl = leaves_equal(state_ref2, state_ref)
         else:
             forcing = {k: v.mean(axis=0, dtype=np.float64).astype(v.dtype) for k, v in raw.items()}
+        state_in = state
         state = ocean_interval(state, st, forcing)
         if i < n_bit:
             bad = leaves_equal(state, state_ref)
-            report["bitwise"].append({"interval": i, "n_differing_leaves": len(bad), "worst": bad[:5]})
-            print(f"[check] interval {i} {st.calendar()} bitwise: {'OK' if not bad else bad[:5]}", flush=True)
+            rec = {"interval": i, "forcing_differing_fields": fbad, "n_differing_leaves": len(bad), "worst": bad[:5],
+                   "control_ref_vs_ref_differing_leaves": len(ctrl), "control_worst": ctrl[:5],
+                   "same_input": len(leaves_equal(state_in, state_ref_in)) == 0}
+            if bad:
+                rec["test_vs_ref"] = diff_stats(state, state_ref)
+            if ctrl:
+                rec["ref_vs_ref"] = diff_stats(state_ref2, state_ref)
+            report["bitwise"].append(rec)
+            print(f"[check] interval {i} {st.calendar()} forcing bitwise: {'OK' if not fbad else fbad}; "
+                  f"state bitwise: {'OK' if not bad else rec.get('test_vs_ref')}; control ref-vs-ref: "
+                  f"{'OK' if not ctrl else rec.get('ref_vs_ref')}", flush=True)
+            # continue both from the reference so each interval compares one interval's program on equal input
+            state = state_ref
         if (i + 1) % ipd == 0:
             sst, sst_r = np.asarray(state.T[:, 0], np.float64), np.asarray(state_ref.T[:, 0], np.float64)
             o2a = ocean_to_atm(state, st)

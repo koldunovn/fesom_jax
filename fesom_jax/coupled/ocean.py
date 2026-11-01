@@ -112,10 +112,14 @@ class OceanStatic:
         if key not in self._exe:
             from ..integrate_sharded import run_steps_sharded_forced
             n = self.nod2D
-            z = np.zeros((nsteps, n), np.float64)
-            seq = surface_forcing.StepForcing(u_air=z, v_air=z, shum=z, shortwave=z, longwave=z, Tair=z,
-                                              prec_rain=z, prec_snow=z, Ssurf_month=z, chl=z)
-            seq_p = shard_mesh.partition_step_forcing(seq, self.part)
+            if self.mode == "flux":
+                from .flux import dummy_seq
+                seq_p = dummy_seq(int(nsteps), n)
+            else:
+                z = np.zeros((nsteps, n), np.float64)
+                seq = surface_forcing.StepForcing(u_air=z, v_air=z, shum=z, shortwave=z, longwave=z, Tair=z,
+                                                  prec_rain=z, prec_snow=z, Ssurf_month=z, chl=z)
+                seq_p = shard_mesh.partition_step_forcing(seq, self.part)
             jfn, args, _ = run_steps_sharded_forced(
                 self.sm, state, self.sop, self.stress_p, seq_p, self.fs_p, int(nsteps), dt=self.dt, npes=1,
                 bootstrap_ab2=bool(bootstrap), state_is_folded=True, return_folded=True,

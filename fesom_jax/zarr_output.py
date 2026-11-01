@@ -245,8 +245,9 @@ def _all_state_fields() -> tuple[str, ...]:
     ``uv_rhsAB`` / ``sigma*`` / ``tke``). Every reader that loops over it to rebuild a State
     (``core2_adj.load_state``, ...) keeps working on restarts with and without the optional
     fields."""
-    from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS, State
-    return tuple(f.name for f in dataclasses.fields(State) if f.name not in ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS)
+    from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS, State
+    return tuple(f.name for f in dataclasses.fields(State)
+                 if f.name not in ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS)
 
 
 def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_stage,
@@ -274,9 +275,9 @@ def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_st
     (a dt change across a restart invalidates the AB2 history; the driver re-bootstraps).
     Returns the store path."""
     if fields is None:      # every present leaf: the SP carry, ICE_AVG_FIELDS, SE_FIELDS and BGC_FIELDS only when they exist
-        from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+        from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
         from .state import RESTART_SKIP
-        fields = tuple(n for n in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS
+        fields = tuple(n for n in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS
                        if getattr(state_folded, n) is not None and n not in RESTART_SKIP)
     fields = tuple(fields)
     # On disk always float64 (FESOM2: netCDF restarts are double in both builds); a single-precision
@@ -365,10 +366,10 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     sharding = NamedSharding(jmesh, PartitionSpec("p"))
 
     from .precision import CARRY_FIELDS
-    from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+    from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
     out = {}
-    for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS:
-        if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS and name not in root:
+    for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS:
+        if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS and name not in root:
             # written by single-precision runs only (the carry), or an ice_ave_steps field the writer did not
             # use (ice_ave_steps == 1, or a restart from before Task 12): None; ice_step.init_ice_avg gives
             # the latter the upstream init values. The split-explicit rings: only an SE run writes them

@@ -242,7 +242,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             st = dataclasses.replace(st, uvnode=_exch(pp.compute_vel_nodes(mesh, st.uv), "nod"))
         if ice_cfg is not None:
             from . import ice_step as _ice_step       # lazy: keep ice deps off the pi path
-            ice_out = _ice_step.ice_surface_step(
+            # the coupled ocean's mode F (fesom_jax.coupled.flux.CplForcing): FESOM2's coupled ice block; a trace-time
+            # branch on the forcing's type, so the standalone program is unchanged
+            _ice_fn = _ice_step.ice_surface_step
+            if getattr(type(step_forcing), "COUPLED_FLUX", False):
+                from .coupled import flux as _cpl_flux
+                _ice_fn = _cpl_flux.ice_surface_step_cpl
+            ice_out = _ice_fn(
                 ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt,
                 owned_mask=_red_mask, axis_name=_red_axis, exch=_exch,
                 boundary_node=boundary_node, use_virt_salt=use_virt_salt, zbar3=zbar3_live,
@@ -751,6 +757,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         if ice_out.ice_steps_since_upd is not None:
             from .state import ICE_AVG_FIELDS
             new = dataclasses.replace(new, **{f: getattr(ice_out, f) for f in ICE_AVG_FIELDS})
+        if ice_out.cpl is not None:                      # coupled mode F only (None otherwise: nothing traced)
+            new = dataclasses.replace(new, **ice_out.cpl)
     return new
 
 

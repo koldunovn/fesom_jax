@@ -158,6 +158,13 @@ class State:
     bgc_diag: jax.Array | None = None             # (nod2D,len(recom.wiring.DIAG2D)) the last BGC step's 2-D diagnostics
     #                                               (output only, not restarted; GloHplus = surface pH among them)
     bgc_budget: jax.Array | None = None           # (nod2D,4,ntr) RecomConfig.budget only: per-column content sums
+    # --- the coupled ocean's mode F (fesom_jax.coupled.flux; FESOM2's __oifs ice arrays). OPTIONAL: None unless the
+    # ocean runs coupled in flux mode (the SE_FIELDS precedent), node fields ---
+    cpl_ice_temp: jax.Array | None = None         # (nod2D,) ice%data(4) ice surface temperature [K]
+    cpl_ice_alb: jax.Array | None = None          # (nod2D,) ice%atmcoupl%ice_alb
+    cpl_apnd: jax.Array | None = None             # (nod2D,) melt-pond area fraction (ice%thermo%apnd)
+    cpl_hpnd: jax.Array | None = None             # (nod2D,) melt-pond depth [m]
+    cpl_ipnd: jax.Array | None = None             # (nod2D,) melt-pond lid thickness [m]
     #                                               (recom.wiring.BUDGET_TERMS), not restarted
 
     # ---- constructors -----------------------------------------------------
@@ -265,6 +272,8 @@ BGC_FIELDS = ("bgc", "bgc_old", "bgc_carry") + BGC_MR_FIELDS + BGC_FULL_FIELDS
 # Present but never written to a restart: FESOM2 restarts neither the carbonate cache nor mstep (both restart with
 # the run segment, fesom_module.F90:849,983,1049; recom_sms.F90:489); the diagnostics and budget sums are output.
 RESTART_SKIP = ("bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget")
+# The optional coupled mode F fields, in State order (None unless fesom_jax.coupled runs in flux mode).
+CPL_FIELDS = ("cpl_ice_temp", "cpl_ice_alb", "cpl_apnd", "cpl_hpnd", "cpl_ipnd")
 
 
 def present_fields(state) -> tuple[str, ...]:

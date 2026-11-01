@@ -173,6 +173,8 @@ class IceStepOut(NamedTuple):
     ice_thdgrsn: jnp.ndarray | None = None
     ice_real_salt_flux: jnp.ndarray | None = None
     ice_a_old: jnp.ndarray | None = None
+    # the coupled ocean's mode F (fesom_jax.coupled.flux): {State.CPL_FIELDS name: array} to carry; None otherwise
+    cpl: dict | None = None
 
 
 def _with_ice_dt(cfg: IceConfig, dt: float) -> IceConfig:
