@@ -10046,3 +10046,20 @@ Three findings from the spectral fork's sharded and gradient gates, one afternoo
    crosses the light, including `graz_max` and `rho_N` through the state. `jax_debug_nans` on a one-step cost,
    un-jitted, names the line (`spectral.py:494`). The fix is the forward-identical double `where`
    (`_safe_sqrt`), as `ice.py` does for the EVP delta; `jnp.maximum(x, tiny)` would have moved the light gate.
+
+### 2026-11-01 (branch recom-spectral, lane W) — a diagnostic sum and a half-filled month can look like a model bias; an XLA CPU crash is not the merge
+
+1. **Count the same groups before reading an NPP gap.** The Fortran spectral runs write `NPPn`, `NPPd`, `NPPp` and
+   no `NPPc`; fesom-jax's `npp` is all four groups. The physics-matched CORE2 pair (kdind15wjp vs jaxphys) agreed to
+   4-6 digits in Chl, pCO2, SST, ice and every inventory and differed by a steady +3.9 % in NPP from January: the
+   coccolithophores, not the port. Chl matching while NPP does not is the tell. The cold comparison against kdind15
+   was understated by the same share ("17 %" was ~20 % group for group, `docs/recom/FORTRAN_JAX_DIFFERENCES.md`).
+2. **A month two segments split.** A 5840-step half year ends 1.5 days into July; each segment writes its own July
+   mean (`n_samples` 48 and 944) and `link_monthly.sh` linked the first, so every July was a 1.5-day mean and showed
+   as a one-month blip (CO2-flux pattern correlation 0.86 between months at 1.000). Check `n_samples` in a monthly
+   store's attributes before reading one month; `link_monthly.sh` now merges split months (`merge_monthly.py`).
+3. **`test_recom_sharded_fork.py` aborts intermittently in XLA's CPU fake-device all-gather** (a segfault in the
+   merge suite, job 48627319_4; `rendezvous.h:355 Check failed: state.use_count() == num_threads` in 2 of 4 reruns
+   on the unmerged branch, jobs 48635024/48635030; the merge branch passed 4 of 4, 48635023/27/29/31). Same env,
+   same test, both branches: a jaxlib CPU collectives race, not a regression; every completed run agrees to 5e-15.
+   Rerun before bisecting a merge on a crash in `integrate_sharded`.
