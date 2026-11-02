@@ -77,6 +77,22 @@ old branch, and the new branch's first commit names the source commit `21e0d02a`
 - This separates toolchain/namelist problems of the new FESOM2 from problems of the port. It also gives the upstream
   namelist set (`config/`) that steps 4-5 start from.
 
+**Steps 0-1 done 2026-11-02.** Base commit **`0aaa2d73`** (upstream/main at the fetch). Worktree
+`/albedo/work/user/sloza/SPECTRAL/fesom2.8_recom_spectral`, branch `fesom2.8_recom_spectral`, submodule `src/recom` at
+`259e70e3`. Build `build_recom/` (cmake `-DCMAKE_BUILD_TYPE=Release -DRECOM_COUPLED=ON`, `env/albedo`, `make -j8`
+under `taskset`: `configure.sh` runs `make -j$(nproc)`, 256 on the login node) -> `bin/fesom.x`, `lib64/libfesom.so`,
+no warnings. Namelists `scripts/recom/fortran/namelists_albedo_fesom28/` (= `namelists_jaxphys` with the Albedo inputs
+and nine `namelist.recom` keys REcoM 259e70e3 no longer reads; README there). pi `bin_2p3z2d`, 1 rank, 1 day:
+job 48698080 aborted reading `&pavariables` (`HetRespFlux_plus`), job **48698081** completed (32 steps, 61 s, CG 35.5
+mean iterations, no non-convergence), run `fesom_jax_runs/recom_ref/fesom28_vanilla_pi_1d`. All fields finite apart
+from the below-bottom fill (45828 values in every 3-D field, T and S alike); sst -1.86..29.67, DIC 1848-2462, CO2f
+-19..67. Production builds and the twins use `CMAKE_BUILD_TYPE=Debug`; the matched builds of step 5 follow them.
+
+Restart check (on paper; the warm start of 5.5 is the real test): every restart variable 2.8 added (`d_eta`,
+`hnode_new`, `sigma11/12/22`, `t_skin`, IDEMIX2, AB3) is defined with `def_*_var_optional`; a 2.6 file only has extra
+ones (the tracer `_AB` fields), and `io_restart.F90` keeps `nc_restart_path_legacy` for the old
+`fesom.<year>.oce.restart.nc` naming. 2.8 itself writes per-variable directories (`fesom.1958-01-02.oce.restart/`).
+
 ### 2. The fork's REcoM back in the tree
 
 - Commit 0 (old base, side branch `recom_spectral_jaxref` off `_recom692_dumps` minus `63283bc9`): cherry-pick
