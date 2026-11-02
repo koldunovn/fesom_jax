@@ -207,6 +207,30 @@ without errors or warnings.
    `scripts/compare_fortran_jax_groups.py`. The remaining difference should be fesom-jax's stated deviations only
    (ballast reset over the whole mesh instead of per rank, the first-call reset skipped at step 1) plus chaos.
 
+**5.2 and 5.3 done 2026-11-02.** 5.2: see step 4 (step-1 REcoM outputs equal to the old fork to 1.2e-12 on
+ice-free nodes). 5.3: the column gates on the 2.8 twin's dumps (`FESOM_RECOM_FORK_RUN` and
+`FESOM_RECOM_SPECTRAL_RUN` = `fesom28_spectral_pi_1d_dumps`): test_recom_sms_fork, _spectral_light, _sinking_fork,
+_spectral_wiring 20 passed (job 48698144). Stage 1 worst **1.3e-13** over steps 1, 2, 3, 17 (`python -m
+fesom_jax.tests.test_recom_sms_fork`, job 48698147; the old twins: 2.4e-13); spectral light planes <= 1.2e-12.
+
+**5.4 done 2026-11-02.** `test_recom_step_fork.py` runs the 2.8 twin (`FESOM28_RUNS`) under
+`configs/albedo/pi_recom_spectral_g4b_fesom28.yaml` (GM/Redi on, as the 2.8 namelists; `mesh_pi_fork`) and **without
+any `legacy_*` setting**. Physics floor **4.09e-8** (T), a_ice 2.7e-7, every BGC tracer <= 2.4e-8 (job 48698151):
+the 692f804 pair's 4.1e-8; the fork on its old base: 5.4e-5 / 3.2e-4. `FLOOR_MAX_28 = 8.2e-8`. All three twins
+pass (job 48698153). Pitfall: `mesh: null` (the packaged pi mesh) differs from the twin's level files
+(`mesh_pi_part`, written by the fork's fesom_ini) at one node by 3 levels; through the wet mask that alone gave a
+"floor" of 0.93 (job 48698146).
+
+**5.5 set up 2026-11-02.** Fortran: `/albedo/work/user/sloza/SPECTRAL/tmp_run_kdind15w28` (README.w28; frozen copy
+of the `a89bb3d6` build; 9 nodes x 96 as kdind15wjp; `TEST_DAYS=N` for a short test), namelists from
+`scripts/recom/fortran/make_namelists_fesom28_core2.py` -> `namelists_albedo_fesom28_core2_warm1998/`. fesom-jax:
+`configs/albedo/core2_recom_spectral_warm1998_fesom28.yaml` (the `_jaxphys_groups` config with `gm: {}` and no
+`legacy`), to run as `scripts/albedo/chain_core2_gpu.sh configs/albedo/core2_recom_spectral_warm1998_fesom28.yaml
+/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/core2_recom_spectral_warm1998_fesom28 2 5840 1998`.
+Submitted 2026-11-02: Fortran 1-day restart test job 48698157 (`TEST_DAYS=1`, ->
+`tmp_recom-fesom_output/fesom2.8_spectral_kdind15w28_test1d`), the year job 48698173 (afterok on the test, ->
+`fesom2.8_spectral_kdind15w28`); fesom-jax segments 48698174, 48698175.
+
 ### 6. Hand-over
 
 - The user pushes `fesom2.8_recom_spectral` to `sveta-loza/fesom2`.
