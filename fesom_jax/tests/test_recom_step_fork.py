@@ -43,7 +43,12 @@ CFG = REPO / "configs" / "albedo" / "pi_recom_spectral_g4b.yaml"
 RUN_CFG = REPO / "configs" / "albedo" / "pi_recom_spectral.yaml"      # the production spectral config (gm on, no legacy)
 NML_NOWB = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb_jaxphys" / "namelist.recom"
 # the physics-matched twins: the spectral build (37 tracers, the spectral light) and the broadband build (36)
-RUNS = [r for r in os.environ.get("FESOM_RECOM_FORK_G4B_RUNS", "pi_1d_spectral_jaxphys,pi_1d_nowb_jaxphys").split(",")
+# The same REcoM on FESOM 2.8 (sveta-loza/fesom2 fesom2.8_recom_spectral, docs/plans/20261102-fortran-spectral-on-
+# fesom28.md): its own config (GM/Redi on, the packaged pi mesh) and none of the legacy settings.
+CFG28 = REPO / "configs" / "albedo" / "pi_recom_spectral_g4b_fesom28.yaml"
+FESOM28_RUNS = ("fesom28_spectral_pi_1d_dumps",)
+RUNS = [r for r in os.environ.get("FESOM_RECOM_FORK_G4B_RUNS",
+                                  "pi_1d_spectral_jaxphys,pi_1d_nowb_jaxphys," + ",".join(FESOM28_RUNS)).split(",")
         if (REF / r / "dumps" / "step_000001").is_dir()]
 HAVE = bool(RUNS) and CFG.is_file()
 need_twin = pytest.mark.skipif(not HAVE, reason=f"the fork's physics-matched twin dumps or the gate config are absent "
@@ -56,24 +61,27 @@ need_twin = pytest.mark.skipif(not HAVE, reason=f"the fork's physics-matched twi
 # follows (the 692f804 pair: 4.1e-8). FLOOR_MAX is twice that; a floor above it means the physics match was lost.
 G4B_FACTOR = 100.0
 FLOOR_MAX = 1.1e-4
+# The same REcoM on FESOM 2.8 (FESOM28_RUNS) with GM/Redi on and none of the legacy settings: floor 4.09e-8 (T; a_ice
+# 2.7e-7; job 48698151 on the twin of job 48698141), the 692f804 pair's 4.1e-8. FLOOR_MAX_28 is twice that.
+FLOOR_MAX_28 = 8.2e-8
 EXTRA = ("recom_out.NPPc", "recom_out.NPPp", "recom_out.GloO2flux", "recom_in.a_ice")
 
 
-def _config(run: str, yaml=CFG):
-    cfg = load_yaml(yaml)
+def _config(run: str, yaml=None):
+    cfg = load_yaml(yaml or (CFG28 if run in FESOM28_RUNS else CFG))
     if "spectral" not in run:                 # the broadband build: the 36-tracer namelist, no spectral light
         cfg = dataclasses.replace(cfg, recom=cfg.recom._replace(namelist=str(NML_NOWB), spectral=False))
     return cfg
 
 
 @lru_cache(maxsize=4)
-def _setup(run: str, yaml=CFG):
+def _setup(run: str, yaml=None):
     """The twin ``run``'s step-0 state, forcing and operators under the config ``yaml`` (the gate's by default; the
     sharded and gradient gates pass the production spectral config)."""
     cfg = _config(run, yaml)
     phys = cfg.physics_kwargs()
     lay = cfg.recom.layout
-    mesh = load_mesh(cfg.mesh)
+    mesh = load_mesh(cfg.mesh) if cfg.mesh else load_mesh()      # mesh: null = the packaged pi mesh
     d1 = load_recom_dump(REF / run / "dumps", 1, names=R.dump_names(layout=lay) + list(EXTRA))[0]
     st = R.twin_step0_state(mesh, d1, phys["ale_cfg"], cfg.recom, layout=lay)
     cf = surface_forcing.build_surface_forcing(mesh, 1958, sst_ic=np.asarray(st.T[:, 0]), dt=cfg.dt, mslp=True,
@@ -81,7 +89,8 @@ def _setup(run: str, yaml=CFG):
                                                **cfg.forcing_paths())
     fs = wiring.with_recom_static(cf.static, mesh, cfg.recom)
     op = ssh.build_ssh_operator(mesh, dt=cfg.dt)
-    return dict(cfg=cfg, phys=phys, lay=lay, mesh=mesh, d1=d1, st=st, cf=cf, fs=fs, op=op)
+    return dict(cfg=cfg, phys=phys, lay=lay, mesh=mesh, d1=d1, st=st, cf=cf, fs=fs, op=op,
+                legacy=run not in FESOM28_RUNS)
 
 
 # the fork's FESOM2 base (cda35117, 2025-10): the FCT limiter bounds without the thickness (before FESOM2
@@ -106,7 +115,7 @@ def _run(fx, n: int, legacy: bool = True):
 
 
 def _one_step(fx):
-    return jax.device_get(_run(fx, 1)[1])
+    return jax.device_get(_run(fx, 1, legacy=fx["legacy"])[1])
 
 
 RESTART = os.environ.get("FESOM_G6_FORK_RESTART",
@@ -173,6 +182,7 @@ def test_g4b_fork_one_step_vs_twin(run):
     for k, v in sorted(e.items(), key=lambda kv: -kv[1][0]):
         print(f"G4B-fork {run} {k:>18}: rel {v[0]:.2e} (max |F| {v[1]:.3e})")
     print(f"G4B-fork {run} physics floor (max rel of T, S) {floor:.2e}, a_ice {e['a_ice'][0]:.2e}")
-    assert floor < FLOOR_MAX, f"the pair's physics is not matched (T/S floor {floor:.2e})"
+    assert floor < (FLOOR_MAX_28 if run in FESOM28_RUNS else FLOOR_MAX), \
+        f"the pair's physics is not matched (T/S floor {floor:.2e})"
     bad = {k: v for k, v in e.items() if k not in ("T", "S", "a_ice") and v[0] > max(G4B_FACTOR * floor, 1e-12)}
     assert not bad, (floor, bad)
