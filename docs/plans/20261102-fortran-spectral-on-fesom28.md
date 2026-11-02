@@ -105,6 +105,25 @@ ones (the tracer `_AB` fields), and `io_restart.F90` keeps `nc_restart_path_lega
   explicit `mesh%...` / `partit%...` references (the mechanical form #1128 used for the host), `mod_parsup` and any
   renamed `MOD_ICE`/`MOD_MESH`/`MOD_TRACER` fields. No change to arithmetic or association order.
 
+**Step 2 done 2026-11-02.**
+- Commit 0: branch `recom_spectral_jaxref` (worktree `/albedo/work/user/sloza/SPECTRAL/recom_spectral_jaxref`) =
+  `867cc6e3` + `1d758359` (cherry-pick of `4d96c3aa`) + **`ce142dcd`** (of `21e0d02a`), both clean. Against production
+  `21e0d02a` it differs by the 11 REcoM commits and the dump hooks only (18 files, +906/-333; host files among them:
+  `oce_ale_tracer`, `oce_ale_vel_rhs`, `oce_setup_step`, `io_meandata`, `io_netcdf_workaround_module`,
+  `recom_ref_dump_hooks.F90`, which step 4 carries over). Built like the jaxphys twins: `build_rel/` Release,
+  `RECOM_WAVEBANDS=ON` -> `install_rel/bin/fesom.x`.
+- Commit 1 `250197af`: `src/int_recom/` from `ce142dcd`, submodule and `.gitmodules` removed; `src/CMakeLists.txt` globs
+  `int_recom/*.F90 int_recom/recom/*.F90` into the fesom target (as the fork), new option `RECOM_WAVEBANDS` (ON) ->
+  `__RECOM_WAVEBANDS`; upstream's `__recom USE_PRECISION=2 __usetp` kept (`__usetp` only declares MPI request arrays
+  in `oce_modules`; int_recom has no `__usetp` code).
+- Commit 2 **`eeb793e2`**: the four `associate_*.h` headers kept privately in `src/int_recom/` (from `e797b8ed^`, so
+  they match the current `t_mesh`/`t_partit`), the 60 includes without `../`; `use MOD_PARSUP` (21) ->
+  `use par_support_module, only: par_abort`, the five `par_ex` error exits -> `par_abort` (upstream #1073/`f3482bb0`).
+  Nothing else in int_recom changed; every int_recom file compiles. Remaining errors are host call sites only:
+  `ice_oce_coupling` (17, `use_virt_tracers`/`virtual_*` from the submodule's `recom_config`), `oce_ale_tracer` (13,
+  `tracers_info`, `expflux/botflux`, `virtual_*`), `io_meandata` (17, `tracer_ids`); `fesom_module` and
+  `gen_forcing_*` are not reached yet.
+
 ### 3. Host call sites back to the fork's interface
 
 - Commit 3: replace upstream's array-interface calls with the fork's type-based ones at every site: `fesom_module`
