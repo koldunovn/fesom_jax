@@ -227,9 +227,14 @@ of the `a89bb3d6` build; 9 nodes x 96 as kdind15wjp; `TEST_DAYS=N` for a short t
 `configs/albedo/core2_recom_spectral_warm1998_fesom28.yaml` (the `_jaxphys_groups` config with `gm: {}` and no
 `legacy`), to run as `scripts/albedo/chain_core2_gpu.sh configs/albedo/core2_recom_spectral_warm1998_fesom28.yaml
 /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/core2_recom_spectral_warm1998_fesom28 2 5840 1998`.
-Submitted 2026-11-02: Fortran 1-day restart test job 48698157 (`TEST_DAYS=1`, ->
-`tmp_recom-fesom_output/fesom2.8_spectral_kdind15w28_test1d`), the year job 48698173 (afterok on the test, ->
-`fesom2.8_spectral_kdind15w28`); fesom-jax segments 48698174, 48698175.
+Submitted 2026-11-02: fesom-jax segments 48698174, 48698175. Fortran: the 1-day restart test job 48698157 failed
+reading `tra0006.nc`: **2.6 named the restart tracers at positions 6/11/12/14/39 `sf6/cfc11/cfc12/r14c/r39ar`** (its
+SELECT CASE ran on the position), 2.8 selects on the tracer ID, so every BGC tracer is `tra<pos>`. The restart
+itself is fine; `scripts/recom/fortran/restart_2p6_to_2p8.py` writes a 2.8 view
+(`p_specbic/sloza/restart_1997_4pft_fesom28`: those 8 files copied with file and variable renamed, the rest
+symlinks; data verified equal). Resubmitted: test 48698182 (`TEST_DAYS=1`, ->
+`tmp_recom-fesom_output/fesom2.8_spectral_kdind15w28_test1d`), year 48698183 (afterok, ->
+`fesom2.8_spectral_kdind15w28`).
 
 ### 6. Hand-over
 
