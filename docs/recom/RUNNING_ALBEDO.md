@@ -162,3 +162,8 @@ With the per-group outputs on (`recom.output` `npp_phy`..`npp_phaeo`, `PhyC`..`P
 `scripts/recom/compare_fortran_jax_groups.py` compare NPP group by group against the Fortran `NPPn/NPPd/NPPc/NPPp`
 streams the run wrote (kdind15* have no `NPPc`) and every group's C and Chl inventory; it writes
 `groups_summary.json` (monthly and annual means).
+The comparison dashboard (a claude.ai artifact, https://claude.ai/artifact/FZdfSKsnqxJ8JDxDVs1fHP) reads CSV files
+made by `scripts/recom/dashboard_data.py OUT` (the monthly global tables of the cold 1958-59 pair and the four warm 1998
+runs; needs both compare scripts' `summary.json`/`groups_summary.json` first) and `scripts/recom/dashboard_maps.py OUT`
+(1-degree surface maps per month and zonal means of the cold pair, regridded from the CORE2 nodes). Their defaults are
+the Albedo run and output paths of lane W.
