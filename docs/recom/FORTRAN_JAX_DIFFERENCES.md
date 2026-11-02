@@ -103,8 +103,8 @@ the REcoM fixes, kdind15wjp - fesom-jax is the residual.
   CO2 flux, pCO2, SST, ice, the six inventories to 4-6 digits, monthly Chl and CO2-flux pattern correlations
   0.99-1.00). The NPP offset (+4 Pg C/yr, +3.9 %, steady from January) has the size of the coccolithophore share:
   the Fortran run writes no `NPPc` stream, so its total sums three groups and fesom-jax's four; the cold run's
-  per-group output puts `npp_cocco` at ~4 % of the total by 1959. Not yet proven for this pair (the jaxphys run
-  predates the per-group outputs, b178eb6).
+  per-group output puts `npp_cocco` at ~4 % of the total by 1959. Proven on 2026-11-02 with the per-group rerun
+  (next section).
 - **The production gap is a Fortran build difference.** kdind15w - kdind15wjp, both Fortran, reproduces the
   fesom-jax-vs-production pattern: +2 to +15 % NPP from January to December (diatoms +8 to +54 %, nanophytoplankton
   +1 to +9 %), +10 to +43 % surface Chl, -0.1 to -1.8 Mkm2 ice. fesom-jax noco2lim (its own GM/Redi on, no `legacy:`
@@ -114,11 +114,35 @@ the REcoM fixes, kdind15wjp - fesom-jax is the residual.
   and the physics namelist (KPP + momix + Ferrari GM/Redi + EVP vs TKE + mEVP + GM/Redi off). Bisecting those
   needs Fortran runs; fesom-jax cannot.
 - The cold 1958-59 run against kdind15 counted the same way (three groups each; `core2_recom_spectral_kdind15_groups`,
-  jobs 48627186-89): fesom-jax ~20 % low by 1959 (nano -20 %, diatoms -25 to -30 %, Phaeocystis equal), the earlier
-  "~17 %" understated it by the coccolithophores. That comparison also carries `spectral_co2lim: true`.
+  jobs 48627186-89, `compare_fortran_jax_groups.py`, annual means in Pg C/yr, fesom-jax/Fortran): 1958 common groups
+  97.65/118.67 (-17.7 %; small phytoplankton 50.06/65.43, diatoms 44.00/50.08, Phaeocystis 3.60/3.16), 1959
+  91.22/115.68 (-21.2 %; 66.16/83.42, 18.32/25.25, 6.74/7.02); fesom-jax coccolithophores 10.27 and 4.29. The earlier
+  "~17 %" understated the gap by the coccolithophores. That comparison also carries `spectral_co2lim: true`.
 - Every July of these chains was a 1.5-day mean until 2026-11-01 (a 5840-step half year ends 1.5 days into July and
   `link_monthly.sh` linked the first segment's 48-sample store); it now merges the two stores sample-weighted
   (`merge_monthly.py`). The July blip in the first jaxphys comparison (CO2-flux corr 0.86) was that, not physics.
+
+### Group by group (compared 2026-11-02)
+
+The jaxphys run again with the per-group outputs (`configs/albedo/core2_recom_spectral_warm1998_jaxphys_groups.yaml`,
+commit 1395ff1, jobs 48635149-50, `fesom_jax_runs/core2_recom_spectral_warm1998_jaxphys_groups`). Its
+`compare_fortran_jax.py` table equals the jaxphys run's to the printed digit (a 0.01 wobble in sea-ice area, NPP and
+the DIC inventory in some months; the per-group outputs do not change the model, so it is run-to-run nondeterminism
+on the GPU, not a code difference). `scripts/recom/compare_fortran_jax_groups.py` against kdind15wjp, 1998:
+
+| Pg C/yr, annual mean | small phytoplankton | diatoms | coccolithophores | Phaeocystis | common three | total |
+|---|---|---|---|---|---|---|
+| fesom-jax jaxphys_groups | 89.05 | 15.83 | 4.32 | 5.73 | 110.61 | 114.93 |
+| kdind15wjp (`NPPn`, `NPPd`, -, `NPPp`) | 89.05 | 15.84 | (no stream) | 5.73 | 110.61 | |
+
+- The NPP of the groups both write agrees month by month: the three-group sum within 0.02 %, small phytoplankton
+  within 0.01 % (pattern corr 1.0000), diatoms within 0.09 % (corr >= 0.9997), Phaeocystis within 0.28 % (corr
+  >= 0.9995). The largest monthly differences are diatoms and Phaeocystis in May-July, shrinking again by autumn.
+- The carbon and chlorophyll inventories of all four groups, the coccolithophores included, agree within 0.2 %
+  (surface pattern corr >= 0.989), so the coccolithophores grow alike on both sides.
+- fesom-jax `npp` is the sum of its four groups (to the printed digit). **The whole NPP offset of the pair is the
+  coccolithophore NPP** (3.6-6.0 Pg C/yr by month, 4.32 on the annual mean) that the Fortran run does not write. The
+  residual of the physics-matched pair is nil in NPP too.
 
 ## The cold 1958-59 run (co2lim on, all physics differences), for the record
 

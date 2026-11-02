@@ -158,3 +158,7 @@ One half-year segment of CORE2 + the spectral fork takes ~3.7 h on one PCIe A100
 (global NPP and CO2 flux [Pg C yr-1], surface Chl, pCO2, SST, ice area, the six inventories, pattern correlations)
 and draws `compare_<YYYY_MM>.png` (surface Chl, NPP, CO2 flux: fesom-jax, Fortran, difference). What differs between
 the two runs (the host physics, and `spectral_co2lim`): `docs/recom/FORTRAN_JAX_DIFFERENCES.md`.
+With the per-group outputs on (`recom.output` `npp_phy`..`npp_phaeo`, `PhyC`..`PhaeoChl`), the same arguments to
+`scripts/recom/compare_fortran_jax_groups.py` compare NPP group by group against the Fortran `NPPn/NPPd/NPPc/NPPp`
+streams the run wrote (kdind15* have no `NPPc`) and every group's C and Chl inventory; it writes
+`groups_summary.json` (monthly and annual means).
