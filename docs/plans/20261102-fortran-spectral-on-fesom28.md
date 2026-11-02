@@ -135,6 +135,33 @@ ones (the tracer `_AB` fields), and `io_restart.F90` keeps `nc_restart_path_lega
   advection, the ice coupling and the output). If upstream moved a call, follow upstream and write it down: it is a
   host-model change and belongs to this update.
 
+**Step 3 done 2026-11-02**: `a5e7717d` (the call sites) + `8c9626dd` (two fixes); full build and install
+without errors or warnings.
+- Upstream did not move REcoM in the step (recom_init after ocean_setup; recom after before_oce_step, before
+  oce_timestep_ale; sbc_do_recom at the end of update_atm_forcing where the fork read the same fields at the
+  end of sbc_do), so only call forms and REcoM blocks changed. Built **without `__usetp`**: all of 2.8's
+  tracer-parallel code (9a1ddd27, 3503b8b6, 1577 lines in 13 files) is behind it, the fork has no such mode.
+- Per file (details in the commit message): fesom_module (type-based recom/recom_init), oce_ale_tracer (fork's
+  sinking/benthos block, verified equal to commit 0 modulo the dump calls; fork's post-loop SinkFlx/SinkingVel
+  sums, which 2.8 does only under `__usetp`; fork's bc_surface block verbatim), ice_oce_coupling (linfs virtual
+  BGC fluxes of 39476fd7 out), io_meandata (the fork's six REcoM blocks, qualified), gen_surface_forcing
+  (sbc_do_recom body = the fork's block, verified equal modulo `mesh%`/`partit%`; `&nam_rspecsbc` read in
+  sbc_ini_recom; the OASIM module variables), gen_model_setup (`&painitialization_N` and `&spectral` were not
+  read by 2.8: the spectral parameters would have stayed at their defaults), oce_setup_step (`DIC_PI`, which 2.8
+  dropped, and the 1023:1041 range). Kept from 2.8: io_restart (same bio variables and logic), gen_ic3d
+  (printout), Alk_surf by ID, the cavity NaN scrub (use_cavity only), REcoM timing.
+- Found by running: (1) the fork's `call monthly_event(do_read)` lacks its N argument (UB since 434f0e6a,
+  upstream fix fc846804); on 2.8 it segfaulted (job 48698119). It sits in the MEDUSA-off branch, where
+  `sedfilename` is never set, so the fork's runs never read there: `do_read = .false.`. (2) `DIC_PI` replaced
+  `&tracer_init3d` entry 5, which is alkalinity in the upstream namelist ordering (job 48698121 had Alk from the
+  PI-DIC file, CO2 flux all outgassing): now the entry with ID 1002, identical for the fork's ordering.
+- Namelists `scripts/recom/fortran/namelists_albedo_fesom28_spectral/` (README there): the 2.8 physics set, the
+  fork's namelist.recom and `&tracer_init3d`, 37 BGC tracers. pi, 1 rank, 1 day: job **48698124** completed
+  (83 s; OASIM v2 read; PI DIC; CG converged). Against the old fork's physics-matched 1-day run
+  (`pi_1d_spectral_jaxphys`, job 48606105, dump of step 32): every tracer within the physics difference of the
+  two bases (rms T 0.006 C, DIC 0.32, 99th percentile T 0.015 C, DIC 1.0; maxima T 0.75 C in the upper 50 m,
+  DIC/O2 ~21 below 200 m at few nodes). This does not test the port (different physics, levels); 5.2 does.
+
 ### 4. The fork's host edits
 
 - Commit 4: the 8 host files' changes from `cda35117..` commit 0 (OASIM/forcing reading in `gen_surface_forcing` and
