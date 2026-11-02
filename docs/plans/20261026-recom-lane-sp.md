@@ -1,6 +1,6 @@
 # Lane SP: single precision with full REcoM (parent plan Task 16, ends at ⛔ STOP 4)
 
-Parent plan: `docs/plans/20261025-recom-port.md` — read Context, Task 2 (the passive SP estimate), Tasks 10-15 and
+Parent plan: `docs/plans/completed/20261025-recom-port.md` — read Context, Task 2 (the passive SP estimate), Tasks 10-15 and
 their lane results. Physics SP plan: `docs/plans/20261020-core2-single-precision.md` (the mechanism, the f64 list, the
 XLA excess-precision guard, the carry, deviations D1-D6). Branch `recom/sp` off `recom/port` (3ea4f49 + 201c101),
 worktree `/work/ab0995/a270088/fesom_jax_dev/wt_recom_sp` (`data` is a symlink to `port_jax/data`). Time box: 10 hours

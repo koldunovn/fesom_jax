@@ -30,7 +30,7 @@ import pytest
 TESTS_DIR = Path(__file__).resolve().parent
 ROOT = TESTS_DIR.parents[1]
 MANIFEST = ROOT / "scripts" / "runs" / "suite_groups.txt"
-VALID_GROUPS = {"ci", "unit", "core2", "ice", "sharding", "scripts"}
+VALID_GROUPS = {"ci", "unit", "core2", "ice", "sharding", "sharding_slow", "scripts"}
 # ⚠️ BOTH directories. Until 2026-08-08 every runner globbed fesom_jax/tests/ only, so the seven
 # files under scripts/tests/ had never run in the suite — including the 12 mesh-diagnostic tests
 # and the 7 horizon-scan harness tests the plan records as passing. They passed by hand.
@@ -119,15 +119,19 @@ def test_the_conventions_that_define_the_groups_hold():
         name = p.name
         if not p.is_file():
             continue
-        if rel.startswith("scripts/tests/") != (group == "scripts"):
-            wrong.append(f"{rel}: everything under scripts/tests/ belongs to the 'scripts' "
-                         f"group and nothing else does, but it is in {group!r}")
+        # a driver test under scripts/tests/ that needs 4 fake devices or assembles CORE2 steps goes by
+        # cost like any other file (every group runs pytest from the repo root)
+        if group == "scripts" and not rel.startswith("scripts/tests/"):
+            wrong.append(f"{rel}: only files under scripts/tests/ belong to the 'scripts' group")
+        if rel.startswith("scripts/tests/") and group not in ("scripts", "sharding", "sharding_slow", "core2"):
+            wrong.append(f"{rel}: a file under scripts/tests/ belongs to 'scripts', 'sharding', "
+                         f"'sharding_slow' or 'core2', but it is in {group!r}")
         # test_ice_* means the assembled-ice MEMORY class for library tests; a driver test
         # under scripts/tests/ (e.g. test_ice_modes.py) is bound by the location rule above.
         if (name.startswith("test_ice_") and group != "ice"
                 and not rel.startswith("scripts/tests/")):
             wrong.append(f"{rel}: named test_ice_* but in {group!r}")
-        if (name.endswith("_sharded.py") or name == "test_halo.py") and group != "sharding":
+        if (name.endswith("_sharded.py") or name == "test_halo.py") and group not in ("sharding", "sharding_slow"):
             wrong.append(f"{rel}: needs 4 fake devices but is in {group!r}")
         if group == "unit" and name not in MARKER_SCAN_EXEMPT:
             src = p.read_text()

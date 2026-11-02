@@ -50,9 +50,9 @@ def test_zeros_shapes_and_dtype(mesh):
     st = State.zeros(mesh)
     exp = _expected_shapes(mesh)
     from fesom_jax.precision import CARRY_FIELDS
-    from fesom_jax.state import ICE_AVG_FIELDS, SE_FIELDS
-    # ice_ave_steps > 1 only; single precision only; split-explicit SSH only
-    optional = set(ICE_AVG_FIELDS) | set(CARRY_FIELDS) | set(SE_FIELDS)
+    from fesom_jax.state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+    # ice_ave_steps > 1 only; single precision only; split-explicit SSH only; REcoM only
+    optional = set(ICE_AVG_FIELDS) | set(CARRY_FIELDS) | set(SE_FIELDS) | set(BGC_FIELDS)
     names = {f.name for f in dataclasses.fields(State)}
     assert names - optional == set(exp), "State fields drifted from the expected inventory"
     assert all(getattr(st, f) is None for f in optional)
@@ -87,9 +87,10 @@ def test_pytree_roundtrip_and_treemap(mesh):
     st = State.rest(mesh)
     leaves, treedef = tree_util.tree_flatten(st)
     from fesom_jax.precision import CARRY_FIELDS
-    from fesom_jax.state import ICE_AVG_FIELDS, SE_FIELDS
-    assert len(leaves) == (len(dataclasses.fields(State)) - len(ICE_AVG_FIELDS) - len(CARRY_FIELDS)
-                           - len(SE_FIELDS))                                   # None: no leaf
+    from fesom_jax.state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+    # a set: bgc_carry is in both CARRY_FIELDS and BGC_FIELDS
+    optional = set(ICE_AVG_FIELDS) | set(CARRY_FIELDS) | set(SE_FIELDS) | set(BGC_FIELDS)
+    assert len(leaves) == len(dataclasses.fields(State)) - len(optional)       # None: no leaf
     st2 = tree_util.tree_unflatten(treedef, leaves)
     np.testing.assert_array_equal(np.asarray(st2.T), np.asarray(st.T))
     st3 = tree_util.tree_map(lambda x: x + 1.0, st)

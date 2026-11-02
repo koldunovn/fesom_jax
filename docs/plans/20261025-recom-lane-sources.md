@@ -1,6 +1,6 @@
 # Lane S: REcoM's parameters, sources and sinks, and stage 1 (parent plan Tasks 6, 9, 10)
 
-Parent plan: `docs/plans/20261025-recom-port.md` (read Overview, Context, Tasks 6, 9, 10, the lane F results under
+Parent plan: `docs/plans/completed/20261025-recom-port.md` (read Overview, Context, Tasks 6, 9, 10, the lane F results under
 Task 4 and the lane M result under Task 8). Branch `recom/sources` off `recom/port`, worktree
 `/work/ab0995/a270088/fesom_jax_dev/wt_recom_src`. REcoM source (read-only): `/work/ab0995/a270088/REcoM_src` at
 692f804. Time box: 12 hours wall. Effort: high.

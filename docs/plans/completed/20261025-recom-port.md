@@ -635,10 +635,18 @@ effort, own branch off `recom/port`, time box, cost stated first): M = Task 8; S
 
 ### Task 17: Verify acceptance criteria
 
-- [ ] REcoM off and `mslp` off: `test_dp_lock.py` + identity gates green
-- [ ] GP, G1-G6 green; numbers in `docs/recom/VALIDATION.md`
+- [x] REcoM off and `mslp` off: `test_dp_lock.py` + identity gates green ➕ the DP programs match the 7e4dd4c
+      baseline once dp_hlo_hash imports fesom_jax from the checkout it hashes (696b5f3)
+- [x] GP, G1-G6 green; numbers in `docs/recom/VALIDATION.md` ➕ suite array 28445934 (unit/core2 groups)
 - [x] CORE2 1-year run done; SYPD in the ledger ➕ job 28431153 (DP, 50.6 SYPD), the SP twin 28439582/3/750
-- [ ] full CPU suite (`scripts/runs/run_suite_parallel.sbatch`) and the sharded REcoM tests
+- [x] full CPU suite (`scripts/runs/run_suite_parallel.sbatch`) and the sharded REcoM tests ➕ array 28445934,
+      then the fixes f7db13c/c5f11e3/b3fc402/696b5f3 rerun (28519728, 28522536, 28534589, 28560735; sharding
+      28519727_4 + 28561842 + 28560839). All green except test_the_cost_split_is_still_worth_having (ci 39 files
+      against core2 48: core2 grew by real CORE2 tests; left red on purpose, the regrouping needs a timing run).
+      The failures were stale tests (the optional BGC/carry State fields), a restartcheck that compared None as
+      NaN, a one-sample fdlin noise floor and a subprocess that imported the main checkout; none in the model.
+      ⚠️ The sharding group no longer fits one 8-h job (~8.3 h of tests) and test_gradient_sharded alone needs
+      more than 240 GB (it passed on a 512 GB node, 1 h 18 min)
 
 ### Task 18: [Final] Documentation
 
@@ -647,7 +655,7 @@ effort, own branch off `recom/port`, time box, cost stated first): M = Task 8; S
       "Biogeochemistry (REcoM)": the YAML block, configs, commands, speed, checks, the two opt-in deviations, not ported
 - [x] `docs/recom/FORTRAN_REFERENCE.md`, `docs/recom/VALIDATION.md` final ➕ VALIDATION gains a summary table and
       the STOP 4 decision; FORTRAN_REFERENCE unchanged (complete since lane F/P)
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Technical Details
 

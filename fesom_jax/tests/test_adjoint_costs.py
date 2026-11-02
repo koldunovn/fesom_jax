@@ -48,7 +48,12 @@ pytestmark = pytest.mark.skipif(
 @pytest.fixture(scope="module")
 def setup():
     mesh = load_mesh(MESH_DIR)
-    st = State(**{f: jnp.asarray(reconstruct_global(RESTART, f)) for f in _all_state_fields()})
+    import zarr
+    from fesom_jax.precision import CARRY_FIELDS
+    root = zarr.open_group(str(RESTART), mode="r")
+    # the single-precision carry is in the store only when the writing run was single precision
+    st = State(**{f: None if f in CARRY_FIELDS and f not in root else jnp.asarray(reconstruct_global(RESTART, f))
+                  for f in _all_state_fields()})
     assert st.T.shape == (mesh.nod2D, mesh.nl)
     lon = np.degrees(np.asarray(mesh.geo_coord_nod2D[:, 0]))
     lon = np.where(lon > 180.0, lon - 360.0, lon)

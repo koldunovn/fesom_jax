@@ -1,4 +1,4 @@
-# pi + REcoM verification physics (plan docs/plans/20261025-recom-port.md, Tasks 4b/5; lane P).
+# pi + REcoM verification physics (plan docs/plans/completed/20261025-recom-port.md, Tasks 4b/5; lane P).
 #
 # The CORE2 production physics of configs/core2_full.yaml on the pi mesh (3140 nodes, 48 levels), forced by
 # JRA55-do from 1958-01-01 with FESOM2's l_mslp on. Its physics-matched Fortran FESOM2 + REcoM twin is the run

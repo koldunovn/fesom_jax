@@ -1,6 +1,6 @@
 # Investigation D: the sharded forced step differs from the dense one on pi (user-approved 2026-10-25)
 
-Context: `docs/plans/20261025-recom-port.md` Task 2b (⚠️ finding). Branch `physics/sharded-dense` off `recom/port`,
+Context: `docs/plans/completed/20261025-recom-port.md` Task 2b (⚠️ finding). Branch `physics/sharded-dense` off `recom/port`,
 worktree `/work/ab0995/a270088/fesom_jax_dev/wt_phys_shd`. Time box: 5 hours wall. Effort: high.
 
 ## The symptom

@@ -174,6 +174,8 @@ def test_step_forward_bitwise_vs_reference(setup, monkeypatch):
     monkeypatch.setattr(ssh, "solve_ssh", C.solve_ssh_reference)
     ref = jax.jit(_step())(st, mesh, op, sf, fs)
     for f in dataclasses.fields(new):
+        if getattr(new, f.name) is None and getattr(ref, f.name) is None:   # an unused optional field
+            continue
         a, b = np.asarray(getattr(new, f.name)), np.asarray(getattr(ref, f.name))
         assert np.array_equal(a, b, equal_nan=True), \
             f"State.{f.name} differs from the reference solve"

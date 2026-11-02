@@ -1,6 +1,6 @@
 # Lane P: the physics side of REcoM runs (parent plan Tasks 4b and 5)
 
-Parent plan: `docs/plans/20261025-recom-port.md` (read its Overview, Context, Tasks 4b and 5, and the lane F results
+Parent plan: `docs/plans/completed/20261025-recom-port.md` (read its Overview, Context, Tasks 4b and 5, and the lane F results
 under Task 4). Branch `recom/physics` off `recom/port`, worktree `/work/ab0995/a270088/fesom_jax_dev/wt_recom_phys`.
 Time box: 8 hours wall. Effort: high.
 

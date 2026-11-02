@@ -1,6 +1,6 @@
 # FESOM2 + REcoM Fortran reference (pi, double precision)
 
-The reference the fesom-jax REcoM port is gated against (plan `docs/plans/20261025-recom-port.md`, Tasks 3-4;
+The reference the fesom-jax REcoM port is gated against (plan `docs/plans/completed/20261025-recom-port.md`, Tasks 3-4;
 lane plan `docs/plans/20261025-recom-lane-fortran-ref.md`). Everything lives outside the repository:
 
 | what | where |

@@ -1,6 +1,6 @@
 # fesom-jax REcoM: validation against FESOM2-REcoM
 
-The gates of the REcoM port (plan `docs/plans/20261025-recom-port.md`, Testing Strategy) and their numbers. The Fortran
+The gates of the REcoM port (plan `docs/plans/completed/20261025-recom-port.md`, Testing Strategy) and their numbers. The Fortran
 reference is described in `docs/recom/FORTRAN_REFERENCE.md`. Lane gates G1-G4a (the pieces fed with Fortran's own
 inputs) are in the plan under Tasks 8-12; this file collects the gates of the connected model (lane W,
 `docs/plans/20261025-recom-lane-wiring.md`). All runs: pi, double precision, CPU, `configs/pi_recom_bgc.yaml`, from the
