@@ -169,6 +169,24 @@ without errors or warnings.
   `gen_model_setup`, `oce_ale_tracer`), applied by hand onto the upstream versions. `config/bin_4p3z2d/namelist.recom`
   from the fork.
 
+**Step 4 done 2026-11-02**: **`a89bb3d6`**.
+- The dump hooks (`src/recom_ref_dump_hooks.F90` unchanged from commit 0) with all 27 calls at the fork's
+  positions, checked to be the same calls in the same order; fesom_finalize's spectral sub-timers (own arrays,
+  2.8's `mean_rtime` layout untouched) and negative-tracer report; the fork's final NaN zeroing in
+  `read_other_NetCDF` (OASIM); `npes=1` without METIS in `mod_mesh_utils` (fesom_meshpart, built with
+  `-DBUILD_MESHPARTITIONER=ON`); the fork's `config/bin_*/namelist.recom`. Already in 2.8: gen_ic3d's NaN
+  clean-up, io_netcdf_workaround's `npes=1`, a growing I/O stream array. Cosmetic leftovers not carried: comment
+  edits in MOD_TRACER/oce_ale_tracer/oce_setup_step, an `(I3)`->`(I4)` in a bc_surface error message.
+- pi spectral day with dumps at steps 1, 2, 3, 17, 32: job **48698141**
+  (`recom_ref/fesom28_spectral_pi_1d_dumps`). Same dump fields as the reference `pi_1d_spectral_jaxphys` (job
+  48606105) plus `transport.fer_uv/fer_w` (GM on in the 2.8 namelists, off in the fork's jaxphys set).
+- **First answer to 5.2**: at step 1, REcoM runs before any ocean step, so its inputs are the initial state and
+  the forcing: equal to the reference to 1e-12 (tracers, interpolation round-off) except the sea ice (a_ice
+  3.2e-4 rel, one 2.8 ice step). REcoM's outputs on the 2173 nodes ice-free in both runs equal the reference to
+  **1.2e-12** relative over all 122 node fields; every larger difference (<= 8.9e-5) is on ice nodes. The move to
+  2.8 does not change the biology. (Tools: scratchpad `cmp_dumps.py`, `cmp_icefree.py`; worth keeping as a
+  script if 5.2 is repeated.)
+
 ### 5. Verification
 
 1. **Build**: DP, Intel, the production build's flags and cpp switches (`RECOM_CALC_ACDOM/APART`, `RECOM_BMASS`,
