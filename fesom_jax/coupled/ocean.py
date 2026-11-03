@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import functools
 import os
 from typing import Any
 
@@ -92,6 +93,9 @@ class OceanStatic:
     _mon_count: int = 0
     flux: Any = None          # mode F constants (fesom_jax.coupled.flux.FluxConfig), None in mode B
     _o2a: Any = None          # the jitted ocean_to_atm
+    # None, or a writer's submit(fn, *args) (one background thread, single process): the monthly means' store, with
+    # their copy to the host, is written by that call (awicm_jax's run_coupled)
+    submit: Any = None
 
     @property
     def nod2D(self) -> int:
@@ -364,10 +368,14 @@ def flush_monthly(static: OceanStatic) -> str | None:
     (yr, mo), cnt = static._mon_key, static._mon_count
     mean = jax.tree.map(lambda x: x / cnt, static._mon_sum)
     path = f"{static.monthly_out}/{yr:04d}_{mo:02d}"
-    ushow_output.write_global_zarr(path, mean, static.sm, static.part, static.mesh,
-                                   attrs={"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": int(cnt),
-                                          "coupled_mode": static.mode},
-                                   time_days=ushow_output.cf_days(datetime.date(yr, mo, 15)))
+    write = functools.partial(ushow_output.write_global_zarr,
+                              attrs={"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": int(cnt),
+                                     "coupled_mode": static.mode},
+                              time_days=ushow_output.cf_days(datetime.date(yr, mo, 15)))
+    if static.submit is None:
+        write(path, mean, static.sm, static.part, static.mesh)
+    else:
+        static.submit(write, path, mean, static.sm, static.part, static.mesh)
     static._mon_key, static._mon_sum, static._mon_count = None, None, 0
     return path
 
@@ -442,7 +450,19 @@ def _ocean_to_atm(state, static: OceanStatic) -> dict:
 def write_ocean_restart(state, static: OceanStatic, path: str) -> str:
     """The full State as a portable restart store (zarr_output.write_restart, global layout, float64 on disk) with
     the step and calendar of ``static``; reload it with ``init_ocean(..., restart_in=path)``."""
+    return _restart_writer(static)(path, state, static.sm, static.part)
+
+
+def ocean_restart_writer(state, static: OceanStatic):
+    """:func:`write_ocean_restart` in two halves (single process): the State widened to float64 (on the device) and
+    the step and calendar of ``static``, now; returns ``write(path) -> path``, the store with the copy to the host,
+    which may run later on another thread while the ocean steps on (the State's arrays are not donated). The copy is
+    not started here: on the step's thread it held up the coupled run's own small copies behind it."""
+    return functools.partial(_restart_writer(static), state_folded=PR.cast_tree(state, keep64=True), sm=static.sm,
+                             part=static.part)
+
+
+def _restart_writer(static):
     y, d, _, _ = static.dates(1)[0]
-    return zarr_output.write_restart(path, state, static.sm, static.part, step=static.step,
-                                     calendar_date=f"{y}-doy{d:03d}", dt_stage=static.dt, layout="global",
-                                     attrs={"coupled_mode": static.mode})
+    return functools.partial(zarr_output.write_restart, step=static.step, calendar_date=f"{y}-doy{d:03d}",
+                             dt_stage=static.dt, layout="global", attrs={"coupled_mode": static.mode})
