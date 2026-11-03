@@ -418,21 +418,20 @@ The defect: the low-order vertical upwind flux (`tracer_adv.adv_flux_ver`) got F
 default program is unchanged, its StableHLO included). Not covered: REcoM's tracer transport with cavities
 (`recom/transport.py` calls `advect_one_fct` without the flag), the w_split path.
 
-### Estimate for the rest (after session 2)
+### Estimate for the rest (after session 3)
 
-* Rung 15 (tracers with the melt as the surface BC at the shelf base, MFCT/QR4C advection at the shelf base) and
-  rung 14 (GM/Redi between `ulevels_nod2D_max` and `nlevels_nod2D_min`): 1-2 days, partly waiting for L-SFC's
-  jaxcpl settings (the tracer scheme, GM scalings) so that the rung isolates the cavity part.
-* The ice substeps as kernels (rung 18) and the shelf-front `a_ice` difference of the whole-step check: 0.5-1 day.
-* The coupled ice path (`coupled/flux.ice_surface_step_cpl(cavity_cfg)`), the coupled CORE3 config, the sharded
-  (dist_N) cavity run: 1-2 days.
-* Single precision with cavities (with L-SFC's SP linfs): 0.5-1 day once that exists.
-Total ~3-6 working days.
+* Lane L-SFC owns substeps 6 (opt_visc 5) and 14 (GM/Redi) on CORE3 and the shelf-front sea-ice difference; this
+  lane gives it hooks in `replay_ladder.py` on request (through the coordinator).
+* A single-precision ladder pass (the SP oracle `run_cav*`; `replay_ladder.py --precision single` needs the mesh
+  cast inside the scope first), with the float64-geometry limitation above: 0.5 day.
+* The coupled CORE3 ocean on GPU (dist_1 / dist_2 / dist_4) and its step time: when GPU slots come; the code paths
+  are the CPU-checked ones.
+* REcoM with cavities (its tracer transport has no cavity flag) and the w_split path: only if needed.
+Total ~1-2 working days for this lane, plus whatever the integration's first coupled month finds.
 
 ## Next session, first steps
 
-1. Rung 15 (tracers) and rung 14 (GM/Redi) in `replay_ladder.py`, against `run_cav_dp`.
-2. The shelf-front `a_ice` difference of the whole-step check (rung 18: FCT advection / thermodynamics at front
-   nodes).
-3. `coupled/flux.ice_surface_step_cpl` with `cavity_cfg`, the coupled CORE3 config (restart `..._as_1855_v2`; the
-   OASIS weights are L-CPL's), a dist_4 run.
+1. The GPU runs, when a slot comes: the standalone 5-day run (28699464 is queued) and the coupled CORE3 ocean on
+   dist_2 / dist_4 (`ocn/jobs/check_cpl_cpu.sbatch` as a template; on GPU drop `JAX_PLATFORMS=cpu`), with the step time.
+2. The single-precision pass of the ladder against the SP oracle.
+3. Support the integration's first coupled month (`--setup jaxcpl`, `configs/core3_cpl.yaml`).
