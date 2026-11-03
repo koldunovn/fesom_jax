@@ -22,8 +22,15 @@ Differences from the Fortran (also in docs/coupling/awicm.md):
 * ice_temp is not advected with the ice (FESOM2 advects ice_temp*a_ice as a 4th FCT tracer). With
   use_atm_ice_tskin the thermodynamics overwrite it wherever a_ice > 0.001, so the advected value is read only on
   nodes with a_ice <= 0.001 (the albedo of a trace of ice, the snow-melt gate and the pond lid there).
-* The atmosphere's runoff/calving (hydr_oce, calv_oce) are not used: the CORE2 runoff climatology instead (plan
-  decision 1), so enthalpyoffuse = 0. u10w/v10w are accepted and unused (FESOM2 reads them only for icebergs).
+* Runoff (FluxConfig.runoff, init_ocean's ``cpl_runoff``): ``"climatology"`` (default, plan decision 1 of the
+  CORE2 coupling) uses the CORE2 runoff climatology and ignores hydr_oce/calv_oce, so enthalpyoffuse = 0;
+  ``"coupled"`` takes the runoff mapper's hydr_oce/calv_oce as FESOM main 0aaa2d73 does under ``__oasis``/``__oifs``
+  (gen_forcing_couple.F90 update_atm_forcing, receive 12 and 13): ``runoff = hydr_oce`` (liquid), ``runoff_solid =
+  calv_oce``, ``enthalpyoffuse = -min(calv_oce * 333.55e6, 1000)`` [W m-2, the heat to melt the calved ice],
+  ``runoff = runoff_liquid + runoff_solid``; ice_thermo_cpl.F90 then adds enthalpyoffuse to the open-water heat
+  flux ``a2ohf`` and ``runo = runoff`` to ``PmEocn``, and oce_fluxes adds ``runoff`` to the coupled freshwater
+  balance (force_flux_consv returns at once under ``__oifs``). u10w/v10w are accepted and unused (FESOM2 reads them
+  only for icebergs).
 * fesom_jax's ocean is the CORE2 configuration (zstar, TKE, mEVP, GM/Redi); AWI-ESM3's FESOM2 runs linfs, KPP,
   standard EVP. The coupled branches above are those of zstar (use_virt_salt false).
 """
@@ -81,6 +88,14 @@ class FluxConfig:
     snowmelt_tgate: bool = True       # MOD_ICE default
     use_atm_ice_tskin: bool = True    # namelist.config
     ponds: MeltPondParams = MeltPondParams()
+    runoff: str = "climatology"       # "climatology" (CORE2 runoff file) or "coupled" (hydr_oce + calv_oce)
+
+
+RUNOFF_MODES = ("climatology", "coupled")
+# gen_forcing_couple.F90: enthalpyoffuse = runoff_solid*333.55*1000000.0 [W m-2], evaluated left to right; the
+# literals are default (4-byte) reals, so 333.55 is float32(333.55) in either working precision
+LATENT_FUSION = float(np.float32(333.55))
+ENTHALPY_CAP = 1000.0                      # enthalpyoffuse = -min(enthalpyoffuse, 1000.0)
 
 
 class CplForcing(NamedTuple):
@@ -99,6 +114,9 @@ class CplForcing(NamedTuple):
     tsk_ico: jnp.ndarray      # ist_ref [K], the atmosphere's ice-tile skin temperature
     Ssurf_month: jnp.ndarray  # SSS restoring target (rate 0 in the coupled configuration)
     chl: jnp.ndarray          # chlorophyll (shortwave penetration)
+    # FluxConfig.runoff = "coupled" only (None: the static CORE2 climatology, the default's program unchanged)
+    runoff: jnp.ndarray = None      # runoff = hydr_oce + calv_oce [m s-1 fresh water, + into the ocean]
+    enthalpy: jnp.ndarray = None    # enthalpyoffuse = -min(calv_oce * 333.55e6, 1000) [W m-2]
     COUPLED_FLUX = True       # the step's dispatch mark (fesom_jax.step: the coupled ice step)
 
 
@@ -117,14 +135,25 @@ def flux_config(ice_cfg) -> FluxConfig:
 # ---------------------------------------------------------------------------------------------------------------
 # init / forcing
 # ---------------------------------------------------------------------------------------------------------------
-def init_flux(state, static):
+def init_flux(state, static, runoff: str = "climatology"):
     """Give ``state`` the :data:`CPL_FIELDS` (from a mode F restart they are kept; else FESOM2's initial values, in
-    the working precision) and ``static`` the mode F configuration."""
+    the working precision) and ``static`` the mode F configuration (``runoff``: :data:`RUNOFF_MODES`)."""
+    if runoff not in RUNOFF_MODES:
+        raise ValueError(f"runoff must be one of {RUNOFF_MODES}, got {runoff!r}")
     if getattr(state, "cpl_ice_temp", None) is None:
         dt = state.a_ice.dtype
         state = dataclasses.replace(state, **{k: jnp.full_like(state.a_ice, v, dtype=dt) for k, v in CPL_INIT.items()})
-    static.flux = flux_config(static.cfg.ice)
+    static.flux = dataclasses.replace(flux_config(static.cfg.ice), runoff=runoff)
     return state, static
+
+
+def runoff_enthalpy(hydr, calv):
+    """FESOM main 0aaa2d73 gen_forcing_couple.F90 (``__oifs``, receive 13): (runoff_liquid + runoff_solid,
+    enthalpyoffuse) from hydr_oce and calv_oce, in their precision."""
+    dt = calv.dtype
+    enth = -jnp.minimum((calv * jnp.asarray(LATENT_FUSION, dt)) * jnp.asarray(1000000.0, dt),
+                        jnp.asarray(ENTHALPY_CAP, dt))
+    return hydr + calv, enth
 
 
 def flux_step_forcing(state, forcing: dict, static, dates):
@@ -148,10 +177,20 @@ def flux_step_forcing(state, forcing: dict, static, dates):
         tix, tiy = g2r(tix, tiy, static.trig, static.M)
     tsk = r("tsk_ico") if "tsk_ico" in forcing else jnp.zeros((T, n), tox.dtype)
     months = np.array([d[3] for d in dates]) - 1
+    extra = {}
+    if getattr(static.flux, "runoff", "climatology") == "coupled":
+        miss = [k for k in ("hydr_oce", "calv_oce") if k not in forcing]
+        if miss:
+            raise KeyError(f"runoff 'coupled' needs {miss} (the runoff mapper's fields)")
+        hydr, calv = r("hydr_oce"), r("calv_oce")
+        if static.precision == "single":             # FESOM2's WP arithmetic of the received fields
+            hydr, calv = hydr.astype(jnp.float32), calv.astype(jnp.float32)
+        extra["runoff"], extra["enthalpy"] = runoff_enthalpy(hydr, calv)
     seq = CplForcing(taux_oce=tox, tauy_oce=toy, taux_ico=tix, tauy_ico=tiy,
                      prec_rain=r("prec_oce"), prec_snow=r("snow_oce"), evap=r("evap_oce"), subl=r("subl_oce"),
                      heat_oce=r("heat_oce"), heat_ico=r("heat_ico"), heat_swo=r("heat_swo"), tsk_ico=tsk,
-                     Ssurf_month=jnp.asarray(static.sss_clim[months]), chl=jnp.asarray(static.chl_clim[months]))
+                     Ssurf_month=jnp.asarray(static.sss_clim[months]), chl=jnp.asarray(static.chl_clim[months]),
+                     **extra)
     return state, (PR.cast_tree(seq) if static.precision == "single" else seq)
 
 
@@ -196,11 +235,12 @@ def oasis_to_fesom(fields: dict) -> dict:
     return out
 
 
-def dummy_seq(nsteps: int, n: int, npes: int = 1):
+def dummy_seq(nsteps: int, n: int, npes: int = 1, runoff: str = "climatology"):
     """A host :class:`CplForcing` of zeros ``[npes, nsteps, n]`` (the partitioned shape the runner folds; ``n`` =
-    the lanes per device) to build the interval program."""
+    the lanes per device) to build the interval program (``runoff = "coupled"``: with the runoff fields)."""
     z = np.zeros((npes, nsteps, n), np.float64)
-    return CplForcing(*([z] * len(CplForcing._fields)))
+    nf = len(CplForcing._fields) - (0 if runoff == "coupled" else 2)
+    return CplForcing(*([z] * nf))
 
 
 def ice_temp_alb(state, static):
@@ -300,7 +340,9 @@ def thermo_cpl(cfg, fc: FluxConfig, *, A, h, hsn, ice_temp_old, apnd, hpnd, ipnd
     con, consn, Sice = cfg.con, cfg.consn, cfg.Sice
     cl, cc = cfg.cl, cfg.cc
     h0min = jnp.where(geo_lat > 0.0, cfg.h0, cfg.h0_s)
-    a2ohf = cf.heat_oce + cf.heat_swo            # + enthalpyoffuse (0: no calving, plan decision 1)
+    a2ohf = cf.heat_oce + cf.heat_swo            # + enthalpyoffuse (runoff "coupled"; else 0, plan decision 1)
+    if cf.enthalpy is not None:
+        a2ohf = a2ohf + cf.enthalpy
     a2ihf = cf.heat_ico
     evap, subli, rain, snow = cf.evap, cf.subl, cf.prec_rain, cf.prec_snow
     rsss = S_oc                                  # ref_sss_local
@@ -467,14 +509,15 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     a_adv, m_adv, ms_adv = ice_adv.fct_solve(cfg, mesh, state.a_ice, state.m_ice, state.m_snow, u_ice, v_ice,
                                              exch=exch)
     a_co, m_co, ms_co = ice_thermo.cut_off(a_adv, m_adv, ms_adv)
+    runoff = fs.runoff_node if cf.runoff is None else cf.runoff     # the climatology, or hydr_oce + calv_oce
     th = thermo_cpl(cfg, fc, A=a_co, h=m_co, hsn=ms_co, ice_temp_old=state.cpl_ice_temp, apnd=state.cpl_apnd,
                     hpnd=state.cpl_hpnd, ipnd=state.cpl_ipnd, T_oc=srf.temp, S_oc=srf.salt, cf=cf,
-                    runo=fs.runoff_node, geo_lat=geo_lat, non_cavity=open_water, dt=cfg.ice_dt,
+                    runo=runoff, geo_lat=geo_lat, non_cavity=open_water, dt=cfg.ice_dt,
                     use_virt_salt=use_virt_salt)
     a_out, m_out, ms_out = _exch(th.a_ice, "nod"), _exch(th.m_ice, "nod"), _exch(th.m_snow, "nod")
 
     # oce_fluxes: heat_flux = -ehf, water_flux = -fw; virtual salt / SSS restoring as the standalone helper
-    icef = ice_coupling.ice_oce_fluxes(srf.salt, th.flx_fw, th.flx_h, cf.Ssurf_month, fs.runoff_node,
+    icef = ice_coupling.ice_oce_fluxes(srf.salt, th.flx_fw, th.flx_h, cf.Ssurf_month, runoff,
                                        fs.areasvol_surf, fs.ocean_area, open_water, owned_mask=owned_mask,
                                        axis_name=axis_name, use_virt_salt=use_virt_salt,
                                        real_salt_flux=th.real_salt_flux)
@@ -482,7 +525,7 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     if not use_virt_salt:
         # the coupled zstar balance (ice_oce_coupling.F90 oce_fluxes, __oasis): + residualifwflx, x rhofwt/rhowat
         flux = (th.evaporation - th.ice_sublimation + cf.prec_rain + cf.prec_snow * (1.0 - a_co) + th.resid
-                + fs.runoff_node) * (cfg.rhofwt / cfg.rhowat)
+                + runoff) * (cfg.rhofwt / cfg.rhowat)
         flux = flux - th.thdgr * cfg.rhoice / cfg.rhowat - th.thdgrsn * cfg.rhosno / cfg.rhowat
         from ..sss_runoff import _area_mean
         water_flux = water_flux + _area_mean(flux, fs.areasvol_surf, fs.ocean_area, owned_mask=owned_mask,
