@@ -359,7 +359,7 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
         raise ValueError("mesh and new_part disagree on global counts (nod2D/elem2D)")
 
     _, Lmax = local_sizes(new_part)
-    devs = jax.devices()[:new_part.npes] if devices is None else list(devices)
+    devs = halo.first_devices(new_part.npes) if devices is None else list(devices)
     if len(devs) < new_part.npes:
         raise ValueError(f"need {new_part.npes} devices, have {len(devs)}")
     jmesh = halo.device_mesh("p", devices=devs)

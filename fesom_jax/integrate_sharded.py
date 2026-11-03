@@ -500,7 +500,7 @@ def run_gm_diag_sharded(sm: ShardedMesh, T_p, S_p, bvfreq_p, hnode_new_p, helem_
     ha, ha_spec = _halo_arrays(sm)
     fT, fS, fbv, fhn = _fold(T_p), _fold(S_p), _fold(bvfreq_p), _fold(hnode_new_p)
     fhe = _fold(helem_p)
-    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    jmesh = halo.device_mesh(devices=halo.first_devices(npes))
 
     def body(m, T, S, bv, hn, he, h):
         exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
@@ -543,7 +543,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
     fstress = _fold(stress_p)
-    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    jmesh = halo.device_mesh(devices=halo.first_devices(npes))
     n_global = sm.nod2D
 
     # Optional CORE2 forcing + the GLOBAL ice boundary_node → sharded shard_map inputs
@@ -646,7 +646,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
     fstress = _fold(stress_p)
-    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    jmesh = halo.device_mesh(devices=halo.first_devices(npes))
     n_global = sm.nod2D
     ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded,
                                coloured=use_coloured)
@@ -894,7 +894,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
         fs_spec = jax.tree.map(lambda _: _P, fs)
     else:
         fs, fs_spec = folded_state(state_p)               # [P,Lmax] (host cold-start) → [P*Lmax]
-    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    jmesh = halo.device_mesh(devices=halo.first_devices(npes))
     n_global = sm.nod2D
     _check_halo_mode(use_ragged, use_padded, use_coloured)
     boundary_node_p = _coast_mask(sm, ice_cfg, boundary_node_p)

@@ -37,7 +37,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .. import jra55, partit, shard_mesh, ssh, sss_runoff, surface_forcing, ushow_output, zarr_output
+from .. import halo, jra55, partit, shard_mesh, ssh, sss_runoff, surface_forcing, ushow_output, zarr_output
 from .. import precision as PR
 from ..mesh import load_mesh
 from ..run import _chunk_dates
@@ -117,9 +117,9 @@ class OceanStatic:
         return int(self.part.npes)
 
     def device_mesh(self):
-        """The runner's device mesh (``halo.device_mesh``: the first ``npes`` devices, axis ``"p"``)."""
+        """The runner's device mesh (``halo.device_mesh`` over ``halo.first_devices(npes)``, axis ``"p"``)."""
         from jax.sharding import Mesh
-        return Mesh(np.asarray(jax.devices()[:self.npes]), ("p",))
+        return Mesh(np.asarray(halo.first_devices(self.npes)), ("p",))
 
     def dates(self, nsteps: int, start: int | None = None):
         """``(year, day of year, second of day, month)`` of each step start of the next interval."""
@@ -206,8 +206,7 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     if npes == 1:
         part = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
     else:
-        if jax.device_count() < npes:
-            raise ValueError(f"partition {pspec}: {jax.device_count()} devices present")
+        halo.first_devices(npes)                  # raises when the process has too few devices
         ddir = dist_dir or os.environ.get("FESOM_DIST_DIR") or DEFAULT_DIST_DIR
         part = partit.read_partition(ddir, npes)
         if cfg.lane_order():          # the lanes inside the shards in a cache-friendly order (global ids unchanged)
@@ -261,7 +260,7 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
             state = jax.tree.map(jnp.asarray, state)
         else:
             from jax.sharding import Mesh, NamedSharding, PartitionSpec
-            sh = NamedSharding(Mesh(np.asarray(jax.devices()[:npes]), ("p",)), PartitionSpec("p"))
+            sh = NamedSharding(Mesh(np.asarray(halo.first_devices(npes)), ("p",)), PartitionSpec("p"))
             state = jax.tree.map(lambda x: jax.device_put(np.asarray(x), sh), state)
         bootstrap = True
         log(f"[ocean] cold start (PHC + FESOM's initial sea ice) at {y:04d}-{m:02d}-{d:02d}, step {step0}")

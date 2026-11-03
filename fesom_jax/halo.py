@@ -424,6 +424,21 @@ def halo_exchange_coloured(field, c: dict, meta, axis_name: str = DEFAULT_AXIS, 
     return jnp.where(mask, gathered, field)
 
 
+#: The first device of this process that a partition of N ranks is placed on (``first_devices``): 0 = the first N
+#: devices of :func:`jax.devices`, as always. awicm_jax's concurrent coupled run (the atmosphere on the first devices,
+#: the ocean on the next ones) sets it before :func:`fesom_jax.coupled.init_ocean`.
+DEVICE_OFFSET = 0
+
+
+def first_devices(n):
+    """The ``n`` devices a partition of ``n`` ranks runs on: ``jax.devices()[DEVICE_OFFSET:DEVICE_OFFSET + n]``."""
+    o, n = int(DEVICE_OFFSET), int(n)
+    devs = jax.devices()[o:o + n]
+    if len(devs) < n:
+        raise ValueError(f"need {n} devices from device {o}, have {len(jax.devices())}")
+    return devs
+
+
 def device_mesh(axis_name: str = DEFAULT_AXIS, devices=None) -> Mesh:
     """A 1-D :class:`jax.sharding.Mesh` over all (or the given) devices. With ``FESOM_HALO_GROUPED=1`` it also sets up
     the grouped transport's NCCL communicator over them (also for ``FESOM_BGC_HALO=grouped``; once per process; every
