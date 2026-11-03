@@ -515,6 +515,8 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     bc_S = dt * (icef.virtual_salt + icef.relax_salt + icef.real_salt_flux * is_nonlinfs)
     cpl = {"cpl_ice_temp": th.ice_temp, "cpl_ice_alb": th.ice_alb, "cpl_apnd": th.apnd, "cpl_hpnd": th.hpnd,
            "cpl_ipnd": th.ipnd}
+    if getattr(state, "cpl_fw", None) is not None:          # the monthly `fw` output (ocean.py monthly_extra)
+        cpl["cpl_fw"] = water_flux.astype(state.cpl_fw.dtype)
     return IceStepOut(
         stress_surf=stress_surf, bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d, stress_node_surf=stress_node_surf,
         heat_flux=heat_flux, water_flux=water_flux, virtual_salt=icef.virtual_salt, relax_salt=icef.relax_salt,
