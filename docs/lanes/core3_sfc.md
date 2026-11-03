@@ -53,6 +53,23 @@ exactly needs the step count since the leg's start (fer_K is not in FESOM's rest
 the other mismatched nodes 0) needs none. The fix in FESOM would be one line: write the template at
 `mesh%ulevels_nod2D(n)` in the F1 loop (or read `fer_k(nzmin_cons)` in F2).
 
+**One whole step against the DP oracle** (`oracle_core2/jobs/step_core3.sbatch`: `run_from_config.py`, 1 step on
+CPU from L-OCN's converted restart, then L-OCN's `scripts/core3/compare_step.py`), max |diff| / max |field| (p99):
+
+| field | `configs/core3_cavity.yaml` (fesom_jax defaults; job 28703616) | `configs/core3_cavity_jaxcpl.yaml` (jaxcpl's settings; job 28703613) |
+|---|---|---|
+| T | cavity 5.8e-5, front 3.1e-4, open 3.6e-3 | cavity 5.8e-5, front 2.5e-5, open 7.7e-5 (p99 9.4e-8) |
+| S | 4.5e-5 / 1.1e-4 / 1.1e-3 | 3.1e-5 / 8.2e-5 / 2.2e-4 |
+| u / v | open 1.4e-2 / 2.9e-2 | open 5.5e-5 / 1.3e-4; cavity, front <= 1e-5 |
+| eta_n | front 1.1e-3, open 8.8e-3 | front 1.1e-3, open 2.1e-3 (p99 8.3e-5; L-OCN's rung 9: the CG tolerance) |
+| a_ice | front 2.9e-3 (p99 6.1e-4), open 4.3e-3 (L-OCN before the FCT fix: front 8.0e-2) | front 2.5e-3 at one point (**p99 1.8e-10**), open 2.3e-4 (p99 1.0e-9) |
+| m_ice | 2.4e-4 / 7.3e-4 | 7.3e-6 / 4.9e-6 |
+
+What is left after one step with jaxcpl's settings: a_ice 2.5e-3 at a few points (p99 1e-10), which can only come
+from the forced thermodynamics (ice_thermo_oce.F90 changed by 558 lines from the port base; not in jaxcpl's coupled
+path, not replayed here); eta_n 2e-3 (the CG solved to soltol, rung 9); the GM shelf template above (it enters the
+tracers from step 1, the 2.5e-5 of T at the front).
+
 ## Status (2026-11-03, session 2)
 
 - Rung 2 of the ladder against FESOM main 0aaa2d73 (lane L-OCN's oracle builds, read only) on **CORE2 without
@@ -218,8 +235,11 @@ GPU job 28699578 (A100, 12 min; `sfc_gate.py`, snapshot `snap/77ceaf25e4` agains
 
 ## Next
 
-1. `configs/core3_cpl_jaxcpl.yaml` from the blocks of `core2_cpl_jaxcpl.yaml` with L-OCN's mesh, `ale: null`
-   (linfs, now allowed in SP), cavities; and `core2_cpl_jaxcpl.yaml` itself can switch to linfs from a linfs restart.
+0. (session 3) Decide the GM shelf template (reproduce jaxcpl's FESOM bug or report it upstream); replay the forced
+   ice thermodynamics against the oracle (the remaining front a_ice points); the coupled ice path with cavities
+   (`coupled/flux.ice_surface_step_cpl` has no `cavity_cfg`; L-OCN's open item) uses the same `ice_adv` fix.
+1. `configs/core3_cpl_jaxcpl.yaml` (the coupled one) from `configs/core3_cavity_jaxcpl.yaml` (forced, session 3);
+   and `core2_cpl_jaxcpl.yaml` itself can switch to linfs from a linfs restart.
 2. The same replays on CORE3 against L-OCN's `run_cav` (opt_visc 5, GM with K_GM_max_NH, mEVP with
    metric_factor_zero), separately for cavity, front and open points (the GM template-level note above).
 3. Melt ponds / alb_tramp: only a coupled (`__oifs`) FESOM2 build or jaxcpl's own output can check them beyond the
