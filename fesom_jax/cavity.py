@@ -12,11 +12,11 @@ Port of FESOM2 main 0aaa2d73 ``src/cavity_param.F90`` (lane L-OCN, plan
 Everything here is a no-op off the cavities (``ulevels_nod2D == 1`` / ``ulevels == 1``) and nothing calls it unless
 ``use_cavity`` is on, so the default model is unchanged.
 
-Precision. Fortran evaluates these in ``WP`` with two kinds of literals: ``_WP`` literals (``2.12_WP``) are parsed in
-``WP``; bare literals (``-0.0575``, ``3.5803E-5``) are default REAL, i.e. float32, then converted to ``WP`` — so in a
-double-precision FESOM ``a = -0.0575`` is ``float64(float32(-0.0575))``. :func:`_r4` reproduces that; the arithmetic
-then runs in the dtype of the inputs (float64, or float32 under :func:`fesom_jax.precision.scope` single precision).
-``hnode`` is ``WP_full`` (float64) in both builds: ``re = hnode/un`` is formed in float64 and rounded to ``WP``.
+Precision. FESOM compiles with ``-r8`` (double) / ``-r4`` (single, ``USE_SINGLE_PRECISION``), so a bare literal
+(``-0.0575``) is ``WP`` like a ``_WP`` one: every constant here is a plain Python float, and the arithmetic runs in the
+dtype of the inputs (float64, or float32 under :func:`fesom_jax.precision.scope` single precision). ``hnode`` is
+``WP_full`` (float64) in both builds: ``re = hnode/un`` is formed in float64 and rounded to ``WP``. The Intel build
+also uses ``-no-prec-div -fimf-use-svml``, so divisions/``log``/``sqrt`` may differ from IEEE by an ulp.
 """
 from __future__ import annotations
 
@@ -40,39 +40,34 @@ class CavityConfig(NamedTuple):
     density_ref_S: float = 34.0
 
 
-def _r4(x: float) -> float:
-    """A default-REAL (float32) Fortran literal, as the value ``WP`` then holds."""
-    return float(np.float32(x))
-
-
 # --- cavity_heat_water_fluxes_3eq parameters (cavity_param.F90:157-180) ----------------------------------------------
-_A, _B, _C = _r4(-0.0575), _r4(0.0901), _r4(7.61e-4)   # Foldvik & Kvinge (1974) freezing point
-_PR, _SC = _r4(13.8), _r4(2432.0)                       # Prandtl, Schmidt numbers
-_AK = _r4(2.50e-3)                                       # drag coefficient
-_UN = _r4(1.95e-6)                                       # kinematic viscosity [m2/s]
-_TOB = _r4(-20.0)                                        # ice-shelf surface temperature [degC]
-_RHOI, _RHOFW = _r4(920.0), _r4(1000.0)
-_CPW, _LHF = _r4(4180.0), _r4(334000.0)
-_TDIF = _r4(1.54e-6)                                     # thermal diffusivity of the shelf [m2/s]
-_ATK = _r4(273.15)
-_TWO_THIRDS = _r4(2.0 / 3.0)
+_A, _B, _C = -0.0575, 0.0901, 7.61e-4   # Foldvik & Kvinge (1974) freezing point
+_PR, _SC = 13.8, 2432.0                       # Prandtl, Schmidt numbers
+_AK = 2.50e-3                                       # drag coefficient
+_UN = 1.95e-6                                       # kinematic viscosity [m2/s]
+_TOB = -20.0                                        # ice-shelf surface temperature [degC]
+_RHOI, _RHOFW = 920.0, 1000.0
+_CPW, _LHF = 4180.0, 334000.0
+_TDIF = 1.54e-6                                     # thermal diffusivity of the shelf [m2/s]
+_ATK = 273.15
+_TWO_THIRDS = 2.0 / 3.0
 
-# --- adlprt (adiabatic lapse rate) coefficients: default-REAL literals -----------------------------------------------
-_S0 = _r4(35.0)
-_A0, _A1, _A2, _A3 = _r4(3.5803e-5), _r4(8.5258e-6), _r4(-6.8360e-8), _r4(6.6228e-10)
-_B0, _B1 = _r4(1.8932e-6), _r4(-4.2393e-8)
-_C0, _C1, _C2, _C3 = _r4(1.8741e-8), _r4(-6.7795e-10), _r4(8.7330e-12), _r4(-5.4481e-14)
-_D0, _D1 = _r4(-1.1351e-10), _r4(2.7759e-12)
-_E0, _E1, _E2 = _r4(-4.6206e-13), _r4(1.8676e-14), _r4(-2.1687e-16)
+# --- adlprt (adiabatic lapse rate) coefficients -----------------------------------------------
+_S0 = 35.0
+_A0, _A1, _A2, _A3 = 3.5803e-5, 8.5258e-6, -6.8360e-8, 6.6228e-10
+_B0, _B1 = 1.8932e-6, -4.2393e-8
+_C0, _C1, _C2, _C3 = 1.8741e-8, -6.7795e-10, 8.7330e-12, -5.4481e-14
+_D0, _D1 = -1.1351e-10, 2.7759e-12
+_E0, _E1, _E2 = -4.6206e-13, 1.8676e-14, -2.1687e-16
 
 
 def _consts(dtype):
-    """The ``WP`` parameters the compiler folds (``pr1 = pr**(2./3.)``, ``sak1 = sqrt(ak)``, ``cpi``), in ``dtype``."""
+    """The parameters the compiler folds (``pr1 = pr**(2./3.)``, ``sak1 = sqrt(ak)``, ``cpi``), in ``dtype``."""
     f = np.dtype(dtype).type
     pr1 = np.power(f(_PR), f(_TWO_THIRDS))
     sc1 = np.power(f(_SC), f(_TWO_THIRDS))
     sak1 = np.sqrt(f(_AK))
-    cpi = f(_r4(152.5)) + f(_r4(7.122)) * (f(_ATK) + f(_TOB))   # Paterson, "The Physics of Glaciers"
+    cpi = f(152.5) + f(7.122) * (f(_ATK) + f(_TOB))   # Paterson, "The Physics of Glaciers"
     return float(pr1), float(sc1), float(sak1), float(cpi)
 
 

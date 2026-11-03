@@ -45,7 +45,8 @@ def main():
     groups = {"cavity": uln > 1, "front": (uln == 1) & (ulmax > 1), "open": ulmax == 1}
     for step in a.steps:
         F = lambda sub, name: io_dump.load_full_field(a.dump_dir, step, sub, name, N)
-        T, S, h = F(20, "T"), F(20, "S"), F(20, "hnode")
+        pad = lambda x: np.pad(x, ((0, 0), (0, nl - x.shape[1])))   # FESOM layer arrays are nl-1 deep
+        T, S, h = pad(F(20, "T")), pad(F(20, "S")), pad(F(20, "hnode"))
         with precision.scope(a.precision):
             mesh = precision.cast_tree(mesh64) if a.precision == "single" else mesh64
             wp = precision.wp_dtype()
@@ -69,8 +70,18 @@ def main():
                 d = np.abs(o[mm] - j[mm])
                 line += f" {g}: max {d.max() / scale:.2e} bitwise {np.mean(d == 0):.3f} |"
             print(line)
+        # where the N^2 differences sit: per level relative to the node's top/bottom interface
+        o, j = ref["bvfreq"], mine["bvfreq"][:, :ref["bvfreq"].shape[1]]
+        m = masks["bvfreq"][:, :o.shape[1]]
+        d = np.where(m, np.abs(o - j), 0.0)
+        rel_top = k[:, :o.shape[1]] - (uln[:, None] - 1); rel_bot = (nln[:, None] - 1) - k[:, :o.shape[1]]
+        for lab, sel in (("top interface", rel_top == 0), ("2nd interface", rel_top == 1),
+                         ("bottom interface", rel_bot == 0), ("one above bottom", rel_bot == 1),
+                         ("interior", (rel_top > 1) & (rel_bot > 1))):
+            sm = m & sel
+            print(f"   bvfreq diff at {lab:17s}: max {d[sm].max():.3e} share nonzero {np.mean(d[sm] > 1e-12 * np.abs(o[m]).max()):.3f}")
         # the cavity fill itself (levels above ulevels at cavity nodes)
-        mm = cav_lev & groups["cavity"][:, None]
+        mm = (cav_lev & groups["cavity"][:, None])[:, :ref["density"].shape[1]]
         d = np.abs(ref["density"][mm] - mine["density"][:, :ref["density"].shape[1]][mm])
         print(f"   density in the shelf levels ({mm.sum()} values): max |diff| {d.max():.3e} kg/m3")
 
