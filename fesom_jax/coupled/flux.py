@@ -455,6 +455,63 @@ def thermo_cpl(cfg, fc: FluxConfig, *, A, h, hsn, ice_temp_old, apnd, hpnd, ipnd
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# cavities: what FESOM main 0aaa2d73 does with the received fields at ice-shelf cavity nodes (coupled, __oifs)
+# ---------------------------------------------------------------------------------------------------------------
+#: the switch (trace time): "1" when the coupled ocean runs with cavities (init_ocean's ``cpl_cavity``, set from the
+#: ocean's cavity switch); unset or "0" = today's program
+CAVITY_ENV = "FESOM_CPL_CAVITY"
+#: lane L-OCN's three-equation melt (fesom_jax.cavity.cavity_heat_water_fluxes_3eq), called where FESOM2's oce_fluxes
+#: calls it: fn(state, mesh, srf, heat_flux, water_flux) -> (heat_flux, water_flux), overwriting the cavity nodes.
+#: None (default): no melt here (the hook point for the wiring; the rest of the cavity branches below do not need it)
+CAVITY_MELT = None
+
+
+def cavity_on() -> bool:
+    import os
+    return os.environ.get(CAVITY_ENV, "0") == "1"
+
+
+def top_wet(x, ulevels_nod2D):
+    """x[n, ulevels_nod2D(n) - 1]: a (nod2D, nl) field at each node's top wet level (cavity nodes: under the shelf)."""
+    return jnp.take_along_axis(x, (jnp.asarray(ulevels_nod2D) - 1)[:, None].astype(jnp.int32), axis=1)[:, 0]
+
+
+def cavity_virtual_salt(water_flux, S_topwet, areasvol_top, ocean_area, open_water, *, use_virt_salt,
+                        owned_mask=None, axis_name=None):
+    """oce_fluxes' virtual salt with cavities (ice_oce_coupling.F90:375-438): rsss = S at the top wet level
+    (ref_sss_local), integrate_nod weights areasvol at ulevels_nod2D, the balance subtracted on open-ocean nodes
+    only (mesh%ocean_area = the open ocean). linfs (use_virt_salt): rsss*water_flux everywhere; zstar: only under the
+    shelves (rigid lid, nothing moves there), counter-balanced over the open ocean."""
+    from ..sss_runoff import _area_mean
+    vs = S_topwet * water_flux
+    if not use_virt_salt:
+        vs = jnp.where(open_water, 0.0, vs)
+    net = _area_mean(vs, areasvol_top, ocean_area, owned_mask=owned_mask, axis_name=axis_name)
+    return jnp.where(open_water, vs - net, vs)
+
+
+def cavity_fw_balance_zstar(water_flux, flux, areasvol_top, ocean_area, open_water, *, owned_mask=None,
+                            axis_name=None):
+    """oce_fluxes' freshwater balance with cavities and zstar (ice_oce_coupling.F90:566-598): no flux under the
+    shelves (flux = 0 there), integrate_nod with areasvol at ulevels_nod2D, net/ocean_area added on open-ocean nodes
+    only. (linfs: water_flux is not read after oce_fluxes in fesom_jax, so its balance is not needed.)"""
+    from ..sss_runoff import _area_mean
+    flux = jnp.where(open_water, flux, 0.0)
+    net = _area_mean(flux, areasvol_top, ocean_area, owned_mask=owned_mask, axis_name=axis_name)
+    return jnp.where(open_water, water_flux + net, water_flux)
+
+
+def cavity_stress(stress_surf, stress_node_surf, open_water, elem_open):
+    """oce_fluxes_mom (ice_oce_coupling.F90:72-117): cavity nodes and cavity elements (ulevels > 1) take no
+    atmosphere or ice-ocean stress: 0 here, left to cavity_momentum_fluxes (lane L-OCN), which FESOM2 calls right
+    after. An open element (ulevels = 1) never has a cavity node (ulevels_nod2D is the minimum over the node's
+    elements), so the open elements' averages are unchanged."""
+    sns = jnp.where(open_water[:, None], stress_node_surf, 0.0)
+    ss = jnp.where(elem_open[:, None], stress_surf, 0.0)
+    return ss, sns
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # the coupled ice step (the twin of fesom_jax.ice_step.ice_surface_step, ice_ave_steps = 1)
 # ---------------------------------------------------------------------------------------------------------------
 def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, boundary_node=None,
@@ -496,7 +553,27 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
                                        axis_name=axis_name, use_virt_salt=use_virt_salt,
                                        real_salt_flux=th.real_salt_flux)
     water_flux = icef.water_flux
-    if not use_virt_salt:
+    cav = cavity_on()
+    heat_flux_in, virtual_salt, relax_salt = icef.heat_flux, icef.virtual_salt, icef.relax_salt
+    if cav:
+        # the received fields at cavity nodes (FESOM main 0aaa2d73, __oifs): thermo_cpl skips the nodes (heat, water,
+        # runoff, enthalpy and the ice fluxes give 0 there: heat_flux = -ehf, water_flux = -fw), the melt overwrites
+        # them (CAVITY_MELT), then the salt and water balances take the cavity branches
+        ul = mesh.ulevels_nod2D
+        areasvol_top = top_wet(jnp.asarray(mesh.areasvol), ul)
+        S_topwet = top_wet(state.S, ul)
+        if CAVITY_MELT is not None:
+            heat_flux_in, water_flux = CAVITY_MELT(state, mesh, srf, heat_flux_in, water_flux)
+        virtual_salt = cavity_virtual_salt(water_flux, S_topwet, areasvol_top, fs.ocean_area, open_water,
+                                           use_virt_salt=use_virt_salt, owned_mask=owned_mask, axis_name=axis_name)
+        relax_salt = jnp.where(open_water, relax_salt, 0.0)       # no SSS restoring under the shelves (rate 0 here)
+    if not use_virt_salt and cav:
+        flux = (th.evaporation - th.ice_sublimation + cf.prec_rain + cf.prec_snow * (1.0 - a_co) + th.resid
+                + runoff) * (cfg.rhofwt / cfg.rhowat)
+        flux = flux - th.thdgr * cfg.rhoice / cfg.rhowat - th.thdgrsn * cfg.rhosno / cfg.rhowat
+        water_flux = cavity_fw_balance_zstar(water_flux, flux, areasvol_top, fs.ocean_area, open_water,
+                                             owned_mask=owned_mask, axis_name=axis_name)
+    elif not use_virt_salt:
         # the coupled zstar balance (ice_oce_coupling.F90 oce_fluxes, __oasis): + residualifwflx, x rhofwt/rhowat
         flux = (th.evaporation - th.ice_sublimation + cf.prec_rain + cf.prec_snow * (1.0 - a_co) + th.resid
                 + runoff) * (cfg.rhofwt / cfg.rhowat)
@@ -507,18 +584,21 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     stress_atm = jnp.stack([cf.taux_oce, cf.tauy_oce], axis=-1)
     stress_surf, stress_node_surf = ice_coupling.ice_oce_fluxes_mom(
         mesh, a_out, u_ice, v_ice, srf.u, srf.v, stress_atm, open_water, cfg)
+    if cav:
+        stress_surf, stress_node_surf = cavity_stress(stress_surf, stress_node_surf, open_water,
+                                                      jnp.asarray(mesh.ulevels) <= 1)
     pene_open = open_water & (a_out <= 0.0)
-    heat_flux, sw_3d = _forcing.cal_shortwave_rad(mesh, icef.heat_flux, cf.heat_swo, cf.chl, pene_open,
+    heat_flux, sw_3d = _forcing.cal_shortwave_rad(mesh, heat_flux_in, cf.heat_swo, cf.chl, pene_open,
                                                   zbar3=zbar3, legacy_depth=legacy_sw_depth)
     is_nonlinfs = 0.0 if use_virt_salt else 1.0
     bc_T = -dt * heat_flux / VCPW
-    bc_S = dt * (icef.virtual_salt + icef.relax_salt + icef.real_salt_flux * is_nonlinfs)
+    bc_S = dt * (virtual_salt + relax_salt + icef.real_salt_flux * is_nonlinfs)
     cpl = {"cpl_ice_temp": th.ice_temp, "cpl_ice_alb": th.ice_alb, "cpl_apnd": th.apnd, "cpl_hpnd": th.hpnd,
            "cpl_ipnd": th.ipnd}
     if getattr(state, "cpl_fw", None) is not None:          # the monthly `fw` output (ocean.py monthly_extra)
         cpl["cpl_fw"] = water_flux.astype(state.cpl_fw.dtype)
     return IceStepOut(
         stress_surf=stress_surf, bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d, stress_node_surf=stress_node_surf,
-        heat_flux=heat_flux, water_flux=water_flux, virtual_salt=icef.virtual_salt, relax_salt=icef.relax_salt,
+        heat_flux=heat_flux, water_flux=water_flux, virtual_salt=virtual_salt, relax_salt=relax_salt,
         real_salt_flux=icef.real_salt_flux, a_ice=a_out, m_ice=m_out, m_snow=ms_out, u_ice=u_ice, v_ice=v_ice,
         t_skin=th.ice_temp - TMELT, sigma11=s11, sigma12=s12, sigma22=s22, cpl=cpl)

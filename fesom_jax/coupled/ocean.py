@@ -186,7 +186,7 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
                ic_dir: str | None = None, start: tuple | None = None, year0: int = 1958, nsteps: int = 4,
                mode: str = "bulk", sss_restoring: bool = False, monthly_out: str | None = None, log=print,
                partition: str | None = None, dist_dir: str | None = None, cpl_runoff: str = "climatology",
-               monthly_extra: tuple = ()):
+               monthly_extra: tuple = (), cpl_cavity: bool | None = None):
     """Build the coupled ocean. Returns ``(state, static)``: the folded device :class:`~fesom_jax.state.State`
     (working precision) and the :class:`OceanStatic`.
 
@@ -203,7 +203,10 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     ``gpu.mevp_wide`` of the config apply as in the standalone runner). ``cpl_runoff`` (mode F): ``"climatology"``
     (default: the CORE2 runoff file, hydr_oce/calv_oce ignored) or ``"coupled"`` (the runoff mapper's hydr_oce +
     calv_oce and the calving's enthalpy of fusion, :mod:`fesom_jax.coupled.flux`). ``monthly_extra``: more fields
-    of the monthly means (:data:`MONTHLY_EXTRA`: ``"w"``, ``"fw"``; default none: the stream unchanged)."""
+    of the monthly means (:data:`MONTHLY_EXTRA`: ``"w"``, ``"fw"``; default none: the stream unchanged).
+    ``cpl_cavity`` (mode F): the cavity branches of the coupled flux (flux.CAVITY_ENV, :mod:`fesom_jax.coupled.flux`);
+    None = follow the ocean's cavity switch (the config's ``cavity`` block of lane L-OCN, when it has one; off
+    otherwise)."""
     monthly_extra = tuple(monthly_extra or ())
     bad = [k for k in monthly_extra if k not in MONTHLY_EXTRA]
     if bad or ("fw" in monthly_extra and mode != "flux"):
@@ -221,6 +224,15 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     if cfg.dt_ramp:
         raise NotImplementedError("dt_ramp is not supported by the coupled ocean")
     _env_setup(cfg, sss_restoring)
+    if cpl_cavity is None:
+        cpl_cavity = getattr(cfg, "cavity", None) is not None
+    if cpl_cavity and mode != "flux":
+        raise ValueError("cpl_cavity is a mode F ('flux') switch")
+    from .flux import CAVITY_ENV
+    if cpl_cavity:
+        os.environ[CAVITY_ENV] = "1"           # read at trace time by the coupled ice step (the process's only user)
+    else:
+        os.environ.pop(CAVITY_ENV, None)
     precision = cfg.precision
     dt = float(cfg.dt)
 
