@@ -560,7 +560,10 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
         # runoff, enthalpy and the ice fluxes give 0 there: heat_flux = -ehf, water_flux = -fw), the melt overwrites
         # them (CAVITY_MELT), then the salt and water balances take the cavity branches
         ul = mesh.ulevels_nod2D
-        areasvol_top = top_wet(jnp.asarray(mesh.areasvol), ul)
+        # areasvol at the top wet level: the forcing's own surface areas on open nodes (fs.areasvol_surf, the
+        # balances' weights without cavities), the level under the shelf at cavity nodes
+        areasvol_top = jnp.where(open_water, fs.areasvol_surf,
+                                 top_wet(jnp.asarray(mesh.areasvol), ul).astype(fs.areasvol_surf.dtype))
         S_topwet = top_wet(state.S, ul)
         if CAVITY_MELT is not None:
             heat_flux_in, water_flux = CAVITY_MELT(state, mesh, srf, heat_flux_in, water_flux)
