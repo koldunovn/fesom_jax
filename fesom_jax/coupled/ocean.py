@@ -139,8 +139,9 @@ class OceanStatic:
             n = self.nod2D
             if self.mode == "flux":
                 from .flux import dummy_seq
-                seq_p = dummy_seq(int(nsteps), n) if self.npes == 1 else \
-                    dummy_seq(int(nsteps), int(self.sm.Lmax["nod"]), self.npes)
+                ro = getattr(self.flux, "runoff", "climatology")
+                seq_p = dummy_seq(int(nsteps), n, runoff=ro) if self.npes == 1 else \
+                    dummy_seq(int(nsteps), int(self.sm.Lmax["nod"]), self.npes, runoff=ro)
             else:
                 z = np.zeros((nsteps, n), np.float64)
                 seq = surface_forcing.StepForcing(u_air=z, v_air=z, shum=z, shortwave=z, longwave=z, Tair=z,
@@ -168,7 +169,7 @@ def _env_setup(cfg: RunConfig, sss_restoring: bool) -> None:
 def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in: str | None = "config",
                ic_dir: str | None = None, start: tuple | None = None, year0: int = 1958, nsteps: int = 4,
                mode: str = "bulk", sss_restoring: bool = False, monthly_out: str | None = None, log=print,
-               partition: str | None = None, dist_dir: str | None = None):
+               partition: str | None = None, dist_dir: str | None = None, cpl_runoff: str = "climatology"):
     """Build the coupled ocean. Returns ``(state, static)``: the folded device :class:`~fesom_jax.state.State`
     (working precision) and the :class:`OceanStatic`.
 
@@ -182,7 +183,9 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     a directory for the monthly means (``<dir>/<YYYY>_<MM>``, run.py's layout). ``partition`` (default: the
     config's): ``serial`` (one device) or ``dist_N`` (the FESOM2 partition of N ranks from ``dist_dir``, default
     $FESOM_DIST_DIR or :data:`DEFAULT_DIST_DIR`, over the first N devices of the process; ``gpu.lane_order`` and
-    ``gpu.mevp_wide`` of the config apply as in the standalone runner)."""
+    ``gpu.mevp_wide`` of the config apply as in the standalone runner). ``cpl_runoff`` (mode F): ``"climatology"``
+    (default: the CORE2 runoff file, hydr_oce/calv_oce ignored) or ``"coupled"`` (the runoff mapper's hydr_oce +
+    calv_oce and the calving's enthalpy of fusion, :mod:`fesom_jax.coupled.flux`)."""
     cfg = load_yaml(config) if isinstance(config, (str, os.PathLike)) else config
     if restart_in != "config":
         cfg = dataclasses.replace(cfg, restart_in=restart_in)
@@ -301,7 +304,9 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         mevp_wide=mevp_wide)
     if mode == "flux":
         from . import flux
-        state, static = flux.init_flux(state, static)
+        state, static = flux.init_flux(state, static, runoff=cpl_runoff)
+    elif cpl_runoff != "climatology":
+        raise ValueError("cpl_runoff 'coupled' is a mode F ('flux') switch")
     log(f"[ocean] CORE2 nod2D={mesh.nod2D} npes={npes} dt={dt} precision={precision} mode={mode} nsteps={nsteps} "
         f"sss_restoring={sss_restoring} calendar {static.calendar()}")
     return state, static
