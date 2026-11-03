@@ -8,14 +8,21 @@ CORE3 with cavities, linfs, `cavity_gamma_scale = 0.6`, ocean from the 1855-01-0
 Outputs live under `/work/ba1583/a270088/awicm/core3/ocn/` (mesh, partitions, jobs, logs) and
 `/work/ba1583/a270088/awicm/core3/fesom_oracle/` (the Fortran oracle: source, build, runs, dumps).
 
-## Status (2026-11-03, session 1)
+## Status (2026-11-03, end of session 2)
 
 | task | state |
 |---|---|
 | 1. CORE3 mesh in fesom_jax format + cavity metadata + dist_1/2/4/8/16 | **done** |
 | 2. FESOM main 0aaa2d73 SP oracle with dumps, run on CORE3 with cavities | **done** |
-| 3. cavities behind `use_cavity` | inventory written (below); `fesom_jax/cavity.py` (melt, shelf drag, ice cleaning, shelf-front ice BC) and the `eos` density_ref + cavity pressure branch ported and replayed against both oracles (double: 1e-16 / 1e-14); nothing wired into the step yet |
-| 4. restart import, coupled CORE3 config | not started |
+| 3. cavities behind `use_cavity` | **wired** behind the `cavity:` config slot (default off): EOS/pressure, melt, shelf drag, no ice under the shelves, the shelf-front ice boundary, the virtual-salt integral, the TKE column under the shelves, the SSH matrix and momentum advection at the shelf base; the replay ladder (substeps 1, 3, 4, 5, 7-13, 16) matches the double-precision oracle to round-off / CG tolerance; a whole CORE3 step runs (CPU, GPU) |
+| 4. restart import | **done**: jaxcpl's 1855-01-01 ocean + ice restart -> fesom_jax restart, bitwise on every wet lane; the coupled CORE3 config is still to do |
+
+Session 2 in one paragraph: the converter of branch `fortran-restart` is on this branch and reads FESOM2 main
+restarts; the replay harness `scripts/core3/replay_ladder.py` checks one kernel per substep against the oracle's
+full dumps; three cavity defects in existing kernels were found by it and fixed (SSH matrix depth, momentum
+advection at the shelf base, the AB2 bootstrap of a step-0 restart) plus one TKE driver change (the column under a
+shelf). Global node order: fesom_jax's CORE3 bundle keeps FESOM's `nod2d.out` order (node i of the bundle = line i+1
+of nod2d.out; `geo_coord_nod2D.npy` is that order), which lane L-CPL relies on.
 
 ## 1. The mesh
 
@@ -227,6 +234,110 @@ What the replay checked (job 28696654, `scripts/core3/replay_cavity_melt.py`): s
 | default path unchanged: `test_eos.py`, `test_dp_lock.py`, `test_prepare_mesh.py` | 28696826 | 22 passed |
 | bundle `area`, `areasvol`, `mesh_resolution`, `elem_area` vs the DP oracle's own `mesh%...` | run_cav_dp | rel 2.0e-12, 2.0e-12, 3.7e-13, 2.2e-12; zero outside the wet levels in both |
 | SP geometry: oracle `mesh%elem_area`/`area`/`areasvol` vs the bundle | run_cav3 (28696663) | elem_area rel median 1.8e-5, p99 1.8e-4, max 8.7e-4: FESOM SP derives the geometry in float32, fesom_jax SP rounds the float64 geometry (max 6e-8). The cavity `areasvol` rule itself agrees: the same 11,055 (node, level) values differ from `area` in both |
+
+## Session 2 (2026-11-03): restart import, the ladder, cavities wired into the step
+
+### Task 4: the 1855-01-01 restart
+
+The converter of branch `fortran-restart` (9cb9a02..c95e476, cherry-picked; the PORTING_LESSONS append conflict
+resolved by keeping both sections) now also reads FESOM2 main restarts: `d_eta` (CG warm start), the mEVP stresses
+`sigma11/12/22` and the Newton seed `t_skin` [degC] are taken from the restart when present (a FESOM 2.7 restart
+converts as before); optional State fields stay `None`; `convert.py --rest-reference` uses a rest state with
+T = S = 0 as the reference (CORE3 has no cached PHC IC; every wet lane comes from the restart, dry and shelf lanes
+0 as FESOM stores them). density / hpressure / bvfreq stay 0, as FESOM does not restart `density_m_rho0` either:
+the oracle's first step after the restart reads rho = 0 + density_ref in the melt (checked: its `pre_fluxes`
+density at step 1 is 0 everywhere).
+
+```bash
+python scripts/fortran_restart/convert.py --oce $W/fesom.1855-01-01.oce.restart --ice $W/fesom.1855-01-01.ice.restart \
+   --mesh-dir $OCN/mesh_core3 --rest-reference --date 1958-01-01 --start-year 1958 --dt 1800 --out <new dir>
+python scripts/core3/check_restart.py <new dir> $OCN/mesh_core3 $W/fesom.1855-01-01.oce.restart $W/fesom.1855-01-01.ice.restart [oracle dumps]
+```
+
+Use **`/work/ba1583/a270088/awicm/core3/ocn/restart_jaxcpl_18550101_as_1958_v2`** (standalone JRA55 1958, step 0;
+the oracle's setup) and `..._as_1855_v2` (the same state dated 1855-01-01 for the coupled run). Job 28698817:
+`RESTART_CHECK_OK`, every restarted field bitwise on its wet lanes (T, S, T_old, S_old, hnode, w, w_e, tke, eta_n,
+hbar, d_eta, ssh_rhs_old, a_ice, m_ice, m_snow, u_ice, v_ice, t_skin, sigma11/12/22, uv, uv_rhsAB). Superseded,
+not to be used: `..._as_1958`, `..._as_1855` (job 28698495: density recomputed, which FESOM does not do) and
+`..._as_1958_v3`, `..._as_1855_v3` (job 28699073: labelled with the previous year to dodge the AB2 bootstrap;
+that needs 1957 forcing, which JRA55-do does not have). `run.py` now never re-bootstraps AB2 at the first step
+of a restart (`plan_chunks(restarted=True)`; before, a restart at step 0 was taken for a cold start and its first
+step ran as the AB2 first step).
+
+### Task 2: the replay ladder (`scripts/core3/replay_ladder.py`, job `ocn/jobs/ladder.sbatch`)
+
+One fesom_jax kernel per substep, its inputs from the double-precision oracle's full dumps of the same step (and
+the converted restart for what FESOM carries but does not dump), its output vs the oracle's dump. Step 1, cavity
+nodes/elements, the cavity front (open, touching a cavity cell) and the rest; max |diff| / max |field|:
+
+| rung | kernel | job | cavity | front | open |
+|---|---|---|---|---|---|
+| 1 | `eos.compute_pressure_bv(density_ref, cavity)` (density, pressure, N^2) | 28697820 | 2.4e-14 / 2.5e-14 / 6.7e-14 | 1e-13 | 1.2e-13 |
+| 3 | `pgf.pressure_force_linfs` | 28698897 | 3.9e-13 | 3.9e-14 | 3.9e-13 |
+| 4 | `tke.mixing_tke(cavity=True)` + `mo_convect`: Kv / Av | 28698897 | 7.8e-15 / bitwise | 1.1e-15 / bitwise | 5.4e-14 / bitwise |
+| 5 | `momentum.compute_vel_rhs(cavity=True)` | 28698812 | 1.0e-12 (was 4.4e-4) | 7.6e-15 (was 4.5e-4) | 4.4e-14 |
+| 7 | `momentum.impl_vert_visc` with the shelf drag | 28698897 | 3.7e-16 | 3.4e-17 | 8.9e-16 |
+| 8 | `ssh.compute_ssh_rhs` | 28698897 | 5.2e-14 | 5.3e-14 | 5.4e-14 |
+| 9 | `ssh.solve_ssh` (CG, soltol 1e-5) | 28698897 | 2.5e-5 (was 0.58) | 3.9e-6 | 2.8e-5: both solutions have residual 9.9e-6 / 9.5e-6 under fesom_jax's matrix, i.e. CG tolerance |
+| 10 | `momentum.update_vel` | 28698897 | 1.5e-12 | 8e-16 | 5e-15 |
+| 11 | `ssh.compute_hbar` (hbar, ssh_rhs_old) | 28698897 | bitwise / 2e-11 | 2e-12 / 1.7e-11 | 4e-12 / 2.8e-10 |
+| 12 | `ssh.eta_n_update` | 28698897 | bitwise | bitwise | bitwise |
+| 13 | `ale.compute_w` | 28698897 | 6e-13 | 2e-13 | 6e-13 |
+| 16 | linfs thickness (hnode, helem) | 28698897 | bitwise | bitwise | bitwise |
+| 17-19 | melt, shelf drag, no ice under the shelves (`replay_cavity_melt.py`) | 28697533 | 1.1e-16 / bitwise | | |
+
+What the ladder found in EXISTING kernels (each a cavity case the C port never ran, fixed here):
+* **SSH stiffness matrix** (`ssh.build_ssh_operator`): the element depth was `zbar[nlevels-1] - zbar[0]`; FESOM's is
+  `zbar_e_bot - zbar_e_srf` with `zbar_e_srf = zbar(ulevels(el))` (oce_ale.F90:1362). Under a shelf the column
+  started at the sea surface: the oracle's `d_eta` had a residual of 0.26 under fesom_jax's matrix. Off the shelves
+  `ulevels = 1`, so the default matrix is unchanged.
+* **Momentum advection** (`momentum.momentum_adv_scalar(cavity=True)`): FESOM adds a cell's top interface
+  velocity only for open cells (`if (ule==1)`); fesom_jax took half of it from the half-sum with the dry level
+  above (4.4e-4 at cavity and front cells).
+* **TKE under a shelf** (`tke.mixing_tke(cavity=True)`): the column core assumes its surface at k = 0; FESOM's CVMix
+  driver hands it the column from the top wet level. The driver now shifts every column up by `ulevels_nod2D - 1`
+  and back, and caps `dzt` with half the top wet layer (it took `hnode[:, 0]`, which is 0 under a shelf).
+* **AB2 at a step-0 restart** (`run.plan_chunks`), above.
+
+Not yet on the ladder: rung 2 (sw_alpha/beta: only GM/KPP read it), 6 (fesom_jax has no `opt_visc = 5`: lane
+L-SFC), 14 (GM/Redi with jaxcpl's scalings: L-SFC), 15 (tracers: advection, the implicit diffusion with the melt as
+the surface BC at the shelf base, GM/Redi), and the forcing / ice substeps 17-18 as kernels (their cavity masks are
+checked in the oracle: no ice and zero atmospheric forcing under the shelves). Rungs at step 1 only: later steps
+need the AB2 slot, `w_expl` and the CG warm start from the previous step, which the oracle does not dump.
+
+### Task 3: the wiring (all behind `cavity:`; `None` = today's program)
+
+* `run_config.RunConfig.cavity: Optional[CavityConfig]` (`gamma_scale`, `density_ref_T/S`), in `physics_kwargs`
+  only when set (like `recom`); `validate()` refuses cavities with zstar (the zstar branches are not ported) and
+  without the prognostic sea ice.
+* `run.py`: `cavity.with_cavity_static` (the virtual-salt integral weights each node by `areasvol` at its top wet
+  level, as FESOM's `integrate_nod`) and `cavity.cavity_boundary_node_mask` (the GLOBAL ice boundary incl. the shelf
+  front). `integrate_sharded.run_steps_sharded_forced(cavity_cfg=)` passes it to `step`; the executable-cache key
+  gets it only when set.
+* `step.step(cavity_cfg=)`: `eos` with `density_ref` and the cavity branch; `compute_vel_rhs(cavity=True)`;
+  `mixing_tke(cavity=True)`; `ice_step.ice_surface_step(cavity_cfg=)`: ice velocity and ice cleared under the shelves
+  after the EVP / at the end of the ice step, the three-equation melt overwriting `-flx_h`/`-flx_fw` at cavity nodes
+  before the virtual salt (which then reads salt at the top wet level there), the shelf-base drag after the stress
+  blend. The melt reads the density the last `pressure_bv` left (`state.density`, relative to `density_ref`), as
+  FESOM, where `oce_fluxes` runs before `oce_timestep_ale`.
+* Inventory rows now closed: mesh, density_ref, pressure_bv, melt, shelf drag, ice cleaning, mEVP shelf-front BC,
+  virtual-salt integral, TKE top boundary, SSH matrix, momentum advection. Still open: `relax_salt` zeroed under the
+  shelves before its mean (zero in jaxcpl: `surf_relax_s = 0`, so not done), the linfs freshwater balance (FESOM
+  main balances `water_flux` also under linfs, fesom_jax does not; under linfs nothing downstream reads the balanced
+  `water_flux`, the virtual salt is formed before it), the coupled ice path (`coupled/flux.ice_surface_step_cpl` has
+  no `cavity_cfg`), the sharded mesh (`cavity.py` reads mesh-local arrays only; the shelf-front mask must be built
+  globally, which `run.py` does), single precision, and the PHC cold start under the shelves.
+
+### Whole-step checks
+
+* CPU, 4 steps from the restart (job 28698898): finite; T -2.31...32.86, max|uv| 2.35. RSS 31 GB, 1 min 45 s.
+* One step vs the double-precision oracle (job 28699335, `scripts/core3/compare_step.py`), max |diff| / max |field|
+  (p99): T cavity 5.8e-5 (1.0e-5), front 5.5e-4 (4.8e-5), open 3.6e-3 (7.7e-6); u cavity 1.8e-3, open 1.4e-2;
+  eta_n cavity bitwise (rigid lid), open 8.8e-3; a_ice front 8.0e-2 (p99 3.9e-3), open 4.3e-3. This mixes the
+  substeps fesom_jax does not have in jaxcpl's form yet (opt_visc 5, GM/Redi scalings, tracer scheme: L-SFC), so
+  it is a sanity rung; the cavity nodes are not worse than the open ocean. The front `a_ice` maximum is the one
+  number to look at next (the mEVP shelf-front boundary or the front's thermodynamics).
+* GPU (task 4 of the session): see below.
 
 ### Estimate for the rest of task 3
 
