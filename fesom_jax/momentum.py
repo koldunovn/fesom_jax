@@ -99,7 +99,7 @@ def _horizontal_adv(mesh: Mesh, uv):
     return ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)                 # (nod2D, nl, 2)
 
 
-def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
+def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None, cavity: bool = False):
     """Momentum advection on scalar control volumes (momadv_opt=2). Returns the
     contribution added to ``uv_rhsAB`` at elements, ``[elem2D, nl, 2]``.
 
@@ -110,7 +110,12 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
     results (incomplete on the halo), and the final vertex→element average gathers them
     at the cell's 3 vertices (incl. HALO nodes) — so the C exchanges the node field
     (``uvnode_rhs``) before that gather (the Kokkos SYNC_MAP substep-4 D21 bracket).
-    ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``."""
+    ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``.
+
+    ``cavity`` (ice-shelf cavities): FESOM2 adds the top interface velocity of a cell only when the cell is open
+    (``if (ule==1) wu(ule) += UV(ule)``, oce_ale_vel_rhs.F90:momentum_adv_scalar); a cavity cell has no flux through
+    the shelf base, so its top interface contributes 0 (here the half-sum with the dry level above would give
+    ``0.5·uv``). ``False`` ⇒ the unchanged program."""
     _exch = exch if exch is not None else (lambda f, kind: f)
     lm_e = mesh.elem_layer_mask
     lm_n = mesh.node_layer_mask
@@ -120,6 +125,11 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
     uvu, uvv = uv[:, :, 0], uv[:, :, 1]
     cu = jnp.where(lm_e, 0.5 * (uvu + _shift_down(uvu)), 0.0)
     cv = jnp.where(lm_e, 0.5 * (uvv + _shift_down(uvv)), 0.0)
+    if cavity:
+        _ke = jnp.arange(mesh.nl)[None, :]
+        shelf_top = (_ke == (mesh.ulevels - 1)[:, None]) & (mesh.ulevels > 1)[:, None]
+        cu = jnp.where(shelf_top, 0.0, cu)
+        cv = jnp.where(shelf_top, 0.0, cv)
     area = mesh.elem_area[:, None]
     wu = _scatter3(mesh, area * cu) * w_e        # (nod2D, nl)
     wv = _scatter3(mesh, area * cv) * w_e
@@ -146,7 +156,7 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
 
 
 def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
-                    *, is_first_step, dt=DT_DEFAULT, exch=None, press_air=None):
+                    *, is_first_step, dt=DT_DEFAULT, exch=None, press_air=None, cavity: bool = False):
     """``(uv_rhs, uv_rhsAB_new)`` element fields ``[elem2D, nl, 2]``.
 
     ``uv``, ``w_e``, ``hnode`` and ``eta_n`` are the *previous-step* state (lagged,
@@ -184,7 +194,8 @@ def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
     uv_rhsAB_new = jnp.stack([new_AB_u, new_AB_v], axis=-1)
 
     # (4) + momentum advection into the AB slot
-    uv_rhsAB_new = uv_rhsAB_new + momentum_adv_scalar(mesh, uv, w_e, hnode, exch=exch)
+    uv_rhsAB_new = uv_rhsAB_new + momentum_adv_scalar(mesh, uv, w_e, hnode, exch=exch,
+                                                      **({"cavity": True} if cavity else {}))
 
     # (5) assemble:  uv_rhs = dt·(rhs + uv_rhsAB·ff_step)/area
     ff_step = 1.0 if is_first_step else _AB2
