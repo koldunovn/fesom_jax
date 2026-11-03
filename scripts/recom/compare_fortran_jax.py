@@ -76,7 +76,7 @@ class Fortran:
             self._cache[key] = d
         d = self._cache[key]
         v = d.variables[var]
-        assert v.shape[0] == 12, (var, v.shape)
+        assert month <= v.shape[0], (var, v.shape, month)          # a full year has 12; shorter runs fewer
         # FESOM 2.8 masks the levels below the bottom with _FillValue (2.6 wrote zeros): fill them with 0
         return np.ma.filled(v[month - 1], 0.0).astype(np.float64)  # (nz1, nod) or (nod,)
 
