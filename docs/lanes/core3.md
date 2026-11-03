@@ -359,6 +359,65 @@ test_ice_step test_tke_replay test_step_pi` 147 passed (job 28699466); `test_cor
 `test_momentum test_ssh test_ssh_ell test_run_entry test_release test_ale` 148 passed (28700740; `test_run_entry`
 alone takes 26 min). The branch is ready for the coordinator's coupled-CORE2 bitwise gate vs 5b88770.
 
+## Session 3 (2026-11-03): the coupled ocean with cavities, the tracer rung
+
+Base: the coordinator's merge `merge/core3_ocn` ba2a797 (this branch's 7d39e7a on coupled/awicm 494357a with lane
+L-SFC's switches and lane L-CPL's coupled cavity flux and runoff), fast-forwarded.
+
+**Behaviour change on record (coordinator's note):** since session 2 `run.py` no longer re-bootstraps the AB2
+momentum history at the first step of ANY restart dated step 0 (`plan_chunks(restarted=True)`); before, such a
+restart was taken for a cold start. This changes standalone fesom_jax for a step-0 restart (cold starts and restarts
+at step > 0 are unchanged); it is right for a converted Fortran restart, which carries the AB2 slot.
+
+### The coupled path (`fesom_jax/coupled/flux.py`, `coupled/ocean.py`)
+
+`ice_surface_step_cpl(cavity_cfg=)` (passed by `step` from the run config's `cavity:` block): the cavity branches
+of lane L-CPL turn on (as their `FESOM_CPL_CAVITY`), the three-equation melt runs at L-CPL's `CAVITY_MELT` point
+(`cavity.melt_fn(cavity_cfg)`, unless a hook is set there), the shelf-base drag (`cavity_momentum_fluxes`) follows
+L-CPL's `cavity_stress`, the sea ice is cleared under the shelves after the EVP and after the thermodynamics, and the
+shelf front is an ice coast. `init_ocean` builds the cavity forcing statics and the global shelf-front ice mask when
+the config has `cavity:`.
+
+`configs/core3_cpl.yaml`: the CORE3 bundle, cavity (gamma 0.6), linfs, single precision, L-SFC's jaxcpl blocks of
+`configs/core2_cpl_jaxcpl.yaml`, `restart_jaxcpl_18550101_as_1855_v2` (step 0 of 1855: `init_ocean(year0=1855)`),
+dist_N from `FESOM_DIST_DIR=/work/ba1583/a270088/awicm/core3/ocn/mesh_core3_raw`.
+
+Check `scripts/core3/check_cpl_core3.py` (`ocn/jobs/check_cpl_cpu.sbatch`): `init_ocean(..., mode="flux")` +
+`ocean_interval` with a fixed atmosphere (stress 0.05 N/m^2, heat_oce -60, heat_swo 120, heat_ico -20 W/m^2,
+rain 2e-8, snow 5e-9, evap -2e-8 m/s, tsk_ico 265 K), 2 steps per interval:
+* serial, CPU (job 28703316): `CPL_CORE3_OK`, 3 intervals finite, SST -2.04...31.46, shelf-base T moving
+  (max |dT| 0.015 / 0.031 / 0.048 K after 1 / 2 / 3 intervals), no sea ice under the shelves; ~7.5-8 s per step
+  on one CPU node after the first interval (init 55 s, first interval 56 s with the compile);
+* dist_2 on two CPU devices (job 28703577, `NDEV=2 PARTITION=dist_2`, the all_gather halo): `CPL_CORE3_OK`, 2
+  intervals finite, and the same diagnostics as serial to the printed digits (SST, shelf-base dT 1.50e-2 /
+  3.09e-2, max|uv| 2.317 / 2.299); ~7.6 s per step. A GPU dist_2 run waits for a GPU slot (the account's fair
+  share is 0; my one GPU job, 28699464, has been pending since session 2).
+
+The whole-step comparison of the standalone config (job 28703654, after the tracer fix) is unchanged at its printed
+digits (T cavity 5.8e-5, open 3.6e-3): that rung is dominated by the settings fesom_jax runs differently from jaxcpl
+in `configs/core3_cavity.yaml` (opt_visc, GM/Redi, ...), not by the cavity kernels.
+
+### Rung 15: tracers (a fourth cavity defect)
+
+`replay_ladder.py --rungs 15` against an oracle run with `fer_gm = redi = .false.` (`fesom_oracle/run_cav_dp_nogm2`,
+build_dp with a20dd2d: the oracle now also dumps `sw_3d` at the fluxes stage and the advection tendency `del_ttf`
+(+ its horizontal / vertical parts) of T and S as substep 21). The rung runs the FCT advection
+(`tracer_adv.advect_one_fct`) and the implicit vertical diffusion (`tracer_diff.impl_vert_diff`, the melt as the BC
+of the top wet layer, the shortwave penetration):
+
+| | job | cavity | front | open |
+|---|---|---|---|---|
+| del_ttf T / S, before | 28703496 | 2.1e-4 / 7.8e-3 | 1.7e-5 / 1.1e-3 | 3e-12 / 3e-11 |
+| T / S after the step, before | 28703496 | 8.9e-6 / 1.0e-4 (top wet layer 2.9e-4 K / 4.3e-3 psu) | 3.6e-7 / 7.2e-6 | 4e-14 |
+| del_ttf T / S, fixed | 28703573 | 5.1e-13 / 2.0e-11 | 1.3e-13 / 7.9e-12 | 3.2e-12 / 3.4e-11 |
+| T / S, fixed | 28703573 | 1.3e-15 / 2.0e-14 | 1.6e-15 / 1.1e-14 | 4.4e-14 / 4.0e-14 |
+
+The defect: the low-order vertical upwind flux (`tracer_adv.adv_flux_ver`) got FESOM's top-interface flux
+`-W·T·area` from edge replication at `k = 0` only; under a shelf `T[nzmin-1]` is the dry shelf level, so for
+`W < 0` the shelf-base flux was 0. Fixed behind `advect_one_fct(cavity=True)` (step passes it with `cavity:`; the
+default program is unchanged, its StableHLO included). Not covered: REcoM's tracer transport with cavities
+(`recom/transport.py` calls `advect_one_fct` without the flag), the w_split path.
+
 ### Estimate for the rest (after session 2)
 
 * Rung 15 (tracers with the melt as the surface BC at the shelf base, MFCT/QR4C advection at the shelf base) and
