@@ -197,5 +197,6 @@ streams the run wrote (kdind15* have no `NPPc`) and every group's C and Chl inve
 The comparison dashboard (a claude.ai artifact, https://claude.ai/artifact/FZdfSKsnqxJ8JDxDVs1fHP) reads CSV files
 made by `scripts/recom/dashboard_data.py OUT` (the monthly global tables of the cold 1958-59 pair and the four warm 1998
 runs; needs both compare scripts' `summary.json`/`groups_summary.json` first) and `scripts/recom/dashboard_maps.py OUT`
-(1-degree surface maps per month and zonal means of the cold pair, regridded from the CORE2 nodes). Their defaults are
+(1-degree surface maps per month and zonal means of the cold pair, regridded from the CORE2 nodes). Since 2026-11-03 it also has a tab for the FESOM 2.8 pair, from `warm1998_fesom28.csv`
+(`dashboard_data.py OUT --only-fesom28` writes just that table). Their defaults are
 the Albedo run and output paths of lane W.

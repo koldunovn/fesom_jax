@@ -10,7 +10,10 @@ Writes into ``OUT``:
   (NPP of the three common groups), the six inventories and the fesom-jax export at 100 m;
 * ``warm1998.csv``: the four warm 1998 runs, a row a month: Fortran ``--wjp`` (matched build and physics) and ``--w``
   (production), fesom-jax ``--jx`` (matched, per-group outputs) and ``--nc`` (own physics, no per-group outputs);
-  columns ``<metric>_<run>``, plus the jx-vs-wjp pattern correlations.
+  columns ``<metric>_<run>``, plus the jx-vs-wjp pattern correlations;
+* ``warm1998_fesom28.csv``: the warm 1998 pair on FESOM 2.8 (``--f28`` Fortran ``fesom2.8_recom_spectral``, ``--j28``
+  fesom-jax ``core2_recom_spectral_warm1998_fesom28``), the same columns with run keys ``f28``/``j28`` and the
+  ``_corr_j28`` correlations, plus the six inventories and each group's C and Chl inventory [Pmol] of both.
 
 Units: NPP and CO2 flux Pg C yr-1, Chl mg m-3, pCO2 uatm, SST degC, ice area Mkm2, inventories Pmol.
 The 1-degree maps come from ``dashboard_maps.py``.
@@ -84,7 +87,7 @@ def cold_table(m: Mesh, run: Path, F: Fortran) -> list[dict]:
     return rows
 
 
-def warm_table(m: Mesh, fortran: dict, jax: dict, year: int) -> list[dict]:
+def warm_table(m: Mesh, fortran: dict, jax: dict, year: int, pair: tuple[str, str] = ("wjp", "jx")) -> list[dict]:
     A = m.area
     glob = lambda x: float(np.sum(x * A) * MMOL_D_TO_PGC_YR)                       # noqa: E731
     amean = lambda x: float(np.sum(x * A) / A.sum())                               # noqa: E731
@@ -115,13 +118,34 @@ def warm_table(m: Mesh, fortran: dict, jax: dict, year: int) -> list[dict]:
             r[f"pco2_{k}"] = r6(amean(J["pco2surf"]))
             r[f"sst_{k}"] = r6(amean(J["temp"][0]))
             r[f"ice_{k}"] = r6(ice(J["a_ice"]))
-        Fw, J = fortran["wjp"], Js["jx"]
-        r["chl_corr_jx"] = r6(wcorr(J["Chl"][0], sum(Fw.field(v, year, mo)[0] for v in FORTRAN_CHL), A))
-        r["co2flux_corr_jx"] = r6(wcorr(J["co2flux"], Fw.field("CO2f", year, mo), A))
-        r["npp3_corr_jx"] = r6(wcorr(sum(J[f"npp_{gg}"] for gg, _ in GROUPS),
-                                     sum(Fw.field(fv, year, mo) for _, fv in GROUPS), A))
+        kf, kj = pair
+        Fw, J = fortran[kf], Js[kj]
+        r[f"chl_corr_{kj}"] = r6(wcorr(J["Chl"][0], sum(Fw.field(v, year, mo)[0] for v in FORTRAN_CHL), A))
+        r[f"co2flux_corr_{kj}"] = r6(wcorr(J["co2flux"], Fw.field("CO2f", year, mo), A))
+        r[f"npp3_corr_{kj}"] = r6(wcorr(sum(J[f"npp_{gg}"] for gg, _ in GROUPS),
+                                        sum(Fw.field(fv, year, mo) for _, fv in GROUPS), A))
         rows.append(r)
-        print(f"[dashboard] warm {name}: NPP 3 groups jx {r['npp3_jx']} wjp {r['npp3_wjp']} w {r['npp3_w']}", flush=True)
+        print(f"[dashboard] warm {name}: NPP 3 groups " + ", ".join(f"{k} {r[f'npp3_{k}']}" for k in (*fortran, *jax)
+                                                                     if f"npp3_{k}" in r), flush=True)
+    return rows
+
+
+def fesom28_table(m: Mesh, fortran: Path, run: Path, year: int) -> list[dict]:
+    """The FESOM 2.8 pair (Fortran f28, fesom-jax j28): the warm-run columns plus, from the run's compare/ summaries,
+    the six inventories of both and every group's C and Chl inventory of both [Pmol]."""
+    rows = warm_table(m, {"f28": Fortran(fortran)}, {"j28": run / "monthly"}, year, pair=("f28", "j28"))
+    S = json.load(open(run / "compare/summary.json"))
+    GS = {r["month"]: r for r in json.load(open(run / "compare/groups_summary.json"))["monthly"]}
+    for r in rows:
+        name = r["month"].replace("-", "_")
+        s, g = S[name], GS[name]
+        for t in INVENTORY:
+            r[f"inv_{t}_j28"] = float(f"{s[f'inv_{t}_jax_Pmol']:.10g}")       # r6 would hide the 1e-7 differences
+            r[f"inv_{t}_f28"] = float(f"{s[f'inv_{t}_fortran_Pmol']:.10g}")
+        for gg in ("phy", "dia", "cocco", "phaeo"):
+            for kind in ("C", "Chl"):
+                r[f"inv_{kind}_{gg}_j28"] = float(f"{g[f'{kind}_{gg}_inv_jax_mmol'] * 1e-18:.10g}")
+                r[f"inv_{kind}_{gg}_f28"] = float(f"{g[f'{kind}_{gg}_inv_fortran_mmol'] * 1e-18:.10g}")
     return rows
 
 
@@ -135,10 +159,18 @@ def main():
     ap.add_argument("--w", type=Path, default=FOUT / "fesom2.6_spectral_kdind15w")
     ap.add_argument("--jx", type=Path, default=RUNS / "core2_recom_spectral_warm1998_jaxphys_groups/monthly")
     ap.add_argument("--nc", type=Path, default=RUNS / "core2_recom_spectral_warm1998_noco2lim/monthly")
+    ap.add_argument("--f28", type=Path, default=FOUT / "fesom2.8_spectral_kdind15w28")
+    ap.add_argument("--j28", type=Path, default=RUNS / "core2_recom_spectral_warm1998_fesom28",
+                    help="the fesom-jax run root (monthly/ and compare/ with both summaries)")
+    ap.add_argument("--only-fesom28", action="store_true", help="write warm1998_fesom28.csv only")
     ap.add_argument("--year", type=int, default=1998)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     m = Mesh(a.mesh)
+    write(a.out / "warm1998_fesom28.csv", fesom28_table(m, a.f28, a.j28, a.year))
+    if a.only_fesom28:
+        print(f"[dashboard] wrote {a.out}/warm1998_fesom28.csv")
+        return
     write(a.out / "cold.csv", cold_table(m, a.cold, Fortran(a.cold_fortran)))
     write(a.out / "warm1998.csv", warm_table(m, {"wjp": Fortran(a.wjp), "w": Fortran(a.w)},
                                              {"jx": a.jx, "nc": a.nc}, a.year))
