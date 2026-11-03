@@ -311,9 +311,15 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     chl_clim = (sss_runoff.build_chl_clim(mesh, fpaths.get("chl_path")))
     sss_clim = np.stack([np.asarray(sss.month(m)) for m in range(1, 13)])
     fs = surface_forcing._static_from_mesh(mesh, sss.runoff_node, np.zeros(int(mesh.nod2D)))
+    if getattr(cfg, "cavity", None) is not None:              # lane L-OCN: integrate_nod weights at the top wet level
+        from .. import cavity as _cav
+        fs = _cav.with_cavity_static(fs, mesh)
     fs_p = shard_mesh.partition_forcing_static(fs, part)
     from .. import ice_evp
     bn = np.asarray(ice_evp.boundary_node_mask(mesh))
+    if getattr(cfg, "cavity", None) is not None:              # the ice-shelf front is a coast for the sea ice
+        from .. import cavity as _cav
+        bn = np.asarray(_cav.cavity_boundary_node_mask(mesh, bn))
     bn_p = shard_mesh._shard_along_axis(bn, part.myList_nod2D, sm.Lmax["nod"], 0, False)
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))
     mevp_wide = None

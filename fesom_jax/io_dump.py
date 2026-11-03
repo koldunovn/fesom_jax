@@ -52,6 +52,7 @@ SUBSTEP_NAMES: dict[int, str] = {
     18: "ice_step",
     19: "oce_fluxes",
     20: "pre_fluxes",   # the ocean state oce_fluxes_mom/oce_fluxes read (cavity melt inputs)
+    21: "tracer_adv",   # the tracer advection tendency del_ttf (+ its horizontal / vertical parts), T and S
 }
 SUBSTEP_IDS: dict[str, int] = {v: k for k, v in SUBSTEP_NAMES.items()}
 

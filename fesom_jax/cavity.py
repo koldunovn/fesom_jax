@@ -253,3 +253,20 @@ def with_cavity_static(fs, mesh):
 def top_values(mesh, field):
     """``field[n, ulevels_nod2D[n]-1]``: a node column's value at its top wet level (layer 0 off the shelves)."""
     return _top(field, (mesh.ulevels_nod2D - 1).astype(jnp.int32))
+
+
+def melt_fn(cavity_cfg):
+    """The three-equation melt as the coupled flux's hook (``fesom_jax.coupled.flux.CAVITY_MELT`` signature):
+    ``fn(state, mesh, srf, heat_flux, water_flux) -> (heat_flux, water_flux)``, the cavity nodes overwritten. It reads
+    what the standalone path reads (``fesom_jax.ice_step``): T, S, uvnode, hnode of the state, ``Z_3d_n = Z`` (linfs,
+    no partial cells) and the density the last ``pressure_bv`` left plus ``density_ref``."""
+    from . import eos
+
+    def fn(state, mesh, srf, heat_flux, water_flux):
+        dref = eos.reference_density(mesh, T_ref=cavity_cfg.density_ref_T, S_ref=cavity_cfg.density_ref_S)
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
+        Z3 = jnp.broadcast_to(Zp[None, :], state.T.shape)
+        hf, wf, _ = cavity_heat_water_fluxes_3eq(mesh, state.T, state.S, state.uvnode, state.hnode, Z3,
+                                                 state.density + dref, heat_flux, water_flux, cavity_cfg.gamma_scale)
+        return hf.astype(heat_flux.dtype), wf.astype(water_flux.dtype)
+    return fn

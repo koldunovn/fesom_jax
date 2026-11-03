@@ -542,11 +542,18 @@ def cavity_stress(stress_surf, stress_node_surf, open_water, elem_open):
 # ---------------------------------------------------------------------------------------------------------------
 def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, boundary_node=None,
                          use_virt_salt: bool = True, owned_mask=None, axis_name=None, exch=None, zbar3=None,
-                         params=None, mevp_wide=None, ice_update=None, legacy_sw_depth: bool = False):
+                         params=None, mevp_wide=None, ice_update=None, legacy_sw_depth: bool = False,
+                         cavity_cfg=None):
     """FESOM2's coupled ice block for one ocean step: ocean2ice -> EVP/mEVP with the received ice stress -> FCT ->
     cut_off -> :func:`thermo_cpl` -> oce_fluxes (coupled) -> oce_fluxes_mom with the received ocean stress ->
     cal_shortwave_rad of ``heat_swo``. Returns an :class:`fesom_jax.ice_step.IceStepOut` whose ``cpl`` carries the
-    :data:`CPL_FIELDS`."""
+    :data:`CPL_FIELDS`.
+
+    ``cavity_cfg`` (lane L-OCN, ``fesom_jax.cavity``; passed by ``step`` when the run config has ``cavity:``): turns
+    the cavity branches on (as :data:`CAVITY_ENV`), clears the sea ice under the shelves after the EVP and after the
+    thermodynamics (ice_timestep), makes the shelf front an ice coast, calls the three-equation melt at the
+    :data:`CAVITY_MELT` point (unless a hook is set there) and applies the shelf-base drag after :func:`cavity_stress`
+    (oce_fluxes_mom -> cavity_momentum_fluxes). ``None`` = the program as before."""
     from ..ice_step import IceStepOut, _with_ice_dt
     if int(cfg.ice_ave_steps) != 1:
         raise NotImplementedError("mode F runs the sea ice every ocean step (ice_ave_steps = 1)")
@@ -555,6 +562,10 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     open_water = fs.open_water
     geo_lat = jnp.asarray(mesh.geo_coord_nod2D)[:, 1]
     srf = ice_coupling.ocean2ice(state)
+    if cavity_cfg is not None:
+        from .. import cavity as _cav
+        if boundary_node is None:                                 # drivers pass the global mask, already extended
+            boundary_node = _cav.cavity_boundary_node_mask(mesh, ice_evp.boundary_node_mask(mesh))
     _evp = ice_mevp.mevp_dynamics if cfg.whichEVP == 1 else ice_evp.evp_dynamics
     kw = {} if mevp_wide is None else {"wide": mevp_wide}
     _exch = (lambda f, k: f) if exch is None else exch          # noqa: E731
@@ -563,6 +574,8 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
         v_ice=state.v_ice, sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,
         srfoce_u=srf.u, srfoce_v=srf.v, elevation=srf.ssh, stress_ax=cf.taux_ico, stress_ay=cf.tauy_ico,
         boundary_node=boundary_node, exch=exch, **kw)
+    if cavity_cfg is not None:                                    # cavity_ice_clean_vel after the EVP
+        u_ice, v_ice = _cav.cavity_ice_clean_vel(mesh, u_ice, v_ice)
     a_adv, m_adv, ms_adv = ice_adv.fct_solve(cfg, mesh, state.a_ice, state.m_ice, state.m_snow, u_ice, v_ice,
                                              exch=exch)
     a_co, m_co, ms_co = ice_thermo.cut_off(a_adv, m_adv, ms_adv)
@@ -572,6 +585,8 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
                     runo=runoff, geo_lat=geo_lat, non_cavity=open_water, dt=cfg.ice_dt,
                     use_virt_salt=use_virt_salt)
     a_out, m_out, ms_out = _exch(th.a_ice, "nod"), _exch(th.m_ice, "nod"), _exch(th.m_snow, "nod")
+    if cavity_cfg is not None:                                    # cavity_ice_clean_ma at the end of ice_timestep
+        a_out, m_out, ms_out = _cav.cavity_ice_clean_ma(mesh, a_out, m_out, ms_out)
 
     # oce_fluxes: heat_flux = -ehf, water_flux = -fw; virtual salt / SSS restoring as the standalone helper
     icef = ice_coupling.ice_oce_fluxes(srf.salt, th.flx_fw, th.flx_h, cf.Ssurf_month, runoff,
@@ -579,7 +594,7 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
                                        axis_name=axis_name, use_virt_salt=use_virt_salt,
                                        real_salt_flux=th.real_salt_flux)
     water_flux = icef.water_flux
-    cav = cavity_on()
+    cav = cavity_on() or cavity_cfg is not None
     heat_flux_in, virtual_salt, relax_salt = icef.heat_flux, icef.virtual_salt, icef.relax_salt
     if cav:
         # the received fields at cavity nodes (FESOM main 0aaa2d73, __oifs): thermo_cpl skips the nodes (heat, water,
@@ -591,8 +606,10 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
         areasvol_top = jnp.where(open_water, fs.areasvol_surf,
                                  top_wet(jnp.asarray(mesh.areasvol), ul).astype(fs.areasvol_surf.dtype))
         S_topwet = top_wet(state.S, ul)
-        if CAVITY_MELT is not None:
-            heat_flux_in, water_flux = CAVITY_MELT(state, mesh, srf, heat_flux_in, water_flux)
+        _melt = CAVITY_MELT if CAVITY_MELT is not None else (
+            None if cavity_cfg is None else _cav.melt_fn(cavity_cfg))
+        if _melt is not None:
+            heat_flux_in, water_flux = _melt(state, mesh, srf, heat_flux_in, water_flux)
         virtual_salt = cavity_virtual_salt(water_flux, S_topwet, areasvol_top, fs.ocean_area, open_water,
                                            use_virt_salt=use_virt_salt, owned_mask=owned_mask, axis_name=axis_name)
         relax_salt = jnp.where(open_water, relax_salt, 0.0)       # no SSS restoring under the shelves (rate 0 here)
@@ -616,6 +633,10 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     if cav:
         stress_surf, stress_node_surf = cavity_stress(stress_surf, stress_node_surf, open_water,
                                                       jnp.asarray(mesh.ulevels) <= 1)
+        if cavity_cfg is not None:                                # cavity_momentum_fluxes: the shelf-base drag
+            from ..config import C_D as _C_D, DENSITY_0 as _RHO0
+            stress_surf, stress_node_surf = _cav.cavity_momentum_fluxes(
+                mesh, state.uv, state.uvnode, stress_surf, stress_node_surf, _RHO0, _C_D)
     pene_open = open_water & (a_out <= 0.0)
     heat_flux, sw_3d = _forcing.cal_shortwave_rad(mesh, heat_flux_in, cf.heat_swo, cf.chl, pene_open,
                                                   zbar3=zbar3, legacy_depth=legacy_sw_depth)

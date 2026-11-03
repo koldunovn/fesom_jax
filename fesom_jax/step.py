@@ -595,24 +595,26 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # the full w_e_adv+w_i. use_wsplit off ⇒ w_i=None ⇒ byte-identical. (w_i is the EULERIAN
     # implicit part; the GM bolus stays explicit in w_e_adv.)
     _wi_adv = w_i if _use_wsplit else None
+    _cav_adv = {} if cavity_cfg is None else {"cavity": True}    # the top-interface LO flux under the shelves
     carry_T = carry_S = None
     if _sp:
         T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff = _tracers_advect_sp(
             mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live, zbar3_new,
-            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj, legacy_k33_weights=legacy_k33_weights)
+            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj, legacy_k33_weights=legacy_k33_weights,
+            **({} if cavity_cfg is None else {"cav_adv": {"cavity": True}}))
     else:
         T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, st.helem, st.hnode,
             hnode_new, st.T, st.T_old, dt=dt, exch=_exch,
             Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
             freeze_limited_flux=_adj.freeze_advection,
-                freeze_limiter=_adj.freeze_fct_limiter))()
+                freeze_limiter=_adj.freeze_fct_limiter, **_cav_adv))()
         S_adv, S_old = _ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, st.helem, st.hnode,
             hnode_new, st.S, st.S_old, dt=dt, exch=_exch,
             Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
             freeze_limited_flux=_adj.freeze_advection,
-                freeze_limiter=_adj.freeze_fct_limiter))()
+                freeze_limiter=_adj.freeze_fct_limiter, **_cav_adv))()
         T_adv = _exch(T_adv, "nod")
         S_adv = _exch(S_adv, "nod")
 
@@ -772,7 +774,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
 
 def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live,
-                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj, legacy_k33_weights=False):
+                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj, legacy_k33_weights=False, cav_adv=None):
     """Single-precision tracer advection + explicit Redi + ALE reconstruction (FESOM2 #1054/#1056/#1206/#1207).
 
     Upstream order (``oce_ale_tracer.F90``): the FCT advection fills the WP_full ``del_ttf`` (low-order tendency in
@@ -785,7 +787,7 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
         d, X_old_new = tracer_content_sp(mesh, X, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, helem=st.helem,
                                          hnode=st.hnode, hnode_new=hnode_new, h_wp=h_wp, gm_diag=gm_diag,
                                          zbar3_live=zbar3_live, Z3d_live=Z3d_live, dt=dt, exch=exch, ckpt=ckpt,
-                                         adj=adj)
+                                         adj=adj, **({} if cav_adv is None else {"cav_adv": cav_adv}))
         Xn, carry = tracer_adv.ale_reconstruct_carry(mesh, X, d, st.hnode, hnode_new, carry)
         return exch(Xn, "nod"), X_old_new, carry
 
@@ -800,7 +802,7 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
 
 
 def tracer_content_sp(mesh, X, X_old, *, uv_adv, w_e_adv, helem, hnode, hnode_new, h_wp, gm_diag, zbar3_live,
-                      Z3d_live, dt, exch, ckpt, adj):
+                      Z3d_live, dt, exch, ckpt, adj, cav_adv=None):
     """Single precision, one tracer: the float64 ``del_ttf`` of the FCT advection (flux-form low order, #1054/#1056)
     plus the explicit Redi content increments (``oce_ale_tracer.F90:1715-1720``, ``:1904``), from the WP tracer ``X``
     with the WP thicknesses ``h_wp`` / ``WP(hnode_new)`` for Redi. Returns ``(del_ttf, X_old_new)``; the caller rounds
@@ -811,7 +813,7 @@ def tracer_content_sp(mesh, X, X_old, *, uv_adv, w_e_adv, helem, hnode, hnode_ne
         mesh, uv_adv, w_e_adv, helem, hnode, hnode_new, X, X_old, dt=dt, exch=exch,
         Z3d=Z3d_live, zbar3=zbar3_live, w_i=None, freeze_limited_flux=adj.freeze_advection,
         freeze_limiter=adj.freeze_fct_limiter,
-        content=True))()
+        content=True, **(cav_adv or {})))()
     if gm_diag is not None:
         sl, Ki = gm_diag.slope_tapered, gm_diag.Ki
         d = (d + PR.full(ckpt(lambda: gm_redi.diff_ver_part_redi_expl(

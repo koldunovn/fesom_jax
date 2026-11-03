@@ -25,7 +25,9 @@ Rungs (jaxcpl: linfs, no partial cells):
  12  eta_n        ssh.eta_n_update(eta_n, hbar[11], hbar)                                 -> eta_n [12]
  13  w            ale.compute_w(uv[10], helem)                                            -> w [13]
  16  thickness    linfs: hnode, helem unchanged                                           -> hnode, helem [16]
-(* = from the converted restart.) Rungs 6 (opt_visc 5), 14 (GM), 15 (tracers) are not here yet: their
+Rung 15 (tracers: FCT advection + implicit vertical diffusion, the melt as the BC at the shelf base) runs without
+GM/Redi: use it against the oracle run with fer_gm = redi = .false. (``fesom_oracle/run_cav_dp_nogm``).
+(* = from the converted restart.) Rungs 6 (opt_visc 5), 14 (GM) are not here (lane L-SFC's): their
 fesom_jax kernels need jaxcpl's L-SFC settings first; the ladder feeds the oracle's outputs past them.
 """
 from __future__ import annotations
@@ -50,7 +52,8 @@ def main():
     ap.add_argument("--dt", type=float, default=1800.0)
     a = ap.parse_args()
     import jax.numpy as jnp
-    from fesom_jax import ale, eos, momentum, pgf, precision, ssh, tke
+    from fesom_jax import ale, eos, momentum, pgf, precision, ssh, tke, tracer_adv, tracer_diff
+    from fesom_jax.config import VCPW
     from fesom_jax.params import Params
     from fesom_jax.mesh import load_mesh
 
@@ -153,6 +156,36 @@ def main():
         if 13 in a.rungs:
             w = ale.compute_w(mesh, J(uv1_o), J(helem))
             report(13, "w", w, D(13, "w"), ifc_n, g_nod)
+        if 15 in a.rungs:
+            # FCT advection (T then S) + implicit vertical diffusion with the surface BC at the top wet layer (the
+            # melt under the shelves) and the shortwave penetration. GM/Redi are NOT in this rung: run it against an
+            # oracle with fer_gm = redi = .false. (fesom_oracle/run_cav_dp_nogm), where uv / w are the tracer
+            # transports as dumped.
+            uv_adv, w_adv = J(uv1_o), J(D(13, "w"))
+            hn = J(hnode)
+            T_adv, _ = tracer_adv.advect_one_fct(mesh, uv_adv, w_adv, J(helem), hn, hn, J(D(20, "T")),
+                                                 J(R("T_old")), dt=a.dt, cavity=True)
+            S_adv, _ = tracer_adv.advect_one_fct(mesh, uv_adv, w_adv, J(helem), hn, hn, J(D(20, "S")),
+                                                 J(R("S_old")), dt=a.dt, cavity=True)
+            # the advection tendency alone (FESOM's del_ttf, dumped as substep 21 by the oracle since a20dd2d)
+            try:
+                for lab, X in (("T", "T"), ("S", "S")):
+                    dtt, _ = tracer_adv.advect_one_fct(mesh, uv_adv, w_adv, J(helem), hn, hn, J(D(20, X)),
+                                                       J(R(X + "_old")), dt=a.dt, content=True, cavity=True)
+                    report(15, "del_ttf_" + lab, dtt, D(21, "del_ttf_" + lab), lay_n, g_nod)
+            except LookupError as e:
+                print(f"   rung 15: no advection-tendency dump ({e})")
+            bc_T = -a.dt * D(19, "heat_flux", two_d=True) / VCPW
+            bc_S = a.dt * (D(19, "virtual_salt", two_d=True) + D(19, "relax_salt", two_d=True))
+            T1, S1 = tracer_diff.impl_vert_diff(mesh, T_adv, S_adv, J(D(15, "Kv_after")), hn, dt=a.dt,
+                                                bc_T=J(bc_T), bc_S=J(bc_S), sw_3d=J(D(19, "sw_3d")))
+            report(15, "T", T1, D(15, "T"), lay_n, g_nod)
+            report(15, "S", S1, D(15, "S"), lay_n, g_nod)
+            top = (uln - 1)[:, None]
+            for lab, X, Xo in (("T", T1, D(15, "T")), ("S", S1, D(15, "S"))):
+                d = np.abs(np.take_along_axis(np.asarray(X), top, 1) - np.take_along_axis(Xo, top, 1))[:, 0]
+                print(f"   rung 15 {lab} at the top wet layer (the melt's BC) under the shelves: max |diff| "
+                      f"{d[g_nod['cavity']].max():.3e}, open {d[g_nod['open']].max():.3e}")
         if 16 in a.rungs:
             report(16, "hnode", hnode, D(16, "hnode"), lay_n, g_nod)
             report(16, "helem", R("helem"), helem, lay_e, g_elem)
