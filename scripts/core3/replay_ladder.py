@@ -13,6 +13,7 @@ elements, the cavity front (open, touching a cavity cell) and the rest, as max |
 bitwise-equal values. Run it against the DOUBLE-precision oracle (``run_cav_dp``) with ``--precision double``.
 
 Rungs (jaxcpl: linfs, no partial cells):
+  2  sw_ab        eos.compute_sw_alpha_beta(T, S)                                        -> sw_alpha, sw_beta [2]
   3  pgf          pgf.pressure_force_linfs(hpressure[1])                                 -> pgf_x, pgf_y [3]
   4  mixing       tke.mixing_tke(uv, bvfreq[1], tke*, stress_node_surf[19], hnode)        -> Kv, Av [4]
   5  vel_rhs      momentum.compute_vel_rhs(uv, uv_rhsAB*, eta_n, pgf[3], w_e*, hnode)    -> uv_rhs [5]
@@ -44,12 +45,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump_dir"); ap.add_argument("mesh_dir"); ap.add_argument("restart")
     ap.add_argument("--step", type=int, default=1)
-    ap.add_argument("--rungs", type=int, nargs="+", default=[3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 16])
+    ap.add_argument("--rungs", type=int, nargs="+", default=[2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 16])
     ap.add_argument("--precision", default="double", choices=("double", "single"))
     ap.add_argument("--dt", type=float, default=1800.0)
     a = ap.parse_args()
     import jax.numpy as jnp
-    from fesom_jax import ale, momentum, pgf, precision, ssh, tke
+    from fesom_jax import ale, eos, momentum, pgf, precision, ssh, tke
     from fesom_jax.params import Params
     from fesom_jax.mesh import load_mesh
 
@@ -99,6 +100,10 @@ def main():
         uv0 = Duv(20, "uv"); hnode = D(20, "hnode"); eta0 = D(20, "eta_n", two_d=True)
         hbar0 = D(20, "hbar", two_d=True)
         helem = D(16, "helem", E)
+        if 2 in a.rungs:
+            sa, sb = eos.compute_sw_alpha_beta(mesh, J(D(20, "T")), J(D(20, "S")))
+            report(2, "sw_alpha", sa, D(2, "sw_alpha"), lay_n, g_nod)
+            report(2, "sw_beta", sb, D(2, "sw_beta"), lay_n, g_nod)
         if 3 in a.rungs:
             px, py = pgf.pressure_force_linfs(mesh, J(D(1, "pressure")))
             report(3, "pgf_x", px, D(3, "pgf_x", E), lay_e, g_elem)

@@ -276,6 +276,7 @@ nodes/elements, the cavity front (open, touching a cavity cell) and the rest; ma
 | rung | kernel | job | cavity | front | open |
 |---|---|---|---|---|---|
 | 1 | `eos.compute_pressure_bv(density_ref, cavity)` (density, pressure, N^2) | 28697820 | 2.4e-14 / 2.5e-14 / 6.7e-14 | 1e-13 | 1.2e-13 |
+| 2 | `eos.compute_sw_alpha_beta` | 28702936 | bitwise | bitwise | bitwise |
 | 3 | `pgf.pressure_force_linfs` | 28698897 | 3.9e-13 | 3.9e-14 | 3.9e-13 |
 | 4 | `tke.mixing_tke(cavity=True)` + `mo_convect`: Kv / Av | 28698897 | 7.8e-15 / bitwise | 1.1e-15 / bitwise | 5.4e-14 / bitwise |
 | 5 | `momentum.compute_vel_rhs(cavity=True)` | 28698812 | 1.0e-12 (was 4.4e-4) | 7.6e-15 (was 4.5e-4) | 4.4e-14 |
@@ -302,7 +303,7 @@ What the ladder found in EXISTING kernels (each a cavity case the C port never r
   and back, and caps `dzt` with half the top wet layer (it took `hnode[:, 0]`, which is 0 under a shelf).
 * **AB2 at a step-0 restart** (`run.plan_chunks`), above.
 
-Not yet on the ladder: rung 2 (sw_alpha/beta: only GM/KPP read it), 6 (fesom_jax has no `opt_visc = 5`: lane
+Not yet on the ladder: rung 6 (fesom_jax has no `opt_visc = 5`: lane
 L-SFC), 14 (GM/Redi with jaxcpl's scalings: L-SFC), 15 (tracers: advection, the implicit diffusion with the melt as
 the surface BC at the shelf base, GM/Redi), and the forcing / ice substeps 17-18 as kernels (their cavity masks are
 checked in the oracle: no ice and zero atmospheric forcing under the shelves). Rungs at step 1 only: later steps
