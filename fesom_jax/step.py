@@ -205,10 +205,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # identity in double precision, so the double-precision trace is unchanged.
     _sp = PR.sp()
     h_wp = PR.wp(st.hnode)
-    if _sp and (ale_cfg is None or tke_cfg is None or kpp_cfg is not None or ice_cfg is None
-                or ice_cfg.whichEVP != 1 or ale_cfg.use_wsplit):
+    if _sp and (tke_cfg is None or kpp_cfg is not None or ice_cfg is None
+                or ice_cfg.whichEVP != 1 or (ale_cfg is not None and ale_cfg.use_wsplit)):
         raise NotImplementedError(
-            "single precision supports the CORE2 production physics only (zstar without w_split, "
+            "single precision supports the CORE2 production physics only (zstar without w_split or linfs, "
             "classical TKE, mEVP sea ice); got ale/tke/kpp/ice = "
             f"{ale_cfg}/{tke_cfg}/{kpp_cfg}/{ice_cfg}")
     zbar3_live = Z3d_live = elem_geo_live = None

@@ -359,8 +359,8 @@ class RunConfig:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {self.precision!r}")
         if self.precision == "single":
             bad = []
-            if self.ale is None or self.ale.use_wsplit:
-                bad.append("zstar without w_split")
+            if self.ale is not None and self.ale.use_wsplit:
+                bad.append("zstar without w_split (or linfs)")
             if self.tke is None or self.kpp is not None:
                 bad.append("classical TKE")
             if self.ice is None or self.ice.whichEVP != 1:

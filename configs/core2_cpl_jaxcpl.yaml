@@ -12,8 +12,8 @@
 #     values (scaling_resolution, scaling_gmzexp 500/0.6, scaling_odm95, redi_ktaper, K_GM_min 2, K_GM_cm 3,
 #     K_GM_cmin 0.1, Redi_Kmin 100) are fesom_jax's defaults already;
 #   * visc: opt_visc 5 (visc_filt_bcksct) with visc_easybsreturn 1.5 (namelist.dyn); gammas 0.003/0.1/0.285 = defaults;
-#   * ice: mEVP alpha/beta 300, ice_diff 0, albedos 0.82/0.65/0.70/0.68 (albw 0.1), FESOM main's mEVP mass factor and
-#     sigma reset, snowmelt_tgate false, alb_tramp 1 K, melt ponds with rfracmax 0.6, pndaspect 1.6 (albpnd 0.20,
+#   * ice: mEVP alpha/beta 300, ice_diff 0, albedos 0.82/0.65/0.70/0.68 (albw 0.1), FESOM main's mEVP mass factor,
+#     metric_factor_zero (namelist.config), snowmelt_tgate false, alb_tramp 1 K, melt ponds with rfracmax 0.6, pndaspect 1.6 (albpnd 0.20,
 #     albpnd_frz 0.36 = defaults); the melt ponds and use_atm_ice_tskin are the coupled path's (mode F) defaults;
 #   * tke: namelist.cvmix param_tke = fesom_jax's TKE defaults; use_momix false, use_instabmix true (0.1) = defaults.
 # Not switched here: se_visc (jaxcpl runs the CG, use_ssh_se_subcycl false, so se_visc is inactive), cavities, the
@@ -38,7 +38,7 @@ ice:
   albim: 0.68
   albw: 0.1
   mevp_mass_floor: true
-  mevp_zero_sigma: true
+  metric_factor_zero: true
   cpl_meltponds: true
   snowmelt_tgate: false
   alb_tramp: 1.0
