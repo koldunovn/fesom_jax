@@ -340,7 +340,16 @@ need the AB2 slot, `w_expl` and the CG warm start from the previous step, which 
   substeps fesom_jax does not have in jaxcpl's form yet (opt_visc 5, GM/Redi scalings, tracer scheme: L-SFC), so
   it is a sanity rung; the cavity nodes are not worse than the open ocean. The front `a_ice` maximum is the one
   number to look at next (the mEVP shelf-front boundary or the front's thermodynamics).
-* GPU (task 4 of the session): see below.
+* CPU, 2 days (96 steps) from the restart (job 28702593, `ocn/jobs/run_core3_cpu5d.sbatch`, 1 node): finite at every
+  chunk; at day 2 T -2.30...32.77, S 0...42.69, max|uv| 2.23, max|eta| 1.83, max CFL_z 0.69-0.90, a_ice max 1,
+  m_ice max 12.1 m. 24-step chunks took 185-197 s each (about 8 s/step, a per-chunk recompile included: the job
+  does not set `FESOM_REUSE_EXE`), RSS 33 GB, wall 14 min 40 s. Restart after 2 days:
+  `ocn/runs/cpu_smoke_28702593/restart`. (A first 5-day CPU attempt, 28701951, ran out of its 30-minute limit and
+  its output was lost in a `| tail` pipe; the job scripts now stream.)
+* GPU, 5 days on one A100-80GB (job 28699464, `ocn/jobs/run_core3_gpu.sbatch`): still PENDING at the end of the
+  session (ab0995_gpu at its running-job limit, fair share 0); when it runs, its log is
+  `ocn/logs/run_core3_gpu.28699464.out` (the `[run.progress] chunk ...` lines give the step time) and its restart
+  `ocn/runs/core3_cavity_gpu_28699464/restart`.
 
 ### Default path (cavity off) after session 2
 
