@@ -558,7 +558,7 @@ SUPPORTED: dict = {
     "fe_2ligands": (False, "two-ligand iron chemistry is not ported"),
     "fe_compl_nica": (False, "the NICA iron complexation is not ported"),
     "fe_data_source": ("Albani", "only the Albani monthly dust climatology is ported"),
-    # the spectral fork (docs/plans/20261028-recom-spectral-port.md): the ecosystem (lane E), the light (lane L)
+    # the spectral fork (docs/plans/completed/20261028-recom-spectral-port.md): the ecosystem (lane E), the light (lane L)
     # and the wiring (lane W) are ported; what stays out:
     "RECOM_MARSHALL": (False, "the D1 photoinhibition tracers are out of scope"),
     "RECOM_CALC_APHYT": (False, "the D1-dependent phytoplankton absorption is out of scope"),

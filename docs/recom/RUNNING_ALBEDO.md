@@ -67,7 +67,7 @@ sbatch scripts/albedo/run_pi_recom.sbatch
 ## pi + the spectral REcoM fork (CPU, 30 days)
 
 The spectral fork (`sveta-loza/fesom2` `fesom2.6_recom_tra_diags_spectral`: 4 phytoplankton groups, CDOM, 13-band
-light from OASIM; `docs/plans/20261028-recom-spectral-port.md`) runs from `configs/albedo/pi_recom_spectral.yaml`:
+light from OASIM; `docs/plans/completed/20261028-recom-spectral-port.md`) runs from `configs/albedo/pi_recom_spectral.yaml`:
 the fork's namelist set (`scripts/recom/fortran/namelists_albedo_spectral/`, 37 tracers), `recom.spectral: true`,
 the optics `.dat` files (`recom.optics_dir`, `fesom_jax_data/recom_pi/optics`), the OASIM monthly climatology
 (`forcing.oasim_dir`, `/albedo/work/projects/p_specbic/sloza/forcing_oasim_v2`) and the pi bundle built from the
@@ -87,7 +87,7 @@ finite, job 48603144).
 decision of 2026-10-28). `recom.spectral: false` with the same namelist (`bgc_num 36`, no CDOM:
 `namelists_albedo_spectral_nowb/`) is the fork's broadband build. The gates behind this run are the
 `test_recom_*_fork.py`, `test_recom_spectral_light.py` and `test_recom_spectral_wiring.py` files against the twin
-runs under `fesom_jax_runs/recom_ref/` (`docs/plans/20261028-recom-spectral-port.md`, progress log).
+runs under `fesom_jax_runs/recom_ref/` (`docs/plans/completed/20261028-recom-spectral-port.md`, progress log).
 
 ## CORE2 + REcoM (one GPU)
 

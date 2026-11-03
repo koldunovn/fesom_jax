@@ -1,4 +1,4 @@
-"""Lane E gate (docs/plans/20261028-recom-spectral-port.md): stage 1 of the spectral fork's REcoM
+"""Lane E gate (docs/plans/completed/20261028-recom-spectral-port.md): stage 1 of the spectral fork's REcoM
 (``recom_sources_sinks_fork``, 4 phytoplankton + 3 zooplankton + 2 detritus, broadband light) from each dumped
 ``recom_in`` of the fork's NON-spectral twin (``install_nowb_rel``, run ``pi_30d_nowb_adv01`` on Albedo, namelist.tra weights 0., 1.) against its
 ``recom_out``: the 36 updated tracers, the fork's 3-D and 2-D diagnostics, PAR, the benthos, ``GlodecayBenthos``,

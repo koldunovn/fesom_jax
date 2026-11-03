@@ -1,4 +1,4 @@
-"""Lane L of the spectral port (docs/plans/20261028-recom-spectral-port.md): the fork's spectral light model
+"""Lane L of the spectral port (docs/plans/completed/20261028-recom-spectral-port.md): the fork's spectral light model
 (:mod:`fesom_jax.recom.spectral`) against the spectral twin's dumps (run ``pi_30d_spectral_adv01`` on Albedo,
 ``install_rel/bin/fesom.x``, 37 tracers with CDOM, OASIM, RECOM_RADTRANS, RECOM_CALC_ACDOM, RECOM_CALC_APART,
 RECOM_BMASS).

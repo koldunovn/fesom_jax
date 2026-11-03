@@ -1,9 +1,9 @@
 # Lane E: the fork's 4-PFT ecosystem (coccolithophores, Phaeocystis) and CDOM in fesom-jax
 
-Parent plan: `docs/plans/20261028-recom-spectral-port.md`. Fortran: the fork worktree
+Parent plan: `docs/plans/completed/20261028-recom-spectral-port.md`. Fortran: the fork worktree
 `/albedo/work/user/sloza/SPECTRAL/recom_spectral_r692` (S = `src/int_recom/recom_sms.F90`, F = `recom_forcing.F90`,
 K = `recom_sinking.F90`, M = `recom_modules.F90`, MAIN = `recom_main.F90`, OAT = `src/oce_ale_tracer.F90`).
-This file is the read-only inventory made 2026-10-28 (an agent's pass over the sources; **verify every line
+**Done 2026-10-28** (parts 1 and 2, gates in `docs/recom/VALIDATION.md`). This file is the read-only inventory made 2026-10-28 (an agent's pass over the sources; **verify every line
 against the source while porting**, line numbers move). Gate: the broadband 4-PFT twin dumps (lane 0,
 `install_nowb/bin/fesom.x`), G2 on `recom_in -> recom_out` per dumped step, rel 1e-11.
 

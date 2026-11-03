@@ -1,5 +1,5 @@
 # Albedo: the spectral REcoM fork (4 phytoplankton groups, CDOM, 13-band light from OASIM) on the pi mesh, 30 days,
-# one CPU node (docs/recom/RUNNING_ALBEDO.md, docs/plans/20261028-recom-spectral-port.md).
+# one CPU node (docs/recom/RUNNING_ALBEDO.md, docs/plans/completed/20261028-recom-spectral-port.md).
 #   The pi mesh bundle built from the fork's partition directory (fesom_jax_data/mesh_pi_fork: the levels the
 #   Fortran twin ran with); the pi PHC IC; JRA55-do 1958 + psl (l_mslp); the 5-degree pi REcoM IC set of FESOM2's
 #   test/input/recom (DIC_PI: the preindustrial GLODAP DIC), the Albani dust on pi, the OASIM monthly

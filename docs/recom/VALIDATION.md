@@ -172,7 +172,7 @@ GM off ~1e-14: the WP Redi increments, as upstream's), so it enters where stage 
 ## The spectral fork (branch `recom-spectral`, Albedo, 2026-10-28)
 
 The port of `sveta-loza/fesom2` `fesom2.6_recom_tra_diags_spectral` (4 phytoplankton groups, CDOM, 13-band OASIM
-light; `docs/plans/20261028-recom-spectral-port.md`), gated against two 1-rank pi twins of the fork's own executable
+light; `docs/plans/completed/20261028-recom-spectral-port.md`), gated against two 1-rank pi twins of the fork's own executable
 built with the 11 upstream REcoM commits cherry-picked (`/albedo/work/user/sloza/SPECTRAL/recom_spectral_r692`):
 `pi_30d_nowb_adv01` (the broadband build, 36 tracers, job 48602452) and `pi_30d_spectral_adv01` (the spectral build,
 37 tracers with CDOM, job 48602453), dumps at steps 1, 2, 3, 17, 224, 960 under

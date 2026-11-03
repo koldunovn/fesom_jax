@@ -1,4 +1,4 @@
-"""Lane W of the spectral port (docs/plans/20261028-recom-spectral-port.md), gate G4b for the fork: one full JAX
+"""Lane W of the spectral port (docs/plans/completed/20261028-recom-spectral-port.md), gate G4b for the fork: one full JAX
 step on the fork's pi bundle from the physics-matched twin's step-0 state against the twin's step 1, for every BGC
 tracer of the fork's layout (37 with CDOM on the spectral twin, 36 on the broadband twin), ``Benthos`` and stage 1's
 surface diagnostics, judged against the physics floor of the same pair and step (T and S, which reach the BGC

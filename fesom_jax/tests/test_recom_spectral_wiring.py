@@ -1,4 +1,4 @@
-"""Lane W of the spectral port (docs/plans/20261028-recom-spectral-port.md): the run-level pieces of the spectral
+"""Lane W of the spectral port (docs/plans/completed/20261028-recom-spectral-port.md): the run-level pieces of the spectral
 fork against its twin's dumps and inputs on Albedo.
 
 * the cold start: :func:`fesom_jax.recom.ic.bgc_initial_state` with the fork's layout (37 tracers, the fork's

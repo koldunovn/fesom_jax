@@ -1,5 +1,5 @@
 """The 1-degree surface maps and zonal means of the REcoM spectral comparison dashboard (the cold 1958-59 pair; lane W
-of docs/plans/20261028-recom-spectral-port.md). The tables come from ``dashboard_data.py``.
+of docs/plans/completed/20261028-recom-spectral-port.md). The tables come from ``dashboard_data.py``.
 
 Writes into ``OUT`` one ``map_<YYYY_MM>.csv`` per month (``lat, lon`` of the 1-degree cell centre, then surface Chl
 [mg m-3], NPP of the three groups both sides write [mmol C m-2 d-1] and the CO2 flux [mmol C m-2 d-1, into the ocean],

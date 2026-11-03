@@ -1,6 +1,6 @@
 # Albedo: CORE2 + the spectral REcoM fork, the COLD START of the user's reference run tmp_run_kdind15 (1958, the same
 # forcing: the JRA55-do repeat-year climatology clim61, CORE2 runoff and PHC2 SSS from the pool, chl 0.1, OASIM; the
-# CORE2 REcoM IC set with DIC_PI). The comparison target of docs/plans/20261028-recom-spectral-port.md: the Fortran
+# CORE2 REcoM IC set with DIC_PI). The comparison target of docs/plans/completed/20261028-recom-spectral-port.md: the Fortran
 # output under tmp_recom-fesom_output/fesom2.6_spectral_kdind15 (monthly means 1958-1959). Two years in half-year
 # GPU segments: scripts/albedo/chain_core2_gpu.sh. Known differences from the Fortran run: no partial cells, the
 # current FESOM2 physics with GM/Redi + TKE (the user's run: KPP), the sea ice (docs/recom/VALIDATION.md).

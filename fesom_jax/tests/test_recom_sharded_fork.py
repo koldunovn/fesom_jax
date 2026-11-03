@@ -1,4 +1,4 @@
-"""Lane W of the spectral port (docs/plans/20261028-recom-spectral-port.md): the spectral fork sharded equals dense.
+"""Lane W of the spectral port (docs/plans/completed/20261028-recom-spectral-port.md): the spectral fork sharded equals dense.
 
 Two full steps of the production spectral configuration (``configs/albedo/pi_recom_spectral.yaml``: 37 tracers, the
 13-band light from the OASIM tables, GM/Redi, TKE, mEVP) on FESOM2's pi ``dist_4`` (4 host devices, the forced

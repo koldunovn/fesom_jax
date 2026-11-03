@@ -1,5 +1,5 @@
 """A fesom-jax REcoM run against a FESOM2-REcoM Fortran run on the same mesh, month by month (lane W of
-docs/plans/20261028-recom-spectral-port.md: the CORE2 spectral runs against the user's ``fesom2.6_spectral_*``).
+docs/plans/completed/20261028-recom-spectral-port.md: the CORE2 spectral runs against the user's ``fesom2.6_spectral_*``).
 
 Inputs: the JAX monthly-mean stores (``<run>/monthly/<YYYY_MM>``, zarr: the ``recom.output`` fields on ``(1, nl,
 nod2D)`` plus ``temp``/``salt``/``a_ice``) and the Fortran monthly means (``<ResultPath>/<var>.fesom.<year>.nc``, 12

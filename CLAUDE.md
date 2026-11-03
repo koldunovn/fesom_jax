@@ -137,7 +137,7 @@ then runs `sms_fork.py`/`stage1.recom_sources_sinks_fork`, the layout-aware `sin
 `RecomConfig.spectral` the light of `spectral.py` from the OASIM fields `oasim.py` reads (`forcing.oasim_dir`).
 Configs `configs/albedo/pi_recom_spectral.yaml`, `core2_recom_spectral.yaml`; gates `test_recom_*_fork.py`,
 `test_recom_spectral_*.py` against the fork's own twins (`docs/recom/VALIDATION.md`, the plan
-`docs/plans/20261028-recom-spectral-port.md`). The fork's FESOM2 base needs `legacy_k33_weights`,
+`docs/plans/completed/20261028-recom-spectral-port.md`). The fork's FESOM2 base needs `legacy_k33_weights`,
 `legacy_fct_bounds`, `legacy_sw_depth` and its own level files in a twin gate; its GM/Redi is not matchable (the
 physics-matched one-day twins run GM/Redi off). The same REcoM on current FESOM2 (`sveta-loza/fesom2`
 `fesom2.8_recom_spectral`, in-tree `src/int_recom/`, no REcoM submodule) needs none of that: GM/Redi on, no

@@ -1,6 +1,6 @@
 """A fesom-jax REcoM run against a FESOM2-REcoM Fortran run group by group (the 4-PFT spectral fork: small
 phytoplankton, diatoms, coccolithophores, Phaeocystis), month by month; the companion of ``compare_fortran_jax.py``
-(lane W of docs/plans/20261028-recom-spectral-port.md).
+(lane W of docs/plans/completed/20261028-recom-spectral-port.md).
 
 For every month both have and every group:
 

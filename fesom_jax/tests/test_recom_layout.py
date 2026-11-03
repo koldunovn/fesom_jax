@@ -1,4 +1,4 @@
-"""Lane P of the spectral port (docs/plans/20261028-recom-spectral-port.md): the tracer layout as a function of the
+"""Lane P of the spectral port (docs/plans/completed/20261028-recom-spectral-port.md): the tracer layout as a function of the
 REcoM switches (fesom_jax.recom.layout) and the fork's namelist keys (fesom_jax.recom.params)."""
 
 from pathlib import Path

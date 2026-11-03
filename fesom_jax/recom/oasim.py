@@ -1,4 +1,4 @@
-"""OASIM's spectral surface irradiance for the spectral fork (lane F of ``docs/plans/20261028-recom-spectral-port.md``).
+"""OASIM's spectral surface irradiance for the spectral fork (lane F of ``docs/plans/completed/20261028-recom-spectral-port.md``).
 
 The fork reads, at every monthly update (``gen_surface_forcing.F90:1800-1822`` of ``sveta-loza/fesom2``
 ``fesom2.6_recom_tra_diags_spectral``), the direct ``Ed`` and diffuse ``Es`` irradiance just below the surface

@@ -1,5 +1,5 @@
 """REcoM's sources and sinks as the spectral fork computes them (lane E of
-``docs/plans/20261028-recom-spectral-port.md``; spec ``docs/plans/20261028-recom-spectral-lane-E.md``).
+``docs/plans/completed/20261028-recom-spectral-port.md``; spec ``docs/plans/completed/20261028-recom-spectral-lane-E.md``).
 
 A literal f64 port of ``REcoM_sms`` of the fork (``sveta-loza/fesom2`` ``fesom2.6_recom_tra_diags_spectral`` +
 the 11 upstream commits, worktree ``/albedo/work/user/sloza/SPECTRAL/recom_spectral_r692``, S =

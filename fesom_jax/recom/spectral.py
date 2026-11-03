@@ -1,4 +1,4 @@
-"""The spectral fork's light model (lane L of ``docs/plans/20261028-recom-spectral-port.md``): 13 wavebands, the
+"""The spectral fork's light model (lane L of ``docs/plans/completed/20261028-recom-spectral-port.md``): 13 wavebands, the
 inherent optical properties of water, phytoplankton, CDOM and detritus, and the three-stream (Ed, Es, Eu) radiative
 transfer of ``module REcoM_spectral`` (``src/int_recom/recom_modules.F90:2357-4544`` of ``sveta-loza/fesom2``
 ``fesom2.6_recom_tra_diags_spectral``, worktree ``/albedo/work/user/sloza/SPECTRAL/recom_spectral_r692``; M = that

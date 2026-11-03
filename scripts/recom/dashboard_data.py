@@ -1,5 +1,5 @@
 """The monthly global tables of the REcoM spectral comparison dashboard (lane W of
-docs/plans/20261028-recom-spectral-port.md; the dashboard is a claude.ai artifact, its data are these CSV files).
+docs/plans/completed/20261028-recom-spectral-port.md; the dashboard is a claude.ai artifact, its data are these CSV files).
 
 Writes into ``OUT``:
 

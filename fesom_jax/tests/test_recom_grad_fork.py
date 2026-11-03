@@ -1,4 +1,4 @@
-"""Lane W of the spectral port (docs/plans/20261028-recom-spectral-port.md), gate G6 for the fork: ``jax.grad`` of a
+"""Lane W of the spectral port (docs/plans/completed/20261028-recom-spectral-port.md), gate G6 for the fork: ``jax.grad`` of a
 1-day NPP cost through the full model step with the spectral light (the 13-band direct 3-stream solver, the 4-PFT
 growth) against central finite differences, as ``test_recom_grad.py`` for REcoM 692f804.
 

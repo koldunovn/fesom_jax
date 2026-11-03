@@ -1,5 +1,5 @@
 # Albedo: CORE2 + the spectral REcoM fork (4 phytoplankton groups, CDOM, 13-band OASIM light; 37 tracers) in double
-# precision on ONE GPU (docs/recom/RUNNING_ALBEDO.md, docs/plans/20261028-recom-spectral-port.md). Physics and inputs
+# precision on ONE GPU (docs/recom/RUNNING_ALBEDO.md, docs/plans/completed/20261028-recom-spectral-port.md). Physics and inputs
 # as configs/albedo/core2_recom.yaml; REcoM from the fork's namelist set (scripts/recom/fortran/namelists_albedo_spectral/),
 # the optics tables and the OASIM monthly climatology as the pi spectral run. The CORE2 REcoM IC set (DIC_PI: the
 # GLODAP preindustrial DIC) and the Albani dust from /albedo/pool/FESOM2/recom; the fork's constants for the other

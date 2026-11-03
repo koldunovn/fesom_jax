@@ -1,6 +1,6 @@
 # fesom-jax vs the Fortran spectral fork: what differs in the CORE2 comparison runs
 
-The CORE2 comparison (lane W of `docs/plans/20261028-recom-spectral-port.md`) sets fesom-jax against the user's
+The CORE2 comparison (lane W of `docs/plans/completed/20261028-recom-spectral-port.md`) sets fesom-jax against the user's
 FESOM2-REcoM spectral fork runs. The two codes share the REcoM model (ported from the fork, gated to <= 2.4e-13 column
 by column and <= 2.0e-5 over one full physics-matched step, `docs/recom/VALIDATION.md`), but not the ocean and sea-ice
 model underneath: fesom-jax follows current upstream FESOM2, the fork sits on FESOM2 `cda35117` (2025-10-09) with

@@ -1,5 +1,5 @@
 """A FESOM2-REcoM Fortran restart -> a fesom-jax restart store (the warm start of the spectral REcoM runs, lane W of
-docs/plans/20261028-recom-spectral-port.md).
+docs/plans/completed/20261028-recom-spectral-port.md).
 
 FESOM2 writes ``<ResultPath>/fesom.<year>.{oce,ice,bio}.restart/``: one NetCDF file per variable (``io_restart.F90``),
 global node / element order, FESOM's ``nl-1`` layers (``nz_1``) or ``nl`` interfaces (``nz``), one record with

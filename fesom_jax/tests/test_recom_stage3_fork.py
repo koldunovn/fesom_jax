@@ -1,4 +1,4 @@
-"""Lane E of the spectral port (docs/plans/20261028-recom-spectral-port.md), gate G4a for the fork: full REcoM's
+"""Lane E of the spectral port (docs/plans/completed/20261028-recom-spectral-port.md), gate G4a for the fork: full REcoM's
 stage 3 with the fork's layout and sinking rules, fed with the fork's non-spectral twin's own transport fields. A
 copy of test_recom_stage3.py (REcoM 692f804) with the fork's reference, namelist, layout and pi mesh bundle.
 REcoM plan Task 12, gate G4a: full REcoM's stage 3 (:func:`fesom_jax.recom.transport.recom_stage3`) fed with the

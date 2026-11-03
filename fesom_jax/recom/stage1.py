@@ -106,7 +106,7 @@ def recom_sources_sinks_fork(bgc, carb: CarbCache, benthos, alk_surf, temp, salt
                              reduce_sum: Callable = jnp.sum, n_iter: int = cb.PH_MAXITER, nc_clamp: bool = False,
                              spectral=None, spectral_co2lim: bool = False):
     """:func:`recom_sources_sinks` for the spectral fork's REcoM (:mod:`fesom_jax.recom.sms_fork`, lane E of
-    ``docs/plans/20261028-recom-spectral-port.md``): the same ``recom()`` order, the fork's ``REcoM_sms`` with the
+    ``docs/plans/completed/20261028-recom-spectral-port.md``): the same ``recom()`` order, the fork's ``REcoM_sms`` with the
     switches and the tracer :class:`~fesom_jax.recom.layout.Layout` (static), no DICremin reset unless the layout
     has that tracer. The base-22 slots the surface fluxes read are the same in every layout. ``spectral`` /
     ``spectral_co2lim``: the spectral light of this step (:func:`fesom_jax.recom.spectral.spectral_step`), see

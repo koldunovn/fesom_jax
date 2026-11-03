@@ -54,7 +54,7 @@ class RecomConfig(NamedTuple):
     ic_dir: Optional[str] = None
     output: tuple = ("DIC", "Alk", "DIN", "DSi", "DFe", "O2", "Chl", "co2flux", "pco2surf", "npp", "export100")
     budget: bool = False
-    # the spectral fork (docs/plans/20261028-recom-spectral-port.md; a namelist with an &spectral group): spectral =
+    # the spectral fork (docs/plans/completed/20261028-recom-spectral-port.md; a namelist with an &spectral group): spectral =
     # the __RECOM_WAVEBANDS build (fesom_jax.recom.spectral: 13-band light from OASIM, the spectral growth terms, the
     # N:C clamp), optics_dir = the directory of its .dat optics files (the namelist names them), spectral_co2lim =
     # apply CO2 limitation in the spectral growth as the broadband build does (the fork does not; the user's stated

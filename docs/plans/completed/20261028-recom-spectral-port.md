@@ -1,7 +1,8 @@
 # REcoM spectral light + 4-PFT ecosystem in fesom-jax
 
 Branch `recom-spectral` off `main` (bdeb99e, "REcoM-2 biogeochemistry"). Written 2026-10-28 on Albedo (AWI), from
-a read-only inventory of the Fortran fork; nothing below is ported yet.
+a read-only inventory of the Fortran fork. **Completed 2026-11-03**: every lane is done and gated (closing note at the
+end of the progress log).
 
 ## Goal
 
@@ -92,21 +93,21 @@ the fork is first rebased onto the submodule REcoM, a Fortran task outside this 
 
 ## Lanes (each a branch off `recom-spectral`, each gated before the next starts)
 
-- [ ] **Lane 0, Fortran reference on Albedo.** Build the fork with REcoM dumps (the env-gated dump hooks of
+- [x] **Lane 0, Fortran reference on Albedo.** Build the fork with REcoM dumps (the env-gated dump hooks of
       `docs/recom/FORTRAN_REFERENCE.md`, ported to `src/int_recom` of the fork; `recom_in`/`recom_out` stages plus
       the new light arrays `PARw`, `Edz..Estop`, `oasim_ed2D/es2D`, `alpha_I_X`) on the pi mesh with
       `bin_4p3z2d` + spectral, 30 days, one rank, and the same run with `RECOM_WAVEBANDS=OFF` (the broadband
       4-PFT twin). Needs the pi REcoM inputs (`din5deg.nc` etc., FESOM2 `test/input/recom`, not on Albedo: fetch
       from the FESOM2 test-data server) and an OASIM climatology interpolated to pi (the reader does that).
       Partition: `mpp`, account `clidyn.clidyn`.
-- [ ] **Lane P, parameters and tracers (A, B).** `params.py`: every `&spectral`, `&nam_rspecsbc` and new biology
+- [x] **Lane P, parameters and tracers (A, B).** `params.py`: every `&spectral`, `&nam_rspecsbc` and new biology
       key with the fork's defaults; `SUPPORTED` gains `enable_coccos`, `RECOM_CDOM`, `RECOM_RADTRANS`, `OASIM`,
       `RECOM_BMASS`, `RECOM_CALC_ACDOM/APART`, refuses `RECOM_MARSHALL`, `RECOM_CALC_APHYT/REFLEC`,
       `DAR_NONSPECTRAL_BACKSCATTERING_RATIO`, niter >= 0. `tracers.py`: the 37-ID layout as a function of the
       switches (the fork's `initialize_tracer_indices`), IC file map, sinking/remin/bc_surface sets per layout.
       `State.bgc` sized by `NTR` from the config, restart reading tolerant of both layouts. Test: slot tables
       against `recom_modules.F90:759-884` for the 4 layouts.
-- [ ] **Lane E, the 4-PFT sources and sinks (A, B).** `sms.py`: cocco/phaeo growth, quotas, grazing matrix,
+- [x] **Lane E, the 4-PFT sources and sinks (A, B).** `sms.py`: cocco/phaeo growth, quotas, grazing matrix,
       calcification, aggregation, mortality, CDOM, the new switches; `sinking.py`: Fe-dependent Phaeocystis sinking
       + benthic flux. Gate G2 on the broadband 4-PFT dumps (lane 0, `RECOM_WAVEBANDS=OFF`): updated tracers and
       diagnostics rel 1e-11. This lane is independent of the light model and is where most of the biology risk is.
@@ -280,6 +281,23 @@ dump exercise. Expect several sessions per lane; do not start lane E or L withou
   --fortran .../fesom2.6_spectral_kdind15 --mesh .../mesh_core2 --out ROOT/compare`. A full warm year against
   kdind15w (both from the 1997 restart) is the cleaner comparison and runs with the warm config the same way.
   Open after that: the figures' reading, the merge into `main`.
+
+- 2026-10-29 to 11-02, the CORE2 comparison (details and numbers in `docs/recom/FORTRAN_JAX_DIFFERENCES.md`, the
+  dashboard in `RUNNING_ALBEDO.md`): the cold 1958-59 pair and four warm 1998 runs; the physics-matched warm pair
+  agrees group by group, its whole NPP offset is the coccolithophores the Fortran runs did not write (`NPPc`); the
+  gap to the production run kdind15w is a difference between the two Fortran builds, not the port.
+- 2026-11-02/03, the Fortran fork on current FESOM2 (`docs/plans/completed/20261102-fortran-spectral-on-fesom28.md`,
+  `sveta-loza/fesom2` `fesom2.8_recom_spectral` `a89bb3d6`): the same REcoM on the host fesom-jax follows; the pi
+  twin gates without `legacy_*` and with GM/Redi on (T floor 4.09e-8), the CORE2 1998 pair agrees to <= 0.019 % in
+  the common-group NPP and 5.6e-7 in the DIC inventory.
+
+- **2026-11-03, closed.** All lanes done; gates in `docs/recom/VALIDATION.md`. Lane E's inventory
+  (`20261028-recom-spectral-lane-E.md`) moved to `completed/` with this plan. Merged into the local `main`
+  (fast-forward). The namelist sets of the 2.8 runs now request `NPPc` (it was always computed, never listed;
+  pi day job 48751970, `recom_ref/fesom28_spectral_pi_1d_nppc`: NPPn/d/c/p all written and finite). Not done here, and each a separate decision: (1) the bisect of the production
+  gap (kdind15w vs the matched build: the 11 REcoM commits, 66658357, the physics namelist), Fortran runs only;
+  (2) upstream REcoM after `_recom692` / the spectral code on the standalone REcoM library; (3) offering the
+  port to `koldunovn/fesom_jax`; (4) calibration with the gradients (G6 holds over a day).
 
 ## Rules (as the parent REcoM port)
 

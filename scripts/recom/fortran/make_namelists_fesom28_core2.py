@@ -85,6 +85,12 @@ def main(out: Path):
             gn, go = groups(t)[grp], groups(o)[grp]
             t = t[:gn.start()] + go.group(0) + t[gn.end():]
         (out / fname).write_text(t)
+    # the partner's output list lacks the coccolithophore NPP (the 2.6 runs never wrote NPPc): add it next to NPPp
+    io = (out / "namelist.io").read_text()
+    if not re.search(r"^\s*'NPPc\s*'", io, re.M):
+        io, n = re.subn(r"^(\s*)'NPPp(\s*)',(.*)$", r"\1'NPPc\2',\3\n\g<0>", io, count=1, flags=re.M)
+        assert n == 1, "no NPPp entry in namelist.io"
+        (out / "namelist.io").write_text(io)
     left = sorted({m for f in out.glob("namelist.*") for m in re.findall(r"@[A-Z_]+@", f.read_text())})
     assert left == ["@RESULT@"], left
     print(f"wrote {out}")

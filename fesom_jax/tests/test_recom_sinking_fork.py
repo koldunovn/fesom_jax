@@ -1,4 +1,4 @@
-"""Gate G3 of the spectral port's lane E (docs/plans/20261028-recom-spectral-port.md): the fork's tracer-loop
+"""Gate G3 of the spectral port's lane E (docs/plans/completed/20261028-recom-spectral-port.md): the fork's tracer-loop
 additions (fesom_jax.recom.sinking with the fork's layout and sinking rules) against the per-tracer stages of the
 fork's NON-spectral twin dumps (run pi_30d_nowb_adv01 on Albedo, namelist.tra weights 0., 1.). A copy of test_recom_sinking.py (REcoM 692f804) with
 the fork's reference, namelist and layout; the fork writes Benthos inside the loop, so the per-tracer Benthos
