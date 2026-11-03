@@ -1,0 +1,51 @@
+# CORE2 ocean of the coupled AWI-CM JAX system on SEVERAL GPUs of one process (awicm_jax run_coupled.py --devices N,
+# plan decision 7: ifs_jax columns sharded, fesom_jax dist_4). configs/core2_cpl.yaml's physics, precision and
+# numerics, with the partition and the multi-GPU layout/transport options of configs/core2_gpu.yaml (each round-off
+# there, measured standalone on 4 A100 / 4 GH200; see that file for the job ids):
+#   * partition: dist_4 (run_coupled passes dist_N for --devices N; the partitions are FESOM2's own, read from
+#     /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2 or $FESOM_DIST_DIR);
+#   * gpu.halo_compact, gpu.mevp_wide 12, gpu.lane_order rcm (no-ops or unused with one device, so core2_cpl.yaml
+#     leaves them out).
+# Restarts and monthly means are written in global node order either way: a restart of this configuration
+# continues under core2_cpl.yaml and back.
+
+ale: {}            # zstar
+gm: {}             # GM/Redi
+kpp: null
+tke: {}            # classical TKE
+ice: {whichEVP: 1}  # mEVP, ice every step
+visc: {}
+tracer: {}
+
+dt: 1800.0
+
+mesh: data/mesh_core2
+partition: dist_4
+forcing:
+  kind: core2
+  start_year: 1958   # the calendar origin of the CORE2 hindcast restarts (their step counts from 1958-01-01)
+ssh:
+  cheb_degree: 3
+  cheb_kappa: 30.0
+  gathered: true
+gpu:
+  halo_compact: true
+  column_unroll: true
+  mevp_wide: 12
+  ssh_ell: true
+  cg_batch: 4
+  mevp_unroll: 12
+  column_kernel: true
+  ssh_inc_ell: true
+  lane_order: rcm
+  ordered_sums: true
+  output_async: true
+  restart_async: true
+  forcing_ahead: 2
+output_dir: /work/ba1583/a270088/awicm/ocn/runs
+snapshot_every: 48
+checkpoint_every: 1440
+restart_in: /work/ab0995/a270088/port_jax/runs/core2_hindcast_v3/restart_archive/fesom.1989.001.00000
+restart_out: null
+duration: 31d
+precision: single

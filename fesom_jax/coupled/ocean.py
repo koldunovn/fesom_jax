@@ -4,7 +4,13 @@ Design (docs/coupling/awicm.md):
 
 * The ocean runs through the production forced runner (:func:`fesom_jax.integrate_sharded.run_steps_sharded_forced`)
   on ONE device (partition ``serial``: one shard whose lanes are the global node order, so every ``(nod2D,)`` array
-  of this API is in fesom_jax's global node order without a permutation). The runner's compiled program for one
+  of this API is in fesom_jax's global node order without a permutation), or on the first N devices of the process
+  (partition ``dist_N``, :func:`init_ocean`'s ``partition``): the State is then folded ``[N*Lmax]`` over the devices,
+  and the API still speaks global node order -- the forcing of :func:`ocean_interval` is laid onto the lanes inside
+  (:func:`to_lanes`, a gather; halo lanes take their node's value, pad lanes 1.0 as ``partition_step_forcing``), and
+  :func:`ocean_to_atm` / :func:`global_view` gather the owner lanes back to global node order (replicated on the
+  devices). Restarts and monthly means are written in global order either way (``layout="global"``), so a restart
+  is interchangeable between 1 and N devices. The runner's compiled program for one
   interval of ``nsteps`` steps is built once (:meth:`OceanStatic.executable`) and then called directly with the
   device State and a device forcing stack: nothing goes through the host between intervals.
 * Mode B (``"bulk"``): the atmosphere's near-surface fields become the :class:`~fesom_jax.surface_forcing.StepForcing`
@@ -50,6 +56,8 @@ OCEAN_TO_ATM = ("sst_feom", "sie_feom", "snt_feom", "ist_feom", "sia_feom", "u_f
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "..", "..", "configs", "core2_cpl.yaml")
 DEFAULT_MESH = "/work/ab0995/a270088/port_jax/data/mesh_core2"
+#: where the FESOM2 ``dist_<N>`` partitions of the CORE2 mesh are (FESOM_DIST_DIR overrides)
+DEFAULT_DIST_DIR = "/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2"
 
 
 def _monthly_fields(s) -> dict:
@@ -96,10 +104,22 @@ class OceanStatic:
     # None, or a writer's submit(fn, *args) (one background thread, single process): the monthly means' store, with
     # their copy to the host, is written by that call (awicm_jax's run_coupled)
     submit: Any = None
+    mevp_wide: Any = None     # gpu.mevp_wide's MevpWideHost (dist_N only), None = the per-subcycle exchange
+    _lanes: Any = None        # the jitted global -> lanes gather of the forcing (dist_N)
+    _views: dict = dataclasses.field(default_factory=dict)   # the jitted lanes -> global gathers (dist_N)
 
     @property
     def nod2D(self) -> int:
         return int(self.mesh.nod2D)
+
+    @property
+    def npes(self) -> int:
+        return int(self.part.npes)
+
+    def device_mesh(self):
+        """The runner's device mesh (``halo.device_mesh``: the first ``npes`` devices, axis ``"p"``)."""
+        from jax.sharding import Mesh
+        return Mesh(np.asarray(jax.devices()[:self.npes]), ("p",))
 
     def dates(self, nsteps: int, start: int | None = None):
         """``(year, day of year, second of day, month)`` of each step start of the next interval."""
@@ -119,17 +139,19 @@ class OceanStatic:
             n = self.nod2D
             if self.mode == "flux":
                 from .flux import dummy_seq
-                seq_p = dummy_seq(int(nsteps), n)
+                seq_p = dummy_seq(int(nsteps), n) if self.npes == 1 else \
+                    dummy_seq(int(nsteps), int(self.sm.Lmax["nod"]), self.npes)
             else:
                 z = np.zeros((nsteps, n), np.float64)
                 seq = surface_forcing.StepForcing(u_air=z, v_air=z, shum=z, shortwave=z, longwave=z, Tair=z,
                                                   prec_rain=z, prec_snow=z, Ssurf_month=z, chl=z)
                 seq_p = shard_mesh.partition_step_forcing(seq, self.part)
             jfn, args, _ = run_steps_sharded_forced(
-                self.sm, state, self.sop, self.stress_p, seq_p, self.fs_p, int(nsteps), dt=self.dt, npes=1,
+                self.sm, state, self.sop, self.stress_p, seq_p, self.fs_p, int(nsteps), dt=self.dt, npes=self.npes,
                 bootstrap_ab2=bool(bootstrap), state_is_folded=True, return_folded=True,
                 boundary_node_p=self.bn_p, reuse_executable=True, return_executable=True,
-                sample_fn=self.sample_fn, ssh_gather=self.gather, precision=self.precision, **self.phys)
+                sample_fn=self.sample_fn, ssh_gather=self.gather, precision=self.precision,
+                **({} if self.mevp_wide is None else {"mevp_wide": self.mevp_wide}), **self.phys)
             self._exe[key] = (jfn, args)
         return self._exe[key]
 
@@ -145,7 +167,8 @@ def _env_setup(cfg: RunConfig, sss_restoring: bool) -> None:
 
 def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in: str | None = "config",
                ic_dir: str | None = None, start: tuple | None = None, year0: int = 1958, nsteps: int = 4,
-               mode: str = "bulk", sss_restoring: bool = False, monthly_out: str | None = None, log=print):
+               mode: str = "bulk", sss_restoring: bool = False, monthly_out: str | None = None, log=print,
+               partition: str | None = None, dist_dir: str | None = None):
     """Build the coupled ocean. Returns ``(state, static)``: the folded device :class:`~fesom_jax.state.State`
     (working precision) and the :class:`OceanStatic`.
 
@@ -156,7 +179,10 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     stamped that way: fesom.1989.001.00000 is step 543504 from 1958). ``nsteps``: ocean steps per coupling interval
     (4 = 7200 s at dt 1800). ``mode``: ``"bulk"`` (B) or ``"flux"`` (F). ``sss_restoring`` (default off, as
     AWI-ESM3 v3.5.1's namelist.tra surf_relax_s = 0): the SSS restoring of the standalone forcing. ``monthly_out``:
-    a directory for the monthly means (``<dir>/<YYYY>_<MM>``, run.py's layout)."""
+    a directory for the monthly means (``<dir>/<YYYY>_<MM>``, run.py's layout). ``partition`` (default: the
+    config's): ``serial`` (one device) or ``dist_N`` (the FESOM2 partition of N ranks from ``dist_dir``, default
+    $FESOM_DIST_DIR or :data:`DEFAULT_DIST_DIR`, over the first N devices of the process; ``gpu.lane_order`` and
+    ``gpu.mevp_wide`` of the config apply as in the standalone runner)."""
     cfg = load_yaml(config) if isinstance(config, (str, os.PathLike)) else config
     if restart_in != "config":
         cfg = dataclasses.replace(cfg, restart_in=restart_in)
@@ -175,10 +201,22 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
 
     mdir = mesh_dir or (cfg.mesh if cfg.mesh and os.path.isdir(str(cfg.mesh)) else DEFAULT_MESH)
     mesh = load_mesh(mdir)
-    part = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
+    pspec = str(cfg.partition if partition is None else partition)
+    npes = 1 if pspec in ("None", "serial", "1", "dist_1") else int(pspec.replace("dist_", ""))
+    if npes == 1:
+        part = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
+    else:
+        if jax.device_count() < npes:
+            raise ValueError(f"partition {pspec}: {jax.device_count()} devices present")
+        ddir = dist_dir or os.environ.get("FESOM_DIST_DIR") or DEFAULT_DIST_DIR
+        part = partit.read_partition(ddir, npes)
+        if cfg.lane_order():          # the lanes inside the shards in a cache-friendly order (global ids unchanged)
+            from ..lane_order import reorder_lanes
+            part = reorder_lanes(part, mesh, cfg.lane_order())
+        log(f"[ocean] partition dist_{npes} ({ddir}), lane_order {cfg.lane_order()}")
     sm = shard_mesh.build_sharded_mesh(mesh, part)
-    if sm.Lmax["nod"] != mesh.nod2D or not np.array_equal(np.asarray(part.myList_nod2D[0]),
-                                                           np.arange(mesh.nod2D)):
+    if npes == 1 and (sm.Lmax["nod"] != mesh.nod2D or not np.array_equal(np.asarray(part.myList_nod2D[0]),
+                                                                         np.arange(mesh.nod2D))):
         raise AssertionError("the serial partition is expected to hold the nodes in global order")
     from .. import ops
     if ops.ordered_sums_enabled():
@@ -218,7 +256,13 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
             raise ValueError(f"start {start} is not on the dt={dt} grid from {year0}-01-01")
         step0 = int(el // dt)
         st0 = cold_start_state(mesh, ic_dir, xp=np)
-        state = jax.tree.map(jnp.asarray, folded_state(shard_mesh.partition_state(st0, part))[0])
+        state = folded_state(shard_mesh.partition_state(st0, part))[0]
+        if npes == 1:
+            state = jax.tree.map(jnp.asarray, state)
+        else:
+            from jax.sharding import Mesh, NamedSharding, PartitionSpec
+            sh = NamedSharding(Mesh(np.asarray(jax.devices()[:npes]), ("p",)), PartitionSpec("p"))
+            state = jax.tree.map(lambda x: jax.device_put(np.asarray(x), sh), state)
         bootstrap = True
         log(f"[ocean] cold start (PHC + FESOM's initial sea ice) at {y:04d}-{m:02d}-{d:02d}, step {step0}")
     state = init_ice_avg(state, cfg.ice)
@@ -235,7 +279,16 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     from .. import ice_evp
     bn = np.asarray(ice_evp.boundary_node_mask(mesh))
     bn_p = shard_mesh._shard_along_axis(bn, part.myList_nod2D, sm.Lmax["nod"], 0, False)
-    stress_p = np.zeros((1, sm.Lmax["elem"], 2))
+    stress_p = np.zeros((npes, sm.Lmax["elem"], 2))
+    mevp_wide = None
+    if npes >= 2 and cfg.ice is not None:
+        from .. import ice_wide
+        kw = ice_wide.mevp_wide_from_env()
+        if kw >= 2:
+            if cfg.ice.whichEVP != 1:
+                raise ValueError(f"gpu.mevp_wide={kw} needs the mEVP sea ice (ice.whichEVP: 1)")
+            mevp_wide = ice_wide.build_mevp_wide(mesh, part, sm, kw)
+            log(f"[ocean] mevp_wide: K={kw}")
     geo = np.asarray(mesh.geo_coord_nod2D, np.float64)
     rot = np.asarray(mesh.coord_nod2D, np.float64)
     trig = tuple(jnp.asarray(t) for t in jra55._g2r_trig(geo[:, 0], geo[:, 1], rot[:, 0], rot[:, 1]))
@@ -245,11 +298,12 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         phys=cfg.physics_kwargs(), precision=precision, dt=dt, nsteps=int(nsteps), mode=mode, year0=int(year0),
         step=step0, sss_clim=sss_clim, chl_clim=np.asarray(chl_clim), trig=trig,
         M=jnp.asarray(jra55._rotation_matrix()), sss_restoring=bool(sss_restoring), bootstrap=bootstrap,
-        monthly_out=monthly_out, sample_fn=_monthly_fields if monthly_out is not None else None)
+        monthly_out=monthly_out, sample_fn=_monthly_fields if monthly_out is not None else None,
+        mevp_wide=mevp_wide)
     if mode == "flux":
         from . import flux
         state, static = flux.init_flux(state, static)
-    log(f"[ocean] CORE2 nod2D={mesh.nod2D} dt={dt} precision={precision} mode={mode} nsteps={nsteps} "
+    log(f"[ocean] CORE2 nod2D={mesh.nod2D} npes={npes} dt={dt} precision={precision} mode={mode} nsteps={nsteps} "
         f"sss_restoring={sss_restoring} calendar {static.calendar()}")
     return state, static
 
@@ -344,6 +398,8 @@ def ocean_interval(state, static: OceanStatic, forcing: dict, nsteps: int | None
     else:
         from . import flux
         state, seq = flux.flux_step_forcing(state, forcing, static, dates)
+    if static.npes > 1:
+        seq = to_lanes(seq, static)
     jfn, a = static.executable(nsteps, static.bootstrap, state)
     out = jfn(a[0], state, a[2], a[3], a[4], seq, *a[6:])
     state, sums = out if static.sample_fn is not None else (out, None)
@@ -381,6 +437,67 @@ def flush_monthly(static: OceanStatic) -> str | None:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# dist_N: global node order <-> the folded lanes
+# ---------------------------------------------------------------------------------------------------------------
+def _replicated(static):
+    from jax.sharding import NamedSharding, PartitionSpec
+    return NamedSharding(static.device_mesh(), PartitionSpec())
+
+
+def to_lanes(seq, static: OceanStatic):
+    """A forcing stack with ``[nsteps, nod2D]`` leaves in global node order -> ``[nsteps, P*Lmax]`` on the runner's
+    lanes, sharded ``PartitionSpec(None, "p")``: a gather by each lane's global node id (halo lanes take their
+    node's value, pad lanes 1.0: the values :func:`fesom_jax.shard_mesh.partition_step_forcing` gives them)."""
+    if static._lanes is None:
+        from jax.sharding import NamedSharding, PartitionSpec
+        from ..zarr_output import _folded_gid_owned
+        gid, _ = _folded_gid_owned(static.part, static.sm, "nod")
+        idx, pad = jnp.asarray(np.where(gid >= 0, gid, 0), jnp.int32), jnp.asarray(gid < 0)
+
+        def f(seq):
+            return jax.tree.map(lambda a: jnp.where(pad, jnp.asarray(1, a.dtype), a[:, idx]), seq)
+        static._lanes = jax.jit(f, out_shardings=NamedSharding(static.device_mesh(), PartitionSpec(None, "p")))
+    return static._lanes(seq)
+
+
+def _lanes_to_global_fn(static: OceanStatic):
+    """gather(state, names) -> {name: the State field in global entity order}: each node's (element's) unique owner
+    lane, by index (traceable; the caller's jit decides where the result lives)."""
+    from ..zarr_output import _folded_gid_owned
+    pos = {}
+    for kind, n in (("nod", static.sm.nod2D), ("elem", static.sm.elem2D)):
+        gid, owned = _folded_gid_owned(static.part, static.sm, kind)
+        p = np.full(int(n), -1, np.int64)
+        p[gid[owned]] = np.nonzero(owned)[0]
+        if (p < 0).any():
+            raise AssertionError(f"{kind}: {(p < 0).sum()} entities without an owner lane")
+        pos[(kind, int(static.npes) * int(static.sm.Lmax[kind]))] = jnp.asarray(p, jnp.int32)
+
+    def gather(state, names):
+        out = {}
+        for k in names:
+            a = getattr(state, k)
+            idx = [v for (kind, lead), v in pos.items() if lead == a.shape[0]]
+            if len(idx) != 1:
+                raise ValueError(f"State.{k}: leading extent {a.shape[0]} is not a folded node or element axis")
+            out[k] = a[idx[0]]
+        return out
+    return gather
+
+
+def global_view(state, static: OceanStatic, names) -> dict:
+    """``{name: State field}`` in global node (element) order: the fields themselves with one device (serial), else
+    the owner lanes gathered (replicated over the devices, one jitted program per ``names``)."""
+    names = tuple(names)
+    if static.npes == 1:
+        return {k: getattr(state, k) for k in names}
+    if names not in static._views:
+        gather = _lanes_to_global_fn(static)
+        static._views[names] = jax.jit(lambda s: gather(s, names), out_shardings=_replicated(static))
+    return static._views[names](state)
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # ocean -> atmosphere
 # ---------------------------------------------------------------------------------------------------------------
 TMELT = 273.15
@@ -405,7 +522,17 @@ def ice_albedo_cpl(h, hsn, t, cfg):
 def ocean_to_atm(state, static: OceanStatic) -> dict:
     """The fields FESOM2 sends to OpenIFS (see :func:`_ocean_to_atm`); one jitted program per ``static``."""
     if static._o2a is None:
-        static._o2a = jax.jit(lambda s: _ocean_to_atm(s, static))
+        if static.npes == 1:
+            static._o2a = jax.jit(lambda s: _ocean_to_atm(s, static))
+        else:                         # the owner lanes in global node order (replicated), then the same function
+            import types
+            names = ("T", "S", "a_ice", "m_ice", "m_snow", "t_skin", "uv") + \
+                (("cpl_ice_temp", "cpl_ice_alb") if static.mode == "flux" else ())
+            gather = _lanes_to_global_fn(static)
+
+            def f(s):
+                return _ocean_to_atm(types.SimpleNamespace(**gather(s, names)), static)
+            static._o2a = jax.jit(f, out_shardings=_replicated(static))
     return static._o2a(state)
 
 

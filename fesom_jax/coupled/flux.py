@@ -184,10 +184,10 @@ def oasis_to_fesom(fields: dict) -> dict:
     return out
 
 
-def dummy_seq(nsteps: int, n: int):
-    """A host :class:`CplForcing` of zeros ``[1, nsteps, n]`` (the partitioned shape the runner folds) to build the
-    interval program."""
-    z = np.zeros((1, nsteps, n), np.float64)
+def dummy_seq(nsteps: int, n: int, npes: int = 1):
+    """A host :class:`CplForcing` of zeros ``[npes, nsteps, n]`` (the partitioned shape the runner folds; ``n`` =
+    the lanes per device) to build the interval program."""
+    z = np.zeros((npes, nsteps, n), np.float64)
     return CplForcing(*([z] * len(CplForcing._fields)))
 
 
