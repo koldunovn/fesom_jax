@@ -1,5 +1,5 @@
 The pi namelist set of the spectral REcoM on FESOM 2.8 (`fesom2.8_recom_spectral`,
-`docs/plans/20261102-fortran-spectral-on-fesom28.md`, steps 3-5): the physics of `../namelists_albedo_fesom28/`
+`docs/plans/completed/20261102-fortran-spectral-on-fesom28.md`, steps 3-5): the physics of `../namelists_albedo_fesom28/`
 (upstream-format, = the 692f804 twin's `namelists_jaxphys` with the Albedo inputs) with the REcoM setup of
 `../namelists_albedo_spectral_jaxphys/` (the fork's physics-matched spectral set).
 

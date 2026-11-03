@@ -216,6 +216,24 @@ the surface velocity under it 1.9e-3) and the surface T of ice-free polar column
 2025-10 ice code against the one fesom-jax follows; the 692f804 pair, whose base has both fixes, sits at 4.1e-8.
 Gate (job 48606115): each BGC tracer <= 100 x the T/S floor and the floor itself <= 1.1e-4.
 
+### The fork on FESOM 2.8 (2026-11-02/03)
+
+The same REcoM on current FESOM2 (`sveta-loza/fesom2` `fesom2.8_recom_spectral` `a89bb3d6` = upstream `0aaa2d73` +
+the in-tree spectral REcoM; plan `docs/plans/completed/20261102-fortran-spectral-on-fesom28.md`, the host side in
+`FORTRAN_JAX_DIFFERENCES.md`). Twin `recom_ref/fesom28_spectral_pi_1d_dumps` (job 48698141: pi, 1 rank, 1 day,
+Release, `RECOM_WAVEBANDS` ON, namelists `scripts/recom/fortran/namelists_albedo_fesom28_spectral/`, GM/Redi on,
+dumps at 1, 2, 3, 17, 32).
+
+| gate | test / tool | result | job |
+|---|---|---|---|
+| the move leaves REcoM unchanged: step-1 REcoM outputs, 2.8 build vs the old-base build `recom_spectral_jaxref` `ce142dcd` | dump comparison over 122 node fields | <= 1.2e-12 on the 2173 nodes ice-free in both (ice nodes <= 8.9e-5: one 2.8 ice step) | 48698141 |
+| G2/G3 and the light on the 2.8 twin (`FESOM_RECOM_FORK_RUN` = `FESOM_RECOM_SPECTRAL_RUN` = the 2.8 run) | `test_recom_sms_fork`, `_spectral_light`, `_sinking_fork`, `_spectral_wiring` | 20 passed; stage 1 <= 1.3e-13 (steps 1, 2, 3, 17); light planes <= 1.2e-12 | 48698144, 48698147 |
+| G4b, one full JAX step, **no `legacy_*`, GM/Redi on** (`configs/albedo/pi_recom_spectral_g4b_fesom28.yaml`, `mesh_pi_fork`) | `test_recom_step_fork.py` (`FESOM28_RUNS`, `FLOOR_MAX_28 = 8.2e-8`) | T floor 4.09e-8, a_ice 2.7e-7, every BGC tracer <= 2.4e-8 (the 692f804 pair: 4.1e-8; the fork on 2.6: 5.4e-5 / 3.2e-4); all three twins pass | 48698151, 48698153 |
+| CORE2 warm 1998, one year (Fortran `tmp_run_kdind15w28` vs `core2_recom_spectral_warm1998_fesom28`) | `compare_fortran_jax.py`, `compare_fortran_jax_groups.py` | common-group NPP <= 0.019 % per month (annual 110.22 / 110.22 Pg C/yr), group C/Chl inventories <= 0.09 %, DIC inventory 5.6e-7, CO2 flux <= 0.0012 Pg C/yr, SST <= 3.4e-4 degC | 48698183; 48698174-75 |
+
+Pitfall: the packaged pi mesh (`mesh: null`) differs from the twin's level files at one node by 3 levels; through
+the wet mask that alone gave a "floor" of 0.93 (job 48698146). Use `mesh_pi_fork`.
+
 ### Sharded and gradient gates of the fork (2026-10-29)
 
 `test_recom_sharded_fork.py` first differed in the sinking tracers only (DetC 2.6e-2, DetSi 2.3e-2 after two steps

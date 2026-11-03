@@ -1,5 +1,5 @@
 The pi namelist set for current upstream FESOM2 (2.8, `fesom2.8_recom_spectral`,
-`docs/plans/20261102-fortran-spectral-on-fesom28.md`) on Albedo: `../namelists_jaxphys/` (the upstream-format,
+`docs/plans/completed/20261102-fortran-spectral-on-fesom28.md`) on Albedo: `../namelists_jaxphys/` (the upstream-format,
 physics-matched set of the 692f804 twin: FESOM2 e96a2b13, `bin_2p3z2d`) with the Albedo inputs. Changes from
 `../namelists_jaxphys/`:
 

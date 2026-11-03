@@ -1,5 +1,5 @@
 """Build the CORE2 warm-1998 namelist set of the spectral REcoM on FESOM 2.8 (sveta-loza/fesom2
-fesom2.8_recom_spectral, docs/plans/20261102-fortran-spectral-on-fesom28.md, step 5.5).
+fesom2.8_recom_spectral, docs/plans/completed/20261102-fortran-spectral-on-fesom28.md, step 5.5).
 
 The physics, REcoM setup and file format are those of ``namelists_albedo_fesom28_spectral/`` (the pi set whose twin
 passes G4b at 4.1e-8: GM/Redi on, cvmix TKE, mEVP, ...); the CORE2 inputs, calendar and restart are those of the

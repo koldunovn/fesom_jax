@@ -144,6 +144,38 @@ rebuilds the layer thicknesses from `hbar` (fesom-jax has no partial cells; the 
 column's deepest value (2 nodes on CORE2). `PROVENANCE.json` in the store records all of it. Note that the 1997
 benthos pools are huge (median benthic C 1e11 mmol m-2 in the Fortran restart itself); the model carries them.
 
+## The Fortran spectral model on FESOM 2.8 (the matched partner)
+
+`sveta-loza/fesom2` branch `fesom2.8_recom_spectral` (`a89bb3d6`): upstream FESOM2 `0aaa2d73` with the spectral
+REcoM in the tree as `src/int_recom/` (there is no `src/recom` submodule on this branch; see
+`FORTRAN_JAX_DIFFERENCES.md`, "The fork on FESOM 2.8"). Worktree `/albedo/work/user/sloza/SPECTRAL/fesom2.8_recom_spectral`.
+
+```bash
+# build (login node: limit make, configure.sh would run make -j256)
+cd /albedo/work/user/sloza/SPECTRAL/fesom2.8_recom_spectral && source env/albedo/shell
+cmake -S . -B build_recom -DCMAKE_BUILD_TYPE=Release -DRECOM_COUPLED=ON -DRECOM_WAVEBANDS=ON \
+    -DCMAKE_INSTALL_PREFIX=$PWD
+taskset -c 0-15 make -C build_recom -j8 install          # -> bin/fesom.x, lib64/libfesom.so
+```
+
+`-DRECOM_WAVEBANDS=OFF` builds the broadband 4-PFT model (36 tracers, no CDOM). The REcoM dump hooks are inert
+unless `FESOM_RECOM_DUMP_DIR` is set. Namelist sets in `scripts/recom/fortran/` (each with a README):
+`namelists_albedo_fesom28/` (vanilla 2.8 + REcoM pi), `namelists_albedo_fesom28_spectral/` (the pi twin of the
+gates), `namelists_albedo_fesom28_core2_warm1998/` (written by `make_namelists_fesom28_core2.py`: the CORE2 warm
+1998 run). 2.8 does not read a 2.6 restart's BGC tracers at positions 6/11/12/14/39 (2.6 named them `sf6`, `cfc11`,
+...): `python scripts/recom/fortran/restart_2p6_to_2p8.py` writes a 2.8 view (renamed copies of those, symlinks for
+the rest), e.g. `/albedo/work/projects/p_specbic/sloza/restart_1997_4pft_fesom28`.
+
+The CORE2 run directory `/albedo/work/user/sloza/SPECTRAL/tmp_run_kdind15w28` (README.w28; frozen copies of
+`fesom.x`/`libfesom.so`; 9 `mpp` nodes x 96, one model year in ~2.0 h with `sbatch job_albedo_spectral_kdind15w28`;
+`TEST_DAYS=1 sbatch --qos=30min -t 00:30:00 job_albedo_spectral_kdind15w28` for a 1-day test into `..._test1d`) writes to `/albedo/work/projects/p_specbic/sloza/tmp_recom-fesom_output/fesom2.8_spectral_kdind15w28`.
+Its fesom-jax partner:
+```bash
+scripts/albedo/chain_core2_gpu.sh configs/albedo/core2_recom_spectral_warm1998_fesom28.yaml \
+    /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/core2_recom_spectral_warm1998_fesom28 2 5840 1998
+```
+then `link_monthly.sh` and both compare scripts as below (results in `FORTRAN_JAX_DIFFERENCES.md`).
+
 ## A multi-year CORE2 run and the comparison with a Fortran run
 
 ```bash

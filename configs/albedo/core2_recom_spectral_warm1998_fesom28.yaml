@@ -1,5 +1,5 @@
 # Albedo: the fesom-jax half of the physics-matched CORE2 pair after the fork's move to FESOM 2.8
-# (docs/plans/20261102-fortran-spectral-on-fesom28.md, step 5.5). The Fortran half is
+# (docs/plans/completed/20261102-fortran-spectral-on-fesom28.md, step 5.5). The Fortran half is
 # /albedo/work/user/sloza/SPECTRAL/tmp_run_kdind15w28 (README.w28: the 2.8 build, namelists
 # scripts/recom/fortran/namelists_albedo_fesom28_core2_warm1998/). As core2_recom_spectral_warm1998_jaxphys_groups.yaml
 # (the pair on the fork's old FESOM2 base) except:

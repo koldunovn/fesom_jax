@@ -1,5 +1,5 @@
 # Albedo: the full-step gate G4b (fesom_jax/tests/test_recom_step_fork.py) for the spectral REcoM on FESOM 2.8
-# (sveta-loza/fesom2 fesom2.8_recom_spectral, docs/plans/20261102-fortran-spectral-on-fesom28.md, step 5.4): one JAX
+# (sveta-loza/fesom2 fesom2.8_recom_spectral, docs/plans/completed/20261102-fortran-spectral-on-fesom28.md, step 5.4): one JAX
 # step from the twin's step-0 state against the twin's step 1. The twin (run fesom28_spectral_pi_1d_dumps, job
 # 48698141) runs scripts/recom/fortran/namelists_albedo_fesom28_spectral/: the physics of the 692f804 twin's
 # namelists_jaxphys (FESOM2 upstream format) with the fork's namelist.recom and &tracer_init3d.

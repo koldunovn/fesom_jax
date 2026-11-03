@@ -43,8 +43,9 @@ CFG = REPO / "configs" / "albedo" / "pi_recom_spectral_g4b.yaml"
 RUN_CFG = REPO / "configs" / "albedo" / "pi_recom_spectral.yaml"      # the production spectral config (gm on, no legacy)
 NML_NOWB = REPO / "scripts" / "recom" / "fortran" / "namelists_albedo_spectral_nowb_jaxphys" / "namelist.recom"
 # the physics-matched twins: the spectral build (37 tracers, the spectral light) and the broadband build (36)
-# The same REcoM on FESOM 2.8 (sveta-loza/fesom2 fesom2.8_recom_spectral, docs/plans/20261102-fortran-spectral-on-
-# fesom28.md): its own config (GM/Redi on, the packaged pi mesh) and none of the legacy settings.
+# The same REcoM on FESOM 2.8 (sveta-loza/fesom2 fesom2.8_recom_spectral,
+# docs/plans/completed/20261102-fortran-spectral-on-fesom28.md): its own config (GM/Redi on, mesh_pi_fork) and none
+# of the legacy settings.
 CFG28 = REPO / "configs" / "albedo" / "pi_recom_spectral_g4b_fesom28.yaml"
 FESOM28_RUNS = ("fesom28_spectral_pi_1d_dumps",)
 RUNS = [r for r in os.environ.get("FESOM_RECOM_FORK_G4B_RUNS",

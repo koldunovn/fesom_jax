@@ -7,6 +7,11 @@ model underneath: fesom-jax follows current upstream FESOM2, the fork sits on FE
 older physics options switched on. This page lists every difference known on 2026-10-30, so the comparison's
 differences can be read as the sensitivity of the biology to the host physics.
 
+**Since 2026-11-03 there is a Fortran spectral model on the host fesom-jax follows** (branch
+`fesom2.8_recom_spectral` of `sveta-loza/fesom2`, section "The fork on FESOM 2.8" at the end): with it the physics
+rows below that say "not matchable" or need a `legacy:` setting are matched, and the CORE2 pair agrees to the stated
+deviations. The tables below describe the 2.6-based production runs.
+
 ## The runs
 
 | | Fortran | fesom-jax |
@@ -143,6 +148,55 @@ on the GPU, not a code difference). `scripts/recom/compare_fortran_jax_groups.py
 - fesom-jax `npp` is the sum of its four groups (to the printed digit). **The whole NPP offset of the pair is the
   coccolithophore NPP** (3.6-6.0 Pg C/yr by month, 4.32 on the annual mean) that the Fortran run does not write. The
   residual of the physics-matched pair is nil in NPP too.
+
+## The fork on FESOM 2.8 (branch `fesom2.8_recom_spectral`, 2026-11-02/03)
+
+Plan `docs/plans/completed/20261102-fortran-spectral-on-fesom28.md`. Pushed to `sveta-loza/fesom2`:
+`fesom2.8_recom_spectral` at **`a89bb3d6`** and the old-base reference `recom_spectral_jaxref` at **`ce142dcd`**.
+
+| | 2.6 fork (production, kdind15*) | `fesom2.8_recom_spectral` |
+|---|---|---|
+| FESOM2 (ocean, sea ice, GM/Redi, forcing) | `cda35117` (2025-10-09) | upstream `0aaa2d73` (2026-11-02, after 2.8.3): the host fesom-jax follows; #944, #1116, `18346243`, #919 in |
+| REcoM source | the fork's in-tree `src/int_recom/` at `e1e62886`/`21e0d02a` | the same in-tree `src/int_recom/`, in the version fesom-jax was gated against: `_recom692` (`9aaf96f7`, the fork + 11 upstream REcoM commits) + `4d96c3aa` (linear mortality, off by default) + `21e0d02a` (`RECOM_CO2LIM_SPECTRAL`) + the env-gated dump hooks |
+| where REcoM lives | in the FESOM2 tree, called with FESOM's derived types | unchanged: in the tree, type-based calls. **Not** upstream 2.8's `src/recom` submodule (the standalone REcoM library `259e70e3` with its array interface and host-side forcing reads); `.gitmodules` drops it |
+| `RECOM_WAVEBANDS` | CMake option -> `__RECOM_WAVEBANDS` (spectral light, CDOM, OASIM reading, spectral outputs) | the same option, default ON; OFF builds the broadband 4-PFT model (36 tracers) |
+| what was adapted | | mechanical only: the 4 `associate_*.h` headers kept as private copies in `int_recom/`, `par_ex` -> `par_abort`, the REcoM call sites on the 2.8 host (at upstream's positions in the step), the fork's host edits (OASIM reading, per-group/spectral outputs, `&spectral` and `&painitialization_N` reads, `DIC_PI` by tracer ID). Built without `__usetp` (2.8's tracer-parallel mode) |
+
+What this means:
+- **The biology is unchanged by the move**: at step 1, REcoM's outputs equal the old-base build to 1.2e-12 on every
+  ice-free node (job 48698141).
+- **The physics now matches by configuration**: the pi twin gates without any `legacy_*` setting and with GM/Redi on
+  at a T floor of 4.09e-8 (the 2.6 fork: 5.4e-5 with GM/Redi off and the legacy settings), `VALIDATION.md`.
+- **Upstream REcoM since `_recom692` is not in it** (nor in fesom-jax): the branch does not follow the REcoM
+  submodule. Moving the spectral code onto the standalone REcoM library is the step that would; not done.
+- Restarts: 2.6 wrote the BGC tracers at positions 6/11/12/14/39 under the transient-tracer names
+  (`sf6`/`cfc11`/`cfc12`/`r14c`/`r39ar`), 2.8 by tracer ID (`tra0006`...); `scripts/recom/fortran/restart_2p6_to_2p8.py`
+  writes a 2.8 view of a 2.6 restart. 2.8 output masks the levels below the bottom with `_FillValue` 9.97e36 (2.6
+  wrote 0); `compare_fortran_jax.py` fills them with 0.
+- Production runs (`21e0d02a` on 2.6) differ from this branch by the 11 REcoM commits and by the whole host change.
+
+### The CORE2 warm 1998 pair on 2.8 (compared 2026-11-03)
+
+| | Fortran | fesom-jax |
+|---|---|---|
+| setup | `tmp_run_kdind15w28` (README.w28): `a89bb3d6` Release, `RECOM_WAVEBANDS` ON, 864 ranks; namelists `scripts/recom/fortran/namelists_albedo_fesom28_core2_warm1998/` = kdind15wjp's inputs with the 2.8 pi-twin physics (cvmix TKE, mEVP, `ice_diff` 10, `opt_visc` 7, weights `0., 1.`, no partial cells, **GM/Redi on**); restart `restart_1997_4pft_fesom28` | `configs/albedo/core2_recom_spectral_warm1998_fesom28.yaml` (`gm: {}`, no `legacy`, `spectral_co2lim: false`, per-group outputs) |
+| job | 48698183 (2.0 h) -> `fesom2.8_spectral_kdind15w28` | 48698174-75 -> `fesom_jax_runs/core2_recom_spectral_warm1998_fesom28` |
+
+Worst month of 1998 (`compare.log`, `compare_groups.log` in the fesom-jax run directory):
+
+| quantity | fesom-jax vs Fortran |
+|---|---|
+| NPP of the groups both write (small phytoplankton + diatoms + Phaeocystis) | <= 0.019 %; annual 110.22 vs 110.22 Pg C/yr |
+| NPP per group | small phytoplankton 0.008 %, diatoms 0.055 %, Phaeocystis 0.12 %; pattern corr >= 0.9998 |
+| C and Chl inventory of each of the 4 groups | <= 0.09 %; surface corr >= 0.9998 |
+| inventories, relative | DIC 5.6e-7, Alk 4.6e-8, DIN 7.3e-6, DSi 4.2e-6, O2 9.3e-6, DFe 1.0e-4 |
+| CO2 flux | <= 0.0012 Pg C/yr, corr >= 0.99997 |
+| surface Chl, SST, ice area | corr >= 0.99998; <= 3.4e-4 degC; <= 0.0033 Mkm2 |
+
+fesom-jax's total NPP (114.38 Pg C/yr) exceeds the Fortran sum by exactly the coccolithophores (4.16), which the
+Fortran run does not write (`NPPc`). The agreement equals the 2.6 physics-matched pair's (previous sections), which
+needed GM/Redi off and the three `legacy` settings; on 2.8 neither is needed. What remains are fesom-jax's stated
+deviations (the ballast reset over the whole mesh; the first-call reset skipped at step 1) and chaos.
 
 ## The cold 1958-59 run (co2lim on, all physics differences), for the record
 

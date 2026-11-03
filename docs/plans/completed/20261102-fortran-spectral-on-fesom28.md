@@ -1,6 +1,6 @@
 # The Fortran spectral fork on current FESOM2 (`fesom2.8_recom_spectral`)
 
-Written 2026-11-02 on Albedo, from a read-only inventory of the Fortran checkouts. Nothing below is done yet.
+Written 2026-11-02 on Albedo, from a read-only inventory of the Fortran checkouts. **Completed 2026-11-03** (all steps; progress notes under each step).
 
 ## Goal
 
@@ -255,6 +255,14 @@ GM/Redi on and no legacy setting: what remains is the stated deviations plus cha
 - The user pushes `fesom2.8_recom_spectral` to `sveta-loza/fesom2`.
 - Update `docs/recom/FORTRAN_JAX_DIFFERENCES.md` (host model rows), `VALIDATION.md` (twin numbers, SLURM job ids),
   `RUNNING_ALBEDO.md` (new build), and move this plan to `completed/`.
+
+**Step 6 done 2026-11-03.** The user pushed `fesom2.8_recom_spectral` (**`a89bb3d6`**) and the old-base reference
+`recom_spectral_jaxref` (**`ce142dcd`**, with the `_recom692_dumps` history under it) to `sveta-loza/fesom2`; both
+remote heads verified equal to the local ones. `FORTRAN_JAX_DIFFERENCES.md` has the section "The fork on FESOM 2.8"
+(host model rows, where REcoM lives and what `RECOM_WAVEBANDS` does, the CORE2 pair), `VALIDATION.md` "The fork on
+FESOM 2.8" (gate numbers and job ids), `RUNNING_ALBEDO.md` "The Fortran spectral model on FESOM 2.8" (build,
+namelists, restart conversion, the CORE2 pair). Plan moved to `completed/`. Left open (Risks): upstream REcoM after
+`_recom692` and the move onto the standalone REcoM library; the Fortran `NPPc` output for the coccolithophores.
 
 ## Risks and open points
 

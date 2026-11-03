@@ -1,4 +1,4 @@
-"""A FESOM 2.8 view of a FESOM 2.6 netCDF restart (docs/plans/20261102-fortran-spectral-on-fesom28.md, step 5.5).
+"""A FESOM 2.8 view of a FESOM 2.6 netCDF restart (docs/plans/completed/20261102-fortran-spectral-on-fesom28.md, step 5.5).
 
 FESOM 2.6's io_restart named a tracer by its POSITION j, except that positions 6, 11, 12, 14 and 39 got the
 transient-tracer names sf6, cfc11, cfc12, r14c, r39ar (the SELECT CASE ran on j). FESOM 2.8 selects on the tracer

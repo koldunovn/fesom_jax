@@ -139,7 +139,9 @@ Configs `configs/albedo/pi_recom_spectral.yaml`, `core2_recom_spectral.yaml`; ga
 `test_recom_spectral_*.py` against the fork's own twins (`docs/recom/VALIDATION.md`, the plan
 `docs/plans/20261028-recom-spectral-port.md`). The fork's FESOM2 base needs `legacy_k33_weights`,
 `legacy_fct_bounds`, `legacy_sw_depth` and its own level files in a twin gate; its GM/Redi is not matchable (the
-physics-matched one-day twins run GM/Redi off). Stated deviation: the fork's whole-array ballast reset reduces over
+physics-matched one-day twins run GM/Redi off). The same REcoM on current FESOM2 (`sveta-loza/fesom2`
+`fesom2.8_recom_spectral`, in-tree `src/int_recom/`, no REcoM submodule) needs none of that: GM/Redi on, no
+`legacy_*`, T floor 4.1e-8 (`FORTRAN_JAX_DIFFERENCES.md` "The fork on FESOM 2.8"). Stated deviation: the fork's whole-array ballast reset reduces over
 the whole mesh, not the rank. The 692f804 programs stay byte-identical.
 
 **Adjoint toolkit.** `adjoint.py`, `adjoint_sharded.py`, `adjoint_check.py`, `adjoint_costs.py`,
