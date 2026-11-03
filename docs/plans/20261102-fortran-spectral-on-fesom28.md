@@ -236,6 +236,20 @@ symlinks; data verified equal). Resubmitted: test 48698182 (`TEST_DAYS=1`, ->
 `tmp_recom-fesom_output/fesom2.8_spectral_kdind15w28_test1d`), year 48698183 (afterok, ->
 `fesom2.8_spectral_kdind15w28`).
 
+**5.5 done 2026-11-03.** All four jobs completed (Fortran test 48698182, year 48698183 in 2.0 h on 864 cores;
+fesom-jax 48698174-75). `scripts/albedo/link_monthly.sh`, then both compare scripts into
+`fesom_jax_runs/core2_recom_spectral_warm1998_fesom28/compare` (`compare.log`, `compare_groups.log`). Fix on the way:
+FESOM 2.8 writes `_FillValue` 9.97e36 below the bottom (2.6 wrote 0), so the Fortran inventories came out as 6e29;
+`compare_fortran_jax.Fortran.field` now fills masked points with 0. Worst month over 1998:
+- NPP of the groups both write (phy+dia+phaeo; the Fortran run still has no `NPPc`): <= 0.019 %, annual 110.22 vs
+  110.22 Pg C/yr; per group phy 0.008 %, dia 0.055 %, phaeo 0.12 % (Dec), pattern corr >= 0.9998. The total NPP
+  offset (fesom-jax 114.38) is again exactly the coccolithophores' 4.16 Pg C/yr.
+- C and Chl inventory of every group (cocco included) <= 0.09 %, surface corr >= 0.9998.
+- Inventories (relative): DIC 5.6e-7, Alk 4.6e-8, DIN 7.3e-6, DSi 4.2e-6, O2 9.3e-6, DFe 1.0e-4. CO2 flux <= 0.0012
+  Pg C/yr (corr >= 0.99997), surface Chl corr >= 0.99998, SST <= 3.4e-4 degC, ice area <= 0.0033 Mkm2.
+Same level as the old 2.6 pair (`_jaxphys_groups`, which needed the `legacy_*` settings and GM/Redi off), now with
+GM/Redi on and no legacy setting: what remains is the stated deviations plus chaotic growth. Next: step 6.
+
 ### 6. Hand-over
 
 - The user pushes `fesom2.8_recom_spectral` to `sveta-loza/fesom2`.
