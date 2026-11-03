@@ -175,13 +175,12 @@ def _write_state_global(out_dir, state_folded, sm, part, *, fields=None, attrs=N
         root.attrs.update(P=P, nod2D=int(sm.nod2D), elem2D=int(sm.elem2D), edge2D=int(sm.edge2D),
                           nl=int(sm.nl), layout="canonical_global", **(attrs or {}))
     if multiproc:
-        from jax.experimental import multihost_utils
-        multihost_utils.sync_global_devices("restart_global_meta")
+        halo.process_barrier("restart_global_meta")       # no device program (halo.process_barrier)
 
     gather = None
     if multiproc:
         from . import canonical_redist as cr
-        jmesh = halo.device_mesh("p", devices=jax.devices()[:P])
+        jmesh = halo.device_mesh("p", devices=halo.first_devices(P))
         gather = cr._allgather_callable(jmesh, "p")
 
     root = zarr.open_group(str(out_dir), mode="a")
@@ -201,8 +200,7 @@ def _write_state_global(out_dir, state_folded, sm, part, *, fields=None, attrs=N
         if r1 > r0:
             root[name][r0:r1] = g[r0:r1]
     if multiproc:
-        from jax.experimental import multihost_utils
-        multihost_utils.sync_global_devices("restart_global_data")
+        halo.process_barrier("restart_global_data")
     return out_dir
 
 
