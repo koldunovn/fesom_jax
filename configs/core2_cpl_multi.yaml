@@ -4,8 +4,12 @@
 # there, measured standalone on 4 A100 / 4 GH200; see that file for the job ids):
 #   * partition: dist_4 (run_coupled passes dist_N for --devices N; the partitions are FESOM2's own, read from
 #     /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2 or $FESOM_DIST_DIR);
-#   * gpu.halo_compact, gpu.mevp_wide 12, gpu.lane_order rcm (no-ops or unused with one device, so core2_cpl.yaml
-#     leaves them out).
+#   * gpu.halo_compact, gpu.mevp_wide 12 (no-ops with one device, so core2_cpl.yaml leaves them out). Both keep the
+#     ocean BITWISE to core2_cpl.yaml on one device (4 coupling intervals with the same forcing, every State field and
+#     every field sent to the atmosphere, awicm_jax scripts/check_ocean_devices.py, job 28680376), and take the
+#     coupled ocean interval on 4 A100 from 140 ms (dist_4 alone) to ~85 ms (200 ms on one A100).
+#   * NOT gpu.lane_order rcm: it is the one multi-GPU option that changes the values (round-off, then the sea ice's
+#     thresholds: SST up to 0.04 K after one interval, job 28680376) for 88.3 -> ~81 ms per interval.
 # Restarts and monthly means are written in global node order either way: a restart of this configuration
 # continues under core2_cpl.yaml and back.
 
@@ -37,7 +41,6 @@ gpu:
   mevp_unroll: 12
   column_kernel: true
   ssh_inc_ell: true
-  lane_order: rcm
   ordered_sums: true
   output_async: true
   restart_async: true
