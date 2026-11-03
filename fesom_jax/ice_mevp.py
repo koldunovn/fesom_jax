@@ -189,11 +189,10 @@ def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: Me
     s12n = det1 * s12 + pressure * eps12 * vale               # :258  (NO 0.5 — T2)
     s11n = det1 * s11 + 0.5 * pressure * (eps1 - delta + eps2 * vale)    # :259
     s22n = det1 * s22 + 0.5 * pressure * (eps1 - delta - eps2 * vale)    # :260
-    # element skip (`!ice_el` ⇒ σ frozen, carry old) — :693 continue; FESOM main zeroes it (mevp_zero_sigma)
-    s_skip = (0.0, 0.0, 0.0) if getattr(cfg, "mevp_zero_sigma", False) else (s11, s12, s22)
-    s11 = jnp.where(st.ice_el, s11n, s_skip[0])
-    s12 = jnp.where(st.ice_el, s12n, s_skip[1])
-    s22 = jnp.where(st.ice_el, s22n, s_skip[2])
+    # element skip (`!ice_el` ⇒ σ frozen, carry old) — :693 continue
+    s11 = jnp.where(st.ice_el, s11n, s11)
+    s12 = jnp.where(st.ice_el, s12n, s12)
+    s22 = jnp.where(st.ice_el, s22n, s22)
     if sigma_out_f is not None:
         s11, s12, s22 = (scale_tangent(s, sigma_out_f) for s in (s11, s12, s22))
 
@@ -280,6 +279,15 @@ def mevp_unroll() -> int:
     return u
 
 
+def metric_factor_mesh(cfg, mesh):
+    """``mesh`` with ``metric_factor = 0`` under ``IceConfig.metric_factor_zero`` (FESOM2 &geometry
+    metric_factor_zero, read only by the sea-ice dynamics); else ``mesh`` itself (nothing traced)."""
+    if not getattr(cfg, "metric_factor_zero", False):
+        return mesh
+    import dataclasses
+    return dataclasses.replace(mesh, metric_factor=jnp.zeros_like(mesh.metric_factor))
+
+
 def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
                   a_ice, m_ice, m_snow,
                   u_ice, v_ice, sigma11, sigma12, sigma22,
@@ -310,6 +318,9 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
     per-subcycle path."""
     if boundary_node is None:
         boundary_node = boundary_node_mask(mesh)
+    mesh = metric_factor_mesh(cfg, mesh)
+    if wide is not None and getattr(cfg, "metric_factor_zero", False):
+        raise NotImplementedError("metric_factor_zero with gpu.mevp_wide: the wide halo carries its own metric_factor")
     if getattr(cfg, "adjoint_damping", "none") == "frozen_sweep":
         # the same forward; a custom_vjp backward (ice_mevp_frozen, docs/PORTING_LESSONS.md I5g)
         if adjoint_subcycles >= 0:

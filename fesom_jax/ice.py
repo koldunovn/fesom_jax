@@ -314,11 +314,15 @@ class IceConfig(NamedTuple):
     # ---- FESOM main 0aaa2d73 switches for jaxcpl (lane L-SFC); the defaults are fesom_jax before them ----
     # mEVP (ice_maEVP.F90 EVPdynamics_m / stress_tensor_m of main; whichEVP=1 only):
     #   mevp_mass_floor: the node mass factor 1/(max(M, 9)·area) (main, ice_maEVP.F90:393-394) instead of the port
-    #       base's M/((1 + M²)·area), M = ρᵢm + ρₛm_s per grid area [kg/m²];
-    #   mevp_zero_sigma: σ11/σ12/σ22 set to 0 on elements without ice (mean m_ice <= 0.01, cavity elements), each
-    #       sweep (main stress_tensor_m), instead of carried unchanged.
+    #       base's M/((1 + M²)·area), M = ρᵢm + ρₛm_s per grid area [kg/m²].
+    #   (main's stress_tensor_m zeroes σ on ice-free elements, but EVPdynamics_m inlines its own σ update without
+    #   that and never calls it: main's mEVP carries σ there, as fesom_jax does. Checked against the oracle's
+    #   EVPdynamics_m inputs and outputs, docs/lanes/core3_sfc.md.)
+    # EVP and mEVP (namelist.config &geometry metric_factor_zero, oce_mesh.F90:2352; jaxcpl .true.):
+    #   metric_factor_zero: the sea-ice dynamics use metric_factor = 0 (no tan(lat)/R metric terms in the strain
+    #       rates and the stress divergence). metric_factor is read only there, in FESOM2 and in fesom_jax.
     mevp_mass_floor: bool = False
-    mevp_zero_sigma: bool = False
+    metric_factor_zero: bool = False
     # Coupled thermodynamics (fesom_jax.coupled.flux, ice_thermo_cpl.F90 of main; mode F only):
     #   cpl_meltponds: namelist.ice use_meltponds of the coupled path (on by default there, as AWI-ESM3 v3.5.1);
     #   snowmelt_tgate: snow melts only where the surface t > 273 K (MOD_ICE default .true.; jaxcpl .false.);

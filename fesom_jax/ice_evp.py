@@ -264,6 +264,8 @@ def evp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
     ``wide`` exists for the dispatch's signature parity with
     :func:`fesom_jax.ice_mevp.mevp_dynamics` only: the mEVP wide halo has no standard-EVP
     counterpart, so anything but ``None`` is refused."""
+    from .ice_mevp import metric_factor_mesh
+    mesh = metric_factor_mesh(cfg, mesh)
     if wide is not None:
         raise ValueError("the wide halo (wide=) is an mEVP option; the standard EVP "
                          "(whichEVP=0) has no wide path")
