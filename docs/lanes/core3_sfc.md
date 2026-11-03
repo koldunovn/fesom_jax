@@ -68,7 +68,7 @@ CPU from L-OCN's converted restart, then L-OCN's `scripts/core3/compare_step.py`
 What is left after one step with jaxcpl's settings: a_ice 2.5e-3 at a few points (p99 1e-10), which can only come
 from the forced thermodynamics (ice_thermo_oce.F90 changed by 558 lines from the port base; not in jaxcpl's coupled
 path, not replayed here); eta_n 2e-3 (the CG solved to soltol, rung 9); the GM shelf template above (it enters the
-tracers from step 1, the 2.5e-5 of T at the front).
+tracers from step 1; whether it is the 2.5e-5 of T at the front is not measured).
 
 ## Status (2026-11-03, session 2)
 
