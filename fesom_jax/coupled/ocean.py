@@ -66,6 +66,22 @@ def _monthly_fields(s) -> dict:
             "a_ice": s.a_ice, "m_ice": s.m_ice, "m_snow": s.m_snow}
 
 
+#: optional fields of the monthly stream (init_ocean's ``monthly_extra``; FESOM2's io names): ``w`` the vertical
+#: velocity at the interfaces (nod2D, nl) [m s-1] (the overturning from w), ``fw`` the step's water_flux (nod2D,)
+#: [m s-1, + = the ocean loses fresh water; basal melt under the shelves], mode F only (State.cpl_fw)
+MONTHLY_EXTRA = {"w": lambda s: s.w, "fw": lambda s: s.cpl_fw}
+
+
+def _monthly_fields_with(extra):
+    extra = tuple(extra)
+
+    def f(s):
+        out = _monthly_fields(s)
+        out.update({k: MONTHLY_EXTRA[k](s) for k in extra})
+        return out
+    return f
+
+
 @dataclasses.dataclass
 class OceanStatic:
     """Everything of the coupled ocean that is not the State: configuration, mesh, partition, operators, the
@@ -169,7 +185,8 @@ def _env_setup(cfg: RunConfig, sss_restoring: bool) -> None:
 def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in: str | None = "config",
                ic_dir: str | None = None, start: tuple | None = None, year0: int = 1958, nsteps: int = 4,
                mode: str = "bulk", sss_restoring: bool = False, monthly_out: str | None = None, log=print,
-               partition: str | None = None, dist_dir: str | None = None, cpl_runoff: str = "climatology"):
+               partition: str | None = None, dist_dir: str | None = None, cpl_runoff: str = "climatology",
+               monthly_extra: tuple = (), cpl_cavity: bool | None = None):
     """Build the coupled ocean. Returns ``(state, static)``: the folded device :class:`~fesom_jax.state.State`
     (working precision) and the :class:`OceanStatic`.
 
@@ -185,7 +202,15 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     $FESOM_DIST_DIR or :data:`DEFAULT_DIST_DIR`, over the first N devices of the process; ``gpu.lane_order`` and
     ``gpu.mevp_wide`` of the config apply as in the standalone runner). ``cpl_runoff`` (mode F): ``"climatology"``
     (default: the CORE2 runoff file, hydr_oce/calv_oce ignored) or ``"coupled"`` (the runoff mapper's hydr_oce +
-    calv_oce and the calving's enthalpy of fusion, :mod:`fesom_jax.coupled.flux`)."""
+    calv_oce and the calving's enthalpy of fusion, :mod:`fesom_jax.coupled.flux`). ``monthly_extra``: more fields
+    of the monthly means (:data:`MONTHLY_EXTRA`: ``"w"``, ``"fw"``; default none: the stream unchanged).
+    ``cpl_cavity`` (mode F): the cavity branches of the coupled flux (flux.CAVITY_ENV, :mod:`fesom_jax.coupled.flux`);
+    None = follow the ocean's cavity switch (the config's ``cavity`` block of lane L-OCN, when it has one; off
+    otherwise)."""
+    monthly_extra = tuple(monthly_extra or ())
+    bad = [k for k in monthly_extra if k not in MONTHLY_EXTRA]
+    if bad or ("fw" in monthly_extra and mode != "flux"):
+        raise ValueError(f"monthly_extra {monthly_extra}: known {tuple(MONTHLY_EXTRA)}, fw in mode 'flux' only")
     cfg = load_yaml(config) if isinstance(config, (str, os.PathLike)) else config
     if restart_in != "config":
         cfg = dataclasses.replace(cfg, restart_in=restart_in)
@@ -199,6 +224,15 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     if cfg.dt_ramp:
         raise NotImplementedError("dt_ramp is not supported by the coupled ocean")
     _env_setup(cfg, sss_restoring)
+    if cpl_cavity is None:
+        cpl_cavity = getattr(cfg, "cavity", None) is not None
+    if cpl_cavity and mode != "flux":
+        raise ValueError("cpl_cavity is a mode F ('flux') switch")
+    from .flux import CAVITY_ENV
+    if cpl_cavity:
+        os.environ[CAVITY_ENV] = "1"           # read at trace time by the coupled ice step (the process's only user)
+    else:
+        os.environ.pop(CAVITY_ENV, None)
     precision = cfg.precision
     dt = float(cfg.dt)
 
@@ -300,11 +334,14 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         phys=cfg.physics_kwargs(), precision=precision, dt=dt, nsteps=int(nsteps), mode=mode, year0=int(year0),
         step=step0, sss_clim=sss_clim, chl_clim=np.asarray(chl_clim), trig=trig,
         M=jnp.asarray(jra55._rotation_matrix()), sss_restoring=bool(sss_restoring), bootstrap=bootstrap,
-        monthly_out=monthly_out, sample_fn=_monthly_fields if monthly_out is not None else None,
+        monthly_out=monthly_out, sample_fn=(None if monthly_out is None else
+                                            _monthly_fields_with(monthly_extra) if monthly_extra else _monthly_fields),
         mevp_wide=mevp_wide)
     if mode == "flux":
         from . import flux
         state, static = flux.init_flux(state, static, runoff=cpl_runoff)
+        if "fw" in monthly_extra and getattr(state, "cpl_fw", None) is None:
+            state = dataclasses.replace(state, cpl_fw=jnp.zeros_like(state.a_ice))
     elif cpl_runoff != "climatology":
         raise ValueError("cpl_runoff 'coupled' is a mode F ('flux') switch")
     log(f"[ocean] CORE2 nod2D={mesh.nod2D} npes={npes} dt={dt} precision={precision} mode={mode} nsteps={nsteps} "

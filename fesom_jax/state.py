@@ -165,6 +165,8 @@ class State:
     cpl_apnd: jax.Array | None = None             # (nod2D,) melt-pond area fraction (ice%thermo%apnd)
     cpl_hpnd: jax.Array | None = None             # (nod2D,) melt-pond depth [m]
     cpl_ipnd: jax.Array | None = None             # (nod2D,) melt-pond lid thickness [m]
+    cpl_fw: jax.Array | None = None               # (nod2D,) the step's water_flux (FESOM2's `fw` output) [m s-1];
+    #                                               only with the coupled monthly output asking for fw, not restarted
     #                                               (recom.wiring.BUDGET_TERMS), not restarted
 
     # ---- constructors -----------------------------------------------------
@@ -271,9 +273,9 @@ BGC_FULL_FIELDS = ("bgc_benthos", "bgc_alk_surf", "bgc_carb", "bgc_mstep", "bgc_
 BGC_FIELDS = ("bgc", "bgc_old", "bgc_carry") + BGC_MR_FIELDS + BGC_FULL_FIELDS
 # Present but never written to a restart: FESOM2 restarts neither the carbonate cache nor mstep (both restart with
 # the run segment, fesom_module.F90:849,983,1049; recom_sms.F90:489); the diagnostics and budget sums are output.
-RESTART_SKIP = ("bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget")
+RESTART_SKIP = ("bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget", "cpl_fw")
 # The optional coupled mode F fields, in State order (None unless fesom_jax.coupled runs in flux mode).
-CPL_FIELDS = ("cpl_ice_temp", "cpl_ice_alb", "cpl_apnd", "cpl_hpnd", "cpl_ipnd")
+CPL_FIELDS = ("cpl_ice_temp", "cpl_ice_alb", "cpl_apnd", "cpl_hpnd", "cpl_ipnd", "cpl_fw")
 
 
 def present_fields(state) -> tuple[str, ...]:
