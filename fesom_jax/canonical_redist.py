@@ -241,7 +241,7 @@ def write_redistribute(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chu
     if jax.process_index() == 0:
         _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, "redistribute",
                       time_days=time_days)
-    _barrier("canon_redist_meta")
+    _barrier("canon_redist_meta", out_dir)
 
     has_time = time_days is not None
     t0 = (0,) if has_time else ()                                 # leading time index, see _create_store
@@ -260,7 +260,7 @@ def write_redistribute(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chu
                 z[t0 + (slice(g0, g0 + nr),)] = data
             else:
                 z[t0 + (slice(None), slice(g0, g0 + nr))] = data.T   # [nr, nlev] → [nlev, nr]
-    _barrier("canon_redist_data")
+    _barrier("canon_redist_data", out_dir)
     if jax.process_index() == 0:
         zarr.consolidate_metadata(out_dir)
     return out_dir
@@ -309,13 +309,15 @@ def write_all_gather(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk
     if pid == 0:
         _create_store(out_dir, fields, glon, glat, n_global, C, chunk_vert, attrs, "all_gather",
                       time_days=time_days)
-    _barrier("canon_ag_meta")
+    _barrier("canon_ag_meta", out_dir)
 
     gather_fn = _allgather_callable(jmesh, "p")
 
     def _gather(field_folded):
         # all_gather → the full [P*Lmax, *rest] REPLICATED on every device (cached callable ⇒ compiled
         # once per shape); out_spec replicated (a sharded out_spec would re-tile the gathered array).
+        if not isinstance(field_folded, jax.Array):              # gathered before (zarr_output.host_folded)
+            return np.asarray(field_folded)
         return np.asarray(gather_fn(field_folded))               # [P*Lmax, *rest] host
 
     has_time = time_days is not None
@@ -332,11 +334,12 @@ def write_all_gather(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk
                 z[t0 + (slice(r0, r1),)] = data
             else:
                 z[t0 + (slice(None), slice(r0, r1))] = data.T
-    _barrier("canon_ag_data")
+    _barrier("canon_ag_data", out_dir)
     if pid == 0:
         zarr.consolidate_metadata(out_dir)
     return out_dir
 
 
-def _barrier(tag):
-    halo.process_barrier(tag)          # the coordination service's barrier, no device program (halo.process_barrier)
+def _barrier(tag, key=None):
+    # the coordination service's barrier, no device program; keyed by the store (halo.process_barrier)
+    halo.process_barrier(tag, key=None if key is None else str(key))

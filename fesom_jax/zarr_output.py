@@ -175,7 +175,7 @@ def _write_state_global(out_dir, state_folded, sm, part, *, fields=None, attrs=N
         root.attrs.update(P=P, nod2D=int(sm.nod2D), elem2D=int(sm.elem2D), edge2D=int(sm.edge2D),
                           nl=int(sm.nl), layout="canonical_global", **(attrs or {}))
     if multiproc:
-        halo.process_barrier("restart_global_meta")       # no device program (halo.process_barrier)
+        halo.process_barrier("restart_global_meta", key=str(out_dir))   # no device program (halo.process_barrier)
 
     gather = None
     if multiproc:
@@ -188,7 +188,8 @@ def _write_state_global(out_dir, state_folded, sm, part, *, fields=None, attrs=N
         kind = _kind_of(arr.shape[0], P, sm.Lmax)
         gid, owned = _go(kind)
         ng = n_global[kind]
-        folded_host = np.asarray(gather(arr)) if multiproc else np.asarray(arr)   # full folded leaf
+        # full folded leaf (a host array, e.g. from host_folded on another thread, is taken as it is)
+        folded_host = np.asarray(gather(arr)) if multiproc and isinstance(arr, jax.Array) else np.asarray(arr)
         g = np.zeros((ng,) + folded_host.shape[1:], dtype=folded_host.dtype)
         g[gid[owned]] = folded_host[owned]                  # canonical [n_global, …]
         # this process writes its DISJOINT whole-chunk range (single-process ⇒ the whole leaf)
@@ -200,7 +201,7 @@ def _write_state_global(out_dir, state_folded, sm, part, *, fields=None, attrs=N
         if r1 > r0:
             root[name][r0:r1] = g[r0:r1]
     if multiproc:
-        halo.process_barrier("restart_global_data")
+        halo.process_barrier("restart_global_data", key=str(out_dir))
     return out_dir
 
 
@@ -246,6 +247,21 @@ def _all_state_fields() -> tuple[str, ...]:
     from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS, State
     return tuple(f.name for f in dataclasses.fields(State)
                  if f.name not in ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS)
+
+
+def host_folded(tree, npes):
+    """Every folded ``[P*Lmax, ...]`` leaf of ``tree`` as a host numpy array on every process: an ``all_gather`` over
+    the partition's devices (:func:`halo.first_devices`) with several processes (a program over those devices: call
+    it on the thread that drives them, in the same order on every process), ``np.asarray`` with one. The writers
+    (:func:`write_restart` with ``layout="global"``, :func:`fesom_jax.ushow_output.write_global_zarr`) take host
+    leaves as they are, so a store can be gathered here and written later on another thread, which then does only
+    file I/O and coordination-service barriers."""
+    if jax.process_count() <= 1:
+        return jax.tree.map(lambda x: np.asarray(x) if isinstance(x, jax.Array) else x, tree)
+    from . import canonical_redist as cr
+    gather = cr._allgather_callable(halo.device_mesh("p", devices=halo.first_devices(int(npes))), "p")
+    return jax.tree.map(lambda x: np.asarray(gather(x)) if isinstance(x, jax.Array) and not x.is_fully_addressable
+                        else (np.asarray(x) if isinstance(x, jax.Array) else x), tree)
 
 
 def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_stage,

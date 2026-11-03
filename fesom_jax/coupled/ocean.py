@@ -472,6 +472,8 @@ def flush_monthly(static: OceanStatic) -> str | None:
     if static.submit is None:
         write(path, mean, static.sm, static.part, static.mesh)
     else:
+        if jax.process_count() > 1:    # several processes: the gather here (the thread driving the ocean), the file
+            mean = zarr_output.host_folded(mean, static.npes)   # on the writer (file I/O and keyed barriers only)
         static.submit(write, path, mean, static.sm, static.part, static.mesh)
     static._mon_key, static._mon_sum, static._mon_count = None, None, 0
     return path
@@ -625,9 +627,13 @@ def ocean_restart_writer(state, static: OceanStatic):
     """:func:`write_ocean_restart` in two halves (single process): the State widened to float64 (on the device) and
     the step and calendar of ``static``, now; returns ``write(path) -> path``, the store with the copy to the host,
     which may run later on another thread while the ocean steps on (the State's arrays are not donated). The copy is
-    not started here: on the step's thread it held up the coupled run's own small copies behind it."""
-    return functools.partial(_restart_writer(static), state_folded=PR.cast_tree(state, keep64=True), sm=static.sm,
-                             part=static.part)
+    not started here: on the step's thread it held up the coupled run's own small copies behind it. Several processes:
+    the State is gathered to the host here (a program over the ocean's devices: call it on the thread that drives
+    them), so that write(path) does file I/O and keyed barriers only."""
+    st = PR.cast_tree(state, keep64=True)
+    if jax.process_count() > 1:
+        st = zarr_output.host_folded(st, static.npes)
+    return functools.partial(_restart_writer(static), state_folded=st, sm=static.sm, part=static.part)
 
 
 def _restart_writer(static):
