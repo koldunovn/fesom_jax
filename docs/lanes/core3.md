@@ -418,6 +418,13 @@ The defect: the low-order vertical upwind flux (`tracer_adv.adv_flux_ver`) got F
 default program is unchanged, its StableHLO included). Not covered: REcoM's tracer transport with cavities
 (`recom/transport.py` calls `advect_one_fct` without the flag), the w_split path.
 
+### Default path after session 3
+
+`test_eos test_dp_lock test_prepare_mesh test_fortran_restart test_run_config test_ice_step test_tke_replay
+test_step_pi` (job 28703651): 146 passed, 1 failed — `test_fortran_restart`'s source table missed the new State
+field `cpl_fw` of lane L-CPL (merged in ba2a797, so the merge itself fails this test); classified as optional, the
+test passes (28703896, 6 passed). `test_tracers` 37 passed (28703695).
+
 ### Estimate for the rest (after session 3)
 
 * Lane L-SFC owns substeps 6 (opt_visc 5) and 14 (GM/Redi) on CORE3 and the shelf-front sea-ice difference; this
