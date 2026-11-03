@@ -1,0 +1,72 @@
+# The coupled ocean of awicm's `--setup jaxcpl` (plan ~/awicm_jax/docs/plans/20261103-jaxcpl-core3.md): FESOM2 CORE3
+# (220,509 nodes) with ice-shelf cavities, linfs, single precision, started from jaxcpl's 1855-01-01 spinup ocean and
+# sea ice (lane L-OCN, docs/lanes/core3.md), with jaxcpl's ocean physics blocks of lane L-SFC
+# (configs/core2_cpl_jaxcpl.yaml, docs/lanes/core3_sfc.md).
+#
+# * mesh: lane L-OCN's CORE3 bundle; global node order = FESOM's nod2d.out order (lane L-CPL's weights rely on it).
+# * partition: serial here; dist_N (N = 1, 2, 4, 8, 16, 128) lives in FESOM_DIST_DIR =
+#   /work/ba1583/a270088/awicm/core3/ocn/mesh_core3_raw (pass partition: dist_N / init_ocean(partition=...)).
+# * restart: the converted jaxcpl restart dated 1855-01-01, step 0 of 1855: init_ocean(year0=1855).
+# * cavity: jaxcpl's cavity_gamma_scale 0.6 (linfs only; the coupled path turns its cavity branches on from this block).
+
+ale: null          # linfs (jaxcpl which_ale)
+gm:
+  k_gm_max: 2500.0
+  redi_kmax_default: 1000.0
+  k_gm_max_nh: 1000.0
+  k_gm_hemi_trans: 10.0
+kpp: null
+tke: {}
+ice:
+  whichEVP: 1
+  alpha_evp: 300.0
+  beta_evp: 300.0
+  ice_diff: 0.0
+  albsn: 0.82
+  albsnm: 0.65
+  albi: 0.70
+  albim: 0.68
+  albw: 0.1
+  mevp_mass_floor: true
+  metric_factor_zero: true
+  cpl_meltponds: true
+  snowmelt_tgate: false
+  alb_tramp: 1.0
+  pnd_rfracmax: 0.6
+  pnd_aspect: 1.6
+cavity:
+  gamma_scale: 0.6
+visc:
+  opt_visc: 5
+  easybsreturn: 1.5
+tracer: {}
+
+dt: 1800.0
+
+mesh: /work/ba1583/a270088/awicm/core3/ocn/mesh_core3
+partition: serial
+forcing:
+  kind: core2
+  start_year: 1855
+ssh:
+  cheb_degree: 3
+  cheb_kappa: 30.0
+  gathered: true
+gpu:
+  column_unroll: true
+  ssh_ell: true
+  cg_batch: 4
+  mevp_unroll: 12
+  column_kernel: true
+  ssh_inc_ell: true
+  ordered_sums: true
+  output_async: true
+  restart_async: true
+  forcing_ahead: 2
+output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/cpl
+snapshot_every: 48
+checkpoint_every: 1440
+restart_in: /work/ba1583/a270088/awicm/core3/ocn/restart_jaxcpl_18550101_as_1855_v2
+restart_out: null
+duration: 31d
+precision: single
