@@ -235,7 +235,7 @@ def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None, density_ref=None, cavity: boo
     bulk_dn = b0 + zmean * (bpz + zmean * bpz2)
     rho_up_n = bulk_up * _shift_down(rhopot) / (bulk_up + 0.1 * zmean * _STATE_EQ_INT)
     rho_dn_n = bulk_dn * rhopot / (bulk_dn + 0.1 * zmean * _STATE_EQ_INT)
-    bv = -g * (1.0 / zdiff) * (rho_up_n - rho_dn_n) / rho_ref            # (nod2D,nl)
+    bv = -g * (1.0 / zdiff) * (rho_up_n - rho_dn_n) / DENSITY_0          # (nod2D,nl); density_0 also with use_density_ref (F90:295)
 
     # pad surface/bottom interfaces: bvfreq[nzmin]=bv[nzmin+1], bvfreq[nzmax]=bv[nzmax-1].
     # Equivalent to gathering bv at clip(nz, nzmin+1, nzmax-1) over the interface range.

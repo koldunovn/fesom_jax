@@ -221,7 +221,9 @@ What the replay checked (job 28696654, `scripts/core3/replay_cavity_melt.py`): s
 | melt + shelf drag replay, double precision, vs DP oracle `run_cav_dp`, steps 1-2 | 28697533 | heat flux max 1.1e-16 of max |flux| (bitwise 99.6 %), water flux 1.1e-16 (99.7 %), drag bitwise. A first DP comparison (28697305) was off by 7e-8: I had emulated bare Fortran literals as float32, but FESOM builds with `-r8`; fixed in `cavity.py` |
 | `eos.reference_density` + `pressure_bv(density_ref=, cavity=True)` vs DP oracle, steps 1-2 | 28697498 | `density_ref` bitwise everywhere; density 2.4e-14 of its max (incl. the 152,242 shelf-level fill values, max 4.5e-13 kg/m^3); hpressure 2.5e-14 at cavity nodes (the cavity `hpressure(nzmin)` branch), 3.5e-14 open |
 | the same, single precision vs SP oracle | 28697161 | density_ref 2.3e-7, density 2.5e-5, pressure 5.4e-5 of max (float32 + geometry; ~15-20 % bitwise) |
-| **open: N^2 (`bvfreq`, substep 1)** | 28697498 | fesom_jax's smoothed N^2 differs from FESOM main's by up to 2.7e-3 of max |N^2| (abs ~2e-5 s^-2) at EVERY level and node group, in double precision, while density/pressure agree to 1e-14: a main-vs-port difference, not a cavity one. The Fortran formula (oce_ale_pressure_bv.F90:285-330, `smooth_nod3D` gen_support.F90:107) reads the same as `eos.pressure_bv` + `eos.smooth_nod3D`; not found this session. Unsmoothed vs oracle: 0.5 of max, so the oracle is smoothed once |
+| N^2 (`bvfreq`, substep 1), double | 28697498 -> fix -> 28697820 | first 2.7e-3 of max at every node: my `pressure_bv` change divided N^2 by `density_ref` instead of `density_0` (F90:295 keeps `density_0`); a numpy re-derivation of FESOM's N^2 + `smooth_nod3D` matched the oracle to 1.2e-13 and isolated it. Fixed: N^2 1.2e-13 of max (interior 6e-16 abs), steps 1-2. **Substep 1 with cavities is green in double precision** |
+| the same, single | 28697821 | N^2 6.6e-5 of max, density 2.5e-5, pressure 5.5e-5 (float32 + the SP geometry) |
+| default path after the fix | 28697822 | 22 passed |
 | default path unchanged: `test_eos.py`, `test_dp_lock.py`, `test_prepare_mesh.py` | 28696826 | 22 passed |
 | bundle `area`, `areasvol`, `mesh_resolution`, `elem_area` vs the DP oracle's own `mesh%...` | run_cav_dp | rel 2.0e-12, 2.0e-12, 3.7e-13, 2.2e-12; zero outside the wet levels in both |
 | SP geometry: oracle `mesh%elem_area`/`area`/`areasvol` vs the bundle | run_cav3 (28696663) | elem_area rel median 1.8e-5, p99 1.8e-4, max 8.7e-4: FESOM SP derives the geometry in float32, fesom_jax SP rounds the float64 geometry (max 6e-8). The cavity `areasvol` rule itself agrees: the same 11,055 (node, level) values differ from `area` in both |
@@ -250,5 +252,4 @@ FESOM2 restart to a fesom_jax restart on CORE2; reuse it, add the SP rounding an
    open nodes separately).
 3. Wire what exists (`cavity:` config slot, `reference_density` once per run, `pressure_bv(..., cavity=True)`,
    `cavity.py` in the forcing / ice path), then the rest of the "todo" rows, each replayed against `run_cav_dp`.
-4. The open N^2 difference (substep 1, all nodes, 2.7e-3 of max) between FESOM main and fesom_jax: not cavity
-   related, but it is the first rung of the ladder; find it before the later substeps (tell lane L-SFC).
+4. Rungs 2-19 the same way (inputs from the oracle's full dumps of the previous substep, output vs the next).
