@@ -258,7 +258,7 @@ def host_folded(tree, npes):
     file I/O and coordination-service barriers."""
     if jax.process_count() <= 1:
         return jax.tree.map(lambda x: np.asarray(x) if isinstance(x, jax.Array) else x, tree)
-    from . import canonical_redist as cr
+    from . import canonical_redist as cr, halo
     gather = cr._allgather_callable(halo.device_mesh("p", devices=halo.first_devices(int(npes))), "p")
     return jax.tree.map(lambda x: np.asarray(gather(x)) if isinstance(x, jax.Array) and not x.is_fully_addressable
                         else (np.asarray(x) if isinstance(x, jax.Array) else x), tree)
