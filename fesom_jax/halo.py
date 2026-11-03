@@ -428,15 +428,42 @@ def halo_exchange_coloured(field, c: dict, meta, axis_name: str = DEFAULT_AXIS, 
 #: devices of :func:`jax.devices`, as always. awicm_jax's concurrent coupled run (the atmosphere on the first devices,
 #: the ocean on the next ones) sets it before :func:`fesom_jax.coupled.init_ocean`.
 DEVICE_OFFSET = 0
+#: An explicit device list (None: :data:`DEVICE_OFFSET` decides). awicm_jax's concurrent coupled run over several
+#: processes (one per node) puts the ocean on some GPUs of EVERY node, which is not a contiguous range of
+#: :func:`jax.devices`; it sets this list (global devices, the partition's rank order) before ``init_ocean``.
+DEVICES = None
 
 
 def first_devices(n):
-    """The ``n`` devices a partition of ``n`` ranks runs on: ``jax.devices()[DEVICE_OFFSET:DEVICE_OFFSET + n]``."""
-    o, n = int(DEVICE_OFFSET), int(n)
+    """The ``n`` devices a partition of ``n`` ranks runs on: the first ``n`` of :data:`DEVICES` when set, else
+    ``jax.devices()[DEVICE_OFFSET:DEVICE_OFFSET + n]``."""
+    n = int(n)
+    if DEVICES is not None:
+        devs = list(DEVICES)[:n]
+        if len(devs) < n:
+            raise ValueError(f"need {n} devices, halo.DEVICES has {len(DEVICES)}")
+        return devs
+    o = int(DEVICE_OFFSET)
     devs = jax.devices()[o:o + n]
     if len(devs) < n:
         raise ValueError(f"need {n} devices from device {o}, have {len(jax.devices())}")
     return devs
+
+
+_BARRIERS = [0]
+
+
+def process_barrier(tag: str, timeout_s: int = 3600):
+    """Every process waits here until all have arrived; a no-op with one process. The distributed runtime's
+    coordination-service barrier, NOT a device collective (``multihost_utils.sync_global_devices`` runs a program on
+    every device of every process: with the coupled run's atmosphere and ocean on different devices of the same
+    processes, driven from two threads, such a program can be queued in different orders on different processes
+    and hang). A counter makes each use's id unique; every process must call it the same number of times."""
+    if jax.process_count() <= 1:
+        return
+    from jax._src import distributed
+    _BARRIERS[0] += 1
+    distributed.global_state.client.wait_at_barrier(f"fesom_{tag}_{_BARRIERS[0]}", int(timeout_s * 1000))
 
 
 def device_mesh(axis_name: str = DEFAULT_AXIS, devices=None) -> Mesh:

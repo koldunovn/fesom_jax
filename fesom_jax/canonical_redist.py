@@ -235,7 +235,7 @@ def write_redistribute(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chu
     C = int(chunk_horiz) if chunk_horiz else n_global
     maps = _cached_maps(sm, part, C)
     glon, glat = node_lonlat(mesh)
-    devs = jax.devices()[:P] if devices is None else list(devices)
+    devs = halo.first_devices(P) if devices is None else list(devices)
     jmesh = halo.device_mesh("p", devices=devs)
 
     if jax.process_index() == 0:
@@ -295,7 +295,7 @@ def write_all_gather(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk
     gid, owned = _folded_gid_owned_nod(part, sm)
     g_idx = gid[owned]
     glon, glat = node_lonlat(mesh)
-    devs = jax.devices()[:P] if devices is None else list(devices)
+    devs = halo.first_devices(P) if devices is None else list(devices)
     jmesh = halo.device_mesh("p", devices=devs)
 
     # process→chunk-range assignment (disjoint, block) so writes never collide / need no lock
@@ -339,6 +339,4 @@ def write_all_gather(out_dir, fields, sm, part, mesh, *, chunk_horiz=None, chunk
 
 
 def _barrier(tag):
-    if jax.process_count() > 1:
-        from jax.experimental import multihost_utils
-        multihost_utils.sync_global_devices(tag)
+    halo.process_barrier(tag)          # the coordination service's barrier, no device program (halo.process_barrier)
