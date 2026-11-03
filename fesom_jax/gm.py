@@ -39,7 +39,7 @@ from jax import lax
 
 from . import gm_nn as _gm_nn
 from . import ops
-from .config import DENSITY_0, G, K_GM_MAX, REDI_KMAX
+from .config import DENSITY_0, G, K_GM_MAX, RAD, REDI_KMAX
 from .mesh import Mesh
 
 
@@ -85,6 +85,14 @@ class GMConfig(NamedTuple):
     # --- defaults for the differentiable ceilings (used when params is None) ---
     k_gm_max: float = K_GM_MAX       # = Params.k_gm default     (fesom_gm.c:357)
     redi_kmax_default: float = REDI_KMAX  # = Params.redi_kmax    (fesom_gm.c:362)
+
+    # --- FESOM main 0aaa2d73 switches for jaxcpl (lane L-SFC); the defaults are fesom_jax before them ---
+    # Hemispheric GM ceiling (oce_fer_gm.F90:295-303 init_Redi_GM, namelist.oce K_GM_max_NH / K_GM_hemi_trans):
+    # K_GM_max south of a transition zone, K_GM_max_NH north of it, linear in geographic latitude across
+    # K_GM_hemi_trans degrees centred on the equator. Only fer_K's ceiling (Ki keeps Redi_Kmax). < 0 = off
+    # (FESOM2's default, and the traced program is the one without it).
+    k_gm_max_nh: float = -1.0
+    k_gm_hemi_trans: float = 10.0
 
 
 def _safe_sqrt(x):
@@ -208,6 +216,12 @@ def init_redi_gm(mesh: Mesh, bvfreq, hnode_new, fer_tapfac, params, cfg: GMConfi
     inv_ref_sq = 1.0 / (cfg.refscalresol * cfg.refscalresol)
     scaling = jnp.minimum(_safe_sqrt(area_n * inv_ref_sq * 2.0), 1.0)   # (N,)
     fer_scal = scaling
+    if cfg.k_gm_max_nh >= 0.0:
+        # oce_fer_gm.F90:297-303: kmax_n = (1-w)·K_GM_max + w·K_GM_max_NH, w = clip((lat°+trans/2)/trans, 0, 1)
+        latd = mesh.geo_coord_nod2D[:, 1] / RAD
+        wnh = (latd + 0.5 * cfg.k_gm_hemi_trans) / max(cfg.k_gm_hemi_trans, 1.0e-6)
+        wnh = jnp.minimum(jnp.maximum(wnh, 0.0), 1.0)
+        k_gm = (1.0 - wnh) * k_gm + wnh * cfg.k_gm_max_nh
     k_top = jnp.maximum(scaling * k_gm, cfg.k_gm_min)       # (N,) fer_K[nzmin]
     ki_top = jnp.maximum(scaling * redi_kmax, cfg.k_gm_min)  # (N,) Ki[nzmin]
 

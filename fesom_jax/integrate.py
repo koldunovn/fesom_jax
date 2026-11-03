@@ -157,7 +157,7 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
     traces the identical program. Only the scanned steps are checkpointed: step 1 runs eagerly
     and keeps all of its residuals anyway."""
     if params is None:
-        params = Params.defaults()
+        params = Params.defaults(gm_cfg)
     _seg = remat_segments
     if _seg == -1:
         import math

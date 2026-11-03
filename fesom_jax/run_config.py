@@ -275,7 +275,7 @@ class RunConfig:
             return None
         from .gm_nn import load_gm_nn
         from .params import Params
-        return dataclasses.replace(Params.defaults(), gm_nn=load_gm_nn(self.params_file))
+        return dataclasses.replace(Params.defaults(self.gm), gm_nn=load_gm_nn(self.params_file))
 
     def ssh_cheb(self) -> tuple:
         """The CGPOLY knobs from the ``ssh:`` block as ``(degree, kappa_guess)``;

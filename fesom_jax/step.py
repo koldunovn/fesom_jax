@@ -141,7 +141,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     per-step inputs, and ``forcing_static`` from :func:`fesom_jax.recom.wiring.with_recom_static`."""
     st = state
     if params is None:
-        params = PR.wp_tree(Params.defaults())       # WP leaves in single precision (identity in double)
+        params = PR.wp_tree(Params.defaults(gm_cfg))       # WP leaves in single precision (identity in double)
     # Backward-only simplifications, one flag per term. None ⇒ all off ⇒ every `if _adj.x`
     # below is a dead branch and the traced graph is exactly the pre-existing one.
     _adj = adjoint_cfg if adjoint_cfg is not None else adjoint_stab.AdjointConfig()
@@ -467,8 +467,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     uv_rhsAB = _exch(uv_rhsAB, "elem")
 
     # 6 — biharmonic horizontal viscosity (splits internally to exchange u_b/v_b)
-    uv_rhs = _ckpt(lambda: momentum.visc_filt_bidiff(mesh, st.uv, uv_rhs, dt=dt, exch=_exch,
-                                                     visc_cfg=visc_cfg))()
+    uv_rhs = _ckpt(lambda: momentum.horizontal_viscosity(mesh, st.uv, uv_rhs, dt=dt, exch=_exch,
+                                                         visc_cfg=visc_cfg))()
     uv_rhs = _exch(uv_rhs, "elem")
 
     # w_split config (static; ale_cfg=None ⇒ off ⇒ byte-identical). Used at substeps 7 + 13.

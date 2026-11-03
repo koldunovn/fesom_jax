@@ -495,7 +495,7 @@ def run_gm_diag_sharded(sm: ShardedMesh, T_p, S_p, bvfreq_p, hnode_new_p, helem_
     spread is the upwind-flip floor, not a missing exchange)."""
     from . import gm
     if params is None:
-        params = Params.defaults()
+        params = Params.defaults(gm_cfg)
     fm, fm_spec = folded_mesh(sm)
     ha, ha_spec = _halo_arrays(sm)
     fT, fS, fbv, fhn = _fold(T_p), _fold(S_p), _fold(bvfreq_p), _fold(hnode_new_p)
@@ -1000,7 +1000,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             seq_folded = seq_folded._replace(co2_atm=co2)
         if use_tables:
             tab_folded = PR.cast_tree(tab_folded)
-        params = PR.cast_tree(params if params is not None else Params.defaults())
+        params = PR.cast_tree(params if params is not None else Params.defaults(gm_cfg))
 
     # forcing_static (device-constant) + the optional global boundary_node, as in run_steps_sharded.
     extras, extras_spec = [c["fsf"]], [c["fsf_spec"]]

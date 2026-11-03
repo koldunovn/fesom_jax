@@ -311,6 +311,33 @@ class IceConfig(NamedTuple):
     adjoint_thin_mass: float = 0.0
     adjoint_sweep_guard: float = 0.0
 
+    # ---- FESOM main 0aaa2d73 switches for jaxcpl (lane L-SFC); the defaults are fesom_jax before them ----
+    # mEVP (ice_maEVP.F90 EVPdynamics_m / stress_tensor_m of main; whichEVP=1 only):
+    #   mevp_mass_floor: the node mass factor 1/(max(M, 9)·area) (main, ice_maEVP.F90:393-394) instead of the port
+    #       base's M/((1 + M²)·area), M = ρᵢm + ρₛm_s per grid area [kg/m²];
+    #   mevp_zero_sigma: σ11/σ12/σ22 set to 0 on elements without ice (mean m_ice <= 0.01, cavity elements), each
+    #       sweep (main stress_tensor_m), instead of carried unchanged.
+    mevp_mass_floor: bool = False
+    mevp_zero_sigma: bool = False
+    # Coupled thermodynamics (fesom_jax.coupled.flux, ice_thermo_cpl.F90 of main; mode F only):
+    #   cpl_meltponds: namelist.ice use_meltponds of the coupled path (on by default there, as AWI-ESM3 v3.5.1);
+    #   snowmelt_tgate: snow melts only where the surface t > 273 K (MOD_ICE default .true.; jaxcpl .false.);
+    #   alb_tramp [K]: > 0 blends the frozen and the melting albedos linearly over alb_tramp K below 273.15 K
+    #       (ice_albedo, jaxcpl 1); 0 = the step at 273.15 K;
+    #   h_snowscale [m]: > 0 blends snow and bare-ice albedo with tanh(hsn/h_snowscale); 0 = the 1 mm step;
+    #   pnd_*: namelist.ice &meltpond (ice_meltponds.F90 module defaults; jaxcpl rfracmax 0.6, pndaspect 1.6).
+    cpl_meltponds: bool = True
+    snowmelt_tgate: bool = True
+    alb_tramp: float = 0.0
+    h_snowscale: float = 0.0
+    pnd_hi_min: float = 0.10
+    pnd_hs1: float = 0.03
+    pnd_rfracmin: float = 0.15
+    pnd_rfracmax: float = 1.00
+    pnd_aspect: float = 0.80
+    pnd_albpnd: float = 0.20
+    pnd_albpnd_frz: float = 0.36
+
     # ---- derived (fesom_ice.c:85-86, 233, 84) ----
     @property
     def cc(self) -> float:

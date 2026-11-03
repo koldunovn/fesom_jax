@@ -102,6 +102,18 @@ class CplForcing(NamedTuple):
     COUPLED_FLUX = True       # the step's dispatch mark (fesom_jax.step: the coupled ice step)
 
 
+def flux_config(ice_cfg) -> FluxConfig:
+    """The :class:`FluxConfig` of a run from its ``ice:`` block (``fesom_jax.ice.IceConfig``: ``cpl_meltponds``,
+    ``snowmelt_tgate``, ``pnd_*``). The IceConfig defaults give ``FluxConfig()``, the AWI-ESM3 v3.5.1 setting."""
+    if ice_cfg is None:
+        return FluxConfig()
+    pp = MeltPondParams(hi_min=ice_cfg.pnd_hi_min, hs1=ice_cfg.pnd_hs1, rfracmin=ice_cfg.pnd_rfracmin,
+                        rfracmax=ice_cfg.pnd_rfracmax, pndaspect=ice_cfg.pnd_aspect, albpnd=ice_cfg.pnd_albpnd,
+                        albpnd_frz=ice_cfg.pnd_albpnd_frz)
+    return FluxConfig(use_meltponds=bool(ice_cfg.cpl_meltponds), snowmelt_tgate=bool(ice_cfg.snowmelt_tgate),
+                      ponds=pp)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # init / forcing
 # ---------------------------------------------------------------------------------------------------------------
@@ -111,7 +123,7 @@ def init_flux(state, static):
     if getattr(state, "cpl_ice_temp", None) is None:
         dt = state.a_ice.dtype
         state = dataclasses.replace(state, **{k: jnp.full_like(state.a_ice, v, dtype=dt) for k, v in CPL_INIT.items()})
-    static.flux = FluxConfig()
+    static.flux = flux_config(static.cfg.ice)
     return state, static
 
 
@@ -303,10 +315,24 @@ def thermo_cpl(cfg, fc: FluxConfig, *, A, h, hsn, ice_temp_old, apnd, hpnd, ipnd
     on = A > AIMIN
     t = jnp.where(on, t_ice, ice_temp_old)        # A <= Aimin: t keeps the old ice_temp (Fortran's local t)
     ice_temp = jnp.where(on, t_ice, _tfrez(S_oc) + TMELT)
-    frozen = t < 273.15
-    alb_snow = jnp.where(frozen, cfg.albsn, cfg.albsnm)
-    alb_bare = jnp.where(frozen, cfg.albi, cfg.albim)
-    alb0 = jnp.where(h > 0.0, jnp.where(hsn > 0.001, alb_snow, alb_bare), 0.066)
+    alb_tramp = float(getattr(cfg, "alb_tramp", 0.0))
+    h_snowscale = float(getattr(cfg, "h_snowscale", 0.0))
+    if alb_tramp > 0.0:
+        # FESOM main ice_albedo: linear frozen -> melting over alb_tramp K below the melting point
+        fmelt = jnp.minimum(1.0, jnp.maximum(0.0, (t - 273.15 + alb_tramp) / alb_tramp))
+        alb_snow = cfg.albsn + fmelt * (cfg.albsnm - cfg.albsn)
+        alb_bare = cfg.albi + fmelt * (cfg.albim - cfg.albi)
+    else:
+        frozen = t < 273.15
+        alb_snow = jnp.where(frozen, cfg.albsn, cfg.albsnm)
+        alb_bare = jnp.where(frozen, cfg.albi, cfg.albim)
+    if h_snowscale > 0.0:
+        # FESOM main ice_albedo: smooth snow/bare blend, alpha_snow = tanh(hsn/h_snowscale)
+        alpha_snow = jnp.tanh(hsn / h_snowscale)
+        alb_np = alpha_snow * alb_snow + (1.0 - alpha_snow) * alb_bare
+    else:
+        alb_np = jnp.where(hsn > 0.001, alb_snow, alb_bare)
+    alb0 = jnp.where(h > 0.0, alb_np, 0.066)
     if fc.use_meltponds:
         alb = jnp.where(h > 0.0, _pond_albedo(hsn, apnd, ipnd, alb0, pp), alb0)
     else:
@@ -426,7 +452,7 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     if int(cfg.ice_ave_steps) != 1:
         raise NotImplementedError("mode F runs the sea ice every ocean step (ice_ave_steps = 1)")
     cfg = _with_ice_dt(cfg, dt)
-    fc = FluxConfig()
+    fc = flux_config(cfg)
     open_water = fs.open_water
     geo_lat = jnp.asarray(mesh.geo_coord_nod2D)[:, 1]
     srf = ice_coupling.ocean2ice(state)

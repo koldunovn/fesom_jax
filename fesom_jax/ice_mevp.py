@@ -98,7 +98,11 @@ def mevp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation,
     it = (cfg.rhoice * m_ice + cfg.rhosno * m_snow) / a_safe   # mean ice+snow thickness (:175)
     inv_thickness = jnp.where(ice_nod, 1.0 / jnp.maximum(it, 9.0), 0.0)   # limit small mass (:176)
     M = m_ice * cfg.rhoice + m_snow * cfg.rhosno              # per-area mass M (NOT /a_ice) (:178)
-    mass = jnp.where(ice_nod, M / ((1.0 + M * M) * area_safe), 0.0)        # T5 (:179)
+    if getattr(cfg, "mevp_mass_floor", False):
+        # FESOM main (ice_maEVP.F90:393-394): 1/(max(M, 9 kg/m²)·area)
+        mass = jnp.where(ice_nod, 1.0 / (jnp.maximum(M, 9.0) * area_safe), 0.0)
+    else:
+        mass = jnp.where(ice_nod, M / ((1.0 + M * M) * area_safe), 0.0)        # T5 (:179)
     # Derivative-only (IceConfig.adjoint_thin_mass; 0 = off, nothing traced): below that load the
     # velocity's dependence on the load leaves the tangent; the values are bitwise unchanged.
     thin = float(getattr(cfg, "adjoint_thin_mass", 0.0))
@@ -185,10 +189,11 @@ def mevp_iterate(cfg: IceConfig, mesh: Mesh, u_aux, v_aux, s11, s12, s22, st: Me
     s12n = det1 * s12 + pressure * eps12 * vale               # :258  (NO 0.5 — T2)
     s11n = det1 * s11 + 0.5 * pressure * (eps1 - delta + eps2 * vale)    # :259
     s22n = det1 * s22 + 0.5 * pressure * (eps1 - delta - eps2 * vale)    # :260
-    # element skip (`!ice_el` ⇒ σ frozen, carry old) — :693 continue
-    s11 = jnp.where(st.ice_el, s11n, s11)
-    s12 = jnp.where(st.ice_el, s12n, s12)
-    s22 = jnp.where(st.ice_el, s22n, s22)
+    # element skip (`!ice_el` ⇒ σ frozen, carry old) — :693 continue; FESOM main zeroes it (mevp_zero_sigma)
+    s_skip = (0.0, 0.0, 0.0) if getattr(cfg, "mevp_zero_sigma", False) else (s11, s12, s22)
+    s11 = jnp.where(st.ice_el, s11n, s_skip[0])
+    s12 = jnp.where(st.ice_el, s12n, s_skip[1])
+    s22 = jnp.where(st.ice_el, s22n, s_skip[2])
     if sigma_out_f is not None:
         s11, s12, s22 = (scale_tangent(s, sigma_out_f) for s in (s11, s12, s22))
 

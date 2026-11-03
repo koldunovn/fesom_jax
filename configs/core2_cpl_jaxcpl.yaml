@@ -1,0 +1,81 @@
+# jaxcpl's ocean physics (Jan's Fortran reference /work/bb1469/a270092/runtime/awicm3-develop/jaxcpl, FESOM main
+# 0aaa2d73 single precision; namelists run_18550101-18551231/work/namelist.{config,oce,ice,tra,dyn,cvmix}) on the CORE2
+# mesh, to exercise the switches of lane L-SFC (plan ~/awicm_jax/docs/plans/20261103-jaxcpl-core3.md) before the CORE3
+# mesh exists. configs/core3_cpl_jaxcpl.yaml takes these blocks over once lane L-OCN's CORE3 mesh, cavities and the
+# 1855 restart are in. The diff behind each value: docs/lanes/core3_sfc.md.
+#
+# Against configs/core2_cpl.yaml (AWI-ESM3 v3.5.1-like, zstar):
+#   * ale: still zstar. jaxcpl runs linfs (namelist.config which_ale 'linfs'), but fesom_jax's single precision is
+#     ported for zstar only (RunConfig.validate), and linfs with cavities is lane L-OCN's task. To run linfs today:
+#     ale: null, precision: double, restart_in: null (the CORE2 hindcast restart carries zstar layer thicknesses);
+#   * gm: K_GM_max 2500 (south) / K_GM_max_NH 1000 (north, 10 degree transition), Redi_Kmax 1000; the other GM/Redi
+#     values (scaling_resolution, scaling_gmzexp 500/0.6, scaling_odm95, redi_ktaper, K_GM_min 2, K_GM_cm 3,
+#     K_GM_cmin 0.1, Redi_Kmin 100) are fesom_jax's defaults already;
+#   * visc: opt_visc 5 (visc_filt_bcksct) with visc_easybsreturn 1.5 (namelist.dyn); gammas 0.003/0.1/0.285 = defaults;
+#   * ice: mEVP alpha/beta 300, ice_diff 0, albedos 0.82/0.65/0.70/0.68 (albw 0.1), FESOM main's mEVP mass factor and
+#     sigma reset, snowmelt_tgate false, alb_tramp 1 K, melt ponds with rfracmax 0.6, pndaspect 1.6 (albpnd 0.20,
+#     albpnd_frz 0.36 = defaults); the melt ponds and use_atm_ice_tskin are the coupled path's (mode F) defaults;
+#   * tke: namelist.cvmix param_tke = fesom_jax's TKE defaults; use_momix false, use_instabmix true (0.1) = defaults.
+# Not switched here: se_visc (jaxcpl runs the CG, use_ssh_se_subcycl false, so se_visc is inactive), cavities, the
+# CORE3 mesh, icebergs.
+
+ale: {}            # zstar (jaxcpl: linfs, see above)
+gm:
+  k_gm_max: 2500.0
+  redi_kmax_default: 1000.0
+  k_gm_max_nh: 1000.0
+  k_gm_hemi_trans: 10.0
+kpp: null
+tke: {}
+ice:
+  whichEVP: 1
+  alpha_evp: 300.0
+  beta_evp: 300.0
+  ice_diff: 0.0
+  albsn: 0.82
+  albsnm: 0.65
+  albi: 0.70
+  albim: 0.68
+  albw: 0.1
+  mevp_mass_floor: true
+  mevp_zero_sigma: true
+  cpl_meltponds: true
+  snowmelt_tgate: false
+  alb_tramp: 1.0
+  pnd_rfracmax: 0.6
+  pnd_aspect: 1.6
+visc:
+  opt_visc: 5
+  easybsreturn: 1.5
+tracer: {}
+
+dt: 1800.0
+
+mesh: data/mesh_core2
+partition: serial
+forcing:
+  kind: core2
+  start_year: 1958
+ssh:
+  cheb_degree: 3
+  cheb_kappa: 30.0
+  gathered: true
+gpu:
+  column_unroll: true
+  ssh_ell: true
+  cg_batch: 4
+  mevp_unroll: 12
+  column_kernel: true
+  ssh_inc_ell: true
+  ordered_sums: true
+  output_async: true
+  restart_async: true
+  forcing_ahead: 2
+output_dir: /work/ba1583/a270088/awicm/core3/sfc/runs
+snapshot_every: 48
+checkpoint_every: 1440
+# the same ocean initial state as configs/core2_cpl.yaml (the CORE2 hindcast v3 on 1989-01-01)
+restart_in: /work/ab0995/a270088/port_jax/runs/core2_hindcast_v3/restart_archive/fesom.1989.001.00000
+restart_out: null
+duration: 31d
+precision: single

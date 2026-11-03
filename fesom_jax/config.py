@@ -127,6 +127,12 @@ class ViscConfig(NamedTuple):
     gamma2: float = VISC_GAMMA2       # |Δu|² flow-aware coefficient
     gamma0_h: float = VISC_GAMMA0_H   # harmonic-stage floor (0 ⇒ pure biharmonic)
     gamma1_h: float = VISC_GAMMA1_H   # harmonic-stage |Δu| coefficient
+    # --- FESOM main 0aaa2d73 switches for jaxcpl (lane L-SFC); the defaults are fesom_jax before them ---
+    # namelist.dyn opt_visc: 7 = visc_filt_bidiff (the biharmonic above, the default), 5 = visc_filt_bcksct (the
+    # harmonic flow-aware viscosity with easy backscatter, oce_dyn.F90:318-460, jaxcpl's choice:
+    # momentum.visc_filt_bcksct). Other options are not ported and raise.
+    opt_visc: int = 7
+    easybsreturn: float = VISC_EASYBSRETURN   # namelist.dyn visc_easybsreturn (opt_visc 5 only; jaxcpl 1.5)
 
 
 # Tracer advection scheme (Phase 4 MFCT/QR4C/FCT). num_ord is HARD-CODED into the
