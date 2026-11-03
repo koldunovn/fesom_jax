@@ -16,6 +16,43 @@ Branch `coupled/core3_sfc` from `5b88770` (tag `awicm-v0-tco95-core2`). Outputs:
   path has no ponds and needs none (FESOM2's `ice_thermo_oce.F90` has none either).
 - Task 3: `configs/core2_cpl_jaxcpl.yaml` (CORE2, zstar, single precision). The CORE3 config waits for lane L-OCN.
 
+## Status (2026-11-03, session 3)
+
+On `merge/core3_ocn` ba2a797 (lane L-OCN's cavities in the step), against L-OCN's double-precision CORE3 cavity
+oracle `run_cav_dp` and this lane's instrumented copy of it (`oracle_core2/run_cav_dp_evp`, the same namelists,
+restart and source plus sea-ice dumps), split as L-OCN's ladder (cavity / shelf front = open node touching a cavity
+cell / open), max |diff| / max |field| (p99):
+
+| rung | job | cavity | front | open | control |
+|---|---|---|---|---|---|
+| 6 viscosity opt_visc 5 (Δuv_rhs) | 28703336 | 3.0e-14 | 3.6e-14 | 2.3e-13 | opt_visc 7: 0.20 / 0.26 / 2.9 |
+| 14 GM fer_uv, jaxcpl | 28703486 | **0.18** (p99 3.3e-2) | **6.0e-2** (p99 7.3e-3) | 1.1e-13 | no hemispheric ceiling: open 1.25 |
+| 14 GM fer_uv with FESOM's stale template emulated (below) | 28703486 | 4.0e-14 | 4.1e-14 | 1.1e-13 | |
+| 18 mEVP u/v_ice on the oracle's EVPdynamics_m inputs (metric_factor_zero, mass floor, front = coast) | 28703447 | - (cleaned) | bitwise (0 in both) | 2.1e-7 | metric terms: 4.6e-2; front not a coast: 1.33 |
+| 18 ice FCT + cut_off + cavity cleaning, a_ice | 28703336 -> 28703447 | bitwise | **4.2e-2 -> 1.0e-14** | 3.0e-3 -> 9.4e-15 | |
+| 18 the same, m_ice / m_snow | 28703447 | bitwise | 9.3e-16 / 7.5e-16 | 3.0e-15 / 1.5e-15 | |
+
+**The shelf-front sea-ice difference (L-OCN's whole-step a_ice 0.08 at the front) is the ice FCT limiter.**
+FESOM's `ice_fem_fct` bounds each node by the old and low-order values of its `nn_pos` neighbours (ice_fct.F90:518-547),
+and `nn_pos` includes the cavity nodes next to a front node (ice 0 there). fesom_jax took the bounds over the node's
+open elements only, so a front node could never be drained below its open neighbours' minimum. Fixed in
+`fesom_jax/ice_adv._fem_fct`: the bounds come from all elements around the node (identical off the cavities, where
+every element is open; pad elements have ulevels 0 and node -1 and were already included). Not in cavity.py.
+
+**GM at the shelf: an upstream FESOM bug that jaxcpl runs.** At the 7,237 nodes with `ulevels_nod2D /=
+ulevels_nod2D_max` (1,104 of them the front), FESOM main's `init_Redi_GM` writes the surface template
+`fer_k(nzmin,n)` at the conservative level `nzmin = ulevels_nod2D_max` (F1 loop) but builds the profile from
+`fer_k(ulevels_nod2D(n),n)` (F2 loop, `nzmin` redefined), which holds what the previous step left there: 500 m²/s at
+setup (`oce_setup_step.F90:1042`, not restarted), then times `zscaling(ulevels_nod2D)` every step. So in jaxcpl the
+GM coefficient there is `500·zscaling(z)` at the front (zscaling = 1 at the sea surface, so it stays 500 for good) and
+`500·zscaling(z_top)^(n-1)·zscaling(z)` under the shelves (dying off within tens of steps of each leg), whatever
+K_GM_max, the resolution scaling or the hemispheric ceiling say. The emulation in rung 14 (step 1) reproduces the
+oracle to 4e-14. fesom_jax does what the code intends (the template at every node). **Not ported; decision needed**
+(reproduce jaxcpl's bug behind a GM switch, or report it to FESOM/Jan and keep the intended behaviour). Reproducing it
+exactly needs the step count since the leg's start (fer_K is not in FESOM's restart); its steady state (front 500·zs,
+the other mismatched nodes 0) needs none. The fix in FESOM would be one line: write the template at
+`mesh%ulevels_nod2D(n)` in the F1 loop (or read `fer_k(nzmin_cons)` in F2).
+
 ## Status (2026-11-03, session 2)
 
 - Rung 2 of the ladder against FESOM main 0aaa2d73 (lane L-OCN's oracle builds, read only) on **CORE2 without
