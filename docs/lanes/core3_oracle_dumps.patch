@@ -1,0 +1,704 @@
+From 39938426c49a466475a48b2738f66892a34975e4 Mon Sep 17 00:00:00 2001
+From: a270088 <a270088@levante>
+Date: Tue, 3 Nov 2026 16:18:32 +0100
+Subject: [PATCH 1/2] fesom_jax reference dumps: env-gated probe and full-field
+ dumps per substep (SP-aware, element fields, forcing/ice stages)
+
+---
+ src/fesom_dump_core3.F90       | 272 +++++++++++++++++++++++++++++++++
+ src/fesom_dump_core3_hooks.F90 |  55 +++++++
+ src/fesom_module.F90           |   7 +
+ src/oce_ale.F90                |  63 ++++++++
+ 4 files changed, 397 insertions(+)
+ create mode 100644 src/fesom_dump_core3.F90
+ create mode 100644 src/fesom_dump_core3_hooks.F90
+
+diff --git a/src/fesom_dump_core3.F90 b/src/fesom_dump_core3.F90
+new file mode 100644
+index 0000000..5bb2325
+--- /dev/null
++++ b/src/fesom_dump_core3.F90
+@@ -0,0 +1,272 @@
++!==============================================================================
++! fesom_dump_core3.F90 -- env-gated reference dumps of FESOM2 main for the
++! fesom_jax (fesom2-jax) verification ladder, ported from port2/fesom2's
++! fesom_dump_shim.F90 and extended for single precision, element fields and
++! ice-shelf cavities. A no-op unless FESOM_DUMP_DIR is set.
++!
++! Environment:
++!   FESOM_DUMP_DIR         output directory (required; enables the dumps)
++!   FESOM_DUMP_MAXSTEPS    record steps 1..MAXSTEPS (default 4)
++!   FESOM_DUMP_PROBES      text file of node global ids (1-based), one per line
++!   FESOM_DUMP_PROBES_ELEM text file of element global ids (1-based), one per line
++!   FESOM_DUMP_FULL_STEPS  also write FULL owned fields for steps 1..N (default 0)
++!
++! Probe files <dir>/probe_nod.<mype:05d> and <dir>/probe_elem.<mype:05d> use the
++! record layout of fesom_jax/io_dump.py (little-endian stream, no header):
++!   int32 step, int32 substep_id, int32 global_id (1-based), int32 nvals,
++!   char[24] field_name, real64 values[nvals]
++! A node column is written over levels 1..nlevels_nod2D(n) (cavity levels
++! 1..ulevels_nod2D-1 INCLUDED, as stored), an element column over
++! 1..nlevels(e)-1 (2-component element fields: all of component 1, then all
++! of component 2), a 2-D field as nvals=1. Values are converted to real64.
++!
++! Full fields <dir>/full/s<step>_<substep>_<name>.<mype:05d>:
++!   int32 n_owned, int32 ncol, int32 gid(n_owned), real64 vals(ncol, n_owned)
++! (the whole stored column, no truncation; owned nodes/elements only).
++!==============================================================================
++module fesom_dump_core3
++  use, intrinsic :: iso_fortran_env, only: int32, real32, real64
++  implicit none
++  private
++
++  integer, parameter, public :: DS_INIT=0, DS_PRESSURE_BV=1, DS_SW_AB=2, DS_PGF=3, DS_MIXING=4, &
++       DS_VEL_RHS=5, DS_VISC_FILTER=6, DS_IMPL_VISC=7, DS_SSH_RHS=8, DS_SSH_SOLVE=9, &
++       DS_UPDATE_VEL=10, DS_HBAR=11, DS_ETA_N=12, DS_ALE=13, DS_GM_BOLUS=14, DS_TRACERS=15, &
++       DS_THICKNESS=16, DS_ATM_FORCING=17, DS_ICE_STEP=18, DS_OCE_FLUXES=19
++
++  logical, save :: inited = .false.
++  logical, save, public :: dump_on = .false.
++  integer, save :: unit_nod = -1, unit_elem = -1
++  integer, save :: max_steps = 4, full_steps = 0, mype_s = 0
++  character(len=512), save :: ddir = ''
++  integer, allocatable, save :: pn_loc(:), pn_gid(:), pe_loc(:), pe_gid(:)
++  integer, allocatable, save :: gl_nod(:), gl_elem(:)
++  integer, save :: n_own_nod = 0, n_own_elem = 0
++
++  interface dump_nod
++     module procedure dump_nod_3d_r4, dump_nod_3d_r8, dump_nod_2d_r4, dump_nod_2d_r8
++  end interface
++  interface dump_elem
++     module procedure dump_elem_3d_r4, dump_elem_3d_r8, dump_elem_uv_r4, dump_elem_uv_r8, &
++                      dump_elem_2d_r4, dump_elem_2d_r8
++  end interface
++  public :: dump_core3_init, dump_nod, dump_elem, dump_core3_finalize, dump_active
++
++contains
++
++  logical function dump_active(step)
++    integer, intent(in) :: step
++    dump_active = dump_on .and. step >= 0 .and. step <= max_steps
++  end function dump_active
++
++  subroutine read_ids(path, ids)
++    character(len=*), intent(in) :: path
++    integer, allocatable, intent(out) :: ids(:)
++    integer :: u, ios, k, v, cnt
++    cnt = 0
++    open(newunit=u, file=trim(path), status='old', action='read', iostat=ios)
++    if (ios /= 0) then
++       allocate(ids(0)); return
++    end if
++    do
++       read(u, *, iostat=ios) v
++       if (ios /= 0) exit
++       cnt = cnt + 1
++    end do
++    rewind(u)
++    allocate(ids(cnt))
++    do k = 1, cnt
++       read(u, *) ids(k)
++    end do
++    close(u)
++  end subroutine read_ids
++
++  subroutine resolve(ids, mylist, ndim, loc)
++    integer, intent(in) :: ids(:), mylist(:), ndim
++    integer, allocatable, intent(out) :: loc(:)
++    integer :: i, j
++    allocate(loc(size(ids))); loc = -1
++    do i = 1, size(ids)
++       do j = 1, ndim
++          if (mylist(j) == ids(i)) then
++             loc(i) = j; exit
++          end if
++       end do
++    end do
++  end subroutine resolve
++
++  subroutine dump_core3_init(mype, myDim_nod2D, myList_nod2D, myDim_elem2D, myList_elem2D)
++    integer, intent(in) :: mype, myDim_nod2D, myDim_elem2D
++    integer, intent(in) :: myList_nod2D(:), myList_elem2D(:)
++    character(len=512) :: env, fname
++    integer :: ios, ln
++    integer, allocatable :: ids(:)
++    if (inited) return
++    inited = .true.
++    call get_environment_variable('FESOM_DUMP_DIR', ddir, length=ln, status=ios)
++    if (ios /= 0 .or. ln == 0) return
++    call get_environment_variable('FESOM_DUMP_MAXSTEPS', env, status=ios)
++    if (ios == 0 .and. len_trim(env) > 0) read(env, *, iostat=ios) max_steps
++    call get_environment_variable('FESOM_DUMP_FULL_STEPS', env, status=ios)
++    if (ios == 0 .and. len_trim(env) > 0) read(env, *, iostat=ios) full_steps
++    mype_s = mype
++    n_own_nod = myDim_nod2D; n_own_elem = myDim_elem2D
++    allocate(gl_nod(myDim_nod2D), gl_elem(myDim_elem2D))
++    gl_nod = myList_nod2D(1:myDim_nod2D); gl_elem = myList_elem2D(1:myDim_elem2D)
++    call get_environment_variable('FESOM_DUMP_PROBES', env, status=ios)
++    if (ios == 0 .and. len_trim(env) > 0) then
++       call read_ids(env, ids)
++    else
++       allocate(ids(0))
++    end if
++    pn_gid = ids
++    call resolve(ids, myList_nod2D, myDim_nod2D, pn_loc)
++    deallocate(ids)
++    call get_environment_variable('FESOM_DUMP_PROBES_ELEM', env, status=ios)
++    if (ios == 0 .and. len_trim(env) > 0) then
++       call read_ids(env, ids)
++    else
++       allocate(ids(0))
++    end if
++    pe_gid = ids
++    call resolve(ids, myList_elem2D, myDim_elem2D, pe_loc)
++    write(fname, '(A,"/probe_nod.",I5.5)') trim(ddir), mype
++    open(newunit=unit_nod, file=trim(fname), status='replace', form='unformatted', &
++         access='stream', action='write', iostat=ios)
++    if (ios /= 0) return
++    write(fname, '(A,"/probe_elem.",I5.5)') trim(ddir), mype
++    open(newunit=unit_elem, file=trim(fname), status='replace', form='unformatted', &
++         access='stream', action='write', iostat=ios)
++    if (ios /= 0) return
++    dump_on = .true.
++    if (mype == 0) print *, '[fesom_dump_core3] active: dir=', trim(ddir), ' max_steps=', max_steps, &
++         ' full_steps=', full_steps, ' node probes=', size(pn_gid), ' elem probes=', size(pe_gid)
++  end subroutine dump_core3_init
++
++  subroutine dump_core3_finalize()
++    if (.not. dump_on) return
++    close(unit_nod); close(unit_elem)
++    dump_on = .false.
++  end subroutine dump_core3_finalize
++
++  ! ---- the one real64 writer every interface goes through ---------------------
++  ! col(:, i): the stored column of owned point i (ncol values); nv(i): how many to
++  ! write to the probe record (the wet column), gids/locs: the probes.
++  subroutine emit(step, sub, name, unit, cols, nv, pgid, ploc, glist, nown)
++    integer, intent(in) :: step, sub, unit, nown
++    character(len=*), intent(in) :: name
++    real(real64), intent(in) :: cols(:,:)
++    integer, intent(in) :: nv(:), pgid(:), ploc(:), glist(:)
++    character(len=24) :: n24
++    character(len=700) :: fname
++    integer :: i, l, u, ios
++    n24 = name
++    do i = 1, size(pgid)
++       l = ploc(i)
++       if (l <= 0) cycle
++       write(unit) int(step,int32), int(sub,int32), int(pgid(i),int32), int(nv(l),int32), n24, &
++                   cols(1:nv(l), l)
++    end do
++    if (step <= full_steps) then
++       write(fname, '(A,"/full/s",I0,"_",I0,"_",A,".",I5.5)') trim(ddir), step, sub, trim(name), mype_s
++       open(newunit=u, file=trim(fname), status='replace', form='unformatted', access='stream', &
++            action='write', iostat=ios)
++       if (ios /= 0) return
++       write(u) int(nown,int32), int(size(cols,1),int32), int(glist(1:nown),int32), cols(:, 1:nown)
++       close(u)
++    end if
++  end subroutine emit
++
++  ! ---- nodes ----------------------------------------------------------------
++  subroutine dump_nod_3d_r8(step, sub, name, f, nlev)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real64), intent(in) :: f(:,:)
++    integer, intent(in) :: nlev(:)
++    integer :: nv(n_own_nod)
++    if (.not. dump_active(step)) return
++    nv = min(nlev(1:n_own_nod), size(f,1))
++    call emit(step, sub, name, unit_nod, f(:, 1:n_own_nod), nv, pn_gid, pn_loc, gl_nod, n_own_nod)
++  end subroutine dump_nod_3d_r8
++  subroutine dump_nod_3d_r4(step, sub, name, f, nlev)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real32), intent(in) :: f(:,:)
++    integer, intent(in) :: nlev(:)
++    if (.not. dump_active(step)) return
++    call dump_nod_3d_r8(step, sub, name, real(f(:, 1:n_own_nod), real64), nlev)
++  end subroutine dump_nod_3d_r4
++  subroutine dump_nod_2d_r8(step, sub, name, f)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real64), intent(in) :: f(:)
++    integer :: nv(n_own_nod)
++    if (.not. dump_active(step)) return
++    nv = 1
++    call emit(step, sub, name, unit_nod, reshape(f(1:n_own_nod), [1, n_own_nod]), nv, pn_gid, pn_loc, &
++              gl_nod, n_own_nod)
++  end subroutine dump_nod_2d_r8
++  subroutine dump_nod_2d_r4(step, sub, name, f)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real32), intent(in) :: f(:)
++    if (.not. dump_active(step)) return
++    call dump_nod_2d_r8(step, sub, name, real(f(1:n_own_nod), real64))
++  end subroutine dump_nod_2d_r4
++
++  ! ---- elements ---------------------------------------------------------------
++  subroutine dump_elem_3d_r8(step, sub, name, f, nlev)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real64), intent(in) :: f(:,:)
++    integer, intent(in) :: nlev(:)
++    integer :: nv(n_own_elem)
++    if (.not. dump_active(step)) return
++    nv = min(nlev(1:n_own_elem) - 1, size(f,1))
++    call emit(step, sub, name, unit_elem, f(:, 1:n_own_elem), nv, pe_gid, pe_loc, gl_elem, n_own_elem)
++  end subroutine dump_elem_3d_r8
++  subroutine dump_elem_3d_r4(step, sub, name, f, nlev)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real32), intent(in) :: f(:,:)
++    integer, intent(in) :: nlev(:)
++    if (.not. dump_active(step)) return
++    call dump_elem_3d_r8(step, sub, name, real(f(:, 1:n_own_elem), real64), nlev)
++  end subroutine dump_elem_3d_r4
++  ! (2, nl-1, elem) vectors: written as two named fields <name>_1, <name>_2
++  subroutine dump_elem_uv_r8(step, sub, name, f, nlev)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real64), intent(in) :: f(:,:,:)
++    integer, intent(in) :: nlev(:)
++    if (.not. dump_active(step)) return
++    call dump_elem_3d_r8(step, sub, trim(name)//'_1', f(1, :, 1:n_own_elem), nlev)
++    call dump_elem_3d_r8(step, sub, trim(name)//'_2', f(2, :, 1:n_own_elem), nlev)
++  end subroutine dump_elem_uv_r8
++  subroutine dump_elem_uv_r4(step, sub, name, f, nlev)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real32), intent(in) :: f(:,:,:)
++    integer, intent(in) :: nlev(:)
++    if (.not. dump_active(step)) return
++    call dump_elem_uv_r8(step, sub, name, real(f(:, :, 1:n_own_elem), real64), nlev)
++  end subroutine dump_elem_uv_r4
++  subroutine dump_elem_2d_r8(step, sub, name, f)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real64), intent(in) :: f(:)
++    integer :: nv(n_own_elem)
++    if (.not. dump_active(step)) return
++    nv = 1
++    call emit(step, sub, name, unit_elem, reshape(f(1:n_own_elem), [1, n_own_elem]), nv, pe_gid, pe_loc, &
++              gl_elem, n_own_elem)
++  end subroutine dump_elem_2d_r8
++  subroutine dump_elem_2d_r4(step, sub, name, f)
++    integer, intent(in) :: step, sub
++    character(len=*), intent(in) :: name
++    real(real32), intent(in) :: f(:)
++    if (.not. dump_active(step)) return
++    call dump_elem_2d_r8(step, sub, name, real(f(1:n_own_elem), real64))
++  end subroutine dump_elem_2d_r4
++
++end module fesom_dump_core3
+diff --git a/src/fesom_dump_core3_hooks.F90 b/src/fesom_dump_core3_hooks.F90
+new file mode 100644
+index 0000000..7705384
+--- /dev/null
++++ b/src/fesom_dump_core3_hooks.F90
+@@ -0,0 +1,55 @@
++!==============================================================================
++! Forcing/ice-stage hooks of the fesom_jax reference dumps (see fesom_dump_core3.F90).
++! Called from the main loop (fesom_module.F90) after update_atm_forcing,
++! ice_timestep and oce_fluxes; a no-op unless FESOM_DUMP_DIR is set.
++!==============================================================================
++module fesom_dump_core3_hooks
++  use fesom_dump_core3
++  implicit none
++  private
++  public :: dump_core3_stage
++contains
++  subroutine dump_core3_stage(n, stage, ice, partit, mesh)
++    use MOD_MESH
++    use MOD_PARTIT
++    use MOD_ICE
++    use o_ARRAYS, only: heat_flux, water_flux, virtual_salt, relax_salt, stress_surf, stress_node_surf
++    use g_forcing_arrays, only: shortwave, longwave, Tair, shum, u_wind, v_wind, prec_rain, prec_snow, &
++                                real_salt_flux
++    integer,        intent(in)            :: n, stage
++    type(t_ice),    intent(inout), target :: ice
++    type(t_partit), intent(inout), target :: partit
++    type(t_mesh),   intent(inout), target :: mesh
++    call dump_core3_init(partit%mype, partit%myDim_nod2D, partit%myList_nod2D, &
++                         partit%myDim_elem2D, partit%myList_elem2D)
++    if (.not. dump_active(n)) return
++    select case (stage)
++    case (DS_ATM_FORCING)
++       call dump_nod(n, stage, 'shortwave', shortwave)
++       call dump_nod(n, stage, 'longwave', longwave)
++       call dump_nod(n, stage, 'Tair', Tair)
++       call dump_nod(n, stage, 'shum', shum)
++       call dump_nod(n, stage, 'u_wind', u_wind)
++       call dump_nod(n, stage, 'v_wind', v_wind)
++       call dump_nod(n, stage, 'prec_rain', prec_rain)
++       call dump_nod(n, stage, 'prec_snow', prec_snow)
++    case (DS_ICE_STEP)
++       call dump_nod(n, stage, 'a_ice', ice%data(1)%values)
++       call dump_nod(n, stage, 'm_ice', ice%data(2)%values)
++       call dump_nod(n, stage, 'm_snow', ice%data(3)%values)
++       call dump_nod(n, stage, 'uice', ice%uice)
++       call dump_nod(n, stage, 'vice', ice%vice)
++    case (DS_OCE_FLUXES)
++       call dump_nod(n, stage, 'heat_flux', heat_flux)
++       call dump_nod(n, stage, 'water_flux', water_flux)
++       call dump_nod(n, stage, 'virtual_salt', virtual_salt)
++       call dump_nod(n, stage, 'relax_salt', relax_salt)
++       call dump_nod(n, stage, 'real_salt_flux', real_salt_flux)
++       call dump_elem(n, stage, 'stress_surf_x', stress_surf(1, :))
++       call dump_elem(n, stage, 'stress_surf_y', stress_surf(2, :))
++       call dump_nod(n, stage, 'stress_node_surf_x', stress_node_surf(1, :))
++       call dump_nod(n, stage, 'stress_node_surf_y', stress_node_surf(2, :))
++       call dump_nod(n, stage, 'a_ice', ice%data(1)%values)
++    end select
++  end subroutine dump_core3_stage
++end module fesom_dump_core3_hooks
+diff --git a/src/fesom_module.F90 b/src/fesom_module.F90
+index 0d703c9..eaeda8c 100755
+--- a/src/fesom_module.F90
++++ b/src/fesom_module.F90
+@@ -918,6 +918,8 @@ contains
+ 
+   subroutine fesom_runloop(current_nsteps)
+     use fesom_main_storage_module
++    use fesom_dump_core3_hooks, only: dump_core3_stage
++    use fesom_dump_core3, only: DS_ATM_FORCING, DS_ICE_STEP, DS_OCE_FLUXES
+ !   use openacc_lib
+     integer, intent(in) :: current_nsteps
+     ! EO parameters
+@@ -1119,6 +1121,7 @@ contains
+ #else
+             call update_atm_forcing(n, f%ice, f%tracers, f%dynamics, f%partit, f%mesh)
+ #endif
++            call dump_core3_stage(n, DS_ATM_FORCING, f%ice, f%partit, f%mesh)
+ #if defined (FESOM_PROFILING)
+         call fesom_profiler_end("update_atm_forcing")
+ #endif
+@@ -1151,6 +1154,7 @@ contains
+         call fesom_profiler_end("ice_timestep")
+ #endif
+             endif
++            call dump_core3_stage(n, DS_ICE_STEP, f%ice, f%partit, f%mesh)
+         end if
+ 
+         if (use_ice .or. .not. toy_ocean) then
+@@ -1165,6 +1169,7 @@ contains
+             f%t_ice_oflx_s = MPI_Wtime()
+             call oce_fluxes_mom(f%ice, f%dynamics, f%partit, f%mesh) ! momentum only
+             call oce_fluxes(f%ice, f%dynamics, f%tracers, f%partit, f%mesh)
++            call dump_core3_stage(n, DS_OCE_FLUXES, f%ice, f%partit, f%mesh)
+             f%t_ice_e = MPI_Wtime()
+         end if
+ 
+@@ -1450,6 +1455,7 @@ contains
+ 
+   subroutine fesom_finalize()
+     use fesom_main_storage_module
++    use fesom_dump_core3, only: dump_core3_finalize
+ #if defined(__MULTIO)
+     use iom
+     use mpp_io
+@@ -1462,6 +1468,7 @@ contains
+     integer           :: i 
+     real(kind=real32), allocatable :: mean_rtime(:), max_rtime(:), min_rtime(:)
+     allocate(mean_rtime(n_rtime), max_rtime(n_rtime), min_rtime(n_rtime))
++    call dump_core3_finalize()
+     
+     ! Start finalization profiling
+ #if defined (FESOM_PROFILING)
+diff --git a/src/oce_ale.F90 b/src/oce_ale.F90
+index aa991a8..132dc04 100644
+--- a/src/oce_ale.F90
++++ b/src/oce_ale.F90
+@@ -3697,6 +3697,7 @@ end subroutine impl_vert_visc_ale_acc
+ !===============================================================================
+ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     
++    use fesom_dump_core3
+     IMPLICIT NONE
+     integer       , intent(in)            :: n
+     type(t_dyn)   , intent(inout), target :: dynamics
+@@ -3715,6 +3716,8 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     ! pointer on necessary derived types
+     real(kind=WP), dimension(:), pointer :: eta_n
+     eta_n => dynamics%eta_n(:)
++    call dump_core3_init(partit%mype, partit%myDim_nod2D, partit%myList_nod2D, &
++                         partit%myDim_elem2D, partit%myList_elem2D)
+ !PS     water_flux = 0.0_WP
+ !PS     heat_flux  = 0.0_WP
+ !PS     stress_surf= 0.0_WP
+@@ -3732,6 +3735,11 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     call fesom_profiler_start("pd_pressure_bv")
+ #endif
+     call pressure_bv(tracers, partit, mesh)
++    if (dump_active(n)) then
++        call dump_nod(n, DS_PRESSURE_BV, 'density', density_m_rho0, mesh%nlevels_nod2D)
++        call dump_nod(n, DS_PRESSURE_BV, 'pressure', hpressure, mesh%nlevels_nod2D)
++        call dump_nod(n, DS_PRESSURE_BV, 'bvfreq', bvfreq, mesh%nlevels_nod2D)
++    end if
+ #if defined (FESOM_PROFILING)
+     call fesom_profiler_end("pd_pressure_bv")
+ #endif            !!!!! HeRE change is made. It is linear EoS now.
+@@ -3741,6 +3749,10 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     if (flag_debug .and. partit%mype==0)  print *, achar(27)//'[36m'//'     --> call pressure_force_4_...'//achar(27)//'[0m'
+     if (trim(which_ale)=='linfs') then
+         call pressure_force_4_linfs(tracers, partit, mesh)
++    if (dump_active(n)) then
++        call dump_elem(n, DS_PGF, 'pgf_x', pgf_x, mesh%nlevels)
++        call dump_elem(n, DS_PGF, 'pgf_y', pgf_y, mesh%nlevels)
++    end if
+     else  
+ #if defined (FESOM_PROFILING)
+         call fesom_profiler_start("pd_pressure_force")
+@@ -3764,6 +3776,10 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     call fesom_profiler_start("pd_alpha_beta")
+ #endif
+     call sw_alpha_beta(tracers%data(1)%values, tracers%data(2)%values, partit, mesh)
++    if (dump_active(n)) then
++        call dump_nod(n, DS_SW_AB, 'sw_alpha', sw_alpha, mesh%nlevels_nod2D)
++        call dump_nod(n, DS_SW_AB, 'sw_beta', sw_beta, mesh%nlevels_nod2D)
++    end if
+ #if defined (FESOM_PROFILING)
+     call fesom_profiler_end("pd_alpha_beta")
+ #endif
+@@ -3890,6 +3906,10 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+         if (flag_debug .and. partit%mype==0)  print *, achar(27)//'[36m'//'     --> call calc_cvmix_tke'//achar(27)//'[0m'
+         call calc_cvmix_tke(dynamics, partit, mesh)
+         call mo_convect(ice, partit, mesh)
++    if (dump_active(n)) then
++        call dump_nod(n, DS_MIXING, 'Kv', Kv, mesh%nlevels_nod2D)
++        call dump_elem(n, DS_MIXING, 'Av', Av, mesh%nlevels)
++    end if
+ #endif  
+     else if(mix_scheme_nmb==9) then
+         if (flag_debug .and. partit%mype==0)  print *, achar(27)//'[36m'//'     --> call oce_mixing_TOY'//achar(27)//'[0m'
+@@ -3925,6 +3945,9 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     call fesom_profiler_start("mom_vel_rhs") ! TEMP sub-timing (step 6 planning)
+ #endif
+     call compute_vel_rhs(ice, dynamics, partit, mesh)
++    if (dump_active(n)) then
++        call dump_elem(n, DS_VEL_RHS, 'uv_rhs', dynamics%uv_rhs, mesh%nlevels)
++    end if
+ #if defined (FESOM_PROFILING)
+     call fesom_profiler_end("mom_vel_rhs")
+ #endif
+@@ -3967,6 +3990,9 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     call fesom_profiler_start("mom_visc_filter") ! TEMP sub-timing
+ #endif
+     call viscosity_filter(dynamics%opt_visc, dynamics, partit, mesh)
++    if (dump_active(n)) then
++        call dump_elem(n, DS_VISC_FILTER, 'uv_rhs', dynamics%uv_rhs, mesh%nlevels)
++    end if
+ #if defined (FESOM_PROFILING)
+     call fesom_profiler_end("mom_visc_filter")
+ #endif
+@@ -4027,6 +4053,9 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+             call fesom_profiler_start("mom_impl_visc") ! TEMP sub-timing
+ #endif
+             call impl_vert_visc_ale(dynamics,partit, mesh)
++    if (dump_active(n)) then
++        call dump_elem(n, DS_IMPL_VISC, 'uv_rhs', dynamics%uv_rhs, mesh%nlevels)
++    end if
+ #if defined (FESOM_PROFILING)
+             call fesom_profiler_end("mom_impl_visc")
+ #endif
+@@ -4102,6 +4131,9 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+         call fesom_profiler_start("ssh_rhs")
+ #endif
+         call compute_ssh_rhs_ale(dynamics, partit, mesh)
++    if (dump_active(n)) then
++        call dump_nod(n, DS_SSH_RHS, 'ssh_rhs', dynamics%ssh_rhs)
++    end if
+ #if defined (FESOM_PROFILING)
+         call fesom_profiler_end("ssh_rhs")
+ #endif
+@@ -4112,6 +4144,9 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+         call fesom_profiler_start("ssh_cg")
+ #endif
+         call solve_ssh_ale(dynamics, partit, mesh)
++    if (dump_active(n)) then
++        call dump_nod(n, DS_SSH_SOLVE, 'd_eta', dynamics%d_eta)
++    end if
+ #if defined (FESOM_PROFILING)
+         call fesom_profiler_end("ssh_cg")
+ #endif
+@@ -4140,6 +4175,9 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+ #else
+         call update_vel(dynamics, partit, mesh)
+ #endif
++    if (dump_active(n)) then
++        call dump_elem(n, DS_UPDATE_VEL, 'uv', dynamics%uv, mesh%nlevels)
++    end if
+         
+         ! --> eta_(n) --> eta_(n+1) = eta_(n) + deta = eta_(n) + (eta_(n+1) + eta_(n))
+         t5=MPI_Wtime()
+@@ -4151,6 +4189,11 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+         ! Update to hbar(n+3/2) and compute dhe to be used on the next step
+         if (flag_debug .and. partit%mype==0)  print *, achar(27)//'[36m'//'     --> call compute_hbar_ale'//achar(27)//'[0m'
+         call compute_hbar_ale(dynamics, partit, mesh)
++    if (dump_active(n)) then
++        call dump_nod(n, DS_HBAR, 'hbar', mesh%hbar)
++        call dump_nod(n, DS_HBAR, 'hbar_old', mesh%hbar_old)
++        call dump_nod(n, DS_HBAR, 'ssh_rhs_old', dynamics%ssh_rhs_old)
++    end if
+ 
+         !___________________________________________________________________________
+         ! - Current dynamic elevation alpha*hbar(n+1/2)+(1-alpha)*hbar(n-1/2)
+@@ -4168,6 +4211,9 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+             if (mesh%ulevels_nod2D(node)==1) eta_n(node)=alpha*mesh%hbar(node)+(1.0_WP-alpha)*mesh%hbar_old(node)
+         end do
+ !$OMP END PARALLEL DO
++    if (dump_active(n)) then
++        call dump_nod(n, DS_ETA_N, 'eta_n', eta_n)
++    end if
+         ! --> eta_(n)
+         ! call zero_dynamics !DS, zeros several dynamical variables; to be used for testing new implementations!
+         t6=MPI_Wtime()
+@@ -4264,6 +4310,10 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+             call fer_gamma2vel_acc(dynamics, partit, mesh)
+         else
+             call fer_gamma2vel(dynamics, partit, mesh)
++    if (dump_active(n)) then
++        call dump_elem(n, DS_GM_BOLUS, 'fer_uv', dynamics%fer_uv, mesh%nlevels)
++        call dump_nod(n, DS_GM_BOLUS, 'fer_w', dynamics%fer_w, mesh%nlevels_nod2D)
++    end if
+         end if
+ #if defined (FESOM_PROFILING)
+         call fesom_profiler_end("gm_gamma2vel")
+@@ -4291,6 +4341,10 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     if (flag_debug .and. partit%mype==0)  print *, achar(27)//'[36m'//'     --> call vert_vel_ale'//achar(27)//'[0m'
+     if ( .not. dynamics%use_ssh_se_subcycl) then
+         call vert_vel_ale(dynamics, partit, mesh)
++    if (dump_active(n)) then
++        call dump_nod(n, DS_ALE, 'hnode_new', mesh%hnode_new, mesh%nlevels_nod2D)
++        call dump_nod(n, DS_ALE, 'w', dynamics%w, mesh%nlevels_nod2D)
++    end if
+     else
+         if (trim(which_ale)=='zstar' ) then
+             call compute_thickness_zstar(dynamics, partit, mesh)
+@@ -4317,6 +4371,11 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+     ! solve tracer equation
+     if (flag_debug .and. partit%mype==0)  print *, achar(27)//'[36m'//'     --> call solve_tracers_ale'//achar(27)//'[0m'
+     call solve_tracers_ale(ice, dynamics, tracers, partit, mesh)
++    if (dump_active(n)) then
++        call dump_nod(n, DS_TRACERS, 'T', tracers%data(1)%values, mesh%nlevels_nod2D)
++        call dump_nod(n, DS_TRACERS, 'S', tracers%data(2)%values, mesh%nlevels_nod2D)
++        call dump_nod(n, DS_TRACERS, 'Kv_after', Kv, mesh%nlevels_nod2D)
++    end if
+     t9=MPI_Wtime()
+ #if defined (FESOM_PROFILING)
+     call fesom_profiler_end("oce_tracer_solve")
+@@ -4361,6 +4420,10 @@ subroutine oce_timestep_ale(n, ice, dynamics, tracers, partit, mesh)
+ #else
+     call update_thickness_ale(partit, mesh)
+ #endif
++    if (dump_active(n)) then
++        call dump_nod(n, DS_THICKNESS, 'hnode', mesh%hnode, mesh%nlevels_nod2D)
++        call dump_elem(n, DS_THICKNESS, 'helem', mesh%helem, mesh%nlevels)
++    end if
+     t10=MPI_Wtime()
+ #if defined (FESOM_PROFILING)
+     call fesom_profiler_end("oce_thickness_update")
+-- 
+2.43.7
+
+
+From ee6b8283c4da1d9cdab653ec76f4da7dd42c6a1b Mon Sep 17 00:00:00 2001
+From: a270088 <a270088@levante>
+Date: Tue, 3 Nov 2026 16:25:30 +0100
+Subject: [PATCH 2/2] dumps: pre_fluxes stage (the ocean state oce_fluxes
+ reads: cavity melt inputs) and the static mesh areas at step 1
+
+---
+ src/fesom_dump_core3.F90       |  2 +-
+ src/fesom_dump_core3_hooks.F90 | 38 +++++++++++++++++++++++++++++++++-
+ src/fesom_module.F90           |  4 +++-
+ 3 files changed, 41 insertions(+), 3 deletions(-)
+
+diff --git a/src/fesom_dump_core3.F90 b/src/fesom_dump_core3.F90
+index 5bb2325..be1fa83 100644
+--- a/src/fesom_dump_core3.F90
++++ b/src/fesom_dump_core3.F90
+@@ -32,7 +32,7 @@ module fesom_dump_core3
+   integer, parameter, public :: DS_INIT=0, DS_PRESSURE_BV=1, DS_SW_AB=2, DS_PGF=3, DS_MIXING=4, &
+        DS_VEL_RHS=5, DS_VISC_FILTER=6, DS_IMPL_VISC=7, DS_SSH_RHS=8, DS_SSH_SOLVE=9, &
+        DS_UPDATE_VEL=10, DS_HBAR=11, DS_ETA_N=12, DS_ALE=13, DS_GM_BOLUS=14, DS_TRACERS=15, &
+-       DS_THICKNESS=16, DS_ATM_FORCING=17, DS_ICE_STEP=18, DS_OCE_FLUXES=19
++       DS_THICKNESS=16, DS_ATM_FORCING=17, DS_ICE_STEP=18, DS_OCE_FLUXES=19, DS_PRE_FLUXES=20
+ 
+   logical, save :: inited = .false.
+   logical, save, public :: dump_on = .false.
+diff --git a/src/fesom_dump_core3_hooks.F90 b/src/fesom_dump_core3_hooks.F90
+index 7705384..76d2da9 100644
+--- a/src/fesom_dump_core3_hooks.F90
++++ b/src/fesom_dump_core3_hooks.F90
+@@ -7,8 +7,44 @@ module fesom_dump_core3_hooks
+   use fesom_dump_core3
+   implicit none
+   private
+-  public :: dump_core3_stage
++  public :: dump_core3_stage, dump_core3_state
+ contains
++  ! The ocean state the forcing stage reads (before oce_fluxes_mom/oce_fluxes): the inputs of the cavity
++  ! three-equation melt and momentum fluxes (T, S, uvnode, uv, density, hnode, Z_3d_n, density_ref).
++  subroutine dump_core3_state(n, stage, dynamics, tracers, partit, mesh)
++    use MOD_MESH
++    use MOD_PARTIT
++    use MOD_DYN
++    use MOD_TRACER
++    use o_ARRAYS, only: density_m_rho0, density_ref
++    integer,        intent(in)            :: n, stage
++    type(t_dyn),    intent(inout), target :: dynamics
++    type(t_tracer), intent(inout), target :: tracers
++    type(t_partit), intent(inout), target :: partit
++    type(t_mesh),   intent(inout), target :: mesh
++    call dump_core3_init(partit%mype, partit%myDim_nod2D, partit%myList_nod2D, &
++                         partit%myDim_elem2D, partit%myList_elem2D)
++    if (.not. dump_active(n)) return
++    call dump_nod(n, stage, 'T', tracers%data(1)%values, mesh%nlevels_nod2D)
++    call dump_nod(n, stage, 'S', tracers%data(2)%values, mesh%nlevels_nod2D)
++    call dump_nod(n, stage, 'uvnode_1', dynamics%uvnode(1, :, :), mesh%nlevels_nod2D)
++    call dump_nod(n, stage, 'uvnode_2', dynamics%uvnode(2, :, :), mesh%nlevels_nod2D)
++    call dump_elem(n, stage, 'uv', dynamics%uv, mesh%nlevels)
++    call dump_nod(n, stage, 'density', density_m_rho0, mesh%nlevels_nod2D)
++    if (allocated(density_ref)) call dump_nod(n, stage, 'density_ref', density_ref, mesh%nlevels_nod2D)
++    call dump_nod(n, stage, 'hnode', mesh%hnode, mesh%nlevels_nod2D)
++    call dump_nod(n, stage, 'Z_3d_n', mesh%Z_3d_n, mesh%nlevels_nod2D)
++    call dump_nod(n, stage, 'eta_n', dynamics%eta_n)
++    call dump_nod(n, stage, 'hbar', mesh%hbar)
++    ! static geometry, to verify the fesom_jax mesh bundle (prepare_mesh.py --cavity) against FESOM itself
++    if (n == 1) then
++       call dump_nod(n, stage, 'area', mesh%area, mesh%nlevels_nod2D)
++       call dump_nod(n, stage, 'areasvol', mesh%areasvol, mesh%nlevels_nod2D)
++       call dump_nod(n, stage, 'mesh_resolution', mesh%mesh_resolution)
++       call dump_elem(n, stage, 'elem_area', mesh%elem_area)
++    end if
++  end subroutine dump_core3_state
++
+   subroutine dump_core3_stage(n, stage, ice, partit, mesh)
+     use MOD_MESH
+     use MOD_PARTIT
+diff --git a/src/fesom_module.F90 b/src/fesom_module.F90
+index eaeda8c..54160e9 100755
+--- a/src/fesom_module.F90
++++ b/src/fesom_module.F90
+@@ -919,7 +919,8 @@ contains
+   subroutine fesom_runloop(current_nsteps)
+     use fesom_main_storage_module
+     use fesom_dump_core3_hooks, only: dump_core3_stage
+-    use fesom_dump_core3, only: DS_ATM_FORCING, DS_ICE_STEP, DS_OCE_FLUXES
++    use fesom_dump_core3_hooks, only: dump_core3_state
++    use fesom_dump_core3, only: DS_ATM_FORCING, DS_ICE_STEP, DS_OCE_FLUXES, DS_PRE_FLUXES
+ !   use openacc_lib
+     integer, intent(in) :: current_nsteps
+     ! EO parameters
+@@ -1167,6 +1168,7 @@ contains
+         end if
+ #endif
+             f%t_ice_oflx_s = MPI_Wtime()
++            call dump_core3_state(n, DS_PRE_FLUXES, f%dynamics, f%tracers, f%partit, f%mesh)
+             call oce_fluxes_mom(f%ice, f%dynamics, f%partit, f%mesh) ! momentum only
+             call oce_fluxes(f%ice, f%dynamics, f%tracers, f%partit, f%mesh)
+             call dump_core3_stage(n, DS_OCE_FLUXES, f%ice, f%partit, f%mesh)
+-- 
+2.43.7
+

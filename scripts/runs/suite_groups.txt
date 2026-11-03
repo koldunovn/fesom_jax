@@ -170,6 +170,7 @@ core2 fesom_jax/tests/test_surface_adj.py
 ci fesom_jax/tests/test_surface_adj_unit.py
 unit fesom_jax/tests/test_adjoint_check.py
 core2 fesom_jax/tests/test_adjoint_costs.py
+core2 fesom_jax/tests/test_fortran_restart.py
 ci fesom_jax/tests/test_adjoint_check_unit.py
 ci fesom_jax/tests/test_tke_cuts.py
 unit fesom_jax/tests/test_tke_cuts_pi.py

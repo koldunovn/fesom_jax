@@ -71,6 +71,7 @@ from .gm import GMConfig
 from .ice import IceConfig
 from .kpp import KppConfig
 from .recom.config import RecomConfig
+from .cavity import CavityConfig
 from .tke import TkeConfig
 
 
@@ -90,7 +91,7 @@ class DtRamp(NamedTuple):
 # Map each physics slot name → its sub-config type (the (de)serialization registry).
 _SUBCONFIGS = {
     "ale": AleConfig, "gm": GMConfig, "kpp": KppConfig,
-    "tke": TkeConfig, "ice": IceConfig, "recom": RecomConfig,
+    "tke": TkeConfig, "ice": IceConfig, "recom": RecomConfig, "cavity": CavityConfig,
 }
 # Non-physics scalar/spec fields that pass through YAML verbatim.
 _SPEC_FIELDS = ("dt", "mesh", "partition", "precision", "forcing", "ssh", "gpu", "output_dir",
@@ -182,6 +183,7 @@ class RunConfig:
     tke: Optional[TkeConfig] = None        # None = no TKE (mutually exclusive with kpp)
     ice: Optional[IceConfig] = None        # None = no sea ice; IceConfig() = mEVP
     recom: Optional[RecomConfig] = None    # None = no REcoM biogeochemistry (fesom_jax.recom)
+    cavity: Optional[CavityConfig] = None  # None = no ice-shelf cavities (FESOM2 use_cavity; fesom_jax.cavity)
     # --- promoted run-dependent scalars ---
     visc: ViscConfig = ViscConfig()        # the horizontal-viscosity γ's (NG5: gamma1=0.2)
     tracer: TracerConfig = TracerConfig()  # the tracer scheme selector (implemented = NG5)
@@ -331,6 +333,14 @@ class RunConfig:
     def validate(self) -> None:
         """Cross-field validity (mirrors the in-kernel guards, fail-fast at config load)."""
         from .precision import PRECISIONS
+        if self.cavity is not None:
+            # FESOM2 dynamics_init (oce_setup_step.F90:649): split-explicit SSH refuses cavities; the cavity physics is
+            # wired for linfs (jaxcpl) only (the zstar fw2press / balance branches are not ported)
+            if self.ale is not None:
+                raise NotImplementedError("cavity: is wired for linfs only (ale: null); FESOM2's zstar cavity branches "
+                                          "(use_cavity_fw2press, the zstar freshwater balance) are not ported")
+            if self.ice is None:
+                raise NotImplementedError("cavity: needs the prognostic sea ice (the melt sits in its oce_fluxes)")
         if isinstance(self.forcing, dict) and not isinstance(self.forcing.get("mslp", False), bool):
             raise TypeError(f"forcing.mslp must be true or false, got {self.forcing['mslp']!r}")
         # REcoM's CO2 and O2 solubility read press_air, which is zero without l_mslp, and a zero air pressure
@@ -452,6 +462,8 @@ class RunConfig:
                   ale_cfg=self.ale_cfg(), visc_cfg=self.visc, tracer_cfg=self.tracer)
         if self.recom is not None:      # only when on: a runner without REcoM support then refuses it loudly
             kw["recom_cfg"] = self.recom
+        if self.cavity is not None:     # likewise: only the runners wired for cavities accept it
+            kw["cavity_cfg"] = self.cavity
         return kw
 
     def dt_at(self, step: int) -> float:

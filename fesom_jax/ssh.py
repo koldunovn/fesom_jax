@@ -559,6 +559,7 @@ def build_ssh_operator(
     edge_cross = np.asarray(mesh.edge_cross_dxdy)[:E]
     zbar = np.asarray(mesh.zbar)
     nlevels = np.asarray(mesh.nlevels)
+    ulevels_el = np.asarray(mesh.ulevels)
     ulevels_nod = np.asarray(mesh.ulevels_nod2D)
     areasvol = np.asarray(mesh.areasvol)
 
@@ -572,7 +573,9 @@ def build_ssh_operator(
         elis = np.where(valid, eli, 0)
         en = elem_nodes[elis]                      # (E,3) the cell's 3 nodes
         g = gradient_sca[elis]                     # (E,6) ∂N/∂x(0:3), ∂N/∂y(3:6)
-        depth = zbar[nlevels[elis] - 1] - zbar[0]  # (E,) zbar_bot − zbar_srf (<0)
+        # (E,) zbar_e_bot − zbar_e_srf (<0); FESOM's zbar_e_srf = zbar(ulevels(el)) (oce_ale.F90:1362): the
+        # water column below an ice shelf starts at the shelf base. Off the shelves ulevels = 1 ⇒ zbar[0], unchanged.
+        depth = zbar[nlevels[elis] - 1] - zbar[ulevels_el[elis] - 1]
         dx_i = edge_cross[:, 2 * i + 0]
         dy_i = edge_cross[:, 2 * i + 1]
         fy = depth[:, None] * (g[:, 0:3] * dy_i[:, None] - g[:, 3:6] * dx_i[:, None])

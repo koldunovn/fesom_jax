@@ -219,7 +219,7 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
                params, *, dt: float = DT_DEFAULT, exch=None, Z3d=None,
                freeze_convection: bool = False, cuts=frozenset(), tke_adj=None,
                freeze_state: bool = False, bvfreq_raw=None, conv_surrogate=None,
-               ice_conc=None, turner=None):
+               ice_conc=None, turner=None, cavity: bool = False):
     """Assembled classical-TKE vertical-mixing driver — the mirror of ``fesom_tke_mixing``
     (``fesom_tke.c:270-505``) followed by the shared ``mo_convect`` (``fesom_step.c:264``).
     Returns ``(Kv, Av, uvnode, tke_new)`` — the ``(Kv, Av, uvnode)`` triple PP/KPP return
@@ -246,6 +246,12 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
     ``tke_pr_tu_cut`` cut reads (:func:`fesom_jax.eos.turner_angle`; ``None`` unless it is on).
     ``cfg.convection`` / ``cfg.conv_ramp_dn2``: the forward convective-adjustment mode (default
     ``"switch"`` = FESOM2).
+
+    ``cavity`` (ice-shelf cavities, lane L-OCN): FESOM2's CVMix driver hands CVMix the column from the top wet level
+    ``nun = ulevels_nod2D`` down (cvmix_driver/gen_modules_cvmix_tke.F90:340), so under a shelf the column core's
+    "surface" is the shelf base, forced by the shelf-base drag in ``stress_node_surf``. Here every column is shifted up
+    by ``ulevels_nod2D - 1`` before :func:`integrate_tke_column` (whose surface is ``k = 0``) and back after it, and
+    the surface cap of ``dzt`` is half the TOP WET layer. ``False`` ⇒ the unchanged program.
     """
     inp = tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, Z3d=Z3d,
                             bvfreq_raw=bvfreq_raw)
@@ -274,13 +280,33 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
         c_eps = params.tke_c_eps * m[:, 1:2]
         cd = params.tke_cd * m[:, 2:3]
 
+    if cavity:
+        if inp.get("Nsqr_raw") is not None or turner is not None or ice_conc is not None:
+            raise NotImplementedError("tke cavity column shift: the adjoint Prandtl / mixing-length cuts are not wired")
+        _u = (mesh.ulevels_nod2D - 1).astype(jnp.int32)[:, None]
+        _k = jnp.arange(mesh.nl)[None, :]
+        dz_trr = jnp.where(is_surf, jnp.take_along_axis(hnode, _u, axis=1) / 2.0, dz_trr)   # hnode[nun]/2
+
+        def _up(x):          # column-local: new[k] = x[k + u], zero past the column's own bottom interface
+            y = jnp.take_along_axis(x, jnp.clip(_k + _u, 0, mesh.nl - 1), axis=1)
+            return jnp.where(_k + _u <= mesh.nl - 1, y, 0.0)
+
+        def _down(x):        # back to the global levels: out[k] = x[k - u], zero inside the shelf
+            y = jnp.take_along_axis(x, jnp.clip(_k - _u, 0, mesh.nl - 1), axis=1)
+            return jnp.where(_k >= _u, y, 0.0)
+
+        tke_c, vshear2_c, bvfreq2_c, hnode_c, dz_trr_c = (_up(x) for x in (tke, vshear2, bvfreq2, hnode, dz_trr))
+        nlev_c = nlev - _u[:, 0]
+    else:
+        tke_c, vshear2_c, bvfreq2_c, hnode_c, dz_trr_c, nlev_c = tke, vshear2, bvfreq2, hnode, dz_trr, nlev
+
     # --- column core (fesom_tke.c:421-442) ---
     # single precision: CVMix runs in cvmix_r8 upstream — WP inputs copied into real64 buffers, WP namelist
     # constants widened, the outputs copied back to WP (cvmix_driver/gen_modules_cvmix_tke.F90:290-298).
     _f, _l = PR.full, PR.lit
     _f_opt = lambda x: None if x is None else _f(x)       # noqa: E731  (the adjoint's optional inputs)
     tke_new, KappaM, KappaH = integrate_tke_column(
-        _f(tke), _f(vshear2), _f(bvfreq2), _f(hnode), _f(dz_trr), _f(forc_tke_surf), nlev,
+        _f(tke_c), _f(vshear2_c), _f(bvfreq2_c), _f(hnode_c), _f(dz_trr_c), _f(forc_tke_surf), nlev_c,
         c_k=_f(c_k), c_eps=_f(c_eps), cd=_f(cd),
         alpha_tke=_f(params.tke_alpha), mxl_min=_l(cfg.mxl_min), tke_min=_l(cfg.tke_min),
         kappaM_max=_l(cfg.kappaM_max), dt=dt, with_diags=False, cuts=cuts, adj=tke_adj,
@@ -288,6 +314,8 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
         lat=(None if tke_adj is None or tke_adj.pr_lat is None
              else _f(mesh.geo_coord_nod2D[:, 1])), turner=turner)
     tke_new, KappaM, KappaH = PR.wp(tke_new), PR.wp(KappaM), PR.wp(KappaH)
+    if cavity:
+        tke_new, KappaM, KappaH = _down(tke_new), _down(KappaM), _down(KappaH)
 
     # --- Kv/Av wiring (fesom_tke.c:484-505, pre-mo_convect) + the shared mo_convect ---
     Kv, Av = _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch)

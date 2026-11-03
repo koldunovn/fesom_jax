@@ -1,0 +1,29 @@
+# CORE3 (220,509 nodes, 48 levels) with ice-shelf cavities -- lane L-OCN (docs/lanes/core3.md).
+# Standalone JRA55-do from jaxcpl's 1855-01-01 spinup ocean (converted Fortran restart, relabelled 1958-01-01 so that
+# the 1958 forcing applies, exactly as the FESOM2 main oracle run_cav_dp is set up).
+#
+# Physics: linfs (jaxcpl's which_ale), TKE, mEVP, GM, cavities with jaxcpl's cavity_gamma_scale. jaxcpl's own GM/Redi
+# scalings, TKE constants, opt_visc 5, melt ponds and single precision are lane L-SFC's; this config keeps
+# fesom_jax's defaults for them.
+
+ale: null          # linfs (jaxcpl); the cavity physics is wired for linfs only
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+cavity: {gamma_scale: 0.6}
+visc: {}
+tracer: {}
+dt: 1800.0
+
+mesh: /work/ba1583/a270088/awicm/core3/ocn/mesh_core3
+partition: serial
+forcing:
+  kind: core2
+  start_year: 1958   # the restart is step 0 = 1958-01-01; run.py does not re-bootstrap AB2 after a restart
+output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/core3_cavity
+snapshot_every: 48
+checkpoint_every: 0
+restart_in: /work/ba1583/a270088/awicm/core3/ocn/restart_jaxcpl_18550101_as_1958_v2
+restart_out: null
+duration: 5day

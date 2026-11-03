@@ -828,7 +828,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              forcing_tables_folded: bool = False,
                              return_grad_fn: bool = False, ssh_gather=None,
                              mevp_wide=None, precision: str = "double", se_wide=None, ice_phase=None,
-                             recom_cfg=None):
+                             recom_cfg=None, cavity_cfg=None):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     ``ice_phase`` (an int, the ``ice_steps_since_upd`` the State carries into this chunk; ``ice_ave_steps > 1``
@@ -1056,7 +1056,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                                 step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                 ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                halo_ctx=ctx, boundary_node=bn_, ice_update=upd, recom_cfg=recom_cfg)
+                                halo_ctx=ctx, boundary_node=bn_, ice_update=upd, recom_cfg=recom_cfg, cavity_cfg=cavity_cfg)
 
         sf0 = jax.tree.map(lambda x: x[0], seq)             # this chunk's first-step forcing
         if ice_phase is not None:
@@ -1170,7 +1170,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                                     step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                     ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                    halo_ctx=ctx, boundary_node=bn_, recom_cfg=recom_cfg)
+                                    halo_ctx=ctx, boundary_node=bn_, recom_cfg=recom_cfg, cavity_cfg=cavity_cfg)
 
             sf0 = jax.tree.map(lambda x: x[0], seq)
             st = one(s, bootstrap_ab2, sf0)
@@ -1223,6 +1223,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             key = key + (id(se_wide),)
         if ice_phase is not None:
             key = key + (("ice_phase", int(ice_phase)),)
+        if cavity_cfg is not None:                    # the no-cavity key is unchanged
+            key = key + (("cavity", id(cavity_cfg)),)
         if recom_cfg is not None:                     # the REcoM-off key is unchanged
             key = key + (("recom", id(recom_cfg)),)
         hit = _FORCED_JIT_CACHE.get(key)

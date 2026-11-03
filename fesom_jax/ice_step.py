@@ -248,7 +248,7 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
                      dt: float, boundary_node=None, use_virt_salt: bool = True,
                      owned_mask=None, axis_name=None, exch=None, zbar3=None,
                      params=None, mevp_wide=None, ice_update=None,
-                     legacy_sw_depth: bool = False) -> IceStepOut:
+                     legacy_sw_depth: bool = False, cavity_cfg=None) -> IceStepOut:
     """One assembled ice step → the surface fluxes + the new ice state. ``sf`` is this step's
     :class:`surface_forcing.StepForcing` (atmosphere + month SSS/chl); ``fs`` the
     :class:`surface_forcing.ForcingStatic` (runoff/areas/open_water). ``boundary_node`` (the
@@ -400,6 +400,12 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
                              f"standard EVP has no wide path, got whichEVP={cfg.whichEVP}")
         _evp_kw["wide"] = mevp_wide
     _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
+    if cavity_cfg is not None:
+        # Ice-shelf cavities (fesom_jax.cavity): the shelf front is a coast for the sea-ice velocity
+        # (ice_maEVP.F90:365-380). Drivers pass the GLOBAL mask already extended (run.py); a direct call derives it.
+        from . import cavity as _cav
+        if boundary_node is None:
+            boundary_node = _cav.cavity_boundary_node_mask(mesh, ice_evp.boundary_node_mask(mesh))
 
     def _ice_update():
         """ice_timestep (ice_setup_step.F90): EVP/mEVP → FCT → cut_off → thermo. Returns the new
@@ -412,6 +418,8 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
             srfoce_u=_evp_u, srfoce_v=_evp_v, elevation=_cut(("ssh",), srf.ssh),
             stress_ax=stress_ax, stress_ay=stress_ay, boundary_node=boundary_node, exch=exch,
             **_evp_kw)
+        if cavity_cfg is not None:                  # ice_timestep: cavity_ice_clean_vel after the EVP
+            u_ice, v_ice = _cav.cavity_ice_clean_vel(mesh, u_ice, v_ice)
 
         _fct_u, _fct_v = _cut(("advect", "fct"), u_ice, v_ice)
         a_adv, m_adv, ms_adv = ice_adv.fct_solve(
@@ -442,6 +450,8 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         a_out = _exch(th.a_ice, "nod")
         m_out = _exch(th.m_ice, "nod")
         ms_out = _exch(th.m_snow, "nod")
+        if cavity_cfg is not None:                  # ice_timestep: cavity_ice_clean_ma at its end
+            a_out, m_out, ms_out = _cav.cavity_ice_clean_ma(mesh, a_out, m_out, ms_out)
         return (a_out, m_out, ms_out, u_ice, v_ice, th.t_skin, s11, s12, s22,
                 th.flx_h, th.flx_fw, th.evaporation, th.ice_sublimation, th.thdgr,
                 th.thdgrsn, th.real_salt_flux, a_co)
@@ -482,6 +492,20 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     # CURRENT surface salinity (salt(1,n)), not the ice's running mean srfoce_salt. With
     # ice_ave_steps == 1 the two are the same array.
     S_top = state.S[:, 0] if avg else srf.salt
+    if cavity_cfg is not None:
+        # oce_fluxes: the three-equation melt overwrites heat_flux / water_flux at the cavity nodes
+        # (ice_oce_coupling.F90:354, before the virtual salt, which then reads salt at the TOP WET level there);
+        # FESOM's heat_flux / water_flux are -flx_h / -flx_fw here. The density is the one the last pressure_bv
+        # left (relative to density_ref), as in FESOM, where oce_fluxes runs before oce_timestep_ale.
+        from . import eos as _eos
+        _dref = _eos.reference_density(mesh, T_ref=cavity_cfg.density_ref_T, S_ref=cavity_cfg.density_ref_S)
+        _Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
+        _Z3 = jnp.broadcast_to(_Zp[None, :], state.T.shape)               # linfs, no partial cells: Z_3d_n = Z
+        _hf, _wf, _cavn = _cav.cavity_heat_water_fluxes_3eq(
+            mesh, state.T, state.S, state.uvnode, state.hnode, _Z3, state.density + _dref,
+            -flx_h, -flx_fw, cavity_cfg.gamma_scale)
+        flx_h, flx_fw = -_hf, -_wf
+        S_top = jnp.where(_cavn, _cav.top_values(mesh, state.S), S_top)
     icef = ice_coupling.ice_oce_fluxes(
         S_top, flx_fw, flx_h, sf.Ssurf_month, fs.runoff_node,
         fs.areasvol_surf, fs.ocean_area, open_water,
@@ -515,6 +539,10 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     # ice%srfoce_u/v here every step (ice_oce_coupling.F90:55-56, 81-83).
     stress_surf, stress_node_surf = ice_coupling.ice_oce_fluxes_mom(
         mesh, a_out, _mom_u, _mom_v, srf.u, srf.v, bulk.stress_node_surf, open_water, cfg)
+    if cavity_cfg is not None:                      # oce_fluxes_mom -> cavity_momentum_fluxes: the shelf-base drag
+        from .config import C_D as _C_D, DENSITY_0 as _RHO0
+        stress_surf, stress_node_surf = _cav.cavity_momentum_fluxes(
+            mesh, state.uv, state.uvnode, stress_surf, stress_node_surf, _RHO0, _C_D)
 
     # --- shortwave penetration (open-water-only gate on the prognostic a_ice) ---
     pene_open = open_water & (a_out <= 0.0)
