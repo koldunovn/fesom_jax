@@ -120,6 +120,11 @@ CORE2_IC_FILES = {
 # &tracer_init3d: "for present-day runs use GLODAPv2.2016b.TCO2_fesom2_mmol_fix_z_Fillvalue.nc with varlist TCO2_mmol")
 CORE2_PRESENT_IC_FILES = {**CORE2_IC_FILES, 1002: ("GLODAPv2.2016b.TCO2_fesom2_mmol_fix_z_Fillvalue.nc", "TCO2_mmol")}
 PI_IC_FILES = dict(T.IC_FILES)       # the 5-degree pi set (test/input/recom), lane F's reference run
+# The same with the present-day DIC (tco2_5deg.nc, TCO2_mmol): the spectral fork's pi reference runs
+# (scripts/recom/fortran/namelists_albedo_spectral*/namelist.tra &tracer_init3d)
+PI_PRESENT_IC_FILES = {**PI_IC_FILES, 1002: ("tco2_5deg.nc", "TCO2_mmol")}
+# What the fork's FESOM2 reads for DIC whenever REcoM's DIC_PI is on (its default), overriding namelist.tra's entry
+DIC_PI_FILE, DIC_PI_VAR = "GLODAPv2.2016b.PI_TCO2_fesom2_mmol_fix_z_Fillvalue.nc", "PI_TCO2_mmol"
 
 _LAT_NAMES = ("LAT", "lat", "latitude")       # gen_ic3d.F90:122-128, 162-169
 _LON_NAMES = ("LON", "longitude", "lon")      # gen_ic3d.F90:132-138, 171-178
@@ -441,7 +446,15 @@ def bgc_initial_state(mesh, ic_files: Mapping[int, Tuple[PathLike, str]], switch
     S; :data:`PI_IC_FILES`, :data:`CORE2_IC_FILES`), relative files under ``ic_dir``. ``switches`` must be the
     ported configuration (:func:`fesom_jax.recom.params.check_supported`); ``params`` gives the constant initial
     values. ``geo_coord`` overrides the mesh's geographic coordinates (see the module docstring)."""
+    from .layout import layout_of
     P.check_supported(switches)
+    lay = layout_of(switches)                               # 692f804's bin_2p3z2d or the fork's (lane P)
+    fork = not lay.dicremin
+    if fork and getattr(switches, "DIC_PI", True) and 1002 in ic_files:
+        # the fork's oce_setup_step.F90:1012-1015 (its FESOM2 base; gone from upstream e96a2b13, the 692f804
+        # reference): `if (DIC_PI) filelist(5) = 'GLODAPv2.2016b.PI_TCO2_...'`, the DIC entry of the hard-wired idlist
+        # order, whatever namelist.tra names (the twins' tco2_5deg.nc was never read; test_recom_spectral_wiring).
+        ic_files = {**ic_files, 1002: (DIC_PI_FILE, DIC_PI_VAR)}
     files = resolve_ic_files(ic_files, ic_dir)
     N, nl = int(mesh.nod2D), int(mesh.nl)
     nlev = np.asarray(mesh.nlevels_nod2D, np.int64)
@@ -449,23 +462,23 @@ def bgc_initial_state(mesh, ic_files: Mapping[int, Tuple[PathLike, str]], switch
     table = _neighbour_table(mesh)
 
     # do_ic3d (+ tracer_init's zeros, + oce_initial_state's zeros for the BGC IDs without a file)
-    vals = np.zeros((N, nl - 1, T.NTR))
-    for tid in T.BGC_IDS:                                   # the tracer loop order of do_ic3d's search
+    vals = np.zeros((N, nl - 1, lay.ntr))
+    for tid in lay.ids:                                     # the tracer loop order of do_ic3d's search
         if tid in files:
             path, var = files[tid]
-            vals[:, :, T.slot(tid)] = interp_ic_field(mesh, path, var, geo_coord=geo_coord, z3=z3,
-                                                      _table=table)
+            vals[:, :, lay.slot(tid)] = interp_ic_field(mesh, path, var, geo_coord=geo_coord, z3=z3,
+                                                        _table=table)
     alk_surf = vals[:, 0, T.ialk].copy() if switches.restore_alkalinity else np.zeros(N)
     bgc_old = vals.copy()                                   # ocean_setup: valuesold = values
 
-    # recom_init
+    # recom_init (the fork's for its layout: tracers.init_value)
     bgc = vals
-    for tid in T.BGC_IDS:
-        s = T.slot(tid)
+    for tid in lay.ids:
+        s = lay.slot(tid)
         if tid == 1019:
             bgc[:, :, s] = bgc[:, :, s] * FE_FACTOR
-        elif tid > 1003 and tid not in (1018, 1022, 1037):
-            bgc[:, :, s] = T.init_value(tid, params)
+        elif tid > 1003 and tid not in (1018, 1022) and (fork or tid != 1037):
+            bgc[:, :, s] = T.init_value(tid, params, lay if fork else None)
     lon, lat = _geo(mesh, geo_coord)
     box = (lat > -12.5 * RAD) & (lat < 9.5 * RAD) & (lon > -106.0 * RAD) & (lon < -72.0 * RAD)
     wet = np.arange(nl - 1)[None, :] < (nlev[:, None] - 1)

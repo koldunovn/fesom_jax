@@ -1,0 +1,45 @@
+# Albedo: CORE2 + full REcoM (bin_2p3z2d, 31 tracers) in double precision on ONE GPU (docs/recom/RUNNING_ALBEDO.md).
+# Albedo's A100s are PCIe-attached (no NVLink): README "Performance" measured CORE2 7.6x slower than on Levante and
+# anti-scaling past one GPU, so partition: null (single device, no halo exchange). Physics = configs/core2_recom.yaml
+# (core2_full.yaml's physics, l_mslp on) with the dense single-device speed options that apply (column kernels,
+# chunking). Inputs: the Zenodo CORE2 package (mesh bundle, PHC IC cache, 1958 JRA55-do) + psl.1958 from Albedo's
+# JRA55-do v1.3.1 + the REcoM CORE2 IC set and Albani dust from /albedo/pool/FESOM2/recom. A cold start: the
+# Levante 1958-2019 physics hindcast restarts are not on Albedo.
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 1800.0
+
+mesh: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/mesh_core2
+partition: null
+forcing:
+  kind: core2
+  start_year: 1958
+  mslp: true
+  jra_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/forcing_1958_mslp
+  sss_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/PHC2_salx.nc
+  runoff_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/CORE2_runoff.nc
+  chl_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/Sweeney_2005.nc
+  dust_file: /albedo/pool/FESOM2/recom/CORE2/DustClimMonthlyAlbani.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_jaxphys/namelist.recom
+  ic_set: core2
+  ic_dir: /albedo/pool/FESOM2/recom
+  output: [DIC, Alk, DIN, DSi, DFe, O2, Chl, co2flux, pco2surf, npp, export100]
+
+gpu:
+  column_unroll: true
+  column_kernel: true
+  chunk_steps: 48
+output_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/core2_recom
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+duration: 1yr             # overridden by --steps

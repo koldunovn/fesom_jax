@@ -9942,3 +9942,124 @@ one-GPU reproduction did not reproduce it (XLA chose tracer-major there by itsel
 away: each updated column as its own kernel behind `lax.optimization_barrier`, then a plain stack (14.0 -> 6.2 ms;
 DP 65.7 -> 60.1, SP 36.3 -> 32.6 ms on 4 GH200, job 28473598). Rule (d): a layout constraint fixes the layout of
 its own result, not of what feeds it; to change how a producer is laid out, change what it is fused with.
+
+### 2026-10-28 (branch recom-spectral, lane E) — a fork's physics is its FESOM2 base: three silent differences behind one 1e-3 gate miss
+
+The spectral REcoM fork (`sveta-loza/fesom2`, merge base with upstream cda35117 of 2025-10-09) reproduces 692f804's
+sources and sinks and sinking to 1e-13, yet the connected tracer loop missed by 1e-3..5e-2 rel — and the per-tracer
+terms matched to 1e-16, so the miss was in the host model, not in REcoM. Staging the dumps (`tra_adv.del_ttf`,
+`tra_redi`, `tra_tstar`, `tra_impl`) against the JAX pieces one at a time found three causes, none visible from the
+REcoM code: (1) the fork's `namelist.tra` asks for `tra_adv_ph/pv = 1., 1.` while the JAX MFCT/QR4C kernels are the
+`0., 1.` reconstruction (a `TracerConfig` validator, not a switch) — rerun the twin with `0., 1.`; (2) the fork's FCT
+limiter normalizes its bounds without the layer thickness (FESOM2 added `/hnode` on 2025-10-29 and `/hnode_new` on
+2026-03-03): 3.6e-4 rel on T, now `zalesak_limit(legacy_bounds=True)` / `step(legacy_fct_bounds=True)`; (3) the
+fork's run read the element levels its own partitioner wrote (`elvls.out`), which differ from the repo's committed
+file at three polar elements: 2.6e-5 rel at the eleven nodes around them, and the dumped `mesh.nlevels` says so
+directly. Rules: (a) for a twin from another FESOM2 revision, diff the ADVECTION and LIMITER sources against the
+revision the port follows (`git diff <ref> -- src/oce_adv_tra_*.F90` after normalizing `mesh%`/`partit%`), not only
+the BGC; the fixes with a date (#944, 18346243, 9afdae7b, #1116) each want a `legacy_*` flag, default off;
+(b) gate the host's own T first (`tra_tstar.tr1`): it has no BGC terms, so a miss there is the host's; (c) compare
+the dumped `mesh.nlevels`/`nlevels_nod2D` with the JAX bundle before anything else — a level mismatch looks like an
+advection bug at the bottom of a few columns; (d) a near-zero tracer (DetN at 1e-14 in the IC) has a meaningless
+relative error; rank the misses by the error over the step's own change instead.
+
+### 2026-10-28 (branch recom-spectral, lanes E/L) — a whole-array `any(...)` reset is physics too, and it fires on day 7
+
+REcoM's ballasting ends with `if (any(scaling_density1_3D(:,:) <= tiny)) scaling_density1_3D(:,:) = 1.0_WP`
+(recom_sinking.F90, upstream d5f9f8ac 2024-05-30, the fork K:858-861): one layer anywhere on the rank whose detritus is
+lighter than the in-situ seawater (`rho_POC = rho_PON = 1033 kg m-3`, the deep ocean is denser) switches the density
+scaling off for every node and layer of that rank for that tracer's call. The port had read it as a guard and left it
+out (the docstring said "no positivity guard"); the gates at steps 1, 2, 3, 17 of a January start never trigger it, step
+224 (day 7) does, with `scaling_density` off by a factor 8 everywhere. Lessons: (a) an `any`/`all` over a whole array
+followed by a whole-array assignment is a global (rank-wide) branch, not a per-cell guard; port it as a reduction + a
+`where`, and say which domain the reduction runs over (here the rank: owned + halo, including the stale entries below
+the bottom, which is why the very first call of a run also resets); (b) gate at a step late enough for the slow
+quantities (particle composition at depth) to have moved: steps 1-17 see the IC, day 7 sees the model.
+
+### 2026-10-28 (branch recom-spectral, lane W) — the IC file a run reads is not the one its namelist names
+
+The fork's cold start of DIC was off by 3 % against the twin while the five other file-initialised tracers matched to
+1e-12: the fork's `oce_setup_step.F90` overrides `filelist(5)` (the DIC entry of FESOM's hard-wired `idlist` order)
+with the GLODAP preindustrial file whenever REcoM's `DIC_PI` is on, and `DIC_PI` defaults to on. `namelist.tra`'s
+`tco2_5deg.nc` is never opened. Upstream FESOM2 has dropped that override by e96a2b13 (the 692f804 reference), so the
+port keys it on the fork flavour. Lessons: (a) gate the cold start against the twin's own `recom_in` at step 1 before
+any step gate: it is one load, and it catches every "the model reads something else" surprise at once; (b) grep the
+host model for every REcoM switch the port lists as "no effect" (`NO_EFFECT`): `DIC_PI` was there because REcoM's
+own sources never read it, but FESOM's setup does.
+
+### 2026-10-28 (branch recom-spectral, lane W) — a cached per-node IC is tied to the level structure it was built on
+
+The first JAX spectral run went non-finite after 960 steps in T, S and velocity, not only in the BGC. The spectral
+code was innocent: the same config on the packaged pi mesh is finite after 32 steps, and the 692f804 config on the
+rebuilt fork bundle is not. The bundle has three polar elements with deeper levels than the repo's (the fork's own
+`elvls.out`), and the packaged `T_ic.npy`/`S_ic.npy` cache has zeros in exactly those layers: three cells of 0 degC,
+0 psu at 500 m. Rules: (a) a cached IC (`fesom_jax/data/ic_pi`, `$FESOM_IC_DIR`) belongs to one `nlevels` per node;
+rebuild it (`phc_ic.build_and_cache_ic`) whenever the bundle's levels change, and check `S[wet] > 0` before a run;
+(b) when a long run ends non-finite everywhere, bisect by configuration pairs with 32-step runs (A on mesh 1, A on
+mesh 2, B on mesh 2) before reading any code: three jobs, ten minutes.
+
+### 2026-10-29 (branch recom-spectral, lane W) — a twin's first three hours are not its physics: the host model's cold-start bugs are in the dumps too
+
+The fork's full-step gate (G4b) first came out at a physics floor of 3.5e-3 on T after one step, 1000x worse than any
+BGC gate, on a pair whose namelists matched as far as the fork's FESOM2 base allows. `scripts/recom/physics_floor.py`
+(now with `--mesh`, `--legacy`, `--no-recom`) put it in one line: the twin's `recom_in.u_wind` differed from the JAX
+wind by 70 % while shortwave and pressure agreed to 1e-14. On a rotated grid FESOM2 rotates the wind interpolation
+coefficients only when it refreshes them, and the cold start never refreshes inside the first forcing window, so the
+first three hours of every cold-started run of the fork's base push the ocean and the ice with winds in the
+geographic frame (upstream fix 66658357, 2026-05-25, after the fork's base cda35117). fesom-jax rotates always.
+Cherry-picking the fix into the twin's dump branch (63283bc9 there) brought the floor to 5.4e-5 (T), 1.6e-5 (S),
+3.2e-4 (a_ice); every BGC tracer is below the T floor. The 692f804 pair sits at 4.1e-8 because its base has the
+fix. Lessons: (a) before reading a single BGC number of a full-step gate, print the floor script's forcing rows:
+a forcing field that disagrees at step 1 is a host-model bug or convention, never a port error, and it is the only
+thing that can make every tracer miss by the same amount; (b) a twin built from an older host base reproduces that
+base's cold-start bugs in its dumps; fixing them in the twin (a cherry-pick with `-x`, recorded in the run's
+`seg_1.info` by its git SHA) is legitimate as long as the fix is upstream's and the plan says so; (c) when the
+host base has no namelist keys for a parameterisation the port implements (the fork's `oce_dyn` has no
+`scaling_GMzexp`, `scaling_ODM95`, `Redi_Ktaper`: its GM/Redi is the FESOM 1.4-style `init_Redi_GM`), switch it off
+on both sides for the gate rather than approximate it; a G4b tests the BGC coupling through the transport, not GM.
+
+### 2026-10-29 (branch recom-spectral, lane W) — a per-rank `any` is partition-dependent physics; a dead parameter is not a plumbing bug; `sqrt(0)` in a dark cell is the adjoint's nan
+
+Three findings from the spectral fork's sharded and gradient gates, one afternoon.
+
+1. **The whole-array ballast reset's domain.** The 4-device run equalled the dense run to 1e-14 in the physics and
+   1e-13 in every non-sinking tracer, and differed by 2.6e-2 in DetC and 2.3e-2 in DetSi after two steps from a grown
+   state. Not round-off: REcoM's `if (any(scaling_density <= tiny)) scaling_density = 1` runs over the rank's array,
+   and the port mirrored it as a per-device `any`, so four devices reproduce a four-rank Fortran and one device a
+   one-rank Fortran, which legitimately differ. The reset now reduces over the whole mesh through the step's global
+   sum (`sinking.ballast(reduce_sum=)`, threaded from `full_bgc_step` through `recom_stage3` and the tracer loop):
+   fesom-jax reproduces the one-rank twins every gate uses and is device-count independent, a stated deviation
+   from Fortran's rank dependence. Lesson: any reduction over "the rank's array" in the host model is physics that
+   changes with the partition; port it over the mesh and say so, never per device. My first reading, a `<= tiny`
+   branch flip on round-off at the floor, was wrong: the differences were in cells far above the floor, which the
+   per-tracer table with `max|dense|` showed at once. Print that column before explaining anything.
+2. **Dead parameters.** The fork's 4-PFT build takes the photosynthesis maximum from its `Temp_*` functions
+   (`exp(ord + expon * T)`), not `P_cm * arrFunc`, and the spectral growth uses the band absorption `alpha_I`, not
+   `alfa`: `P_cm`, `P_cm_c`, `P_cm_d`, `alfa*` have exactly zero finite differences in that build. A zero adjoint
+   next to a nan one is not a threading bug (a parameter that never enters gives a symbolic zero, a parameter that
+   enters through a broken path gives nan); check the one-step finite differences of every parameter first, they
+   cost one forward each. The fork's G6 gate differentiates `expon_phy`, `expon_cocco`, `graz_max`, `rho_N`,
+   `deg_Chl`, `cdomcoeff`.
+3. **`jnp.sqrt` of a product that is exactly zero.** The geometric-mean irradiance of the 3-stream solver,
+   `sqrt(Etop * Ebot)`, is 0 in every dark cell (night, under ice, below the euphotic depth); its derivative is
+   infinite there and the backward pass multiplies it by a zero cotangent: nan in every parameter whose path
+   crosses the light, including `graz_max` and `rho_N` through the state. `jax_debug_nans` on a one-step cost,
+   un-jitted, names the line (`spectral.py:494`). The fix is the forward-identical double `where`
+   (`_safe_sqrt`), as `ice.py` does for the EVP delta; `jnp.maximum(x, tiny)` would have moved the light gate.
+
+### 2026-11-01 (branch recom-spectral, lane W) — a diagnostic sum and a half-filled month can look like a model bias; an XLA CPU crash is not the merge
+
+1. **Count the same groups before reading an NPP gap.** The Fortran spectral runs write `NPPn`, `NPPd`, `NPPp` and
+   no `NPPc`; fesom-jax's `npp` is all four groups. The physics-matched CORE2 pair (kdind15wjp vs jaxphys) agreed to
+   4-6 digits in Chl, pCO2, SST, ice and every inventory and differed by a steady +3.9 % in NPP from January: the
+   coccolithophores, not the port. Chl matching while NPP does not is the tell. The cold comparison against kdind15
+   was understated by the same share ("17 %" was ~20 % group for group, `docs/recom/FORTRAN_JAX_DIFFERENCES.md`).
+2. **A month two segments split.** A 5840-step half year ends 1.5 days into July; each segment writes its own July
+   mean (`n_samples` 48 and 944) and `link_monthly.sh` linked the first, so every July was a 1.5-day mean and showed
+   as a one-month blip (CO2-flux pattern correlation 0.86 between months at 1.000). Check `n_samples` in a monthly
+   store's attributes before reading one month; `link_monthly.sh` now merges split months (`merge_monthly.py`).
+3. **`test_recom_sharded_fork.py` aborts intermittently in XLA's CPU fake-device all-gather** (a segfault in the
+   merge suite, job 48627319_4; `rendezvous.h:355 Check failed: state.use_count() == num_threads` in 2 of 4 reruns
+   on the unmerged branch, jobs 48635024/48635030; the merge branch passed 4 of 4, 48635023/27/29/31). Same env,
+   same test, both branches: a jaxlib CPU collectives race, not a regression; every completed run agrees to 5e-15.
+   Rerun before bisecting a merge on a crash in `integrate_sharded`.

@@ -17,11 +17,15 @@ from functools import lru_cache
 from typing import NamedTuple, Optional
 
 PASSIVE_BC = ("zero", "salt")
-IC_SETS = ("pi", "core2", "core2_present")
+IC_SETS = ("pi", "pi_present", "core2", "core2_present")
 # The BGC fields a run can write into its mean-output streams (fesom_jax.recom.wiring.output_fields): 3-D tracers
-# (Chl = PhyChl + DiaChl) and the 2-D diagnostics of State.bgc_diag
+# (Chl = the sum of the groups' chlorophyll; the per-group carbon and chlorophyll) and the 2-D diagnostics of
+# State.bgc_diag (npp = the sum of the groups' column NPP; npp_<group> one group's). Cocco and Phaeo fields need
+# enable_coccos.
 OUTPUT_FIELDS = ("DIC", "Alk", "DIN", "DSi", "DFe", "O2", "Chl", "co2flux", "pco2surf", "npp", "export100", "ph",
-                 "o2flux")
+                 "o2flux", "PhyC", "PhyChl", "DiaC", "DiaChl", "CoccoC", "CoccoChl", "PhaeoC", "PhaeoChl",
+                 "npp_phy", "npp_dia", "npp_cocco", "npp_phaeo")
+_COCCO_OUTPUT = ("CoccoC", "CoccoChl", "PhaeoC", "PhaeoChl", "npp_cocco", "npp_phaeo")
 
 
 class RecomConfig(NamedTuple):
@@ -50,6 +54,14 @@ class RecomConfig(NamedTuple):
     ic_dir: Optional[str] = None
     output: tuple = ("DIC", "Alk", "DIN", "DSi", "DFe", "O2", "Chl", "co2flux", "pco2surf", "npp", "export100")
     budget: bool = False
+    # the spectral fork (docs/plans/completed/20261028-recom-spectral-port.md; a namelist with an &spectral group): spectral =
+    # the __RECOM_WAVEBANDS build (fesom_jax.recom.spectral: 13-band light from OASIM, the spectral growth terms, the
+    # N:C clamp), optics_dir = the directory of its .dat optics files (the namelist names them), spectral_co2lim =
+    # apply CO2 limitation in the spectral growth as the broadband build does (the fork does not; the user's stated
+    # deviation, 2026-10-28). False = the fork's non-spectral build of the same namelist.
+    spectral: bool = False
+    optics_dir: Optional[str] = None
+    spectral_co2lim: bool = True
 
     @property
     def mode(self) -> str:
@@ -60,9 +72,16 @@ class RecomConfig(NamedTuple):
     def ntr(self) -> int:
         """The number of BGC tracers the State carries (the trailing axis of ``State.bgc``)."""
         if self.namelist is not None:
-            from .tracers import NTR
-            return NTR
+            return self.layout.ntr
         return int(self.passive_tracers)
+
+    @property
+    def layout(self):
+        """The tracer :class:`~fesom_jax.recom.layout.Layout` of the namelist's switches (full mode): REcoM
+        692f804's ``bin_2p3z2d`` (31) or the spectral fork's configurations (22-37, lane P)."""
+        from .layout import layout_of
+        sw, _ = self.load()
+        return layout_of(sw)
 
     def namelist_path(self) -> str:
         """``namelist`` as given, or relative to the repository root when it does not exist relative to the cwd."""
@@ -88,14 +107,34 @@ class RecomConfig(NamedTuple):
                 raise ValueError("recom.namelist (full REcoM) and recom.passive_tracers are exclusive")
             sw, _ = self.load()                     # NotImplementedError for an out-of-scope switch
             if sw.bgc_num != self.ntr:
-                raise ValueError(f"namelist bgc_num {sw.bgc_num} != the {self.ntr} tracers of fesom_jax.recom.tracers")
+                raise ValueError(f"namelist bgc_num {sw.bgc_num} != the {self.ntr} tracers of its layout "
+                                 f"({self.layout.describe()})")
             if self.ic_set not in IC_SETS:
                 raise ValueError(f"recom.ic_set must be one of {IC_SETS}, got {self.ic_set!r}")
+            if (self.ic_set.endswith("_present") and getattr(sw, "DIC_PI", True)
+                    and getattr(sw, "spectral_fork", False)):
+                raise ValueError(f"recom.ic_set {self.ic_set!r} (present-day DIC) with the fork's DIC_PI on: the "
+                                 "fork's FESOM2 reads the preindustrial GLODAP DIC whenever DIC_PI is on "
+                                 "(oce_setup_step.F90); set DIC_PI = .false. in the namelist or ic_set without _present")
+            if self.spectral:
+                if not getattr(sw, "spectral_fork", False):
+                    raise ValueError("recom.spectral needs the spectral fork's namelist (an &spectral group)")
+                if self.optics_dir is None:
+                    raise ValueError("recom.spectral needs recom.optics_dir (the directory of the .dat optics files)")
+                if sw.RECOM_CDOM != self.layout.cdom:
+                    raise ValueError("recom.spectral: the namelist's bgc_num must count the CDOM tracer of a spectral "
+                                     "build (RECOM_CDOM)")
+            elif getattr(sw, "spectral_fork", False) and self.layout.cdom:
+                raise ValueError("a non-spectral run of the fork has no CDOM tracer: set recom.spectral or a "
+                                 "namelist with bgc_num without it")
             if not isinstance(self.output, tuple):
                 raise TypeError("recom.output must be a tuple (RunConfig.from_dict converts a YAML list)")
             bad = sorted(set(self.output) - set(OUTPUT_FIELDS))
             if bad:
                 raise ValueError(f"recom.output: unknown fields {bad}; allowed {list(OUTPUT_FIELDS)}")
+            cocco = sorted(set(self.output) & set(_COCCO_OUTPUT))
+            if cocco and not self.layout.enable_coccos:
+                raise ValueError(f"recom.output: {cocco} need the coccolithophores and Phaeocystis (enable_coccos)")
             return self
         if self.passive_tracers <= 0:
             raise NotImplementedError(

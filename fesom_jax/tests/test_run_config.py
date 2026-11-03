@@ -299,6 +299,28 @@ def test_validate_and_dt_ramp():
 
 
 # --------------------------------------------------------------------------
+# 7b. legacy: the fork base's older behaviours, off unless set, forced runner only
+# --------------------------------------------------------------------------
+def test_legacy_block():
+    from fesom_jax.run_config import LegacyConfig
+    assert "legacy_cfg" not in RunConfig.defaults().physics_kwargs()          # off: the kwargs are unchanged
+    with pytest.raises(NotImplementedError):
+        RunConfig(legacy=LegacyConfig()).validate()                           # the unforced runner has no seam
+    cfg = RunConfig.from_dict({"legacy": {"sw_depth": False}, "forcing": {"kind": "core2"}})
+    cfg.validate()
+    assert cfg.legacy == LegacyConfig(sw_depth=False)
+    assert cfg.physics_kwargs()["legacy_cfg"].step_kwargs() == dict(
+        legacy_k33_weights=True, legacy_fct_bounds=True, legacy_sw_depth=False)
+    assert RunConfig.from_dict(cfg.to_dict()) == cfg                          # round-trips
+    with pytest.raises(KeyError):
+        RunConfig.from_dict({"legacy": {"k33": True}})
+    import inspect
+    from fesom_jax import step as stepmod
+    names = set(inspect.signature(stepmod.step).parameters)
+    assert set(LegacyConfig().step_kwargs()) <= names                         # the step kwargs exist
+
+
+# --------------------------------------------------------------------------
 # 7b. Archival restart config: validation + YAML round-trip
 # --------------------------------------------------------------------------
 def test_restart_archive_config():

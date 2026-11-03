@@ -93,6 +93,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .carbonate import p80
+from .layout import DEFAULT as DEFAULT_LAYOUT, Layout
 from .params import REDO2C, SECONDS_PER_DAY, TINY, RecomParams, RecomSwitches
 from .tracers import BGC_IDS, DET2_IDS, DET_IDS, NTR, REMIN_IDS, SINKING_IDS, SLOT
 
@@ -413,6 +414,19 @@ class SinkingGeometry(NamedTuple):
     nlev: jax.Array           # (nod2D,) int: nlevels_nod2D - 1, the wet layers are k < nlev
     lat_deg: jax.Array        # (nod2D,) geo latitude geo_coord_nod2D(2)/rad [deg]
     saar: SaarColumns         # :func:`saar_columns` of the nodes
+    nlmin: Optional[jax.Array] = None   # (nod2D,) int: min over the node's elements of nlevels(e) (1-based level
+                                        # count), the fork's ``nlevels_nod2D_minimum + 1`` (:func:`elem_levels_min`)
+
+
+def elem_levels_min(elem_nodes, elem_nlevels, nod2D: int):
+    """Per node, the smallest ``nlevels(e)`` of the elements around it (the fork's ``nlevels_nod2D_minimum`` is
+    this minus one; ``recom_sinking.F90`` of the fork, the ``nod_in_elem2D`` loops)."""
+    en = np.asarray(elem_nodes)
+    nlv = np.asarray(elem_nlevels)
+    out = np.full(nod2D, np.iinfo(np.int32).max, np.int32)
+    for j in range(3):
+        np.minimum.at(out, en[:, j], nlv)
+    return out
 
 
 def seafloor_area(elem_nodes, elem_nlevels, elem_area, nod2D: int, nl: int):
@@ -463,12 +477,28 @@ def benthic_bottom_flux(tracer_id: int, decay_benthos, params: RecomParams):
     raise ValueError(f"tracer {tid} is not a remin tracer {REMIN_IDS} (Fortran stops here)")
 
 
-def diff_ver_recom_expl(tracer_id: int, decay_benthos, geom: SinkingGeometry, dt, params: RecomParams):
+def diff_ver_recom_expl(tracer_id: int, decay_benthos, geom: SinkingGeometry, dt, params: RecomParams,
+                        fork: bool = False):
     """The benthic return flux ``dtr_bf`` (nod2D, nl-1) of a remin tracer [tracer units per step]:
     the areal flux times ``area(1)``, spread over the layers in proportion to the seafloor area under each,
-    entering each layer through its bottom face: ``seafloor(k) tot/sum(seafloor) dt/areasvol(k)/hnode_new(k)``."""
+    entering each layer through its bottom face: ``seafloor(k) tot/sum(seafloor) dt/areasvol(k)/hnode_new(k)``.
+
+    ``fork`` (the spectral fork, K:270-415): ``GlodecayBenthos`` is a per-node flux [mmol s-1] (its benthos is
+    area-integrated); ``vd(j) = (area(j) - area(j+1)) bf / area(0)`` for the interfaces from the shallowest
+    neighbouring element's bottom layer down, ``vd(nl1) = area(nl1) bf / area(0)`` at the bottom interface, and
+    layer k receives ``vd(k+1) dt / areasvol(k) / hnode_new(k)``."""
     k, nlev = _levels(geom, geom.hnode.shape[1])
     wet = k < nlev
+    if fork:
+        nl1 = geom.hnode.shape[1]
+        bf = benthic_bottom_flux(tracer_id, decay_benthos, params)[:, None]
+        sf = _fork_seafloor(geom, nl1)                                           # (nod, nl1): vd at j = 0..nl1-1
+        vd = jnp.concatenate([sf, geom.area[:, nl1:nl1 + 1]], axis=1) * bf / geom.area[:, :1]    # j = 0..nl1
+        # the deepest wet layer k = nlev-1 takes the bottom interface j = nlev (Fortran's vd_flux(nl1+1))
+        bot = jnp.take_along_axis(geom.area, nlev, axis=1) * bf / geom.area[:, :1]
+        recv = jnp.where(k == nlev - 1, bot, vd[:, 1:])
+        out = recv * dt / _wet_areasvol(geom, wet) / jnp.where(wet, geom.hnode_new, 1.0)
+        return jnp.where(wet, out, 0.0)
     tot = benthic_bottom_flux(tracer_id, decay_benthos, params) * geom.area[:, 0]
     sf = jnp.where(wet, geom.seafloor, 0.0)
     ssum = jnp.sum(sf, axis=1, keepdims=True)
@@ -506,9 +536,9 @@ def get_particle_density(det_c, det_n, det_si, det_cal, nlev, params: RecomParam
     return jnp.where(wet, rho, 0.0)
 
 
-def particle_densities(stack, nlev, params: RecomParams):
-    """``(rho_particle1, rho_particle2)`` from a BGC stack (nod2D, nl-1, ntr) in State.bgc slot order."""
-    pick = lambda ids: [stack[..., SLOT[i]] for i in ids]
+def particle_densities(stack, nlev, params: RecomParams, layout: Layout = DEFAULT_LAYOUT):
+    """``(rho_particle1, rho_particle2)`` from a BGC stack (nod2D, nl-1, ntr) in ``layout`` slot order."""
+    pick = lambda ids: [stack[..., layout.slot(i)] for i in ids]
     return (get_particle_density(*pick(DET1_CNSICAL), nlev, params),
             get_particle_density(*pick(DET2_CNSICAL), nlev, params))
 
@@ -545,17 +575,37 @@ class Ballast(NamedTuple):
     scaling_density2: jax.Array   # (nod2D, nl)
 
 
-def ballast(rho_particle1, rho_particle2, rho_seawater, visc, nlev, params: RecomParams) -> Ballast:
+def ballast(rho_particle1, rho_particle2, rho_seawater, visc, nlev, params: RecomParams,
+            layout: Layout = DEFAULT_LAYOUT, reduce_sum=None) -> Ballast:
     """The scaling factors of the ballasted sinking speed, ``recom_sinking.F90:928-1043``
     (``use_density_scaling``, ``use_viscosity_scaling``, ``enable_3zoo2det`` all on): density
     ``(rho_particle - rho_seawater)/(rho_ref_part - rho_ref_water)`` (no positivity guard), viscosity
-    ``visc_ref_water/visc`` (1 where ``visc = 0``); on the wet layers and copied to the bottom interface."""
+    ``visc_ref_water/visc`` (1 where ``visc = 0``); on the wet layers and copied to the bottom interface.
+
+    The fork flavour (``layout.dicremin`` False) adds REcoM's whole-array reset (fork K:858-861, upstream d5f9f8ac
+    2024-05-30): ``if (any(scaling_density1_3D <= tiny)) scaling_density1_3D = 1`` (and ``..2`` with 3zoo2det), an
+    ``any`` over the rank's array, i.e. one layer with particles lighter than the in-situ seawater (``rho_POC = 1033``
+    against ``rho > 1033`` at depth) switches the density scaling off everywhere on that rank for that tracer's
+    call (the broadband twin: step 224, day 7). Here: any over the wet layers of the WHOLE mesh when ``reduce_sum``
+    (the step's global sum over the owned nodes, :func:`fesom_jax.reductions.global_sum`) is given, else over this
+    device's (the pad lanes are dry). Fortran's domain is the rank, so its result depends on the partition; the
+    global domain reproduces the 1-rank twins every gate uses and keeps the model device-count independent (a
+    4-device run equalled the dense one except in the sinking tracers, 2.6e-2 on DetC after two steps, before this;
+    the stated deviation, 2026-10-29). REcoM 692f804 carries the same lines; its port predates this finding and its
+    programs stay as gated, so the reset is keyed on the fork layout (``docs/PORTING_LESSONS.md`` 2026-10-28)."""
     p = params
     k = jnp.arange(visc.shape[1])[None, :]
     wet = k < jnp.asarray(nlev)[:, None]
     sd1 = (rho_particle1 - rho_seawater) / (p.rho_ref_part - p.rho_ref_water)
     sd2 = (rho_particle2 - rho_seawater) / (p.rho_ref_part - p.rho_ref_water)
     sv = jnp.where(visc != 0.0, p.visc_ref_water / jnp.where(visc != 0.0, visc, 1.0), 1.0)
+    if not layout.dicremin:
+        def _any(flag):                                  # (nod, nl-1) -> the mesh-wide any (owned nodes suffice)
+            col = jnp.any(flag, axis=1)
+            return jnp.any(col) if reduce_sum is None else reduce_sum(col.astype(jnp.float64)) > 0.0
+        sd1 = jnp.where(_any(wet & (sd1 <= TINY)), 1.0, sd1)
+        if layout.enable_3zoo2det:
+            sd2 = jnp.where(_any(wet & (sd2 <= TINY)), 1.0, sd2)
     sd1, sd2, sv = (jnp.where(wet, x, 1.0) for x in (sd1, sd2, sv))
     return Ballast(scaling_visc=_extend_bottom(sv, nlev, 1.0),
                    scaling_density1=_extend_bottom(sd1, nlev, 1.0),
@@ -565,17 +615,24 @@ def ballast(rho_particle1, rho_particle2, rho_seawater, visc, nlev, params: Reco
 # --------------------------------------------------------------------------------------
 # ver_sinking_recom (recom_sinking.F90:601-908)
 # --------------------------------------------------------------------------------------
-def base_sinking_speed(tracer_id: int, params: RecomParams):
-    """``Vsink`` [m d-1] of ``ver_sinking_recom`` (``recom_sinking.F90:645-693``, no coccolithophores)."""
+def base_sinking_speed(tracer_id: int, params: RecomParams, layout: Layout = DEFAULT_LAYOUT):
+    """``Vsink`` [m d-1] of ``ver_sinking_recom`` (``recom_sinking.F90:645-693``; the fork K:496-528 with the
+    coccolithophores ``VCocco``, Phaeocystis ``VPhaeo`` and PhyCalc at ``VCocco`` when they are on)."""
     tid = int(tracer_id)
     p = params
-    if tid in DET_IDS:
+    if tid in layout.det_ids:
         return p.VDet
-    if tid in (1004, 1005, 1006, 1020):
+    if tid in (1004, 1005, 1006):
         return p.VPhy
+    if tid == 1020:
+        return p.VCocco if layout.enable_coccos else p.VPhy
     if tid in DIA_IDS:
         return p.VDia
-    if tid in DET2_IDS:
+    if tid in layout.cocco_ids:
+        return p.VCocco
+    if tid in layout.phaeo_ids:
+        return p.VPhaeo
+    if tid in layout.det2_ids:
         return p.VDet_zoo2
     return 0.0
 
@@ -604,24 +661,39 @@ def _static_bool(x):
 
 
 def sinking_velocity(tracer_id: int, bal: Optional[Ballast], geom: SinkingGeometry, dt, params: RecomParams,
-                     switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True)):
+                     switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True), *,
+                     layout: Layout = DEFAULT_LAYOUT, fe=None):
     """``Wvel_flux`` (nod2D, nl) [m s-1, negative down] at the interfaces ``0..nlev`` of a sinking tracer,
     CFL-capped at ``0.9 dz/dt`` (``recom_sinking.F90:711-806``); 0 below. ``bal`` is needed for the
-    detritus tracers (the ballasted speed)."""
+    detritus tracers (the ballasted speed).
+
+    The spectral fork (``switches.spectral_fork``, K:574-611): no CFL cap, and the Phaeocystis tracers sink at
+    ``-VPhaeo (1 - Fe/(Fe + k_Fe_p))`` with the dissolved iron ``fe`` (nod2D, nl-1) of the layer above each
+    interface (``max(nzmin, nz-1)``), replacing the depth and ballasting terms."""
     p = params
     tid = int(tracer_id)
-    vs = base_sinking_speed(tid, p)
+    fork = bool(getattr(switches, "spectral_fork", False))
+    vs = base_sinking_speed(tid, p, layout)
     absz = jnp.abs(geom.zbar)
     spd = SECONDS_PER_DAY
     w = jnp.broadcast_to(-vs / spd, absz.shape).astype(f64)
     if switches.allow_var_sinking:
         w = -((p.Vdet_a * absz / spd) + vs / spd)
-        if switches.use_ballasting and tid in DET_IDS:
+        if switches.use_ballasting and tid in layout.det_ids:
             w = p.w_ref1 * bal.scaling_density1 * bal.scaling_visc
             w = jnp.where(p.depth_scaling1 > 0.0, w + (p.depth_scaling1 * absz), w)
             w = jnp.where(jnp.abs(w) > p.max_sinking_velocity, p.max_sinking_velocity, w)
             w = -1.0 * w / spd
-    if switches.enable_3zoo2det and tid in DET2_IDS:
+    if fork and switches.enable_coccos and tid in layout.phaeo_ids:
+        if fe is None:
+            raise ValueError("the Phaeocystis sinking speed needs the DFe column (fe)")
+        nl1 = fe.shape[1]
+        kk = jnp.arange(nl1 + 1)[None, :]
+        fe_up = jnp.take_along_axis(fe, jnp.clip(jnp.broadcast_to(kk - 1, (fe.shape[0], nl1 + 1)), 0, nl1 - 1),
+                                    axis=1)
+        fe_up = jnp.maximum(fe_up, 0.0)
+        w = -p.VPhaeo * (1.0 - fe_up / (fe_up + p.k_Fe_p)) / spd
+    if switches.enable_3zoo2det and tid in layout.det2_ids:
         w = jnp.broadcast_to(-p.VDet_zoo2 / spd, absz.shape).astype(f64)
         if switches.use_ballasting:
             w = p.w_ref2 * bal.scaling_density2 * bal.scaling_visc
@@ -629,17 +701,19 @@ def sinking_velocity(tracer_id: int, bal: Optional[Ballast], geom: SinkingGeomet
             w = jnp.where(jnp.abs(w) > p.max_sinking_velocity, p.max_sinking_velocity, w)
             w = -1.0 * w / spd
     dz = _tracer_point_distance(geom)
-    cap = CFL_SAFETY * dz / dt
-    w = jnp.where(dz > 0.0, jnp.copysign(jnp.minimum(jnp.abs(w), cap), w), w)
+    if not fork:
+        cap = CFL_SAFETY * dz / dt
+        w = jnp.where(dz > 0.0, jnp.copysign(jnp.minimum(jnp.abs(w), cap), w), w)
     k = jnp.arange(dz.shape[1])[None, :]
     return jnp.where(k <= geom.nlev[:, None], w, 0.0)
 
 
-def ver_sinking_recom(tracer_id: int, values, wvel, geom: SinkingGeometry, dt, params: RecomParams):
+def ver_sinking_recom(tracer_id: int, values, wvel, geom: SinkingGeometry, dt, params: RecomParams,
+                      layout: Layout = DEFAULT_LAYOUT):
     """``vert_sink`` (nod2D, nl-1): the DST3 flux-limited sinking flux divergence of ``ver_sinking_recom``
     (``recom_sinking.F90:808-905``) for ``values`` (nod2D, nl-1) with ``wvel`` from :func:`sinking_velocity`;
     the interfaces ``1..nlev-1`` carry flux, the surface and the bottom none. Zero unless ``Vsink > 0.1``."""
-    vs = base_sinking_speed(tracer_id, params)
+    vs = base_sinking_speed(tracer_id, params, layout)
     on = _static_bool(vs > 0.1)
     nod, nl1 = values.shape
     if on is False:
@@ -680,13 +754,23 @@ def ver_sinking_recom(tracer_id: int, values, wvel, geom: SinkingGeometry, dt, p
 # --------------------------------------------------------------------------------------
 # ver_sinking_recom_benthos (recom_sinking.F90:48-418)
 # --------------------------------------------------------------------------------------
+def _phaeo_sinks(tracer_id: int, params: RecomParams, switches: RecomSwitches, layout: Layout):
+    """The fork's ``phaeo_sinks`` (K:97-98) as a traced bool: a Phaeocystis tracer with ``VPhaeo > 0.1``."""
+    on = bool(getattr(switches, "spectral_fork", False)) and switches.enable_coccos and int(tracer_id) in layout.phaeo_ids
+    return (params.VPhaeo > 0.1) if on else None
+
+
 def benthos_speed(tracer_id: int, geom: SinkingGeometry, params: RecomParams,
-                  switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True)):
-    """``Vben`` (nod2D, nl) [m s-1, positive down] of ``ver_sinking_recom_benthos`` (``:108-140``)."""
+                  switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True), *,
+                  layout: Layout = DEFAULT_LAYOUT, fe=None):
+    """``Vben`` (nod2D, nl) [m s-1, positive down] of ``ver_sinking_recom_benthos`` (``:108-140``; the fork
+    K:99-120: the coccolithophore tracers are in no speed list (``Vben = 0`` plus the depth term), PhyCalc keeps
+    ``VPhy`` here, and a Phaeocystis tracer with ``VPhaeo > 0.1`` takes ``VPhaeo (1 - Fe/(Fe + k_Fe_p))`` of
+    the layer's own iron ``fe`` (nod2D, nl-1), without the depth term)."""
     p = params
     tid = int(tracer_id)
     vb = 0.0
-    if tid in DET_IDS:
+    if tid in layout.det_ids:
         vb = p.VDet
     if tid in PHY_IDS:
         vb = p.VPhy
@@ -695,28 +779,49 @@ def benthos_speed(tracer_id: int, geom: SinkingGeometry, params: RecomParams,
     vben = jnp.broadcast_to(jnp.asarray(vb, f64), geom.zbar.shape)
     if switches.allow_var_sinking:
         vben = p.Vdet_a * jnp.abs(geom.zbar) + vben
-    if switches.enable_3zoo2det and tid in DET2_IDS:
+    ps = _phaeo_sinks(tid, p, switches, layout)
+    if ps is not None:
+        if fe is None:
+            raise ValueError("the Phaeocystis benthic flux needs the DFe column (fe)")
+        nod, nl1 = fe.shape
+        fe_loc = jnp.maximum(fe, 0.0)
+        vp = jnp.concatenate([p.VPhaeo * (1.0 - fe_loc / (fe_loc + p.k_Fe_p)), jnp.zeros((nod, 1), f64)], axis=1)
+        vben = jnp.where(ps, vp, vben)
+    if switches.enable_3zoo2det and tid in layout.det2_ids:
         vben = jnp.broadcast_to(jnp.asarray(p.VDet_zoo2, f64), geom.zbar.shape)
     return vben / SECONDS_PER_DAY
 
 
 def ver_sinking_recom_benthos(tracer_id: int, values, geom: SinkingGeometry, dt, params: RecomParams,
-                              switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True)):
+                              switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True), *,
+                              layout: Layout = DEFAULT_LAYOUT, fe=None):
     """``(str_bf, benthos_tr)``: the loss of each layer to the seafloor under it
     (``-values Vben seafloor dt/areasvol/(zbar(k) - zbar(k+1))``, nod2D x nl-1) and the deposit per unit
-    area into this tracer's benthos pool (nod2D, 4) [mmol m-2] (zero for the chlorophylls)."""
+    area into this tracer's benthos pool (nod2D, 4) [mmol m-2] (zero for the chlorophylls; the fork: PhaeoN
+    and PhaeoC into the N and C pools when ``VPhaeo > 0.1``, K:170-179; the coccolithophores' outflux is lost)."""
     nod, nl1 = values.shape
     k = jnp.arange(nl1)[None, :]
     wet = k < geom.nlev[:, None]
-    vben = benthos_speed(tracer_id, geom, params, switches)[:, :nl1]
-    aux = jnp.where(wet, -(values * vben) * geom.seafloor, 0.0)
+    vben = benthos_speed(tracer_id, geom, params, switches, layout=layout, fe=fe)[:, :nl1]
     dzb = geom.zbar[:, :nl1] - geom.zbar[:, 1:]
-    str_bf = jnp.where(wet, aux * dt / _wet_areasvol(geom, wet) / jnp.where(wet, dzb, 1.0), 0.0)
-    add = -jnp.sum(aux * dt, axis=1) / geom.area[:, 0]
+    if getattr(switches, "spectral_fork", False):
+        # the fork (K:121-131): the control-volume area steps as the seafloor, str_bf over area(k), and the
+        # deposit area-integrated [mmol] (no division by area(1))
+        aux = jnp.where(wet, -(values * vben) * _fork_seafloor(geom, nl1), 0.0)
+        str_bf = jnp.where(wet, aux * dt / jnp.where(wet, geom.area[:, :nl1], 1.0) / jnp.where(wet, dzb, 1.0), 0.0)
+        add = -jnp.sum(aux * dt, axis=1)
+    else:
+        aux = jnp.where(wet, -(values * vben) * geom.seafloor, 0.0)
+        str_bf = jnp.where(wet, aux * dt / _wet_areasvol(geom, wet) / jnp.where(wet, dzb, 1.0), 0.0)
+        add = -jnp.sum(aux * dt, axis=1) / geom.area[:, 0]
     btr = jnp.zeros((nod, 4), f64)
     pool = BENTHOS_POOL.get(int(tracer_id))
     if pool is not None:
         btr = btr.at[:, pool].set(add)
+    ps = _phaeo_sinks(int(tracer_id), params, switches, layout)
+    if ps is not None and int(tracer_id) in layout.phaeo_ids[:2]:
+        pool = layout.phaeo_ids.index(int(tracer_id))                 # PhaeoN -> N, PhaeoC -> C
+        btr = btr.at[:, pool].set(jnp.where(ps, add, 0.0))
     return str_bf, btr
 
 
@@ -748,30 +853,33 @@ def loop_context(temp, salt, geom: SinkingGeometry) -> LoopContext:
 
 def tracer_terms(tracer_id: int, current, ctx: LoopContext, geom: SinkingGeometry, decay_benthos, dt,
                  params: RecomParams, switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True), *,
-                 need_ballast: Optional[bool] = None) -> TracerTerms:
+                 need_ballast: Optional[bool] = None, layout: Layout = DEFAULT_LAYOUT,
+                 reduce_sum=None) -> TracerTerms:
     """Steps 2-3 of the module docstring for ONE BGC tracer. ``current`` (nod2D, nl-1, ntr) is the BGC stack
     as Fortran holds it when this tracer's turn comes (finished tracers final, the rest at the start of the
     loop); this tracer's own column is its start-of-loop value. ``need_ballast`` (default: detritus only)
     computes the densities and scaling factors (Fortran computes them for every sinking tracer; only the
     detritus speeds read them)."""
     tid = int(tracer_id)
-    v = current[..., SLOT[tid]]
+    v = current[..., layout.slot(tid)]
     nl1 = v.shape[1]
     wet = jnp.arange(nl1)[None, :] < geom.nlev[:, None]
     dtr_bf = vert_sink = str_bf = wsink = btr = bal = rho = None
     vmod = v
-    if tid in REMIN_IDS:
-        dtr_bf = diff_ver_recom_expl(tid, decay_benthos, geom, dt, params)
+    if tid in layout.remin_ids:
+        dtr_bf = diff_ver_recom_expl(tid, decay_benthos, geom, dt, params,
+                                     fork=bool(getattr(switches, "spectral_fork", False)))
         vmod = jnp.where(wet, v + dtr_bf, v)
-    if tid in SINKING_IDS:
+    if tid in layout.sinking_ids:
         if need_ballast is None:
-            need_ballast = tid in DET_IDS or tid in DET2_IDS
+            need_ballast = tid in layout.det_ids or tid in layout.det2_ids
         if need_ballast:
-            rho = particle_densities(current, geom.nlev, params)
-            bal = ballast(rho[0], rho[1], ctx.rho_seawater, ctx.visc, geom.nlev, params)
-        wsink = sinking_velocity(tid, bal, geom, dt, params, switches)
-        vert_sink = ver_sinking_recom(tid, v, wsink, geom, dt, params)
-        str_bf, btr = ver_sinking_recom_benthos(tid, v, geom, dt, params, switches)
+            rho = particle_densities(current, geom.nlev, params, layout)
+            bal = ballast(rho[0], rho[1], ctx.rho_seawater, ctx.visc, geom.nlev, params, layout, reduce_sum=reduce_sum)
+        fe = current[..., layout.ife] if tid in layout.phaeo_ids else None    # Fortran reads DFe's current values
+        wsink = sinking_velocity(tid, bal, geom, dt, params, switches, layout=layout, fe=fe)
+        vert_sink = ver_sinking_recom(tid, v, wsink, geom, dt, params, layout)
+        str_bf, btr = ver_sinking_recom_benthos(tid, v, geom, dt, params, switches, layout=layout, fe=fe)
         vmod = jnp.where(wet, (v + vert_sink) + str_bf, v)
     return TracerTerms(values_mod=vmod, dtr_bf=dtr_bf, vert_sink=vert_sink, str_bf=str_bf, wsink=wsink,
                        benthos_tr=btr, ballast=bal, rho_particle=rho)
@@ -785,13 +893,19 @@ class LoopTermsResult(NamedTuple):
     terms: Optional[Dict[int, TracerTerms]]   # per tracer ID, with ``diagnostics=True``
 
 
-def _schedule(batched: bool) -> Tuple[Tuple[int, ...], ...]:
-    """The tracer IDs finished together, in order. Sequential: Fortran's loop, one by one."""
+def _schedule(batched: bool, layout: Layout = DEFAULT_LAYOUT) -> Tuple[Tuple[int, ...], ...]:
+    """The tracer IDs finished together, in order. Sequential: Fortran's loop, one by one. Batched: every tracer
+    that reads only start-of-loop values first, then the detritus pairs (their ballasting reads the current
+    detritus pools), then the Phaeocystis tracers (their sinking reads DFe, finished earlier in Fortran's order)."""
     if not batched:
-        return tuple((i,) for i in BGC_IDS)
-    dets = set(DET_IDS) | set(DET2_IDS)
-    rest = tuple(i for i in BGC_IDS if i not in dets)
-    return (rest,) + tuple(zip(DET_IDS, DET2_IDS))
+        return tuple((i,) for i in layout.ids)
+    dets = set(layout.det_ids) | set(layout.det2_ids)
+    late = set(layout.phaeo_ids)
+    rest = tuple(i for i in layout.ids if i not in dets and i not in late)
+    out = (rest,) + tuple(zip(layout.det_ids, layout.det2_ids))
+    if late:
+        out = out + (tuple(i for i in layout.ids if i in late),)
+    return out
 
 
 Finish = Callable[[Tuple[int, ...], jax.Array], jax.Array]
@@ -813,7 +927,8 @@ class _Columns:
 def recom_tracer_loop_terms(bgc, temp, salt, geom: SinkingGeometry, decay_benthos, benthos, dt,
                             params: RecomParams, finish: Finish, *,
                             switches: RecomSwitches = RecomSwitches(enable_3zoo2det=True),
-                            batched: bool = True, diagnostics: bool = False) -> LoopTermsResult:
+                            batched: bool = True, diagnostics: bool = False,
+                            layout: Layout = DEFAULT_LAYOUT, reduce_sum=None) -> LoopTermsResult:
     """REcoM's part of FESOM2's tracer loop for the whole BGC stack, in Fortran's order.
 
     Inputs (stage 3 hands them over):
@@ -847,36 +962,50 @@ def recom_tracer_loop_terms(bgc, temp, salt, geom: SinkingGeometry, decay_bentho
     btr_cols = [None] * ntr
     cur = _Columns(cur_cols)
     terms: Dict[int, TracerTerms] = {}
-    for group in _schedule(batched):
+    for group in _schedule(batched, layout):
         vm = []
         for tid in group:
             tt = tracer_terms(tid, cur, ctx, geom, decay_benthos, dt, params, switches,
-                              need_ballast=(True if diagnostics and tid in SINKING_IDS else None))
+                              need_ballast=(True if diagnostics and tid in layout.sinking_ids else None),
+                              layout=layout, reduce_sum=reduce_sum)
             vm.append(tt.values_mod)
             if tt.benthos_tr is not None:
-                btr_cols[SLOT[tid]] = tt.benthos_tr
+                btr_cols[layout.slot(tid)] = tt.benthos_tr
             if diagnostics:
                 terms[tid] = tt
         fin = finish(tuple(group), jnp.stack(vm, axis=-1))
         for k, tid in enumerate(group):
-            vmod_cols[SLOT[tid]] = vm[k]
-            cur_cols[SLOT[tid]] = fin[..., k]
+            vmod_cols[layout.slot(tid)] = vm[k]
+            cur_cols[layout.slot(tid)] = fin[..., k]
     zero_b = jnp.zeros(bgc.shape[:1] + (4,), f64)
     btr_all = jnp.stack([zero_b if c is None else c for c in btr_cols], axis=-1)
     vmod_all = jnp.stack(vmod_cols, axis=-1)
     cur = jnp.stack(cur_cols, axis=-1)
     b = jnp.asarray(benthos, f64)
-    for tid in BGC_IDS:                                   # oce_ale_tracer.F90:536-541, tracer order
-        if tid in BENTHOS_POOL:
-            b = b + btr_all[:, :, SLOT[tid]]
+    for tid in layout.ids:                                # oce_ale_tracer.F90:536-541, tracer order
+        if tid in BENTHOS_POOL or tid in layout.phaeo_ids[:2]:
+            b = b + btr_all[:, :, layout.slot(tid)]
     return LoopTermsResult(values_mod=vmod_all, bgc=cur, benthos=b, benthos_tr=btr_all,
                            terms=terms if diagnostics else None)
 
 
 def sinking_geometry(hnode, hnode_new, zbar, z, area, areasvol, seafloor, nlev, lat_deg,
-                     saar: SaarColumns) -> SinkingGeometry:
-    """Build a :class:`SinkingGeometry` (f64 arrays, int levels)."""
+                     saar: SaarColumns, nlmin=None) -> SinkingGeometry:
+    """Build a :class:`SinkingGeometry` (f64 arrays, int levels). ``nlmin`` (:func:`elem_levels_min`) is needed
+    by the spectral fork's benthic routines only."""
     a = lambda x: jnp.asarray(x, f64)
     return SinkingGeometry(hnode=a(hnode), hnode_new=a(hnode_new), zbar=a(zbar), z=a(z), area=a(area),
                            areasvol=a(areasvol), seafloor=a(seafloor), nlev=jnp.asarray(nlev, jnp.int32),
-                           lat_deg=a(lat_deg), saar=saar)
+                           lat_deg=a(lat_deg), saar=saar,
+                           nlmin=None if nlmin is None else jnp.asarray(nlmin, jnp.int32))
+
+
+def _fork_seafloor(geom: SinkingGeometry, nl1: int):
+    """The fork's seafloor measure of layer k: ``area(k) - area(k+1)`` from the shallowest neighbouring element's
+    bottom layer down (``nz = nlevels_nod2D_minimum .. nl1``, 0 above), (nod2D, nl-1). The fork predates REcoM's
+    element-based ``seafloor`` (commit 192fbf4), so its benthic exchange uses the control-volume area steps."""
+    if geom.nlmin is None:
+        raise ValueError("the fork's benthic routines need SinkingGeometry.nlmin (elem_levels_min)")
+    k = jnp.arange(nl1)[None, :]
+    jmin = (geom.nlmin - 2)[:, None]                          # 0-based layer of Fortran's nlevels_nod2D_minimum
+    return jnp.where(k >= jmin, geom.area[:, :nl1] - geom.area[:, 1:nl1 + 1], 0.0)

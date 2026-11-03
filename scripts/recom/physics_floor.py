@@ -73,12 +73,21 @@ def main():
     ap.add_argument("--dumps", type=Path, default=DUMPS)
     ap.add_argument("--config", type=Path, default=REPO / "configs" / "pi_recom.yaml")
     ap.add_argument("--steps", type=int, default=2)
+    ap.add_argument("--mesh", type=Path, default=None, help="a mesh bundle (default: the packaged pi)")
+    ap.add_argument("--legacy", action="store_true",
+                    help="the three host-model legacy settings of the REcoM spectral fork's FESOM2 base "
+                         "(legacy_k33_weights, legacy_sw_depth, legacy_fct_bounds)")
+    ap.add_argument("--no-recom", action="store_true", help="drop the config's recom block (the physics alone)")
     args = ap.parse_args()
 
     cfg = load_yaml(args.config)
+    if args.no_recom:
+        cfg = dataclasses.replace(cfg, recom=None)
     phys = cfg.physics_kwargs()
+    if args.legacy:
+        phys.update(legacy_k33_weights=True, legacy_sw_depth=True, legacy_fct_bounds=True)
     dt = float(cfg.dt)
-    mesh = load_mesh()
+    mesh = load_mesh(args.mesh) if args.mesh else load_mesh()
     nl = int(mesh.nl)
     d = {n: load_recom_dump(args.dumps, n)[0] for n in range(1, args.steps + 1)}
     d1 = d[1]
@@ -93,6 +102,7 @@ def main():
     assert np.array_equal(nlev_n, np.asarray(mesh.nlevels_nod2D)), "pi node level counts differ"
 
     st = step0_state(mesh, d1, phys["ale_cfg"])
+    print(f"[floor] config {args.config} mesh {args.mesh or 'packaged pi'} legacy {args.legacy} recom {cfg.recom is not None}")
     print(f"[floor] rest hnode vs Fortran step-1 recom_in.hnode: "
           f"{np.max(np.abs(np.asarray(st.hnode)[:, :nl - 1] - d1['recom_in.hnode'])):.3e}")
     st = jax.tree.map(jnp.asarray, st)

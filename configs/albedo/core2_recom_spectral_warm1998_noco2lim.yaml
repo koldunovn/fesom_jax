@@ -1,0 +1,56 @@
+# Albedo: configs/albedo/core2_recom_spectral_warm1998.yaml with spectral_co2lim: false, i.e. the fork's own spectral
+# growth (no CO2 limitation of the spectral Cphot, recom_sms.F90:2544/2605/2665/2723 apply it in the broadband branch
+# only), as the user's Fortran run fesom2.6_spectral_kdind15w has it. The remaining differences from that run are the
+# host-model physics (KPP vs TKE, the fork's GM/Redi, EVP vs mEVP, partial cells, the legacy FCT/K33/sw-depth details).
+# Albedo: CORE2 + the spectral REcoM fork warm-started from the user's 1997 4-PFT Fortran restart
+# (/albedo/work/projects/p_specbic/sloza/restart_1997_4pft, its README), converted by
+# scripts/recom/fortran_restart_to_jax.py into restart_in below; the forcing of the user's Fortran runs
+# (tmp_run_kdind15 and its warm clones): the JRA55-do repeat-year climatology clim61 (FESOM2 y_perpetual ->
+# forcing.repeat_year), CORE2 runoff and PHC2 SSS from the FESOM2 pool, a constant chlorophyll 0.1 (chl_data_source
+# 'None'), the OASIM climatology. Model years 1998- are forced like every year. Physics and GPU options as
+# configs/albedo/core2_recom_spectral.yaml. Known differences from the Fortran run: no partial cells (the restart's
+# layer thicknesses are rebuilt from hbar), the current FESOM2 physics (docs/recom/VALIDATION.md).
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 2700.0                # the user's runs: step_per_day 32
+
+mesh: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/mesh_core2
+partition: null
+forcing:
+  kind: core2
+  start_year: 1998
+  mslp: true
+  jra_dir: /albedo/work/user/anbros001/Maresys
+  repeat_year: clim61
+  chl_const: 0.1
+  sss_path: /albedo/work/projects/p_pool_fesom2/forcing/CORE2/PHC2_salx.nc
+  runoff_path: /albedo/work/projects/p_pool_fesom2/forcing/CORE2/runoff.nc
+  dust_file: /albedo/pool/FESOM2/recom/CORE2/DustClimMonthlyAlbani.nc
+  oasim_dir: /albedo/work/projects/p_specbic/sloza/forcing_oasim_v2
+  oasim_pattern: oasim_clim1998-2012_darwin400.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_albedo_spectral/namelist.recom   # 37 tracers: 3zoo2det + coccos + CDOM
+  spectral: true
+  spectral_co2lim: false                # the fork: no CO2 limitation in the spectral growth
+  optics_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi/optics
+  ic_set: core2                         # only Alk_surf (the restoring target) is taken from the IC at the conversion
+  ic_dir: /albedo/pool/FESOM2/recom
+  output: [DIC, Alk, DIN, DSi, DFe, O2, Chl, co2flux, pco2surf, npp, export100]
+
+gpu:
+  column_unroll: true
+  column_kernel: true
+  chunk_steps: 48
+output_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/core2_recom_spectral_warm1998_noco2lim
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/restart_1997_4pft_jax
+restart_out: null
+duration: 1yr             # overridden by --steps

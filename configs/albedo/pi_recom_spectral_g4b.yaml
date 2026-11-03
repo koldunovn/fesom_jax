@@ -1,0 +1,53 @@
+# Albedo: the spectral fork's full-step gate G4b (fesom_jax/tests/test_recom_step_fork.py): one JAX step from the
+# physics-matched twin's step-0 state against the twin's step 1. The twin is the fork's own executable run with
+# scripts/recom/fortran/namelists_albedo_spectral_jaxphys/ (its README lists the physics changes from the user's
+# set and why the fork cannot be matched further), job scripts/albedo/run_pi_recom_fork.sbatch.
+# As configs/albedo/pi_recom_spectral.yaml except:
+#   gm: null             the fork's GM/Redi is the FESOM 1.4-style init_Redi_GM (no ODM95 taper, depth scaling or
+#                        Redi tapering), which fesom-jax does not have: off on both sides (Fer_GM = Redi = .false.,
+#                        K_hor 0 so the fork's Ki is zero)
+#   spectral_co2lim      false: the fork applies no CO2 limitation in the spectral growth (the run config keeps the
+#                        user's deviation; a gate must mirror the twin)
+#   output_dir/duration  the gate's; the test runs one step
+# The test adds step kwargs the YAML has no key for: legacy_fct_bounds (the fork's FCT limiter bounds without the
+# thickness), legacy_sw_depth (the absolute shortwave attenuation depth before FESOM2 #1116) and legacy_k33_weights
+# (unused with gm null, kept for the record).
+ale: {}
+gm: null
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 2700.0
+
+mesh: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/mesh_pi_fork
+partition: null
+forcing:
+  kind: core2
+  start_year: 1958
+  mslp: true
+  jra_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/forcing_1958_mslp
+  sss_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/PHC2_salx.nc
+  runoff_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/CORE2_runoff.nc
+  chl_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/Sweeney_2005.nc
+  dust_file: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi/DustClimMonthlyAlbani_pimesh.nc
+  oasim_dir: /albedo/work/projects/p_specbic/sloza/forcing_oasim_v2
+  oasim_pattern: oasim_clim1998-2012_darwin400.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_albedo_spectral_jaxphys/namelist.recom   # 37 tracers: 3zoo2det + coccos + CDOM
+  spectral: true
+  spectral_co2lim: false
+  optics_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi/optics
+  ic_set: pi
+  ic_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi
+  output: [DIC, Alk, DIN, DSi, DFe, O2, Chl, co2flux, pco2surf, npp, export100]
+
+output_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/pi_recom_spectral_g4b
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+duration: 32step          # one day; the gate runs one step

@@ -1,0 +1,39 @@
+# Albedo: configs/pi_recom_bgc.yaml with Albedo inputs (docs/recom/RUNNING_ALBEDO.md).
+#   The packaged pi mesh + pi PHC IC; JRA55-do 1958 from the Zenodo package plus psl.1958 (sea-level pressure,
+#   FESOM2's l_mslp, required by REcoM) from Albedo's JRA55-do v1.3.1; the CORE2 (1-degree) REcoM IC set from
+#   /albedo/pool/FESOM2/recom interpolated onto pi (FESOM2's 5-degree pi set is not on Albedo); the Albani dust
+#   on pi by nearest CORE2 node (scripts/albedo/make_pi_dust.py). Physics as configs/pi_recom_bgc.yaml.
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 2700.0
+
+mesh: null
+partition: null
+forcing:
+  kind: core2
+  start_year: 1958
+  mslp: true
+  jra_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/forcing_1958_mslp
+  sss_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/PHC2_salx.nc
+  runoff_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/CORE2_runoff.nc
+  chl_path: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/Sweeney_2005.nc
+  dust_file: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi/DustClimMonthlyAlbani_pimesh.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_jaxphys/namelist.recom
+  ic_set: core2
+  ic_dir: /albedo/pool/FESOM2/recom
+  output: [DIC, Alk, DIN, DSi, DFe, O2, Chl, co2flux, pco2surf, npp, export100]
+
+output_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/pi_recom_bgc
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+duration: 960step         # 30 days

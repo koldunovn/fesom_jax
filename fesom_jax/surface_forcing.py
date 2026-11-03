@@ -91,6 +91,7 @@ class ForcingStatic(NamedTuple):
     bgc_saar_pcap: jnp.ndarray = None   # (nod2D,) p_ref(ndepth_max) [dbar]
     bgc_saar_data: jnp.ndarray = None   # (nod2D,) bool: the SAAR table has data here
     bgc_saar_baltic: jnp.ndarray = None # (nod2D,) bool: gsw_sa_from_sp_baltic applies
+    bgc_nlmin: jnp.ndarray = None       # (nod2D,) int32: the spectral fork's benthic routines (sinking.elem_levels_min)
 
 
 class StepForcing(NamedTuple):
@@ -119,6 +120,10 @@ class StepForcing(NamedTuple):
     # () float64: AtmCO2(month) [ppm], REcoM's prescribed atmospheric CO2 (recom_main.F90:375) from the time series
     # (constant_CO2 off, :class:`AtmCO2Series`); None with constant_CO2 (CO2_for_spinup, no leaf)
     co2_atm: jnp.ndarray = None
+    # the spectral fork with OASIM (fesom_jax.recom.oasim): the held month's direct/diffuse surface irradiance per
+    # band [W m-2], (nod2D, 13); None otherwise (no leaf)
+    oasim_ed: jnp.ndarray = None
+    oasim_es: jnp.ndarray = None
 
 
 #: StepForcing fields that are per-step SCALARS (REcoM's calendar): replicated on every device, never partitioned
@@ -137,6 +142,8 @@ class ForcingTables(NamedTuple):
     sss: jnp.ndarray                # [nm, nod2D] month table: SSS restoring target [psu]
     chl: jnp.ndarray                # [nm, nod2D] month table: chlorophyll [mg/m³]
     dust: jnp.ndarray = None        # [nm, nod2D] held-dust table (full REcoM; None otherwise)
+    oasim_ed: jnp.ndarray = None    # [nm, 13, nod2D] held OASIM Ed table (the spectral fork; None otherwise)
+    oasim_es: jnp.ndarray = None    # [nm, 13, nod2D]
 
 
 class ForcingSched(NamedTuple):
@@ -219,7 +226,9 @@ def combine_step_forcing(tables: ForcingTables, rdate, fidx, midx,
         chl=tables.chl[midx],
         press_air=val(jra55.I_MSLP) if tables.coef_a.shape[0] > jra55.N_FLD else None,
         fe_dust=None if tables.dust is None else tables.dust[didx],
-        daynew=daynew, ndpyr=ndpyr, co2_atm=co2_atm)
+        daynew=daynew, ndpyr=ndpyr, co2_atm=co2_atm,
+        oasim_ed=None if tables.oasim_ed is None else jnp.moveaxis(tables.oasim_ed[didx], 0, -1),
+        oasim_es=None if tables.oasim_es is None else jnp.moveaxis(tables.oasim_es[didx], 0, -1))
 
 
 class SurfaceFluxes(NamedTuple):
@@ -373,8 +382,10 @@ class SurfaceForcing:
             return {}
         c, m = self.bgc.inputs(year, day, sec)
         co2 = {} if self.bgc.co2 is None else dict(co2_atm=xp.asarray(np.float64(self.bgc.co2_atm(c))))
+        oasim = {} if self.bgc.oasim is None else dict(oasim_ed=xp.asarray(self.bgc.oasim[0][m - 1]),
+                                                       oasim_es=xp.asarray(self.bgc.oasim[1][m - 1]))
         return dict(fe_dust=xp.asarray(self.bgc.dust[m - 1]), daynew=xp.asarray(np.int32(c.daynew)),
-                    ndpyr=xp.asarray(np.int32(c.ndpyr)), **co2)
+                    ndpyr=xp.asarray(np.int32(c.ndpyr)), **co2, **oasim)
 
     def stack(self, dates, *, xp=jnp) -> StepForcing:
         """Stack per-step forcings for an iterable of ``(year, day, sec, month)`` into a
@@ -439,6 +450,12 @@ class SurfaceForcing:
             for j, m in enumerate(dmonths):
                 dust_tab[j] = self.bgc.dust[m - 1]
             bgc_tab = dict(dust=dust_tab)
+            if self.bgc.oasim is not None:        # (nm, 13, N): the node axis last, as every table
+                for key, arr in (("oasim_ed", self.bgc.oasim[0]), ("oasim_es", self.bgc.oasim[1])):
+                    tab = np.zeros((nm, arr.shape[2], N), dtype=arr.dtype)
+                    for j, m in enumerate(dmonths):
+                        tab[j] = np.moveaxis(arr[m - 1], -1, 0)
+                    bgc_tab[key] = tab
             bgc_sched = dict(didx=didx, daynew=dayn, ndpyr=ndp, co2_atm=co2)
         # dtype mirrors step_forcing's (no cast) so the ON/OFF paths agree byte-for-byte
         sss_rows = [np.asarray(self.sss.month(mo)) for mo in months]
@@ -494,7 +511,7 @@ def build_surface_forcing(mesh: Mesh, year: int, *, sst_ic=None,
                        forcing_midstep: bool = True,
                        mslp: bool = False,
                        bgc_dust_path: str | None = None,
-                       dt_ramp=None, bgc_co2=None) -> SurfaceForcing:
+                       dt_ramp=None, bgc_co2=None, bgc_oasim=None, jra_tag=None) -> SurfaceForcing:
     """Build the surface-forcing driver for a JRA55-do ``year`` (host setup, ~seconds).
     Mesh-agnostic: works on any :class:`~fesom_jax.mesh.Mesh` (pi, farc, dars, CORE2, NG5).
 
@@ -524,8 +541,12 @@ def build_surface_forcing(mesh: Mesh, year: int, *, sst_ic=None,
     (:class:`BgcForcing`: ``fe_dust``, ``daynew``, ``ndpyr``, and ``co2_atm`` with ``bgc_co2``, an
     :class:`AtmCO2Series`); it needs ``dt``, and the run's ``dt_ramp`` when it has one (the calendar's start year is
     ``year``). None (the default) adds nothing. ``dt_ramp`` also sets the
-    forcing's mid-step offset after the switch (:func:`set_midstep`)."""
-    jra = jra55.JRA55Reader(mesh, year, jra_dir, mslp=mslp)
+    forcing's mid-step offset after the switch (:func:`set_midstep`). ``bgc_oasim`` (the spectral fork with OASIM,
+    :meth:`fesom_jax.run_config.RunConfig.bgc_oasim`): ``dict(path, pattern, ed_var, es_var)`` of the OASIM
+    climatology, read on the mesh by :func:`fesom_jax.recom.oasim.read_oasim_clim` and held with the dust.
+    ``jra_tag`` (``forcing.repeat_year``): the repeat-year JRA files ``{var}.{tag}.nc`` for every model year
+    (:class:`fesom_jax.jra55.JRA55Reader`)."""
+    jra = jra55.JRA55Reader(mesh, year, jra_dir, mslp=mslp, tag=jra_tag)
     set_midstep(jra, dt, forcing_midstep, dt_ramp, year)
     sss = sss_runoff.build_reader(mesh, sss_path, runoff_path)
     if chl_const is None:
@@ -538,8 +559,13 @@ def build_surface_forcing(mesh: Mesh, year: int, *, sst_ic=None,
     if bgc_dust_path is not None:
         if dt is None:
             raise ValueError("bgc_dust_path needs dt: FESOM2's clock at the recom call is the step end")
+        oasim = None
+        if bgc_oasim is not None:
+            from .recom.oasim import read_oasim_clim
+            oasim = read_oasim_clim(mesh, bgc_oasim["path"], bgc_oasim["pattern"], bgc_oasim.get("ed_var", "Ed"),
+                                    bgc_oasim.get("es_var", "Es"))
         bgc = BgcForcing(read_dust_clim(bgc_dust_path, int(mesh.nod2D)), float(dt), dt_ramp=dt_ramp, year0=year,
-                         co2=bgc_co2)
+                         co2=bgc_co2, oasim=oasim)
     return SurfaceForcing(jra=jra, sss=sss, chl_clim=chl_clim,
                        static=_static_from_mesh(mesh, sss.runoff_node, a_ice), bgc=bgc)
 
@@ -672,10 +698,14 @@ class BgcForcing:
     piecewise clock, ``run._elapsed_seconds``), so a segment that starts after the switch, or straddles it, steps on
     its own grid and each step's clock reads its own dt. None: one ``dt`` throughout."""
 
-    def __init__(self, dust: np.ndarray, dt: float, start=None, *, dt_ramp=None, year0=None, co2=None):
+    def __init__(self, dust: np.ndarray, dt: float, start=None, *, dt_ramp=None, year0=None, co2=None,
+                 oasim=None):
         self.dust = np.asarray(dust)
         self.dt = float(dt)
         self.co2 = co2
+        # the spectral fork's OASIM climatology ``(ed, es)``, each (12, nod2D, 13), held by the dust rule
+        # (gen_surface_forcing.F90:1800-1822 reads both in the same update_monthly_flag block)
+        self.oasim = None if oasim is None else (np.asarray(oasim[0]), np.asarray(oasim[1]))
         self.start = None if start is None else self._key(*start[:3])
         self._switch, self._dt1 = None, None
         if dt_ramp is not None:

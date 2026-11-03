@@ -168,3 +168,82 @@ Open: the SP budget residual above 1e-12 sits in the five tracers that grow by o
 initial value in the first steps (DetCalc, DICremin, PhyCalc, DOC, DON), always a small loss (~1e-11 of the step's
 content change) that does not grow from 4 to 30 steps; stage 3 alone conserves to <= 3e-13 on the G4a inputs (with
 GM off ~1e-14: the WP Redi increments, as upstream's), so it enters where stage 1 meets the tracer step. Not isolated.
+
+## The spectral fork (branch `recom-spectral`, Albedo, 2026-10-28)
+
+The port of `sveta-loza/fesom2` `fesom2.6_recom_tra_diags_spectral` (4 phytoplankton groups, CDOM, 13-band OASIM
+light; `docs/plans/completed/20261028-recom-spectral-port.md`), gated against two 1-rank pi twins of the fork's own executable
+built with the 11 upstream REcoM commits cherry-picked (`/albedo/work/user/sloza/SPECTRAL/recom_spectral_r692`):
+`pi_30d_nowb_adv01` (the broadband build, 36 tracers, job 48602452) and `pi_30d_spectral_adv01` (the spectral build,
+37 tracers with CDOM, job 48602453), dumps at steps 1, 2, 3, 17, 224, 960 under
+`/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/recom_ref/`. The twins run with namelist.tra advection weights
+`0., 1.` (the implemented reconstruction) and the JAX side with the fork's FESOM2 base in mind:
+`legacy_k33_weights`, `legacy_fct_bounds` and the mesh bundle built from the twin's own `elvls.out`
+(`fesom_jax_data/mesh_pi_fork`).
+
+| gate | test | twin | steps | result |
+|---|---|---|---|---|
+| G2, sources and sinks (recom_in -> recom_out, every tracer, diagnostic, flux and cache field) | `test_recom_sms_fork.py` | broadband | 1, 2, 3, 17, 224, 960 | <= 2.4e-13 |
+| G2 with the spectral light (TCphotLigLim_* skipped: unset by the fork) | `test_recom_sms_fork.py` | spectral | 1, 2, 3, 17, 224, 960 | <= 1.3e-13 |
+| the light planes Edz/Esz/Euz/Eutop/Estop x 13 bands and PAR3D | `test_recom_spectral_light.py` | spectral | 1, 2, 3, 17, 224, 960 | <= 1.5e-12 |
+| G3, per-tracer loop terms (benthic return, ballasting, sinking, benthos, the whole loop) | `test_recom_sinking_fork.py` | both | 1, 2, 3, 17, 224, 960 | <= 4.6e-15 |
+| G4a, stage 3 fed with the twin's transport | `test_recom_stage3_fork.py` | both | 1, 2, 3, 17, 224, 960 | <= 3.2e-14 |
+| the cold start (the twin's recom_in at step 1, 37 tracers) | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
+| the OASIM January fields on the nodes | `test_recom_spectral_wiring.py` | spectral | 1 | <= 1e-12 |
+| G4b, one full JAX step from the twin's step-0 state (every tracer, Benthos, the surface diagnostics) | `test_recom_step_fork.py` | both, physics-matched (`pi_1d_*_jaxphys`) | 1 | every tracer <= 2.0e-5, below the pair's T floor 5.4e-5 (S 1.6e-5, a_ice 3.2e-4); Benthos <= 1.6e-10, pCO2 1e-13, pH 6e-15 |
+| sharded (pi dist_4, 4 host devices) equals dense, 2 steps of the production spectral config from the 30-day state | `test_recom_sharded_fork.py` | JAX alone | 2 | every tracer <= 3.2e-13 (median 4.5e-16), Benthos 5.6e-18, physics 1.1e-14 (job 48611814) |
+| G6, `jax.grad` of the 1-day NPP cost vs central FD (expon_phy, expon_cocco, rho_N, deg_Chl, cdomcoeff; graz_max numerically zero) | `test_recom_grad_fork.py` | JAX alone, from the 30-day state | 32 | rel 4.4e-6, 6.6e-7, 8.2e-5, 6.0e-8, 1.2e-7 (job 48611817, 22 min on 16 cores) |
+
+Known skips: the fork's first-call ballast reset (step 1, tracer 1004: `any(scaling_density <= tiny)` on the
+never-written entries below the bottom) and its bottom-interface ballast diagnostics, both documented in
+`test_recom_sinking_fork.py`.
+
+### G4b for the fork (2026-10-29)
+
+The 30-day twins run the user's experiment physics (KPP, the fork's GM/Redi), so the full-step gate has its own
+one-day twins, `pi_1d_spectral_jaxphys` (job 48606105) and `pi_1d_nowb_jaxphys` (48606106), dumps at steps 1, 2,
+3, 17, 32, from the namelist sets `scripts/recom/fortran/namelists_albedo_spectral{,_nowb}_jaxphys/` (their README:
+cvmix TKE with the 692f804 twin's `namelist.cvmix`, mEVP, `ice_diff` 10, no Monin-Obukhov mixing, and GM/Redi
+**off on both sides**, since the fork's `init_Redi_GM` is the FESOM 1.4-style builder without the ODM95 taper, depth
+scaling and Redi tapering fesom-jax implements). The JAX side is `configs/albedo/pi_recom_spectral_g4b.yaml` (`gm:
+null`, `spectral_co2lim: false`) with the three legacy settings of the fork's base as step kwargs
+(`legacy_fct_bounds`, `legacy_sw_depth`, `legacy_k33_weights`). The twins' executables carry upstream FESOM2
+66658357 cherry-picked (63283bc9 on the dump branch): without it the fork's base leaves the first forcing window's
+winds unrotated on the rotated grid and the pair's T floor is 3.5e-3 (runs `pi_1d_*_jaxphys_nofix`, jobs
+48605353/48605354); `legacy_sw_depth` takes the floor from 3.6e-4 to 5.4e-5 (`scripts/recom/physics_floor.py
+--mesh ... --legacy --no-recom`, job 48606112). The residual floor sits in the sea ice (a_ice 3.2e-4 at one node,
+the surface velocity under it 1.9e-3) and the surface T of ice-free polar columns (1.6e-3 degC): the fork's
+2025-10 ice code against the one fesom-jax follows; the 692f804 pair, whose base has both fixes, sits at 4.1e-8.
+Gate (job 48606115): each BGC tracer <= 100 x the T/S floor and the floor itself <= 1.1e-4.
+
+### The fork on FESOM 2.8 (2026-11-02/03)
+
+The same REcoM on current FESOM2 (`sveta-loza/fesom2` `fesom2.8_recom_spectral` `a89bb3d6` = upstream `0aaa2d73` +
+the in-tree spectral REcoM; plan `docs/plans/completed/20261102-fortran-spectral-on-fesom28.md`, the host side in
+`FORTRAN_JAX_DIFFERENCES.md`). Twin `recom_ref/fesom28_spectral_pi_1d_dumps` (job 48698141: pi, 1 rank, 1 day,
+Release, `RECOM_WAVEBANDS` ON, namelists `scripts/recom/fortran/namelists_albedo_fesom28_spectral/`, GM/Redi on,
+dumps at 1, 2, 3, 17, 32).
+
+| gate | test / tool | result | job |
+|---|---|---|---|
+| the move leaves REcoM unchanged: step-1 REcoM outputs, 2.8 build vs the old-base build `recom_spectral_jaxref` `ce142dcd` | dump comparison over 122 node fields | <= 1.2e-12 on the 2173 nodes ice-free in both (ice nodes <= 8.9e-5: one 2.8 ice step) | 48698141 |
+| G2/G3 and the light on the 2.8 twin (`FESOM_RECOM_FORK_RUN` = `FESOM_RECOM_SPECTRAL_RUN` = the 2.8 run) | `test_recom_sms_fork`, `_spectral_light`, `_sinking_fork`, `_spectral_wiring` | 20 passed; stage 1 <= 1.3e-13 (steps 1, 2, 3, 17); light planes <= 1.2e-12 | 48698144, 48698147 |
+| G4b, one full JAX step, **no `legacy_*`, GM/Redi on** (`configs/albedo/pi_recom_spectral_g4b_fesom28.yaml`, `mesh_pi_fork`) | `test_recom_step_fork.py` (`FESOM28_RUNS`, `FLOOR_MAX_28 = 8.2e-8`) | T floor 4.09e-8, a_ice 2.7e-7, every BGC tracer <= 2.4e-8 (the 692f804 pair: 4.1e-8; the fork on 2.6: 5.4e-5 / 3.2e-4); all three twins pass | 48698151, 48698153 |
+| CORE2 warm 1998, one year (Fortran `tmp_run_kdind15w28` vs `core2_recom_spectral_warm1998_fesom28`) | `compare_fortran_jax.py`, `compare_fortran_jax_groups.py` | common-group NPP <= 0.019 % per month (annual 110.22 / 110.22 Pg C/yr), group C/Chl inventories <= 0.09 %, DIC inventory 5.6e-7, CO2 flux <= 0.0012 Pg C/yr, SST <= 3.4e-4 degC | 48698183; 48698174-75 |
+
+Pitfall: the packaged pi mesh (`mesh: null`) differs from the twin's level files at one node by 3 levels; through
+the wet mask that alone gave a "floor" of 0.93 (job 48698146). Use `mesh_pi_fork`.
+
+### Sharded and gradient gates of the fork (2026-10-29)
+
+`test_recom_sharded_fork.py` first differed in the sinking tracers only (DetC 2.6e-2, DetSi 2.3e-2 after two steps
+from the 30-day state; the physics 1e-14): the fork's whole-array ballast reset (`any(scaling_density <= tiny)`,
+`sinking.ballast`) ran per device, Fortran's per-rank domain, so four devices reproduced a four-rank Fortran and one
+device a one-rank one. **Stated deviation:** the reset now reduces over the whole mesh (the step's global sum
+threaded to `ballast(reduce_sum=)`); fesom-jax reproduces the one-rank twins and is device-count independent. The
+twin gates and the DP lock are unchanged (job 48611804: 36 passed). `test_recom_grad_fork.py` first returned nan for
+every parameter that acts through the light: `sqrt(Etop * Ebot)` of the 3-stream solver is 0 in dark cells, its
+derivative infinite; `spectral._safe_sqrt` (the double `where`, forward-identical: the light gate is unchanged, job
+48611818) fixes it. The fork's 4-PFT build takes the photosynthesis maximum from its `Temp_*` functions and the
+spectral growth from the band absorption, so `P_cm*` and `alfa*` are dead parameters there (finite differences
+exactly 0); the gate differentiates the temperature exponents instead (`docs/PORTING_LESSONS.md` 2026-10-29).

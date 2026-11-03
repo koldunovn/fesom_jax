@@ -93,7 +93,8 @@ def init_every_k(state, k: int):
 
 
 def bgc_transport(mesh, X, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_new, zbar3_live, Z3d_live,
-                  Z3d_new, gm_diag, Kv_eff, bc, dt, exch, ckpt, adj, sp_estimate: bool = False, helem_flux=None):
+                  Z3d_new, gm_diag, Kv_eff, bc, dt, exch, ckpt, adj, sp_estimate: bool = False, helem_flux=None,
+                  legacy_fct_bounds: bool = False):
     """Advance the BGC stack ``X`` (``(nod2D, nl, ntr)``) through the tracer stage of one step. Returns
     ``(X_new, X_old_new)``, both ``(nod2D, nl, ntr)``, with ``X_old_new = X`` (the AB2 ``valuesold`` save).
 
@@ -109,11 +110,12 @@ def bgc_transport(mesh, X, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
 
     ``sp_estimate`` (single precision, plan Task 2 only): the vertical diffusion runs its column in float64 as for
     T/S (``impl_vert_diff_one(carry=...)``) but the rounding residual is dropped instead of carried across steps:
-    the cost of FESOM2's SP scheme, not its values (Task 16 ports the scheme)."""
+    the cost of FESOM2's SP scheme, not its values (Task 16 ports the scheme). ``legacy_fct_bounds``: the pre-18346243
+    FCT limiter bounds (:func:`fesom_jax.tracer_adv.zalesak_limit`), for the spectral fork's twin only."""
     X_adv, X_old_new = bgc_advect_redi(
         mesh, X, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=w_i, helem=helem, hnode=hnode, hnode_new=hnode_new,
         zbar3_live=zbar3_live, Z3d_live=Z3d_live, gm_diag=gm_diag, dt=dt, exch=exch, ckpt=ckpt, adj=adj,
-        helem_flux=helem_flux)
+        helem_flux=helem_flux, legacy_fct_bounds=legacy_fct_bounds)
     X_new = bgc_diffuse(mesh, X_adv, Kv_eff=Kv_eff, hnode_new=hnode_new, Z3d_new=Z3d_new, bc=bc, dt=dt,
                         exch=exch, ckpt=ckpt, sp_estimate=sp_estimate)
     if sp_estimate:     # the WP State keeps its dtype (the AB2 save comes back in WP_full)
@@ -148,7 +150,7 @@ def _over_stack(fn, arrays, axes):
 
 
 def bgc_advect_redi(mesh, X, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_new, zbar3_live, Z3d_live,
-                    gm_diag, dt, exch, ckpt, adj, helem_flux=None):
+                    gm_diag, dt, exch, ckpt, adj, helem_flux=None, legacy_fct_bounds: bool = False):
     """The first half of the BGC tracer stage: FCT advection (the T* reconstruction included) + the explicit Redi
     terms, halo-refreshed after the advection. Returns ``(X_adv, X_old_new)`` (``(nod2D, nl, ntr)``); arguments as
     :func:`bgc_transport`."""
@@ -158,7 +160,8 @@ def bgc_advect_redi(mesh, X, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode
         x_adv, x_old_new = ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, h_flux, hnode, hnode_new, x, x_old, dt=dt, exch=exch,
             Z3d=Z3d_live, zbar3=zbar3_live, w_i=w_i,
-            freeze_limited_flux=adj.freeze_advection, freeze_limiter=adj.freeze_fct_limiter))()
+            freeze_limited_flux=adj.freeze_advection, freeze_limiter=adj.freeze_fct_limiter,
+            legacy_fct_bounds=legacy_fct_bounds))()
         x_adv = exch(x_adv, "nod")
         if gm_diag is not None:
             # the Redi gradients read the PRE-step tracer (the `valuesold` of the advection), as for T/S
@@ -189,19 +192,23 @@ def bgc_diffuse(mesh, X_adv, *, Kv_eff, hnode_new, Z3d_new, bc, dt, exch, ckpt, 
     return _over_stack(one, (X_adv, bc), (-1, -1 if per_tracer_bc else None))
 
 
-def surface_bc(sfc, dt):
+def surface_bc(sfc, dt, tracer_layout=None):
     """REcoM's ``bc_surface`` (``oce_ale_tracer.F90:2232-2290``) for the whole stack, ``(nod2D, ntr)``: ``dt`` times
-    the stage-1 flux of :data:`fesom_jax.recom.tracers.BC_SURFACE_SOURCE` for the IDs that have one, 0 elsewhere."""
-    from .tracers import BC_SURFACE_SOURCE, BGC_IDS
+    the stage-1 flux of :data:`fesom_jax.recom.tracers.BC_SURFACE_SOURCE` for the IDs that have one, 0 elsewhere
+    (``tracer_layout``: the tracer :class:`~fesom_jax.recom.layout.Layout`; default REcoM 692f804's bin_2p3z2d)."""
+    from .layout import DEFAULT
+    from .tracers import BC_SURFACE_SOURCE
+    ids = (tracer_layout or DEFAULT).ids
     ref = sfc.GloCO2flux_seaicemask
     cols = [dt * getattr(sfc, BC_SURFACE_SOURCE[i]) if BC_SURFACE_SOURCE.get(i, "zero") != "zero"
-            else jnp.zeros_like(ref) for i in BGC_IDS]
+            else jnp.zeros_like(ref) for i in ids]
     return jnp.stack(cols, axis=-1)
 
 
 def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_new, zbar3_live, Z3d_live, Z3d_new,
                  gm_diag, Kv_eff, temp, salt, sfc, benthos, geom_sink, params, switches, dt, exch, ckpt, adj,
-                 helem_flux=None, return_terms: bool = False, carry=None):
+                 helem_flux=None, return_terms: bool = False, carry=None, tracer_layout=None,
+                 legacy_fct_bounds: bool = False, reduce_sum=None):
     """Full REcoM's stage 3: FESOM2's tracer loop for the 31 BGC tracers (``solve_tracers_ale``,
     ``oce_ale_tracer.F90:725-930``). ``X1`` is stage 1's output (the tracers at the start of the loop, ``(nod2D, nl,
     31)``), ``temp``/``salt`` the step's final T and S (S before ``S_FLOOR``), ``sfc``/``benthos`` stage 1's
@@ -218,7 +225,9 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
     ``carry`` (single precision, the BGC rounding carry ``State.bgc_carry``): :func:`_recom_stage3_sp`, the #1207
     scheme; the result tuple then ends with the new carry."""
     from . import sinking
-    from .tracers import SLOT
+    from .layout import DEFAULT
+    tracer_layout = tracer_layout or DEFAULT
+    SLOT = tracer_layout.slot_map
     if carry is not None:
         if w_i is not None or helem_flux is not None:
             raise NotImplementedError("single precision + REcoM: no w_split, bgc_every = 1 only")
@@ -226,14 +235,15 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
                                 hnode_new=hnode_new, zbar3_live=zbar3_live, Z3d_live=Z3d_live, Z3d_new=Z3d_new,
                                 gm_diag=gm_diag, Kv_eff=Kv_eff, temp=temp, salt=salt, sfc=sfc, benthos=benthos,
                                 geom_sink=geom_sink, params=params, switches=switches, dt=dt, exch=exch, ckpt=ckpt,
-                                adj=adj, return_terms=return_terms)
+                                adj=adj, return_terms=return_terms, tracer_layout=tracer_layout,
+                                legacy_fct_bounds=legacy_fct_bounds)
     nl1 = mesh.nl - 1
     X1 = hold_major(X1)             # the advection, the T* of every group and the loop terms read this one buffer
     X_adv, X_old_new = bgc_advect_redi(
         mesh, X1, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=w_i, helem=helem, hnode=hnode, hnode_new=hnode_new,
         zbar3_live=zbar3_live, Z3d_live=Z3d_live, gm_diag=gm_diag, dt=dt, exch=exch, ckpt=ckpt, adj=adj,
-        helem_flux=helem_flux)
-    bc = surface_bc(sfc, dt)
+        helem_flux=helem_flux, legacy_fct_bounds=legacy_fct_bounds)
+    bc = surface_bc(sfc, dt, tracer_layout)
     ratio = jnp.where(hnode_new > 0.0, hnode / jnp.where(hnode_new > 0.0, hnode_new, 1.0), 0.0)[..., None]
 
     def finish(ids, values_mod):
@@ -246,7 +256,8 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
         return x_new[:, :nl1]
 
     res = sinking.recom_tracer_loop_terms(X1[:, :nl1], temp[:, :nl1], salt[:, :nl1], geom_sink,
-                                          sfc.GlodecayBenthos, benthos, dt, params, finish, switches=switches)
+                                          sfc.GlodecayBenthos, benthos, dt, params, finish, switches=switches,
+                                          layout=tracer_layout, reduce_sum=reduce_sum)
     X_new = exch(jnp.concatenate([res.bgc, X1[:, nl1:]], axis=1), "nod")
     if return_terms:
         return X_new, X_old_new, exch(res.benthos, "nod"), res
@@ -255,7 +266,7 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
 
 def _recom_stage3_sp(mesh, X1, X_old, carry, *, uv_adv, w_e_adv, helem, hnode, hnode_new, zbar3_live, Z3d_live,
                      Z3d_new, gm_diag, Kv_eff, temp, salt, sfc, benthos, geom_sink, params, switches, dt, exch, ckpt,
-                     adj, return_terms):
+                     adj, return_terms, tracer_layout=None, legacy_fct_bounds: bool = False):
     """Stage 3 in single precision + full REcoM (an opt-in deviation; plan ``20261026-recom-lane-sp``, S1 design).
 
     FESOM2 #1207's tracer scheme for every BGC tracer, as for T and S (:func:`fesom_jax.step._tracers_advect_sp`),
@@ -274,7 +285,9 @@ def _recom_stage3_sp(mesh, X1, X_old, carry, *, uv_adv, w_e_adv, helem, hnode, h
     from .. import precision as PR
     from ..step import tracer_content_sp
     from . import sinking
-    from .tracers import SLOT
+    from .layout import DEFAULT
+    tracer_layout = tracer_layout or DEFAULT
+    SLOT = tracer_layout.slot_map
     nl1 = mesh.nl - 1
     X1, carry = hold_major(X1), hold_major(carry)        # one tracer-major buffer each (hold_major)
     V1 = PR.wp(X1)                                        # FESOM2's WP values after recom()
@@ -283,11 +296,12 @@ def _recom_stage3_sp(mesh, X1, X_old, carry, *, uv_adv, w_e_adv, helem, hnode, h
     def content(x, x_old):
         return tracer_content_sp(mesh, x, x_old, uv_adv=uv_adv, w_e_adv=w_e_adv, helem=helem, hnode=hnode,
                                  hnode_new=hnode_new, h_wp=h_wp, gm_diag=gm_diag, zbar3_live=zbar3_live,
-                                 Z3d_live=Z3d_live, dt=dt, exch=exch, ckpt=ckpt, adj=adj)
+                                 Z3d_live=Z3d_live, dt=dt, exch=exch, ckpt=ckpt, adj=adj,
+                                 legacy_fct_bounds=legacy_fct_bounds)
 
     d, X_old_new = _over_stack(content, (V1, X_old), (-1, -1))       # d float64 (nod2D, nl, ntr)
     d = hold_major(d)
-    bc = surface_bc(sfc, dt)                          # REcoM's real(8) fluxes · dt, (nod2D, ntr)
+    bc = surface_bc(sfc, dt, tracer_layout)                          # REcoM's real(8) fluxes · dt, (nod2D, ntr)
     carry_cols = [carry[..., s] for s in range(carry.shape[-1])]
 
     def finish(ids, values_mod):
@@ -320,7 +334,8 @@ def _recom_stage3_sp(mesh, X1, X_old, carry, *, uv_adv, w_e_adv, helem, hnode, h
 
 
 def bgc_every_k(mesh, st, k: int, *, uv_adv, w_e_adv, w_i, helem, hnode_new, Z3d_new, gm_diag, Kv_eff, bc, dt,
-                exch, ckpt, adj, zstar: bool, sp_estimate: bool = False, full=None):
+                exch, ckpt, adj, zstar: bool, sp_estimate: bool = False, full=None,
+                legacy_fct_bounds: bool = False):
     """One physics step of the BGC-every-k scheme. Adds this step's transport (``uv_adv·helem``, ``w_e_adv``, ``w_i``,
     ``Kv_eff``, the surface BC ``bc``) to the interval sums; on the k-th step of the interval runs
     :func:`bgc_transport` once with ``k·dt`` on the means, from the thickness at the interval start (``bgc_h0``, its
@@ -368,7 +383,8 @@ def bgc_every_k(mesh, st, k: int, *, uv_adv, w_e_adv, w_i, helem, hnode_new, Z3d
             mesh, st.bgc, st.bgc_old, uv_adv=uvh * inv, helem_flux=jnp.ones_like(helem), w_e_adv=we * inv,
             w_i=None if w_i is None else wi * inv, helem=helem0, hnode=h0, hnode_new=hnode_new,
             zbar3_live=zbar3_0, Z3d_live=Z3d_0, Z3d_new=Z3d_new, gm_diag=gm_diag, Kv_eff=kv * inv,
-            bc=None if bc is None else bcs, dt=k * dt, exch=exch, ckpt=ckpt, adj=adj, sp_estimate=sp_estimate)
+            bc=None if bc is None else bcs, dt=k * dt, exch=exch, ckpt=ckpt, adj=adj, sp_estimate=sp_estimate,
+            legacy_fct_bounds=legacy_fct_bounds)
         return dict(bgc=X_new, bgc_old=X_old_new, bgc_steps=n * 0, bgc_uvh=uvh * 0, bgc_we=we * 0, bgc_wi=wi * 0,
                     bgc_kv=kv * 0, bgc_bc=bcs * 0, bgc_h0=hnode_new.astype(h0.dtype))
 

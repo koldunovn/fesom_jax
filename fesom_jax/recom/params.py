@@ -43,7 +43,7 @@ PA2ATM = 101325.0
 REDO2C = 1.453
 
 NAMELIST_GROUPS = {
-    "parecomsetup": ('enable_3zoo2det', 'enable_coccos',),
+    "parecomsetup": ('enable_3zoo2det', 'enable_coccos', 'recom_neg_diag',),
     "pavariables": ('use_REcoM', 'REcoM_restart', 'bgc_num', 'diags3d_num', 'bgc_base_num', 'VDet', 'VDet_zoo2',
             'VPhy', 'VDia', 'VCocco', 'VPhaeo', 'allow_var_sinking', 'biostep', 'REcoM_Geider_limiter',
             'REcoM_Grazing_Variable_Preference', 'REcoM_Grazing_Variable_Efficiency', 'Grazing_detritus',
@@ -53,7 +53,7 @@ NAMELIST_GROUPS = {
             'useRivers', 'useRivFe', 'useErosion', 'NitrogenSS', 'useAeolianN', 'firstyearoffesomcycle',
             'lastyearoffesomcycle', 'numofCO2cycles', 'currentCO2cycle', 'Nmocsy', 'recom_debug', 'ciso',
             'benthos_num', 'use_MEDUSA', 'sedflx_num', 'bottflx_num', 'add_loopback', 'lb_tscale', 'use_atbox',
-            'use_virt_tracers',),
+            'use_virt_tracers', 'DIC_PI', 'fe_2ligands', 'fe_compl_nica',),   # the fork lists the last three here
     "pasinking": ('Vdet_a', 'Vcalc',),
     "painitialization_N": ('cPhyN', 'cHetN', 'cZoo2N',),
     "paArrhenius": ('recom_Tref', 'C2K', 'Ae', 'Tmax_phaeo', 'Topt_phaeo', 'uopt_phaeo', 'beta_phaeo', 'ord_d',
@@ -61,13 +61,14 @@ NAMELIST_GROUPS = {
             'k_o2_remin',),
     "palimiter_function": ('NMinSlope', 'SiMinSlope', 'NCmin', 'NCmin_d', 'NCmin_c', 'NCmin_p', 'SiCmin', 'k_Fe',
             'k_Fe_d', 'k_Fe_c', 'k_Fe_p', 'k_si', 'P_cm', 'P_cm_d', 'P_cm_c', 'P_cm_p',),
-    "palight_calculations": ('k_w', 'a_chl',),
-    "paphotosynthesis": ('alfa', 'alfa_d', 'alfa_c', 'alfa_p', 'parFrac',),
+    "palight_calculations": ('k_w', 'a_chl', 'par_layer_mean',),
+    "paphotosynthesis": ('alfa', 'alfa_d', 'alfa_c', 'alfa_p', 'parFrac', 'beta_inh', 'beta_inh_d', 'beta_inh_c',
+            'beta_inh_p',),
     "paassimilation": ('V_cm_fact', 'V_cm_fact_d', 'V_cm_fact_c', 'V_cm_fact_p', 'NMaxSlope', 'SiMaxSlope', 'NCmax',
             'NCmax_d', 'NCmax_c', 'NCmax_p', 'SiCmax', 'NCuptakeRatio', 'NCUptakeRatio_d', 'NCUptakeRatio_c',
             'NCUptakeRatio_p', 'SiCUptakeRatio', 'k_din', 'k_din_d', 'k_din_c', 'k_din_p', 'Chl2N_max',
             'Chl2N_max_d', 'Chl2N_max_c', 'Chl2N_max_p', 'res_phy', 'res_phy_d', 'res_phy_c', 'res_phy_p',
-            'biosynth', 'biosynthSi',),
+            'biosynth', 'biosynthSi', 'res_phy_const', 'nfix_floor', 'nfix_Tmin', 'nfix_max',),
     "pairon_chem": ('totalligand', 'ligandStabConst', 'fe_2ligands', 'fe_compl_nica',),
     "pazooplankton": ('graz_max', 'epsilonr', 'res_het', 'Redfield', 'loss_het', 'pzDia', 'sDiaNsq', 'pzPhy',
             'sPhyNsq', 'pzCocco', 'sCoccoNsq', 'pzPhaeo', 'sPhaeoNsq', 'pzMicZoo', 'sMicZooNsq', 'tiny_het',),
@@ -79,11 +80,12 @@ NAMELIST_GROUPS = {
             'sPhyNsq3', 'pzCocco3', 'sCoccoNsq3', 'pzPhaeo3', 'sPhaeoNsq3',),
     "pagrazingdetritus": ('pzDet', 'sDetNsq', 'pzDetZ2', 'sDetZ2Nsq', 'pzDet2', 'sDetNsq2', 'pzDetZ22',
             'sDetZ2Nsq2',),
-    "paaggregation": ('agg_PD', 'agg_PP',),
+    "paaggregation": ('agg_PD', 'agg_PP', 'agg_fac_phaeo', 'agg_fac_phaeo_det',),
     "padin_rho_N": ('rho_N',),
     "padic_rho_C1": ('rho_C1',),
-    "paphytoplankton_N": ('lossN', 'lossN_d', 'lossN_c', 'lossN_p',),
-    "paphytoplankton_C": ('lossC', 'lossC_d', 'lossC_c', 'lossC_p',),
+    "paphytoplankton_N": ('lossN', 'lossN_d', 'lossN_c', 'lossN_p', 'mort_phaeo', 'mort_fac_fe_phaeo',),
+    "paphytoplankton_C": ('lossC', 'lossC_d', 'lossC_c', 'lossC_p', 'f_ovf', 'ovf_to_cdom', 'res_ovf', 'res_ovf_d',
+            'res_ovf_c', 'res_ovf_p',),
     "paphytoplankton_ChlA": ('deg_Chl', 'deg_Chl_d', 'deg_Chl_c', 'deg_Chl_p',),
     "padetritus_N": ('gfin', 'grazEff2', 'grazEff3', 'reminN',),
     "padetritus_C": ('reminC', 'rho_c2',),
@@ -95,7 +97,7 @@ NAMELIST_GROUPS = {
             'c_co2_phaeo', 'c_co2_calc', 'd_co2_phy', 'd_co2_dia', 'd_co2_cocco', 'd_co2_phaeo', 'd_co2_calc',),
     "pairon": ('Fe2N', 'Fe2N_benthos', 'kScavFe', 'kScavFe2', 'dust_sol', 'RiverFeConc',),
     "pacalc": ('calc_prod_ratio', 'calc_diss_guts', 'calc_diss_rate', 'calc_diss_rate2', 'calc_diss_omegac',
-            'calc_diss_exp',),
+            'calc_diss_exp', 'k_din_calc',),
     "pabenthos_decay_rate": ('decayRateBenN', 'decayRateBenC', 'decayRateBenSi', 'q_NC_Denit',),
     "paco2_flux_param": ('permil', 'permeg', 'Xacc', 'CO2_for_spinup',),
     "paalkalinity_restoring": ('surf_relax_Alk',),
@@ -103,6 +105,17 @@ NAMELIST_GROUPS = {
             'visc_ref_water', 'w_ref1', 'w_ref2', 'depth_scaling1', 'depth_scaling2', 'max_sinking_velocity',),
     "nam_rsbc": ('fe_data_source', 'nm_fe_data_file', 'nm_aen_data_file', 'nm_river_data_file',
             'nm_erosion_data_file', 'nm_co2_data_file',),
+    # the spectral fork (recom_modules.F90:610-751 of fesom2.6_recom_tra_diags_spectral): &spectral and the OASIM
+    # forcing group of gen_surface_forcing.F90:118-144; darwin_bbphy(4) is read as darwin_bbphy(1)..(4)
+    "spectral": ('RECOM_CDOM', 'RECOM_MARSHALL', 'RECOM_RADTRANS', 'OASIM', 'RECOM_BMASS', 'RECOM_CALC_ACDOM',
+            'RECOM_CALC_APART', 'RECOM_CALC_APHYT', 'RECOM_CALC_REFLEC', 'DAR_NONSPECTRAL_BACKSCATTERING_RATIO',
+            'darwin_bbphy(1)', 'darwin_bbphy(2)', 'darwin_bbphy(3)', 'darwin_bbphy(4)', 'QYmax', 'QYmax_d',
+            'QYmax_cocco', 'QYmax_phaeo', 'cdomcoeff', 'bb_to_b', 'bb_bg443', 'bb_bg_slope', 'aphyt_slope_phy',
+            'aphyt_icept_phy', 'aphyt_slope_dia', 'aphyt_icept_dia', 'aphyt_slope_cocco', 'aphyt_icept_cocco',
+            'aphyt_slope_phaeo', 'aphyt_icept_phaeo', 'k_deg_cocco', 'r_max_cocco', 'k_rep_cocco', 'k_deg_phaeo',
+            'r_max_phaeo', 'k_rep_phaeo', 'darwin_waterabsorbFile', 'darwin_surfacespecFile',
+            'darwin_phytoabsorbFile', 'darwin_acdomFile', 'darwin_particleabsorbFile',),
+    "nam_rspecsbc": ('OASIM_path', 'OASIM_file_pattern', 'OASIM_Ed_varname', 'OASIM_Es_varname',),
     "paciso": ('ciso_init', 'ciso_14', 'ciso_organic_14', 'lambda_14', 'delta_CO2_13', 'big_delta_CO2_14',
             'atbox_spinup', 'cosmic_14_init',),
 }
@@ -368,6 +381,51 @@ class RecomParams(NamedTuple):
     depth_scaling2: float = 0.0         # recom_modules.F90:994
     max_sinking_velocity: float = 250.0 # recom_modules.F90:997
 
+    # ---- the spectral fork (fesom2.6_recom_tra_diags_spectral recom_modules.F90, defaults as declared there) ----
+    beta_inh: float = 0.0               # fork :296 Platt photoinhibition, small phytoplankton
+    beta_inh_d: float = 0.0             # fork :297
+    beta_inh_c: float = 0.0             # fork :298
+    beta_inh_p: float = 0.0             # fork :299
+    nfix_floor: float = 0.0             # fork :341 pseudo N fixation: 0 = off
+    nfix_Tmin: float = 20.0             # fork :342 [degC]
+    nfix_max: float = 0.0               # fork :343 [mmol N m-2 d-1], 0 = no cap
+    agg_fac_phaeo: float = 1.0          # fork :441
+    agg_fac_phaeo_det: float = 1.0      # fork :446
+    mort_phaeo: float = 0.0             # fork :465 Phaeocystis linear mortality [d-1]
+    mort_fac_fe_phaeo: float = 1.3      # fork :466
+    f_ovf: float = 0.0                  # fork :474 carbon overflow fraction
+    res_ovf: float = 0.0                # fork :481 overflow respired
+    res_ovf_d: float = -1.0             # fork :486 -1 = use res_ovf
+    res_ovf_c: float = -1.0             # fork :487
+    res_ovf_p: float = -1.0             # fork :488
+    k_din_calc: float = -1.0            # fork :568 [mmol N m-3], -1 = off
+    darwin_bbphy_1: float = 0.0020      # fork :719 darwin_bbphy(tnabp) = (/0.0020, 0.0105, 0.0200, 0.0020/)
+    darwin_bbphy_2: float = 0.0105
+    darwin_bbphy_3: float = 0.0200
+    darwin_bbphy_4: float = 0.0020
+    QYmax: float = 4.8e-4               # fork :629 [mmol C J-1]
+    QYmax_d: float = 4.8e-4             # fork :630
+    QYmax_cocco: float = 4.8e-4         # fork :631
+    QYmax_phaeo: float = 4.8e-4         # fork :632
+    cdomcoeff: float = 0.18             # fork :725 [m2 mmol-1] specific CDOM absorption at 450 nm
+    bb_to_b: float = 0.05               # fork :730 detritus backscatter ratio (RECOM_CALC_APART)
+    bb_bg443: float = 0.0               # fork :731 background backscatter at 443 nm
+    bb_bg_slope: float = 1.0            # fork :732
+    aphyt_slope_phy: float = -1.930e-3  # fork :639 (RECOM_CALC_APHYT, not ported)
+    aphyt_icept_phy: float = -1.011e-4  # fork :640
+    aphyt_slope_dia: float = -1.418e-3  # fork :641
+    aphyt_icept_dia: float = -5.800e-5  # fork :642
+    aphyt_slope_cocco: float = -5.600e-4   # fork :654
+    aphyt_icept_cocco: float = -3.300e-4   # fork :655
+    aphyt_slope_phaeo: float = -3.972e-3   # fork :656
+    aphyt_icept_phaeo: float = -2.660e-4   # fork :657
+    k_deg_cocco: float = 8.0e-7         # fork :676 (RECOM_MARSHALL, not ported)
+    r_max_cocco: float = 20.0           # fork :677
+    k_rep_cocco: float = 0.5            # fork :678
+    k_deg_phaeo: float = 8.0e-7         # fork :679
+    r_max_phaeo: float = 20.0           # fork :680
+    k_rep_phaeo: float = 0.5            # fork :681
+
 
 @dataclasses.dataclass(frozen=True)
 class RecomSwitches:
@@ -433,6 +491,32 @@ class RecomSwitches:
     nm_river_data_file: str = ''
     nm_erosion_data_file: str = ''
     nm_co2_data_file: str = ''
+    # ---- the spectral fork (fesom2.6_recom_tra_diags_spectral) ----
+    spectral_fork: bool = False         # the namelist has an &spectral group: the fork's flavour (fesom_jax.recom.layout)
+    recom_neg_diag: bool = False        # fork recom_modules.F90:102 (a print diagnostic)
+    DIC_PI: bool = True                 # fork :162; the fork's oce_setup_step.F90 reads the GLODAP PI DIC file when on
+    par_layer_mean: bool = False        # fork :283 default .true. (FORK_DEFAULTS): the exact layer-mean broadband PAR
+    res_phy_const: bool = False         # fork :336
+    ovf_to_cdom: bool = True            # fork :478
+    RECOM_CDOM: bool = True             # fork :613
+    RECOM_MARSHALL: bool = False        # fork :614
+    RECOM_RADTRANS: bool = True         # fork :615
+    OASIM: bool = False                 # fork :616
+    RECOM_CALC_ACDOM: bool = False      # fork :617
+    RECOM_CALC_APART: bool = False      # fork :618
+    RECOM_CALC_APHYT: bool = False      # fork :619
+    RECOM_CALC_REFLEC: bool = False     # fork :620
+    RECOM_BMASS: bool = False           # fork :621
+    DAR_NONSPECTRAL_BACKSCATTERING_RATIO: bool = False   # fork :718
+    darwin_waterabsorbFile: str = 'abw25par.dat'                   # fork :682
+    darwin_surfacespecFile: str = 'surfspec_13amt6.dat'            # fork :683
+    darwin_phytoabsorbFile: str = 'optics_phyto_recom_carbon_12.dat'   # fork :684
+    darwin_acdomFile: str = 'aCDOM13amtVK2006.dat'                 # fork :685
+    darwin_particleabsorbFile: str = 'optics_detritus_3bb.dat'     # fork :686
+    OASIM_path: str = '/albedo/work/projects/p_specbic/sloza/forcing_oasim_v2/'   # fork gen_surface_forcing.F90:140
+    OASIM_file_pattern: str = 'oasim_clim1998-2012_darwin400.nc'   # fork :141
+    OASIM_Ed_varname: str = 'Ed'        # fork :142
+    OASIM_Es_varname: str = 'Es'        # fork :143
 
 
 # The switch values of the ported configuration (bin_2p3z2d). A switch listed here with any other value
@@ -474,26 +558,39 @@ SUPPORTED: dict = {
     "fe_2ligands": (False, "two-ligand iron chemistry is not ported"),
     "fe_compl_nica": (False, "the NICA iron complexation is not ported"),
     "fe_data_source": ("Albani", "only the Albani monthly dust climatology is ported"),
+    # the spectral fork (docs/plans/completed/20261028-recom-spectral-port.md): the ecosystem (lane E), the light (lane L)
+    # and the wiring (lane W) are ported; what stays out:
+    "RECOM_MARSHALL": (False, "the D1 photoinhibition tracers are out of scope"),
+    "RECOM_CALC_APHYT": (False, "the D1-dependent phytoplankton absorption is out of scope"),
+    "RECOM_CALC_REFLEC": (False, "the reflectance diagnostic is out of scope"),
+    "DAR_NONSPECTRAL_BACKSCATTERING_RATIO": (False, "the Darwin backscatter ratio option is not ported"),
 }
+# What the fork's recom_config declares differently from REcoM 692f804: applied before a namelist that has an
+# &spectral group (the fork flavour), so an unset key gets the fork's default, not 692f804's.
+FORK_DEFAULTS = {"par_layer_mean": True, "NCmax_p": 0.2, "bgc_num": 31}
 # Accepted with any value, no effect on the ported code: output/diagnostic and bookkeeping flags, the
 # flags REcoM 692f804 declares but never reads (UseFeDust, UseDustClim, UseDustClimAlbani,
 # HetRespFlux_plus), the file names and the CO2 cycle years (read by the input layer, Task 13, and with constant_CO2
 # off by fesom_jax.run_config.RunConfig.bgc_co2), use_virt_tracers (FESOM2 reads it
 # only for linfs virtual tracer fluxes, ice_oce_coupling.F90:450; fesom-jax REcoM runs zstar),
 # allow_var_sinking (sinking lane, recom_sinking.F90:122).
-NO_EFFECT = ("REcoM_restart", "recom_debug", "Diags", "diags3d_num", "UseFeDust", "UseDustClim",
+NO_EFFECT = ("REcoM_restart", "recom_debug", "Diags", "diags3d_num", "UseFeDust", "UseDustClim", "recom_neg_diag", "DIC_PI",
+             "darwin_waterabsorbFile", "darwin_surfacespecFile", "darwin_phytoabsorbFile", "darwin_acdomFile",
+             "darwin_particleabsorbFile", "OASIM_path", "OASIM_file_pattern", "OASIM_Ed_varname", "OASIM_Es_varname",
              "UseDustClimAlbani", "HetRespFlux_plus", "REcoMDataPath", "firstyearoffesomcycle",
              "lastyearoffesomcycle", "numofCO2cycles", "currentCO2cycle", "bottflx_num", "use_virt_tracers",
              "allow_var_sinking", "nm_fe_data_file", "nm_aen_data_file", "nm_river_data_file",
              "nm_erosion_data_file", "nm_co2_data_file")
 
 _PARAM_FIELDS = {f.lower(): f for f in RecomParams._fields}
+_PARAM_FIELDS.update({f"darwin_bbphy({i})": f"darwin_bbphy_{i}" for i in range(1, 5)})
 _SWITCH_FIELDS = {f.name.lower(): f.name for f in dataclasses.fields(RecomSwitches)}
 _GROUP_KEYS = {g.lower(): {k.lower() for k in keys} for g, keys in NAMELIST_GROUPS.items()}
 _GROUP_KEYS["nam_rsbc"] = {"fe_data_source", "nm_fe_data_file", "nm_aen_data_file", "nm_river_data_file",
                            "nm_erosion_data_file", "nm_co2_data_file"}
 _IGNORED_GROUPS = {"paciso": _GROUP_KEYS.pop("paciso")}
-assert set(_SWITCH_FIELDS) | set(_PARAM_FIELDS) == set().union(*_GROUP_KEYS.values())
+_ALL_KEYS = set().union(*_GROUP_KEYS.values())
+assert (set(_SWITCH_FIELDS) | set(_PARAM_FIELDS)) - {f"darwin_bbphy_{i}" for i in range(1, 5)} - {"spectral_fork"} == _ALL_KEYS
 
 
 # --------------------------------------------------------------------------------------
@@ -543,6 +640,8 @@ def read_namelist(path: Union[str, Path]) -> dict:
         if cur is None:
             m = re.match(r"&(\w+)\s*(.*)$", line)
             if not m:
+                if not groups:                   # a free-text header before the first group (Fortran skips it)
+                    continue
                 raise ValueError(f"{path}: text outside a namelist group: {raw!r}")
             cur = m.group(1).lower()
             if cur in groups:
@@ -573,6 +672,11 @@ def from_namelist_dict(groups: dict) -> Tuple[RecomSwitches, RecomParams]:
     """Apply ``{group: {key: value}}`` (as :func:`read_namelist` returns it) to the defaults.
     Unknown groups or keys raise ``KeyError``; a value of the wrong kind raises ``TypeError``."""
     sw_kw, par_kw = {}, {}
+    fork = "spectral" in {g.lower() for g in groups}
+    if fork:                                        # the fork's own defaults for what it declares differently
+        sw_kw["spectral_fork"] = True
+        for k, v in FORK_DEFAULTS.items():
+            (par_kw if k in RecomParams._fields else sw_kw)[k] = v
     for g, entries in groups.items():
         g = g.lower()
         if g in _IGNORED_GROUPS:
@@ -585,7 +689,8 @@ def from_namelist_dict(groups: dict) -> Tuple[RecomSwitches, RecomParams]:
         for k, v in entries.items():
             k = k.lower()
             if k not in _GROUP_KEYS[g]:
-                raise KeyError(f"unknown key {k!r} in &{g}")
+                if k not in _ALL_KEYS:                   # the fork lists a few keys under another group
+                    raise KeyError(f"unknown key {k!r} in &{g}")
             if k in _PARAM_FIELDS:
                 if isinstance(v, bool) or not isinstance(v, (int, float)):
                     raise TypeError(f"&{g} {k} = {v!r}: a REAL is expected")
@@ -621,12 +726,24 @@ def load_namelist(path: Union[str, Path], check: bool = True) -> Tuple[RecomSwit
     return sw, par
 
 
+# What the spectral fork's flavour ports beyond bin_2p3z2d (lanes E/L/W): its 4-PFT layouts (enable_coccos) and
+# the tracer counts of its layouts (bgc_num, checked by fesom_jax.recom.layout.layout_of).
+FORK_PORTED = ("enable_coccos", "bgc_num")
+
+
 def check_supported(sw: RecomSwitches) -> RecomSwitches:
-    """Raise ``NotImplementedError`` for any switch outside the ported ``bin_2p3z2d`` configuration."""
+    """Raise ``NotImplementedError`` for any switch outside the ported ``bin_2p3z2d`` configuration (or, for a
+    namelist of the spectral fork, outside its ported flavour)."""
     bad = []
+    fork = bool(getattr(sw, "spectral_fork", False))
     for name, (want, why) in SUPPORTED.items():
+        if fork and name in FORK_PORTED:
+            continue
         if getattr(sw, name) != want:
             bad.append(f"{name} = {getattr(sw, name)!r} ({why})")
+    if fork and not bad:
+        from .layout import layout_of
+        layout_of(sw)                     # ValueError when bgc_num fits none of the fork's layouts
     if bad:
         raise NotImplementedError("REcoM switch(es) outside the ported bin_2p3z2d configuration "
                                   "(fesom_jax/recom/params.py SUPPORTED): " + "; ".join(bad))
@@ -641,13 +758,22 @@ class Derived(NamedTuple):
     tiny_N_d: float
     tiny_C_d: float
     tiny_Si: float
+    tiny_N_c: float = 0.0
+    tiny_C_c: float = 0.0
+    tiny_N_p: float = 0.0
+    tiny_C_p: float = 0.0
 
 
 def derived(p: RecomParams) -> Derived:
-    """``recom_init.F90:941-973`` (cocco/Phaeocystis floors omitted: out of scope)."""
+    """``recom_init.F90:941-973``; the coccolithophore and Phaeocystis floors as the fork's
+    ``recom_sms.F90:257-272`` (``tiny_N_c = tiny_chl / chl2N_max_c``, ``tiny_C_c = tiny_N_c / NCmax_c``, same for p)."""
     tiny_N = TINY_CHL / p.Chl2N_max
     tiny_C = tiny_N / p.NCmax
     tiny_N_d = TINY_CHL / p.Chl2N_max_d
     tiny_C_d = tiny_N_d / p.NCmax_d
     tiny_Si = tiny_C_d * p.SiCmax
-    return Derived(tiny_N, tiny_C, tiny_N_d, tiny_C_d, tiny_Si)
+    tiny_N_c = TINY_CHL / p.Chl2N_max_c
+    tiny_C_c = tiny_N_c / p.NCmax_c
+    tiny_N_p = TINY_CHL / p.Chl2N_max_p
+    tiny_C_p = tiny_N_p / p.NCmax_p
+    return Derived(tiny_N, tiny_C, tiny_N_d, tiny_C_d, tiny_Si, tiny_N_c, tiny_C_c, tiny_N_p, tiny_C_p)

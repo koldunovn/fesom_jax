@@ -1,0 +1,54 @@
+# Albedo: configs/albedo/core2_recom_spectral_kdind15.yaml (the cold 1958-59 run against the Fortran kdind15, jobs
+# 48621400-03) rerun with the four phytoplankton groups in the monthly output: carbon and chlorophyll (3-D) and the
+# column NPP of each group (npp_phy/dia/cocco/phaeo; the Fortran kdind15 output has NPPn, NPPd, NPPp but no NPPc).
+# Everything else as that config, spectral_co2lim included.
+# Albedo: CORE2 + the spectral REcoM fork, the COLD START of the user's reference run tmp_run_kdind15 (1958, the same
+# forcing: the JRA55-do repeat-year climatology clim61, CORE2 runoff and PHC2 SSS from the pool, chl 0.1, OASIM; the
+# CORE2 REcoM IC set with DIC_PI). The comparison target of docs/plans/completed/20261028-recom-spectral-port.md: the Fortran
+# output under tmp_recom-fesom_output/fesom2.6_spectral_kdind15 (monthly means 1958-1959). Two years in half-year
+# GPU segments: scripts/albedo/chain_core2_gpu.sh. Known differences from the Fortran run: no partial cells, the
+# current FESOM2 physics with GM/Redi + TKE (the user's run: KPP), the sea ice (docs/recom/VALIDATION.md).
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 2700.0                # the user's runs: step_per_day 32
+
+mesh: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/core2_mesh_ic/mesh_core2
+partition: null
+forcing:
+  kind: core2
+  start_year: 1958
+  mslp: true
+  jra_dir: /albedo/work/user/anbros001/Maresys
+  repeat_year: clim61
+  chl_const: 0.1
+  sss_path: /albedo/work/projects/p_pool_fesom2/forcing/CORE2/PHC2_salx.nc
+  runoff_path: /albedo/work/projects/p_pool_fesom2/forcing/CORE2/runoff.nc
+  dust_file: /albedo/pool/FESOM2/recom/CORE2/DustClimMonthlyAlbani.nc
+  oasim_dir: /albedo/work/projects/p_specbic/sloza/forcing_oasim_v2
+  oasim_pattern: oasim_clim1998-2012_darwin400.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_albedo_spectral/namelist.recom   # 37 tracers: 3zoo2det + coccos + CDOM
+  spectral: true
+  spectral_co2lim: true                 # the user's deviation from the fork (2026-10-28)
+  optics_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_data/recom_pi/optics
+  ic_set: core2
+  ic_dir: /albedo/pool/FESOM2/recom
+  output: [DIC, Alk, DIN, DSi, DFe, O2, Chl, co2flux, pco2surf, npp, export100, PhyC, PhyChl, DiaC, DiaChl, CoccoC, CoccoChl, PhaeoC, PhaeoChl, npp_phy, npp_dia, npp_cocco, npp_phaeo]
+
+gpu:
+  column_unroll: true
+  column_kernel: true
+  chunk_steps: 48
+output_dir: /albedo/work/projects/p_specbic/sloza/fesom_jax_runs/core2_recom_spectral_kdind15_groups
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: null
+restart_out: null
+duration: 1yr             # overridden by --steps

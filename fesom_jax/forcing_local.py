@@ -146,7 +146,8 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
                         chl_path=None,
                         chl_const=None, static=None,
                         dt=None, forcing_midstep: bool = True, mslp: bool = False,
-                        bgc_dust_path=None, dt_ramp=None, bgc_co2=None) -> LocalForcing:
+                        bgc_dust_path=None, dt_ramp=None, bgc_co2=None, bgc_oasim=None,
+                        jra_tag=None) -> LocalForcing:
     """Build a :class:`LocalForcing` for this process's local partitions.
 
     The four input-path kwargs default to ``None`` ⇒ resolved by the readers through
@@ -168,15 +169,20 @@ def build_local_forcing(mesh, year, part, npes, *, sst_ic=None, local_parts=None
     sub = _SubMesh(mesh, local_nodes)
     chl = (np.full((12, int(len(local_nodes))), float(chl_const), dtype=np.float64)
            if chl_const is not None else sss_runoff.build_chl_clim(sub, chl_path))
-    jra = jra55.JRA55Reader(sub, int(year), jra_dir, mslp=mslp)
+    jra = jra55.JRA55Reader(sub, int(year), jra_dir, mslp=mslp, tag=jra_tag)
     set_midstep(jra, dt, forcing_midstep, dt_ramp, year)         # drift fix 2 (see surface_forcing)
     bgc = None
     if bgc_dust_path is not None:
         if dt is None:
             raise ValueError("bgc_dust_path needs dt: FESOM2's clock at the recom call is the step end")
         from .surface_forcing import read_dust_clim
+        oasim = None
+        if bgc_oasim is not None:             # read at the local nodes only, as the SSS and chlorophyll are
+            from .recom.oasim import read_oasim_clim
+            oasim = read_oasim_clim(sub, bgc_oasim["path"], bgc_oasim["pattern"], bgc_oasim.get("ed_var", "Ed"),
+                                    bgc_oasim.get("es_var", "Es"))
         bgc = BgcForcing(read_dust_clim(bgc_dust_path, int(mesh.nod2D))[:, local_nodes], float(dt),
-                         dt_ramp=dt_ramp, year0=year, co2=bgc_co2)
+                         dt_ramp=dt_ramp, year0=year, co2=bgc_co2, oasim=oasim)
     cf = SurfaceForcing(jra=jra,
                      sss=sss_runoff.build_reader(sub, sss_path, runoff_path),
                      chl_clim=chl, static=static, bgc=bgc)

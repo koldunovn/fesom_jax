@@ -32,8 +32,11 @@ def pad_levels(a, nl):
     return np.pad(a, pad)
 
 
-def twin_step0_state(mesh, d1, ale_cfg, rcfg):
-    """The twin's step-0 State (host numpy) from its step-1 dump ``d1`` (``io_dump.load_recom_dump`` dict)."""
+def twin_step0_state(mesh, d1, ale_cfg, rcfg, layout=None):
+    """The twin's step-0 State (host numpy) from its step-1 dump ``d1`` (``io_dump.load_recom_dump`` dict).
+    ``layout`` (a :class:`~fesom_jax.recom.layout.Layout`) selects the tracer IDs; default: ``rcfg.layout`` in
+    full mode, else REcoM 692f804's ``bin_2p3z2d``."""
+    ids = _ids(layout, rcfg)
     from .. import ice
     from ..state import State
     from .wiring import segment_fields
@@ -46,23 +49,32 @@ def twin_step0_state(mesh, d1, ale_cfg, rcfg):
     S_old = np.where(mask, pad_levels(d1["tra_in.tr2.valuesold"], nl), 0.0)
     st = dataclasses.replace(st, T=T_, S=S_, T_old=T_old, S_old=S_old)
     st = ice.seed_ice(st, mesh, st.T[:, 0], xp=np)
-    bgc = np.stack([pad_levels(d1[f"recom_in.tr{i}"], nl) for i in T.BGC_IDS], axis=-1)
-    bgc_old = np.stack([pad_levels(d1[f"tra_in.tr{i}.valuesold"], nl) for i in T.BGC_IDS], axis=-1)
+    bgc = np.stack([pad_levels(d1[f"recom_in.tr{i}"], nl) for i in ids], axis=-1)
+    bgc_old = np.stack([pad_levels(d1[f"tra_in.tr{i}.valuesold"], nl) for i in ids], axis=-1)
     st = dataclasses.replace(st, bgc=bgc, bgc_old=bgc_old, bgc_benthos=np.asarray(d1["recom_in.Benthos"]).T.copy(),
                              bgc_alk_surf=np.asarray(d1["recom_in.Alk_surf"], np.float64),
                              **segment_fields(mesh.nod2D, nl - 1, rcfg, np))
     return st
 
 
-def dump_names(step_end: bool = True):
-    """The dump records :func:`twin_step0_state` and the step comparisons read."""
+def _ids(layout, rcfg=None):
+    if layout is not None:
+        return tuple(layout.ids)
+    if rcfg is not None and getattr(rcfg, "namelist", None) is not None:
+        return tuple(rcfg.layout.ids)
+    return T.BGC_IDS
+
+
+def dump_names(step_end: bool = True, layout=None):
+    """The dump records :func:`twin_step0_state` and the step comparisons read (``layout`` as above)."""
+    ids = _ids(layout)
     r = ["mesh.gid_nod", "mesh.nlevels_nod2D", "mesh.geo_coord_nod2D", "recom_in.tr1", "recom_in.tr2",
          "tra_in.tr1.valuesold", "tra_in.tr2.valuesold", "recom_in.Benthos", "recom_in.Alk_surf"]
-    for i in T.BGC_IDS:
+    for i in ids:
         r += [f"recom_in.tr{i}", f"tra_in.tr{i}.valuesold"]
     if step_end:
-        r += ["step_end.Benthos"] + [f"step_end.tr{i}" for i in (1, 2) + T.BGC_IDS]
+        r += ["step_end.Benthos"] + [f"step_end.tr{i}" for i in (1, 2) + ids]
         r += ["recom_out.GloCO2flux", "recom_out.GloPCO2surf", "recom_out.GloHplus", "recom_out.NPPn",
               "recom_out.NPPd", "recom_out.relax_alk", "recom_out.Benthos"]
-        r += [f"recom_out.tr{i}" for i in T.BGC_IDS]
+        r += [f"recom_out.tr{i}" for i in ids]
     return r
