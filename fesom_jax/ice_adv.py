@@ -140,11 +140,14 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
     s = wv.sum(axis=1, keepdims=True) - 3.0 * wv           # [elem,3] (q)
     icefluxes = jnp.where(nc_e[:, None], -s * (vol[:, None] * inv_area[en]) / 12.0, 0.0)
 
-    # cluster bounds: min/max over a node's element-neighbours of max(vals_l, vals).
+    # cluster bounds: min/max over a node's neighbours (FESOM2 nn_pos = the nodes of every element around it) of
+    # max(vals_l, vals). ALL elements count, cavity elements too: FESOM's tmax/tmin read nn_pos, which includes the
+    # cavity nodes next to the shelf front (ice_fct.F90:518-547, values 0 there), so a front node may lose all its
+    # ice to the antidiffusive flux. Without cavities every element is open and this is the old bound.
     elem_hi = jnp.maximum(vals_l[en].max(1), vals[en].max(1))   # [elem]
     elem_lo = jnp.minimum(vals_l[en].min(1), vals[en].min(1))
-    hi_flat = jnp.broadcast_to(jnp.where(nc_e, elem_hi, -jnp.inf)[:, None], (en.shape[0], 3))
-    lo_flat = jnp.broadcast_to(jnp.where(nc_e, elem_lo, jnp.inf)[:, None], (en.shape[0], 3))
+    hi_flat = jnp.broadcast_to(elem_hi[:, None], (en.shape[0], 3))
+    lo_flat = jnp.broadcast_to(elem_lo[:, None], (en.shape[0], 3))
     hi = jax.ops.segment_max(hi_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
     lo = jax.ops.segment_min(lo_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
     # Pad / all-non-cell nodes keep the ±inf sentinel (empty/masked segment). The clipping
