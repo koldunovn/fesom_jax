@@ -16,6 +16,22 @@ Branch `coupled/core3_sfc` from `5b88770` (tag `awicm-v0-tco95-core2`). Outputs:
   path has no ponds and needs none (FESOM2's `ice_thermo_oce.F90` has none either).
 - Task 3: `configs/core2_cpl_jaxcpl.yaml` (CORE2, zstar, single precision). The CORE3 config waits for lane L-OCN.
 
+## Status (2026-11-03, session 2)
+
+- Rung 2 of the ladder against FESOM main 0aaa2d73 (lane L-OCN's oracle builds, read only) on **CORE2 without
+  cavities**, with jaxcpl's namelists (zstar, forced JRA55-do 1958, from the Fortran CORE2 restart of 1958-02-01):
+  viscosity opt_visc 5 and the hemispheric GM agree with the **DP oracle to 1.8e-13 / 8.9e-14** (relative to the
+  field maximum), mEVP to 3.5e-7 on the oracle's own inputs; each control (opt_visc 7, no hemispheric ceiling, the
+  base mass factor, the metric terms) is off by 2e-4 ... 2, so the checks discriminate.
+- The oracle found one jaxcpl switch the session-1 diff missed: **`metric_factor_zero = .true.`** (namelist.config),
+  which removes the metric terms of the sea-ice dynamics; without it fesom_jax's ice velocity was 1.4e-2 m/s off in
+  compact ice. Ported as `ice.metric_factor_zero`. It also showed that session 1's `ice.mevp_zero_sigma` ported a
+  routine main's mEVP never calls; removed.
+- Single-precision linfs: allowed (two guards relaxed); a CORE2 SP linfs run of 3 days is finite and its SP - DP
+  difference is the size of zstar's (below).
+- Melt ponds and alb_tramp (coupled only): field-level checks of session 1 (sfc_kernels_check.py and the line-by-line
+  read of ice_meltponds.F90 / ice_albedo) stand; the forced oracle has neither.
+
 ## Method
 
 fesom_jax was verified against the port base `9271ae92` (FESOM2 branch `llmport-fortran-reference`, base PR #867
@@ -43,7 +59,8 @@ fixes were already taken into fesom_jax, e.g. the K33 weights and the shortwave 
 | whichEVP 1, evp_rheol_steps 120, pstar 3e4, ellipse 2, c_pressure 20, delta_min 1e-11, cd_oce_ice 5.5e-3, theta_io 0 | ice_maEVP.F90 EVPdynamics_m / stress_tensor_m | ice_mevp | same except the two rows below | - |
 | alpha_evp 300, beta_evp 300 | namelist | IceConfig 250 / 250 | value | config |
 | **mEVP node mass factor** | ice_maEVP.F90:393-394: `1/(max(M,9)·area)` | `M/((1+M²)·area)` (the base's, "dimensionally inconsistent" in main's comment) | **changed upstream** (thin ice: base 0.5/area at M = 1, main 0.11/area) | **done**: `ice.mevp_mass_floor` |
-| **mEVP sigma on ice-free elements** | stress_tensor_m: set to 0 (mean m_ice <= 0.01) | carried | **changed upstream** | **done**: `ice.mevp_zero_sigma` |
+| mEVP sigma on ice-free elements | stress_tensor_m sets it to 0, but EVPdynamics_m inlines its own sigma update without that and never calls stress_tensor_m (ice_maEVP.F90:433 `!NR call stress_tensor_m`) | carried | **same** (session 1 misread this as a change and ported it as `ice.mevp_zero_sigma`; the oracle's EVPdynamics_m output showed sigma carried; the switch is removed in session 2) | - |
+| **metric_factor_zero .true.** (namelist.config &geometry; missed in session 1, found by the oracle) | oce_mesh.F90:2352: `metric_factor = 0`; read only by the sea-ice EVP/mEVP (strain-rate and stress-divergence metric terms) | tan(lat)/R | **missing** | **done** (session 2): `ice.metric_factor_zero` |
 | mEVP m_ice_old | `m_ice_old = m_ice` (base: `= a_ice`) | - | no effect (thermodynamics overwrites it before any read) | - |
 | ice FCT (ice_gamma_fct 0.5), ice_diff 0.0 | ice_fct.F90 | ice_adv | same (main: gathers instead of locked scatters; mass-matrix check relative); ice_diff value (fesom_jax default 10) | config |
 | ice_temp advected as a 4th tracer | ice_setup_step.F90 / ice_fct | not advected | known difference (flux.py docstring; with use_atm_ice_tskin read only where a_ice <= 0.001); main sets 271.35 K where a_ice <= 1e-6 after advection | as before |
@@ -59,14 +76,14 @@ fixes were already taken into fesom_jax, e.g. the K33 weights and the shortwave 
 | se_visc (gammas 10/19500/0) | oce_ale_ssh_splitexpl_subcycl.F90:668-720 | ssh_se (split-explicit, a different scheme) | **inactive in jaxcpl**: use_ssh_se_subcycl .false. (the CG runs) | nothing to do |
 | momadv_opt 2, use_ivertvisc, ab_order 2, A_ver 1e-4, C_d 0.0025 | oce_ale_vel_rhs.F90 | momentum | same (main: gathers instead of locked scatters) | - |
 | soltol 1e-5, maxiter 2000, precond_variant 1 | solver.F90 | ssh (MAXITER 500) | maxiter only bounds the CG | - |
-| which_ale linfs | oce_ale.F90 | `ale: null` (linfs) exists in double precision; single precision is ported for zstar only (RunConfig.validate) | **SP linfs missing** | L-OCN (ALE, linfs with cavities) |
+| which_ale linfs | oce_ale.F90 | `ale: null` (linfs) exists in double precision; single precision was refused by two guards | the guards were a scope limit, not a failure (session 2, below) | **done** (session 2): guards relaxed, d94fd35 |
 | use_cavity, cavity_gamma_scale 0.6 | cavity_param.F90 and ~90 branches | absent | missing | L-OCN |
 | icebergs | icb_*.F90 | absent | out of plan | - |
 | k_ver 1e-5, kv0_const, double_diffusion false, surf_relax_s 0, balance_salt_water, ref_sss_local | namelist.tra | config defaults; SSS restoring off in the coupled ocean | same | - |
 | tracer scheme MFCT/QR4C/FCT (0, 1) | oce_adv_tra_* | tracer_adv (TracerConfig) | same | - |
 
-Summary: of the options jaxcpl switches on in my scope, 6 code differences (hemispheric GM, opt_visc 5, two mEVP
-changes, alb_tramp, the pond/tgate switches that were fixed in code) and 8 value-only differences (K_GM_max,
+Summary: of the options jaxcpl switches on in my scope, 6 code differences (hemispheric GM, opt_visc 5, the mEVP mass
+factor, metric_factor_zero, alb_tramp, the pond/tgate switches that were fixed in code) and 8 value-only differences (K_GM_max,
 Redi_Kmax, alpha/beta_evp, ice_diff, four albedos); everything else is the same. Outside my scope: linfs in single
 precision and cavities (L-OCN), icebergs (later).
 
@@ -77,7 +94,8 @@ precision and cavities (L-OCN), icebergs (later).
 | gm | k_gm_max / redi_kmax_default | 1000 / 1000 | 2500 / 1000 | namelist K_GM_max, Redi_Kmax (now used by `Params.defaults(gm_cfg)` when no params are passed) |
 | gm | k_gm_max_nh / k_gm_hemi_trans | -1 (off) / 10 | 1000 / 10 | oce_fer_gm.F90:295-306 |
 | visc | opt_visc / easybsreturn | 7 / 1.0 | 5 / 1.5 | oce_dyn.F90 viscosity_filter, visc_filt_bcksct |
-| ice | mevp_mass_floor / mevp_zero_sigma | False / False | True / True | ice_maEVP.F90:393-394, stress_tensor_m |
+| ice | mevp_mass_floor | False | True | ice_maEVP.F90:393-394 |
+| ice | metric_factor_zero | False | True | oce_mesh.F90:2352 (namelist.config &geometry) |
 | ice | cpl_meltponds / snowmelt_tgate | True / True | True / False | ice_thermo_cpl.F90 (mode F only) |
 | ice | alb_tramp / h_snowscale | 0 / 0 | 1 / 0 | ice_thermo_cpl.F90 ice_albedo |
 | ice | pnd_hi_min, pnd_hs1, pnd_rfracmin, pnd_rfracmax, pnd_aspect, pnd_albpnd, pnd_albpnd_frz | 0.1, 0.03, 0.15, 1.0, 0.8, 0.2, 0.36 | rfracmax 0.6, aspect 1.6 | ice_meltponds.F90 &meltpond |
@@ -95,11 +113,79 @@ end of each NamedTuple (`# --- FESOM main 0aaa2d73 switches for jaxcpl (lane L-S
 | same job | (2) coupled mode F (`check_mode_f.py`, offline JRA55 atmosphere) `core2_cpl.yaml` 2 days, branch vs 5b88770 | **BITWISE** (mode F restart incl. ponds, ice_temp, ice_alb) |
 | same job | (3) `core2_cpl_jaxcpl.yaml` mode F 10 days (1989-01-01..11) | finite every day; SST 10.469 -> 10.558, ice area NH 14.64 -> 15.05, SH 4.76 -> 3.65 (1e12 m²); restart round trip OK; 48.6 ms/step (default 50.6). End state vs the default's (2 days): ponds on 6,998 nodes, apnd max 0.38 (default 0.65, aspect 1.6 makes them deeper and smaller), hpnd max 1.64 m (capped by the freeboard of thick ice, as the Fortran); ice albedo max 0.82 (= albsn); sigma11 non-zero on 67,805 elements (default 98,846: the ice-free elements are reset) |
 
+### Session 2: the ladder against the FESOM main oracle on CORE2
+
+Oracle runs (`/work/ba1583/a270088/awicm/core3/sfc/oracle_core2/`, job `jobs/run.sbatch`, 128 ranks, 6 steps of
+1800 s, probes 17 nodes / 17 elements in `probes/` (7 earlier CORE2 probes, 3 Arctic and 3 Antarctic pack ice, 4 ice
+edge), full fields steps 1-2): jaxcpl's namelists with `meshpath` = `fesom_jax_dev/fortran/meshes/core2_prefix`
+(the source of fesom_jax's CORE2 mesh, `dist_128`), `use_cavity = .false.`, `which_ale = 'zstar'` (fesom_jax's
+single precision was zstar-only when this started), `use_atm_ice_tskin = .false.`, icebergs off, L-OCN's forced
+namelist.forcing (JRA55-do v1.4.0, 1958, CORE2 runoff), the restart `fortran/core2_rst/jan/fesom.1958.{oce,ice}.restart`
+(read through main's pre-2.8 fallback; no sigma in it, so the mEVP starts from 0 as fesom_jax's converter does).
+
+Replays (`scripts/coupled/sfc_oracle_replay.py`, CPU; each block on the oracle's inputs of the same step, output
+against the oracle's dump; max |Δ| / max |ref| over the wet points, rms ratio, the probe columns through
+`verify.compare_column` at 1e-5 relative + 1e-6 of the field maximum):
+
+| block | oracle | job | jaxcpl switches | control |
+|---|---|---|---|---|
+| viscosity (Δuv_rhs, steps 1, 2) | DP `run_dp` (28698559) | 28699395 | **1.8e-13**, rms 8.5e-14, probes 17/17 | opt_visc 7: 2.1, probes 0/17 |
+| viscosity | SP `run1` (28697167) | 28699396 | 4.5e-5 / 3.9e-5, probes 17/17 | 2.1 |
+| GM fer_uv (step 2) | DP | 28699395 | **8.9e-14**, probes 17/17 | without K_GM_max_NH: 1.5, probes 7/17 |
+| GM fer_uv | SP | 28699396 | 3.2e-5, probes 9/17 at the 1e-5 bar | 1.5 |
+| mEVP u/v_ice on the oracle's own EVPdynamics_m inputs and outputs (instrumented DP copy, substeps 21/22) | DP `run_dp_evp` (28699044, build 28698871) | 28699292 | step 1 **3.5e-7** (sigma 2.4e-5), step 2 3.7e-8 (sigma 1.5e-6) | base mass factor 3.6e-4 / 2.1e-4; with the metric terms 1.4e-2 / 1.6e-2 (sigma 31 %) |
+| mEVP from inputs rebuilt from the restart and stages 17/20 | DP | 28699395 | step 1 6.2e-7, probes 13/13; step 2 3.8e-4 (fesom_jax's own step-1 sigma and the rebuilt atmosphere-ice stress) | metric terms 2.5e-2 |
+| same | SP | 28699396 | 5.4e-4 / 7.9e-4 | metric terms 2.5e-2 (the SP floor, FESOM SP's float32 geometry, hides the mass-factor control: 6.4e-4) |
+
+How the missing switch was found: with the metric terms the mEVP was 2.5e-2 off in DP and in SP alike, only in
+compact ice (a >= 0.5; free drift agreed to 1e-6), and no mEVP constant explained it (alpha/beta 250 or 500,
+240 sweeps, P*, C, delta_min, Cd, ellipse; `tools/mevp_diag.py`, jobs 28697893, 28698681). The instrumented
+copy (`oracle_core2/fesom-evpdump`, ice_setup_step.F90 only) took the input reconstruction out of the question; then
+jaxcpl's namelist.config showed `metric_factor_zero = .true.`.
+
+### Session 2: single-precision linfs
+
+Why it was refused: `RunConfig.validate` and the guard at the top of `step.step` listed "zstar without w_split" among
+the production physics of the single-precision plan (docs/plans/20261020-core2-single-precision.md:266, "Guards: SP
+with linfs ... raises"). That is a scope statement of the plan; the plan measured nothing for fesom_jax linfs, and
+its own Fortran anchor ran a linfs SP-DP pair without trouble (table Task 1b). Nothing in the single-precision path
+depends on zstar: the float64 tracer content and the carry (`step._tracers_advect_sp`, `tracer_adv.ale_reconstruct_carry`),
+the float64 implicit-diffusion column (`Z3d_diff` from `hnode_new`, which is `hnode` under linfs) and the WP_full
+`hnode`/`hnode_new` read the same fields under linfs.
+
+The fix (d94fd35, 5 lines, no line of ale.py): `fesom_jax/step.py` the guard `if _sp and (...)` drops `ale_cfg is None`
+and keeps w_split refused (`ale_cfg is not None and ale_cfg.use_wsplit`); `fesom_jax/run_config.py` `validate` the
+same (`self.ale is not None and self.ale.use_wsplit`).
+
+Checks:
+
+| check | job | result |
+|---|---|---|
+| pi mesh, CPU (`tools/sp_linfs_pi_check.py`): GM/Redi + TKE + mEVP, linfs, single | login node | no implicit f32/f64 promotion in the traced step (the test_precision net); 4 steps finite with the SP dtypes; SP - DP max after 4 steps T 7.7e-2, S 1.4e-2, eta 1.3e-4 for linfs against 7.7e-2, 1.4e-2, 1.1e-4 for zstar |
+| CORE2, A100 (`tools/sp_linfs_core2.py`): configs/core2_cpl.yaml physics, PHC cold start 1958-01-01, 144 steps (3 days), {linfs, zstar} x {DP, DP with a float32-rounded IC, SP}, `--budget` | 28697619 | all six finite; surface rms SP - DP: linfs T 1.55e-3, S 3.5e-4, eta 8.2e-5, a_ice 1.4e-4, uv 2.2e-3; zstar T 1.36e-3, S 3.0e-4, eta 8.5e-5, a_ice 6.0e-5, uv 2.2e-3. Content after 3 days, SP - DP: linfs salt -5.8e10 psu m³ (5.8e10 of 4.6e19; the f32-IC envelope -1.9e12), heat +9.5e9 J/(ρc), volume 0 (linfs); zstar salt -1.5e12, heat -1.4e10, volume +6e5 m³; global mean eta SP 6e-10 (linfs) and 1.8e-9 m (zstar) against 1e-17 in DP |
+
+So SP linfs drifts like SP zstar. In both, the surface SP - DP after 3 days is 10-30x the f32-IC envelope (T: linfs
+10x, zstar 28x), a 3-day spread; the plan's own gate is a 1-year one and was not repeated here.
+(The first submission, 28697407, failed in all six runs: no `--ic-dir`.)
+
+### Session 2: default paths
+
+GPU job 28699578 (A100, 12 min; `sfc_gate.py`, snapshot `snap/77ceaf25e4` against `snap/5b887707aa`):
+
+| check | result |
+|---|---|
+| coupled mode F, `core2_cpl.yaml`, 2 days, branch vs base | **BITWISE** |
+| standalone `core2_cpl.yaml`, 96 steps | branch vs base of this job differs, by exactly the numbers of session 1's base-vs-base control (T 0.25336742 K, Av 0.09997762, ...). The standalone GPU run has two outcomes, A and B, and each one is reproduced bit for bit: gate1 base = gate2 base (A), **gate1 base2 = gate2 branch (B, bitwise)**, gate1 base = gate1 branch (A). Every branch result equals a base result bit for bit; which of the two a process gets is not decided by the code (probably XLA:GPU autotuning or a cache shared between the processes of a job). |
+| `core2_cpl_jaxcpl.yaml` mode F, 5 days (now with metric_factor_zero, sigma carried) | finite every day; SST 10.470 -> 10.515; ice area NH 14.64 -> 14.86, SH 4.76 -> 4.34; ponds on 7,787 nodes (apnd max 0.47, hpnd max 0.30 m) |
+
+
 ## Next
 
-1. On CORE3 (L-OCN's mesh, forced oracle `/work/ba1583/a270088/awicm/core3/fesom_oracle/run_cav`, which runs
-   opt_visc 5, GM with K_GM_max_NH, mEVP): the ladder for viscosity, GM coefficients and mEVP against the dumps.
-   The forced oracle has no melt ponds (ice_thermo_oce.F90 has none); the coupled pond path can only be checked
-   against a coupled (__oifs) FESOM2 build or jaxcpl's output.
-2. `configs/core3_cpl_jaxcpl.yaml` from the blocks of `core2_cpl_jaxcpl.yaml` with L-OCN's mesh, linfs, cavities.
-3. Single-precision linfs (RunConfig.validate refuses it today): with L-OCN.
+1. `configs/core3_cpl_jaxcpl.yaml` from the blocks of `core2_cpl_jaxcpl.yaml` with L-OCN's mesh, `ale: null`
+   (linfs, now allowed in SP), cavities; and `core2_cpl_jaxcpl.yaml` itself can switch to linfs from a linfs restart.
+2. The same replays on CORE3 against L-OCN's `run_cav` (opt_visc 5, GM with K_GM_max_NH, mEVP with
+   metric_factor_zero), separately for cavity, front and open points (the GM template-level note above).
+3. Melt ponds / alb_tramp: only a coupled (`__oifs`) FESOM2 build or jaxcpl's own output can check them beyond the
+   field-level checks; the forced oracle has neither.
+4. Not yet compared against the oracle: the forced ice thermodynamics (ice_thermo_oce.F90 changed by 558 lines from
+   the port base; not used by the coupled jaxcpl path, which runs ice_thermo_cpl.F90), and the rest of the step.
