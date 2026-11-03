@@ -56,7 +56,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
          halo_ctx=None, boundary_node=None, adjoint_cfg=None,
          remat_blocks: bool = False, bulk_uvnode_lag: bool = False, ice_update=None,
-         recom_cfg=None, legacy_k33_weights: bool = False, legacy_sw_depth: bool = False) -> State:
+         recom_cfg=None, legacy_k33_weights: bool = False, legacy_sw_depth: bool = False,
+         cavity_cfg=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -254,7 +255,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 boundary_node=boundary_node, use_virt_salt=use_virt_salt, zbar3=zbar3_live,
                 params=params, ice_update=ice_update, legacy_sw_depth=legacy_sw_depth,
                 **({} if halo_ctx is None or halo_ctx.mevp_wide is None
-                   else {"mevp_wide": halo_ctx.mevp_wide}))
+                   else {"mevp_wide": halo_ctx.mevp_wide}),
+                **({} if cavity_cfg is None else {"cavity_cfg": cavity_cfg}))
             # Frozen-ice adjoint (paper §2): run the FULL mEVP ice in the forward but
             # stop_gradient the whole ice update so the backward never enters the (unstable)
             # mEVP rheology adjoint. stop_gradient is the identity in the forward ⇒ forward
@@ -301,6 +303,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             mesh, _sadj, bc_T=bc_T, heat_flux=heat_flux, stress_surf=stress_surf,
             stress_node_surf=stress_node_surf, dt=dt, halo_ctx=halo_ctx)
 
+    # Ice-shelf cavities (cavity_cfg; FESOM2 use_cavity, which forces use_density_ref): the density relative to the
+    # reference profile and the shelf-level fill / displaced-column pressure (eos.pressure_bv). None ⇒ no kwargs.
+    _cav_eos = ({} if cavity_cfg is None else
+                dict(density_ref=eos.reference_density(mesh, T_ref=cavity_cfg.density_ref_T,
+                                                       S_ref=cavity_cfg.density_ref_S), cavity=True))
     # 1 — EOS / hydrostatic pressure / N² (zstar: density compressibility + N² spacing on
     #     live geometry; hpressure unused under zstar). Z3d_live=None ⇒ static (byte-identical).
     bvfreq_raw = None
@@ -317,7 +324,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         # (raw EOS/N², then the one-sweep smoother), so the forward is bitwise. The raw field is a per-node map of halo-complete T/S, so it needs no
         # halo exchange (the smoothed one does, below).
         def _eos_with_raw():
-            d, h, b = eos.pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live)
+            d, h, b = eos.pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live, **_cav_eos)
             return d, h, eos.smooth_nod3D(mesh, b, 1), b
         density, hpressure, bvfreq, bvfreq_raw = _ckpt(_eos_with_raw)()
         if _tke_local:
@@ -325,7 +332,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         bvfreq_raw = jax.lax.stop_gradient(bvfreq_raw)
     else:
         density, hpressure, bvfreq = _ckpt(
-            lambda: eos.compute_pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live))()
+            lambda: eos.compute_pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live, **_cav_eos))()
     # ---- backward-only simplifications (adjoint_cfg) -----------------------------------
     # Every flag below replaces "differentiate this term as written" with "use the value it
     # computes, but omit its dependence on the ocean state in the adjoint". stop_gradient is
@@ -418,7 +425,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             tke_adj=_adj.tke_options(), freeze_state=_adj.freeze_mixing_state,
             bvfreq_raw=bvfreq_raw, conv_surrogate=_adj.conv_surrogate, dt=dt, exch=_exch,
             Z3d=Z3d_live,
-            ice_conc=None if _adj.tke_pr_ice_cut is None else st.a_ice, turner=_turner))()
+            ice_conc=None if _adj.tke_pr_ice_cut is None else st.a_ice, turner=_turner,
+            **({} if cavity_cfg is None else {"cavity": True})))()
     elif kpp_cfg is not None:
         if heat_flux is None:
             raise ValueError(
@@ -462,7 +470,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     uv_rhs, uv_rhsAB = _ckpt(lambda: momentum.compute_vel_rhs(
         mesh, st.uv, st.uv_rhsAB, st.eta_n, pgf_x, pgf_y, st.w_e, h_wp,
         is_first_step=is_first_step, dt=dt, exch=_exch,
-        press_air=getattr(step_forcing, "press_air", None)))()
+        press_air=getattr(step_forcing, "press_air", None),
+        **({} if cavity_cfg is None else {"cavity": True})))()
     uv_rhs = _exch(uv_rhs, "elem")
     uv_rhsAB = _exch(uv_rhsAB, "elem")
 

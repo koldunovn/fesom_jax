@@ -238,3 +238,18 @@ def cavity_boundary_node_mask(mesh, boundary_node):
     ce = (cav1 | cav2).astype(jnp.int32)
     cnt = ops.scatter_add(ce, mesh.edges[:, 0], mesh.nod2D) + ops.scatter_add(ce, mesh.edges[:, 1], mesh.nod2D)
     return jnp.asarray(boundary_node) | (cnt > 0)
+
+
+def with_cavity_static(fs, mesh):
+    """The :class:`fesom_jax.surface_forcing.ForcingStatic` of a cavity run: ``areasvol_surf`` = ``areasvol`` at each
+    node's TOP WET level (FESOM2 ``integrate_nod``, gen_support.F90:334, weights every node by
+    ``areasvol(ulevels_nod2D(n), n)``), so the global virtual-salt mean includes the melt under the shelves; at open
+    nodes this is ``areasvol[:, 0]``, unchanged. ``ocean_area`` stays the open-ocean area (FESOM divides by it)."""
+    av = np.asarray(mesh.areasvol)
+    top = np.asarray(mesh.ulevels_nod2D) - 1
+    return fs._replace(areasvol_surf=jnp.asarray(av[np.arange(av.shape[0]), top]))
+
+
+def top_values(mesh, field):
+    """``field[n, ulevels_nod2D[n]-1]``: a node column's value at its top wet level (layer 0 off the shelves)."""
+    return _top(field, (mesh.ulevels_nod2D - 1).astype(jnp.int32))
