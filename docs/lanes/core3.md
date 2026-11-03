@@ -128,8 +128,11 @@ Port kernels against the DOUBLE oracle with fesom_jax in double precision: that 
 reductions ~1e-12; the cavity mesh and kernels below already meet it). The SP oracle then checks fesom_jax's
 single-precision mode at float32 tolerances, with one known, forced deviation: FESOM SP derives its geometry in
 float32 (elem_area off the float64 value by up to 8.7e-4 relative on CORE3, median 1.8e-5), fesom_jax SP rounds the
-float64 geometry (6e-8). Whether fesom_jax SP should derive the mesh in float32 is Nikolay's call
-(fesom_jax = shadow of FESOM2). Compiler: FESOM's Intel flags are `-r8`/`-r4` (a bare literal is `WP`, not
+float64 geometry (6e-8). Decision (coordinator 2026-11-03, put to Nikolay): keep fesom_jax's
+float64-derived geometry for now. Where that limits the SP comparison: every SP rung that reads areas or gradients
+(`elem_area`, `area`/`areasvol`, `gradient_sca`, edge geometry: N^2 smoothing, PGF, momentum, the SSH matrix,
+tracer fluxes, the global integrals) carries geometry differences up to ~1e-3 relative; rungs that are column maps
+(EOS density/pressure, the melt, the TKE column) do not, and there the SP rung is float32-tight (melt 99.4 % bitwise). Compiler: FESOM's Intel flags are `-r8`/`-r4` (a bare literal is `WP`, not
 float32) with `-fp-model precise -no-prec-div -fimf-use-svml -no-prec-sqrt`, so divisions/sqrt/log are not always
 IEEE-rounded: expect ulp-level, not bitwise, agreement in a few percent of values.
 
@@ -339,28 +342,28 @@ need the AB2 slot, `w_expl` and the CG warm start from the previous step, which 
   number to look at next (the mEVP shelf-front boundary or the front's thermodynamics).
 * GPU (task 4 of the session): see below.
 
-### Estimate for the rest of task 3
+### Default path (cavity off) after session 2
 
-* `use_density_ref` (init_ref_density + every density consumer) — 1 day incl. replay of substeps 1-3.
-* `pressure_bv` cavity fill + `hpressure(nzmin)` — 0.5 day.
-* the freshwater/virtual-salt balance branches (B) — 0.5-1 day (`use_cavity_fw2press` is zstar-only).
-* wiring: `use_cavity` config block (default off, today's results unchanged), `load_mesh` extras, calls of
-  `cavity.py` in the forcing/ice path, mEVP cavity-edge BC, TKE top BC — 1.5-2 days.
-* the ladder over substeps 1-19 on CORE3 (single precision vs the oracle, probes + full fields), fixing what it
-  finds in the "mask present" rows — 2-4 days. It needs task 4's restart import first (fesom_jax must start from
-  the oracle's state; the 1855 restart, rounded to float32 as the SP oracle reads it).
+`pytest` on the branch, CPU: `test_eos test_dp_lock test_prepare_mesh test_fortran_restart test_run_config
+test_ice_step test_tke_replay test_step_pi` 147 passed (job 28699466); `test_core2_step` 6 passed (28700115);
+`test_momentum test_ssh test_ssh_ell test_run_entry test_release test_ale` 148 passed (28700740; `test_run_entry`
+alone takes 26 min). The branch is ready for the coordinator's coupled-CORE2 bitwise gate vs 5b88770.
 
-Total ~6-9 working days for task 3, plus 1-2 days for task 4 (branch `fortran-restart`, c95e476, already converts a
-FESOM2 restart to a fesom_jax restart on CORE2; reuse it, add the SP rounding and the cavity levels).
+### Estimate for the rest (after session 2)
+
+* Rung 15 (tracers with the melt as the surface BC at the shelf base, MFCT/QR4C advection at the shelf base) and
+  rung 14 (GM/Redi between `ulevels_nod2D_max` and `nlevels_nod2D_min`): 1-2 days, partly waiting for L-SFC's
+  jaxcpl settings (the tracer scheme, GM scalings) so that the rung isolates the cavity part.
+* The ice substeps as kernels (rung 18) and the shelf-front `a_ice` difference of the whole-step check: 0.5-1 day.
+* The coupled ice path (`coupled/flux.ice_surface_step_cpl(cavity_cfg)`), the coupled CORE3 config, the sharded
+  (dist_N) cavity run: 1-2 days.
+* Single precision with cavities (with L-SFC's SP linfs): 0.5-1 day once that exists.
+Total ~3-6 working days.
 
 ## Next session, first steps
 
-1. Task 4 first (it unblocks the ladder): cherry-pick the converter of branch `fortran-restart`
-   (`fesom_jax/fortran_restart.py`, `scripts/fortran_restart/convert.py`) onto `coupled/core3`, convert
-   jaxcpl's `fesom.1855-01-01.{oce,ice}.restart` on `mesh_core3`.
-2. A replay harness: build a fesom_jax `State` from the oracle's `pre_fluxes` full dump + restart, run one step in
-   single precision on CORE3, compare every substep's full field with `io_dump.load_full_field` (cavity, front and
-   open nodes separately).
-3. Wire what exists (`cavity:` config slot, `reference_density` once per run, `pressure_bv(..., cavity=True)`,
-   `cavity.py` in the forcing / ice path), then the rest of the "todo" rows, each replayed against `run_cav_dp`.
-4. Rungs 2-19 the same way (inputs from the oracle's full dumps of the previous substep, output vs the next).
+1. Rung 15 (tracers) and rung 14 (GM/Redi) in `replay_ladder.py`, against `run_cav_dp`.
+2. The shelf-front `a_ice` difference of the whole-step check (rung 18: FCT advection / thermodynamics at front
+   nodes).
+3. `coupled/flux.ice_surface_step_cpl` with `cavity_cfg`, the coupled CORE3 config (restart `..._as_1855_v2`; the
+   OASIS weights are L-CPL's), a dist_4 run.
