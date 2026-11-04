@@ -89,7 +89,7 @@ gpu:
   # device is round-off (a different partition sums in another order; after 27 h the States differ like weather).
   halo_compact: true      # the all_gather ships only the lanes other devices read; bitwise
   mevp_wide: 12           # mEVP exchanges every 12 subcycles on 12-ring ice lanes; bitwise on 2 GH200 (on CPU with
-                          # metric_factor_zero: round-off, 2e-13 relative, tests/test_mevp_wide_sharded.py)
+                          # metric_factor_zero: round-off, <= 2e-12 relative, tests/test_mevp_wide_sharded.py)
 output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/cpl
 snapshot_every: 48
 checkpoint_every: 1440

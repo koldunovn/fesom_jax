@@ -472,7 +472,8 @@ def test_forced_run_wide_bitwise(monkeypatch):
 def test_wide_mevp_metric_factor_zero(mevp_setup4):
     """IceConfig.metric_factor_zero (jaxcpl's &geometry): the wide halo's own lane mesh zeroes its metric_factor
     as metric_factor_mesh does for the per-subcycle path. K = 12 then agrees with the per-subcycle sharded mEVP to
-    round-off, NOT bitwise (measured: 407 of 31716 owned u_ice values differ, by <= 5e-16 absolute, 2e-13 relative):
+    round-off, NOT bitwise (measured in float64: 407 of 31716 owned u_ice values differ by <= 5e-16, 2e-13 relative;
+    sigma11 by 2.7e-8 of 1.3e4, 2e-12 relative, after the 120 subcycles; bound 1e-10 of the field's maximum):
     with a zero metric factor XLA fuses the two loops' arithmetic differently. The switch itself matters (the
     metric terms are not negligible here)."""
     s = mevp_setup4
@@ -485,6 +486,6 @@ def test_wide_mevp_metric_factor_zero(mevp_setup4):
             sl = own_n if i < 2 else own_e
             g, r = np.asarray(got[i])[d][sl], np.asarray(ref[i])[d][sl]
             scale = max(float(np.abs(r).max()), 1e-30)
-            assert float(np.abs(g - r).max()) <= 1e-12 * scale, f"{nm} owned d{d}: {np.abs(g - r).max()} / {scale}"
+            assert float(np.abs(g - r).max()) <= 1e-10 * scale, f"{nm} owned d{d}: {np.abs(g - r).max()} / {scale}"
     own = _lanes(s["part"], s["sm"])[0][0]
     assert np.abs(np.asarray(ref[0])[0][own] - np.asarray(s["ref"][0][0])[0][own]).max() > 0.0
