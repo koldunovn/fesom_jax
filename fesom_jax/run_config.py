@@ -148,7 +148,10 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "forcing_ahead": "FESOM_FORCING_AHEAD", "restart_async": "FESOM_RESTART_ASYNC",
             "se_wide": "FESOM_SE_WIDE", "se_unroll": "FESOM_SE_UNROLL", "step_unroll": "FESOM_STEP_UNROLL",
             "ice_static": "FESOM_ICE_STATIC", "chunk_tail": "FESOM_CHUNK_TAIL", "bgc_layout": "FESOM_BGC_LAYOUT",
-            "bgc_halo": "FESOM_BGC_HALO", "cpl_forcing_jit": "FESOM_CPL_FORCING_JIT"}
+            "bgc_halo": "FESOM_BGC_HALO", "cpl_forcing_jit": "FESOM_CPL_FORCING_JIT",
+            "serial_halo_skip": "FESOM_SERIAL_HALO_SKIP"}
+# `serial_halo_skip`: on one device every halo exchange returns its field (the one-device maps are the identity,
+# checked on the host): fesom_jax.halo.serial_skip_enabled; the same bits, no all_gather and permutation gather.
 # `cpl_forcing_jit` (coupled ocean, mode F): the interval's forcing build and the monthly sums as compiled programs
 # instead of eager device ops (fesom_jax.coupled.flux.flux_step_forcing_jit; bitwise the eager build).
 # `bgc_layout`: how the REcoM tracer stage runs over the tracer axis (a string): "major" (default: one batched pass

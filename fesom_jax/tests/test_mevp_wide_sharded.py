@@ -465,3 +465,18 @@ def test_forced_run_wide_bitwise(monkeypatch):
     assert checked > 10
     u = np.asarray(ref.u_ice)
     assert np.abs(u[0, : int(part.myDim_nod2D[0])]).max() > 1e-4, "ice velocities trivial"
+
+
+@avail
+@pytest.mark.skipif(_PLATFORM != "cpu", reason="bitwise is a CPU property")
+def test_wide_mevp_bitwise_metric_factor_zero(mevp_setup4):
+    """IceConfig.metric_factor_zero (jaxcpl's &geometry): the wide halo's own lane mesh zeroes its metric_factor
+    as metric_factor_mesh does for the per-subcycle path, so K = 12 is bitwise the per-subcycle sharded mEVP on the
+    owned and standard halo lanes; and the switch changes the result (the metric terms are not negligible here)."""
+    s = mevp_setup4
+    cfg0 = s["cfg"]._replace(metric_factor_zero=True)
+    ref = _runner(s["mesh"], s["part"], s["sm"], cfg0, None)(s["inp"])
+    got = _runner(s["mesh"], s["part"], s["sm"], cfg0, 12)(s["inp"])
+    _assert_bitwise(got, ref, s["part"], s["sm"], "metric_factor_zero K=12")
+    own = _lanes(s["part"], s["sm"])[0][0]
+    assert np.abs(np.asarray(ref[0])[0][own] - np.asarray(s["ref"][0][0])[0][own]).max() > 0.0

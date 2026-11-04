@@ -319,8 +319,7 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
     if boundary_node is None:
         boundary_node = boundary_node_mask(mesh)
     mesh = metric_factor_mesh(cfg, mesh)
-    if wide is not None and getattr(cfg, "metric_factor_zero", False):
-        raise NotImplementedError("metric_factor_zero with gpu.mevp_wide: the wide halo carries its own metric_factor")
+    # gpu.mevp_wide carries its own lane mesh: _mevp_wide zeroes its metric_factor under metric_factor_zero as well
     if getattr(cfg, "adjoint_damping", "none") == "frozen_sweep":
         # the same forward; a custom_vjp backward (ice_mevp_frozen, docs/PORTING_LESSONS.md I5g)
         if adjoint_subcycles >= 0:
@@ -444,6 +443,8 @@ def _mevp_wide(cfg: IceConfig, wide, st: MevpStatic, rdt, n: int,
     wst = MevpStatic(ice_nod=inod > 0.5, inv_thickness=ith, mass=mass, tilt_u=tu, tilt_v=tv,
                      ice_el=xe[:, 4] > 0.5, pressure_fac=xe[:, 3], bc_index=bci)
     lm = wide.lane_mesh()
+    if getattr(cfg, "metric_factor_zero", False):     # FESOM2 &geometry metric_factor_zero (metric_factor_mesh)
+        lm = lm._replace(metric_factor=jnp.zeros_like(lm.metric_factor))
 
     def body(c, _):
         return mevp_iterate(cfg, lm, *c, wst, u0, v0, su, sv, sax, say, rdt,

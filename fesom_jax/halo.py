@@ -98,6 +98,8 @@ class HaloCtx:
         ``all_to_all`` when ``use_padded`` (Phase 8c), the halo-only ``ragged_all_to_all``
         when ``use_ragged`` (Phase 8b), else ``all_gather``. ``FESOM_HALO_BARRIER``
         (:func:`halo_barrier_mode`) fences the exchange off from XLA fusion."""
+        if serial_identity(self.axis_name):
+            return field
         mode = halo_barrier_mode()
         if mode == "both":
             field = lax.optimization_barrier(field)
@@ -109,7 +111,7 @@ class HaloCtx:
         (``gpu.bgc_halo: grouped``), else :meth:`exchange`. The same values either way. Its exchanges carry 31
         tracers a call (bound by their bytes, where the grouped transport sends only the pairs' real rows); the rest
         of the step's (bound by their latency) stay with the run's transport."""
-        if self.bulk_maps is None:
+        if self.bulk_maps is None or serial_identity(self.axis_name):
             return self.exchange(field, kind)
         mode = halo_barrier_mode()
         if mode == "both":
@@ -202,6 +204,22 @@ def halo_exchange(field, src_dev, src_lane, axis_name: str = DEFAULT_AXIS):
         return field
     gathered = lax.all_gather(field, axis_name, axis=0, tiled=False)  # [P, Lmax, *rest]
     return gathered[src_dev, src_lane]
+
+
+def serial_skip_enabled() -> bool:
+    """``FESOM_SERIAL_HALO_SKIP=1`` (``gpu.serial_halo_skip``, read at trace time): on ONE device (axis size 1) every
+    halo exchange of :class:`HaloCtx` returns its field unchanged. The one-device exchange maps are the identity
+    (every lane its own owner; checked on the host by ``integrate_sharded._halo_arrays``), so the values are the same
+    bits; what goes is the all_gather over one device and its permutation gather, ~5 ms a step of the coupled CORE3
+    ocean on one GH200 (16 % of its kernel time). Off by default: the programs are byte-unchanged."""
+    return os.environ.get("FESOM_SERIAL_HALO_SKIP", "0").strip() not in ("", "0")
+
+
+def serial_identity(axis_name: str) -> bool:
+    """True when :func:`serial_skip_enabled` and the ``shard_map`` axis has one device (static at trace time)."""
+    if not serial_skip_enabled():
+        return False
+    return int(lax.psum(1, axis_name)) == 1
 
 
 def halo_none() -> bool:

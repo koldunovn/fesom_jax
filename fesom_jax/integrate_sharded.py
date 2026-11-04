@@ -325,8 +325,14 @@ def _halo_arrays(sm: ShardedMesh, ragged: bool = False, padded: bool = False,
     The coloured rounds are PACKED into one buffer per kind (round r at
     ``[offs[r], offs[r]+slots[r])``), so this adds 3 arrays per kind, not 2·K."""
     ha: dict = {}
+    from .halo import serial_skip_enabled
     for k in _RKINDS:
         src_dev, src_lane = sm.exchange[k]
+        if serial_skip_enabled() and np.asarray(src_dev).shape[0] == 1:
+            # gpu.serial_halo_skip: one device's exchange must be the identity for the skip to keep the bits
+            if not (np.all(np.asarray(src_dev) == 0)
+                    and np.array_equal(np.asarray(src_lane)[0], np.arange(np.asarray(src_lane).shape[1]))):
+                raise AssertionError(f"gpu.serial_halo_skip: the one-device {k} exchange map is not the identity")
         ha[f"sd_{k}"] = _fold(src_dev).astype(np.int32)       # mesh constants → host numpy
         ha[f"sl_{k}"] = _fold(src_lane).astype(np.int32)
         if ragged or padded or coloured:
