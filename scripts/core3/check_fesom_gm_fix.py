@@ -59,8 +59,8 @@ def main():
                                                     "fer_uv_1", "fer_uv_2", "helem", "stress_surf_x",
                                                     "stress_surf_y", "sigma11", "sigma12", "sigma22",
                                                     "elem_area") else E
-        x = io_dump.load_full_field(a.unfixed, st, sub, field, n)
-        y = io_dump.load_full_field(a.fixed, st, sub, field, n)
+        x = io_dump.load_full_field(str(Path(a.unfixed) / "dumps"), st, sub, field, n)
+        y = io_dump.load_full_field(str(Path(a.fixed) / "dumps"), st, sub, field, n)
         if np.array_equal(np.nan_to_num(x, nan=-9e99).view(np.uint64), np.nan_to_num(y, nan=-9e99).view(np.uint64)):
             n_bitwise += 1
             continue
@@ -91,7 +91,7 @@ def main():
         ifc, lay = np.asarray(mesh.node_iface_mask), np.asarray(mesh.node_layer_mask)
         fn = jax.jit(lambda T, S, b, h, e: gm.gm_diagnostics(mesh, T, S, b, h, e, p, gc))
         for s in range(1, a.steps + 1):
-            D = lambda sub, name, n=N: pad(io_dump.load_full_field(a.fixed, s, sub, name, n))  # noqa: E731
+            D = lambda sub, name, n=N: pad(io_dump.load_full_field(str(Path(a.fixed) / "dumps"), s, sub, name, n))  # noqa: E731
             out = fn(*(jnp.asarray(np.nan_to_num(v)) for v in (D(20, "T"), D(20, "S"), D(1, "bvfreq"), D(20, "hnode"),
                                                                  D(16, "helem", E))))
             for lab, mine, ref, m in (("fer_k", out.fer_K, D(14, "fer_k"), ifc), ("Ki", out.Ki, D(14, "Ki"), lay)):
