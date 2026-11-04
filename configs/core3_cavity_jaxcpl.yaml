@@ -16,6 +16,11 @@ gm:
   redi_kmax_default: 1000.0
   k_gm_max_nh: 1000.0
   k_gm_hemi_trans: 10.0
+  # REPRODUCES A FESOM2 BUG, NOT PHYSICS: init_Redi_GM builds the GM profile from the wrong level at the ice-shelf
+  # front and under parts of the shelves (oce_fer_gm.F90:223,304-306 vs :349,439,443; fer_K = 500 from
+  # oce_setup_step.F90:1042). Only to compare with Fortran FESOM2 0aaa2d73 runs such as jaxcpl; the correct
+  # behaviour is false (the default). Filed upstream (FESOM/fesom2). See GMConfig and docs/lanes/core3_sfc.md.
+  reproduce_fesom_bug_kgm_surface_level: true
 kpp: null
 tke: {}
 ice:

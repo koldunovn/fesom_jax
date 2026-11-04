@@ -16,6 +16,44 @@ Branch `coupled/core3_sfc` from `5b88770` (tag `awicm-v0-tco95-core2`). Outputs:
   path has no ponds and needs none (FESOM2's `ice_thermo_oce.F90` has none either).
 - Task 3: `configs/core2_cpl_jaxcpl.yaml` (CORE2, zstar, single precision). The CORE3 config waits for lane L-OCN.
 
+## Status (2026-11-04, session 4): the GM shelf bug, reproduced behind a switch
+
+Branch `coupled/gm_bug` from `merge/core3_int` 2caa192. Nikolay's decision: reproduce FESOM's behaviour behind a
+switch and make it unmistakable that it is a FESOM2 bug, not physics (reported upstream).
+
+`gm.reproduce_fesom_bug_kgm_surface_level` (default **false** = the correct behaviour) **REPRODUCES A FESOM2 BUG,
+NOT PHYSICS, only to compare with Fortran FESOM2 0aaa2d73 runs such as jaxcpl**: `init_Redi_GM` writes fer_k's
+surface value at the maximum `ulevels` of the node's elements (oce_fer_gm.F90:223, :304-306), but the vertical-scaling
+loop builds the profile from `fer_k(ulevels_nod2D(n), n)` (:349, :439, :443); that slot holds `fer_K = 500` from
+oce_setup_step.F90:1042 at the first call and then its own value times `zscaling` every call; `init_Redi_GM_acc` does
+the same (:582, :615-616, :634); the Redi branch (:330-334) avoids it.
+
+Implementation (exact, not the steady state): `State.gm_kgm_stale` (node, the stale slot), set to 500 m²/s at every
+run start by `gm.init_kgm_bug_state` (run.py, coupled/ocean.py, integrate.py), never written to a restart
+(`state.FESOM_BUG_FIELDS`, excluded in `zarr_output`), as FESOM2 does not restart fer_K; `gm.fesom_bug_kgm_surface_level`
+replaces fer_K at the nodes with `ulevels_nod2D != ulevels_nod2D_max` by `stale·zscaling(z)` and carries
+`stale·zscaling(ulevels_nod2D)`. Without cavities those nodes do not exist and the switch changes nothing. On in
+`configs/core3_cavity_jaxcpl.yaml` and `configs/core3_cpl.yaml` (one line with the comment), listed in
+`docs/FORTRAN_BUGS_REPRODUCED.md` (linked from USER_GUIDE.md section 9).
+
+Check (`scripts/core3/replay_ladder_sfc.py --rungs 14 --gm-steps 6`, job 28708036): rung 14 against a 6-step
+double-precision oracle run with full dumps every step (`oracle_core2/run_cav_dp6`, job 28708022: L-OCN's run_cav_dp
+namelists, restart and source, this lane's instrumented binary), each step on the oracle's inputs, the stale slot
+carried by the replay itself from 500 at step 1; fer_uv, max |diff| / max |field|:
+
+| step | switch on: cavity / front / open | switch off: cavity / front / open |
+|---|---|---|
+| 1 | 4.0e-14 / 4.1e-14 / 1.1e-13 | 0.18 / 6.0e-2 / 1.1e-13 |
+| 2 | 4.0e-14 / 4.3e-14 / 1.1e-13 | 0.17 / 5.9e-2 / 1.1e-13 |
+| 3 | 3.7e-14 / 3.7e-14 / 1.1e-13 | 0.16 / 5.9e-2 / 1.1e-13 |
+| 4 | 3.2e-14 / 3.3e-14 / 1.1e-13 | 0.16 / 5.9e-2 / 1.1e-13 |
+| 5 | 3.6e-14 / 3.6e-14 / 1.1e-13 | 0.15 / 6.0e-2 / 1.1e-13 |
+| 6 | 3.8e-14 / 4.0e-14 / 1.1e-13 | 0.14 / 6.0e-2 / 1.1e-13 |
+
+The switch-off numbers at step 1 are session 3's (the GM path is unchanged off). Control without the hemispheric
+ceiling: open 1.2 at every step. Tests on CPU: test_state, test_restart, test_fortran_restart, test_gm_redi (17
+passed, 4 skipped; job 28708039), test_gm_coeffs, test_gm_step, test_gm_bolus (13 passed; job 28708040).
+
 ## Status (2026-11-03, session 3)
 
 On `merge/core3_ocn` ba2a797 (lane L-OCN's cavities in the step), against L-OCN's double-precision CORE3 cavity
@@ -47,7 +85,7 @@ setup (`oce_setup_step.F90:1042`, not restarted), then times `zscaling(ulevels_n
 GM coefficient there is `500·zscaling(z)` at the front (zscaling = 1 at the sea surface, so it stays 500 for good) and
 `500·zscaling(z_top)^(n-1)·zscaling(z)` under the shelves (dying off within tens of steps of each leg), whatever
 K_GM_max, the resolution scaling or the hemispheric ceiling say. The emulation in rung 14 (step 1) reproduces the
-oracle to 4e-14. fesom_jax does what the code intends (the template at every node). **Not ported; decision needed**
+oracle to 4e-14. fesom_jax does what the code intends (the template at every node). **Session 4: reproduced behind `gm.reproduce_fesom_bug_kgm_surface_level` (above); not physics**
 (reproduce jaxcpl's bug behind a GM switch, or report it to FESOM/Jan and keep the intended behaviour). Reproducing it
 exactly needs the step count since the leg's start (fer_K is not in FESOM's restart); its steady state (front 500·zs,
 the other mismatched nodes 0) needs none. The fix in FESOM would be one line: write the template at

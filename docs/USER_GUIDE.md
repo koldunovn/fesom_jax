@@ -211,3 +211,9 @@ CPU / a single device.** On GPU, XLA's reduction order is nondeterministic, so t
 (including `test_defaults_bit_identical_step`) can fail there at roundoff — same commit, same
 environment: 551/551 on CPU vs 9 exactness-gate failures on GPU (measured 2026-07, A100). On GPU
 expect roundoff-level agreement, not bitwise; run the exactness gates on CPU.
+
+## 9. Reproduced FESOM2 bugs
+
+Some switches reproduce a FESOM2 bug, only to compare with a Fortran FESOM2 run; their names say so (e.g.
+`gm.reproduce_fesom_bug_kgm_surface_level`). They are not physics and are off by default. The list, with file and
+lines: [FORTRAN_BUGS_REPRODUCED.md](FORTRAN_BUGS_REPRODUCED.md).

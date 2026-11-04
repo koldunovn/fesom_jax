@@ -302,6 +302,8 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         bootstrap = True
         log(f"[ocean] cold start (PHC + FESOM's initial sea ice) at {y:04d}-{m:02d}-{d:02d}, step {step0}")
     state = init_ice_avg(state, cfg.ice)
+    from ..gm import init_kgm_bug_state             # a FESOM2 bug reproduced (GMConfig): 500 m2/s at every run start
+    state = init_kgm_bug_state(state, cfg.gm)
     if precision == "single":
         state = PR.cast_state(state)
 

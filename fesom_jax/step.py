@@ -372,7 +372,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                                                   params, gm_cfg, exch=_exch,
                                                   Z3d=Z3d_live, zbar3=zbar3_live,
                                                   freeze_nn_features=_adj.freeze_nn_features,
-                                                  adj=_adj))()
+                                                  adj=_adj, kgm_stale=st.gm_kgm_stale))()
 
     # 3 — pressure-gradient force. zstar ⇒ the shchepetkin density-Jacobian on live geometry
     #     (NO hpressure under zstar — the C uses none); linfs ⇒ the hpressure gradient (byte-identical).
@@ -757,6 +757,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # the ice precedent — so the tke_cfg=None path never touches state.tke ⇒ byte-identical).
     if tke_cfg is not None:
         new = dataclasses.replace(new, tke=tke_new)
+    # GMConfig.reproduce_fesom_bug_kgm_surface_level (a FESOM2 bug reproduced, not physics): the stale slot
+    if gm_diag is not None and gm_diag.kgm_stale is not None:
+        new = dataclasses.replace(new, gm_kgm_stale=gm_diag.kgm_stale)
     # Phase 6: carry the updated prognostic ice state (the ice step ran before the ocean step).
     if ice_out is not None:
         new = dataclasses.replace(

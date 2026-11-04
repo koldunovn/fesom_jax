@@ -94,6 +94,18 @@ class GMConfig(NamedTuple):
     k_gm_max_nh: float = -1.0
     k_gm_hemi_trans: float = 10.0
 
+    # --- REPRODUCTION OF A FESOM2 BUG, NOT PHYSICS (lane L-SFC; default False = the correct behaviour) ---
+    # FESOM2 0aaa2d73 init_Redi_GM (oce_fer_gm.F90:223 and :304-306) writes fer_k's surface value at the MAXIMUM
+    # ulevels of the node's elements (ulevels_nod2D_max), but the vertical-scaling loop builds the profile from
+    # fer_k(ulevels_nod2D(n), n) (:349, :439, :443); init_Redi_GM_acc does the same (:582, :615-616, :634). Where
+    # the two levels differ (ice-shelf cavities: the shelf front and parts of the cavity) that slot holds
+    # fer_K = 500 m2/s from oce_setup_step.F90:1042 at the first call of a run, then its own value times
+    # zscaling(ulevels_nod2D) at every call; K_GM_max, the resolution scaling and the hemispheric ceiling are
+    # ignored there. True reproduces it (State.gm_kgm_stale, 500 at every run start, never restarted, as FESOM2),
+    # ONLY to compare with Fortran FESOM2 0aaa2d73 runs such as jaxcpl. Without cavities the levels never differ and
+    # True changes nothing. Filed upstream (FESOM/fesom2); the Redi branch (:330-334) already avoids it.
+    reproduce_fesom_bug_kgm_surface_level: bool = False
+
 
 def _safe_sqrt(x):
     """Double-``where`` safe sqrt: forward-identical to ``sqrt(max(x,0))`` but with a
@@ -453,6 +465,65 @@ def fer_gamma2vel(mesh: Mesh, fer_gamma, helem):
 # ============================================================================
 # G.5 — gm_diagnostics: the per-step GM/Redi driver (state -> GM fields)
 # ============================================================================
+#: FESOM2's initial fer_K [m2/s] (oce_setup_step.F90:1042): the value GMConfig.reproduce_fesom_bug_kgm_surface_level
+#: starts from at every run start
+FESOM_FER_K_INIT = 500.0
+
+
+def _gm_zscaling(mesh: Mesh, cfg: GMConfig, zbar3=None):
+    """The scaling_GMzexp depth factor of :func:`init_redi_gm`, ``(N, nl)``."""
+    z = jnp.abs(mesh.zbar_3d_n if zbar3 is None else zbar3)
+    zs = cfg.gmzexp_smin + (1.0 - cfg.gmzexp_smin) * jnp.exp(-z / cfg.gmzexp_zref)
+    return jnp.clip(zs, cfg.gmzexp_smin, 1.0)
+
+
+def fesom_bug_kgm_surface_level(mesh: Mesh, cfg: GMConfig, fer_K, kgm_stale, zbar3=None):
+    """REPRODUCTION OF A FESOM2 BUG, NOT PHYSICS (``GMConfig.reproduce_fesom_bug_kgm_surface_level``; see there).
+
+    At the nodes where ``ulevels_nod2D != ulevels_nod2D_max``, FESOM2 0aaa2d73's ``init_Redi_GM`` builds the GM
+    profile as ``fer_k(nz) = s · zscaling(nz)`` for ``nz = ulevels_nod2D .. nlevels_nod2D`` with ``s`` the value its
+    ``fer_k(ulevels_nod2D)`` slot kept from the previous call, and leaves ``s · zscaling(ulevels_nod2D)`` in that slot
+    (oce_fer_gm.F90:439-443). ``kgm_stale`` ``(N,)`` is ``s`` (``FESOM_FER_K_INIT`` at a run start). Returns
+    ``(fer_K, kgm_stale_new)``; ``fer_K`` is unchanged at every other node, and so is ``kgm_stale`` there (FESOM2
+    overwrites the slot there, but nothing reads it)."""
+    zs = _gm_zscaling(mesh, cfg, zbar3)
+    reg = (mesh.ulevels_nod2D - 1).astype(jnp.int32)
+    bad = mesh.ulevels_nod2D != mesh.ulevels_nod2D_max
+    zs_reg = jnp.take_along_axis(zs, reg[:, None], axis=1)[:, 0]
+    stale = kgm_stale.astype(fer_K.dtype)
+    prof = jnp.where(mesh.node_iface_mask, stale[:, None] * zs, 0.0)
+    fer_K = jnp.where(bad[:, None], prof, fer_K)
+    new = jnp.where(bad, stale * zs_reg, stale)
+    return fer_K, new.astype(kgm_stale.dtype)
+
+
+def init_kgm_bug_state(state, gm_cfg, *, xp=None):
+    """Give ``state`` the ``gm_kgm_stale`` field of ``GMConfig.reproduce_fesom_bug_kgm_surface_level`` (a FESOM2 bug
+    reproduction) at ``FESOM_FER_K_INIT`` when the switch is on and the field is absent (every run start: it is never
+    restarted, as FESOM2 does not restart fer_K), or strip it when the switch is off. Works on dense, partitioned host
+    and folded device-sharded States (the leaf takes ``a_ice``'s shape, dtype and sharding)."""
+    import dataclasses
+
+    import jax
+    import numpy as np
+    on = gm_cfg is not None and bool(getattr(gm_cfg, "reproduce_fesom_bug_kgm_surface_level", False))
+    if not on:
+        return state if getattr(state, "gm_kgm_stale", None) is None else dataclasses.replace(state, gm_kgm_stale=None)
+    if getattr(state, "gm_kgm_stale", None) is not None:
+        return state
+    ref = state.a_ice
+    host = np.full(tuple(ref.shape), FESOM_FER_K_INIT, dtype=np.asarray(ref[:0]).dtype if not isinstance(
+        ref, np.ndarray) else ref.dtype)
+    if xp is np or isinstance(ref, np.ndarray):
+        new = host
+    elif (isinstance(ref, jax.Array) and not isinstance(ref, jax.core.Tracer)
+          and len(ref.sharding.device_set) > 1):
+        new = jax.make_array_from_callback(host.shape, ref.sharding, lambda idx, a=host: a[idx])
+    else:
+        new = jnp.asarray(host)
+    return dataclasses.replace(state, gm_kgm_stale=new)
+
+
 class GMDiag(NamedTuple):
     """Per-step GM/Redi diagnostic fields (all recomputed from the state — GM is
     stateless). ``fer_uv`` (element bolus velocity) drives the bolus advection
@@ -463,11 +534,12 @@ class GMDiag(NamedTuple):
     Ki: jnp.ndarray             # (N,nl)     Redi diffusivity
     fer_K: jnp.ndarray          # (N,nl)     GM thickness diffusivity (diag)
     fer_C: jnp.ndarray          # (N,)       baroclinic wave speed² (diag)
+    kgm_stale: jnp.ndarray = None  # (N,) the FESOM2-bug slot after this call (reproduce_fesom_bug_...; else None)
 
 
 def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
                    cfg: GMConfig, exch=None, Z3d=None, zbar3=None,
-                   freeze_nn_features: bool = False, adj=None) -> GMDiag:
+                   freeze_nn_features: bool = False, adj=None, kgm_stale=None) -> GMDiag:
     """Run the full GM/Redi diagnostic chain (G.2-G.4) from the ocean state:
     ``sw_alpha_beta → sigma_xy → neutral_slope → init_redi_gm → fer_solve_gamma →
     fer_gamma2vel``. Returns the fields the bolus advection (G.5) and Redi terms
@@ -514,6 +586,13 @@ def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
         steep_cut=getattr(adj, "gm_slope_cut", None))
     fer_K, Ki, fer_C, _ = init_redi_gm(mesh, dcut(adj, "gm.cm_n2", bvfreq), hnode_new,
                                        fer_tapfac, params, cfg, zbar3=zbar3)
+    kgm_stale_new = None
+    if getattr(cfg, "reproduce_fesom_bug_kgm_surface_level", False):
+        # A FESOM2 BUG REPRODUCED, NOT PHYSICS (GMConfig.reproduce_fesom_bug_kgm_surface_level)
+        if kgm_stale is None:
+            raise ValueError("GMConfig.reproduce_fesom_bug_kgm_surface_level needs State.gm_kgm_stale: "
+                             "gm.init_kgm_bug_state(state, gm_cfg) first (the drivers do)")
+        fer_K, kgm_stale_new = fesom_bug_kgm_surface_level(mesh, cfg, fer_K, kgm_stale, zbar3=zbar3)
 
     # --- the Arm-A NN seam (NN-GM plan Task 7). ``params.gm_nn is None`` ⇒ a PYTHON-level
     # branch, so the default path has no trace change whatsoever and stays byte-identical to the
@@ -542,4 +621,4 @@ def gm_diagnostics(mesh: Mesh, T, S, bvfreq, hnode_new, helem, params,
     slope_tapered = exch(slope_tapered, "nod")         # read at HALO edge endpoints (Redi G7b)
     Ki = exch(Ki, "nod")                               # read at HALO edge endpoints (Redi G7b)
     return GMDiag(fer_uv=fer_uv, slope_tapered=slope_tapered, Ki=Ki,
-                  fer_K=fer_K, fer_C=fer_C)
+                  fer_K=fer_K, fer_C=fer_C, kgm_stale=kgm_stale_new)

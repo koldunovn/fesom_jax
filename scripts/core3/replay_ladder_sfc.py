@@ -6,7 +6,9 @@ the same loaders, the same cavity / shelf-front / open split, the same max |diff
 
 Rungs (each kernel on the oracle's inputs of the same step, output against the oracle's dump of that substep):
   6   momentum.horizontal_viscosity(opt_visc 5, easybsreturn 1.5)(uv[20], uv_rhs[5])          -> uv_rhs [6]
-  14  gm.gm_diagnostics(T, S [20], bvfreq [1], hnode [20], helem [16]; jaxcpl's GM block)     -> fer_uv [14]
+  14  gm.gm_diagnostics(T, S [20], bvfreq [1], hnode [20], helem [16]; jaxcpl's GM block)     -> fer_uv [14],
+      steps 1 .. --gm-steps (dumps of --gm-dump), with GMConfig.reproduce_fesom_bug_kgm_surface_level (a FESOM2 bug
+      reproduced, not physics) carrying its stale slot from step to step, and with the switch off
   18  sea ice from the instrumented oracle copy (``--evp-dump``, substeps 21/22/23 of
       ``oracle_core2/fesom-evpdump``): mEVP (metric_factor_zero, mass floor, the shelf front as a coast) on the
       EVPdynamics_m inputs [21] -> u/v_ice, sigma [22]; ice FCT + cut_off + cavity cleaning on [21] and the mEVP
@@ -65,6 +67,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump_dir"); ap.add_argument("mesh_dir")
     ap.add_argument("--evp-dump", default=None)
+    ap.add_argument("--gm-dump", default=None, help="dump dir with full fields for steps 1..--gm-steps (rung 14)")
+    ap.add_argument("--gm-steps", type=int, default=1)
     ap.add_argument("--step", type=int, default=1)
     ap.add_argument("--rungs", type=int, nargs="+", default=[6, 14, 18])
     ap.add_argument("--config", default=str(ROOT / "configs" / "core2_cpl_jaxcpl.yaml"))
@@ -102,40 +106,31 @@ def main():
                 mesh, u, r, dt=a.dt, visc_cfg=vc))(J(uv0), J(r5)))
             report(6, tag + " Δuv_rhs", got - r5, r6 - r5, lay_e, g_elem)
     if 14 in a.rungs:
-        T, S, bv, hn, he = D(20, "T"), D(20, "S"), D(1, "bvfreq"), D(20, "hnode"), D(16, "helem", E)
-        ref = Duv(14, "fer_uv")
-        for gc, tag in ((cfg.gm, "GM fer_uv (jaxcpl)"), (cfg.gm._replace(k_gm_max_nh=-1.0), "GM no-hemi (control)")):
-            p = Params.defaults(gc)
-            got = np.asarray(jax.jit(lambda T, S, b, h, e, gc=gc, p=p: gm.gm_diagnostics(
-                mesh, T, S, b, h, e, p, gc).fer_uv)(J(T), J(S), J(bv), J(hn), J(he)))
-            report(14, tag, got, ref, lay_e, g_elem)
-        # FESOM main's init_Redi_GM at nodes where ulevels_nod2D /= ulevels_nod2D_max (the shelf front and parts of
-        # the cavity): the surface template goes to fer_k(ulevels_nod2D_max) (F1), the profile reads
-        # fer_k(ulevels_nod2D) (F2), which holds the previous step's value -- 500 at setup (oce_setup_step.F90:1042),
-        # times zscaling(ulevels_nod2D) each step. Emulated here for step `st` to test that this is the difference.
-        orig = gm.init_redi_gm
-        reg = np.asarray(mesh.ulevels_nod2D) - 1
-        cons = np.asarray(mesh.ulevels_nod2D_max) - 1
-        z = np.abs(np.asarray(mesh.zbar_3d_n))
-        g0 = cfg.gm
-        zs = np.clip(g0.gmzexp_smin + (1 - g0.gmzexp_smin) * np.exp(-z / g0.gmzexp_zref), g0.gmzexp_smin, 1.0)
-        stale = 500.0 * zs[np.arange(N), reg] ** (st - 1)
-        alt = np.where(np.asarray(mesh.node_iface_mask), stale[:, None] * zs, 0.0)
-        bad = cons != reg
-
-        def emul(*args, **kw):
-            fk, ki, fc, fs = orig(*args, **kw)
-            return jnp.where(jnp.asarray(bad)[:, None], jnp.asarray(alt), fk), ki, fc, fs
-        gm.init_redi_gm = emul
-        try:
-            p = Params.defaults(cfg.gm)
-            got = np.asarray(jax.jit(lambda T, S, b, h, e: gm.gm_diagnostics(
-                mesh, T, S, b, h, e, p, cfg.gm).fer_uv)(J(T), J(S), J(bv), J(hn), J(he)))
-        finally:
-            gm.init_redi_gm = orig
+        # GM/Redi bolus velocity at steps 1 .. a.gm_steps, each on the oracle's inputs of that step. With
+        # reproduce_fesom_bug_kgm_surface_level (a FESOM2 bug reproduced, not physics) the stale fer_k slot is carried
+        # from this replay's own previous call, starting at 500 m2/s at step 1 as a run start does.
+        he = D(16, "helem", E)
+        stale = np.full(N, gm.FESOM_FER_K_INIT)
+        variants = (("GM, FESOM bug reproduced", cfg.gm._replace(reproduce_fesom_bug_kgm_surface_level=True)),
+                    ("GM, correct (switch off)", cfg.gm._replace(reproduce_fesom_bug_kgm_surface_level=False)),
+                    ("GM, no hemispheric ceiling (control)",
+                     cfg.gm._replace(reproduce_fesom_bug_kgm_surface_level=True, k_gm_max_nh=-1.0)))
+        bad = np.asarray(mesh.ulevels_nod2D) != np.asarray(mesh.ulevels_nod2D_max)
         print(f"   rung 14: {int(bad.sum())} nodes with ulevels_nod2D /= ulevels_nod2D_max "
-              f"({int((bad & (reg == 0)).sum())} at the front)", flush=True)
-        report(14, "GM fer_uv, FESOM's stale template", got, ref, lay_e, g_elem)
+              f"({int((bad & (np.asarray(mesh.ulevels_nod2D) == 1)).sum())} at the shelf front)", flush=True)
+        stales = {tag: stale.copy() for tag, _ in variants}
+        for s_ in range(1, a.gm_steps + 1):
+            Ds = lambda sub, name, n=N: pad(io_dump.load_full_field(a.gm_dump or a.dump_dir, s_, sub, name, n))  # noqa
+            T, S, bv, hn = Ds(20, "T"), Ds(20, "S"), Ds(1, "bvfreq"), Ds(20, "hnode")
+            ref = np.stack([Ds(14, "fer_uv_1", E), Ds(14, "fer_uv_2", E)], -1)
+            for tag, gc in variants:
+                p = Params.defaults(gc)
+                kw = {"kgm_stale": J(stales[tag])} if gc.reproduce_fesom_bug_kgm_surface_level else {}
+                out = jax.jit(lambda T, S, b, h, e, gc=gc, p=p, kw=kw: gm.gm_diagnostics(
+                    mesh, T, S, b, h, e, p, gc, **kw))(J(T), J(S), J(bv), J(hn), J(he))
+                if out.kgm_stale is not None:
+                    stales[tag] = np.asarray(out.kgm_stale)
+                report(14, f"step {s_} {tag}", np.asarray(out.fer_uv), ref, lay_e, g_elem)
     if 18 in a.rungs and a.evp_dump:
         dd = a.evp_dump
         x = {k: D(21, k, two_d=True, d=dd) for k in ("a_ice", "m_ice", "m_snow", "uice", "vice", "srfoce_u",

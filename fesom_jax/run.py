@@ -529,6 +529,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # carries them (resume mid-cycle), else the upstream init values; None when ice_ave_steps == 1
     from .ice_step import init_ice_avg
     state_p = init_ice_avg(state_p, cfg.ice)
+    # GMConfig.reproduce_fesom_bug_kgm_surface_level (a FESOM2 bug reproduced): 500 m2/s at every run start
+    from .gm import init_kgm_bug_state
+    state_p = init_kgm_bug_state(state_p, cfg.gm)
     # REcoM (fesom_jax.recom): the BGC tracers from the restart when it carries them, else (passive-tracer mode,
     # plan Task 1) copies of salinity
     if _recom_full:

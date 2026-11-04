@@ -169,6 +169,10 @@ class State:
     #                                               only with the coupled monthly output asking for fw, not restarted
     #                                               (recom.wiring.BUDGET_TERMS), not restarted
 
+    # --- REPRODUCTION OF A FESOM2 BUG, NOT PHYSICS (GMConfig.reproduce_fesom_bug_kgm_surface_level): FESOM2's stale
+    # fer_k(ulevels_nod2D) slot of init_Redi_GM, 500 m2/s at every run start, never restarted (as FESOM2) ---
+    gm_kgm_stale: jax.Array | None = None         # (nod2D,) [m2/s]
+
     # ---- constructors -----------------------------------------------------
     @classmethod
     def zeros(cls, mesh: Mesh, *, xp=jnp) -> "State":
@@ -276,6 +280,8 @@ BGC_FIELDS = ("bgc", "bgc_old", "bgc_carry") + BGC_MR_FIELDS + BGC_FULL_FIELDS
 RESTART_SKIP = ("bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget", "cpl_fw")
 # The optional coupled mode F fields, in State order (None unless fesom_jax.coupled runs in flux mode).
 CPL_FIELDS = ("cpl_ice_temp", "cpl_ice_alb", "cpl_apnd", "cpl_hpnd", "cpl_ipnd", "cpl_fw")
+# The optional fields of reproduced FESOM2 bugs (None unless switched on; never restarted).
+FESOM_BUG_FIELDS = ("gm_kgm_stale",)
 
 
 def present_fields(state) -> tuple[str, ...]:
