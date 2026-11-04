@@ -54,6 +54,11 @@ The switch-off numbers at step 1 are session 3's (the GM path is unchanged off).
 ceiling: open 1.2 at every step. Tests on CPU: test_state, test_restart, test_fortran_restart, test_gm_redi (17
 passed, 4 skipped; job 28708039), test_gm_coeffs, test_gm_step, test_gm_bolus (13 passed; job 28708040).
 
+Through the driver (`configs/core3_cavity_jaxcpl.yaml`, switch on, `run_from_config.py` 1 step on CPU, job 28708161):
+finite; the restart has no `gm_kgm_stale`; one step against the DP oracle (L-OCN's compare_step.py), T max |diff| /
+max |T|: cavity 2.8e-6 (switch off, session 3: 5.8e-5), front 1.9e-5 (2.5e-5; p99 7.0e-7 against 6.3e-6), open
+7.7e-5 (unchanged); the other fields as in session 3.
+
 ## Status (2026-11-03, session 3)
 
 On `merge/core3_ocn` ba2a797 (lane L-OCN's cavities in the step), against L-OCN's double-precision CORE3 cavity
