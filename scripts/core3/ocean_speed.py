@@ -9,7 +9,7 @@ the fields for the atmosphere. Monthly sums and the w/fw extras are on as in `--
     ocean_speed.py compare A.npz B.npz [--json OUT]
 
 run writes OUT.json (ms per interval: every timed interval, median, mean; peak device memory) and OUT.npz (every
-State leaf at the end in global entity order, float64). --prof calls cudaProfilerStart/Stop around the timed
+State leaf at the end in global entity order, its own dtype). --prof calls cudaProfilerStart/Stop around the timed
 intervals (run under nsys --capture-range=cudaProfilerApi). compare prints per field max |a-b|, the max relative
 difference (|a-b| / max|a|) and whether the two are bitwise equal.
 """
@@ -52,7 +52,7 @@ def _save_state(state, st, path):
                 out[k] = np.asarray(global_view(state, st, (k,))[k])
             except ValueError:
                 pass                                   # not a folded node / element field (scalars)
-    np.savez(path, **{k: v.astype(np.float64) if v.dtype.kind == "f" else v for k, v in out.items()})
+    np.savez(path, **out)                                  # native dtypes (float32 State in single precision)
     return sorted(out)
 
 
@@ -130,6 +130,7 @@ def cmd_compare(a):
         if x.dtype.kind != "f":
             rows[k] = {"bitwise": bool(np.array_equal(x, y)), "ndiff": int((x != y).sum())}
             continue
+        x, y = x.astype(np.float64), y.astype(np.float64)
         d = np.abs(x - y)
         s = float(np.nanmax(np.abs(x))) if x.size else 0.0
         rows[k] = {"bitwise": bool(np.array_equal(x, y, equal_nan=True)), "max_abs": float(np.nanmax(d)) if d.size
