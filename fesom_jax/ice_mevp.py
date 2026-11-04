@@ -320,6 +320,7 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
         boundary_node = boundary_node_mask(mesh)
     mesh = metric_factor_mesh(cfg, mesh)
     # gpu.mevp_wide carries its own lane mesh: _mevp_wide zeroes its metric_factor under metric_factor_zero as well
+    # (round-off, not bitwise, against the per-subcycle path: tests/test_mevp_wide_sharded.py)
     if getattr(cfg, "adjoint_damping", "none") == "frozen_sweep":
         # the same forward; a custom_vjp backward (ice_mevp_frozen, docs/PORTING_LESSONS.md I5g)
         if adjoint_subcycles >= 0:

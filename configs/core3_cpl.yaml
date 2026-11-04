@@ -62,17 +62,34 @@ ssh:
   cheb_degree: 3
   cheb_kappa: 30.0
   gathered: true
+# gpu: performance switches only, none changes the physics. Measured by lane ocean_speed (2026-11-04, the ocean alone
+# as the concurrent coupler drives it: scripts/core3/ocean_speed.py, 1855-07-01 restart, 27 intervals of 2 steps;
+# ms per interval on 1 GH200 unless noted; runs under /work/ba1583/a270088/awicm/core3/ocean_speed/runs). "bitwise" =
+# the final State identical in every field to the run without the switch.
 gpu:
-  column_unroll: true
-  ssh_ell: true
-  cg_batch: 4
-  mevp_unroll: 12
-  column_kernel: true
-  ssh_inc_ell: true
-  ordered_sums: true
+  column_unroll: true     # level sweeps unrolled (the standalone stack's default)
+  ssh_ell: true           # SSH matvecs on the ELL layout
+  cg_batch: 4             # 4 masked CG iterations per while trip; bitwise. 8 / 16: bitwise and slower (81.3 / 84.9
+                          # against 80.6): the masked iterations cost more than the host syncs they save
+  mevp_unroll: 12         # mEVP subcycles unrolled 12 per trip; 24 / 40: bitwise and slower (69.0 against 67.2)
+  column_kernel: true     # Pallas column kernels: off = 149.5 against 67.2 ms; bitwise on CORE3 (GH200)
+  ssh_inc_ell: true       # (zstar only: idle with linfs)
+  ordered_sums: true      # ordered gathers instead of atomic scatter-adds: off = 86.3 against 67.2 ms, and the atomics
+                          # are not reproducible run to run (their order varies); with it two runs are bitwise
   output_async: true
   restart_async: true
-  forcing_ahead: 2
+  forcing_ahead: 2        # (the standalone runner's JRA prefetch: idle in the coupled ocean)
+  cpl_forcing_jit: true   # the interval's forcing build (stress rotation, broadcasts, casts, month rows) and the
+                          # monthly sums in 8 compiled programs instead of ~100 eager ops: 80.6 -> 67.2 ms (-17 %);
+                          # bitwise (products and the sums they feed in separate programs, so no FMA contraction)
+  serial_halo_skip: true  # one device: the halo exchanges return their field (identity maps): 67.6 -> 66.6 ms; bitwise
+  # --- dist_N only (--ocean-devices N; idle on one device). 2 GH200: all_gather 76.9 ms, halo_compact 46.1, padded
+  # 46.0, + mevp_wide 12: compact 44.0 / padded 44.8; all bitwise against each other. lane_order rcm 46.5 (no gain,
+  # round-off: it reorders the sums); ssh.gathered false (the sharded CG) 51.0 (bitwise, slower). dist_2 against one
+  # device is round-off (a different partition sums in another order; after 27 h the States differ like weather).
+  halo_compact: true      # the all_gather ships only the lanes other devices read; bitwise
+  mevp_wide: 12           # mEVP exchanges every 12 subcycles on 12-ring ice lanes; bitwise on 2 GH200 (on CPU with
+                          # metric_factor_zero: round-off, 2e-13 relative, tests/test_mevp_wide_sharded.py)
 output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/cpl
 snapshot_every: 48
 checkpoint_every: 1440
