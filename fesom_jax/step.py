@@ -760,6 +760,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # GMConfig.reproduce_fesom_bug_kgm_surface_level (a FESOM2 bug reproduced, not physics): the stale slot
     if gm_diag is not None and gm_diag.kgm_stale is not None:
         new = dataclasses.replace(new, gm_kgm_stale=gm_diag.kgm_stale)
+    # output diagnostics (State.DIAG_OUT_FIELDS; None unless asked for: nothing traced otherwise)
+    if st.diag_fer_k_top is not None and gm_diag is not None:
+        _top = (mesh.ulevels_nod2D - 1).astype(jnp.int32)
+        new = dataclasses.replace(new, diag_fer_k_top=jnp.take_along_axis(
+            gm_diag.fer_K, _top[:, None], axis=1)[:, 0].astype(st.diag_fer_k_top.dtype))
     # Phase 6: carry the updated prognostic ice state (the ice step ran before the ocean step).
     if ice_out is not None:
         new = dataclasses.replace(
@@ -773,6 +778,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             new = dataclasses.replace(new, **{f: getattr(ice_out, f) for f in ICE_AVG_FIELDS})
         if ice_out.cpl is not None:                      # coupled mode F only (None otherwise: nothing traced)
             new = dataclasses.replace(new, **ice_out.cpl)
+        if st.diag_fw is not None:                       # output diagnostic (State.DIAG_OUT_FIELDS)
+            new = dataclasses.replace(new, diag_fw=ice_out.water_flux.astype(st.diag_fw.dtype))
     return new
 
 

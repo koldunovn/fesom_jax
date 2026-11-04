@@ -243,10 +243,11 @@ def _all_state_fields() -> tuple[str, ...]:
     ``uv_rhsAB`` / ``sigma*`` / ``tke``). Every reader that loops over it to rebuild a State
     (``core2_adj.load_state``, ...) keeps working on restarts with and without the optional
     fields."""
-    from .state import BGC_FIELDS, CPL_FIELDS, FESOM_BUG_FIELDS, ICE_AVG_FIELDS, SE_FIELDS, State
+    from .state import BGC_FIELDS, CPL_FIELDS, DIAG_OUT_FIELDS, FESOM_BUG_FIELDS, ICE_AVG_FIELDS, SE_FIELDS, State
     # FESOM_BUG_FIELDS are never written: they restart at their FESOM2 value at every run start
     return tuple(f.name for f in dataclasses.fields(State)
-                 if f.name not in ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS + FESOM_BUG_FIELDS)
+                 if f.name not in ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS + FESOM_BUG_FIELDS
+                                    + DIAG_OUT_FIELDS)
 
 
 def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_stage,

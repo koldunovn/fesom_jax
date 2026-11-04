@@ -532,6 +532,23 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # GMConfig.reproduce_fesom_bug_kgm_surface_level (a FESOM2 bug reproduced): 500 m2/s at every run start
     from .gm import init_kgm_bug_state
     state_p = init_kgm_bug_state(state_p, cfg.gm)
+    # FESOM_DIAG_GM_MELT=1 with monthly output: the GM coefficient at the top wet level and the surface water flux
+    # (basal melt at the cavity nodes) join the monthly means (State.DIAG_OUT_FIELDS; never restarted)
+    _diag_gm_melt = (monthly_out is not None
+                     and os.environ.get("FESOM_DIAG_GM_MELT", "0").strip() not in ("", "0"))
+    if _diag_gm_melt:
+        _ref = state_p.a_ice                                 # host [P,Lmax] or folded device array (sharding kept)
+        state_p = dataclasses.replace(state_p, diag_fer_k_top=_ref * 0, diag_fw=_ref * 0)
+    # FESOM_IC_PERTURB_T=<eps>: a noise control, T (and T_old) times (1 + eps * N(0,1)) at the start (seed 1234)
+    _eps_t = float(os.environ.get("FESOM_IC_PERTURB_T", "0") or 0)
+    if _eps_t != 0.0:
+        _r = np.random.default_rng(1234).standard_normal(tuple(state_p.T.shape))
+        _f = 1.0 + _eps_t * _r
+        if isinstance(state_p.T, jax.Array):
+            _f = jax.device_put(_f.astype(state_p.T.dtype), state_p.T.sharding)
+        state_p = dataclasses.replace(state_p, T=state_p.T * _f, T_old=state_p.T_old * _f)
+        if jax.process_index() == 0:
+            print(f"[run] FESOM_IC_PERTURB_T={_eps_t:g}: T and T_old perturbed (relative, seed 1234)", flush=True)
     # REcoM (fesom_jax.recom): the BGC tracers from the restart when it carries them, else (passive-tracer mode,
     # plan Task 1) copies of salinity
     if _recom_full:
@@ -821,9 +838,12 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         out_sample_specs.append(_daily_fields)
 
     if monthly_out is not None:
+        _diag_names = ("fer_k_top", "fw") if _diag_gm_melt else ()
+
         def _monthly_fields(s):
+            _d = {"fer_k_top": s.diag_fer_k_top, "fw": s.diag_fw} if _diag_gm_melt else {}
             return {"temp": s.T, "salt": s.S, "u": s.uvnode[:, :, 0], "v": s.uvnode[:, :, 1],
-                    "ssh": s.eta_n, "a_ice": s.a_ice, "m_ice": s.m_ice, **_bgc_out(s)}
+                    "ssh": s.eta_n, "a_ice": s.a_ice, "m_ice": s.m_ice, **_d, **_bgc_out(s)}
 
         def _write_monthly(key, mean, count):
             yr, mo = key
@@ -836,7 +856,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
             yr, _, _, mo = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
             return (int(yr), int(mo))
 
-        streams.append(_MeanStream(("temp", "salt", "u", "v", "ssh", "a_ice", "m_ice") + _bgc_names,
+        streams.append(_MeanStream(("temp", "salt", "u", "v", "ssh", "a_ice", "m_ice") + _diag_names + _bgc_names,
                                    _monthly_key, _write_monthly, monthly_start_step))
         out_sample_specs.append(_monthly_fields)
 
