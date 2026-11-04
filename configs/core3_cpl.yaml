@@ -53,6 +53,11 @@ partition: serial
 forcing:
   kind: core2
   start_year: 1855
+  # chlorophyll of the shortwave penetration: FESOM2's coupled build (__oasis) never calls sbc_ini / sbc_do, so chl
+  # stays at gen_forcing_init.F90's constant 0.1 mg m-3; namelist.forcing's chl_data_source='Sweeney' is not read
+  # there (jaxcpl's FESOM log has no "Updating chlorophyll climatology"). Default without this key: the Sweeney
+  # monthly climatology (fesom_jax.coupled.ocean, init_ocean)
+  chl: 0.1
 ssh:
   cheb_degree: 3
   cheb_kappa: 30.0

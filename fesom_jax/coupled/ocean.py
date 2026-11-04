@@ -310,7 +310,16 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     # --- climatologies + static forcing (runoff, areas), the coastal mask, the rotation tables ---
     fpaths = cfg.forcing_paths()
     sss = sss_runoff.build_reader(mesh, fpaths.get("sss_path"), fpaths.get("runoff_path"))
-    chl_clim = (sss_runoff.build_chl_clim(mesh, fpaths.get("chl_path")))
+    # chlorophyll of the shortwave penetration: the forcing block's `chl` (default "climatology": the Sweeney monthly
+    # field, as the standalone FESOM2 with chl_data_source='Sweeney'); a number = that constant everywhere [mg m-3].
+    # FESOM2's COUPLED build (__oasis) never calls sbc_ini / sbc_do, so it keeps gen_forcing_init.F90's chl = 0.1
+    # whatever namelist.forcing says (jaxcpl's log has no "Updating chlorophyll climatology"): configs/core3_cpl.yaml
+    chl_set = (cfg.forcing or {}).get("chl", "climatology")
+    if chl_set == "climatology":
+        chl_clim = (sss_runoff.build_chl_clim(mesh, fpaths.get("chl_path")))
+    else:
+        chl_clim = np.full((12, int(mesh.nod2D)), float(chl_set))
+        log(f"[ocean] chlorophyll constant {float(chl_set)} mg m-3 (FESOM2's coupled build)")
     sss_clim = np.stack([np.asarray(sss.month(m)) for m in range(1, 13)])
     fs = surface_forcing._static_from_mesh(mesh, sss.runoff_node, np.zeros(int(mesh.nod2D)))
     if getattr(cfg, "cavity", None) is not None:              # lane L-OCN: integrate_nod weights at the top wet level

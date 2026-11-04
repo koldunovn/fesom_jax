@@ -112,7 +112,8 @@ _ARCHIVE_PERIODS = ("year", "month", "day")
 # `co2_file` (full REcoM with constant_CO2 off): the AtmCO2_<year> monthly time series; absent ⇒ the namelist's
 # nm_co2_data_file when that is an absolute path (as dust_file).
 _FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path",
-                 "on_device", "mslp", "dust_file", "co2_file")
+                 "on_device", "mslp", "dust_file", "co2_file",
+                 "chl")    # the coupled ocean's chlorophyll: "climatology" (default) or a constant [mg m-3]
 _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 # The `ssh:` mapping — SSH CG solver options. `cheb_degree` (int ≥1) enables the degree-k
 # Chebyshev polynomial preconditioner (CGPOLY, ssh.enable_cheb_precond) in place of the
