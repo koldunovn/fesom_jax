@@ -148,7 +148,9 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "forcing_ahead": "FESOM_FORCING_AHEAD", "restart_async": "FESOM_RESTART_ASYNC",
             "se_wide": "FESOM_SE_WIDE", "se_unroll": "FESOM_SE_UNROLL", "step_unroll": "FESOM_STEP_UNROLL",
             "ice_static": "FESOM_ICE_STATIC", "chunk_tail": "FESOM_CHUNK_TAIL", "bgc_layout": "FESOM_BGC_LAYOUT",
-            "bgc_halo": "FESOM_BGC_HALO"}
+            "bgc_halo": "FESOM_BGC_HALO", "cpl_forcing_jit": "FESOM_CPL_FORCING_JIT"}
+# `cpl_forcing_jit` (coupled ocean, mode F): the interval's forcing build and the monthly sums as compiled programs
+# instead of eager device ops (fesom_jax.coupled.flux.flux_step_forcing_jit; bitwise the eager build).
 # `bgc_layout`: how the REcoM tracer stage runs over the tracer axis (a string): "major" (default: one batched pass
 # over the stack held tracer-major in memory, one halo exchange per FCT stage), "vmap" (the batched pass over the
 # trailing tracer axis, XLA's layout) or "loop" (one tracer at a time, the reference; fesom_jax.recom.transport).

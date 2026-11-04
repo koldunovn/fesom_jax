@@ -194,6 +194,142 @@ def flux_step_forcing(state, forcing: dict, static, dates):
     return state, (PR.cast_tree(seq) if static.precision == "single" else seq)
 
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# the same forcing build as ONE compiled program (gpu.cpl_forcing_jit, FESOM_CPL_FORCING_JIT)
+# ---------------------------------------------------------------------------------------------------------------
+JIT_ENV = "FESOM_CPL_FORCING_JIT"
+
+
+def forcing_jit_enabled() -> bool:
+    """``gpu.cpl_forcing_jit`` (``FESOM_CPL_FORCING_JIT=1``): :func:`flux_step_forcing` as 8 compiled programs instead
+    of ~100 eager device ops a coupling interval (each op a Python dispatch: ~20 ms of GPU idle an interval on GH200
+    under nsys, more while the atmosphere's thread holds the GIL). Values bitwise the eager build (see
+    :func:`_stages`)."""
+    import os
+    return os.environ.get(JIT_ENV, "0").strip() not in ("", "0")
+
+
+def _stages():
+    """The compiled stages of :func:`_flux_seq_staged`, built once. Each stage holds only multiplications (and
+    negations) or only additions (and subtractions, min, casts, gathers): XLA contracts ``a*b + c`` into one FMA
+    when a product and its sum share a fusion (one rounding instead of two; an optimization_barrier does not stop
+    it, the barrier is gone before fusion), so a product and the sum it feeds are never in the same program."""
+    g = globals()
+    if "_STAGES" in g:
+        return g["_STAGES"]
+
+    def m1(pairs, trig):              # vector_g2r's first products (fesom_jax.jra55._vector_g2r)
+        sgl, cgl, sgo, cgo = trig[:4]
+        return [((-v) * sgl * cgo, u * sgo, (-v) * sgl * sgo, u * cgo, v * cgl) for u, v in pairs]
+
+    def a1(prods):
+        return [(p[0] - p[1], p[2] + p[3], p[4]) for p in prods]
+
+    def m2(vecs, M):
+        return [tuple(M[3 * i + j] * vec[j] for i in range(3) for j in range(3)) for vec in vecs]
+
+    def a2(prods):
+        return [tuple(p[3 * i] + p[3 * i + 1] + p[3 * i + 2] for i in range(3)) for p in prods]
+
+    def m3(vecs, trig):
+        srl, crl, sro, cro = trig[4:]
+        return [((-srl) * cro * x, srl * sro * y, crl * z, (-sro) * x, cro * y) for x, y, z in vecs]
+
+    def a3(prods):
+        return [(p[3] + p[4], p[0] - p[1] + p[2]) for p in prods]            # (u_rot, v_rot)
+
+    def enth_m(calv, lf, mega):       # (calv * L) * 1e6 as written (the factors as arguments: nothing folded)
+        return (calv * lf) * mega
+
+    g["_STAGES"] = tuple(jax.jit(f) for f in (m1, a1, m2, a2, m3, a3, enth_m))
+    return g["_STAGES"]
+
+
+def _flux_seq_staged(fields, months, trig, M, sss_clim, chl_clim, *, T, n, runoff, single, rotate, has_tsk,
+                     assemble):
+    """:func:`flux_step_forcing`'s operations in a few compiled programs: the rotation in the product / sum stages
+    of :func:`_stages`, the rest (broadcasts, the runoff sum, the enthalpy cap, the month rows, the casts: no
+    product) in ``assemble``."""
+    m1, a1, m2, a2, m3, a3, enth_m = _stages()
+
+    def r(a):
+        return jnp.broadcast_to(a, (T, n)) if a.shape == (n,) else a
+
+    rot = None
+    if rotate:
+        pairs = [(r(fields["taux_oce"]), r(fields["tauy_oce"])), (r(fields["taux_ico"]), r(fields["tauy_ico"]))]
+        rot = a3(m3(a2(m2(a1(m1(pairs, trig)), M)), trig))
+    enth = None
+    if runoff == "coupled":
+        calv = r(fields["calv_oce"])
+        calv = calv.astype(jnp.float32) if single else calv
+        enth = enth_m(calv, jnp.asarray(LATENT_FUSION, calv.dtype), jnp.asarray(1000000.0, calv.dtype))
+    return assemble(fields, rot, enth, months, sss_clim, chl_clim)
+
+
+def _assemble(fields, rot, enth, months, sss_clim, chl_clim, *, T, n, runoff, single, has_tsk):
+    from .. import precision as PR
+
+    def r(k):
+        a = fields[k]
+        return jnp.broadcast_to(a, (T, n)) if a.shape == (n,) else a
+
+    if rot is None:
+        tox, toy, tix, tiy = r("taux_oce"), r("tauy_oce"), r("taux_ico"), r("tauy_ico")
+    else:
+        (tox, toy), (tix, tiy) = rot
+    tsk = r("tsk_ico") if has_tsk else jnp.zeros((T, n), tox.dtype)
+    extra = {}
+    if runoff == "coupled":
+        hydr, calv = r("hydr_oce"), r("calv_oce")
+        if single:
+            hydr, calv = hydr.astype(jnp.float32), calv.astype(jnp.float32)
+        extra["runoff"] = hydr + calv
+        extra["enthalpy"] = -jnp.minimum(enth, jnp.asarray(ENTHALPY_CAP, calv.dtype))
+    seq = CplForcing(taux_oce=tox, tauy_oce=toy, taux_ico=tix, tauy_ico=tiy,
+                     prec_rain=r("prec_oce"), prec_snow=r("snow_oce"), evap=r("evap_oce"), subl=r("subl_oce"),
+                     heat_oce=r("heat_oce"), heat_ico=r("heat_ico"), heat_swo=r("heat_swo"), tsk_ico=tsk,
+                     Ssurf_month=sss_clim[months], chl=chl_clim[months], **extra)
+    return PR.cast_tree(seq) if single else seq
+
+
+def flux_step_forcing_jit(state, forcing: dict, static, dates):
+    """:func:`flux_step_forcing` in a few compiled programs (:func:`_flux_seq_staged`, one set per interval length
+    and field set); the climatologies stay on the device. Returns ``(state, seq)``, bitwise the eager build
+    (checked on the GPU by ``scripts/core3/ocean_speed.py run --check-forcing``)."""
+    import functools
+    from .. import jra55
+    n, T = static.nod2D, len(dates)
+    need = ("taux_oce", "tauy_oce", "taux_ico", "tauy_ico", "prec_oce", "snow_oce", "evap_oce", "subl_oce",
+            "heat_oce", "heat_ico", "heat_swo")
+    missing = [k for k in need if k not in forcing]
+    if missing:
+        raise KeyError(f"mode F forcing lacks {missing}")
+    runoff = getattr(static.flux, "runoff", "climatology")
+    names = need + (("tsk_ico",) if "tsk_ico" in forcing else ()) + \
+        (("hydr_oce", "calv_oce") if runoff == "coupled" else ())
+    miss = [k for k in names if k not in forcing]
+    if miss:
+        raise KeyError(f"runoff 'coupled' needs {miss} (the runoff mapper's fields)")
+    fields = {}
+    for k in names:
+        a = forcing[k]
+        a = a if isinstance(a, jax.Array) else jnp.asarray(np.asarray(a))
+        if a.shape not in ((n,), (T, n)):
+            raise ValueError(f"forcing[{k!r}] has shape {a.shape}; need ({n},) or ({T}, {n})")
+        fields[k] = a
+    cache = static._fjit
+    if "clim" not in cache:
+        cache["clim"] = (jnp.asarray(static.sss_clim), jnp.asarray(static.chl_clim))
+    key = (T, tuple((k, fields[k].shape, str(fields[k].dtype)) for k in names), runoff)
+    kw = dict(T=T, n=n, runoff=runoff, single=static.precision == "single", has_tsk="tsk_ico" in forcing)
+    if key not in cache:
+        cache[key] = functools.partial(_flux_seq_staged, rotate=bool(jra55.FORCE_ROTATION),
+                                       assemble=jax.jit(functools.partial(_assemble, **kw)), **kw)
+    months = jnp.asarray(np.array([d[3] for d in dates]) - 1, jnp.int32)
+    return state, cache[key](fields, months, static.trig, static.M, *cache["clim"])
+
 #: namcouple (AWI-ESM3 v3.5.1): the atmosphere's OASIS name -> the FESOM2 name it arrives under (cpl_driver cpl_recv)
 OASIS_TO_FESOM = {"A_Qns_oce": "heat_oce", "A_Qs_all": "heat_swo", "A_Precip_liquid": "prec_oce",
                   "A_Precip_solid": "snow_oce", "A_Evap": "evap_oce", "A_Subl": "subl_oce", "A_Q_ice": "heat_ico",

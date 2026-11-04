@@ -123,6 +123,8 @@ class OceanStatic:
     mevp_wide: Any = None     # gpu.mevp_wide's MevpWideHost (dist_N only), None = the per-subcycle exchange
     _lanes: Any = None        # the jitted global -> lanes gather of the forcing (dist_N)
     _views: dict = dataclasses.field(default_factory=dict)   # the jitted lanes -> global gathers (dist_N)
+    _fjit: dict = dataclasses.field(default_factory=dict)    # gpu.cpl_forcing_jit: the compiled forcing builds
+    _mon_add: Any = None                                     # ... and the monthly sums' compiled addition
 
     @property
     def nod2D(self) -> int:
@@ -163,8 +165,14 @@ class OceanStatic:
                 seq = surface_forcing.StepForcing(u_air=z, v_air=z, shum=z, shortwave=z, longwave=z, Tair=z,
                                                   prec_rain=z, prec_snow=z, Ssurf_month=z, chl=z)
                 seq_p = shard_mesh.partition_step_forcing(seq, self.part)
+            # gpu.halo_transport (dist_N only; serial has no halo): the standalone runner's transports, as
+            # scripts/run_from_config.py maps them; "all_gather" (absent) passes nothing (byte-unchanged)
+            tr = self.cfg.halo_transport() if self.npes > 1 else "all_gather"
+            hx = {} if tr == "all_gather" else {"use_padded": tr == "padded", "use_ragged": tr == "ragged",
+                                                 "use_coloured": tr in ("coloured", "grouped")}
             jfn, args, _ = run_steps_sharded_forced(
                 self.sm, state, self.sop, self.stress_p, seq_p, self.fs_p, int(nsteps), dt=self.dt, npes=self.npes,
+                **hx,
                 bootstrap_ab2=bool(bootstrap), state_is_folded=True, return_folded=True,
                 boundary_node_p=self.bn_p, reuse_executable=True, return_executable=True,
                 sample_fn=self.sample_fn, ssh_gather=self.gather, precision=self.precision,
@@ -249,7 +257,9 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         if cfg.lane_order():          # the lanes inside the shards in a cache-friendly order (global ids unchanged)
             from ..lane_order import reorder_lanes
             part = reorder_lanes(part, mesh, cfg.lane_order())
-        log(f"[ocean] partition dist_{npes} ({ddir}), lane_order {cfg.lane_order()}")
+        if cfg.halo_transport() == "grouped":   # the coloured maps, their rounds in one NCCL group (run_from_config)
+            os.environ["FESOM_HALO_GROUPED"] = "1"
+        log(f"[ocean] partition dist_{npes} ({ddir}), lane_order {cfg.lane_order()}, halo {cfg.halo_transport()}")
     sm = shard_mesh.build_sharded_mesh(mesh, part)
     if npes == 1 and (sm.Lmax["nod"] != mesh.nod2D or not np.array_equal(np.asarray(part.myList_nod2D[0]),
                                                                          np.arange(mesh.nod2D))):
@@ -455,7 +465,8 @@ def ocean_interval(state, static: OceanStatic, forcing: dict, nsteps: int | None
         seq = bulk_step_forcing(forcing, static, dates)
     else:
         from . import flux
-        state, seq = flux.flux_step_forcing(state, forcing, static, dates)
+        build = flux.flux_step_forcing_jit if flux.forcing_jit_enabled() else flux.flux_step_forcing
+        state, seq = build(state, forcing, static, dates)
     if static.npes > 1:
         seq = to_lanes(seq, static)
     jfn, a = static.executable(nsteps, static.bootstrap, state)
@@ -468,11 +479,21 @@ def ocean_interval(state, static: OceanStatic, forcing: dict, nsteps: int | None
             flush_monthly(static)
         if static._mon_sum is None:
             static._mon_key, static._mon_sum, static._mon_count = key, sums, 0
+        elif flux_jit_on():              # one program for the ~10 sums (additions only: bitwise the eager adds)
+            if static._mon_add is None:
+                static._mon_add = jax.jit(lambda a, b: jax.tree.map(jnp.add, a, b))
+            static._mon_sum = static._mon_add(static._mon_sum, sums)
         else:
             static._mon_sum = jax.tree.map(jnp.add, static._mon_sum, sums)
         static._mon_count += nsteps
     static.step += nsteps
     return state
+
+
+def flux_jit_on() -> bool:
+    """``gpu.cpl_forcing_jit`` (:func:`fesom_jax.coupled.flux.forcing_jit_enabled`)."""
+    from .flux import forcing_jit_enabled
+    return forcing_jit_enabled()
 
 
 def flush_monthly(static: OceanStatic) -> str | None:
