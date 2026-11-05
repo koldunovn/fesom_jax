@@ -152,7 +152,7 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "serial_halo_skip": "FESOM_SERIAL_HALO_SKIP", "ice_mm_sum3": "FESOM_ICE_MM_SUM3",
             "ice_fct_extreme": "FESOM_ICE_FCT_EXTREME", "ice_scatter_fuse": "FESOM_ICE_SCATTER_FUSE",
             "cg_prefix": "FESOM_CG_PREFIX", "potit_unroll": "FESOM_POTIT_UNROLL",
-            "column_direct": "FESOM_COLUMN_DIRECT"}
+            "column_direct": "FESOM_COLUMN_DIRECT", "ssh_rhs_split": "FESOM_SSH_RHS_SPLIT"}
 # Lane ocean_speed2 (performance only, off when absent): `ice_mm_sum3` (an integer 1-3: the association) the ice FCT
 # mass-matrix element sum as two
 # adds (ice_adv._mm_times; XLA's Triton row-reduction fusion of the 3-sum was 257 us a call); `ice_fct_extreme` the

@@ -773,6 +773,11 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
     el1s = jnp.where(has1, el1, 0)
     el2s = jnp.where(has2, el2, 0)
     cross = mesh.edge_cross_dxdy
+    if os.environ.get("FESOM_SSH_RHS_SPLIT", "0").strip() not in ("", "0"):
+        # gpu.ssh_rhs_split: the edge terms read uv / uv_rhs / helem through an optimization barrier, so XLA does
+        # not sibling-fuse this level sum with the tracer advection's edge fluxes into one multi-output reduction
+        # (0.98 + 0.79 ms an interval on a GH200 for what is bandwidth-bound work); the same operations
+        uv, uv_rhs, helem = jax.lax.optimization_barrier((uv, uv_rhs, helem))
     U, V = uv[:, :, 0], uv[:, :, 1]
     Ur, Vr = uv_rhs[:, :, 0], uv_rhs[:, :, 1]
     lm = mesh.elem_layer_mask

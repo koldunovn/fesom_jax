@@ -1,4 +1,4 @@
-"""Lane ocean_speed2's performance switches (``gpu.ice_mm_sum3``, ``ice_fct_extreme``, ``ice_scatter_fuse``,
+"""Lane ocean_speed2's performance switches (``gpu.ice_mm_sum3``, ``ice_fct_extreme``, ``ice_scatter_fuse``, ``ssh_rhs_split``,
 ``cg_prefix``, ``potit_unroll``, ``column_direct``) against the code paths they replace, on CPU. Each changes how
 the GPU program is built (fusions, loop structure, memory access), not the operations, so on CPU the values are the
 same bits except the ice FCT switches, around which XLA's CPU program fuses and contracts otherwise (round-off). The
@@ -124,3 +124,14 @@ def test_ice_fct_switches(mesh, monkeypatch):
                 {"FESOM_ICE_MM_SUM3": "1", "FESOM_ICE_FCT_EXTREME": "1"}):
         got = _with(monkeypatch, env, run)
         jax.tree.map(lambda g, r: np.testing.assert_allclose(g, r, rtol=1e-12, atol=1e-14), got, ref)
+
+
+@avail
+def test_ssh_rhs_split(mesh, monkeypatch):
+    from fesom_jax import ssh
+    e, nl = mesh.elem2D, mesh.nl
+    uv = jnp.asarray(RNG.standard_normal((e, nl, 2)))
+    uvr = jnp.asarray(1e-3 * RNG.standard_normal((e, nl, 2)))
+    he = jnp.asarray(10.0 + RNG.random((e, nl)))
+    run = lambda: jax.jit(lambda *a: ssh.compute_ssh_rhs(mesh, *a))(uv, uvr, he)  # noqa: E731
+    np.testing.assert_array_equal(_with(monkeypatch, {"FESOM_SSH_RHS_SPLIT": "1"}, run), _with(monkeypatch, {}, run))
