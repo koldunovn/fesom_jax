@@ -38,11 +38,14 @@ def _mm_times(mesh: Mesh, X):
     ``Σ_{elem∋row} area/12·(X[row] + ΣX_elem)``. Cavity elements contribute 0."""
     en = mesh.elem_nodes
     Xv = X[en]                                              # [elem,3]
-    if ops.env_switch("FESOM_ICE_MM_SUM3"):
-        # gpu.ice_mm_sum3: the element sum as two explicit adds, (X0 + X1) + X2. XLA otherwise matches
-        # `Xv + Xv.sum(1)` as a Triton "softmax" fusion with one warp per element row: 257 us a call on a GH200
-        # for 426k x 3 floats (9 calls a step, 7 % of the coupled CORE3 ocean's kernel time)
-        s3 = (Xv[:, 0] + Xv[:, 1]) + Xv[:, 2]
+    mm3 = ops.env_int("FESOM_ICE_MM_SUM3")
+    if mm3:
+        # gpu.ice_mm_sum3: the element sum as two explicit adds. XLA otherwise matches `Xv + Xv.sum(1)` as a
+        # Triton "softmax" fusion with one warp per element row: 257 us a call on a GH200 for 426k x 3 floats
+        # (9 calls a step, 7 % of the coupled CORE3 ocean's kernel time). 1: (X0 + X1) + X2, 2: (X0 + X2) + X1
+        # (the Triton warp reduction's butterfly order over the row padded to 4), 3: X0 + (X1 + X2)
+        x0, x1, x2 = Xv[:, 0], Xv[:, 1], Xv[:, 2]
+        s3 = {1: lambda: (x0 + x1) + x2, 2: lambda: (x0 + x2) + x1, 3: lambda: x0 + (x1 + x2)}[mm3]()
         contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + s3[:, None])
     else:
         contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + Xv.sum(axis=1, keepdims=True))
