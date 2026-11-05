@@ -20,6 +20,7 @@ step-1 dump gate). Coriolis/SSH/advection are exercised by the synthetic + AD te
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from . import precision as PR
@@ -311,6 +312,10 @@ def visc_filt_bcksct(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_c
     a1, a2 = PR.full(a1), PR.full(a2)
     upd_u = jnp.where(emask, u1 * vi, 0.0)
     upd_v = jnp.where(emask, v1 * vi, 0.0)
+    if ops.env_switch("FESOM_VISC_UPD_BARRIER"):
+        # gpu.visc_upd_barrier: the edge updates computed once per edge (a barrier), not again for every element
+        # slot of the ordered edge->element sums below (1.6 ms a step on a GH200 at 490 GB/s); the same operations
+        upd_u, upd_v = jax.lax.optimization_barrier((upd_u, upd_v))
     du_u = jnp.stack([-upd_u / a1[:, None], upd_u / a2[:, None]], axis=1)          # (edge,2,nl)
     du_v = jnp.stack([-upd_v / a1[:, None], upd_v / a2[:, None]], axis=1)
     Ub = PR.wp(ops.scatter_add(du_u, mesh.edge_tri, mesh.elem2D, inv=mesh.inv_edge_tri))     # (elem2D,nl) WP

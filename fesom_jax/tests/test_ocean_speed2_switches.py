@@ -135,3 +135,25 @@ def test_ssh_rhs_split(mesh, monkeypatch):
     he = jnp.asarray(10.0 + RNG.random((e, nl)))
     run = lambda: jax.jit(lambda *a: ssh.compute_ssh_rhs(mesh, *a))(uv, uvr, he)  # noqa: E731
     np.testing.assert_array_equal(_with(monkeypatch, {"FESOM_SSH_RHS_SPLIT": "1"}, run), _with(monkeypatch, {}, run))
+
+
+@avail
+def test_barrier_switches(mesh, monkeypatch):
+    """visc_upd_barrier, fct_aux_barrier, fct_flux_barrier: an optimization barrier only."""
+    from fesom_jax import momentum, tracer_adv
+    monkeypatch.setenv("FESOM_ORDERED_SUMS", "1")
+    e, n, ed, nl = mesh.elem2D, mesh.nod2D, mesh.edge2D, mesh.nl
+    uv = jnp.asarray(0.3 * RNG.standard_normal((e, nl, 2)))
+    uvr = jnp.asarray(1e-4 * RNG.standard_normal((e, nl, 2)))
+    run = lambda: jax.jit(lambda a, b: momentum.visc_filt_bcksct(mesh, a, b))(uv, uvr)  # noqa: E731
+    np.testing.assert_array_equal(_with(monkeypatch, {"FESOM_VISC_UPD_BARRIER": "1"}, run), _with(monkeypatch, {}, run))
+    T = jnp.asarray(10.0 + RNG.standard_normal((n, nl)))
+    LO = T + jnp.asarray(0.01 * RNG.standard_normal((n, nl)))
+    adf_h = jnp.asarray(1e3 * RNG.standard_normal((ed, nl)))
+    adf_v = jnp.asarray(1e2 * RNG.standard_normal((n, nl)))
+    hn = jnp.asarray(10.0 + RNG.random((n, nl)))
+    f = lambda: jax.jit(lambda *a: tracer_adv.zalesak_limit(mesh, *a))(T, LO, adf_h, adf_v, hn)  # noqa: E731
+    ref = _with(monkeypatch, {}, f)
+    jax.tree.map(np.testing.assert_array_equal, _with(monkeypatch, {"FESOM_FCT_AUX_BARRIER": "1"}, f), ref)
+    g = lambda: jax.jit(lambda *a: tracer_adv.flux2dtracer_fct(mesh, *a))(T, LO, adf_h, adf_v, hn, hn)  # noqa: E731
+    np.testing.assert_array_equal(_with(monkeypatch, {"FESOM_FCT_FLUX_BARRIER": "1"}, g), _with(monkeypatch, {}, g))

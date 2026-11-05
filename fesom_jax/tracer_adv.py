@@ -454,6 +454,10 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     em = mesh.elem_layer_mask
     aux_max = jnp.where(em, jnp.max(ttf_max[mesh.elem_nodes], axis=1), -_FCT_BIG)
     aux_min = jnp.where(em, jnp.min(ttf_min[mesh.elem_nodes], axis=1), _FCT_BIG)
+    if ops.env_switch("FESOM_FCT_AUX_BARRIER"):
+        # gpu.fct_aux_barrier: the element bounds computed once (a barrier), not again for each node slot of the
+        # ordered max/min below; max/min are exact
+        aux_max, aux_min = jax.lax.optimization_barrier((aux_max, aux_min))
 
     # a3: per-node cluster max/min over surrounding cells (element→node)
     seg = mesh.elem_nodes.reshape(-1)
@@ -539,6 +543,10 @@ def flux2dtracer_fct(mesh: Mesh, T, LO, adf_h, adf_v, hnode, hnode_new, *,
     transition ``−T·hnode + LO·hnode_new``, and the antidiffusive divergences are formed from float64 fluxes
     (``oce_adv_tra_driver.F90:514, 549``); the result is the float64 ``del_ttf``."""
     nlm = mesh.node_layer_mask
+    if ops.env_switch("FESOM_FCT_FLUX_BARRIER"):
+        # gpu.fct_flux_barrier: the limited edge fluxes computed once (a barrier), not again (with the limiter's
+        # node-factor gathers) for each node slot of the ordered edge->node sum below; the same operations
+        adf_h = jax.lax.optimization_barrier(adf_h)
     if lo_tend is not None:
         a = mesh.areasvol
         safe_a = PR.full(jnp.where(a > 0.0, a, 1.0))
