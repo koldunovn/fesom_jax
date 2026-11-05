@@ -157,3 +157,14 @@ def test_barrier_switches(mesh, monkeypatch):
     jax.tree.map(np.testing.assert_array_equal, _with(monkeypatch, {"FESOM_FCT_AUX_BARRIER": "1"}, f), ref)
     g = lambda: jax.jit(lambda *a: tracer_adv.flux2dtracer_fct(mesh, *a))(T, LO, adf_h, adf_v, hn, hn)  # noqa: E731
     np.testing.assert_array_equal(_with(monkeypatch, {"FESOM_FCT_FLUX_BARRIER": "1"}, g), _with(monkeypatch, {}, g))
+
+
+@avail
+def test_o2a_surface_vel_nodes():
+    from fesom_jax import mesh as mesh_mod
+    from fesom_jax.coupled.ocean import _surface_vel_nodes
+    from fesom_jax.pp import compute_vel_nodes
+    m = mesh_mod.load_mesh(CORE2_MESH)                       # no inverse maps: built on the host
+    uv = jnp.asarray(RNG.standard_normal((m.elem2D, m.nl, 2)))
+    ref = np.asarray(compute_vel_nodes(m, uv)[:, 0, :])
+    np.testing.assert_allclose(np.asarray(_surface_vel_nodes(m, uv)), ref, rtol=1e-13, atol=1e-15)

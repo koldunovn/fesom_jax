@@ -615,6 +615,28 @@ def ocean_to_atm(state, static: OceanStatic) -> dict:
     return static._o2a(state)
 
 
+def _surface_vel_nodes(mesh, uv):
+    """``compute_vel_nodes(mesh, uv)[:, 0, :]`` for the surface level only (gpu.o2a_surface): the same per-element
+    terms and division, the node sums as ordered sums over the elements' inverse map (built here on the host when
+    the mesh carries none) instead of the 48-level float64 atomic scatter-add (1.7 ms an interval on a GH200, the
+    largest kernels of ocean_to_atm). Deterministic; against the atomic sums it differs at most in the last float64
+    bit of a sum before the cast to the working precision."""
+    from .. import ops
+    e = mesh.elem2D
+    m = mesh.elem_layer_mask[:, 0]
+    area = mesh.elem_area
+    contrib = jnp.where(m[:, None], area[:, None] * uv[:, 0, :], 0.0)                 # (elem2D,2)
+    area_lev = jnp.where(m, area, 0.0)
+    inv = mesh.inv_elem_nodes
+    if inv is None:
+        inv = jnp.asarray(ops.inverse_map(np.asarray(mesh.elem_nodes), mesh.nod2D))
+    vals = jnp.broadcast_to(contrib[:, None], (e, 3, 2)).reshape(3 * e, 2)
+    num = ops.ordered_sum(vals, inv)
+    den = ops.ordered_sum(jnp.broadcast_to(area_lev[:, None], (e, 3)).reshape(-1), inv)
+    safe = jnp.where(den > 0.0, den, 1.0)[:, None]
+    return jnp.where(mesh.node_layer_mask[:, 0][:, None], num / safe, 0.0)
+
+
 def _ocean_to_atm(state, static: OceanStatic) -> dict:
     """The fields FESOM2 sends to OpenIFS (gen_forcing_couple.F90 update_atm_forcing, ``__oifs``), each
     ``(nod2D,)`` in global node order, INSTANT at the call:
@@ -638,7 +660,10 @@ def _ocean_to_atm(state, static: OceanStatic) -> dict:
         ice_alb = ice_albedo_cpl(state.m_ice, state.m_snow, ice_temp, static.cfg.ice)
     # FESOM2 sends UVnode as compute_vel_nodes made it at the top of the step from the carried velocity (step.py
     # drift fix 1); state.uvnode is one step older, so recompute it from state.uv
-    uvn = compute_vel_nodes(static.mesh, state.uv)[:, 0, :]
+    if os.environ.get("FESOM_O2A_SURFACE", "0").strip() not in ("", "0"):
+        uvn = _surface_vel_nodes(static.mesh, state.uv)      # gpu.o2a_surface
+    else:
+        uvn = compute_vel_nodes(static.mesh, state.uv)[:, 0, :]
     u_g, v_g = r2g(uvn[:, 0].astype(jnp.float64), uvn[:, 1].astype(jnp.float64), static.trig, static.M)
     wp = state.T.dtype
     return {"sst_feom": state.T[:, 0] + jnp.asarray(TMELT, wp),

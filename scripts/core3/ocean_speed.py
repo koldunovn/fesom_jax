@@ -56,8 +56,8 @@ def _state_arrays(state, st):
     return out
 
 
-def _save_state(state, st, path):
-    out = _state_arrays(state, st)
+def _save_state(state, st, path, extra=None):
+    out = {**_state_arrays(state, st), **(extra or {})}
     np.savez(path, **out)                                  # native dtypes (float32 State in single precision)
     return sorted(out)
 
@@ -139,13 +139,14 @@ def cmd_run(a):
                                                                                                 * 24 / 1e3, 3),
            "finite": fin, "peak_gb": mem, "calendar_end": st.calendar(),
            "xla_flags": os.environ.get("XLA_FLAGS", ""), "ms_all": [round(float(x), 2) for x in ms]}
+    o2a_last = {"o2a_" + k: np.asarray(v) for k, v in o2a.items()}    # the last interval's fields for the atmosphere
     if a.compare_to:               # compare the final State with a reference npz here instead of saving it
-        rows = _compare(_state_arrays(state, st), np.load(a.compare_to))
+        rows = _compare({**_state_arrays(state, st), **o2a_last}, np.load(a.compare_to))
         rec["compare_to"] = a.compare_to
         rec["bitwise"] = all(r.get("bitwise", False) for r in rows.values())
         rec["differ"] = {k: r for k, r in rows.items() if not r.get("bitwise", False)}
     if not a.no_save:
-        rec["saved"] = _save_state(state, st, a.out + ".npz")
+        rec["saved"] = _save_state(state, st, a.out + ".npz", extra=o2a_last)
     with open(a.out + ".json", "w") as fh:
         json.dump(rec, fh, indent=1)
     print("[speed] " + json.dumps({k: v for k, v in rec.items() if k not in ("ms_all", "saved", "differ")}),
