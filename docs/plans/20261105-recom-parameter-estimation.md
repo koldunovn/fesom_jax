@@ -1,0 +1,229 @@
+# REcoM spectral parameter estimation in fesom-jax: weak-constraint variational state and parameter estimation
+
+Written 2026-11-05 on Albedo. **Draft for discussion with the user: nothing here has been started or measured.**
+
+## Goal
+
+Estimate REcoM spectral parameters, and the state and model error alongside them, from observations, using the adjoint
+that JAX gives. Two outputs matter equally:
+
+1. **A better, objectively chosen parameter set** with uncertainties. The current reference `kdind15wco2sl1` came from
+   sequential single-change adoption by expert judgement, with no objective cost.
+2. **A diagnosis of model structure**: where and when the data ask for what fixed parameters cannot give.
+
+## Why weak constraint (the lessons this builds on)
+
+From the abstracts only; the publisher and EPIC pages refused automated access. The user should correct this section.
+
+- **Losa, Kivman, Schröter & Wenzel 2003** (J. Mar. Syst. 43, 31-49, doi:10.1016/j.jmarsys.2003.06.001): a Sequential
+  Importance Resampling filter combines state and parameter estimation on BATS data with a nine-compartment model. Some
+  parameters varied seasonally; the filtered solution beat fixed parameters; the seasonal phytoplankton mortality may mean
+  the mortality parameterization needs improving or that Chl:C varies in time.
+- **Losa, Kivman & Ryabchenko 2004** (J. Mar. Syst. 45, 1-20, doi:10.1016/j.jmarsys.2003.08.005): a weak-constraint method
+  on a 0-D four-component model; a posteriori evaluation of the relative credibility of data and model; a way to estimate
+  the accuracy of parameterizations. At Station "S", phytoplankton mortality, zooplankton losses and detritus breakdown
+  came out as the main sources of model error.
+
+What the plan takes from them:
+
+- **Time-varying parameters are a diagnostic, not a nuisance.** A parameter that must vary seasonally points to a process
+  that is wrong. That sets the form of the model error here (below).
+- **Model error belongs to named processes**, not to every grid point.
+- **The a posteriori credibility check is a deliverable**, not an afterthought.
+
+The structural errors in the user's notes make the case for this model. Hand tuning did not remove them:
+
+- Southern Ocean Jun-Oct Chl 4-6x high, surviving all mortality forms tried.
+- HNLC lost: Station P DIN 0.04 against 9.9, surviving Fe removal.
+- Preformed N 45-60S 7.3/8.8 against WOA 13.6/16.8, with a mode layer too thin (physics, not biology).
+- Gyre NPP 2.8x CbPM (kdind15w).
+
+A strong-constraint fit would bend parameters to absorb these, and the parameters would then be wrong for the right
+biology. This is the main scientific argument for weak constraint.
+
+## What decides the design
+
+**1. Physics never reads a BGC tracer (`step.py`, `recom/wiring.py`), so the BGC adjoint is one-way.** With respect to
+REcoM parameters or BGC state the physics is a constant. `ADJOINT_HORIZON.md`'s day-scale limit came from the turbulence
+closure's response to the ocean state, and chaos needs a flow that responds to the control: neither applies here. What
+remains is the biology's own growth, the FCT limiter (subgradient, `LIMITER_GRADIENTS.md`) and the floors. **So the
+horizon may be months rather than days. That is an expectation from the code, not a measurement; only 1-day gradients
+exist (G6, `test_recom_grad*.py`). Phase 1 measures it, and everything after depends on it.**
+
+**2. The forcing is repeat-year `clim61`.** The model has no real 1998 weather, so compare monthly climatologies, with
+interannual variability inside R. `obs_table.txt` section A already gives that yardstick (Rrs log10 sd 0.012-0.13).
+Dated matchups would be wrong for this model.
+
+**3. Rrs alone cannot constrain the biology.** `obs_table.txt`: about two separable directions (backscatter settings
+share a cosine of 0.84-0.96, cdomcoeff against QYmax -0.90), and quantum yield of coccolithophores, photoinhibition,
+deg_Chl, k_din and dark respiration are undetectable (< 0.5 interannual sd). Rrs must be combined with nutrients and
+carbon data.
+
+**4. The Rrs misfit is operator bias as much as biology.** Clear-water misfit of r2bdoc is 0.05-0.18 in log10 against an
+interannual sd of 0.012-0.05, and NEXT_STEPS 21e/21k note that Rrs there asks for more carbon while carbon is already
+too high. Fitting raw Rrs would drive carbon the wrong way, so operator bias must be estimated, not ignored.
+
+**5. Equifinality is known.** NMinSlope ~ NCmin ~ photoinhibition; agg_PP ~ cdomcoeff; pMax cancels between N_assim and
+Cphot; grazing compensates growth; PFTs replace each other. Priors and Hessian analysis must expect this.
+
+**6. Some parameters are dead or need care.** Under the spectral 4-PFT build `P_cm`, `P_cm_d`, `P_cm_c` and the light
+slopes `alfa*` have exactly zero derivative (`test_recom_grad_fork.py`). `graz_max` is numerically zero over 1 day.
+`max(tiny, ...)` floors stop gradients through a collapsed group, so a dead population cannot be revived by the adjoint.
+
+**7. Cost is the practical limit.** One model year is 11680 steps, about 7.4 h on one PCIe A100 (jobs 48698174-75). If a
+gradient costs about 5 forward runs (an assumption, from the reverse/forward ratio in `ADJOINT_API.md`), 30 iterations of
+a one-year window take about 46 days on one Albedo GPU. The port's notes give 66 ms/step on 4 GH200 (job 28458068), about
+13 min a year. **Global one-year windows need faster hardware or shorter windows** (decision D3).
+
+## The formulation
+
+Minimise over `z = (theta, b, x0, delta)`:
+
+```
+J = 1/2 |theta - theta_b|^2_{B_theta}            parameters, log space (positive by construction)
+  + 1/2 |b - b_b|^2_{B_b}                        observation-operator bias (Q, background backscatter)
+  + 1/2 |x0 - x_b|^2_{B_x}                       initial state, low-dimensional basis
+  + 1/2 sum_k delta_k^T Q^-1 delta_k             model error
+  + 1/2 sum_i |y_i - H_i(x; b)|^2_{R_i}          observations, log space for Rrs and Chl
+
+with  x_{k+1} = M(x_k; theta_k),   log theta_k(r) = log theta + G delta_k(r)
+```
+
+**Model error as process-level parameter anomalies (recommended).** `delta` is a smooth anomaly in a few log-parameters
+over time (monthly, AR(1) through Q) and region (about 10 biomes). `delta = 0` recovers strong constraint exactly, so
+both are one code path. A large fitted `delta` with a clear seasonal or regional pattern is the structural diagnosis, in
+the spirit of the 2003 seasonal mortality. Candidates follow the 2004 result and the user's biases: phytoplankton
+mortality or loss, zooplankton loss, detritus remineralisation, Fe scavenging.
+
+**Optional additive term.** A low-dimensional tracer source on DIN and DFe per region and month, for errors no biological
+process can absorb, such as preformed N from a thin mode layer.
+
+**Rejected: gridded model error at every step** (37 tracers x about 6M points x 11680 steps). Unaffordable, and far beyond
+what the data determine.
+
+**Solver.** Control-variable transform, then L-BFGS (`calibrate.py`, optax). Posterior from Gauss-Newton Hessian-vector
+products (`jvp` of `vjp`) and Lanczos: leading eigenvectors show which parameter combinations the data determine, which
+replaces intuition about equifinality with a computed answer.
+
+**A posteriori checks.** `J_min` against its expected value (chi-square), Desroziers-type statistics to see whether B, Q
+and R are consistent, innovation whiteness, and held-out data. This is the modern form of the 2004 credibility analysis.
+
+## Observations
+
+Variational `R` = instrument/algorithm error + interannual variability + representation error, on monthly climatologies.
+
+| Priority | Data | Constrains | On disk | Note |
+|---|---|---|---|---|
+| **Core** | OC-CCI v6 Rrs, 6 bands, 2003-12 | optics, CDOM, biomass, clear-water N:C | `obs_data/oceancolour/occci_rrs` | R from `obs_table.txt`; the 2007-08 daily product carries `Rrs_*_rmsd`, `_bias` (not used so far) |
+| **Core** | WOA nitrate, silicate (+ phosphate, O2 if wanted) | drawdown, HNLC, preformed N | WOA13 annual; WOA18 in `pool/recom/eval` | monthly surface fields needed for the seasonal drawdown |
+| **Core** | GLODAPv2 DIC, Alk, nutrients | carbon, remineralisation, interior | `pool/recom/eval` | unused so far |
+| **Add** | SOCAT / MPI-SOM-FFN surface pCO2 | air-sea carbon | `pool/recom/eval` | unused so far; the bisect shows carbon is sensitive to code, see D1 |
+| **Add** | HPLC (Soppa, Xi) | PFTs, in situ | `obs_data/HPLC_PFT` | sparse but direct; the strongest PFT constraint |
+| **Add** | Huang dFe | iron, HNLC | `pool/recom/eval` | sparse; needed for k_Fe, kScavFe |
+| **Add, low weight** | CMEMS PFT | PFT patterns | `obs_data/oceancolour/cmems_pft` | stated uncertainty Dia ~149 %, Hap ~70 % |
+| **Validate only** | CbPM and Arrigo NPP, MAREDAT, Burt 2018 | independent checks | on disk | NPP products are themselves models |
+| **Get** | BGC-Argo nitrate, Chl, bbp, O2 | SO winter, vertical structure | **not found** | the best single addition: winter and under-cloud data where the worst biases are |
+| **Get** | POC, in-situ aCDOM | carbon, CDOM | **not found** | separates Chl from carbon; C:Chl is a known problem |
+| **Maybe** | BATS, HOT, Station P time series | seasonal cycle, 1-D checks | not found | the setting of the 2003-04 papers |
+
+**Do not double count.** OC-CCI Chl, adg_443, CMEMS PFT and CbPM all derive from the same radiances. If Rrs is assimilated,
+these are not independent data: keep them for validation, or use them with an honest shared error.
+
+**Assimilating Rrs directly rather than Chl** is the right call: it avoids the band-ratio algorithm and uses the model's
+own spectral optics, which is what the spectral version is for.
+
+## Parameter set
+
+Log-space, from the user's sensitivity brackets, about 15-20 to start. Trim with Phase 2.
+
+- **Optics:** cdomcoeff, bb_to_b, bb_bg443, and the BMASS/APART/ACDOM choices (table-based; see Phase 0).
+- **Quota and carbon:** NCmin, NMinSlope, res_ovf / f_ovf.
+- **Light and pigment:** quantum yield per PFT, deg_Chl.
+- **Nutrients:** k_din_d, k_Fe, kScavFe, reminSi.
+- **Losses:** lossC, graz_max, agg_PP, rho_N, reminN.
+
+Fix at first: insensitive or dead ones (`P_cm*`, `alfa*`, res_phy_const, totalligand, SiCUptakeRatio).
+
+## Phases, each with an exit test
+
+### Phase 0: foundations (no assimilation)
+
+- 0.1 Settle D1 (code and physics) after the bisect.
+- 0.2 fesom-jax runs the reference: map `RECOM_CO2LIM_SPECTRAL` to `spectral_co2lim` (the only active key it rejects in
+  `kdind15wco2sl1`'s namelist), use the L1 OASIM set, add a parity gate against the Fortran.
+- 0.3 Port the Rrs operator: `RECOM_CALC_REFLEC` (out of scope today, `params.py`), then `rrs_compare.py`'s conversion
+  (R -> rrs -> Rrs, band interpolation, ice and light masks) with Q as a control. Monthly means accumulated in the scan.
+  Gate: against `rrs_compare.py` on the same fields.
+- 0.4 Make the optics differentiable: `load_tables` is host numpy, so table-derived quantities are constants today.
+- 0.5 Let parameters vary by region and month: `RecomParams` leaves are scalars; a broadcast and a per-step input are
+  needed, with `None`-means-off keeping the default jaxpr unchanged (the project rule; add the test).
+
+**Exit:** reference reproduced, Rrs matches offline, defaults byte-identical.
+
+### Phase 1: how far can the BGC gradient reach? (the go / no-go)
+
+On pi, then CORE2: gradients of a surface cost against finite differences over 1, 5, 30, 90, 365 days, for about 6
+parameters spanning fast and slow processes, with reverse-field growth per step measured as in `ADJOINT_HORIZON.md`.
+
+Also check that JAX really keeps physics out of the linearisation, and measure time and memory. If physics replay
+dominates, consider stored transport (a stated deviation, so measured against the full path first).
+
+**Exit:** a usable window length and an honest cost per gradient. If gradients die early, windows shrink and multi-window
+or EKI (`eki.py`) takes over for the slow targets.
+
+### Phase 2: identifiability on twins (pi mesh)
+
+Synthetic observations with the real sampling and R from a perturbed truth; pi needs no new driver.
+
+- 2a Strong constraint: recover known parameters. Compute the Hessian spectrum; report which combinations are determined by
+  Rrs alone, by Rrs + nutrients, and by all data. This turns the observability table into a formal result and tests whether
+  the data set above is enough.
+- 2b Weak constraint: truth with a seasonally varying mortality, then fit with `delta` on and off. Strong constraint should
+  bias other parameters; weak constraint should recover the seasonal shape. This is the 2003 result as a controlled test.
+
+**Exit:** known parameters and model error recovered within posterior uncertainty; final parameter list and Q scales.
+
+### Phase 3: real data, strong constraint (the baseline)
+
+CORE2, windowed as Phase 1 allows, core data, with operator bias `b`. Needed as the comparator for Phase 4, and it should
+show where parameters are forced to compensate.
+
+**Exit:** lower misfit on held-out data than the reference, or a documented reason why not.
+
+### Phase 4: real data, weak constraint
+
+Add `delta` and the x0 basis. Inspect the patterns of `delta` by process, region and season against the known biases.
+
+**Exit:** chi-square and Desroziers checks consistent; parameters credible; a stated structural diagnosis.
+
+### Phase 5: back to the Fortran, and the science
+
+Run the estimated set in the Fortran model over several years to see that the improvement holds outside the window and
+in production. Multi-year quantities (preformed nutrients, interior carbon) get checked here, or via EKI as a
+cross-check. Then write up.
+
+## Decisions for the user
+
+- **D1. Which code and physics are we estimating for?** Parameters are conditional on both. Physics carries 0.86 of the
+  diatom gap and 1.00 of the sea-ice gap (bisect stage 1). Recommendation: the FESOM 2.8 pair (validated Fortran against
+  fesom-jax, GM/Redi on). But it carries the r692 REcoM, including `1cc2d0d3`, which production lacks: **wait for C1.**
+- **D2. Main aim first:** better production parameters, or structural diagnosis? The method serves both; it changes which
+  phases get the depth.
+- **D3. Hardware:** is GH200 or NVLink time available (Levante, JUPITER)? On one Albedo A100 global one-year optimisation
+  is out of reach, which would mean shorter windows or a regional focus.
+- **D4. First target region:** global, or start where the biases are worst (Southern Ocean)?
+- **D5. BGC-Argo and POC:** acquire now?
+- **D6. Ensemble methods:** this plan is variational first, with EKI only as a cross-check. A colleague's PDAF work and the
+  2003 SIR line would be a natural comparison later.
+
+## Risks
+
+- **Fitting physics errors with biology.** The thin mode layer cannot be repaired by REcoM parameters. Hence `delta`, the
+  additive term, and care with preformed N as a target.
+- **Spin-up.** Windows of a year do not reach deep equilibrium; nutrients in the interior respond over decades. Windows
+  constrain fast processes, so interior targets need x0 control or a low weight.
+- **Non-smoothness.** Limiters, floors and `min()` limitation laws give kinks; L-BFGS may stall. Log-space misfits and warm
+  starts help; Phase 1 tests it.
+- **Collapsed PFTs.** Floors give zero gradient: keep optimisation inside regions where groups exist, and watch for
+  replacement between PFTs.
+- **The surface alkalinity drift** seen in the bisect (Alk down 17-21 in a year) is unexplained, and affects carbon targets.
