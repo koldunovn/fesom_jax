@@ -45,7 +45,8 @@ def _mm_times(mesh: Mesh, X):
         # (9 calls a step, 7 % of the coupled CORE3 ocean's kernel time). 1: (X0 + X1) + X2, 2: (X0 + X2) + X1
         # (the Triton warp reduction's butterfly order over the row padded to 4), 3: X0 + (X1 + X2)
         x0, x1, x2 = Xv[:, 0], Xv[:, 1], Xv[:, 2]
-        s3 = {1: lambda: (x0 + x1) + x2, 2: lambda: (x0 + x2) + x1, 3: lambda: x0 + (x1 + x2)}[mm3]()
+        s3 = {1: lambda: (x0 + x1) + x2, 2: lambda: (x0 + x2) + x1, 3: lambda: x0 + (x1 + x2),
+              4: lambda: jax.lax.optimization_barrier((x0 + x2) + x1)}[mm3]()   # 4: 2 behind a barrier
         contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + s3[:, None])
     else:
         contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + Xv.sum(axis=1, keepdims=True))
