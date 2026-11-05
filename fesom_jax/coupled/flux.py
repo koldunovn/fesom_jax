@@ -294,7 +294,7 @@ def _assemble(fields, rot, enth, months, sss_clim, chl_clim, *, T, n, runoff, si
     return PR.cast_tree(seq) if single else seq
 
 
-def flux_step_forcing_jit(state, forcing: dict, static, dates):
+def flux_step_forcing_jit(state, forcing: dict, static, dates, device=None):
     """:func:`flux_step_forcing` in a few compiled programs (:func:`_flux_seq_staged`, one set per interval length
     and field set); the climatologies stay on the device. Returns ``(state, seq)``, bitwise the eager build
     (checked on the GPU by ``scripts/core3/ocean_speed.py run --check-forcing``)."""
@@ -328,7 +328,13 @@ def flux_step_forcing_jit(state, forcing: dict, static, dates):
         cache[key] = functools.partial(_flux_seq_staged, rotate=bool(jra55.FORCE_ROTATION),
                                        assemble=jax.jit(functools.partial(_assemble, **kw)), **kw)
     months = jnp.asarray(np.array([d[3] for d in dates]) - 1, jnp.int32)
-    return state, cache[key](fields, months, static.trig, static.M, *cache["clim"])
+    trig, M, clim = static.trig, static.M, cache["clim"]
+    if device is not None:           # coupled.prepare_interval: the constants' copies on the forcing's device
+        if ("dev", device) not in cache:
+            cache[("dev", device)] = jax.device_put((trig, M, clim), device)
+        trig, M, clim = cache[("dev", device)]
+        months = jax.device_put(months, device)
+    return state, cache[key](fields, months, trig, M, *clim)
 
 #: namcouple (AWI-ESM3 v3.5.1): the atmosphere's OASIS name -> the FESOM2 name it arrives under (cpl_driver cpl_recv)
 OASIS_TO_FESOM = {"A_Qns_oce": "heat_oce", "A_Qs_all": "heat_swo", "A_Precip_liquid": "prec_oce",

@@ -140,7 +140,7 @@ def cmd_run(a):
     times, t_first = [], None
     rt = _cudart() if a.prof else None
     probe = _GilProbe(a.gil_load) if (a.gil_probe or a.gil_load) else None
-    pyprof = None
+    pyprof, prep = None, None
     for i in range(a.warm + a.intervals):
         if i == a.warm and rt is not None:
             rt.cudaProfilerStart()
@@ -149,8 +149,15 @@ def cmd_run(a):
             pyprof = cProfile.Profile()
             pyprof.enable()
         t1 = time.perf_counter()
-        state = C.ocean_interval(state, st, fo, nsteps=2)
-        o2a = C.ocean_to_atm(state, st)
+        if a.prep_ahead:           # the coupler's AWICM_OCEAN_PREP: the forcing built before the interval
+            if prep is None:
+                prep = C.prepare_interval(fo, st, st.step, 2)
+            state = C.ocean_interval(state, st, C.place_prepared(prep, st), nsteps=2)
+            o2a = C.ocean_to_atm(state, st)
+            prep = C.prepare_interval(fo, st, st.step, 2)        # the next interval's, while this one ends
+        else:
+            state = C.ocean_interval(state, st, fo, nsteps=2)
+            o2a = C.ocean_to_atm(state, st)
         jax.block_until_ready(o2a)
         dt = time.perf_counter() - t1
         if i == 0:
@@ -233,6 +240,8 @@ def main():
     r.add_argument("--warm", type=int, default=3)
     r.add_argument("--intervals", type=int, default=24)
     r.add_argument("--prof", action="store_true")
+    r.add_argument("--prep-ahead", action="store_true", help="each interval's forcing built ahead with "
+                   "coupled.prepare_interval (dispatched while the previous interval ends), as awicm's AWICM_OCEAN_PREP")
     r.add_argument("--pyprof", default=None, help="diagnostic: cProfile of the timed intervals to this file")
     r.add_argument("--gil-probe", action="store_true", help="diagnostic: a Python thread measuring GIL hold times")
     r.add_argument("--gil-load", type=float, default=0.0, help="diagnostic: that thread also busy in Python this "
