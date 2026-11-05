@@ -153,7 +153,8 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "ice_fct_extreme": "FESOM_ICE_FCT_EXTREME", "ice_scatter_fuse": "FESOM_ICE_SCATTER_FUSE",
             "cg_prefix": "FESOM_CG_PREFIX", "potit_unroll": "FESOM_POTIT_UNROLL",
             "column_direct": "FESOM_COLUMN_DIRECT"}
-# Lane ocean_speed2 (performance only, off when absent): `ice_mm_sum3` the ice FCT mass-matrix element sum as two
+# Lane ocean_speed2 (performance only, off when absent): `ice_mm_sum3` (an integer 1-3: the association) the ice FCT
+# mass-matrix element sum as two
 # adds (ice_adv._mm_times; XLA's Triton row-reduction fusion of the 3-sum was 257 us a call); `ice_fct_extreme` the
 # ice FCT cluster bounds as ordered gathers (ops.segment_extreme) instead of atomic scatter-max/min; `ice_scatter_fuse`
 # (an integer 0-3) the mEVP stress-divergence ordered sums' barriers (ice_evp.stress_div_scatter); `cg_prefix` (an
@@ -176,7 +177,7 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
 # (ice_ave_steps > 1): each step's ice update branch is fixed at trace time from the cycle's phase, no lax.cond and
 # no host sync a step (run_steps_sharded_forced ice_phase, FESOM_ICE_STATIC).
 _GPU_INT = ("mevp_wide", "cg_batch", "mevp_unroll", "forcing_procs", "forcing_ahead", "se_wide", "se_unroll",
-            "step_unroll", "chunk_tail", "ice_scatter_fuse", "cg_prefix", "potit_unroll")
+            "step_unroll", "chunk_tail", "ice_scatter_fuse", "cg_prefix", "potit_unroll", "ice_mm_sum3")
 # `chunk_tail` (an integer q >= 0): a chunk shorter than the chunk length whose length is a multiple of q runs as
 # q-chunks (run.split_tails, FESOM_CHUNK_TAIL): one compiled length less where month ends leave 2q.
 _GPU_STR = ("bgc_layout", "bgc_halo")        # string-valued switches, passed through as written
