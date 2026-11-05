@@ -154,7 +154,9 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "cg_prefix": "FESOM_CG_PREFIX", "potit_unroll": "FESOM_POTIT_UNROLL",
             "column_direct": "FESOM_COLUMN_DIRECT", "ssh_rhs_split": "FESOM_SSH_RHS_SPLIT",
             "visc_upd_barrier": "FESOM_VISC_UPD_BARRIER", "fct_aux_barrier": "FESOM_FCT_AUX_BARRIER",
-            "fct_flux_barrier": "FESOM_FCT_FLUX_BARRIER", "o2a_surface": "FESOM_O2A_SURFACE"}
+            "fct_flux_barrier": "FESOM_FCT_FLUX_BARRIER", "o2a_surface": "FESOM_O2A_SURFACE",
+            "o2a_lanes_surface": "FESOM_O2A_LANES_SURFACE",
+            "mevp_wide_barrier": "FESOM_MEVP_WIDE_BARRIER"}
 # Lane ocean_speed2 (performance only, off when absent; configs/core3_cpl.yaml has the measurements):
 # `ice_mm_sum3` (an integer 1-4: the association; 4 = the Triton order behind a barrier) the ice FCT mass-matrix
 # element sum (ice_adv._mm_times); `ice_fct_extreme` the ice FCT cluster bounds as ordered gathers
@@ -165,6 +167,8 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
 # transpose kernels (column_kernel.direct); `ssh_rhs_split`, `visc_upd_barrier`, `fct_aux_barrier`,
 # `fct_flux_barrier` optimization barriers at the SSH rhs, the backscatter viscosity and the tracer FCT ordered sums;
 # `o2a_surface` ocean_to_atm's surface velocity from the surface level only (coupled.ocean._surface_vel_nodes).
+# Lane ocean_speed3: `o2a_lanes_surface` (dist_N) ocean_to_atm gathers only the surface level of T, S, uv from the lanes;
+# `mevp_wide_barrier` (dist_N, mevp_wide) the wide mEVP's element terms behind a barrier before its node sums.
 # `serial_halo_skip`: on one device every halo exchange returns its field (the one-device maps are the identity,
 # checked on the host): fesom_jax.halo.serial_skip_enabled; the same bits, no all_gather and permutation gather.
 # `cpl_forcing_jit` (coupled ocean, mode F): the interval's forcing build and the monthly sums as compiled programs

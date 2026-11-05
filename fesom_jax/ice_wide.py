@@ -323,6 +323,10 @@ class MevpWide:
         terms added from zero in its owner's ``scatter_add`` order — the bits the owner's
         segment-sum gives (a trailing ``+0.0`` for a pad slot leaves a sum unchanged)."""
         csr = self.a["csr"]
+        # gpu.mevp_wide_barrier (FESOM_MEVP_WIDE_BARRIER, lane ocean_speed3): the element terms computed once
+        # (behind a barrier) instead of once per gathered slot inside the sum's fusion; the same additions
+        if os.environ.get("FESOM_MEVP_WIDE_BARRIER", "0").strip() not in ("", "0"):
+            c = lax.optimization_barrier(c)
         flat = c.reshape(-1)
         out = jnp.zeros(csr.shape[:1], c.dtype)
         for j in range(csr.shape[1]):

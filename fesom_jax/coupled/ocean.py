@@ -608,8 +608,18 @@ def ocean_to_atm(state, static: OceanStatic) -> dict:
             names = ("T", "S", "a_ice", "m_ice", "m_snow", "t_skin", "uv") + \
                 (("cpl_ice_temp", "cpl_ice_alb") if static.mode == "flux" else ())
             gather = _lanes_to_global_fn(static)
+            # gpu.o2a_lanes_surface (FESOM_O2A_LANES_SURFACE): only the surface level of T, S (and of uv with
+            # gpu.o2a_surface) goes through the owner-lane gather and the replication, not every level (the 3-D
+            # fields were all-gathered across the devices for their level 1 only); the same values
+            surf = os.environ.get("FESOM_O2A_LANES_SURFACE", "0").strip() not in ("", "0")
+            uv_surf = surf and os.environ.get("FESOM_O2A_SURFACE", "0").strip() not in ("", "0")
 
             def f(s):
+                if surf:
+                    lev = {"T": s.T[:, :1], "S": s.S[:, :1]}
+                    if uv_surf:
+                        lev["uv"] = s.uv[:, :1, :]
+                    s = types.SimpleNamespace(**{k: lev.get(k, getattr(s, k)) for k in names})
                 return _ocean_to_atm(types.SimpleNamespace(**gather(s, names)), static)
             static._o2a = jax.jit(f, out_shardings=_replicated(static))
     return static._o2a(state)
