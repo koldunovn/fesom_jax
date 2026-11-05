@@ -1,5 +1,6 @@
-"""Lane ocean_speed2's performance switches (``gpu.ice_mm_sum3``, ``ice_fct_extreme``, ``ice_scatter_fuse``, ``ssh_rhs_split``,
-``cg_prefix``, ``potit_unroll``, ``column_direct``) against the code paths they replace, on CPU. Each changes how
+"""Lane ocean_speed2's performance switches (``gpu.ice_mm_sum3``, ``ice_fct_extreme``, ``ice_scatter_fuse``,
+``cg_prefix``, ``potit_unroll``, ``column_direct``, ``ssh_rhs_split``, the barriers, ``o2a_surface``) against the
+code paths they replace, on CPU. Each changes how
 the GPU program is built (fusions, loop structure, memory access), not the operations, so on CPU the values are the
 same bits except the ice FCT switches, around which XLA's CPU program fuses and contracts otherwise (round-off). The
 GPU bitwise evidence is the lane's 27-hour State comparison (configs/core3_cpl.yaml comments)."""

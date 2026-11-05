@@ -90,6 +90,23 @@ gpu:
   halo_compact: true      # the all_gather ships only the lanes other devices read; bitwise
   mevp_wide: 12           # mEVP exchanges every 12 subcycles on 12-ring ice lanes; bitwise on 2 GH200 (on CPU with
                           # metric_factor_zero: round-off, <= 2e-12 relative, tests/test_mevp_wide_sharded.py)
+  # --- lane ocean_speed2 (2026-11-05; same harness, runs under /work/ba1583/a270088/awicm/core3/ocean_speed2/runs;
+  # each alone against 65.0 ms on 1 GH200, "bitwise" = the final State and the last ocean_to_atm fields identical):
+  ice_mm_sum3: 4          # ice FCT mass-matrix element sum as (X0 + X2) + X1 behind a barrier: XLA had made the 3-sum
+                          # a Triton row reduction with one warp per row, 257 us a call, 9 a step: 60.2 ms; bitwise
+                          # (that order IS the Triton butterfly's; 1 = (X0 + X1) + X2 is as fast and round-off)
+  ice_fct_extreme: true   # ice FCT cluster max/min as ordered gathers, not atomic scatter-max/min: 64.7; bitwise
+  ice_scatter_fuse: 2     # mEVP stress divergence: element terms once (barrier), node solve fused into the sums:
+                          # 64.1 (A100 121.6 against 125.8); bitwise
+  potit_unroll: 10        # cavity potit 10 iterations a loop trip: 64.6 (A100 124.3); bitwise
+  visc_upd_barrier: true  # backscatter viscosity edge updates once per edge for the edge->element sums: 64.5; bitwise
+  fct_aux_barrier: true   # tracer FCT element bounds once for the ordered node max/min: 64.5; bitwise
+  fct_flux_barrier: true  # tracer FCT limited fluxes once for the ordered edge->node sum: 64.0; bitwise
+  o2a_surface: true       # ocean_to_atm's surface velocity from level 1 only, ordered sums (was a 48-level float64
+                          # atomic scatter, 1.7 ms an interval)
+  # measured and left off: cg_prefix 12 / 16 (65.6, bitwise, slower: the masked straight-line iterations cost more
+  # than the 3-4 host syncs they save), column_direct (109.4, bitwise, the column kernels read [ncol, K] rows
+  # strided), ssh_rhs_split (65.2, bitwise, no gain), ice_scatter_fuse 1 / 3 (65.1 / 64.5)
 output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/cpl
 snapshot_every: 48
 checkpoint_every: 1440

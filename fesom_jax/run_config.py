@@ -155,14 +155,16 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "column_direct": "FESOM_COLUMN_DIRECT", "ssh_rhs_split": "FESOM_SSH_RHS_SPLIT",
             "visc_upd_barrier": "FESOM_VISC_UPD_BARRIER", "fct_aux_barrier": "FESOM_FCT_AUX_BARRIER",
             "fct_flux_barrier": "FESOM_FCT_FLUX_BARRIER", "o2a_surface": "FESOM_O2A_SURFACE"}
-# Lane ocean_speed2 (performance only, off when absent): `ice_mm_sum3` (an integer 1-3: the association) the ice FCT
-# mass-matrix element sum as two
-# adds (ice_adv._mm_times; XLA's Triton row-reduction fusion of the 3-sum was 257 us a call); `ice_fct_extreme` the
-# ice FCT cluster bounds as ordered gathers (ops.segment_extreme) instead of atomic scatter-max/min; `ice_scatter_fuse`
-# (an integer 0-3) the mEVP stress-divergence ordered sums' barriers (ice_evp.stress_div_scatter); `cg_prefix` (an
-# integer m >= 0) the CG's first m masked iterations ahead of its while loop (ssh.cg_prefix); `potit_unroll` (an
-# integer u) the cavity potit iterations u per loop trip (cavity.potit); `column_direct` the column kernels on the
-# [ncol, K] arrays without the transpose kernels (column_kernel.direct).
+# Lane ocean_speed2 (performance only, off when absent; configs/core3_cpl.yaml has the measurements):
+# `ice_mm_sum3` (an integer 1-4: the association; 4 = the Triton order behind a barrier) the ice FCT mass-matrix
+# element sum (ice_adv._mm_times); `ice_fct_extreme` the ice FCT cluster bounds as ordered gathers
+# (ops.segment_extreme) instead of atomic scatter-max/min; `ice_scatter_fuse` (an integer 0-3) the mEVP
+# stress-divergence ordered sums' barriers (ice_evp.stress_div_scatter); `cg_prefix` (an integer m >= 0) the CG's
+# first m masked iterations ahead of its while loop (ssh.cg_prefix); `potit_unroll` (an integer u) the cavity potit
+# iterations u per loop trip (cavity.potit); `column_direct` the column kernels on the [ncol, K] arrays without the
+# transpose kernels (column_kernel.direct); `ssh_rhs_split`, `visc_upd_barrier`, `fct_aux_barrier`,
+# `fct_flux_barrier` optimization barriers at the SSH rhs, the backscatter viscosity and the tracer FCT ordered sums;
+# `o2a_surface` ocean_to_atm's surface velocity from the surface level only (coupled.ocean._surface_vel_nodes).
 # `serial_halo_skip`: on one device every halo exchange returns its field (the one-device maps are the identity,
 # checked on the host): fesom_jax.halo.serial_skip_enabled; the same bits, no all_gather and permutation gather.
 # `cpl_forcing_jit` (coupled ocean, mode F): the interval's forcing build and the monthly sums as compiled programs
