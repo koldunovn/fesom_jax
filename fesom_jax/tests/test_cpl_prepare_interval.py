@@ -73,3 +73,25 @@ def test_o2a_lanes_surface_dist2(monkeypatch):
     assert sorted(ref) == sorted(new)
     for k in ref:
         np.testing.assert_array_equal(new[k], ref[k], err_msg=k)
+
+
+@avail
+@pytest.mark.parametrize("partition", ["serial", "dist_2"])
+def test_forcing_lean_bitwise(monkeypatch, partition):
+    """gpu.cpl_forcing_lean (no eager op, dist_2: the lanes gathered in the assembly program) against the staged
+    build, and the prepared path with it on."""
+    from fesom_jax import coupled as C
+    monkeypatch.setenv("FESOM_CPL_FORCING_JIT", "1")
+    monkeypatch.setenv("FESOM_DIST_DIR", str(DIST.parent))
+    out = []
+    for lean, prep in ((False, False), (True, False), (True, True)):
+        monkeypatch.setenv("FESOM_CPL_FORCING_LEAN", "1" if lean else "0")
+        state, st = C.init_ocean(str(CFG), restart_in=str(RST), mode="flux", nsteps=2,
+                                 partition=None if partition == "serial" else partition)
+        fo = C.oasis_to_fesom(_forcing(st.nod2D))
+        f = C.prepare_interval(fo, st, st.step, 2) if prep else fo
+        state = C.ocean_interval(state, st, f, nsteps=2)
+        out.append(_leaves(state))
+    for b in out[1:]:
+        bad = [k for k in out[0] if not np.array_equal(out[0][k], b[k], equal_nan=True)]
+        assert not bad, bad

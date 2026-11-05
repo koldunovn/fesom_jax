@@ -38,6 +38,7 @@ Differences from the Fortran (also in docs/coupling/awicm.md):
 from __future__ import annotations
 
 import dataclasses
+import functools
 from typing import NamedTuple
 
 import jax
@@ -246,6 +247,48 @@ def _stages():
     return g["_STAGES"]
 
 
+def _flux_lean_call(fields, static, dates, cache, key, kw, device):
+    """The lean build (:func:`forcing_lean_enabled`): constants, scalars, month rows and (dist_N, unless ``device``:
+    coupled.prepare_interval gathers there itself) the lane maps placed once per placement of the forcing."""
+    import functools
+    from .. import jra55
+    leaf = next(iter(fields.values()))
+    place = leaf.sharding
+    lanes_here = static.npes > 1 and device is None
+    if lanes_here:                   # the forcing replicated over the ocean's devices (as the coupler puts it)
+        from jax.sharding import NamedSharding, PartitionSpec
+        mesh = static.device_mesh()
+        if set(place.device_set) != set(mesh.devices.flat):
+            place = NamedSharding(mesh, PartitionSpec())
+            fields = jax.device_put(fields, place)
+    lk = ("lean", key, lanes_here)
+    if lk not in cache:
+        out_sh = None
+        if lanes_here:
+            from jax.sharding import NamedSharding, PartitionSpec
+            out_sh = NamedSharding(static.device_mesh(), PartitionSpec(None, "p"))
+        asm = functools.partial(_assemble_lanes, **kw)
+        cache[lk] = functools.partial(_flux_seq_lean, rotate=bool(jra55.FORCE_ROTATION),
+                                      assemble=jax.jit(asm) if out_sh is None else jax.jit(asm, out_shardings=out_sh),
+                                      **kw)
+    pk = ("lean_place", place)
+    if pk not in cache:
+        lanes = None
+        if lanes_here:
+            from ..zarr_output import _folded_gid_owned
+            gid, _ = _folded_gid_owned(static.part, static.sm, "nod")
+            lanes = (np.where(gid >= 0, gid, 0).astype(np.int32), gid < 0)
+        sc = (np.asarray(LATENT_FUSION, np.float64), np.asarray(1000000.0, np.float64))
+        if "clim" not in cache:
+            cache["clim"] = (jnp.asarray(static.sss_clim), jnp.asarray(static.chl_clim))
+        cache[pk] = jax.device_put((static.trig, static.M, cache["clim"], sc, lanes), place)
+    trig, M, clim, sc, lanes = cache[pk]
+    mk = ("lean_months", place, tuple(int(d[3]) for d in dates))
+    if mk not in cache:
+        cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, place)
+    return cache[lk](fields, cache[mk], trig, M, *clim, sc, lanes)
+
+
 def _flux_seq_staged(fields, months, trig, M, sss_clim, chl_clim, *, T, n, runoff, single, rotate, has_tsk,
                      assemble, scalars=None):
     """:func:`flux_step_forcing`'s operations in a few compiled programs: the rotation in the product / sum stages
@@ -329,6 +372,8 @@ def flux_step_forcing_jit(state, forcing: dict, static, dates, device=None):
     if key not in cache:
         cache[key] = functools.partial(_flux_seq_staged, rotate=bool(jra55.FORCE_ROTATION),
                                        assemble=jax.jit(functools.partial(_assemble, **kw)), **kw)
+    if forcing_lean_enabled():
+        return state, _flux_lean_call(fields, static, dates, cache, key, kw, device)
     months = jnp.asarray(np.array([d[3] for d in dates]) - 1, jnp.int32)
     trig, M, clim = static.trig, static.M, cache["clim"]
     if device is not None:           # coupled.prepare_interval: the constants' copies on the forcing's device, made
@@ -343,6 +388,68 @@ def flux_step_forcing_jit(state, forcing: dict, static, dates, device=None):
             cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, device)
         return state, cache[key](fields, cache[mk], trig, M, *clim, scalars=sc)
     return state, cache[key](fields, months, trig, M, *clim)
+
+def forcing_lean_enabled() -> bool:
+    """``gpu.cpl_forcing_lean`` (``FESOM_CPL_FORCING_LEAN=1``, lane ocean_speed3; with ``cpl_forcing_jit``): the
+    interval's forcing build without eager device ops and host-to-device copies: the broadcasts and casts inside the
+    stage programs, the scalars and month rows copied to the device once, and (dist_N) the gather onto the lanes in
+    the assembly program (:func:`_flux_seq_lean`). Eight compiled programs an interval and nothing else: less work
+    for the ocean's Python thread, which shares the interpreter with the atmosphere's. The same operations on the
+    same values (broadcasts, casts, gathers and selects moved between programs; no product meets a sum)."""
+    import os
+    return os.environ.get("FESOM_CPL_FORCING_LEAN", "0").strip() not in ("", "0")
+
+
+def _lean_stages():
+    """:func:`_stages`' m1 and enth_m with the broadcast to ``[T, n]`` (and the cast to float32) inside."""
+    g = globals()
+    if "_LEAN" in g:
+        return g["_LEAN"]
+    m1, a1, m2, a2, m3, a3, enth_m = _stages()
+
+    @functools.partial(jax.jit, static_argnames=("T",))
+    def m1b(pairs, trig, T):
+        def r(a):
+            return jnp.broadcast_to(a, (T, a.shape[-1])) if a.ndim == 1 else a
+        sgl, cgl, sgo, cgo = trig[:4]
+        pairs = [(r(u), r(v)) for u, v in pairs]
+        return [((-v) * sgl * cgo, u * sgo, (-v) * sgl * sgo, u * cgo, v * cgl) for u, v in pairs]
+
+    @functools.partial(jax.jit, static_argnames=("T", "single"))
+    def enth_mb(calv, lf, mega, T, single):
+        calv = jnp.broadcast_to(calv, (T, calv.shape[-1])) if calv.ndim == 1 else calv
+        calv = calv.astype(jnp.float32) if single else calv
+        return (calv * lf.astype(calv.dtype)) * mega.astype(calv.dtype)
+
+    g["_LEAN"] = (m1b, a1, m2, a2, m3, a3, enth_mb)
+    return g["_LEAN"]
+
+
+def _flux_seq_lean(fields, months, trig, M, sss_clim, chl_clim, scalars, lanes, *, T, n, runoff, single, rotate,
+                   has_tsk, assemble):
+    """:func:`_flux_seq_staged` with no eager op: see :func:`forcing_lean_enabled`. ``lanes``: None, or
+    ``(idx, pad)`` of the dist_N lanes (gathered in ``assemble``)."""
+    m1b, a1, m2, a2, m3, a3, enth_mb = _lean_stages()
+    rot = None
+    if rotate:
+        pairs = [(fields["taux_oce"], fields["tauy_oce"]), (fields["taux_ico"], fields["tauy_ico"])]
+        rot = a3(m3(a2(m2(a1(m1b(pairs, trig, T=T)), M)), trig))
+    enth = None
+    if runoff == "coupled":
+        lf, mega = scalars
+        enth = enth_mb(fields["calv_oce"], lf, mega, T=T, single=single)
+    return assemble(fields, rot, enth, months, sss_clim, chl_clim, lanes)
+
+
+def _assemble_lanes(fields, rot, enth, months, sss_clim, chl_clim, lanes, **kw):
+    """:func:`_assemble`, then (``lanes`` given) each leaf gathered onto the dist_N lanes as
+    :func:`fesom_jax.coupled.ocean.to_lanes` does (halo lanes their node's value, pad lanes 1.0)."""
+    seq = _assemble(fields, rot, enth, months, sss_clim, chl_clim, **kw)
+    if lanes is None:
+        return seq
+    idx, pad = lanes
+    return jax.tree.map(lambda a: jnp.where(pad, jnp.asarray(1, a.dtype), a[:, idx]), seq)
+
 
 #: namcouple (AWI-ESM3 v3.5.1): the atmosphere's OASIS name -> the FESOM2 name it arrives under (cpl_driver cpl_recv)
 OASIS_TO_FESOM = {"A_Qns_oce": "heat_oce", "A_Qs_all": "heat_swo", "A_Precip_liquid": "prec_oce",

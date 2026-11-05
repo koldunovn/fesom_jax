@@ -473,8 +473,9 @@ def ocean_interval(state, static: OceanStatic, forcing: dict, nsteps: int | None
         from . import flux
         build = flux.flux_step_forcing_jit if flux.forcing_jit_enabled() else flux.flux_step_forcing
         state, seq = build(state, forcing, static, dates)
-    if static.npes > 1 and not isinstance(forcing, PreparedForcing):
-        seq = to_lanes(seq, static)
+    if static.npes > 1 and not isinstance(forcing, PreparedForcing) and not (
+            mode == "flux" and flux.forcing_jit_enabled() and flux.forcing_lean_enabled()):
+        seq = to_lanes(seq, static)            # (gpu.cpl_forcing_lean: gathered onto the lanes by the build)
     jfn, a = static.executable(nsteps, static.bootstrap, state)
     out = jfn(a[0], state, a[2], a[3], a[4], seq, *a[6:])
     state, sums = out if static.sample_fn is not None else (out, None)
