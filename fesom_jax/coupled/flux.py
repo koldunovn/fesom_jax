@@ -247,7 +247,7 @@ def _stages():
 
 
 def _flux_seq_staged(fields, months, trig, M, sss_clim, chl_clim, *, T, n, runoff, single, rotate, has_tsk,
-                     assemble):
+                     assemble, scalars=None):
     """:func:`flux_step_forcing`'s operations in a few compiled programs: the rotation in the product / sum stages
     of :func:`_stages`, the rest (broadcasts, the runoff sum, the enthalpy cap, the month rows, the casts: no
     product) in ``assemble``."""
@@ -264,7 +264,9 @@ def _flux_seq_staged(fields, months, trig, M, sss_clim, chl_clim, *, T, n, runof
     if runoff == "coupled":
         calv = r(fields["calv_oce"])
         calv = calv.astype(jnp.float32) if single else calv
-        enth = enth_m(calv, jnp.asarray(LATENT_FUSION, calv.dtype), jnp.asarray(1000000.0, calv.dtype))
+        lf, mega = (jnp.asarray(LATENT_FUSION, calv.dtype), jnp.asarray(1000000.0, calv.dtype)) if scalars is None \
+            else scalars[str(calv.dtype)]
+        enth = enth_m(calv, lf, mega)
     return assemble(fields, rot, enth, months, sss_clim, chl_clim)
 
 
@@ -329,11 +331,17 @@ def flux_step_forcing_jit(state, forcing: dict, static, dates, device=None):
                                        assemble=jax.jit(functools.partial(_assemble, **kw)), **kw)
     months = jnp.asarray(np.array([d[3] for d in dates]) - 1, jnp.int32)
     trig, M, clim = static.trig, static.M, cache["clim"]
-    if device is not None:           # coupled.prepare_interval: the constants' copies on the forcing's device
+    if device is not None:           # coupled.prepare_interval: the constants' copies on the forcing's device, made
+        # once (and the month rows once per month): no copy to that device per interval, which on a device busy with
+        # another program held the calling thread until the device was done
         if ("dev", device) not in cache:
-            cache[("dev", device)] = jax.device_put((trig, M, clim), device)
-        trig, M, clim = cache[("dev", device)]
-        months = jax.device_put(months, device)
+            sc = {d: (np.asarray(LATENT_FUSION, d), np.asarray(1000000.0, d)) for d in ("float32", "float64")}
+            cache[("dev", device)] = jax.device_put((trig, M, clim, sc), device)
+        trig, M, clim, sc = cache[("dev", device)]
+        mk = ("months", device, tuple(int(d[3]) for d in dates))
+        if mk not in cache:
+            cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, device)
+        return state, cache[key](fields, cache[mk], trig, M, *clim, scalars=sc)
     return state, cache[key](fields, months, trig, M, *clim)
 
 #: namcouple (AWI-ESM3 v3.5.1): the atmosphere's OASIS name -> the FESOM2 name it arrives under (cpl_driver cpl_recv)
