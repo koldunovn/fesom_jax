@@ -97,7 +97,10 @@ class RecomConfig(NamedTuple):
         """``(switches, params)`` of the namelist (:func:`fesom_jax.recom.params.load_namelist`, checked; cached)."""
         if self.namelist is None:
             raise ValueError("recom.namelist is not set (the passive mode has no REcoM parameters)")
-        return _load_cached(self.namelist_path())
+        sw, par = _load_cached(self.namelist_path())
+        if sw.RECOM_CO2LIM_SPECTRAL and self.spectral and not self.spectral_co2lim:
+            raise ValueError("the namelist sets RECOM_CO2LIM_SPECTRAL but recom.spectral_co2lim is false")
+        return sw, par
 
     def validate(self) -> "RecomConfig":
         if int(self.bgc_every) < 1:

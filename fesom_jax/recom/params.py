@@ -108,7 +108,8 @@ NAMELIST_GROUPS = {
     # the spectral fork (recom_modules.F90:610-751 of fesom2.6_recom_tra_diags_spectral): &spectral and the OASIM
     # forcing group of gen_surface_forcing.F90:118-144; darwin_bbphy(4) is read as darwin_bbphy(1)..(4)
     "spectral": ('RECOM_CDOM', 'RECOM_MARSHALL', 'RECOM_RADTRANS', 'OASIM', 'RECOM_BMASS', 'RECOM_CALC_ACDOM',
-            'RECOM_CALC_APART', 'RECOM_CALC_APHYT', 'RECOM_CALC_REFLEC', 'DAR_NONSPECTRAL_BACKSCATTERING_RATIO',
+            'RECOM_CALC_APART', 'RECOM_CALC_APHYT', 'RECOM_CALC_REFLEC', 'RECOM_CO2LIM_SPECTRAL',
+            'DAR_NONSPECTRAL_BACKSCATTERING_RATIO',
             'darwin_bbphy(1)', 'darwin_bbphy(2)', 'darwin_bbphy(3)', 'darwin_bbphy(4)', 'QYmax', 'QYmax_d',
             'QYmax_cocco', 'QYmax_phaeo', 'cdomcoeff', 'bb_to_b', 'bb_bg443', 'bb_bg_slope', 'aphyt_slope_phy',
             'aphyt_icept_phy', 'aphyt_slope_dia', 'aphyt_icept_dia', 'aphyt_slope_cocco', 'aphyt_icept_cocco',
@@ -506,6 +507,7 @@ class RecomSwitches:
     RECOM_CALC_APART: bool = False      # fork :618
     RECOM_CALC_APHYT: bool = False      # fork :619
     RECOM_CALC_REFLEC: bool = False     # fork :620
+    RECOM_CO2LIM_SPECTRAL: bool = False  # fork 21e0d02a; the growth itself follows RecomConfig.spectral_co2lim
     RECOM_BMASS: bool = False           # fork :621
     DAR_NONSPECTRAL_BACKSCATTERING_RATIO: bool = False   # fork :718
     darwin_waterabsorbFile: str = 'abw25par.dat'                   # fork :682

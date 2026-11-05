@@ -114,7 +114,7 @@ J = 1/2 |theta - theta_b|^2_{B_theta}            parameters: constant, log space
   + 1/2 sum_k eta_k^T Q^-1 eta_k                 model error
   + 1/2 sum_i |y_i - H_i(x; b)|^2_{R_i}          observations, log space for Rrs and Chl
 
-with  x_{k+1} = M(x_k; theta) + G eta_k
+with  x_{k+1} = M(x_k; theta) + xbar_k ⊙ G eta_k        (all controls normalised by the reference, below)
 ```
 
 **Model error as a low-dimensional additive term in the BGC tendencies (recommended).** `eta` is a smooth correction by
@@ -139,6 +139,28 @@ flux diagnostics: the output is budgets that close, and a ranking of the paramet
 **Rejected: gridded model error at every step** (37 tracers x about 6M points x 11680 steps). Unaffordable, and far beyond
 what the data determine.
 
+**Normalisation by a reference solution.** The user's formulation, used in the 2004 study though not stated in the paper
+([note](https://claude.ai/artifact/VHJ3qAaMBfMJD1azBiC1am)): `x(t) = xbar(t) ⊙ xt(t)`, `p = pbar ⊙ pt`, with the
+reference kept fixed for the whole inversion, so `xt = 1, pt = 1` is the reference. All controls are nondimensional:
+
+- Gradients become `xbar ⊙ dJ/dx` and `pbar ⊙ dJ/dp`, and the Hessian `D^T H D`, so no compartment or season dominates the search.
+- Unit-variance penalties mean a diagonal prior of relative errors, sigma = xbar: the preconditioning of Courtier et al. (1994),
+  with relative rather than absolute errors. A chosen relative error scales it.
+- Model error is relative too: `x_{k+1} = M(x_k; theta) + xbar_k ⊙ G eta_k`, the residual `r = (dx/dt - M) / xbar`.
+- `x = xbar ⊙ exp(xi)` adds positivity and a lognormal prior, of which the normalised form is the first-order limit. Use it for
+  `theta` (already log space) and `x0`; test it for `eta`.
+
+Choices for this model:
+
+- **Reference (decided 2026-11-05):** time-varying, not one constant per tracer: seasonal ranges are large. For CORE2 the source must be
+  a run on the chosen physics: a FESOM 2.8 run with the reference's REcoM settings (Phase 0.1), not `kdind15wco2sl1bf`, which
+  has the 2.6 production physics. Monthly means to start, as the output is monthly. With biome-month
+  `eta`, `xbar` is only needed on that basis, so daily biome means are cheap; multiple shooting uses the fields directly.
+- **A floor on `xbar` per tracer.** Sigma = xbar means a group near `tiny` gets almost no freedom, so a collapsed group stays
+  collapsed. Near-zero water also makes the division ill-defined, as do dry cells.
+- **It conditions the problem, not the dynamics.** It removes magnitude effects but not a true instability of the adjoint,
+  which is why the scaled sensitivity is the right Phase 1 diagnostic.
+
 **Solver.** Control-variable transform, then L-BFGS (`calibrate.py`, optax). Posterior from Gauss-Newton Hessian-vector
 products (`jvp` of `vjp`) and Lanczos: leading eigenvectors show which parameter combinations the data determine, which
 replaces intuition about equifinality with a computed answer.
@@ -161,8 +183,10 @@ Variational `R` = instrument/algorithm error + interannual variability + represe
 | **Add** | Huang dFe | iron, HNLC | `pool/recom/eval` | sparse; needed for k_Fe, kScavFe |
 | **Add, low weight** | CMEMS PFT | PFT patterns | `obs_data/oceancolour/cmems_pft` | stated uncertainty Dia ~149 %, Hap ~70 % |
 | **Validate only** | CbPM and Arrigo NPP, MAREDAT, Burt 2018 | independent checks | on disk | NPP products are themselves models |
-| **Get** | BGC-Argo nitrate, Chl, bbp, O2 | SO winter, vertical structure | **not found** | the best single addition: winter and under-cloud data where the worst biases are |
-| **Get** | POC, in-situ aCDOM | carbon, CDOM | **not found** | separates Chl from carbon; C:Chl is a known problem |
+| **Add** | BGC-Argo nitrate, Chl, bbp, O2 (Sprof, 1595 floats) | SO winter, vertical structure | `p_specbic/sloza/obs_bgc/bgc_argo` | fetched 2026-11-05; 125k nitrate, 198k Chl, 195k bbp profiles; the best single addition. Mostly 2012 onwards, so climatological use |
+| **Add** | POC in situ: GO-POPCORN v2, 2664 samples | carbon, separates Chl from carbon | `p_specbic/sloza/obs_bgc/poc_insitu` | fetched 2026-11-05; surface, Bio-GO-SHIP 2011-20. bbp from Argo adds depth, through a bbp-to-POC conversion |
+| **Validate only** | BICEP satellite POC (OC-CCI v5, monthly, 4 km, with bias and rmsd) | POC patterns | not fetched (CEDA, open, 247 GB) | built from Rrs490/Rrs560, so not independent of Rrs |
+| **Get** | in-situ aCDOM | CDOM | not found | |
 | **Maybe** | BATS, HOT, Station P time series | seasonal cycle, 1-D checks | not found | the setting of the 2003-04 papers |
 
 **Do not double count.** OC-CCI Chl, adg_443, CMEMS PFT and CbPM all derive from the same radiances. If Rrs is assimilated,
@@ -188,8 +212,10 @@ to stay inseparable, like `g` and `k3` in 2004: `graz_max` with its half-saturat
 
 ### Phase 0: foundations (no assimilation)
 
-- 0.1 Settle the code and physics (D1). The user adopts the ballasting fix `1cc2d0d3` in production (2026-11-05), so a
-  new reference run with the fix replaces `kdind15wco2sl1` as the starting point.
+- 0.1 A new reference on the chosen physics: FESOM 2.8 (`fesom2.8_recom_spectral`, which carries the ballasting fix) with
+  `kdind15wco2sl1`'s REcoM settings (L1 OASIM, `RECOM_CO2LIM_SPECTRAL`, the Phaeocystis CO2 set), its fesom-jax twin, and a
+  check that the pair still agrees. Source of `xbar` and of the first guess. `kdind15wco2sl1bf` (2.6 production physics, job
+  48871413) answers a separate question: what the fix does to the production reference.
 - 0.2 fesom-jax runs the reference: map `RECOM_CO2LIM_SPECTRAL` to `spectral_co2lim` (the only active key it rejects in
   `kdind15wco2sl1`'s namelist), use the L1 OASIM set, add a parity gate against the Fortran.
 - 0.3 Port the Rrs operator: `RECOM_CALC_REFLEC` (out of scope today, `params.py`), then `rrs_compare.py`'s conversion
@@ -264,17 +290,18 @@ cross-check. Then write up.
 
 ## Decisions for the user
 
-- **D1. Which physics are we estimating for?** Parameters are conditional on it. Physics carries 0.86 of the diatom gap
-  and 1.00 of the sea-ice gap (bisect stage 1). Recommendation: the FESOM 2.8 pair (validated Fortran against fesom-jax,
-  GM/Redi on). The code side is settled: bisect C1 showed `1cc2d0d3` is the whole code gap, and the user adopts it.
-- **D2. Main aim first:** better production parameters, or structural diagnosis? The method serves both; it changes which
-  phases get the depth.
-- **D3. Hardware:** is GH200 or NVLink time available (Levante, JUPITER)? On one Albedo A100 global one-year optimisation
-  is out of reach, which would mean shorter windows or a regional focus.
-- **D4. First target region:** global, or start where the biases are worst (Southern Ocean)?
-- **D5. BGC-Argo and POC:** acquire now?
-- **D6. Ensemble methods:** this plan is variational first, with EKI only as a cross-check. A colleague's PDAF work and the
-  2003 SIR line would be a natural comparison later.
+- **D1. Physics (decided 2026-11-05):** the FESOM 2.8 pair, validated against fesom-jax, GM/Redi on. It differs from the 2.6
+  production physics in seven of the eight bisect factors (cvmix TKE, no momix, advection weights, mEVP, ice_diff, opt_visc,
+  no partial cells; only GM/Redi agree), and physics carries 0.86 of the diatom gap and all of the sea-ice gap in stage 1.
+  So the estimated parameters belong to the 2.8 physics, and Phase 5 validates in the 2.8 Fortran, not in 2.6.
+- **D2. First aim (decided 2026-11-05):** production parameters first, then structural diagnosis.
+- **D3. Hardware (decided 2026-11-05):** start on Albedo, then GH200 on Levante. Albedo (one A100): Phases 0-2 and the CORE2
+  gradient check. GH200 (dolpung, project `mh1571`; 0.060 s per CORE2 + REcoM step on 4 GH200, `RUNNING_ALBEDO.md`, about 12
+  minutes a model year, against about 7.4 h here): Phases 3-4. To prepare: the project membership, moving data and restarts, and
+  repeating the gates there, because the noise of the forward differs by machine.
+- **D4. Region (decided 2026-11-05):** global.
+- **D5. New data (decided 2026-11-05):** acquire BGC-Argo and POC.
+- **D6. Ensemble methods (decided 2026-11-05):** adjoint first, then a comparison with ensemble methods (EKI, PDAF, SIR).
 
 ## Risks
 

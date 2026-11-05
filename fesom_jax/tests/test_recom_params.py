@@ -148,3 +148,16 @@ def test_recom_config_modes():
     from fesom_jax.run_config import RunConfig
     cfg = RunConfig.from_dict({"recom": {"namelist": str(NML)}})
     assert cfg.recom == full and RunConfig.from_dict(cfg.to_dict()) == cfg
+
+
+def test_co2lim_spectral_key_and_guard():
+    """&spectral RECOM_CO2LIM_SPECTRAL is read, defaults off, and must not contradict RecomConfig.spectral_co2lim."""
+    import pytest
+    from fesom_jax.recom.config import RecomConfig
+    from fesom_jax.recom.params import RecomSwitches
+    assert RecomSwitches().RECOM_CO2LIM_SPECTRAL is False
+    src = Path(__file__).resolve().parents[2] / "scripts/recom/fortran/namelists_albedo_fesom28_core2_sl1/namelist.recom"
+    cfg = RecomConfig(namelist=str(src), spectral=True, spectral_co2lim=True)
+    assert cfg.load()[0].RECOM_CO2LIM_SPECTRAL is True
+    with pytest.raises(ValueError, match="RECOM_CO2LIM_SPECTRAL"):
+        cfg._replace(spectral_co2lim=False).load()

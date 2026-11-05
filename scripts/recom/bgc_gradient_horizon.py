@@ -1,13 +1,16 @@
 """Phase 1 of docs/plans/20261105-recom-parameter-estimation.md: how far does the REcoM gradient reach?
 
 Physics reads no BGC tracer, so the day-scale limit of the physics adjoint (docs/ADJOINT_HORIZON.md) need not apply to
-REcoM parameters. This measures it. For each window of D days from the 30-day spectral restart on pi, with a cost taken
-on the LAST day only (so every window tests sensitivity across its whole length):
+REcoM parameters. This measures it. For each window of D days from a pi restart (``--restart``, ``--start-day``; by
+default the 30-day spectral restart, a young ecosystem), with a cost taken on the LAST day only (so every window tests sensitivity across its whole length):
 
-- ``jax.grad`` with respect to the parameters against central differences at two step sizes (their disagreement shows
-  the noise or kinks of the finite difference itself);
-- ``|dJ/dbgc0|``, the reverse field at the start of the window: its growth with D is the growth measure of
-  ADJOINT_HORIZON.md;
+- ``jax.grad`` with respect to the parameters against central differences at two step sizes;
+- the noise of J: the same forward repeated. The GPU forward is not bit-reproducible, and the noise bar of a central
+  difference is noise / (2 h p), printed beside it. ``--xla_gpu_deterministic_ops`` is impractical (ADJOINT_HORIZON.md);
+  a CPU run gives clean differences at a higher cost;
+- the reverse field at the start of the window, raw ``dJ/dx0`` and normalised by the reference ``x0 * dJ/dx0`` (the
+  plan's normalisation, x = xbar * xt), per tracer with the location of the raw peak. Raw growth that collapses when
+  scaled is a magnitude effect at a tracer near zero; growth that survives is a real amplification;
 - forward and gradient wall time.
 
 Costs: ``chl`` area-mean surface Chl of the four groups, ``din`` area-mean surface DIN, ``npp`` area-integrated NPP.
@@ -121,6 +124,21 @@ def tangent_check(fx, st0, cf, day):
           f"  exactly zero: {dead}", flush=True)
 
 
+def tracer_report(names, bgc0, gx, top=6):
+    """Per tracer: raw and reference-normalised reverse-field norms, the raw peak and the tracer's value there."""
+    x, g = np.asarray(bgc0), np.asarray(gx)
+    rows = []
+    for i, nm in enumerate(names):
+        gi, xi = g[..., i], x[..., i]
+        k = np.unravel_index(int(np.argmax(np.abs(gi))), gi.shape)
+        rows.append(dict(tracer=nm, raw=float(np.linalg.norm(gi)), scaled=float(np.linalg.norm(xi * gi)),
+                         raw_max=float(np.abs(gi[k])), node=int(k[0]), level=int(k[1]), x_at_max=float(xi[k])))
+    for r in sorted(rows, key=lambda r: -r["raw"])[:top]:
+        print(f"    raw {r['raw']:.3e} scaled {r['scaled']:.3e}  {r['tracer']:>9}: peak {r['raw_max']:.3e} at node "
+              f"{r['node']} level {r['level']}, x there {r['x_at_max']:.3e}", flush=True)
+    return rows
+
+
 def timed(fn, *a):
     t = time.time()
     r = jax.block_until_ready(fn(*a))
@@ -131,7 +149,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--days", type=int, nargs="+", default=[1, 5, 30, 90])
     ap.add_argument("--cost", nargs="+", choices=("chl", "din", "npp"), default=["chl"])
-    ap.add_argument("--h", type=float, nargs=2, default=[1e-3, 1e-4], help="relative FD steps")
+    ap.add_argument("--h", type=float, nargs="+", default=[1e-2, 3e-3], help="relative FD steps")
+    ap.add_argument("--repeats", type=int, default=4, help="repeats of the forward, for the noise of J")
+    ap.add_argument("--restart", default=TF.RESTART, help="restart to start from")
+    ap.add_argument("--start-day", type=int, default=None, help="day of 1958 of the start (default: from the restart)")
     ap.add_argument("--no-fd", action="store_true")
     ap.add_argument("--tangent-check", action="store_true", help="one-step physics-tangent check first")
     ap.add_argument("--out", type=Path,
@@ -139,10 +160,13 @@ def main():
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     fx = TF._setup(RUN, TF.RUN_CFG)
-    st0, cf, day = TF.warm_start(fx)
+    st0, cf, day = TF.warm_start(fx, a.restart)
     if day <= 1:
-        raise SystemExit(f"no warm restart at {TF.RESTART}: the windows need a grown ecosystem")
-    print(f"start day {day} of 1958, backend {jax.default_backend()}, bgc {st0.bgc.shape}", flush=True)
+        raise SystemExit(f"no warm restart at {a.restart}: the windows need a grown ecosystem")
+    day = a.start_day or day
+    print(f"start day {day} of 1958 from {a.restart}, backend {jax.default_backend()}, bgc {st0.bgc.shape}", flush=True)
+    b0 = np.asarray(st0.bgc)
+    print("surface means: " + "  ".join(f"{n} {b0[:, 0, i].mean():.3g}" for i, n in enumerate(fx["lay"].names)), flush=True)
     if a.tangent_check:
         tangent_check(fx, st0, cf, day)
     for d in a.days:
@@ -161,9 +185,12 @@ def main():
             j0, t_fwd = timed(fwd_c, theta, st0.bgc, st0, stack)
             (g, gx), t_grad = timed(grad_c, theta, st0.bgc, st0, stack)
             g = np.asarray(g)
+            reps = [float(fwd_c(theta, st0.bgc, st0, stack)) for _ in range(a.repeats)]
+            noise = float(np.std(reps + [float(j0)], ddof=1)) if a.repeats else 0.0
             rec = dict(days=d, steps=n, cost=kind, backend=jax.default_backend(), J=float(j0), names=NAMES,
                        theta=[float(x) for x in theta], grad=g.tolist(), finite=bool(np.all(np.isfinite(g))),
                        x0_norm=float(jnp.sqrt(jnp.sum(gx * gx))), x0_max=float(jnp.max(jnp.abs(gx))),
+                       x0_scaled_norm=float(jnp.sqrt(jnp.sum((st0.bgc * gx) ** 2))), noise=noise, reps=reps,
                        t_compile=t_compile, t_fwd=t_fwd, t_grad=t_grad, split=split(n), fd={})
             if not a.no_fd:
                 for h in a.h:
@@ -173,12 +200,14 @@ def main():
                         fd.append((float(fwd_c(theta + e, st0.bgc, st0, stack))
                                    - float(fwd_c(theta - e, st0.bgc, st0, stack))) / (2 * float(e[i])))
                     rec["fd"][str(h)] = fd
+            print(f"{d:4d} d {kind}: J {rec['J']:.6e}  noise {noise:.2e}  |dJ/dx0| {rec['x0_norm']:.3e}  "
+                  f"|x0 dJ/dx0| {rec['x0_scaled_norm']:.3e}  fwd {t_fwd:.1f}s  grad {t_grad:.1f}s  "
+                  f"compile {t_compile:.0f}s", flush=True)
+            rec["tracers"] = tracer_report(fx["lay"].names, st0.bgc, gx)
             with open(a.out / "horizon.jsonl", "a") as f:
                 f.write(json.dumps(rec) + "\n")
-            print(f"{d:4d} d {kind}: J {rec['J']:.6e}  |dJ/dx0| {rec['x0_norm']:.3e}  fwd {t_fwd:.1f}s  "
-                  f"grad {t_grad:.1f}s  compile {t_compile:.0f}s", flush=True)
             for i, k in enumerate(NAMES):
-                fds = "  ".join(f"FD({h}) {rec['fd'][h][i]: .6e} rel {abs(g[i] - rec['fd'][h][i]) / max(abs(rec['fd'][h][i]), 1e-300):.1e}"
+                fds = "  ".join(f"FD({h}) {rec['fd'][h][i]: .6e} +- {noise / (2 * float(h) * float(theta[i])):.1e}"
                                 for h in rec["fd"])
                 print(f"    {k:>10}: dJ/dlog p {g[i] * float(theta[i]): .4e}  adjoint {g[i]: .6e}  {fds}", flush=True)
 
