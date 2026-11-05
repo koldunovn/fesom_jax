@@ -13,23 +13,48 @@ that JAX gives. Two outputs matter equally:
 
 ## Why weak constraint (the lessons this builds on)
 
-From the abstracts only; the publisher and EPIC pages refused automated access. The user should correct this section.
+From the full papers (`/albedo/scratch/user/sloza/parameter_reference`, read 2026-11-05).
 
-- **Losa, Kivman, Schröter & Wenzel 2003** (J. Mar. Syst. 43, 31-49, doi:10.1016/j.jmarsys.2003.06.001): a Sequential
-  Importance Resampling filter combines state and parameter estimation on BATS data with a nine-compartment model. Some
-  parameters varied seasonally; the filtered solution beat fixed parameters; the seasonal phytoplankton mortality may mean
-  the mortality parameterization needs improving or that Chl:C varies in time.
-- **Losa, Kivman & Ryabchenko 2004** (J. Mar. Syst. 45, 1-20, doi:10.1016/j.jmarsys.2003.08.005): a weak-constraint method
-  on a 0-D four-component model; a posteriori evaluation of the relative credibility of data and model; a way to estimate
-  the accuracy of parameterizations. At Station "S", phytoplankton mortality, zooplankton losses and detritus breakdown
-  came out as the main sources of model error.
+- **Losa, Kivman & Ryabchenko 2004** (J. Mar. Syst. 45, 1-20, doi:10.1016/j.jmarsys.2003.08.005) is the direct ancestor: a
+  generalized inverse, `F(c, p) = int |dc/dt - M_p(c)|^2 dt + beta sum |L_m(c) - d_m|^2` (omega = 1), minimised over the whole
+  trajectory and six parameters by conjugate gradients, with a periodicity condition `c(0) = c(T)`, for a 0-D four-component
+  model in independent 5 x 5 degree North Atlantic boxes, against monthly CZCS chlorophyll.
+- **Losa, Kivman, Schröter & Wenzel 2003** (J. Mar. Syst. 43, 31-49, doi:10.1016/j.jmarsys.2003.06.001): a sequential (SIR)
+  counterpart for a nine-compartment model at BATS, with chlorophyll, nitrate, PON and POC; 1000 members; bacteria held out.
 
 What the plan takes from them:
 
-- **Time-varying parameters are a diagnostic, not a nuisance.** A parameter that must vary seasonally points to a process
-  that is wrong. That sets the form of the model error here (below).
-- **Model error belongs to named processes**, not to every grid point.
-- **The a posteriori credibility check is a deliverable**, not an afterthought.
+1. **Secondary inversion (2004, Section 7.2).** The weak solution breaks the model equations, so fluxes cannot be read from
+   it. Mass balance is then imposed strongly and the process formulas weakly: the residuals are redistributed among the
+   processes (primary production, grazing, mortality, ...), staying closest to what each formula gives. The processes that
+   move most are the parameterizations to improve (at Station S: phytoplankton mortality, zooplankton losses, detritus
+   breakdown; primary production and grazing held up). **With constant parameters this is the route from model error
+   to named processes, and it restores the budgets.**
+2. **Weights are chosen a posteriori.** Model error cannot be estimated a priori and data error barely. 2004 uses the maximum
+   data cost criterion (Kivman et al. 2001): the data cost tends to 0 for very small and very large beta, so take beta at its
+   maximum; well above it the solution goes negative. 2003 chose noise by trial and error, about 20 % of the characteristic flux
+   of each equation: a first guess for Q.
+3. **The credibility ratio.** `r` = data cost / model cost (2004 Eq. 17), mapped: r < 1 marks where the data are worse than the
+   model (coastal and shelf waters, the cloudy north-east), r < 10 over most of the basin meant model error cannot be neglected.
+4. **Model error has a systematic part.** The residuals were biased, markedly so along the Gulf Stream and North Atlantic
+   Current, although the formulation assumed white noise.
+5. **Parameters must be in the control.** With parameters fixed at a wrong set, the state-only inverse failed: "errors in
+   specification of the model parameters cannot be compensated by accounting for the model noise" (2004 Section 6; also 2003
+   Fig. 6 and Kagan et al. 1997).
+6. **Do the twin after the real inversion too.** Following Schartau et al. (2001), 2004 argues for a twin around the real
+   solution: the problem is nonlinear, so a twin elsewhere in control space says little about the error bars.
+7. **An apparent process signal can be an operator error.** The seasonal mortality of 2003 may be an artifact of a constant
+   Chl:C ratio in the observation operator. The discussion calls it "fact or artifact".
+8. **Not everything is determined.** 2004 tuned 6 parameters from 12 monthly data with no parameter penalty. In 2003, 8 of 15
+   reached stable estimates. `g` and `k3` enter one term and could not be separated. Chlorophyll alone "may not suffice",
+   and combination with in situ data is "vital". Holding out a compartment (bacteria) was a strong test.
+
+**A tension to keep in view.** Both papers conclude that parameters vary: 2004 found significant, stable spatial variation
+(larger than the twin's errors), found it "unlikely to find a unified set" for the North Atlantic "or even more for the global
+ocean", and answered "no" to whether estimates apply elsewhere. Constant global parameters are the user's deliberate start. Those
+were local 0-D models with one phytoplankton group, and part of that variation may be what REcoM's four PFTs and 3-D transport
+now represent explicitly, which is an open question this study can test. Where it does not, real parameter variation will appear
+in `eta` and must not be mistaken for a wrong process.
 
 The structural errors in the user's notes make the case for this model. Hand tuning did not remove them:
 
@@ -77,26 +102,39 @@ a one-year window take about 46 days on one Albedo GPU. The port's notes give 66
 
 ## The formulation
 
-Minimise over `z = (theta, b, x0, delta)`:
+**Decision (user, 2026-11-05): parameters are constant in time and space, at least to start.** The system is far more
+complicated than the 0-D models of 2003-04. Time- or space-varying parameters remain a possible later extension.
+
+Minimise over `z = (theta, b, x0, eta)`:
 
 ```
-J = 1/2 |theta - theta_b|^2_{B_theta}            parameters, log space (positive by construction)
+J = 1/2 |theta - theta_b|^2_{B_theta}            parameters: constant, log space (positive by construction)
   + 1/2 |b - b_b|^2_{B_b}                        observation-operator bias (Q, background backscatter)
   + 1/2 |x0 - x_b|^2_{B_x}                       initial state, low-dimensional basis
-  + 1/2 sum_k delta_k^T Q^-1 delta_k             model error
+  + 1/2 sum_k eta_k^T Q^-1 eta_k                 model error
   + 1/2 sum_i |y_i - H_i(x; b)|^2_{R_i}          observations, log space for Rrs and Chl
 
-with  x_{k+1} = M(x_k; theta_k),   log theta_k(r) = log theta + G delta_k(r)
+with  x_{k+1} = M(x_k; theta) + G eta_k
 ```
 
-**Model error as process-level parameter anomalies (recommended).** `delta` is a smooth anomaly in a few log-parameters
-over time (monthly, AR(1) through Q) and region (about 10 biomes). `delta = 0` recovers strong constraint exactly, so
-both are one code path. A large fitted `delta` with a clear seasonal or regional pattern is the structural diagnosis, in
-the spirit of the 2003 seasonal mortality. Candidates follow the 2004 result and the user's biases: phytoplankton
-mortality or loss, zooplankton loss, detritus remineralisation, Fe scavenging.
+**Model error as a low-dimensional additive term in the BGC tendencies (recommended).** `eta` is a smooth correction by
+month (AR(1) through Q) and region (about 10 biomes), with a time-mean part because the residuals of 2004 were biased; `G`
+spreads it over the surface layers. It covers **each compartment class**: nutrients, phytoplankton, zooplankton, detritus,
+so that the secondary inversion has a residual in each equation to redistribute. That is a few thousand controls.
+First-guess Q: about 20 % of each equation's characteristic flux (2003), the ratio then set a posteriori. `eta = 0` recovers
+strong constraint exactly, so both are one code path. It enters only BGC tracers, so the one-way adjoint stays one-way.
 
-**Optional additive term.** A low-dimensional tracer source on DIN and DFe per region and month, for errors no biological
-process can absorb, such as preformed N from a thin mode layer.
+**How this differs from 2004.** There the whole trajectory was the control, the cost was analytic in all variables, and no model
+integration was needed; that formulation is better posed than strong constraint. Ours keeps a forward model with a reduced
+`eta`, because 37 tracers on 3-D CORE2 rule out the full form, so it keeps more of strong constraint's nonlinearity and kinks.
+**To test on pi:** state controls at monthly nodes with the jumps as model error (multiple shooting), which is closer to 2004
+and gives short, independent windows.
+
+**Periodicity.** With repeat-year forcing, 2004's `c(0) = c(T)` applies to the upper ocean as a penalty, an alternative to
+free `x0` control. The bisect's surface Alk drift would violate it. Not for the interior, which is not periodic on a year.
+
+**Secondary inversion (after the weak solution).** Per region and month, mass balance strong, process formulas weak, using REcoM's
+flux diagnostics: the output is budgets that close, and a ranking of the parameterizations that carry the error.
 
 **Rejected: gridded model error at every step** (37 tracers x about 6M points x 11680 steps). Unaffordable, and far beyond
 what the data determine.
@@ -105,8 +143,9 @@ what the data determine.
 products (`jvp` of `vjp`) and Lanczos: leading eigenvectors show which parameter combinations the data determine, which
 replaces intuition about equifinality with a computed answer.
 
-**A posteriori checks.** `J_min` against its expected value (chi-square), Desroziers-type statistics to see whether B, Q
-and R are consistent, innovation whiteness, and held-out data. This is the modern form of the 2004 credibility analysis.
+**Weights and a posteriori checks.** Choose the data/model weight by the maximum data cost criterion (2004), one sweep in the
+twin and in Phase 4. Map the credibility ratio `r` by region. Add `J_min` against its expected value, Desroziers-type
+statistics for B, Q and R, and held-out data, including a held-out compartment as with bacteria in 2003.
 
 ## Observations
 
@@ -142,21 +181,23 @@ Log-space, from the user's sensitivity brackets, about 15-20 to start. Trim with
 - **Nutrients:** k_din_d, k_Fe, kScavFe, reminSi.
 - **Losses:** lossC, graz_max, agg_PP, rho_N, reminN.
 
-Fix at first: insensitive or dead ones (`P_cm*`, `alfa*`, res_phy_const, totalligand, SiCUptakeRatio).
+Fix at first: insensitive or dead ones (`P_cm*`, `alfa*`, res_phy_const, totalligand, SiCUptakeRatio). Expect pairs in one term
+to stay inseparable, like `g` and `k3` in 2004: `graz_max` with its half-saturation.
 
 ## Phases, each with an exit test
 
 ### Phase 0: foundations (no assimilation)
 
-- 0.1 Settle D1 (code and physics) after the bisect.
+- 0.1 Settle the code and physics (D1). The user adopts the ballasting fix `1cc2d0d3` in production (2026-11-05), so a
+  new reference run with the fix replaces `kdind15wco2sl1` as the starting point.
 - 0.2 fesom-jax runs the reference: map `RECOM_CO2LIM_SPECTRAL` to `spectral_co2lim` (the only active key it rejects in
   `kdind15wco2sl1`'s namelist), use the L1 OASIM set, add a parity gate against the Fortran.
 - 0.3 Port the Rrs operator: `RECOM_CALC_REFLEC` (out of scope today, `params.py`), then `rrs_compare.py`'s conversion
   (R -> rrs -> Rrs, band interpolation, ice and light masks) with Q as a control. Monthly means accumulated in the scan.
   Gate: against `rrs_compare.py` on the same fields.
 - 0.4 Make the optics differentiable: `load_tables` is host numpy, so table-derived quantities are constants today.
-- 0.5 Let parameters vary by region and month: `RecomParams` leaves are scalars; a broadcast and a per-step input are
-  needed, with `None`-means-off keeping the default jaxpr unchanged (the project rule; add the test).
+- 0.5 Add the model-error input: a per-step additive BGC tendency from `eta` by region and month, with `None`-means-off
+  keeping the default jaxpr unchanged (the project rule; add the test). `RecomParams` stay scalar.
 
 **Exit:** reference reproduced, Rrs matches offline, defaults byte-identical.
 
@@ -178,8 +219,9 @@ Synthetic observations with the real sampling and R from a perturbed truth; pi n
 - 2a Strong constraint: recover known parameters. Compute the Hessian spectrum; report which combinations are determined by
   Rrs alone, by Rrs + nutrients, and by all data. This turns the observability table into a formal result and tests whether
   the data set above is enough.
-- 2b Weak constraint: truth with a seasonally varying mortality, then fit with `delta` on and off. Strong constraint should
-  bias other parameters; weak constraint should recover the seasonal shape. This is the 2003 result as a controlled test.
+- 2b Weak constraint: a truth with a process the fitted model lacks (a seasonal mortality), then fit constant parameters
+  with `eta` on and off. Strong constraint should bias the parameters; weak constraint should keep them closer to the truth
+  and show the missing process in `eta`. This is the 2003 lesson as a controlled test.
 
 **Exit:** known parameters and model error recovered within posterior uncertainty; final parameter list and Q scales.
 
@@ -188,13 +230,21 @@ Synthetic observations with the real sampling and R from a perturbed truth; pi n
 CORE2, windowed as Phase 1 allows, core data, with operator bias `b`. Needed as the comparator for Phase 4, and it should
 show where parameters are forced to compensate.
 
+Also compute the gradient of the misfit per biome: if biomes pull a parameter in opposite directions, constant parameters
+are under strain there. This tests the 2004 conclusion at the cost of a few gradients, with no varying parameters.
+
 **Exit:** lower misfit on held-out data than the reference, or a documented reason why not.
 
 ### Phase 4: real data, weak constraint
 
-Add `delta` and the x0 basis. Inspect the patterns of `delta` by process, region and season against the known biases.
+Add `eta` and the x0 basis, with the weight by maximum data cost. Then, in this order:
 
-**Exit:** chi-square and Desroziers checks consistent; parameters credible; a stated structural diagnosis.
+- rule out operator error (`b`, the Chl:C lesson of 2003) and real parameter variation (the per-biome gradients) as causes;
+- run the secondary inversion: closed budgets and the ranking of parameterizations;
+- map `r`, to see where Rrs and the model are each the less credible;
+- repeat a twin around this solution, for honest error bars (2004).
+
+**Exit:** checks consistent; parameters credible with error bars; budgets closed; a stated structural diagnosis.
 
 ### Phase 5: back to the Fortran, and the science
 
@@ -202,11 +252,21 @@ Run the estimated set in the Fortran model over several years to see that the im
 in production. Multi-year quantities (preformed nutrients, interior carbon) get checked here, or via EKI as a
 cross-check. Then write up.
 
+### Phase 1 record
+
+- 2026-11-05, 1-day smoke on pi, chl cost, CPU (job 48832211): adjoint against central FD at h = 1e-4: `expon_phy` 1.9e-7,
+  `rho_N` 1.1e-6, `deg_Chl` 7.2e-8, `cdomcoeff` 8.6e-7, `k_Fe_d` 4.4e-7; `graz_max` numerically zero. Gradient 18x forward.
+- GPU, one A100 (job 48870956): gradient 6.3 s against forward 1.4 s per day, **4.5x**; the 18x was the CPU. Gradients
+  agree with the CPU run to 7 digits. **Physics is out of the linearisation:** linearising one step with respect to
+  (parameters, BGC state), every physics field's tangent is exactly zero (T, S, uv, w, hnode, Kv, Av, ice, ...); only
+  `bgc`, `bgc_old`, `bgc_benthos`, `bgc_carb`, `bgc_diag` are nonzero. The tangent costs 0.030 s against 0.043 s for the
+  forward step. This confirms the structure in point 1 above for one step; the horizon itself is still unmeasured.
+
 ## Decisions for the user
 
-- **D1. Which code and physics are we estimating for?** Parameters are conditional on both. Physics carries 0.86 of the
-  diatom gap and 1.00 of the sea-ice gap (bisect stage 1). Recommendation: the FESOM 2.8 pair (validated Fortran against
-  fesom-jax, GM/Redi on). But it carries the r692 REcoM, including `1cc2d0d3`, which production lacks: **wait for C1.**
+- **D1. Which physics are we estimating for?** Parameters are conditional on it. Physics carries 0.86 of the diatom gap
+  and 1.00 of the sea-ice gap (bisect stage 1). Recommendation: the FESOM 2.8 pair (validated Fortran against fesom-jax,
+  GM/Redi on). The code side is settled: bisect C1 showed `1cc2d0d3` is the whole code gap, and the user adopts it.
 - **D2. Main aim first:** better production parameters, or structural diagnosis? The method serves both; it changes which
   phases get the depth.
 - **D3. Hardware:** is GH200 or NVLink time available (Levante, JUPITER)? On one Albedo A100 global one-year optimisation
@@ -218,8 +278,9 @@ cross-check. Then write up.
 
 ## Risks
 
-- **Fitting physics errors with biology.** The thin mode layer cannot be repaired by REcoM parameters. Hence `delta`, the
-  additive term, and care with preformed N as a target.
+- **Fitting physics errors with biology.** The thin mode layer cannot be repaired by REcoM parameters. Hence `eta`, and care
+  with preformed N as a target.
+- **Reading `eta` wrongly.** It mixes wrong processes, operator error and real parameter variation: see the order in Phase 4.
 - **Spin-up.** Windows of a year do not reach deep equilibrium; nutrients in the interior respond over decades. Windows
   constrain fast processes, so interior targets need x0 control or a low weight.
 - **Non-smoothness.** Limiters, floors and `min()` limitation laws give kinks; L-BFGS may stall. Log-space misfits and warm

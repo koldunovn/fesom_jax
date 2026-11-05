@@ -134,6 +134,32 @@ build's `flags.make`; namelists identical to B1's). C1 + C2 + C3 should add up t
 deletes the `wFlux*` allocations and zeroing that `96137d06` added, leaving `wFluxPhy`/`wFluxDia = 0.d0` in `recom_init`,
 the only uses of those arrays there; removed as the commit intends. `ten` differs from `_recom692` by exactly `1cc2d0d3`.
 
+### Stage 2a result (2026-11-05)
+
+All jobs exit 0. **C0 reproduces kdind15w January: 133/133 fields bit-identical**, so the builds are sound.
+
+Share of the gap, 1998 means, 1 - position:
+
+| run | NPP | small phyto | diatom | Chl | CO2 flux | pCO2 | ice N / S |
+|---|---|---|---|---|---|---|---|
+| C1 `1cc2d0d3` | 0.390 | 0.626 | 0.191 | 0.104 | 0.744 | 0.869 | 0 / 0 |
+| C2 the other ten | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0 / 0 |
+| C3 `63283bc9` | 0.000 | 0.000 | 0.000 | 0.000 | -0.002 | -0.001 | 0 / 0 |
+| sum C1-C3 | 0.390 | 0.627 | 0.191 | 0.104 | 0.742 | 0.868 | 0 / 0 |
+| B1, all together | 0.390 | 0.627 | 0.191 | 0.104 | 0.742 | 0.868 | 0 / 0 |
+
+- **The whole code effect is the ballasting fix `1cc2d0d3`**: 4.04 of 10.35 Pg C/yr NPP and 0.279 of 0.375 Pg C/yr CO2 flux,
+  with the same month-by-month growth as B1. The commits add up exactly.
+- **The other ten commits are numerically inert for this setup:** C2 is bit-identical to kdind15w in January, June and December
+  in all six fields checked, with a different library. The refactors and allocation fixes change nothing here.
+- **`63283bc9` has no global effect**: C3 is not bit-identical (local chaos-like differences), but its global means agree
+  with kdind15w within noise.
+- What the fix does: the old code applied ballasting to detrital carbon only above a biomass of 0.001 ("OG Todo: remove");
+  its commit message says this "results in large air-sea co2flux uptake", which is the gap's sign.
+- Production (`e4d41f52`) still lacks `1cc2d0d3`, so `kdind15wco2sl1` does too. fesom-jax and the FESOM 2.8 branch follow the
+  fixed code. Whether production adopts it is the user's decision.
+- The remaining gap is physics. Stage 2b (the eight singles) is not started.
+
 ## The production code change of 2026-11-04 (`e4d41f52`)
 
 `&spectral ice_light_transm` (light test L2), default 0, which keeps the old `(1 - a_ice)` expression. The user's check
