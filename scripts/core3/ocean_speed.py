@@ -10,7 +10,8 @@ the fields for the atmosphere. Monthly sums and the w/fw extras are on as in `--
 
 run writes OUT.json (ms per interval: every timed interval, median, mean; peak device memory) and OUT.npz (every
 State leaf at the end in global entity order, its own dtype). --prof calls cudaProfilerStart/Stop around the timed
-intervals (run under nsys --capture-range=cudaProfilerApi). compare prints per field max |a-b|, the max relative
+intervals (run under nsys --capture-range=cudaProfilerApi); --compare-to REF.npz compares the final State with a
+reference in the run (with --no-save, no State copy is written). compare prints per field max |a-b|, the max relative
 difference (|a-b| / max|a|) and whether the two are bitwise equal.
 """
 from __future__ import annotations
@@ -38,7 +39,7 @@ def _cudart():
     return ctypes.CDLL(sorted(lib)[0])
 
 
-def _save_state(state, st, path):
+def _state_arrays(state, st):
     import jax
     from fesom_jax.coupled import global_view
     out = {}
@@ -52,8 +53,34 @@ def _save_state(state, st, path):
                 out[k] = np.asarray(global_view(state, st, (k,))[k])
             except ValueError:
                 pass                                   # not a folded node / element field (scalars)
+    return out
+
+
+def _save_state(state, st, path):
+    out = _state_arrays(state, st)
     np.savez(path, **out)                                  # native dtypes (float32 State in single precision)
     return sorted(out)
+
+
+def _compare(A, B):
+    """Per field of two State dicts (or npz): bitwise, max |a-b|, max relative difference, count."""
+    rows = {}
+    for k in sorted(set(A.keys() if isinstance(A, dict) else A.files) & set(B.keys() if isinstance(B, dict)
+                                                                           else B.files)):
+        x, y = np.asarray(A[k]), np.asarray(B[k])
+        if x.shape != y.shape:
+            rows[k] = {"shape": [list(x.shape), list(y.shape)]}
+            continue
+        if x.dtype.kind != "f":
+            rows[k] = {"bitwise": bool(np.array_equal(x, y)), "ndiff": int((x != y).sum())}
+            continue
+        x, y = x.astype(np.float64), y.astype(np.float64)
+        d = np.abs(x - y)
+        s = float(np.nanmax(np.abs(x))) if x.size else 0.0
+        rows[k] = {"bitwise": bool(np.array_equal(x, y, equal_nan=True)), "max_abs": float(np.nanmax(d)) if d.size
+                   else 0.0, "max_rel": (float(np.nanmax(d)) / s if s > 0 else 0.0), "ndiff": int((d > 0).sum()),
+                   "scale": s}
+    return rows
 
 
 def cmd_run(a):
@@ -112,30 +139,25 @@ def cmd_run(a):
                                                                                                 * 24 / 1e3, 3),
            "finite": fin, "peak_gb": mem, "calendar_end": st.calendar(),
            "xla_flags": os.environ.get("XLA_FLAGS", ""), "ms_all": [round(float(x), 2) for x in ms]}
+    if a.compare_to:               # compare the final State with a reference npz here instead of saving it
+        rows = _compare(_state_arrays(state, st), np.load(a.compare_to))
+        rec["compare_to"] = a.compare_to
+        rec["bitwise"] = all(r.get("bitwise", False) for r in rows.values())
+        rec["differ"] = {k: r for k, r in rows.items() if not r.get("bitwise", False)}
     if not a.no_save:
         rec["saved"] = _save_state(state, st, a.out + ".npz")
     with open(a.out + ".json", "w") as fh:
         json.dump(rec, fh, indent=1)
-    print("[speed] " + json.dumps({k: v for k, v in rec.items() if k not in ("ms_all", "saved")}), flush=True)
+    print("[speed] " + json.dumps({k: v for k, v in rec.items() if k not in ("ms_all", "saved", "differ")}),
+          flush=True)
+    if a.compare_to:
+        print(f"[speed] compare: {'BITWISE' if rec['bitwise'] else 'differ'} against {a.compare_to}; " + "; ".join(
+            f"{k} max_rel {r.get('max_rel')} n {r.get('ndiff')}" for k, r in list(rec["differ"].items())[:12]),
+            flush=True)
 
 
 def cmd_compare(a):
-    A, B = np.load(a.a), np.load(a.b)
-    rows = {}
-    for k in sorted(set(A.files) & set(B.files)):
-        x, y = A[k], B[k]
-        if x.shape != y.shape:
-            rows[k] = {"shape": [list(x.shape), list(y.shape)]}
-            continue
-        if x.dtype.kind != "f":
-            rows[k] = {"bitwise": bool(np.array_equal(x, y)), "ndiff": int((x != y).sum())}
-            continue
-        x, y = x.astype(np.float64), y.astype(np.float64)
-        d = np.abs(x - y)
-        s = float(np.nanmax(np.abs(x))) if x.size else 0.0
-        rows[k] = {"bitwise": bool(np.array_equal(x, y, equal_nan=True)), "max_abs": float(np.nanmax(d)) if d.size
-                   else 0.0, "max_rel": (float(np.nanmax(d)) / s if s > 0 else 0.0), "ndiff": int((d > 0).sum()),
-                   "scale": s}
+    rows = _compare(np.load(a.a), np.load(a.b))
     allbit = all(r.get("bitwise", False) for r in rows.values())
     print(f"compare {a.a} vs {a.b}: {'BITWISE' if allbit else 'differ'}")
     for k in ("T", "S", "uv", "eta_n", "a_ice", "m_ice", "m_snow", "u_ice", "tke", "w"):
@@ -162,6 +184,8 @@ def main():
     r.add_argument("--intervals", type=int, default=24)
     r.add_argument("--prof", action="store_true")
     r.add_argument("--no-save", action="store_true")
+    r.add_argument("--compare-to", default=None, help="reference State npz: compare the final State with it "
+                   "(bitwise / max relative difference per field, in OUT.json) instead of keeping a copy")
     r.add_argument("--check-forcing", action="store_true", help="compare the jitted and the eager forcing builds")
     c = sub.add_parser("compare")
     c.add_argument("a")
