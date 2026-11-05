@@ -22,6 +22,8 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import os
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -121,7 +123,13 @@ def potit(salz, pt, pres, rfpres, n_iter: int = 100):
         return tin, epsi, done | conv
 
     z = jnp.zeros_like(pt)
-    tin, _, _ = jax.lax.fori_loop(0, n_iter, body, (z, z, jnp.zeros(pt.shape, bool)))
+    # gpu.potit_unroll (FESOM_POTIT_UNROLL=u): u iterations per loop trip (fori_loop's unroll), so XLA fuses them
+    # into one kernel; the same operations per lane in the same order
+    u = int(os.environ.get("FESOM_POTIT_UNROLL", "0") or 0)
+    if u > 1:
+        tin, _, _ = jax.lax.fori_loop(0, n_iter, body, (z, z, jnp.zeros(pt.shape, bool)), unroll=u)
+    else:
+        tin, _, _ = jax.lax.fori_loop(0, n_iter, body, (z, z, jnp.zeros(pt.shape, bool)))
     return tin
 
 

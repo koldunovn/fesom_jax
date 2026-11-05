@@ -38,7 +38,14 @@ def _mm_times(mesh: Mesh, X):
     ``Σ_{elem∋row} area/12·(X[row] + ΣX_elem)``. Cavity elements contribute 0."""
     en = mesh.elem_nodes
     Xv = X[en]                                              # [elem,3]
-    contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + Xv.sum(axis=1, keepdims=True))
+    if ops.env_switch("FESOM_ICE_MM_SUM3"):
+        # gpu.ice_mm_sum3: the element sum as two explicit adds, (X0 + X1) + X2. XLA otherwise matches
+        # `Xv + Xv.sum(1)` as a Triton "softmax" fusion with one warp per element row: 257 us a call on a GH200
+        # for 426k x 3 floats (9 calls a step, 7 % of the coupled CORE3 ocean's kernel time)
+        s3 = (Xv[:, 0] + Xv[:, 1]) + Xv[:, 2]
+        contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + s3[:, None])
+    else:
+        contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + Xv.sum(axis=1, keepdims=True))
     contrib = jnp.where((mesh.ulevels <= 1)[:, None], contrib, 0.0)
     return ops.scatter_add(contrib, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
 
@@ -148,8 +155,16 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
     elem_lo = jnp.minimum(vals_l[en].min(1), vals[en].min(1))
     hi_flat = jnp.broadcast_to(elem_hi[:, None], (en.shape[0], 3))
     lo_flat = jnp.broadcast_to(elem_lo[:, None], (en.shape[0], 3))
-    hi = jax.ops.segment_max(hi_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
-    lo = jax.ops.segment_min(lo_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
+    if ops.env_switch("FESOM_ICE_FCT_EXTREME"):
+        # gpu.ice_fct_extreme: the cluster bounds as ordered gathers over the node's elements
+        # (ops.segment_extreme with the inverse map; max/min are exact in any order) instead of atomic
+        # scatter-max/min (1.7 ms an interval of the coupled CORE3 ocean on a GH200)
+        inv = getattr(mesh, "inv_elem_nodes", None)
+        hi = ops.segment_extreme(hi_flat.reshape(-1), en.reshape(-1), mesh.nod2D, "max", inv=inv)
+        lo = ops.segment_extreme(lo_flat.reshape(-1), en.reshape(-1), mesh.nod2D, "min", inv=inv)
+    else:
+        hi = jax.ops.segment_max(hi_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
+        lo = jax.ops.segment_min(lo_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
     # Pad / all-non-cell nodes keep the ±inf sentinel (empty/masked segment). The clipping
     # ratios below mask them (`fp>0`/`fm<0`), but ±inf poisons the AD backward (0·inf=NaN —
     # the sharded reverse pass exposes it). Clamp to finite (forward byte-identical; the

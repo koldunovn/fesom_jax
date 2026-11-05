@@ -149,7 +149,17 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "se_wide": "FESOM_SE_WIDE", "se_unroll": "FESOM_SE_UNROLL", "step_unroll": "FESOM_STEP_UNROLL",
             "ice_static": "FESOM_ICE_STATIC", "chunk_tail": "FESOM_CHUNK_TAIL", "bgc_layout": "FESOM_BGC_LAYOUT",
             "bgc_halo": "FESOM_BGC_HALO", "cpl_forcing_jit": "FESOM_CPL_FORCING_JIT",
-            "serial_halo_skip": "FESOM_SERIAL_HALO_SKIP"}
+            "serial_halo_skip": "FESOM_SERIAL_HALO_SKIP", "ice_mm_sum3": "FESOM_ICE_MM_SUM3",
+            "ice_fct_extreme": "FESOM_ICE_FCT_EXTREME", "ice_scatter_fuse": "FESOM_ICE_SCATTER_FUSE",
+            "cg_prefix": "FESOM_CG_PREFIX", "potit_unroll": "FESOM_POTIT_UNROLL",
+            "column_direct": "FESOM_COLUMN_DIRECT"}
+# Lane ocean_speed2 (performance only, off when absent): `ice_mm_sum3` the ice FCT mass-matrix element sum as two
+# adds (ice_adv._mm_times; XLA's Triton row-reduction fusion of the 3-sum was 257 us a call); `ice_fct_extreme` the
+# ice FCT cluster bounds as ordered gathers (ops.segment_extreme) instead of atomic scatter-max/min; `ice_scatter_fuse`
+# (an integer 0-3) the mEVP stress-divergence ordered sums' barriers (ice_evp.stress_div_scatter); `cg_prefix` (an
+# integer m >= 0) the CG's first m masked iterations ahead of its while loop (ssh.cg_prefix); `potit_unroll` (an
+# integer u) the cavity potit iterations u per loop trip (cavity.potit); `column_direct` the column kernels on the
+# [ncol, K] arrays without the transpose kernels (column_kernel.direct).
 # `serial_halo_skip`: on one device every halo exchange returns its field (the one-device maps are the identity,
 # checked on the host): fesom_jax.halo.serial_skip_enabled; the same bits, no all_gather and permutation gather.
 # `cpl_forcing_jit` (coupled ocean, mode F): the interval's forcing build and the monthly sums as compiled programs
@@ -166,7 +176,7 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
 # (ice_ave_steps > 1): each step's ice update branch is fixed at trace time from the cycle's phase, no lax.cond and
 # no host sync a step (run_steps_sharded_forced ice_phase, FESOM_ICE_STATIC).
 _GPU_INT = ("mevp_wide", "cg_batch", "mevp_unroll", "forcing_procs", "forcing_ahead", "se_wide", "se_unroll",
-            "step_unroll", "chunk_tail")
+            "step_unroll", "chunk_tail", "ice_scatter_fuse", "cg_prefix", "potit_unroll")
 # `chunk_tail` (an integer q >= 0): a chunk shorter than the chunk length whose length is a multiple of q runs as
 # q-chunks (run.split_tails, FESOM_CHUNK_TAIL): one compiled length less where month ends leave 2q.
 _GPU_STR = ("bgc_layout", "bgc_halo")        # string-valued switches, passed through as written

@@ -816,6 +816,16 @@ def cg_batch() -> int:
     return k
 
 
+def cg_prefix() -> int:
+    """``FESOM_CG_PREFIX=m`` (``gpu.cg_prefix``, read at trace time; default 0): the CG runs its first m iterations
+    unrolled ahead of the while loop, each masked by the stopping test (:func:`cg_batch`'s masking), so the
+    iterate and the iteration count are unchanged and the host reads the loop predicate only after them."""
+    m = int(os.environ.get("FESOM_CG_PREFIX", "0") or 0)
+    if m < 0:
+        raise ValueError(f"FESOM_CG_PREFIX must be >= 0, got {m}")
+    return m
+
+
 def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
          reduce=None, reduce_pair=None, n_global=None, return_iters=False):
     """Preconditioned CG, a literal port of ``fesom_ssh_solve_cg``
@@ -876,6 +886,7 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
             return (x, r, z, p, sp0, resid, it + 1)
 
         k = cg_batch()
+        body_one = body
         if k > 1:
             # k iterations per trip of the while loop, each after the first masked by the stopping
             # test: the iterate is the one-at-a-time loop's (the masked steps are discarded by
@@ -890,6 +901,12 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
                 return c
 
         init = (x0, r0, z0, z0, sold0, resid0, jnp.array(0))
+        # gpu.cg_prefix (FESOM_CG_PREFIX=m): the first m iterations straight-line before the while loop, each
+        # masked by the stopping test as cg_batch masks its extra ones: the same iterate and count, and the
+        # loop's predicate is read by the host only after them
+        for _ in range(cg_prefix()):
+            live = cond(init)
+            init = jax.tree.map(lambda new, old: jnp.where(live, new, old), body_one(init), init)
         final = lax.while_loop(cond, body, init)
         # DIAGNOSTIC (env-gated, inert by default): report the PCG trip count + whether it
         # STOPPED ON maxiter rather than on the tolerance.  Added while chasing the ng5 x

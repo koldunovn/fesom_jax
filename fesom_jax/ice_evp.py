@@ -117,8 +117,14 @@ def stress_div_scatter(mesh: Mesh, s11, s12, s22, act, node_sum=None):
         axis=1)
     if node_sum is not None:
         return node_sum(cu), node_sum(cv)
-    u_rhs = ops.scatter_add(cu, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
-    v_rhs = ops.scatter_add(cv, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
+    # gpu.ice_scatter_fuse (FESOM_ICE_SCATTER_FUSE, a fusion choice for the ordered sums only, same additions):
+    # 1 = no barrier on the node sums, so the node solve fuses into the gather chain (one kernel less a subcycle);
+    # 2 = also a barrier on the element terms, computed once with the stress instead of once per gathered slot;
+    # 3 = the element-terms barrier with the default barrier on the sums
+    mode = ops.env_int("FESOM_ICE_SCATTER_FUSE")
+    bar = {0: None, 1: (False, False), 2: (True, False), 3: (True, True)}[mode]
+    u_rhs = ops.scatter_add(cu, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None), barrier=bar)
+    v_rhs = ops.scatter_add(cv, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None), barrier=bar)
     return u_rhs, v_rhs
 
 

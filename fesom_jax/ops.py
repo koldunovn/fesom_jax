@@ -22,6 +22,7 @@ Fidelity / AD notes
 
 from __future__ import annotations
 
+import functools
 import os
 
 import jax
@@ -64,6 +65,17 @@ def ordered_sums_enabled() -> bool:
     ``segment_sum``, which a GPU lowers to atomic scatter-adds (slow for f64 3-D fields, and
     non-deterministic). Off by default: the ``inv`` maps are then not even built (``mesh.inv_* = None``)."""
     return os.environ.get("FESOM_ORDERED_SUMS", "0").strip() not in ("", "0")
+
+
+def env_switch(name: str) -> bool:
+    """A trace-time on/off environment switch (``gpu.*`` keys of :mod:`fesom_jax.run_config`): set and not "0"."""
+    return os.environ.get(name, "0").strip() not in ("", "0")
+
+
+def env_int(name: str, default: int = 0) -> int:
+    """A trace-time integer environment switch (``gpu.*`` keys of :mod:`fesom_jax.run_config`)."""
+    v = os.environ.get(name, "").strip()
+    return int(v) if v else default
 
 
 def ordered_sums_barrier() -> tuple[bool, bool]:
@@ -112,7 +124,7 @@ def ordered_vjp_enabled() -> bool:
     return os.environ.get("FESOM_ORDERED_VJP", "0").strip() not in ("", "0")
 
 
-def ordered_sum(vals_flat, inv, seg_flat=None):
+def ordered_sum(vals_flat, inv, seg_flat=None, barrier=None):
     """``out[t] = 0 + vals_flat[inv[t, 0]] + vals_flat[inv[t, 1]] + ...`` as an explicit left-to-right
     chain over the ``D`` slots (no ``jnp.sum``, which XLA may reassociate); the sentinel position
     ``vals_flat.shape[0]`` reads 0 (``mode="fill"``), so a short row adds +0.0 after its last entry. The
@@ -122,15 +134,17 @@ def ordered_sum(vals_flat, inv, seg_flat=None):
     ``[N, *rest]``. Default AD (the gathers' transpose, a scatter-add of the cotangent — atomic on a GPU); with
     ``seg_flat`` (the index ``inv`` inverts, ``[n]``) and :func:`ordered_vjp_enabled` the transpose is the gather
     ``vals_bar[i] = out_bar[seg_flat[i]]`` (0 where ``seg_flat`` has no target) instead: no atomics. The forward
-    is the same either way."""
+    is the same either way. ``barrier`` (``(on the values, on the sums)``, default :func:`ordered_sums_barrier`)
+    overrides where the ``optimization_barrier`` goes for this call only (a fusion choice; the additions are the
+    same)."""
     if seg_flat is not None and ordered_vjp_enabled():
-        return _ordered_sum_vjp(vals_flat, jnp.asarray(inv), jnp.asarray(seg_flat))
-    return _ordered_chain(vals_flat, inv)
+        return _ordered_sum_vjp(vals_flat, jnp.asarray(inv), jnp.asarray(seg_flat), barrier)
+    return _ordered_chain(vals_flat, inv, barrier)
 
 
-def _ordered_chain(vals_flat, inv):
+def _ordered_chain(vals_flat, inv, barrier=None):
     inv = jnp.asarray(inv)
-    bar_in, bar_out = ordered_sums_barrier()
+    bar_in, bar_out = ordered_sums_barrier() if barrier is None else barrier
     if bar_in:
         vals_flat = lax.optimization_barrier(vals_flat)
     out = None
@@ -140,16 +154,16 @@ def _ordered_chain(vals_flat, inv):
     return lax.optimization_barrier(out) if bar_out else out
 
 
-@jax.custom_vjp
-def _ordered_sum_vjp(vals_flat, inv, seg_flat):
-    return _ordered_chain(vals_flat, inv)
+@functools.partial(jax.custom_vjp, nondiff_argnums=(3,))
+def _ordered_sum_vjp(vals_flat, inv, seg_flat, barrier=None):
+    return _ordered_chain(vals_flat, inv, barrier)
 
 
-def _ordered_sum_vjp_fwd(vals_flat, inv, seg_flat):
-    return _ordered_chain(vals_flat, inv), (seg_flat, inv.shape[0])
+def _ordered_sum_vjp_fwd(vals_flat, inv, seg_flat, barrier=None):
+    return _ordered_chain(vals_flat, inv, barrier), (seg_flat, inv.shape[0])
 
 
-def _ordered_sum_vjp_bwd(res, out_bar):
+def _ordered_sum_vjp_bwd(barrier, res, out_bar):
     seg, n_out = res
     ok = (seg >= 0) & (seg < n_out)
     g = jnp.take(out_bar, jnp.where(ok, seg, 0), axis=0)
@@ -160,7 +174,7 @@ def _ordered_sum_vjp_bwd(res, out_bar):
 _ordered_sum_vjp.defvjp(_ordered_sum_vjp_fwd, _ordered_sum_vjp_bwd)
 
 
-def scatter_add(vals, seg, num_segments: int, inv=None):
+def scatter_add(vals, seg, num_segments: int, inv=None, barrier=None):
     """Differentiable masked segment-sum.
 
     Sums ``vals`` into ``num_segments`` output rows according to ``seg``. The
@@ -170,7 +184,8 @@ def scatter_add(vals, seg, num_segments: int, inv=None):
 
     ``inv`` (optional): ``seg``'s :func:`inverse_map` (e.g. ``mesh.inv_edges`` for ``mesh.edges``).
     With it and :func:`ordered_sums_enabled`, the sum is the :func:`ordered_sum` (ordered gathers, no
-    atomics on a GPU); otherwise the ``segment_sum`` (the default, byte-identical).
+    atomics on a GPU); otherwise the ``segment_sum`` (the default, byte-identical). ``barrier``: the ordered
+    sum's barrier placement for this call (:func:`ordered_sum`; ``None`` = :func:`ordered_sums_barrier`).
 
     ``vals``: ``[*S, *rest]``  ``seg``: ``[*S]``  →  out ``[num_segments, *rest]``.
     """
@@ -187,7 +202,7 @@ def scatter_add(vals, seg, num_segments: int, inv=None):
     if inv is not None and ordered_sums_enabled():
         if tuple(inv.shape[:1]) != (num_segments,):
             raise ValueError(f"scatter_add: inv rows {inv.shape[0]} != num_segments {num_segments}")
-        return ordered_sum(vals_flat, inv, seg_flat)
+        return ordered_sum(vals_flat, inv, seg_flat, barrier=barrier)
 
     valid = seg_flat >= 0
     safe_seg = jnp.where(valid, seg_flat, 0)
