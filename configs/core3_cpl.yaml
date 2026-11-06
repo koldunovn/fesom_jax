@@ -120,7 +120,15 @@ gpu:
                           # (broadcasts and casts inside the stage programs, scalars / month rows placed once;
                           # dist_N: the lane gather inside the assembly program): 1 GH200 54.5 against 55.9, with
                           # the two above on 2 GH200 35.8 against 38.3 (-6.5 %); bitwise
-  # @@COUPLED@@
+  # the three on: 1 GH200 54.5 against 55.9 ms, 2 GH200 35.8 against 38.3; 1 A100 107.0 against 108.3, 2 A100 66.1
+  # against 70.1; all bitwise. Coupled jaxcpl --wam-concurrent 10 days (median s per day from day 4, the atmosphere
+  # State and every progress value bitwise against the baseline of the same job, job 28765573): GH200 1+1+1 1.50 / 1.50
+  # against 1.52 / 1.52; 1+2+1 1.52 / 1.56 against 1.52 / 1.53 (the same baseline ran 1.53-1.59 in other jobs: no
+  # change within the spread). Both coupled configurations are set by the atmosphere's step and its main thread, not
+  # by the ocean: with the ocean's forcing built ahead (measured, not kept) the main thread never waited for the ocean
+  # any more and the day did not get faster. "ocean busy" (AWICM_OCEAN_PARTS) counts, at each interval's start, the
+  # wait for the copy of the forcing from the atmosphere's device, held while that device runs its step.
+  # measured and left off: mevp_wide 20 / 30 with the three (35.2 / 34.9 against 35.1 with 12, bitwise, no clear gain)
 output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/cpl
 snapshot_every: 48
 checkpoint_every: 1440
