@@ -109,6 +109,18 @@ gpu:
   # measured and left off: cg_prefix 12 / 16 (65.6, bitwise, slower: the masked straight-line iterations cost more
   # than the 3-4 host syncs they save), column_direct (109.4, bitwise, the column kernels read [ncol, K] rows
   # strided), ssh_rhs_split (65.2, bitwise, no gain), ice_scatter_fuse 1 / 3 (65.1 / 64.5)
+  # --- lane ocean_speed3 (2026-11-05/06; same harness, the lane's runs under
+  # /work/ba1583/a270088/awicm/core3/ocean_speed3/cpl; today's baseline 55.7 ms on 1 GH200, 38.4 on 2 GH200 (dist_2);
+  # "bitwise" as above):
+  o2a_lanes_surface: true # dist_N: ocean_to_atm gathers only level 1 of T, S, uv from the lanes (it all-reduced the
+                          # whole 3-D T, S and uv, 250 MB, for their surface level): 2 GH200 36.3 against 38.4; bitwise
+  mevp_wide_barrier: true # dist_N mevp_wide: the element terms of the wide mEVP's node sums once, behind a barrier
+                          # (ice_scatter_fuse 2 for the wide path): 2 GH200 37.5 against 38.4; bitwise
+  cpl_forcing_lean: true  # the interval's forcing build without eager ops or per-interval host-to-device copies
+                          # (broadcasts and casts inside the stage programs, scalars / month rows placed once;
+                          # dist_N: the lane gather inside the assembly program): 1 GH200 54.5 against 55.9, with
+                          # the two above on 2 GH200 35.8 against 38.3 (-6.5 %); bitwise
+  # @@COUPLED@@
 output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/cpl
 snapshot_every: 48
 checkpoint_every: 1440

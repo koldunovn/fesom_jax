@@ -122,7 +122,6 @@ class OceanStatic:
     submit: Any = None
     mevp_wide: Any = None     # gpu.mevp_wide's MevpWideHost (dist_N only), None = the per-subcycle exchange
     _lanes: Any = None        # the jitted global -> lanes gather of the forcing (dist_N)
-    _lanes_here: Any = None   # prepare_interval's gather onto the lanes where the forcing is (dist_N)
     _views: dict = dataclasses.field(default_factory=dict)   # the jitted lanes -> global gathers (dist_N)
     _fjit: dict = dataclasses.field(default_factory=dict)    # gpu.cpl_forcing_jit: the compiled forcing builds
     _mon_add: Any = None                                     # ... and the monthly sums' compiled addition
@@ -462,19 +461,13 @@ def ocean_interval(state, static: OceanStatic, forcing: dict, nsteps: int | None
     if mode != static.mode:
         raise ValueError(f"the ocean was built for mode {static.mode!r}, not {mode!r}")
     dates = static.dates(nsteps)
-    if isinstance(forcing, PreparedForcing):          # prepare_interval's output: the forcing stack is built
-        if (forcing.step0, forcing.nsteps) != (static.step, nsteps):
-            raise ValueError(f"prepared forcing for steps {forcing.step0}+{forcing.nsteps}, the ocean is at "
-                             f"{static.step}+{nsteps}")
-        seq = place_prepared(forcing, static).seq
-    elif mode == "bulk":
+    if mode == "bulk":
         seq = bulk_step_forcing(forcing, static, dates)
     else:
         from . import flux
         build = flux.flux_step_forcing_jit if flux.forcing_jit_enabled() else flux.flux_step_forcing
         state, seq = build(state, forcing, static, dates)
-    if static.npes > 1 and not isinstance(forcing, PreparedForcing) and not (
-            mode == "flux" and flux.forcing_jit_enabled() and flux.forcing_lean_enabled()):
+    if static.npes > 1 and not (mode == "flux" and flux.forcing_jit_enabled() and flux.forcing_lean_enabled()):
         seq = to_lanes(seq, static)            # (gpu.cpl_forcing_lean: gathered onto the lanes by the build)
     jfn, a = static.executable(nsteps, static.bootstrap, state)
     out = jfn(a[0], state, a[2], a[3], a[4], seq, *a[6:])
@@ -495,63 +488,6 @@ def ocean_interval(state, static: OceanStatic, forcing: dict, nsteps: int | None
         static._mon_count += nsteps
     static.step += nsteps
     return state
-
-
-@dataclasses.dataclass(frozen=True)
-class PreparedForcing:
-    """The forcing stack of the interval of ``nsteps`` steps starting at absolute step ``step0``, built ahead of the
-    interval (:func:`prepare_interval`) where the forcing lived, and ``placed`` on the ocean's devices or not yet
-    (:func:`place_prepared`)."""
-    step0: int
-    nsteps: int
-    seq: Any
-    placed: bool = False
-
-
-def prepare_interval(forcing: dict, static: OceanStatic, step0: int, nsteps: int | None = None) -> PreparedForcing:
-    """Mode F with ``gpu.cpl_forcing_jit``: the forcing stack :func:`ocean_interval` builds from ``forcing`` for the
-    interval starting at absolute step ``step0`` (``static.step`` when it runs), built on the device ``forcing``
-    lives on with the same compiled programs as inside :func:`ocean_interval` (dist_N: and gathered onto the lanes
-    there), not yet copied to the ocean's devices (:func:`place_prepared`, or :func:`ocean_interval` does it). So a
-    caller can build the next interval's forcing on another thread while the ocean runs the current one, without a
-    copy between devices on that thread. Pass the result to :func:`ocean_interval` as ``forcing``: the same values
-    as giving it ``forcing`` itself (copies and gathers only between the same programs)."""
-    from . import flux
-    nsteps = static.nsteps if nsteps is None else int(nsteps)
-    if static.mode != "flux" or not flux.forcing_jit_enabled():
-        raise NotImplementedError("prepare_interval: mode F with gpu.cpl_forcing_jit only")
-    dates = static.dates(nsteps, start=int(step0))
-    leaf = next(v for v in forcing.values() if isinstance(v, jax.Array))
-    dev = next(iter(leaf.devices()))
-    _, seq = flux.flux_step_forcing_jit(None, forcing, static, dates, device=dev)
-    if static.npes > 1:
-        if static._lanes_here is None:
-            from ..zarr_output import _folded_gid_owned
-            gid, _ = _folded_gid_owned(static.part, static.sm, "nod")
-            idx, pad = np.where(gid >= 0, gid, 0).astype(np.int32), gid < 0
-
-            def f(seq, idx, pad):
-                return jax.tree.map(lambda a: jnp.where(pad, jnp.asarray(1, a.dtype), a[:, idx]), seq)
-            static._lanes_here = {"f": jax.jit(f), "host": (idx, pad)}
-        L = static._lanes_here
-        if dev not in L:
-            L[dev] = jax.device_put(L["host"], dev)
-        seq = L["f"](seq, *L[dev])
-    return PreparedForcing(int(step0), nsteps, seq)
-
-
-def place_prepared(prep: PreparedForcing, static: OceanStatic, via_host: bool = False) -> PreparedForcing:
-    """``prep`` copied onto the ocean's devices (dist_N: each device its lanes) as :func:`ocean_interval` takes it;
-    ``via_host``: through host memory (device_get, then a put) instead of device-to-device copies."""
-    if prep.placed:
-        return prep
-    from jax.sharding import NamedSharding, PartitionSpec, SingleDeviceSharding
-    seq = jax.device_get(prep.seq) if via_host else prep.seq
-    if static.npes > 1:
-        seq = jax.device_put(seq, NamedSharding(static.device_mesh(), PartitionSpec(None, "p")))
-    else:
-        seq = jax.device_put(seq, SingleDeviceSharding(halo.first_devices(1)[0]))
-    return dataclasses.replace(prep, seq=seq, placed=True)
 
 
 def flux_jit_on() -> bool:
@@ -673,8 +609,8 @@ def ocean_to_atm(state, static: OceanStatic) -> dict:
                 (("cpl_ice_temp", "cpl_ice_alb") if static.mode == "flux" else ())
             gather = _lanes_to_global_fn(static)
             # gpu.o2a_lanes_surface (FESOM_O2A_LANES_SURFACE): only the surface level of T, S (and of uv with
-            # gpu.o2a_surface) goes through the owner-lane gather and the replication, not every level (the 3-D
-            # fields were all-gathered across the devices for their level 1 only); the same values
+            # gpu.o2a_surface) goes through the owner-lane gather and the replication, not every level (XLA
+            # all-reduced the whole 3-D T, S and uv across the devices, ~250 MB, for their level 1); the same values
             surf = os.environ.get("FESOM_O2A_LANES_SURFACE", "0").strip() not in ("", "0")
             uv_surf = surf and os.environ.get("FESOM_O2A_SURFACE", "0").strip() not in ("", "0")
 

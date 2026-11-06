@@ -1,7 +1,7 @@
-"""Lane ocean_speed3 (CPU): ``coupled.prepare_interval`` (the forcing stack built ahead, where the forcing lives,
-then placed) gives the interval bitwise what ``ocean_interval`` gives with the forcing dict itself, on one device
-and on CORE2 ``dist_2`` (two fake CPU devices); and ``gpu.o2a_lanes_surface`` gives ``ocean_to_atm`` the same
-fields on ``dist_2``. One coupled interval of the CORE2 coupled configuration in mode F from its restart."""
+"""Lane ocean_speed3 (CPU): ``gpu.cpl_forcing_lean`` gives the coupled interval bitwise what the staged forcing build
+gives, on one device and on CORE2 ``dist_2`` (two fake CPU devices); ``gpu.o2a_lanes_surface`` gives
+``ocean_to_atm`` the same fields on ``dist_2``. One coupled interval of the CORE2 coupled configuration in mode F
+from its restart."""
 
 from __future__ import annotations
 
@@ -41,26 +41,6 @@ def _leaves(state):
 
 
 @avail
-@pytest.mark.parametrize("partition", ["serial", "dist_2"])
-def test_prepared_interval_bitwise(monkeypatch, partition):
-    from fesom_jax import coupled as C
-    monkeypatch.setenv("FESOM_CPL_FORCING_JIT", "1")
-    monkeypatch.setenv("FESOM_DIST_DIR", str(DIST.parent))
-    out = []
-    for prep in (False, True):
-        state, st = C.init_ocean(str(CFG), restart_in=str(RST), mode="flux", nsteps=2,
-                                 partition=None if partition == "serial" else partition)
-        fo = C.oasis_to_fesom(_forcing(st.nod2D))
-        f = C.prepare_interval(fo, st, st.step, 2) if prep else fo
-        state = C.ocean_interval(state, st, f, nsteps=2)
-        out.append(_leaves(state))
-    a, b = out
-    assert sorted(a) == sorted(b)
-    bad = [k for k in a if not np.array_equal(a[k], b[k], equal_nan=True)]
-    assert not bad, bad
-
-
-@avail
 def test_o2a_lanes_surface_dist2(monkeypatch):
     from fesom_jax import coupled as C
     monkeypatch.setenv("FESOM_DIST_DIR", str(DIST.parent))
@@ -79,18 +59,17 @@ def test_o2a_lanes_surface_dist2(monkeypatch):
 @pytest.mark.parametrize("partition", ["serial", "dist_2"])
 def test_forcing_lean_bitwise(monkeypatch, partition):
     """gpu.cpl_forcing_lean (no eager op, dist_2: the lanes gathered in the assembly program) against the staged
-    build, and the prepared path with it on."""
+    build."""
     from fesom_jax import coupled as C
     monkeypatch.setenv("FESOM_CPL_FORCING_JIT", "1")
     monkeypatch.setenv("FESOM_DIST_DIR", str(DIST.parent))
     out = []
-    for lean, prep in ((False, False), (True, False), (True, True)):
+    for lean in (False, True):
         monkeypatch.setenv("FESOM_CPL_FORCING_LEAN", "1" if lean else "0")
         state, st = C.init_ocean(str(CFG), restart_in=str(RST), mode="flux", nsteps=2,
                                  partition=None if partition == "serial" else partition)
         fo = C.oasis_to_fesom(_forcing(st.nod2D))
-        f = C.prepare_interval(fo, st, st.step, 2) if prep else fo
-        state = C.ocean_interval(state, st, f, nsteps=2)
+        state = C.ocean_interval(state, st, fo, nsteps=2)
         out.append(_leaves(state))
     for b in out[1:]:
         bad = [k for k in out[0] if not np.array_equal(out[0][k], b[k], equal_nan=True)]
