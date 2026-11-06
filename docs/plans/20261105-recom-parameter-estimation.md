@@ -189,6 +189,16 @@ Variational `R` = instrument/algorithm error + interannual variability + represe
 | **Get** | in-situ aCDOM | CDOM | not found | |
 | **Maybe** | BATS, HOT, Station P time series | seasonal cycle, 1-D checks | not found | the setting of the 2003-04 papers |
 
+**The satellite POC algorithm (read 2026-11-05).** BICEP v5.0 is exactly `POC = 292 (Rrs490/Rrs560)^-1.49` mg m-3: on January 2003 the
+fit returns 292.0 and -1.490, and the product matches the formula to 2e-7, so it holds no information beyond that ratio. It
+is Stramski et al. (2008) (a power law, exponent -1.639 for this ratio, from 12-270 mg m-3 in the tropical and subtropical Pacific and Atlantic, over
+50 pairs) recalibrated on in situ matchups by Type II regression, chosen over Loisel 2002, Le 2018 and Tran 2019. Stated error
+`POC_rmsd`, median 0.17 in log10 (a factor of 1.5). Limits: the same ratio drives Chl, so POC and Chl are "unrealistically
+forced to always covary" (Stramski 2008), and POC:Chl from this product carries no independent information; the high end is
+underestimated in turbid water (Li et al. 2023); the 2008 paper warns of *Phaeocystis* bloom data off the Rrs-bb relation.
+For validation, two comparisons: the algorithm applied to model Rrs (like with like, tests the optics), and model particulate carbon
+tracers against the product (tests the carbon, inherits the algorithm's error). Their difference shows the operator's share.
+
 **Do not double count.** OC-CCI Chl, adg_443, CMEMS PFT and CbPM all derive from the same radiances. If Rrs is assimilated,
 these are not independent data: keep them for validation, or use them with an honest shared error.
 
@@ -287,6 +297,16 @@ cross-check. Then write up.
   (parameters, BGC state), every physics field's tangent is exactly zero (T, S, uv, w, hnode, Kv, Av, ice, ...); only
   `bgc`, `bgc_old`, `bgc_benthos`, `bgc_carb`, `bgc_diag` are nonzero. The tangent costs 0.030 s against 0.043 s for the
   forward step. This confirms the structure in point 1 above for one step; the horizon itself is still unmeasured.
+
+- 2026-11-06, first sweep to 330 days from the 30-day restart (jobs 48871169-70): `|dJ/dx0|` Chl 0.14, 3.6e6, 3.9e11, 2.1e15, 3.7e27 at
+  5, 30, 90, 180, 330 days; DIN 0.12, 2.7e4, 2.9e11, 1.2e11, 1.4e22. Parameter gradients stay O(1) to 90 days, leave the FD range at 180
+  days for Chl (dJ/dlog p up to 25) and reach 1e13 at 330 days (DIN 1e8). Not usable beyond about 90 days from this young state.
+- Mature start (spin-up 48871811, test 48871812), Chl: noise of J 1.3e-7 at 1 day, 6.4e-7 at 5 days, about 50 times below the young state
+  at 5 days. Adjoint against FD (h = 1e-2) within 0.01-0.6 % at 1 day, 0.01-1.1 % at 5 days for five parameters; `graz_max` now live, within 0.4 %
+  at 1 day and 3 % at 5 days (slightly outside the noise bar). `|dJ/dx0|` 0.032 to 0.057, scaled 0.0034 to 0.0039: no growth so far. Zoo2 is
+  near its floor after two years (surface mean 1.9e-8). Windows beyond 5 days from the mature state are not yet measured.
+- FESOM 2.8 reference pair, first 22 months (Fortran 48872095, fesom-jax 48872096-98): NPP 1998 106.90 against 106.90 Pg C/yr, groups within
+  0.2 %, inventories within 1e-5 relative (DFe 3e-4), surface patterns corr 1.000. The first test of the spectral CO2 limitation against the Fortran: passed.
 
 ## Decisions for the user
 

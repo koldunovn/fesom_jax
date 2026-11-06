@@ -160,6 +160,12 @@ Share of the gap, 1998 means, 1 - position:
   fixed code. Whether production adopts it is the user's decision.
 - The remaining gap is physics. Stage 2b (the eight singles) is not started.
 
+### The fix on the reference (kdind15wco2sl1bf, job 48871413, 2026-11-06)
+
+kdind15wco2sl1 with `1cc2d0d3`, annual means 1998, 1999, 2000: NPP (three groups) -3.6, -5.9, -6.9 Pg C/yr; CO2 flux 0.32, 0.25, 0.32 becomes
+0.04, -0.45, -0.65 Pg C/yr; surface pCO2 +1.3, +3.3, +4.6 uatm; sea ice unchanged. The runs have `constant_CO2 = .true.`, 278 ppm. The effect still grows
+at the end of 2000, more slowly each year.
+
 ## The production code change of 2026-11-04 (`e4d41f52`)
 
 `&spectral ice_light_transm` (light test L2), default 0, which keeps the old `(1 - a_ice)` expression. The user's check
