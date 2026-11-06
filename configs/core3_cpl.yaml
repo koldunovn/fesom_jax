@@ -128,7 +128,8 @@ gpu:
   # by the ocean: with the ocean's forcing built ahead (measured, not kept) the main thread never waited for the ocean
   # any more and the day did not get faster. "ocean busy" (AWICM_OCEAN_PARTS) counts, at each interval's start, the
   # wait for the copy of the forcing from the atmosphere's device, held while that device runs its step.
-  # measured and left off: mevp_wide 20 / 30 with the three (35.2 / 34.9 against 35.1 with 12, bitwise, no clear gain)
+  # measured and left off: mevp_wide 20 / 30 with the first two on (2 GH200 35.2 / 34.9 against 35.1 with 12; bitwise,
+  # no clear gain)
 output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/cpl
 snapshot_every: 48
 checkpoint_every: 1440
