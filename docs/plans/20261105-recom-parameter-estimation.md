@@ -307,6 +307,14 @@ cross-check. Then write up.
   near its floor after two years (surface mean 1.9e-8). Windows beyond 5 days from the mature state are not yet measured.
 - FESOM 2.8 reference pair, first 22 months (Fortran 48872095, fesom-jax 48872096-98): NPP 1998 106.90 against 106.90 Pg C/yr, groups within
   0.2 %, inventories within 1e-5 relative (DFe 3e-4), surface patterns corr 1.000. The first test of the spectral CO2 limitation against the Fortran: passed.
+- Ballast freeze test, 2026-11-07 (jobs 48931248-49, `FESOM_ADJ_FREEZE_BALLAST=1`, stop-gradient on the particle densities, backward pass only;
+  backward scan 48931037 before it): forward unchanged. `|dJ/dx0|` at 330 days Chl 1.0e116 (full 6.4e123), DIN 2.5e103 (full 2.4e127), so ballasting is
+  not the whole cause. At 180 days the frozen gradient is worse than the full one: Chl 442 against 0.75, `expon_phy` -38 against -0.027 (FD -0.003 to -0.10).
+  The ballast path damps growth in the tangent there, so freezing it is not a remedy. Largest values move to PhyN and DIN (node 1455 level 6 at 180 days,
+  nodes 1823, 1882 at 330 days). FD stays normal, so the growth is in the local derivative, not in the response. The usable window stays 180 days.
+- Column Jacobian, 2026-11-07 (`--column-jacobian`): one-step Jacobian of single columns, raw and normalised by the column, spectral radius,
+  leading singular vector, tracer-pair blocks, FD along the leading vector. Smoke 48931649 (day 2, nodes 1455, 1823): FD agrees with the
+  tangent at h = 1e-2 to 1e-6. Full run 48931721: nodes 1455, 1763, 1822, 1823, 1882 on days 150-270, midnight and noon.
 
 ## Decisions for the user
 

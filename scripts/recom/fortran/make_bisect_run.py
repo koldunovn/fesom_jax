@@ -45,7 +45,8 @@ EXE = {   # name -> (fesom.x, libfesom.so, what it is)
                 "recom_spectral_r692 _recom692_dumps 63283bc9 with the production build's flags (build_alb)"),
     "r692rel": (MATCHED / "fesom.x", MATCHED / "libfesom.so",
                 "the matched run's executable (recom_spectral_r692 build_rel, 63283bc9; '-O3 -xHost')"),
-    # stage 2, code split: worktrees recom_bisect_<v> (local branches bisect_<v>) on e1e62886, production flags
+    # stage 2, code split: worktrees recom_bisect_<v> (local branches bisect_<v>) on e1e62886, production flags. The worktrees
+    # were removed on 2026-11-07 after the runs; the frozen copies stay in tmp_run_bisect/c_*. Rebuild before reusing these.
     **{v: (SPECTRAL / f"recom_bisect_{v}/install_alb/bin/fesom.x",
            SPECTRAL / f"recom_bisect_{v}/install_alb/lib64/libfesom.so", d) for v, d in {
         "e1base": "e1e62886 alone (the code of kdind15w), production flags: the control of the stage-2 builds",

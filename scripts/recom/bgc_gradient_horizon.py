@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import sys
 import time
@@ -124,6 +125,118 @@ def tangent_check(fx, st0, cf, day):
           f"  exactly zero: {dead}", flush=True)
 
 
+def backward_scan(fx, st0, cf, day, kind, end_day, snapshots, names):
+    """When does the reverse field blow up? The cost stays on the last day before ``end_day``; the gradient is taken from
+    snapshots of the forward run at later and later start days, so ``|dJ/dx(s)|`` traces the reverse field back through
+    the window. The first snapshot (going backward) with a huge value brackets the event."""
+    mesh, dt = fx["mesh"], fx["cfg"].dt
+    zero = jnp.zeros((mesh.elem2D, 2))
+    n_end = end_day * STEPS_PER_DAY
+    full = cf.stack(surface_forcing.dates_for_steps(1958, dt, n_end, start_day=day))
+    params = Params.defaults()._replace(recom=fx["cfg"].recom.load()[1]) if hasattr(Params, "_replace") else \
+        dataclasses.replace(Params.defaults(), recom=fx["cfg"].recom.load()[1])
+
+    @jax.jit
+    def advance(st, stack):
+        def one(s, sf):
+            return stepmod.step(s, mesh, fx["op"], zero, params, dt=dt, is_first_step=False, step_forcing=sf,
+                                forcing_static=fx["fs"], **fx["phys"]), None
+        return jax.lax.scan(one, st, stack)[0]
+
+    st, done = st0, 0
+    for s in snapshots:
+        k = s * STEPS_PER_DAY
+        st = advance(st, jax.tree.map(lambda a: a[done:k], full))
+        done = k
+        n = n_end - k
+        stack = jax.tree.map(lambda a: a[k:], full)
+        cost, theta = make_cost(fx, kind, n)
+        (g, gx) = jax.block_until_ready(jax.jit(jax.grad(cost, argnums=(0, 1)))(theta, st.bgc, st, stack))
+        print(f"from day {s:4d} to {end_day}: |dJ/dx| {float(jnp.sqrt(jnp.sum(gx * gx))):.3e}  scaled "
+              f"{float(jnp.sqrt(jnp.sum((st.bgc * gx) ** 2))):.3e}  dJ/dlog p {np.asarray(g * theta)}", flush=True)
+        tracer_report(names, st.bgc, gx, top=3)
+
+
+def column_jacobian(fx, st0, cf, day, jac_days, steps_in_day, nodes, names, out, batch=32, hs=(1e-2, 1e-4, 1e-6)):
+    """Which term expands the reverse field? At each (day, step of that day) of the forward run and each node: the
+    one-step Jacobian of the node's own column, J = d bgc_new[n] / d bgc[n] over its wet levels and all tracers (the
+    full step: sources and sinks, sinking, vertical mixing, the column's own advection; the coupling to neighbours is
+    left out). Reported raw and normalised by the column itself, Jt = diag(1/xb) J diag(xb), xb = max(|x|, floor):
+    spectral radius (asymptotic growth per step), largest singular value (one-step growth, non-normal), the leading
+    singular vector by tracer and level, the tracer-pair blocks of Jt - I with the largest norms (which tracer drives
+    which), and a central difference of the step along the leading scaled singular vector at several sizes: FD close
+    to sigma means the expansion is in the model's response, FD far below sigma means a local derivative (a floor, a
+    switch, a ratio near zero). Matrices go to OUT/jac_d<day>_s<step>_n<node>.npz, a summary line to OUT/jacobian.jsonl."""
+    mesh, dt = fx["mesh"], fx["cfg"].dt
+    zero = jnp.zeros((mesh.elem2D, 2))
+    params = dataclasses.replace(Params.defaults(), recom=fx["cfg"].recom.load()[1])
+    nzmax = np.asarray(mesh.nlevels_nod2D) - 1
+    ntr = st0.bgc.shape[-1]
+    last = max(jac_days) * STEPS_PER_DAY + max(steps_in_day) + 1
+    full = cf.stack(surface_forcing.dates_for_steps(1958, dt, last, start_day=day))
+
+    def one(s, sf):
+        return stepmod.step(s, mesh, fx["op"], zero, params, dt=dt, is_first_step=False, step_forcing=sf,
+                            forcing_static=fx["fs"], **fx["phys"]), None
+
+    advance = jax.jit(lambda st, stack: jax.lax.scan(one, st, stack)[0])
+    step_bgc = lambda st, bgc, sf: one(dataclasses.replace(st, bgc=bgc), sf)[0].bgc
+    stepf = jax.jit(step_bgc)
+
+    @functools.partial(jax.jit, static_argnames=("L",))
+    def tangents(st, x, sf, E, n, L):                    # E: (batch, L * ntr) column tangents -> column responses
+        def tan(e):
+            t = jnp.zeros_like(x).at[n, :L, :].set(e.reshape(L, ntr))
+            return jax.jvp(lambda b: step_bgc(st, b, sf), (x,), (t,))[1][n, :L, :].reshape(-1)
+        return jax.vmap(tan)(E)
+    st, done = st0, 0
+    for d in jac_days:
+        for s in steps_in_day:
+            k = d * STEPS_PER_DAY + s
+            st = advance(st, jax.tree.map(lambda a: a[done:k], full))
+            done = k
+            sf = jax.tree.map(lambda a: a[k], full)
+            x = st.bgc
+            for n in nodes:
+                L = int(nzmax[n])
+                m = L * ntr
+                eye = np.eye(m, m + (-m) % batch).T             # padded to whole batches: one compile per L
+                J = np.concatenate([np.asarray(tangents(st, x, sf, jnp.asarray(eye[i:i + batch]), n, L))
+                                    for i in range(0, eye.shape[0], batch)])[:m].T   # J[out, in]
+                xc = np.asarray(x[n, :L, :])
+                xb = np.maximum(np.abs(xc), 1e-12 * np.maximum(np.abs(xc).max(axis=0, keepdims=True), 1e-30)).reshape(m)
+                Jt = J * (xb[None, :] / xb[:, None])
+                rho, rho_t = float(np.abs(np.linalg.eigvals(J)).max()), float(np.abs(np.linalg.eigvals(Jt)).max())
+                U, S, Vh = np.linalg.svd(Jt)
+                v = Vh[0].reshape(L, ntr)
+                comp = (v ** 2).sum(axis=0)
+                lev = (v ** 2).sum(axis=1)
+                D = (Jt - np.eye(m)).reshape(L, ntr, L, ntr)
+                blocks = np.sqrt((D ** 2).sum(axis=(0, 2)))   # [out tracer, in tracer]
+                top = np.dstack(np.unravel_index(np.argsort(-blocks, axis=None)[:8], blocks.shape))[0]
+                fd = {}
+                y = np.asarray(x[n, :L, :])
+                for h in hs:
+                    dx = jnp.zeros_like(x).at[n, :L, :].set(jnp.asarray((h * xb * Vh[0]).reshape(L, ntr)))
+                    dy = (np.asarray(stepf(st, x + dx, sf)[n, :L, :]) - np.asarray(stepf(st, x - dx, sf)[n, :L, :])).reshape(m)
+                    fd[str(h)] = float(np.linalg.norm(dy / xb) / (2 * h))
+                rec = dict(day=day + d, step=s, node=int(n), levels=L, rho=rho, rho_scaled=rho_t, sigma_scaled=S[:4].tolist(),
+                           sigma_raw=float(np.linalg.norm(J, 2)), fd_along_v1=fd,
+                           v1_tracers={names[i]: float(comp[i]) for i in np.argsort(-comp)[:6]},
+                           v1_levels={int(i): float(lev[i]) for i in np.argsort(-lev)[:4]},
+                           blocks=[(names[i], names[j], float(blocks[i, j])) for i, j in top],
+                           x_v1={names[i]: float(np.abs(xc[:, i]).max()) for i in np.argsort(-comp)[:6]})
+                np.savez_compressed(out / f"jac_d{day + d}_s{s}_n{n}.npz", J=J.astype(np.float32), xb=xb, x=xc)
+                with open(out / "jacobian.jsonl", "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+                print(f"day {day + d:3d} step {s:2d} node {n:4d} ({L} levels): rho {rho:.4f}  rho~ {rho_t:.4f}  "
+                      f"sigma~ {S[0]:.3e}  FD along v1 " + "  ".join(f"{h}: {fd[h]:.3e}" for h in fd), flush=True)
+                print("    v1: " + "  ".join(f"{k} {w:.2f}" for k, w in rec["v1_tracers"].items())
+                      + "  | levels " + "  ".join(f"{k}:{w:.2f}" for k, w in rec["v1_levels"].items()), flush=True)
+                print("    largest blocks of Jt - I (out <- in): " + "  ".join(f"{a}<-{b} {w:.2e}" for a, b, w in rec["blocks"]),
+                      flush=True)
+
+
 def tracer_report(names, bgc0, gx, top=6):
     """Per tracer: raw and reference-normalised reverse-field norms, the raw peak and the tracer's value there."""
     x, g = np.asarray(bgc0), np.asarray(gx)
@@ -150,6 +263,13 @@ def main():
     ap.add_argument("--days", type=int, nargs="+", default=[1, 5, 30, 90])
     ap.add_argument("--cost", nargs="+", choices=("chl", "din", "npp"), default=["chl"])
     ap.add_argument("--h", type=float, nargs="+", default=[1e-2, 3e-3], help="relative FD steps")
+    ap.add_argument("--backward", type=int, nargs="+", default=None, metavar="DAY",
+                    help="backward scan: END_DAY then the snapshot days (ascending); no windows are run")
+    ap.add_argument("--column-jacobian", type=int, nargs="+", default=None, metavar="NODE",
+                    help="one-step column Jacobians at these nodes on --jac-days (from the start); no windows are run")
+    ap.add_argument("--jac-days", type=int, nargs="+", default=[150, 180, 210, 240, 270])
+    ap.add_argument("--jac-steps", type=int, nargs="+", default=[0, 16], help="steps of the day (32 a day; 16 = noon)")
+    ap.add_argument("--batch", type=int, default=32, help="column tangents per vmap batch")
     ap.add_argument("--repeats", type=int, default=4, help="repeats of the forward, for the noise of J")
     ap.add_argument("--restart", default=TF.RESTART, help="restart to start from")
     ap.add_argument("--start-day", type=int, default=None, help="day of 1958 of the start (default: from the restart)")
@@ -169,6 +289,12 @@ def main():
     print("surface means: " + "  ".join(f"{n} {b0[:, 0, i].mean():.3g}" for i, n in enumerate(fx["lay"].names)), flush=True)
     if a.tangent_check:
         tangent_check(fx, st0, cf, day)
+    if a.column_jacobian:
+        column_jacobian(fx, st0, cf, day, a.jac_days, a.jac_steps, a.column_jacobian, fx["lay"].names, a.out, a.batch)
+        return
+    if a.backward:
+        backward_scan(fx, st0, cf, day, a.cost[0], a.backward[0], a.backward[1:], fx["lay"].names)
+        return
     for d in a.days:
         if day + d > 361:
             raise SystemExit(f"window of {d} days from day {day} leaves 1958")
