@@ -701,7 +701,9 @@ def sinking_velocity(tracer_id: int, bal: Optional[Ballast], geom: SinkingGeomet
             w = jnp.where(jnp.abs(w) > p.max_sinking_velocity, p.max_sinking_velocity, w)
             w = -1.0 * w / spd
     dz = _tracer_point_distance(geom)
-    if not fork:
+    # Experiment (plan 20261105 Phase 1, the column Jacobian 48931721): FESOM_RECOM_FORK_SINK_CFL=1 gives the fork the
+    # upstream cap too. Read at trace time; unset (the default), the fork's traced program is unchanged.
+    if not fork or os.environ.get("FESOM_RECOM_FORK_SINK_CFL", "").strip() == "1":
         cap = CFL_SAFETY * dz / dt
         w = jnp.where(dz > 0.0, jnp.copysign(jnp.minimum(jnp.abs(w), cap), w), w)
     k = jnp.arange(dz.shape[1])[None, :]

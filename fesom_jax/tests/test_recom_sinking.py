@@ -20,6 +20,7 @@ prints the G3 table.
 
 from __future__ import annotations
 
+import dataclasses
 import os
 from functools import lru_cache
 from pathlib import Path
@@ -504,3 +505,22 @@ def _table():
 
 if __name__ == "__main__":
     _table()
+
+
+def test_fork_cfl_cap_experiment_switch(toy, monkeypatch):
+    """FESOM_RECOM_FORK_SINK_CFL=1 (plan 20261105 Phase 1) gives the spectral fork the upstream CFL cap; unset, the
+    fork stays uncapped and its traced program is unchanged."""
+    sw, p, geom, bgc, temp, salt, decay, benthos = toy
+    fork = dataclasses.replace(sw, spectral_fork=True)
+    ctx = S.loop_context(temp, salt, geom)
+    bal = S.ballast(*S.particle_densities(bgc, geom.nlev, p), ctx.rho_seawater, ctx.visc, geom.nlev, p)
+    dt = 2700.0 * 40
+    monkeypatch.delenv("FESOM_RECOM_FORK_SINK_CFL", raising=False)
+    w_free = np.asarray(S.sinking_velocity(1025, bal, geom, dt, p, fork))
+    jx = str(jax.make_jaxpr(lambda b: S.sinking_velocity(1025, b, geom, dt, p, fork))(bal))
+    monkeypatch.setenv("FESOM_RECOM_FORK_SINK_CFL", "0")
+    assert str(jax.make_jaxpr(lambda b: S.sinking_velocity(1025, b, geom, dt, p, fork))(bal)) == jx
+    monkeypatch.setenv("FESOM_RECOM_FORK_SINK_CFL", "1")
+    w = np.asarray(S.sinking_velocity(1025, bal, geom, dt, p, fork))
+    np.testing.assert_array_equal(w, np.asarray(S.sinking_velocity(1025, bal, geom, dt, p, sw)))
+    assert np.any(np.abs(w) < np.abs(w_free))

@@ -315,6 +315,18 @@ cross-check. Then write up.
 - Column Jacobian, 2026-11-07 (`--column-jacobian`): one-step Jacobian of single columns, raw and normalised by the column, spectral radius,
   leading singular vector, tracer-pair blocks, FD along the leading vector. Smoke 48931649 (day 2, nodes 1455, 1823): FD agrees with the
   tangent at h = 1e-2 to 1e-6. Full run 48931721: nodes 1455, 1763, 1822, 1823, 1882 on days 150-270, midnight and noon.
+- Column Jacobian result (48931721, 50 Jacobians, nodes 1455/1763/1822/1823/1882, days 151-271): FD along the leading singular vector
+  agrees with the tangent almost everywhere, so the one-step derivatives are genuine. Spectral radius up to 1.92 per step in about 20 of 50.
+  Almost every expanding mode is detritus, mostly the second class (DetZ2C/N/Si/Calc), in one cell. Most have a negative self-derivative
+  -1.2 to -1.57 at levels 0-1 (the 5 m layers), at values near zero and alternating in sign, with +0.78 into the cell below: an explicit
+  sinking overshoot. Det2 sinks at up to 250 m/d (w_ref2 200, max_sinking_velocity 250), 7.8 m a step against 5 m (CFL 1.56), and the fork's
+  sinking has no CFL cap (sinking.py, fork K:574-611; upstream REcoM caps at 0.9 dz/dt). A few deeper cases have a positive self-term
+  +1.8 to +1.9 (node 1823 level 16, 1455 level 21, 1882 level 25), not yet explained. No coupling to the other Det2 tracers at the same
+  level, so this is not the ballast composition derivative, which is why the freeze test did not cure it.
+- CFL test, 2026-11-07: `FESOM_RECOM_FORK_SINK_CFL=1` (sinking.py, read at trace time, default off, test
+  `test_fork_cfl_cap_experiment_switch`) gives the fork the upstream cap 0.9 dz/dt. Mature sweep with the cap, 180 and 330 days,
+  FD at h = 1e-2, 3e-3: jobs 48932194 (chl), 48932195 (din) -> bgc_gradient_horizon/mature_cfl. Finite and FD-consistent at 330 days
+  would confirm the Det2 sinking overshoot as the cause. The cap changes the forward, so it is a test, not yet a model decision.
 
 ## Decisions for the user
 
