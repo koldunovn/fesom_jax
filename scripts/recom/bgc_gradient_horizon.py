@@ -237,6 +237,56 @@ def column_jacobian(fx, st0, cf, day, jac_days, steps_in_day, nodes, names, out,
                       flush=True)
 
 
+def window_scan(fx, st0, cf, day, kinds, lengths, starts, out, h=1e-2):
+    """How long may a window be, season by season? For every start (days after the restart, ascending) and every length
+    that ends inside the forcing year: the last-day cost's gradient from the forward state at that start. Reported:
+    ``|dJ/dx|`` raw and scaled, ``dJ/dlog p``, and one central difference along ``p * sign(g)``, the direction of the
+    largest linear response, against the adjoint's ``sum |p g|``. Each (cost, length) compiles once. One line per
+    window goes to OUT/window_scan.jsonl."""
+    mesh, dt = fx["mesh"], fx["cfg"].dt
+    zero = jnp.zeros((mesh.elem2D, 2))
+    params = dataclasses.replace(Params.defaults(), recom=fx["cfg"].recom.load()[1])
+    fits = lambda s, L: day + s + L <= 361
+    last = max(s + L for s in starts for L in lengths if fits(s, L)) * STEPS_PER_DAY
+    full = cf.stack(surface_forcing.dates_for_steps(1958, dt, last, start_day=day))
+
+    def one(st, sf):
+        return stepmod.step(st, mesh, fx["op"], zero, params, dt=dt, is_first_step=False, step_forcing=sf,
+                            forcing_static=fx["fs"], **fx["phys"]), None
+
+    advance = jax.jit(lambda st, stack: jax.lax.scan(one, st, stack)[0])
+    compiled, st, done = {}, st0, 0
+    for s in starts:
+        k = s * STEPS_PER_DAY
+        if k > done:
+            st = jax.block_until_ready(advance(st, jax.tree.map(lambda a: a[done:k], full)))
+            done = k
+        for L in lengths:
+            if not fits(s, L):
+                continue
+            n = L * STEPS_PER_DAY
+            stack = jax.tree.map(lambda a: a[k:k + n], full)
+            for kind in kinds:
+                if (kind, L) not in compiled:
+                    cost, theta = make_cost(fx, kind, n)
+                    compiled[kind, L] = (jax.jit(cost), jax.jit(jax.grad(cost, argnums=(0, 1))), theta)
+                fwd, grad, theta = compiled[kind, L]
+                (g, gx), t_grad = timed(grad, theta, st.bgc, st, stack)
+                j0 = float(fwd(theta, st.bgc, st, stack))
+                d = theta * jnp.sign(g)
+                fd = (float(fwd(theta + h * d, st.bgc, st, stack)) - float(fwd(theta - h * d, st.bgc, st, stack))) / (2 * h)
+                ad = float(jnp.sum(g * d))
+                rec = dict(start=s, first_day=day + s, length=L, cost=kind, J=j0, names=NAMES, grad=np.asarray(g).tolist(),
+                           dJ_dlogp=np.asarray(g * theta).tolist(), x0_norm=float(jnp.sqrt(jnp.sum(gx * gx))),
+                           x0_scaled_norm=float(jnp.sqrt(jnp.sum((st.bgc * gx) ** 2))), adjoint_dir=ad, fd_dir=fd, h=h,
+                           finite=bool(np.all(np.isfinite(np.asarray(g)))), t_grad=t_grad)
+                with open(out / "window_scan.jsonl", "a") as f:
+                    f.write(json.dumps(rec) + "\n")
+                print(f"start {s:3d} length {L:3d} {kind}: J {j0:.6e}  |dJ/dx| {rec['x0_norm']:.3e}  scaled "
+                      f"{rec['x0_scaled_norm']:.3e}  max|dJ/dlog p| {float(jnp.max(jnp.abs(g * theta))):.3e}  "
+                      f"along p sign(g): adjoint {ad:.4e}  FD {fd:.4e}", flush=True)
+
+
 def tracer_report(names, bgc0, gx, top=6):
     """Per tracer: raw and reference-normalised reverse-field norms, the raw peak and the tracer's value there."""
     x, g = np.asarray(bgc0), np.asarray(gx)
@@ -270,6 +320,9 @@ def main():
     ap.add_argument("--jac-days", type=int, nargs="+", default=[150, 180, 210, 240, 270])
     ap.add_argument("--jac-steps", type=int, nargs="+", default=[0, 16], help="steps of the day (32 a day; 16 = noon)")
     ap.add_argument("--batch", type=int, default=32, help="column tangents per vmap batch")
+    ap.add_argument("--window-scan", type=int, nargs="+", default=None, metavar="LENGTH",
+                    help="seasonal scan: these window lengths [days] at every --scan-starts; no other windows are run")
+    ap.add_argument("--scan-starts", type=int, nargs="+", default=list(range(0, 331, 30)), help="start days after the restart")
     ap.add_argument("--repeats", type=int, default=4, help="repeats of the forward, for the noise of J")
     ap.add_argument("--restart", default=TF.RESTART, help="restart to start from")
     ap.add_argument("--start-day", type=int, default=None, help="day of 1958 of the start (default: from the restart)")
@@ -289,6 +342,9 @@ def main():
     print("surface means: " + "  ".join(f"{n} {b0[:, 0, i].mean():.3g}" for i, n in enumerate(fx["lay"].names)), flush=True)
     if a.tangent_check:
         tangent_check(fx, st0, cf, day)
+    if a.window_scan:
+        window_scan(fx, st0, cf, day, a.cost, a.window_scan, sorted(a.scan_starts), a.out)
+        return
     if a.column_jacobian:
         column_jacobian(fx, st0, cf, day, a.jac_days, a.jac_steps, a.column_jacobian, fx["lay"].names, a.out, a.batch)
         return

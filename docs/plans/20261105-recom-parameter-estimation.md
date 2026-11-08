@@ -311,7 +311,7 @@ cross-check. Then write up.
   backward scan 48931037 before it): forward unchanged. `|dJ/dx0|` at 330 days Chl 1.0e116 (full 6.4e123), DIN 2.5e103 (full 2.4e127), so ballasting is
   not the whole cause. At 180 days the frozen gradient is worse than the full one: Chl 442 against 0.75, `expon_phy` -38 against -0.027 (FD -0.003 to -0.10).
   The ballast path damps growth in the tangent there, so freezing it is not a remedy. Largest values move to PhyN and DIN (node 1455 level 6 at 180 days,
-  nodes 1823, 1882 at 330 days). FD stays normal, so the growth is in the local derivative, not in the response. The usable window stays 180 days.
+  nodes 1823, 1882 at 330 days). FD stays normal, so the growth is in the local derivative, not in the response. (180 days holds from a January start only; see the entry on the cap test.)
 - Column Jacobian, 2026-11-07 (`--column-jacobian`): one-step Jacobian of single columns, raw and normalised by the column, spectral radius,
   leading singular vector, tracer-pair blocks, FD along the leading vector. Smoke 48931649 (day 2, nodes 1455, 1823): FD agrees with the
   tangent at h = 1e-2 to 1e-6. Full run 48931721: nodes 1455, 1763, 1822, 1823, 1882 on days 150-270, midnight and noon.
@@ -327,6 +327,14 @@ cross-check. Then write up.
   `test_fork_cfl_cap_experiment_switch`) gives the fork the upstream cap 0.9 dz/dt. Mature sweep with the cap, 180 and 330 days,
   FD at h = 1e-2, 3e-3: jobs 48932194 (chl), 48932195 (din) -> bgc_gradient_horizon/mature_cfl. Finite and FD-consistent at 330 days
   would confirm the Det2 sinking overshoot as the cause. The cap changes the forward, so it is a test, not yet a model decision.
+- CFL test result, 2026-11-08: the cap does not cure it. `|dJ/dx0|` at 330 days: Chl 2e134 (uncapped 6e123), DIN 1e136 (2e127); 180-day gradients unchanged
+  (48932194-95). Capped column Jacobians (48936843, 8 of 12 before the time limit) show the switch works: self-derivatives at levels 0-1 go from -1.50, -1.22, -1.53 to
+  -1.28, -1.05, -1.17, still beyond -1 although CFL <= 0.9, so a pure CFL overshoot is too simple. Open: the flux limiter at near-zero alternating values, local sources.
+  **Usable window depends on season:** from the backward scan (48931037, cost on day 330), 60 days from day 270 is normal, 90 days from day 240 is 1e34. Next proposed: a scan of
+  15, 30, 60, 90-day windows every 30 days. Additive eta does not shorten the adjoint path; only segment start states as controls (multiple shooting) cut the chain.
+  Explainer page: https://claude.ai/artifact/LhXbn9DHxHxKBz2xyRQ5do
+- Decisions 2026-11-08: seasonal window scan approved (`--window-scan`, lengths 15, 30, 60, 90 days, starts every 30 days, smoke 48936964 passed, FD and adjoint within 1e-4 relative at 1-2 days; full scan 48936979 (chl), 48936980 (din) -> bgc_gradient_horizon/window_scan. Segment start states: a low-dimensional
+  increment on the forward run for CORE2, compared with the full state plus Q on pi. Length of the outer-loop rerun: not fixed in advance, chosen from the cost in the pi twin, against a baseline rerun with unchanged parameters.
 
 ## Decisions for the user
 
