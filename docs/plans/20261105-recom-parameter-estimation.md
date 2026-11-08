@@ -335,6 +335,13 @@ cross-check. Then write up.
   Explainer page: https://claude.ai/artifact/LhXbn9DHxHxKBz2xyRQ5do
 - Decisions 2026-11-08: seasonal window scan approved (`--window-scan`, lengths 15, 30, 60, 90 days, starts every 30 days, smoke 48936964 passed, FD and adjoint within 1e-4 relative at 1-2 days; full scan 48936979 (chl), 48936980 (din) -> bgc_gradient_horizon/window_scan. Segment start states: a low-dimensional
   increment on the forward run for CORE2, compared with the full state plus Q on pi. Length of the outer-loop rerun: not fixed in advance, chosen from the cost in the pi twin, against a baseline rerun with unchanged parameters.
+- Daily against interpolated monthly x-bar, 2026-11-08 (48937105, `scripts/recom/xbar_daily_vs_monthly.py`, run kdind15w28sl1d 2001, REcoM floors `max(tiny_i, x)` applied on read; summary in
+  fesom_jax_runs/xbar_daily_vs_monthly/summary.txt), relative error, volume-weighted, 0-50 m, median / p90: Alk, DIC, O2 <= 0.2 % / 0.8 %; DIN, DFe, DON, DOC, CDOM, PhyN, PhyC 1 % / 6-10 %; Cocco, Phaeo, Dia, Det, DSi 1-8 % / 20-63 %;
+  HetN/C, Zoo3N/C, idetz2* 13-25 % / 250-2000 %, 20-39 % of the volume above 50 %. Below 1000 m nearly zero except detritus. Latitude bands stand in for biomes. Largest errors at low concentrations, 15S-45N; the
+  relative metric is sensitive there, and `tiny` (2.23e-16) is too small as a scaling floor, to be decided.
+- Local scaling floor, 2026-11-08 (48937173, `--epsilon`): xs = max(x, eps * max_t x, tiny_i) per grid point and level, each product from its own data. At eps = 0.01 the 0-50 m p90 of the monthly-against-daily error falls from 20x to
+  100 % for HetC, 3x to 63 % for Zoo3C, 8-10x to 79-100 % for idetz2*; other tracers barely change; 0-11 % of cell-days lifted (Het, Zoo3, idetz2 16-22 %). The remaining differences in Het and idetz2 (20-33 % of the volume above 50 % even at eps = 0.1) look like real intermittency.
+  **Decision (user, 2026-11-08):** reference state `max(tiny_i, x)`; scaling floor eps = 0.01 local; monthly x-bar for all tracers to start; daily x-bar per segment for HetN/C, Zoo3N/C, idetz2* as a refinement (about 7 GB per 60-day segment).
 
 ## Decisions for the user
 
