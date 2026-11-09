@@ -812,6 +812,27 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     _evp = ice_mevp.mevp_dynamics if cfg.whichEVP == 1 else ice_evp.evp_dynamics
     kw = {} if mevp_wide is None else {"wide": mevp_wide}
     _exch = (lambda f, k: f) if exch is None else exch          # noqa: E731
+    # IceConfig.adjoint_mode in the coupled ice block, as fesom_jax.ice_step.ice_surface_step reads it (the same
+    # switches, backward only; "exact" with the default adjoint_sweeps = -1 is the unchanged program):
+    #   "rheology"    the mEVP subcycles are not unrolled in the backward (adjoint_subcycles 0): the ice velocity
+    #                 carries no tangent, thermodynamics / advection / cut-off / ocean-to-ice stay differentiated;
+    #   "prescribed"  the ice trajectory is given: the nine prognostic ice fields (and the coupled ice_temp, albedo,
+    #                 ponds) carry no tangent into the step nor out of it, every flux stays differentiable;
+    #   adjoint_sweeps >= 0 (with "exact"): only the last N subcycles unrolled.
+    # "frozen" is handled by fesom_jax.step for either ice block; "dynamics" and adjoint_cuts are not wired here.
+    mode = getattr(cfg, "adjoint_mode", "exact")
+    if mode == "dynamics" or getattr(cfg, "adjoint_cuts", ()):
+        raise NotImplementedError("the coupled ice block: adjoint_mode 'dynamics' / adjoint_cuts are not wired")
+    _sg = jax.lax.stop_gradient
+    prescribed = mode == "prescribed"
+    if prescribed:
+        from ..ice_step import _ICE_PROGNOSTIC
+        state = dataclasses.replace(state, **{f: _sg(getattr(state, f)) for f in _ICE_PROGNOSTIC + CPL_FIELDS
+                                              if getattr(state, f, None) is not None})
+    if mode in ("rheology", "prescribed"):
+        kw["adjoint_subcycles"] = 0
+    elif getattr(cfg, "adjoint_sweeps", -1) >= 0:
+        kw["adjoint_subcycles"] = int(cfg.adjoint_sweeps)
     u_ice, v_ice, s11, s12, s22 = _evp(
         cfg, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow, u_ice=state.u_ice,
         v_ice=state.v_ice, sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,
@@ -828,6 +849,9 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
                     runo=runoff, geo_lat=geo_lat, non_cavity=open_water, dt=cfg.ice_dt,
                     use_virt_salt=use_virt_salt)
     a_out, m_out, ms_out = _exch(th.a_ice, "nod"), _exch(th.m_ice, "nod"), _exch(th.m_snow, "nod")
+    if prescribed:                                # the exit half: the updated ice leaves without a tangent
+        a_out, m_out, ms_out, u_ice, v_ice, s11, s12, s22 = (_sg(x) for x in (a_out, m_out, ms_out, u_ice, v_ice,
+                                                                               s11, s12, s22))
     if cavity_cfg is not None:                                    # cavity_ice_clean_ma at the end of ice_timestep
         a_out, m_out, ms_out = _cav.cavity_ice_clean_ma(mesh, a_out, m_out, ms_out)
 
@@ -888,10 +912,14 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     bc_S = dt * (virtual_salt + relax_salt + icef.real_salt_flux * is_nonlinfs)
     cpl = {"cpl_ice_temp": th.ice_temp, "cpl_ice_alb": th.ice_alb, "cpl_apnd": th.apnd, "cpl_hpnd": th.hpnd,
            "cpl_ipnd": th.ipnd}
+    t_skin_out = th.ice_temp - TMELT
+    if prescribed:                                # (exit half) the coupled ice fields and the skin as well
+        cpl = {k: _sg(v) for k, v in cpl.items()}
+        t_skin_out = _sg(t_skin_out)
     if getattr(state, "cpl_fw", None) is not None:          # the monthly `fw` output (ocean.py monthly_extra)
         cpl["cpl_fw"] = water_flux.astype(state.cpl_fw.dtype)
     return IceStepOut(
         stress_surf=stress_surf, bc_T=bc_T, bc_S=bc_S, sw_3d=sw_3d, stress_node_surf=stress_node_surf,
         heat_flux=heat_flux, water_flux=water_flux, virtual_salt=virtual_salt, relax_salt=relax_salt,
         real_salt_flux=icef.real_salt_flux, a_ice=a_out, m_ice=m_out, m_snow=ms_out, u_ice=u_ice, v_ice=v_ice,
-        t_skin=th.ice_temp - TMELT, sigma11=s11, sigma12=s12, sigma22=s22, cpl=cpl)
+        t_skin=t_skin_out, sigma11=s11, sigma12=s12, sigma22=s22, cpl=cpl)
