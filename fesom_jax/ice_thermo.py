@@ -206,7 +206,7 @@ def therm_ice_cell(cfg: IceConfig, h, hsn, A, fsh, flo, Ta, qa, rain, snow, runo
     rh = sh + hsntmp * cfg.rhosno / cfg.rhoice
     h = jnp.maximum(h, 0.0)
     Tfrez_S = tfrez(cfg, S_oc)
-    o2ihf = ((T_oc - Tfrez_S) * 0.006 * ustar * cfg.cc * A
+    o2ihf = ((T_oc - Tfrez_S) * cfg.st_oce_ice * ustar * cfg.cc * A
              + (T_oc - Tfrez_S) * cfg.h_ml / ice_dt * cfg.cc * one_minus_A)
     rh = rh - o2ihf * ice_dt / cfg.cl
     qhst = h + rh

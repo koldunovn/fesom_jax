@@ -30,7 +30,7 @@ import jax.numpy as jnp
 from . import forcing as _forcing
 from . import ice_adv, ice_coupling, ice_evp, ice_mevp, ice_thermo
 from .config import VCPW
-from .ice import IceConfig
+from .ice import IceConfig, check_ice_ctrl
 from .mesh import Mesh
 from .state import State
 
@@ -259,7 +259,9 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
 
     ``params`` (a :class:`fesom_jax.params.Params`, or ``None``): its optional ice controls
     ``ice_pstar`` / ``ice_cd`` replace ``cfg.pstar`` / ``cfg.cd_oce_ice`` for this step, as traced
-    values. Unset (``None``, the default) ⇒ the configured constants, nothing traced.
+    values, and ``ice_ctrl`` (a dict ``{IceConfig field: scalar}``, the float fields of
+    :data:`fesom_jax.ice.ICE_CTRL_FIELDS`) replaces each named field. Unset (``None``, the
+    default) ⇒ the configured constants, nothing traced.
 
     ``mevp_wide`` (a :class:`fesom_jax.ice_wide.MevpWide`, sharded mEVP only; ``None`` ⇒
     unchanged): the mEVP subcycles run on K-ring ice lanes with one exchange every K subcycles.
@@ -306,6 +308,20 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         cfg = cfg._replace(pstar=_pstar)
     if _cd is not None:
         cfg = cfg._replace(cd_oce_ice=_cd)
+    # Generic ice controls (Params.ice_ctrl = {IceConfig field: traced scalar}), after the
+    # ice_dt derivation above so that field can never be overridden (check_ice_ctrl refuses it,
+    # the adjoint settings and every non-float field). The thermodynamic fields are read only
+    # by ice_thermo's arithmetic, and the frozen-sweep mEVP backward passes any traced field
+    # through its custom_vjp (ice_mevp_frozen._traced_fields). None or {} ⇒ dead branch.
+    _ctrl = getattr(params, "ice_ctrl", None)
+    if _ctrl:
+        _ctrl = check_ice_ctrl(_ctrl)
+        _clash = [k for k, v in (("pstar", _pstar), ("cd_oce_ice", _cd))
+                  if v is not None and k in _ctrl]
+        if _clash:
+            raise ValueError(f"Params.ice_ctrl sets {_clash}, which Params.ice_pstar / ice_cd "
+                             "also set; use one of the two")
+        cfg = cfg._replace(**_ctrl)
 
     # IceConfig.adjoint_mode="prescribed": the ice TRAJECTORY is taken as given. The nine
     # prognostic ice fields carry no tangent into this step (below) and none out of it (at the
@@ -369,7 +385,8 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
         mesh, sf.u_air, sf.v_air, sf.shum, sf.shortwave, sf.longwave, sf.Tair,
         sf.prec_rain, sf.prec_snow, sst_bulk, u_w0, v_w0)
     stress_ax, stress_ay = _forcing.atm_ice_stress(
-        sf.u_air, sf.v_air, state.u_ice, state.v_ice)         # prev-step u_ice (bulk runs first)
+        sf.u_air, sf.v_air, state.u_ice, state.v_ice,         # prev-step u_ice (bulk runs first)
+        cd=cfg.cd_atm_ice)
 
     # --- fesom_ice_step: ocean2ice → EVP → FCT → cut_off → thermo → oce_fluxes ---
     if not avg:

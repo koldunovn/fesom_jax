@@ -42,6 +42,8 @@
 #               ⚠️ NOT cheap any more: scripts/tests/test_core2_adj.py (2026-09-27) runs the
 #               shared CORE2 adjoint driver on two production steps — five compiled CORE2
 #               programs, ~1 h and >= 200 GB on a CPU node. Give the group --mem=200G.
+#               scripts/tests/test_tke_lbfgs.py (the TKE calibration driver, same scale) adds
+#               another ~1 h.
 #
 # ⚠️ EVERY test_*.py under fesom_jax/tests/ AND scripts/tests/ must appear here exactly once.
 # fesom_jax/tests/test_suite_groups.py fails if one does not, so a new file cannot join the
@@ -102,6 +104,7 @@ scripts scripts/tests/test_tke_diag_summary.py
 scripts scripts/tests/test_tke_cbar.py
 scripts scripts/tests/test_ice_modes.py
 scripts scripts/tests/test_perf_tools.py
+scripts scripts/tests/test_tke_lbfgs.py
 sharding fesom_jax/tests/test_forcing_sharded.py
 sharding fesom_jax/tests/test_gm_nn_sharded.py
 sharding fesom_jax/tests/test_gradient_sharded.py
@@ -126,6 +129,7 @@ ci fesom_jax/tests/test_canonical_redist.py
 ci fesom_jax/tests/test_coarsen.py
 ci fesom_jax/tests/test_coarsen_remap.py
 ci fesom_jax/tests/test_config.py
+unit fesom_jax/tests/test_controls.py
 ci fesom_jax/tests/test_diagnostics.py
 ci fesom_jax/tests/test_eki.py
 ci fesom_jax/tests/test_eos.py
@@ -141,6 +145,7 @@ unit fesom_jax/tests/test_momentum.py
 ci fesom_jax/tests/test_nn_twin.py
 ci fesom_jax/tests/test_obs_compare.py
 ci fesom_jax/tests/test_obs_ice.py
+unit fesom_jax/tests/test_optim_lbfgs.py
 ci fesom_jax/tests/test_ops.py
 unit fesom_jax/tests/test_column_kernel.py
 ci fesom_jax/tests/test_partit.py
@@ -170,6 +175,7 @@ core2 fesom_jax/tests/test_surface_adj.py
 ci fesom_jax/tests/test_surface_adj_unit.py
 unit fesom_jax/tests/test_adjoint_check.py
 core2 fesom_jax/tests/test_adjoint_costs.py
+core2 fesom_jax/tests/test_fortran_restart.py
 ci fesom_jax/tests/test_adjoint_check_unit.py
 ci fesom_jax/tests/test_tke_cuts.py
 unit fesom_jax/tests/test_tke_cuts_pi.py
@@ -225,3 +231,14 @@ core2 fesom_jax/tests/test_recom_restart.py
 sharding fesom_jax/tests/test_recom_sp.py
 unit fesom_jax/tests/test_recom_stage3.py
 sharding fesom_jax/tests/test_recom_step.py
+ice fesom_jax/tests/test_ice_stanton.py
+ice fesom_jax/tests/test_ice_ctrl.py
+ci fesom_jax/tests/test_obs_seaice.py
+scripts scripts/tests/test_icecal_prep_obs.py
+ci fesom_jax/tests/test_seaice_cost.py
+scripts scripts/tests/test_icecal_score.py
+scripts scripts/tests/test_icecal.py
+scripts scripts/tests/test_icecal_chain.py
+scripts scripts/tests/test_icecal_parity.py
+scripts scripts/tests/test_icecal_s1sum.py
+scripts scripts/tests/test_icecal_fdgn.py

@@ -138,6 +138,16 @@ class Params:
     # REcoM parameters (fesom_jax.recom.params.RecomParams with traced leaves, full REcoM only): ``None`` (default) ⇒
     # no leaves, nothing traced; the step then reads the namelist values of RecomConfig.namelist as constants.
     recom: object = None
+    # Generic sea-ice controls: a dict ``{IceConfig field: scalar}`` (e.g. ``{"albsn": ...,
+    # "st_oce_ice": ...}``). ``None`` (default) or ``{}`` ⇒ no leaves, nothing traced,
+    # byte-identical. Set ⇒ ``ice_surface_step`` replaces each named field by its value
+    # (``cfg._replace(**ice_ctrl)``) after deriving ``ice_dt``. Only the float fields listed in
+    # ``fesom_jax.ice.ICE_CTRL_FIELDS`` are accepted (``ice.check_ice_ctrl``: no ``ice_dt``, no
+    # ``adjoint_*``, no integer or string field); ``pstar`` / ``cd_oce_ice`` may not be set here
+    # and through ``ice_pstar`` / ``ice_cd`` at the same time. The thermodynamic fields need
+    # ``IceConfig.adjoint_mode="exact"`` for a gradient: "dynamics"/"prescribed" cut the
+    # ice-state tangents.
+    ice_ctrl: object = None
 
     @staticmethod
     def defaults() -> "Params":
@@ -159,6 +169,6 @@ tree_util.register_dataclass(
     Params,
     data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
                  "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn", "gm_nn",
-                 "surface_adj", "forcing_adj", "ice_pstar", "ice_cd", "recom"],
+                 "surface_adj", "forcing_adj", "ice_pstar", "ice_cd", "recom", "ice_ctrl"],
     meta_fields=[],
 )

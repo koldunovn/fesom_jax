@@ -121,6 +121,10 @@ class IceConfig(NamedTuple):
     h0: float = 0.5               # lead-closing N hemi [m]
     h0_s: float = 0.5             # lead-closing S hemi [m]
     h_ml: float = 2.5             # upper-layer thickness for heat available [m]
+    # Ocean-to-ice Stanton number of the basal heat flux (T_oc - T_f)*st_oce_ice*u*·cc·A; the
+    # literal 0.006 in FESOM2 (ice_thermo_oce.F90:582). A field so it can be a calibration
+    # control (Params.ice_ctrl); the Python-float default traces the literal's program.
+    st_oce_ice: float = 0.006
     iclasses: int = 7             # ice-thickness gradations (growth-rate average)
     hmin: float = 0.01            # cutoff ice thickness [m]
     armin: float = 0.01           # minimum ice concentration
@@ -367,6 +371,41 @@ def _validating_ice_config_new(cls, *args, **kwargs):
 
 
 IceConfig.__new__ = _validating_ice_config_new
+
+
+# --- generic ice controls (Params.ice_ctrl) -----------------------------------------------
+#: IceConfig fields that may be replaced by a traced scalar through ``Params.ice_ctrl``: every
+#: field whose default is a Python float, except ``ice_dt`` (``ice_surface_step`` derives it
+#: from the ocean dt; a swap would silently override that) and the ``adjoint_*`` settings
+#: (static: read with ``float()`` at trace time). Integer and string fields select code paths
+#: and loop lengths, so they can never be traced.
+ICE_CTRL_FIELDS = tuple(
+    k for k, v in zip(IceConfig._fields, IceConfig())
+    if type(v) is float and k != "ice_dt" and not k.startswith("adjoint_"))
+
+
+def check_ice_ctrl(ice_ctrl) -> dict:
+    """Validate a ``Params.ice_ctrl`` mapping ``{IceConfig field: scalar}`` and return it as a
+    dict. Raises ``ValueError`` naming the field for an unknown name, a non-float field, an
+    adjoint setting, ``ice_dt`` or a non-scalar value; ``TypeError`` if it is not a dict."""
+    if not isinstance(ice_ctrl, dict):
+        raise TypeError(f"Params.ice_ctrl must be a dict {{IceConfig field: scalar}}, got "
+                        f"{type(ice_ctrl).__name__}")
+    for k, v in ice_ctrl.items():
+        if k not in IceConfig._fields:
+            raise ValueError(f"Params.ice_ctrl: unknown IceConfig field {k!r}")
+        if k.startswith("adjoint_"):
+            raise ValueError(f"Params.ice_ctrl: {k!r} is an adjoint setting, not a control")
+        if k == "ice_dt":
+            raise ValueError("Params.ice_ctrl: 'ice_dt' is derived from the ocean dt in "
+                             "ice_surface_step and cannot be a control")
+        if k not in ICE_CTRL_FIELDS:
+            raise ValueError(f"Params.ice_ctrl: {k!r} is not a float field (it selects a code "
+                             f"path or a loop length) and cannot be traced")
+        if jnp.ndim(v) != 0:
+            raise ValueError(f"Params.ice_ctrl: {k!r} must be a scalar, got shape "
+                             f"{jnp.shape(v)}")
+    return dict(ice_ctrl)
 
 
 def ice_initial_state(mesh: Mesh, sst, *, xp=jnp):

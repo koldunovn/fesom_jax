@@ -6929,6 +6929,81 @@ hunt — is looking at a number that was never the constraint. Two real bugs wer
 the way to this one and neither was the cause; **fixing a real bug is not evidence you fixed THE
 bug**, and both times the group stayed red and the reason was re-diagnosed from scratch.
 
+### 2026-09-27 (F1) — a result record's label is not the run's configuration; the job log is
+
+Re-reading the D2a TKE-vs-WOA calibration (`scripts/paper/core2_paper_calib_tke_obs.py`) before
+building a replacement for it, three facts differed from what the script's defaults suggest:
+
+- **The headline c_k = 0.243 ran the all-on model with the frozen-ice adjoint, not the ocean-only
+  `tkegm` config.** The sbatch default is `CONFIG=${4:-tkegm}`, but job 25602108's banner reads
+  `config=all3`, and every record in the results JSONL says `"config": "zstar+TKE+mEVP+GM(frozen-ice)"`
+  because that string is a literal in `main()` (`core2_paper_calib_tke_obs.py:205`), written whatever
+  `--config` was. The later cross-validation jobs did run `tkegm`, but reused the S0 pickle the
+  all-on spin-up had written, so they integrated an ocean-only model from an ice-bearing state; their
+  full-domain baseline misfit (1005.9 m²) is not the headline's (1075.1 m²) for that reason.
+- **The headline was the one-constant fit** (`--params ck`); the two-constant default
+  (`ck_ceps`, job 25601631) is the run in which c_eps collapsed to 0.0225.
+- **The model's MLD validity flag is discarded** (`mld, _ = obs_compare.mld_density_threshold(...)`,
+  :262): a column mixed to the bottom enters the misfit with MLD = 0 m, and only the WOA-side masks
+  (`mld_valid`, SST > −1 °C, a wet model node in the cell) weight the cells (:246).
+
+A comparison against an earlier result has to name what that result actually was. The record's
+label, the script's default and the sbatch's default were all readable and all wrong here; the
+banner the job printed at run time was the only source that recorded the argument that was passed.
+Helper added for this track: `scripts/calib/job_cpu.sbatch` (pytest on a CPU node with the checkout
+asserted as the imported `fesom_jax`, the `data` link asserted, `-rs`, no persistent XLA cache).
+
+### 2026-09-27 (F2) — a test that compares a transform with itself passes when the transform is wrong
+
+`fesom_jax/controls.py` puts the calibrated constants on a conditioned scale,
+`p = p0·exp(sigma·u)` with a standard-normal prior on `u`. Before trusting its tests, the
+transform was deliberately broken in a scratch copy (sigma dropped from both `to_physical`
+methods, the domain bound in `check` widened by one; job 27734393): 4 of 16 tests failed, and the
+one that did NOT fail is the instructive one. `test_to_params_sets_only_the_controlled_leaves`
+checks the leaves `to_params` writes against `cs.to_physical(u)`, and both went through the same
+broken expression, so it passed. The failures came from the tests with an INDEPENDENT reference:
+the round trip against a hand-chosen physical vector, and the chain rule
+`∂J/∂u = sigma·p·∂J/∂p` checked against an analytic `∂J/∂p`
+(`fesom_jax/tests/test_controls.py::test_gradient_in_u_is_sigma_p_dJdp`). A consistency test
+between two paths through one formula proves the plumbing, not the formula.
+
+Also non-obvious: `ControlSet` is a jit static argument and a cache key, so `LogNormalControl`
+coerces `p0`/`sigma` to Python floats in `__post_init__` (controls.py) — a spec built from
+`np.float64` values must hash and compare equal to one built from literals, or every driver that
+builds its control set from a config file would recompile.
+
+### 2026-09-27 (F3) — three budget rules for an expensive-evaluation L-BFGS, each found by a stall
+
+`fesom_jax/optim_lbfgs.py` is a numpy L-BFGS in the style of MITgcm `lsopt` / m1qn3 (two-loop
+recursion over the `dgscale.F` diagonal, Fletcher's cold start, loose Armijo/Wolfe constants),
+built for costs whose single evaluation is a multi-day adjoint. The plan's line search was "halve
+the step, at most two extra evaluations, stop after two consecutive failures". Probing it on the
+planned test problems before writing the tests turned up three things:
+
+- **Pure halving cannot repair a bad first scale.** A convex quadratic started at its f = 0 point
+  (no 0.2 % expected-decrease rule possible, so a unit step is taken) overshot by ~10³; three
+  trials at t = 1, ½, ¼ all increased f, the reset tried ⅛, and the run stopped as stalled after
+  7 evaluations on a problem with a perfectly good gradient. The shortened step is now the
+  minimiser of the quadratic through f(0), gᵀd and f(t), clipped to [0.01·t, 0.5·t]
+  (`LBFGS._backtrack`): still at least a halving, exact on a quadratic, and the same number of
+  evaluations. The wrong-sign-gradient stall bound (7 evaluations) is unchanged.
+- **A test quadratic with an O(1) minimum value cannot reach ‖g‖ < 1e-8 through Armijo.** Near
+  the optimum the decrease ½·gᵀH⁻¹g falls below the last bit of f ≈ 0.55, every trial "fails"
+  and the run stalls; the tests use `½·(u−u*)ᵀA(u−u*)` so f keeps its relative precision.
+- **"3n + 10 = 22 iterations" holds for a diagonal Hessian, not a rotated one.** Over 50 random
+  4-d quadratics with condition number 10³, to ‖g‖ < 1e-8: diagonal Hessian max 19 / median 16
+  iterations (scipy L-BFGS-B, maxcor 5: max 46 / median 26); rotated Hessian max 36 / median
+  24.5 (scipy: max 44 / median 27). The diagonal case keeps the 22 bound; the rotated case is
+  tested at 40. Measuring the reference implementation first is what separated "my optimiser is
+  slow" from "the bound was optimistic".
+
+Each gate was then checked against a planted error in a scratch copy (jobs 27734522-25): a
+sign-flipped diagonal update fails the diagonal/convergence tests (17 fail), storing every pair
+fails the negative-curvature and Wolfe tests, a float32 round trip in the log replay fails the
+bitwise-resume test, and disabling the stall rule fails the wrong-sign bound.
+Inner products use `math.fsum` (correctly rounded) rather than `np.dot`, so a replayed log gives
+the same proposal bitwise whatever BLAS or SIMD width the resuming host has.
+
 ### 2026-09-27 (adjoint foundation, task 0) — a fresh worktree tests nothing and says it passed
 
 A `git worktree add` checks out neither the gitignored `data/` link nor anything behind it, and
@@ -7615,6 +7690,46 @@ when a dot test must isolate the transpose on a GPU; read the plain relative mis
 `rel_norm`; use `check_linear="zero"` on the GPU and `"full"` only with 1-step chunks or on a
 CPU; expect the `exact()` adjoint of the all-on model to differ between identical GPU runs
 already over one day, and repeat any number that matters.
+
+### 2026-09-27 (F4) — finite differences of an MLD cost carry a bias that does not shrink with h
+
+`scripts/calib/tke_lbfgs.py` calibrates the four TKE constants against the window-mean
+density-threshold MLD (conditioned controls u, host-summed chunked gradients per window). Its
+FD test on a 2-step CORE2 window first asked for 1e-3 agreement at h = 1e-2..1e-4 and failed on
+c_k alone: 1.8e-2, 2.1e-3, 4.9e-3 — not converging. A probe (job 27738136; eight step sizes,
+every forward's MLD field kept) separated the causes:
+
+- The MLD field has **jumps**, not only kinks: `obs_compare.mld_density_threshold` takes the
+  FIRST level below 10 m whose density excess crosses 0 (`argmax(crossed)`), so a shallower level
+  that starts to cross moves the MLD by up to a layer; and a column that becomes fully mixed
+  goes from its deepest crossing (at most the deepest wet MID-layer depth) to
+  `column_bottom_depth` (the bottom INTERFACE) in the default `invalid="column"` mode — a jump
+  of half the bottom layer, smaller than `"zero"`'s whole column but not zero. At h = 3e-2 five
+  columns jumped by up to 17.5 m. A jump inside [u − h, u + h] adds O(jump/h) to one FD value
+  with probability O(h): an O(1) bias that no step size removes.
+- Replacing the jumping columns (|ΔMLD| > 1 m) by their midpoint brings c_k's FD to 3e-4 of the
+  adjoint at h = 3e-3; the other three constants agree to ≤ 1e-4 for h in [1e-5, 1e-3]; c_k at
+  h = 1e-5 is off by 18 % with no metre-scale jump left (sub-metre ones remain).
+- A smooth functional of the same model, controls and compiled programs (terminal area-mean
+  SST) agrees to ≤ 1e-5 at h = 3e-4 for all four constants, so the adjoint and the u chain rule
+  are right; what disagrees is the cost's own differentiability.
+
+So the test bounds the MLD-cost FD at 5e-3 (h = 1e-3, 3e-4) and adds the strict SST check at
+1e-4; a planted chain-rule error (gradient in ln p instead of u, factor 1/ln 2) is rejected by
+both. For F5's window-length check this means an MLD-cost FD "plateau" can be a jump artefact:
+compare against the smooth-functional FD and count jumping columns before calling a constant's
+gradient wrong.
+
+The other half of the task was keeping ONE compiled program across windows and iterations:
+every window-specific input (State, dates, WOA month target, weights) goes in through
+`init_state` / `xs_fn` / a loss closure that calls two process-wide jitted functions (cell map,
+misfit) with the window's arrays as ARGUMENTS. Two windows × two L-BFGS iterations on CPU: the
+first window compiles 83 programs (182 s: chunk forward + VJP + the small eager ones), the other
+three compile nothing (`n_compiles` = 0 in `windows.jsonl`); the linearity guard runs `"full"`
+on each window's first evaluation (≈ 2× the 61 s gradient) and is off afterwards. The twin at
+its truth gives a data term of exactly 0.0 and a data gradient of exactly 0 because the targets
+are made by the SAME jitted forward and cell map as the evaluation (a separately compiled
+mapping would not guarantee a bitwise zero).
 
 ### 2026-09-27 (adjoint foundation, follow-up) — the fill value of an invalid MLD is part of the cost's smoothness
 
@@ -9942,3 +10057,559 @@ one-GPU reproduction did not reproduce it (XLA chose tracer-major there by itsel
 away: each updated column as its own kernel behind `lax.optimization_barrier`, then a plain stack (14.0 -> 6.2 ms;
 DP 65.7 -> 60.1, SP 36.3 -> 32.6 ms on 4 GH200, job 28473598). Rule (d): a layout constraint fixes the layout of
 its own result, not of what feeds it; to change how a producer is laid out, change what it is fused with.
+
+### 2026-10-10 (Fortran restart converter, CORE2) — a FESOM2 restart becomes a fesom-jax restart
+
+Why: farc needs a spun-up state. JAX-farc runs 0.62 s/step on one GH200 and 0.38 s/step on a node, i.e. one to
+1.5 days for five years. Fortran FESOM2 on CPU does the same in hours. The missing piece was the restart conversion.
+
+What FESOM2 restarts (fesom27 `io_restart.F90`):
+* Format: a directory per group, `fesom.<YYYY>.oce.restart/` and `fesom.<YYYY>.ice.restart/`, with one NetCDF per
+  variable. Dimensions are (time, nz_1 or nz, node or elem).
+* Ocean: ssh, hbar, ssh_rhs_old, hnode, u, v, urhs_AB, vrhs_AB, temp, salt, temp_AB, salt_AB, temp_M1, salt_M1,
+  w, w_expl, w_impl, tke.
+* Ice: area, hice, hsnow, uice, vice. `ice_temp` is optional and is not written by this build.
+* Not stored: the mEVP stresses, Kv/Av, and the per-step diagnostics.
+
+Which State fields one fesom-jax step reads (`scripts/fortran_restart/carried_fields.py`; each field perturbed,
+one CORE2 step, outputs compared): 24 of 40.
+* From the restart: T, S, T_old, S_old, uv, uv_rhsAB, w_e, eta_n, hnode, hbar, tke and the ice state.
+* Rebuilt as the JAX commit does: helem, the element mean of hnode.
+* Set to the value FESOM itself restarts with:
+  * d_eta = 0. It is only the CG warm start.
+  * t_skin from the initial state. It is not in the restart.
+  * The mEVP stresses = 0.
+* del_ttf and uvnode_rhs feed only their own outputs.
+* The other 16 fields the step recomputes, ssh_rhs_old and hbar_old among them.
+
+`fesom_jax.fortran_restart.SOURCES` records this table, and a test fails when a State field is added without an
+entry.
+
+Validation on CORE2:
+* Setup:
+  * The Fortran run uses the JAX's pre-2026-07-03 levels; the mesh copy is
+    `fesom_jax_dev/fortran/meshes/core2_prefix`.
+  * Fortran January 1958 from the PHC cold start, then the Feb-1 restart.
+  * Fortran February continued with daily means.
+  * JAX February started (a) from the converted restart and (b) from its own cold start in January.
+* The conversion takes 17-37 s on CPU. The wet lanes match the Fortran files bitwise (test).
+* The JAX start shows no shock: first-day cfl_z 0.63, then 0.4-0.5; the cold start has 1.07.
+* RMS difference to the Fortran daily means (area-weighted), converted / cold:
+
+| day | SST °C | SSS | SSH mm | a_ice | m_ice mm | NH ice area 10^6 km² (Fortran) |
+|---|---|---|---|---|---|---|
+| Feb 1 | 0.004 / 0.033 | 0.0014 / 0.050 | 0.44 / 1.5 | 0.0011 / 0.010 | 1.3 / 15 | 15.450 / 15.463 (15.453) |
+| Feb 7 | 0.015 / 0.030 | 0.006 / 0.040 | 0.10 / 1.4 | 0.0035 / 0.010 | 5.1 / 15 | 15.722 / 15.740 (15.734) |
+| Feb 28 | 0.016 / 0.026 | 0.007 / 0.019 | 0.10 / 1.0 | 0.0070 / 0.011 | 10 / 14 | 16.443 / 16.466 (16.459) |
+
+Lesson: restarting from the converted Fortran state puts fesom-jax 9-35× closer to Fortran on the first day than its
+own spin-up does. What remains, growing over days, is the difference between the two codes, not the conversion.
+* The axis order of a restart variable is decided by the dimension NAME (node/elem): with as many levels as nodes
+  the size is ambiguous, which the synthetic test caught.
+* FESOM writes `_FillValue` (~1e37) in the ice fields wherever there is no ice (69 % of the CORE2 nodes in
+  February). Any comparison has to read it as 0.
+* The Fortran mesh must carry the same levels as the JAX export; /pool's CORE2 changed on 2026-07-03.
+
+Code: branch fortran-restart (fesom_jax/fortran_restart.py, scripts/fortran_restart/{convert,carried_fields,
+compare_daily}.py, fesom_jax/tests/test_fortran_restart.py).
+
+### 2026-09-27 (F5) — a reproducible adjoint gradient does not make a finite-difference check possible
+
+The window-mean MLD gradient of the TKE-constant calibration cost repeats on an A100 to
+≤ 1e-6 (3 h), ≤ 3e-5 (6 h) and ≤ 4e-3 (12 h, worst window and constant) relative, although two
+runs of the same compiled window already differ in the window-mean MLD at 7-27 thousand nodes.
+The finite differences are the hard part: a perturbation of a constant by h moves the density
+pick between levels and flips discrete switches (convective mixing) at 2-25 thousand nodes per
+h, so the full cost has no FD plateau at 3, 6 or 12 h. Even the area-mean SST, meant as the
+smooth control of the machinery, has none (errors 1e-3 … 1e-1 against a forward noise of 1e-5
+relative; the same on the CPU, where the forward is deterministic). What works:
+`scripts/calib/tke_lbfgs.py:745` `jumping_nodes` flags, per node, a second difference larger
+than half the central difference; `run_fd_rule` (:784) holds those nodes fixed in the FD and,
+through `stop_gradient` (`masked_loss_fn`, :385), in the adjoint — agreement ≤ 1.7e-2 for all
+four constants at 3, 6 and 12 h. The machinery itself is checked without differences: the
+forward-mode data gradient from `window_jvp` against the adjoint (`run_ident`, :981), ≤ 5e-5
+per window at 6 h.
+
+Two driver faults found on the way. `adam_minimize` entered `jax.default_device(cpu)` around
+the whole loop, so every CORE2 forward and adjoint of an Adam run executed on the host CPU
+(~50× slower, GPU idle) — only the optimiser's own arithmetic belongs there (`host()`, :597;
+the test reads `jax.config.jax_default_device` inside the callback). And the linearity guard
+"full" is noise for multi-step GPU chunks (the repeated VJP re-runs a rematerialised forward
+that flips switches differently): the first evaluation now uses "zero" on a GPU unless the
+chunks are single steps (`resolve_check`, :244).
+
+The optimiser met the same non-smoothness. On the 12-hour twin the first six L-BFGS steps were
+accepted without storing a single (s, y) pair: along the short first steps the adjoint gradient
+GREW (sᵀy < 0, although the Gauss-Newton curvature there is about +120), because thousands of
+nodes change MLD level per 1e-3 of u and the gradient switches between smooth pieces of the
+cost. With the memory empty the cold start reused the last step's length, so the run crawled at
+the 0.2 %-rule first step (f −0.5 %, constants +0.1 % per evaluation) until the seventh pair
+happened to pass; the quasi-Newton steps that followed took J from 2.66 to 0.075 in two
+evaluations. A Wolfe line search
+(m1qn3, lsopt) would extrapolate there; `LBFGSOptions.expand` (fesom_jax/optim_lbfgs.py) makes
+the cold start after a dropped pair `expand` times longer (library default 1 = unchanged; the
+calibration passes 4, `LBFGS_EXPAND` in the driver).
+
+### 2026-09-28 (F5/F6) — calibrating on CPU in multi-job evaluations, and what 12-hour MLD windows can decide
+
+With the GPU account's fairshare exhausted, and the 40 GB devel GPUs unable to hold the CORE2 12-hour
+backward program (one 31-33 GiB buffer at 6- or 12-step chunks), the twins and the WOA calibrations
+ran on CPU with one job per window and evaluation: `tke_lbfgs.py mjstep` replays the optimiser log and
+sums `eval_<k>/win_<MM>.json` (or posts `eval_<k>/u.json`), `winjob` writes one window,
+`scripts/calib/mj_drive.py` packs the ready windows of several runs into multi-node jobs
+(`mj_batch.sbatch`, one window per node). The iterates equal the single-process optimiser's bit for
+bit, and CPU results do not depend on the CPU count (16/52/128 bit-identical). Traps met on the way:
+the per-user limit of 20 running jobs (hence multi-node jobs); Slurm raising SLURM_CPUS_PER_TASK to
+cover --mem, which srun then refuses against SLURM_TRES_PER_TASK; `--export` splitting on commas;
+argparse reading `--u -2.3,...` as an option (use `--u=`); and a quasi-Newton step through a nearly
+flat curvature pair proposing cd = inf — the multi-job path now rejects points outside the controls'
+domain before posting them (`mj_fun_and_grad`).
+
+The window-mean MLD cost decides little. J(c_k) moves by under 0.7 % over a factor 12 in c_k; the
+c_k-only fit stops at 0.020 (misfit −0.57 %); the four-constant fit walks to c_eps 84, cd 1384, alpha
+3.7 for −2.45 % (at N_eff = 500 the data term, ~1.8e4, makes the prior negligible); and the sign of
+dJ/dc_k flips between the 2013 hindcast state (equilibrated at c_k = 0.1, wants less mixing) and a
+10-day spin-up state (wants more). Near a twin truth, L-BFGS stalls at J ~ 0.04: over steps of
+0.01-0.02 in u the MLD level switches, not the smooth gradient, decide the cost change, so line
+searches fail. A smooth mixed-layer metric (a sigmoid-weighted threshold crossing, or a
+potential-energy anomaly) is the change to test before longer windows.
+
+### 2026-10-10 (sea-ice calibration, task 1) — ice-calib merges adjoint-ice-df, fortran-restart and adjoint-calib; a queued job tests the tree it finds when it starts
+
+Branch `ice-calib` = `adjoint-ice-df` (ed164ba) + `fortran-restart` (merge 465ae2a) + `adjoint-calib`
+(merge af5413c), both `--no-ff`. Conflicts: `docs/PORTING_LESSONS.md` (one hunk from fortran-restart,
+two from adjoint-calib, all appended blocks, kept both) and `scripts/runs/suite_groups.txt` (one
+hunk from adjoint-calib: the four scripts-group lines of the ice/TKE work against
+`test_tke_lbfgs.py`, kept both). `suite_groups.txt` merged cleanly with fortran-restart.
+
+* The baseline on the merged tree (job 28030428; eight files: controls, optim_lbfgs, ice_controls,
+  ice_frozen_sweep, fortran_restart, suite_groups, tke_lbfgs, cbar_ice_core2) gave 126 passed,
+  3 failed, 0 skipped. All three failures are inherited, not caused by the merge resolution:
+  * `test_suite_groups.py::test_the_cost_split_is_still_worth_having`: ci = core2 = 39 files.
+    fortran-restart puts `test_fortran_restart.py` in core2, and that branch alone already has
+    37 = 37. New data-free files in `ci` lift ci above core2 again.
+  * `scripts/tests/test_tke_lbfgs.py::test_gradient_matches_central_fd`: the strict check on the
+    smooth terminal-SST functional gives c_k adjoint −3.236e-3 against FD −3.264e-3 (rel 8.7e-3,
+    bound 1e-4); the MLD rows pass their 5e-3 bound except c_k at h = 3e-4 (4.7e-3, still inside).
+    `::test_ident_tangent_gradient_matches_adjoint`: the tangent matches the adjoint to 1e-7, but
+    the Gauss–Newton H is not bitwise symmetric. Both bounds were measured on adjoint-calib, whose
+    model predates the drift fixes on adjoint-ice-df (surface-velocity refresh, mid-step JRA55
+    instant); not investigated here.
+* A job submitted on a live worktree runs whatever the tree holds when it STARTS, not when it
+  was submitted. The first baseline (28030348) waited in the queue while the Task 2 edits began,
+  so the baseline was repeated on a `git archive af5413c` export under /scratch (28030428). Run a
+  baseline from an export, or do not edit the tree until the job has started and imported.
+
+### 2026-10-10 (sea-ice calibration, task 2) — the ocean-to-ice Stanton number becomes `IceConfig.st_oce_ice`; a Python-float field traces the literal's program
+
+The basal heat flux `o2ihf = (T_oc − T_f)·0.006·u*·cc·A + …` (`fesom_jax/ice_thermo.py:209`;
+`ice_thermo_oce.F90:582` in FESOM2) now reads `cfg.st_oce_ice`, a new `IceConfig` field next to
+`h_ml` (`fesom_jax/ice.py:124-127`), not at the end of the tuple: `test_ice_frozen_sweep.py:78`
+pins the last two fields.
+
+* A NamedTuple field holding a Python float enters `make_jaxpr` as the same scalar literal as the
+  inline constant, so the default changes nothing: the sha256 of the canonicalised jaxpr of one
+  CORE2 `thermodynamics` call, of one ice step with standard EVP and of one with mEVP + frozen
+  sweep on the zstar path were pinned at af5413c BEFORE the edit (job 28030375) and are unchanged
+  after it (`fesom_jax/tests/test_ice_stanton.py`, job 28030390: 6 passed, 0 skipped). A
+  default of 0.0060000001 in a scratch copy changes all three hashes (job 28030391).
+* The jaxpr text prints closed-over arrays (mesh, forcing) by shape only, so such a hash sees the
+  code and every scalar literal but not the data; that is what makes it a cheap cross-commit
+  pin of "the program did not change".
+* Linearity is checked on a snow-free synthetic cell: with hsn = 0 nothing melts snow and
+  flooding is a no-op, so h_new = h + rh_atm − o2ihf·ice_dt/cl and dh_new/dSt =
+  −(T_oc − T_f)·u*·cc·A·ice_dt/cl exactly (rtol 1e-9, A = 1 and 0.7).
+
+### 2026-10-10 (sea-ice calibration, task 3) — generic ice controls `Params.ice_ctrl`; a 2-step FD check needs a start state where every control acts smoothly
+
+`Params.ice_ctrl = {IceConfig field: scalar}` (`fesom_jax/params.py:141`, a pytree leaf; `None`
+or `{}` ⇒ no leaves). `ice_surface_step` validates it with `ice.check_ice_ctrl` and swaps it in
+with `cfg._replace(**ice_ctrl)` (`fesom_jax/ice_step.py:180-188`), AFTER `ice_dt` is derived
+from the ocean dt and after the `ice_pstar`/`ice_cd` swap. Allowed names: `ice.ICE_CTRL_FIELDS`
+(`fesom_jax/ice.py:325`), the 44 fields whose default is a Python float, minus `ice_dt` and the
+`adjoint_*` settings; integer and string fields select code paths or loop lengths and are
+refused, as is a non-scalar value and a field set both here and through `ice_pstar`/`ice_cd`.
+
+* Unset, the ice step traces the program pinned in test_ice_stanton before either change (EVP and
+  mEVP + frozen sweep, `params` None / defaults / `ice_ctrl={}`).
+* The ten thermodynamic controls traced together at their configured values give the
+  constant-config step to 3.9e-13 relative (eta_n; every other State field ≤ 3.1e-13; bound
+  1e-11), and a second control vector reuses the executable (`_cache_size() == 1`).
+* The frozen-sweep custom_vjp passes a traced field the mEVP does not read (albsn) with an exact
+  zero cotangent next to a non-zero P* one. Comparing its forward with a jitted program is
+  bitwise only against another jitted program: against the eager call it differs by 2e-13.
+* 2-step CORE2 gradient (exact + frozen sweep, J = Σ area·(a_ice + m_ice)/1e12 = 65.2) against a
+  central FD of the IceConfig fields set directly (traced through `ice_cfg`, one compile; the
+  `ice_ctrl` path is not used, and two separately compiled constant configs agree with it to
+  6.5e-9 relative for st_oce_ice at h = 1e-4), h = 1e-4/1e-5/1e-6 (job 28031396):
+  con 3.8e-7, consn 3.7e-7, h0 4.0e-6, st_oce_ice 7.0e-6, albsn 1.2e-5, c_melt 1.28e-4 (a
+  stable gap, not FD noise: the FD agrees with itself across h to 1e-8; cause not pinned), h0_s 3.3e-4 (dJ = −1.3e-7, January: little new ice in the south),
+  albsnm 3.1e-3 with an FD that itself moves 0.6 % between h — the dry/melting albedo switch
+  `t < 0` of `ice_thermo._budget`, re-evaluated for each thickness class, which the pathwise
+  adjoint does not see (the forward-jump gap expected in S1). Bound 1e-2: a plumbing error is O(1).
+* albi and albim: FD and adjoint exactly 0, because `seed_ice` puts snow on every ice node and the
+  bare-ice albedos are never read. Giving half the Antarctic pack bare ice made the 2-step FD of
+  EVERY control jump by O(1) between h (jobs 28030810, 28031160; also with snowfall switched off),
+  so the gradient test keeps the seeded start and a separate one-step test covers the plumbing:
+  one ice step with `ice_ctrl` equals the step with `cfg._replace` of the same traced values
+  bitwise, for each control moved by 1 % in turn, and every move changes a_ice/m_ice/m_snow
+  (albi 2.6e-5, albim 1.7e-5).
+* Negative control (scratch copy, the swap skips c_melt, job 28031397): the gradient test fails
+  on c_melt only (adjoint 0 against FD −3.53e-2) and the one-step test fails on c_melt only.
+
+### 2026-10-10 (sea-ice calibration, task 4) — ice controls in `controls.py`: `ice.<field>` names, one `ice_ctrl` dict, a σ table that only a table test can check
+
+* A control named `ice.<IceConfig field>` is valid for the float fields of `ice.ICE_CTRL_FIELDS`;
+  `ControlSet.to_params` (`fesom_jax/controls.py:158`) collects every `ice.*` control into ONE
+  `Params.ice_ctrl` dict, merged over the base's own dict, and keeps the `dataclasses.replace`
+  path for scalar fields, so TKE, `ice_pstar` and ice-dict controls mix in one set.
+  `surface_adj` and `ice_ctrl` joined `_NON_SCALAR_FIELDS` (:50): both are pytrees, and before
+  this the generic scalar path would have accepted `surface_adj` as a control name.
+* `ice_thermo_control_set()` (:258): p0 from `IceConfig()` (`Params.defaults()` carries no ice
+  values), σ = 0.05/p0 for the four albedos (±0.05 absolute at u = ±1) and ln 2 for the other six.
+  The test asserts the plan's table value by value (p0 exactly; σ and p(u = ±1) to the table's
+  three significant figures). A wrong albedo σ (0.06/p0 for albsnm, scratch copy, job 28030591)
+  fails that test and nothing else: the chain-rule test g_u = σ·p·∂J/∂p still passes, because
+  `to_physical` and `grad_u` use the same wrong σ.
+* `ControlSet.out_of_domain(u)` / `in_domain(u)` (:203): albedos in (0, 0.95], every other control
+  within a factor 10 of p0, a wrong shape or non-finite u out. A log-normal albedo passes 1 at
+  finite u (albsn at u > 3.4), which a prior-off line search with `expand=4` can reach; the
+  calibration coordinator (Task 8) is to turn such a point into a failed evaluation without
+  running the model.
+* Tests: `fesom_jax/tests/test_controls.py` 31 passed (job 28032067, with suite_groups,
+  ice_stanton, frozen_sweep, ice_thermo, ice_step and optim_lbfgs: 119 passed, 1 failed = the
+  inherited ci/core2 balance, 0 skipped). `scripts/tests/test_tke_lbfgs.py` on this tree (job
+  28030590) fails the same two tests with the same numbers as the baseline (task 1).
+
+### 2026-10-10 (ice-parameter calibration, Task 5) — sea-ice super-observations on the CORE2 nodes: what the OSI-SAF and CCI files actually contain
+
+`fesom_jax/obs_seaice.py` moves every observed EASE2 cell (25 km) to its nearest wet surface node (KD-tree on unit
+vectors, cap 30 km north / 50 km south, `assign_cells` :118) and averages per node and month; the weight is the
+observed area, n·625 km² / (100 km)² (`obs_weight` :81). `scripts/icecal/prep_obs.py --years 2013` (CPU job
+28030451, 57 s) wrote `runs/icecal/obs/obs_2013.{npz,json}` and the cached assignment `assign.npz`.
+
+* **The JAX node order is the Fortran output order.** `data/mesh_core2/geo_coord_nod2D.npy` equals /pool's
+  `core2/nod2d.out` to 2e-13 deg, and every CORE2 surface node is wet (ulevels 1, nlevels ≥ 5).
+* **OSI-SAF `status_flag` is a bit mask; only two of the kept bits are zeros.** In 2013 every kept
+  `open_water_filtered` and `max_ice_climo` cell is exactly 0. `high_t2m` is a caution flag on the retrieved value:
+  32 268 of the 223 619 kept NH high_t2m cell-days are above 0, up to 100 % (check job 28030473). Dropped:
+  land, lake, land_spill_over, spatial_interp and the fill value (`OSI_DROP_BITS` :71, `osisaf_valid` :138). A
+  generic "flag ≠ 0 → drop" would have removed 82 % (NH) and 86 % (SH) of the kept cell-days (the whole open-water
+  side).
+* **Kept cells can lack an uncertainty.** All `temporal_interp` cells and ~1 % of the `open_water_filtered` cells
+  carry the fill value in `total_standard_uncertainty`. They add nothing to the monthly σ (`MonthlyCellMean` :192);
+  the 0.1 floor dominates anyway.
+* **Raw integers, not percent.** `ice_conc` is an int with `scale_factor` 0.01 and units "%", so fraction = raw·1e-4.
+  The reader switches auto-scaling off and asserts the attributes (`prep_obs.py:120`). A synthetic test file written
+  after `Dataset.set_auto_maskandscale(False)` is still auto-PACKED: the Dataset call covers only variables that
+  already exist, so a variable created later needs its own `set_auto_maskandscale(False)`
+  (`test_icecal_prep_obs.py:48`; the first test run read 65 instead of 0.65).
+* **CCI has no `_FillValue`; missing is NaN.** Flag 0 cells with a NaN concentration exist (2-20 per month) and are
+  dropped; flag 0 thicknesses below zero (24-77 cells per month, down to −0.46 m) are kept, as the product intends,
+  for unbiased averaging (`cci_effective_thickness` :205). The CCI and OSI-SAF NH cell centres agree to 4e-6 deg, so
+  one NH assignment serves both.
+* **The open-water zeros dominate the node counts.** Valid concentration nodes per month: NH 46 970-47 754 (of 79 233
+  NH nodes; 8 696-22 116 with C > 0), SH 24 430-24 887 (4 268-11 537 with C > 0); thickness nodes 8 214-15 748 in
+  Jan-Apr and Oct-Dec. The `max_ice_climo` zeros reach 16° latitude, so Σw per month is ~4 500 (NH) and ~9 150 (SH),
+  not the 1-2·10³ of the ice-covered area. They add no misfit where the model has no ice, but they count in N_eff.
+* **Cells beyond the cap:** NH ~24 400 of ~96 400 valid cells a month, SH 6 844 of ~153 000; median |lat| 36°, 99 %
+  below 56° (the coarse subtropical mesh). On 2013-03-15, 253 ice-covered NH cells fell beyond the cap (up to 83°N).
+* Negative control: an off-by-one in the cell → node index (scratch copy, job 28030443) fails both assignment tests.
+
+### 2026-10-10 (ice-parameter calibration, Task 6) — monthly-mean accumulators from a per-chunk month scalar, and one cost formula for JAX and Fortran output
+
+`fesom_jax/seaice_cost.py`: `monthly_accumulators(month)` (:41) returns `a_mon`/`m_mon` [12, nod2D] and `n_mon` [12]
+for the existing `adjoint_costs.with_running_costs`, as closures over the chunk's month index. `cost_terms` (jnp) and
+`cost_terms_np` (numpy, :168) evaluate the same `_terms` (:130), so the Fortran scoring of S4 cannot drift from the
+cost the adjoint differentiates.
+
+* **The month enters as data, not as a closure constant.** The month is a traced int32 scalar in the chunk's xs, and
+  the increment is a one-hot row times the state (linear, so its cotangent is the accumulator cotangent's row). A
+  jitted toy chunk run with months [0, 1, 1] traces once (`test_seaice_cost.py`). Closing over a Python int instead
+  would compile one chunk per month, which breaks the one-`chunk_fn`-per-process rule of the executable cache.
+  `init_accumulators(monthly_accumulators(0), state)` gives the shapes (eval_shape only).
+* **Which month owns a step:** the month of its MID-step time (`chunk_months` :71). The step that ends at 00:00 on
+  the 1st belongs to the month before, as in FESOM's monthly output. `chunk_months` refuses any chunk whose first
+  and last mid-step times lie in different months, and any window that leaves its start year (the 12 rows would
+  alias two years). With 24 steps of 1800 s from 00:00 or 12:00 no chunk straddles; a 06:00 start does, on 31 Jan.
+* **NaN never reaches the jnp graph.** `cost_obs` (:108) replaces the observation NaNs on the host by 0 values with
+  weight 0, and folds w/σ² into one array. The residual is masked with `where` (:142), not multiplied by a 0 weight,
+  so NaN rows of a Fortran field outside the scored months, or at unobserved nodes, are harmless in numpy too.
+* **Months without a model step are skipped.** A partly covered month (a 30-day window from 1 Jan ends on 30 Jan)
+  is still compared with the full-month observation; for the S1 gradient checks this does not matter, for a reported
+  misfit it does.
+* Negative control: a weight without A_corr (scratch copy, job 28030444) fails the numpy-loop reference by a
+  factor 1e10.
+
+### 2026-10-10 (ice-parameter calibration, Task 17 tool) — the multi-year sea-ice score: Fortran fill = no ice, and an extent the super-observations cannot give back
+
+`scripts/icecal/score.py` scores a Fortran run directory (monthly `a_ice`/`m_ice.fesom.YYYY.nc`) or JAX
+`fields[_YYYY].npz` files (keys `C_mean`, `H_mean`, `n_mon`, `year`) against the `obs_<YYYY>.npz` files: J per year
+and term through `seaice_cost.cost_terms_np`, hemispheric area and extent, NH March/September extent trends and RMSE,
+the SH seasonal-cycle RMSE, the IIEE, CCI winters' J_H and thickness bias, per-decade means; JSON and three line plots.
+
+* **FESOM's monthly ice files hold the netCDF fill value (9.96921e36) at ice-free nodes** (Jan 1958, one-month
+  test run: 85 831 fill nodes, 41 027 with ice). The reader turns it into 0 (`score.py:109`). Decoding it to NaN
+  and dropping it would remove every ice-free node from J, area and IIEE; averaging it would put 1e36 into J.
+* **Record i is month i + 1** (paper_jax's `fortran_iter_months` logic). The record's `time` is the start of the
+  month's last step (e.g. 1960-02-29 23:30), so the reader also checks that stamp's year and month and refuses a
+  file whose records do not match (`score.py:118` for the mapping). A record-offset planted in a scratch copy fails
+  five of the seven tests, J among them (job 28030624).
+* **The cell-level extent is lost in a super-observation.** A node's mean of up to 16 cells says nothing about how
+  many of its cells exceed 15 %. `prep_obs.py` therefore now also writes `nE`, the number of the node's cells whose
+  monthly mean exceeds 15 % (`obs_seaice.count_above` :243). The observed extent is `nE · 625 km²`, the same number
+  paper_jax's `grid_ice_area` gives on the cells (frozen in the test). obs_2013.npz predates `nE`; the score falls
+  back to `nC · [C_obs > 0.15]` and works either way.
+* **"Same masks" has two readings, and both are reported.** The model on its own node areas over the whole
+  hemisphere (`area_model`) is what the climate literature compares with satellite area, but it includes cells
+  the observations drop (beyond the cap, land spill-over, the pole hole). The observation-space companion
+  (`*_model_obsspace`, each observed cell takes its node's model value) uses exactly the observed cells. The IIEE
+  is computed the same way: each observed node's cells take the model's ice/no-ice verdict of the node, so a node
+  with 3 icy cells of 4 contributes 1 cell of overestimate where the model says ice (`score.py:218`).
+* Gaps: a month without observations keeps its model numbers and has no observed ones (None, not 0); a missing
+  observation year is listed and not scored; a partial model year is scored on its months.
+
+### 2026-10-10 (ice-parameter calibration, Tasks 5/6/17 revision) — high_t2m dropped, active weights for N_eff, near-empty months as gaps, and the 1980-2019 observation files
+
+Decisions taken after the Task 5 numbers: drop every OSI-SAF `high_t2m` cell (bit 16, zeros included, also combined
+with a kept bit; `obs_seaice.py:73`), keep the far-field `max_ice_climo` zeros in J but count only ACTIVE
+super-observations in N_eff, keep negative CCI thickness.
+
+* **Active weights.** `cost_terms`/`cost_terms_np` return `Nact_C_NH`, `Nact_C_SH`, `Nact_H_NH` next to `N_*`: the
+  observed-area weight of the node-months where the observation or the model mean is above 0 (`seaice_cost.py:165`).
+  The boolean on the model mean only selects weights, so the J gradient is unchanged. On the superseded R2 run in 2013
+  (job 28031096) the active weight is 29 % of the scored weight in the north (15 600 of 53 596) and 17 % in the south
+  (18 964 of 109 762); thickness observations are all active.
+* **What dropping high_t2m changes** (R2, 2013, score against obs_v2 vs obs): J_C_NH 19 773 → 19 602 (−0.9 %, almost
+  all in May-August: June 1 995 → 1 935, July 2 823 → 2 744), J_C_SH and J_H_NH unchanged; NH valid nodes in July
+  47 110 → 45 792. The high_t2m cells are a summer, marginal-ice feature in the north (980 cell-days in the south).
+* **Near-empty months.** The OSI-SAF record has months with almost no files: 1986-04/05 none, 1986-06 four,
+  1987-12 two (the 1st and 2nd). The half-of-available-days rule alone would turn the two December 1987 files into a
+  "monthly mean". `prep_obs.py` now requires at least 8 daily files (`MIN_FILES` :52, applied at :218); the
+  every-other-day months before mid-1987 have 10-16 (1987-01: 9). Skipped months are flagged in the provenance.
+* **One assignment for 40 years.** `--assign` reuses a cached cell → node assignment read-only after checking the
+  mesh and grid hashes and the caps (`get_assignment` :163); every year 1980-2019 matched the 2013 cache, so all
+  observation files share it.
+* **1980-2019 files** (`runs/icecal/obs_v2/`, jobs 28031048 for 2013 and 28031092-95, 35 min in total): 12 months
+  of concentration every year except 1986 (9; April-June missing) and 1987 (11; December); valid NH nodes 44 500-47 800
+  per month (monthly maxima 45 900-46 100 in 1980-1986, 47 500-47 800 from 1988), SH 24 300-24 900;
+  thickness Nov 2010 - Apr 2017, 6 844-16 034 nodes per month.
+
+### 2026-10-11 (ice-parameter calibration, Task 7) — the evaluation driver `scripts/icecal/icecal.py`; the CORE2 forward is round-off sensitive at 1e-4 within four steps
+
+`eval` (one `chunked_grad`, boundaries in host RAM), `fwd` (`--save-state-at`) and `fdbatch` (perturbed forwards in
+ln p, one subdirectory each) on one chunk function per process. Outputs `eval.json`, `fields.npz` (the score.py
+schema), `trace.json`.
+
+* **The month reaches the program through xs.** The local chunk function (`icecal.py:452`) takes xs = (StepForcing
+  chunk, int32 month of the chunk from `seaice_cost.chunk_months`) and closes `monthly_accumulators(month)` over the
+  traced scalar inside `AC.with_running_costs`; `core2_adj` is untouched (the step is reachable from the model's
+  mesh/op/forcing/phys). The model's own `chunk_fn` is replaced by it, so anything that would run the month-0 program
+  with plain StepForcing xs fails on the tuple instead of silently filling January. The test window starts on Feb 1
+  so a month stuck at 0 would show.
+* **Getting the final accumulators out of `chunked_grad`.** The library returns loss and gradient, not the final
+  carry. `chunked_grad` evaluates `loss_fn` once on the concrete final carry and once more under `jax.vjp`; the
+  driver's loss (`icecal.py:369`) keeps the accumulators and cost terms only when its input is not a
+  `jax.core.Tracer` (:377). No second forward, no library change.
+* **One compile.** u enters as `{"u": jnp.asarray(u, float64)}`, the month as a device int32: the first eval made
+  137 backend compiles (2 model programs + eager ops), the next two (another stride, another u) and all 24 forwards of
+  the FD test made none (job 28034222). Stride 2 equals stride 1 bitwise on CPU (one span rebuilt). First eval of the
+  8-step window on a CPU node: 799 s wall (130 s compile), VmHWM 87 GB.
+* **Round-off sensitivity (the finding of this task).** A 1-ulp change of the start `T` (or of `a_ice`) moves `a_ice`
+  by 1.3e-4, `m_ice` by 4.5e-4, ocean `T` by 1.4e-5 and `t_skin` by up to 4.3 K at ~30 nodes after 4 steps, in one
+  and the same compiled program (diagnostic job 28032950, 2013-04-01 State; differences on ~22 000 nodes, both
+  hemispheres; the single-step program itself repeats bitwise). The chunk scan and a single-step loop of the same step
+  therefore differ by 1.0e-4 in a node's 8-step mean concentration (jobs 28032252, 28032664 for Feb, 28032829 for Apr),
+  and `J_data` (~3e3) carries a round-off noise of a few 1e-4. Seeding the ice (`ice.seed_ice`, as test_ice_ctrl)
+  does not remove it (4e-6 in the fields, and an FD of `con` that changes sign between h, job 28032663). For S1 this
+  means the J noise floor is set by this sensitivity, not by GPU non-determinism alone; the FD steps must be large
+  (u-steps 0.03-0.3 resolve `c_melt` here) and the noise must be measured (repeats).
+* **Testing under that noise.** The independent step-by-step mean is compared with a bound of 20x the measured
+  program-to-program spread (2e-3 in C, 6e-3 in H) and the test asserts the bound can still tell a one-step shift of
+  the average apart (3.4e-2); the saved State is compared bitwise with the chunk program's State after one chunk; the
+  FD noise is measured in the test (J at u + 1e-12 e_j, three probes) and a step size counts only where it is below a
+  quarter of the tolerance.
+* **Adjoint vs FD at 8 steps: two kinds of controls.** `c_melt` and `h0` (act on A directly: the melt and
+  lead-closing terms) agree: `c_melt` -3.4539 vs -3.4580 at u-step 0.03 (1.2e-3), `h0` 0.41851 vs 0.41863 at 0.1
+  (2.8e-4; job 28034222); `c_melt` the same with the exact derivative (9e-4). `st_oce_ice` and `con` (act through
+  the heat budget) do not: `st_oce_ice` -0.536 (calibration setting, job 28033085) and
+  -0.532 (exact derivative, job 28033589) against an FD of -0.493 ... -0.510 at u-steps 0.03-0.3 with a measured
+  noise of 0.1-0.8 %; `con` 0.051 against 0.039 and 0.018 at u-steps 0.1 and 0.3 (noise 2-3 %, job 28034222). The setting changes the
+  `st_oce_ice` adjoint by 0.7 %, so the frozen mixing is not the cause; forward switches and kinks the pathwise
+  adjoint does not see (the plan's S1 gap (a): albedo at t < 0, `active`, the h < 1e-6 cut, the 5-iteration
+  skin-temperature Newton whose output moves by kelvins under a 1-ulp change) are the likely one. The driver test
+  asserts the FD for `c_melt` and `h0` and reports `st_oce_ice` and `con`; S1 decides what the gap means for
+  the calibration.
+
+### 2026-10-11 (ice-parameter calibration, Task 8) — the L-BFGS chain reuses the TKE coordinator by import; no-clobber window files with `os.link`
+
+`scripts/icecal/icecal.py chain-init` / `chain-step` and `scripts/icecal/job_chain_gh200.sh`: one evaluation per
+dolpung job, the next job submitted by the one that completes an evaluation.
+
+* **Reused by import, not factored.** `tke_lbfgs.mj_fun_and_grad` (`scripts/calib/tke_lbfgs.py:1143`) names a
+  window file `win_{m:02d}.json` (:1179), which is `win_2013.json` for a year, so window ids may be years. Its only
+  month-specific demand is the key `month` in each window file (read at :1204): the ice chain writes the window year
+  there. `run_mjstep` (:1212) and `_mj_try_coordinate` (:1269, the `O_EXCL` `coord.lock`) take any `ControlSet`,
+  so `tke_lbfgs.py` is unchanged and its tests are not affected (no `mj_core.py`).
+* **The physical domain plugs into the coordinator through `check`.** `mj_fun_and_grad` turns a `ValueError` from
+  `cs.check(u)` (:1161) into a failed evaluation (f = g = NaN, logged, counted, never posted). `DomainControlSet`
+  (`icecal.py:591`) is a `ControlSet` whose `check` also raises when `out_of_domain(u)` is not empty, so a
+  line-search trial with an albedo above 0.95 costs no model run. The prior-off test with an albsn target at
+  u = 6 (p = 1.17) produces such trials, and the evaluator asserts it never sees one.
+* **`run_mjstep` compares `run_config.json`.** With a `config`, `tke_lbfgs._write_config` (:493) refuses a file whose
+  `calib`, `optimizer`, `options` or `free` differ. `chain-init` (`icecal.py:614`) writes exactly those keys in the
+  coordinator's shape (`options` = `vars(LBFGSOptions(expand=4))`, `free` = all ten names), so the coordinator only
+  ever compares and never writes the file.
+* **No-clobber publication.** `tke_lbfgs._write_json_atomic` (:1135) ends in `os.replace`, which would replace an
+  existing window file. `publish_json` (`icecal.py:157`) writes the whole file under `eval_<k>/.tmp/`, fsyncs it
+  and `os.link`s it to the target: atomic for readers, and `FileExistsError` if the target exists. Nothing is
+  unlinked, so the temporary name stays as a second link to the same inode (no extra space). Negative control: with
+  `os.replace` in its place (scratch copy) the no-overwrite test fails and the other nine pass.
+* **Who submits what.** The orchestrator starts one step per window by hand; afterwards only the process that
+  completes evaluation k and wins `eval_<k+1>/coord.lock` submits, one job per window of k+1. A step that finds
+  evaluation k complete but never coordinated (its last job died after writing its window file) coordinates and
+  submits the OTHER windows of k+1 itself. `STOP` is checked at the start of a step (nothing evaluated) and before
+  submitting; `maxeval` is enforced by `minimize` and checked again before submitting. A failed submission (the
+  dolpung cap of 4 jobs, sbatch error) keeps the window file, is logged in `chain.jsonl` and exits 3; rerunning
+  `job_chain_gh200.sh R W` resumes at the posted point.
+* **Tests without Slurm.** Fake `sbatch`/`squeue` executables first on `PATH` let the real job script run; an
+  emulator runs every submitted step in-process. The chain reproduces `optim_lbfgs.minimize` on the same function
+  bitwise (iterates, f, g, stop status) with the prior on, with the prior off and out-of-domain trials, with a NaN
+  gradient at evaluation 3 (a failed Armijo trial; the chain goes on), and with two windows (J summed with
+  `math.fsum` as the coordinator does).
+
+### 2026-10-13 (ice-parameter calibration, Task 12) — a JAX year from a converted Fortran restart tracks the Fortran sea ice to 0.1 %; a year evaluation needs ~245 GB of host memory
+
+Start state, GPU smoke and JAX–Fortran parity of 2013 (`runs/icecal/states/`, `smoke/`, `parity/`).
+
+* **Which record is the start state.** The default Fortran hindcast keeps monthly restarts in yearly directories,
+  so the state at Jan 1 of year Y is the LAST record of `fesom.<Y-1>.*.restart` (time = year length − 1800 s), not a
+  record of `fesom.<Y>`. The conversion script checks that record (12 records, time 31620600 s, iter 964272) before
+  it submits `convert.py` (job 28101372). This build writes no `ice_temp`, so `t_skin` comes from the reference
+  state, as in the converter's validation; at the precision below it does not matter.
+* **Parity.** `icecal.py fwd` over 365 days at u = 0 (job 28104887) against the Fortran default's 2013 monthly
+  means (`parity.py`, job 28104888): per month, ice area within 0.0024 (NH) / 0.0022 (SH) 10⁶ km² (≤ 0.02 % /
+  0.07 %), volume within 0.0018 / 0.0014 10³ km³ (≤ 0.012 % / 0.06 %), node-area RMS of the concentration
+  difference ≤ 0.005 / 0.016 and of the effective thickness ≤ 0.8 / 1.6 cm. The largest differences are in the
+  Southern Ocean melt season (Nov–Feb, thin ice over small areas); extent moves most there (0.028 10⁶ km² in
+  November) because the 15 % threshold turns small C differences into whole cells. So the forward the adjoint
+  differentiates is, for sea ice over a year, the Fortran model the transfer test scores: a model–model gap will not
+  confound S3 → S4.
+* **Costs measured, and one that would have failed.** The 30-day `eval` (job 28103981): forward 216 s, reverse 977 s,
+  compile 203 s, host VmHWM 47.7 GB of which the stride-8 boundaries are 17.6 GB, device peak 46 GB. The boundaries
+  grow with the window and the device peak does not, so a year needs ≈ 214 GB of boundaries and ≈ 245 GB host
+  memory: the chain's default `--mem=200G` would be killed. The plain `fwd` is faster per day than the `eval`
+  forward (1779 s per year against 216 s per 30 days) because it saves no boundaries; one year evaluation ≈ 4.1 h.
+* `sbatch --test-only -p dolpung` from inside a dolpung job returns 0, so the chain can submit its successor from
+  the node.
+
+### 2026-10-13 (ice-parameter calibration, correction to Task 12) — a year evaluation needs 123 GB of host memory, not 245 GB
+
+* The Task 12 entry above projected ≈ 214 GB of boundaries and ≈ 245 GB host memory for a 365-day `eval` by scaling
+  the 30-day smoke linearly at its stride 8. That was wrong: `adjoint.chunked_grad` defaults the boundary stride to
+  √n_chunks, so host memory grows like (n/k + k) States, not like n/8. Measured by the S1 year eval (job 28106248,
+  730 chunks): stride 27, boundaries 56.7 GB, MaxRSS 123 GB, forward 31 min + reverse 2.9 h (3.5 GPU-h, below the
+  4.1 h projected). The chain's default `--mem=200G` is enough; `--mem=300G` is not needed.
+* Lesson: project a checkpointed reverse's memory with the stride rule the driver actually uses, not from one
+  measured point.
+
+### 2026-10-14 (ice-parameter calibration, Task 13) — the thermodynamic ice adjoint passes the winter thickness cost and under-estimates the concentration cost by 25-65 %
+
+* **What was measured.** Ten thermodynamic controls (p = p0·exp(σu)) against central finite differences in ln p
+  (h = 1e-2, plus 3e-2 for four controls) over 30 days from January and July and over 365 days of 2013, cost =
+  monthly-mean super-observations (NH/SH concentration, NH CS2 thickness), setting freeze_mixing + freeze_gm_slope +
+  freeze_fct_limiter, mEVP frozen sweep θ 0.97. 34.9 GH200 GPU-h in all (plan ≈ 40 with probe and localisation).
+* **The split is by cost term, not by window or control.** Year, adjoint/FD: NH thickness con 1.01, consn 1.00,
+  h0 1.05, albim 0.97 (pass, FD consistent across h); NH concentration 0.36-0.75 for every control. At 30 days the
+  same pattern, weaker: Jan thickness 1.02-1.10, Jan concentration con 0.59, consn 0.63. Controls that act through
+  summer melt (snow albedos, c_melt) fail in thickness too (0.51-0.67), because CS2 sees only winter and the summer
+  signal reaches it through the concentration. So the gradient the adjoint loses is the one that passes through the
+  concentration update (lateral melt/freeze, `min(A, h·1e6)`, `h < 1e-6 → 0`, `cut_off`) or through the ice drift
+  of the marginal ice zone; the FD response sits 84-96 % in MIZ node-months.
+* **Not the frozen mixing.** A live-TKE 30-day eval moves no ratio beyond noise (con 0.89 → 0.87). A live-TKE year
+  bursts in the TKE cotangent on 26-27 Dec 2013 and is unusable; that question stays open.
+* **The year Gauss–Newton Hessian from h = 1e-2 FD is noise-dominated** (diagonal noise 1.0e5 against a top
+  eigenvalue 8.7e4; 4 of 10 corrected eigenvalues are negative or below 40). Year FD for SH concentration is
+  inconsistent between h = 1e-2 and 3e-2 (con 321 vs 81, h0 228 vs −55): one year of SH concentration is chaotic at
+  this step, so a Hessian or an FD bar for it needs larger h or more repeats.
+* **Per-term reverse traces tell the terms apart.** The J_H_NH year trace grows ×69 with four spikes below ×3; the
+  J_C_NH trace grows ×3644 and has a one-boundary m_snow spike ×81 at the November freeze-up. The total-J trace
+  showed only the December spikes; per-term seeds are worth the extra reverse when a bar fails.
+* **Subtracting reverses is not a gradient.** J_C_SH = full − J_C_NH − J_H_NH from three separate year reverses
+  gives ratios like −5.9 and 4.9: each GPU evaluation follows its own round-off path (the three evals' J_data are
+  33249-33264, a spread of 15 against the FD base repeats' sd of 1.24). Seed every needed term in one
+  `chunked_grad_multi` pass instead.
+* Tooling: `s1sum` must get `--eval` explicitly when a window holds runs of another setting (the default glob would
+  pick up the live-TKE eval, and the window check refuses mixed settings).
+
+### 2026-10-15 (ice-parameter calibration, Task 13 follow-up) — the concentration-gradient bias and the year spikes both run through the ice-advection derivative; freezing the FCT limiter and the u_ice → advection derivative removes the spikes and the length shortfall, not the angle
+
+* **What was tried.** The farc ice session's derivative-only cuts, picked onto `ice-calib-cuts` (forward bitwise, so
+  the S1 FD runs serve): "fct_flux" (low-order ice-advection tangent), "strength_conc", `adjoint_thin_mass` 100 kg/m²
+  and `adjoint_sweep_guard` 10, all together, then one at a time, then two narrower FCT cuts. 33.9 GH200 GPU-h
+  (19 jobs) + 9.3 CPU node-h.
+* **The farc bundle is wrong for concentration costs.** It removes every year spike (J_C_NH trace max ×3644 → ×47)
+  but halves the gradients (year J_C_NH adj/FD con 0.58 → 0.20, consn 0.60 → 0.21, albim 0.71 → 0.31; July h0_s
+  flips sign). The CORE2 year-window session's TKE/drag costs pass with the same bundle: a cut is validated per cost.
+* **One cut at a time (January 30 d) names the culprit.** "fct_flux" alone gives the whole loss (h0 0.82 → 0.44,
+  c_melt 0.85 → 0.32); thin mass 100 changes no ratio by more than 0.03; "strength_conc" is mixed. The high-order
+  (antidiffusive) part of the ice-advection tangent carries most of the marginal-ice-zone concentration sensitivity.
+* **The narrow fix.** Cuts "fct_limiter" (Zalesak factors constant, the antidiffusive flux derivative kept) + "fct"
+  (no u_ice derivative into the advection) + thin mass 100 + guard 10. Year J_C_NH: no one-chunk growth above ×1.2,
+  0 guard trips, adj/FD albim 1.00, h0 0.92, consn 0.90, con 0.84-0.87, c_melt 1.21, albsnm 0.71-0.74, albsn 0.52
+  (S1 0.36-0.75). Cutting u_ice → advection RAISES the ratios: the adjoint's ice-dynamics path opposed the
+  thermodynamic response more strongly than the model does. The limiter cut alone (with thin mass and guard) is
+  not enough for the year: J_C_NH 0.38-0.85 (S1 + 0.02-0.10), one-chunk growth up to ×4; the u_ice → advection
+  cut carries the fix. Year J_H_NH keeps con/consn/h0 at 1.02/1.02/0.98 (albim 0.97 → 1.15, c_melt 0.67 → 2.17
+  on a small term); year J_data con 0.87-0.94, consn 1.12, h0 0.84-1.05, albim 1.08, albsnm 0.75-0.77, c_melt 1.30,
+  h0_s 0.80 (S1 0.39-0.95), one-chunk growth ≤ ×1.09, 0 guard trips. Cost: July albsnm 0.61 → 0.39.
+* **Per-control ratios are not the verdict for an optimizer; the direction in u is.** The cut moves the year J_data
+  gradient from 0.75 to 1.17 of the FD length, but its angle to the FD gradient in u (σ-scaled) grows from 5.5° to
+  9.0°, because c_melt, the largest u-component, now overshoots (1.30). In u the albedos are 5-20× weaker than
+  c_melt/con/consn, so the alarming 0.36-0.5 albedo ratios of S1 hardly turn the gradient. Report the angle and the
+  scale next to the ratio table, and let an optimum found WITHOUT the adjoint (FD Gauss–Newton) decide whether a
+  biased adjoint moves the optimum.
+* **The spikes do not move the year gradient.** A repeat of the S1 year (guard 10, 0 trips) gives the same ratios to
+  0.01-0.03 although its spikes fall on other dates; the 25-65 % S1 shortfall is systematic, not spike noise.
+* **Where the spikes are.** `icecal eval --cot-maps` (cotangent maps at every chunk boundary): each spike is ONE node
+  holding 93 % of the m_ice or m_snow cotangent, ×13-×233 in one 12-h chunk, then decaying; Okhotsk (W Kamchatka,
+  NE Sakhalin), N Iceland, Greenland Sea, E Siberian coast. The saved states show every such node ICE-FREE at the
+  chunk start (a = m = 0) with a nonzero ice velocity and ice around it, near freezing (Okhotsk) or at +1.7 °C (N
+  Iceland): ephemeral ice at an empty node, the farc polynya-node class (m → free-drift u_ice via the load → FCT
+  advection of neighbour ice → m), which "fct" and thin mass cut.
+* Tooling: a year reverse on a busy GH200 node ran at half speed (0.5 vs 0.25 min per 12-h boundary) and hit its
+  6 h limit; give year evals 8 h. A CORE2 57-day forward does not fit 3 h on a CPU node; a GPU forward takes 7 min.
+
+### 2026-10-20 (ice-parameter calibration, Tasks 15/15b + dynamics probe) — FD Gauss–Newton finds the 2013 minimum; an adjoint that passed at the start stalls near it; the uncut adjoint reaches 98 % of the gain; adding P* and the two drags lowers J by another 5.5 %
+
+* **Setting.** 2013 year window, J = J_C_NH + J_C_SH + J_H_NH + ½uᵀu, seven thermodynamic controls (con, consn,
+  h0, c_melt, albim, h0_s, albsnm). Main track: adjoint L-BFGS; cross-check: FD Gauss–Newton (`icecal fdgn`,
+  central Jacobian at Δu 0.3-0.7σ, GPU-noise term, trust-radius trials).
+* **FD Gauss–Newton** reached J 24946 (−25.0 % from 33249) in 6 Jacobian/step rounds, ~28 GH200-h. The optimum sits
+  outside every plausibility range (con 0.45 W/m/K vs 2.17, h0_s 0.14 m vs 0.5, consn 0.89 vs 0.31): one year of
+  concentration and thickness pins combinations (conduction through ice + snow, summer albedo), and the unit prior
+  (~9 against J ≈ 2.5e4) cannot hold the weak directions. Gates stayed report-only (Nikolay).
+* **The adjoint with the FCT cuts stalled at J 27927 (−16 %)** after 10 evaluations (~35 GH200-h). At the FD-GN
+  optimum its gradient is 73° and 5.7× off the FD of J (9.5° / 1.13 at u = 0): the cuts carry an absolute c_melt
+  bias ≈ −3000 that is harmless where the gradient is ~1e4 and dominant where it is ~100. The uncut S1 adjoint
+  (frozen sweep θ 0.97, guard 10) at the same point: 35.9° / 1.66. Rule: certify an adjoint for an optimizer near
+  the optimum, and rank settings by the expected loss ½ bᵀH⁻¹b (b = g_adj − g_FD, H from the FD Jacobian:
+  S1 ≈ 125, the cut candidate ≈ 1050), not by the per-control ratios at the start (which favoured the cuts).
+* **The S1 L-BFGS chain** reached J 25110.6 (−24.5 %) in 15 evaluations (13 jobs, 45 GH200-h; two trials fell outside
+  the control domain and cost no job), 165 above FD-GN = 98 % of its gain, close to the predicted ½ bᵀH⁻¹b ≈ 125.
+  It agrees with FD-GN on the implausible values (con 0.65, h0_s 0.08 m). The last three evaluations gained nothing.
+* **Dynamics probe.** `ice_joint_control_set` adds P*, cd_oce_ice and cd_atm_ice (σ ln 2). The atmosphere–ice stress
+  used the module constant, so a cd_atm_ice control changed nothing until `atm_ice_stress` took the drag from
+  `IceConfig` (default bitwise unchanged). FD columns at the FD-GN Jacobian centre u5: all three far above the GPU
+  noise (|A|²_W cd_atm_ice 37400, the largest of the ten; P* 6900; cd_oce_ice 4400; noise 112). The joint GN model
+  predicted −784 (radius 1σ) and −891 (2σ) against −250..−360 for thermodynamics alone; year forwards gave −1199
+  and −1403 (J 23958 at 2σ, 988 below the thermodynamic FD-GN optimum). The gain is all NH concentration (J_C_NH
+  −11 %); J_C_SH −2 %, J_H_NH +9 %. The step wants cd_oce_ice +46 %, P* −6 %, cd_atm_ice +5 %, and leaves con
+  (0.57), consn (1.66) and h0_s (0.13) implausible: the thermodynamic values compensate something the ice dynamics
+  does not explain (forcing, ocean). The model − observation maps after the thermodynamic fit show a thickness
+  dipole (too thick on the Siberian–Pacific side, too thin north of Greenland and the Archipelago).
+* Tooling: Levante `DependencyParameters = kill_invalid_depend`: an afterok job whose parent fails is cancelled by
+  Slurm itself (no DependencyNeverSatisfied left in the queue), so a failed gate job means resubmitting the chain.
+  A new worktree needs its `data` link or every CORE2 test silently skips. The heavy `test_icecal` evals take
+  ~55 min on a CPU node. A100 year forward 4355 s = 2.35× the GH200 (1850 s); the A100 J at u5 matched the
+  GH200 to 2 in 25360.
