@@ -105,6 +105,7 @@ scripts scripts/tests/test_tke_cbar.py
 scripts scripts/tests/test_ice_modes.py
 scripts scripts/tests/test_perf_tools.py
 scripts scripts/tests/test_tke_lbfgs.py
+scripts scripts/tests/test_norm_ab.py
 sharding fesom_jax/tests/test_forcing_sharded.py
 sharding fesom_jax/tests/test_gm_nn_sharded.py
 sharding fesom_jax/tests/test_gradient_sharded.py

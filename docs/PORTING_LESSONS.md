@@ -10613,3 +10613,50 @@ Start state, GPU smoke and JAX–Fortran parity of 2013 (`runs/icecal/states/`, 
   A new worktree needs its `data` link or every CORE2 test silently skips. The heavy `test_icecal` evals take
   ~55 min on a CPU node. A100 year forward 4355 s = 2.35× the GH200 (1850 s); the A100 J at u5 matched the
   GH200 to 2 in 25360.
+
+### 2026-10-14 — what a control transform can and cannot do for the calibration (raw, linear, log)
+
+The calibration optimises log controls, p = p0·exp(σu) (`fesom_jax/controls.py`); the older Adam
+scripts used linear ones, u = p/p0. `scripts/calib/norm_ab.py` compares raw, linear and log on the
+same cost by changing variables on the host only: the model and its adjoint always run in u, and
+the gradient in the arm's variable v is (dp/dv)/(σp)·∂J/∂u. A transform is a fixed diagonal change
+of variables, so it cannot change the adjoint (growth, bursts and relative FD ratios are the same in
+every arm); it changes only the geometry the optimiser sees.
+
+The conditioning, from track F's Gauss-Newton Hessians of the MLD twin cost (four TKE constants):
+κ is 3e6-1.5e7 in raw units and 237-1080 in either normalised form. Linear and log are the same
+matrix at the first guess (dp/dv = σp0 in both) and differ by at most a factor three elsewhere. The
+remaining κ ~ 1e3 is identifiability (the c_eps−cd trade-off, a weak α), which only the prior
+removes. On a surrogate cost with that Hessian, L-BFGS in raw units needs 11-15 evaluations to
+reduce J a hundredfold from two of three starts, against 5-6 for linear (5 for both from p0): the
+optimiser's own diagonal scaling (the lsopt `dgscale` update) absorbs most of a 1e4 condition
+number, not all of it. Adam in raw units misses that reduction from two of three starts.
+
+Three traps in the A/B itself. (1) The log arm must return the base function's result object
+unchanged and the linear arm must form the ratio (dp/dv)/(σp) before multiplying: computed the
+other way, round-off breaks the "log run = plain run" and "linear at v = 0 = log at u = 0" identities
+the tests rely on. (2) A point with p ≤ 0 is rejected without running the model, but the L-BFGS
+still counts it against `maxeval` and as a failed line-search trial, so equal `maxeval` gives the
+linear arm fewer model evaluations; the budget is counted in model evaluations instead. (3) Two GPU
+evaluations of the same program are not bitwise equal, so the GPU check that linear and log agree at
+the first guess compares against the repeat spread; bitwise agreement is a CPU test.
+
+### 2026-10-14 (result) — log vs linear controls on a far-truth TKE twin: no practical difference by the rule, log ahead on the margins
+
+The A/B of the entry above, run on the real model (A100, four 6-hour windows Jan/Apr/Jul/Oct 2013, window-mean MLD
+twin cost, prior off), truth (c_k, c_eps, cd, α) = (0.3, 0.233, 7.5, 15), i.e. ×3, ÷3, ×2, ÷2 from the first guess,
+L-BFGS (expand 4) from three shared physical starts, 25 model evaluations per run, plus one replicate of the log run
+from the first guess as the GPU noise baseline. Evaluations to J/J0 ≤ 1e-2 (log / linear): first guess 12 / 20,
+plus 17 / 18, minus 21 / 17; to ≤ 1e-3: 19 / 21, 20 / never, 25 / 23; the replicate moved by 1 and 4. The rule
+fixed before the runs (all three starts the same way, median gap ≥ max(3, 2·noise)) gives "no practical difference"
+at both milestones. Outside the rule, log ended lower at every start (minimum J/J0 1.2e-7 vs 9.7e-5, 1.3e-4 vs 2.0e-3,
+4.2e-4 vs 9.7e-4) and never left the domain, while every linear run proposed 4-6 steps with a negative constant
+(rejected without a model run). Forward-only cost profiles through the truth explain part of it: in c_eps and α the
+cost is quadratic in ln p (J(2p*)/J(p*/2) ≈ 0.9-1.2, R² 0.99-1.0 in ln p against 0.55-0.92 in p); in c_k and cd it
+lies between the two (ratios ~2 and 4-5, where log-quadratic gives 1 and p-quadratic 4 and 16).
+
+What decides the trajectories is still the MLD cost's non-smoothness (plateaus where line searches fail), not the
+transform. Only one direction is identifiable at this truth (eigenvalue 28, mostly c_k), so cd and α are recovered
+only by the runs that happen to get close. The log controls of `controls.py` stay; a linear option is not needed.
+Five twin jobs first died at start-up because argparse read the forwarded `--mode` as an abbreviation of the driver's
+own `--model-budget`: a driver that forwards unknown options to another parser needs `allow_abbrev=False`.
