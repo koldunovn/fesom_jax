@@ -158,7 +158,20 @@ class State:
     bgc_diag: jax.Array | None = None             # (nod2D,len(recom.wiring.DIAG2D)) the last BGC step's 2-D diagnostics
     #                                               (output only, not restarted; GloHplus = surface pH among them)
     bgc_budget: jax.Array | None = None           # (nod2D,4,ntr) RecomConfig.budget only: per-column content sums
+    # --- the coupled ocean's mode F (fesom_jax.coupled.flux; FESOM2's __oifs ice arrays). OPTIONAL: None unless the
+    # ocean runs coupled in flux mode (the SE_FIELDS precedent), node fields ---
+    cpl_ice_temp: jax.Array | None = None         # (nod2D,) ice%data(4) ice surface temperature [K]
+    cpl_ice_alb: jax.Array | None = None          # (nod2D,) ice%atmcoupl%ice_alb
+    cpl_apnd: jax.Array | None = None             # (nod2D,) melt-pond area fraction (ice%thermo%apnd)
+    cpl_hpnd: jax.Array | None = None             # (nod2D,) melt-pond depth [m]
+    cpl_ipnd: jax.Array | None = None             # (nod2D,) melt-pond lid thickness [m]
+    cpl_fw: jax.Array | None = None               # (nod2D,) the step's water_flux (FESOM2's `fw` output) [m s-1];
+    #                                               only with the coupled monthly output asking for fw, not restarted
     #                                               (recom.wiring.BUDGET_TERMS), not restarted
+
+    # --- REPRODUCTION OF A FESOM2 BUG, NOT PHYSICS (GMConfig.reproduce_fesom_bug_kgm_surface_level): FESOM2's stale
+    # fer_k(ulevels_nod2D) slot of init_Redi_GM, 500 m2/s at every run start, never restarted (as FESOM2) ---
+    gm_kgm_stale: jax.Array | None = None         # (nod2D,) [m2/s]
 
     # ---- constructors -----------------------------------------------------
     @classmethod
@@ -264,7 +277,11 @@ BGC_FULL_FIELDS = ("bgc_benthos", "bgc_alk_surf", "bgc_carb", "bgc_mstep", "bgc_
 BGC_FIELDS = ("bgc", "bgc_old", "bgc_carry") + BGC_MR_FIELDS + BGC_FULL_FIELDS
 # Present but never written to a restart: FESOM2 restarts neither the carbonate cache nor mstep (both restart with
 # the run segment, fesom_module.F90:849,983,1049; recom_sms.F90:489); the diagnostics and budget sums are output.
-RESTART_SKIP = ("bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget")
+RESTART_SKIP = ("bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget", "cpl_fw")
+# The optional coupled mode F fields, in State order (None unless fesom_jax.coupled runs in flux mode).
+CPL_FIELDS = ("cpl_ice_temp", "cpl_ice_alb", "cpl_apnd", "cpl_hpnd", "cpl_ipnd", "cpl_fw")
+# The optional fields of reproduced FESOM2 bugs (None unless switched on; never restarted).
+FESOM_BUG_FIELDS = ("gm_kgm_stale",)
 
 
 def present_fields(state) -> tuple[str, ...]:

@@ -3,6 +3,18 @@
 
     python scripts/prepare_mesh.py RAW_MESH_DIR OUT_DIR
     python scripts/prepare_mesh.py RAW_MESH_DIR x --verify C_EXPORT_DIR   # diff vs the C oracle
+    python scripts/prepare_mesh.py RAW_MESH_DIR OUT_DIR --cavity          # ice-shelf cavities (use_cavity)
+
+``--cavity`` reads ``cavity_nlvls.out`` / ``cavity_elvls.out`` / ``cavity_depth@node.out`` (written by
+FESOM's partitioner with ``use_cavity=.true.``) and derives the cavity-aware arrays exactly as FESOM2 main
+``oce_mesh.F90`` (``find_levels_cavity``, ``find_levels_min_e2n``, ``mesh_areas``) does: ``ulevels`` /
+``ulevels_nod2D`` from the files, ``ulevels_nod2D_max`` = MAX over the node's cells, ``area`` summed only over
+the levels ``ulevels(e)..nlevels(e)-1`` of each cell, ``areasvol`` = the area of the LOWER prism face where a
+cavity cell touches the node's upper face, ``mesh_resolution`` from ``areasvol`` at the node's top level, and the
+extra arrays ``cavity_depth`` (node, m, <=0) plus ``ocean_areawithcav`` in ``meta.txt``. Without ``--cavity`` the
+output is unchanged (all ``ulevels == 1``), byte for byte. No partial cavity cells (``use_cavity_partial_cell``
+false): ``zbar_3d_n`` is ``zbar`` on every node's levels 1..nlevels_nod2D, including the dummy levels inside the
+cavity (``init_ale``).
 
 Reads the raw FESOM mesh files and writes EXACTLY the `.npy` + `meta.txt` layout that `load_mesh`
 consumes (`docs/MESH_EXPORT_LAYOUT.md`) — so the JAX model ships **without a C-FESOM build
@@ -37,8 +49,8 @@ ALPHA, BETA, GAMMA = 50.0, 15.0, -90.0   # Euler angles (deg)
 # ==========================================================================
 # Raw FESOM ASCII readers
 # ==========================================================================
-def read_fesom_ascii(mesh_dir) -> dict:
-    """Read the primitive FESOM mesh + the prebuilt level/edge files."""
+def read_fesom_ascii(mesh_dir, cavity: bool = False) -> dict:
+    """Read the primitive FESOM mesh + the prebuilt level/edge files (+ the cavity files if ``cavity``)."""
     d = Path(mesh_dir)
     with open(d / "nod2d.out") as f:
         nod2D = int(f.readline().split()[0])
@@ -66,9 +78,21 @@ def read_fesom_ascii(mesh_dir) -> dict:
     et = np.loadtxt(d / "edge_tri.out", dtype=np.int64)
     edge_tri = np.where(et > 0, et - 1, -1).astype(np.int32)  # -999/≤0 → -1
 
-    return dict(nodes_deg=nodes_deg, coast=coast, elem_nodes=elem_nodes, nl=nl, zbar=zbar,
-                depth=depth, nlevels_nod2D=nlevels_nod2D, nlevels=nlevels, edges=edges,
-                edge_tri=edge_tri, nod2D=nod2D, elem2D=elem2D)
+    out = dict(nodes_deg=nodes_deg, coast=coast, elem_nodes=elem_nodes, nl=nl, zbar=zbar,
+               depth=depth, nlevels_nod2D=nlevels_nod2D, nlevels=nlevels, edges=edges,
+               edge_tri=edge_tri, nod2D=nod2D, elem2D=elem2D, cavity=cavity)
+    if cavity:
+        # FESOM2 find_levels_cavity: ulevels / ulevels_nod2D are read verbatim (1-based level of the top
+        # wet cell; 1 = no cavity); cavity_depth@node.out is the ice-shelf draft (m, <=0; 0 off-shelf).
+        out["ulevels"] = np.loadtxt(d / "cavity_elvls.out", dtype=np.int64).astype(np.int32)
+        out["ulevels_nod2D"] = np.loadtxt(d / "cavity_nlvls.out", dtype=np.int64).astype(np.int32)
+        out["cavity_depth"] = np.loadtxt(d / "cavity_depth@node.out").astype(np.float64)
+        assert out["ulevels"].shape == (elem2D,) and out["ulevels_nod2D"].shape == (nod2D,)
+        assert out["cavity_depth"].shape == (nod2D,)
+    elif (d / "cavity_elvls.out").exists():
+        print("[prepare_mesh] WARNING: cavity_elvls.out exists but --cavity not given: cavity cells are "
+              "treated as open ocean (FESOM2 refuses this combination, check_cavity_mesh_conflict)")
+    return out
 
 
 # ==========================================================================
@@ -141,12 +165,18 @@ def derive(raw: dict) -> dict:
 
     # --- levels ---
     nlevels = raw["nlevels"]; nlevels_nod2D = raw["nlevels_nod2D"]
-    ulevels = np.ones(E, np.int32); ulevels_nod2D = np.ones(N, np.int32)
+    cavity = bool(raw.get("cavity", False))
+    if cavity:
+        ulevels = raw["ulevels"]; ulevels_nod2D = raw["ulevels_nod2D"]
+    else:
+        ulevels = np.ones(E, np.int32); ulevels_nod2D = np.ones(N, np.int32)
     nlevels_nod2D_min = np.empty(N, np.int32)
     ul_max = np.ones(N, np.int32)
     np.minimum.at(_init_full(nlevels_nod2D_min, np.iinfo(np.int32).max), pair_node, nlevels[pair_elem])
     nlevels_nod2D_min = np.minimum(nlevels_nod2D_min, nlevels_nod2D)  # serial: no-empty guard is a no-op
-    # ul_max = MAX of ulevels(=1) over cells ⇒ all 1 (mirror the reduction trivially)
+    if cavity:   # find_levels_min_e2n: ulevels_nod2D_max = MAX of ulevels over the node's cells
+        np.maximum.at(ul_max, pair_node, ulevels[pair_elem])
+    # (no cavity: ul_max = MAX of ulevels(=1) over cells ⇒ all 1, the reduction mirrored trivially)
 
     # --- elem_area (m²) ---  ay = cos(mean of 3 vertex rotated lats) == elem_cos
     lat0, lat1, lat2 = rlat[n0], rlat[n1], rlat[n2]
@@ -158,15 +188,35 @@ def derive(raw: dict) -> dict:
 
     # --- node areas (CSR-order accumulation via element-ascending loop) ---
     area = np.zeros((N, nl)); third = elem_area / 3.0
-    for e in range(E):                                         # element-ascending ⇒ CSR order
-        nlev = int(nlevels[e]) - 1                             # C loops nz in [0, nlevels[e]-1)
-        t = third[e]
-        area[en[e, 0], :nlev] += t; area[en[e, 1], :nlev] += t; area[en[e, 2], :nlev] += t
-    areasvol = np.zeros((N, nl))
-    for n in range(N):
-        k = int(nlevels_nod2D[n]) - 1                          # ulevels_nod2D-1 = 0 .. nlevels_nod2D-2
-        areasvol[n, :k] = area[n, :k]
+    if not cavity:
+        for e in range(E):                                     # element-ascending ⇒ CSR order
+            nlev = int(nlevels[e]) - 1                         # C loops nz in [0, nlevels[e]-1)
+            t = third[e]
+            area[en[e, 0], :nlev] += t; area[en[e, 1], :nlev] += t; area[en[e, 2], :nlev] += t
+        areasvol = np.zeros((N, nl))
+        for n in range(N):
+            k = int(nlevels_nod2D[n]) - 1                      # ulevels_nod2D-1 = 0 .. nlevels_nod2D-2
+            areasvol[n, :k] = area[n, :k]
+    else:
+        # mesh_areas, use_cavity branch. Fortran nz = ulevels(e)..nlevels(e)-1 (1-based) is the 0-based
+        # slice [ulevels-1, nlevels-1); cavity_contribut(nz,n) counts the node's cells whose top wet cell is
+        # below level nz (Fortran nz = 1..ulevels(e)-1 ⇒ 0-based [0, ulevels-1)).
+        contrib = np.zeros((N, nl), np.int32)
+        for e in range(E):                                     # element-ascending ⇒ the Fortran CSR order
+            lo = int(ulevels[e]) - 1; hi = int(nlevels[e]) - 1
+            t = third[e]
+            for v in range(3):
+                area[en[e, v], lo:hi] += t
+                contrib[en[e, v], :lo] += 1
+        areasvol = np.zeros((N, nl))
+        for n in range(N):
+            lo = int(ulevels_nod2D[n]) - 1; hi = int(nlevels_nod2D[n]) - 1   # 0-based [lo, hi)
+            nzmax = hi - 1                                     # Fortran nzmax = nlevels_nod2D-1, 0-based
+            for k in range(lo, hi):
+                areasvol[n, k] = area[n, min(k + 1, nzmax)] if contrib[n, k] > 0 else area[n, k]
     ocean_area = float(areasvol[ulevels_nod2D <= 1, 0].sum())
+    # area also under the cavities: Σ areasvol at each node's top wet level (mesh%ocean_areawithcav)
+    ocean_areawithcav = float(areasvol[np.arange(N), ulevels_nod2D - 1].sum())
 
     # --- elem centers (min-anchored cyclic), cos, metric, coriolis ---
     axk = np.stack([lon0, lon1, lon2], axis=1)
@@ -208,7 +258,7 @@ def derive(raw: dict) -> dict:
 
     # --- mesh_resolution (full-precision pi; 3-pass Jacobi over CSR) ---
     inv_pi = 1.0 / PI_FULL
-    mres = 2.0 * np.sqrt(areasvol[:, 0] * inv_pi)              # ulevels_nod2D-1 = 0
+    mres = 2.0 * np.sqrt(areasvol[np.arange(N), ulevels_nod2D - 1] * inv_pi)   # areasvol at the top wet level
     for _ in range(3):
         mean3 = (mres[n0] + mres[n1] + mres[n2]) / 3.0
         acc = np.zeros(N); vol = np.zeros(N)
@@ -225,7 +275,10 @@ def derive(raw: dict) -> dict:
     # --- edge_up_dn_tri (MFCT scan) ---
     edge_up_dn_tri = _build_edge_up_dn_tri(raw["edges"], en, rlon, rlat, nie, offsets)
 
+    extra = {"cavity_depth": raw["cavity_depth"]} if cavity else {}
+    meta_extra = {"ocean_areawithcav": ocean_areawithcav} if cavity else {}
     return {
+        **extra,
         "coord_nod2D": coord, "geo_coord_nod2D": geo, "coast_flag": raw["coast"],
         "nlevels_nod2D": nlevels_nod2D, "nlevels_nod2D_min": nlevels_nod2D_min,
         "ulevels_nod2D": ulevels_nod2D, "ulevels_nod2D_max": ul_max, "depth": raw["depth"],
@@ -239,7 +292,8 @@ def derive(raw: dict) -> dict:
         "zbar": zbar, "Z": 0.5 * (zbar[:-1] + zbar[1:]), "nod_in_elem2D": nie,
         "_meta": dict(nod2D=N, elem2D=E, edge2D=int(raw["edges"].shape[0]), nl=nl,
                       edge2D_in=int(np.sum((et2[:, 0] >= 0) & (et2[:, 1] >= 0))),
-                      myDim_edge2D=int(raw["edges"].shape[0]), npes=1, ocean_area=ocean_area),
+                      myDim_edge2D=int(raw["edges"].shape[0]), npes=1, ocean_area=ocean_area,
+                      **meta_extra),
     }
 
 
@@ -337,6 +391,8 @@ def write_mesh(out: dict, out_dir):
         for k in ("nod2D", "elem2D", "edge2D", "nl", "edge2D_in", "myDim_edge2D", "npes"):
             f.write(f"{k} {m[k]}\n")
         f.write(f"ocean_area {m['ocean_area']:.17g}\n")
+        if "ocean_areawithcav" in m:
+            f.write(f"ocean_areawithcav {m['ocean_areawithcav']:.17g}\n")
 
 
 def main():
@@ -344,8 +400,10 @@ def main():
     ap.add_argument("raw_mesh_dir")
     ap.add_argument("out_dir")
     ap.add_argument("--verify", help="a C-export dir to diff against")
+    ap.add_argument("--cavity", action="store_true",
+                    help="ice-shelf cavities: read cavity_{n,e}lvls.out + cavity_depth@node.out (use_cavity)")
     args = ap.parse_args()
-    raw = read_fesom_ascii(args.raw_mesh_dir)
+    raw = read_fesom_ascii(args.raw_mesh_dir, cavity=args.cavity)
     print(f"[prepare_mesh] raw: nod2D={raw['nod2D']} elem2D={raw['elem2D']} nl={raw['nl']} "
           f"edge2D={raw['edges'].shape[0]}")
     out = derive(raw)

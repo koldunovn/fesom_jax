@@ -114,7 +114,38 @@ def shift_down(x):
 _shift_down = shift_down
 
 
-def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None):
+# --- reference density profile (use_density_ref; forced on by use_cavity) ------------------------------------------
+DENSITY_REF_T, DENSITY_REF_S = 2.0, 34.0      # o_PARAM density_ref_T / density_ref_S (namelist defaults)
+
+
+def reference_density(mesh: Mesh, Z3d=None, T_ref: float = DENSITY_REF_T, S_ref: float = DENSITY_REF_S):
+    """``density_ref(nz, node)`` of FESOM2 ``init_ref_density`` (oce_ale_pressure_bv.F90:3413): the in-situ JM
+    density of the constant water mass (``density_ref_T``, ``density_ref_S``) at every node's mid-layer depths
+    ``Z_3d_n`` (levels 1..nlevels_nod2D-1, the cavity levels included; the top one at ``min(0, Z_3d_n(1))``).
+
+    FESOM2 main switches this on whenever ``use_cavity`` is (oce_setup_step.F90:193): every ``density_m_rho0``
+    is then relative to this depth profile instead of ``density_0``. ``auxz`` is ``real(8)`` in the Fortran, so the
+    bulk modulus and the division run in float64 and are stored in ``WP`` (the identity in double precision).
+    Returns ``(nod2D, nl)``, zero below ``nlevels_nod2D-1``.
+    """
+    from . import precision
+    if Z3d is None:
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])
+        z = jnp.broadcast_to(Zp[None, :], (mesh.nod2D, mesh.nl))
+    else:
+        z = jnp.asarray(Z3d)
+    k = jnp.arange(mesh.nl).reshape(1, -1)
+    z = jnp.where(k == 0, jnp.minimum(0.0, z), z)
+    wpt = precision.wp_dtype()
+    b0, bpz, bpz2, rhopot = jm_components(jnp.asarray(T_ref, wpt), jnp.asarray(S_ref, wpt))
+    auxz = precision.full(z)                                   # real(8)
+    rho = precision.wp(b0 + auxz * (bpz + auxz * bpz2))        # rho is WP
+    ref = precision.wp((rho * rhopot) / (rho + 0.1 * auxz * _STATE_EQ_INT))
+    valid = k < (mesh.nlevels_nod2D - 1).reshape(-1, 1)
+    return jnp.where(valid, ref, 0.0)
+
+
+def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None, density_ref=None, cavity: bool = False):
     """Raw (pre-smooth) ``density``, ``hpressure``, ``bvfreq`` columns.
 
     ``T``, ``S``, ``hnode`` are ``[nod2D, nl]`` (``hnode`` zero below bottom). The
@@ -126,9 +157,17 @@ def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None):
     the N² layer spacing from the static column-uniform ``mesh.Z`` to the moving
     coordinate. ``Z3d=None`` ⇒ the static path (byte-identical; live==static at cold
     start). hpressure also uses the depth but is UNUSED under zstar (the shchepetkin PGF
-    takes density directly)."""
+    takes density directly).
+
+    **Cavities (``use_cavity``, lane L-OCN).** ``density_ref`` (``(nod2D, nl)`` from :func:`reference_density`)
+    replaces the constant ``density_0`` in ``density = rho - density_ref`` (``use_density_ref``; ``None`` ⇒
+    ``density_0``, today's path). ``cavity=True`` adds FESOM2's cavity branch of ``pressure_bv``
+    (oce_ale_pressure_bv.F90:193-236): the levels ``1..ulevels_nod2D-1`` inside the shelf get the density of the
+    top wet cell's water mass at their own depth (stored in ``density`` there), and the top wet cell's pressure is
+    the weight of that displaced column, integrated over ``zbar_3d_n`` from the surface; below it the usual
+    ``hnode`` recursion. Off-cavity nodes are unchanged (bitwise). With both off the trace is the old one."""
     g = G
-    rho_ref = DENSITY_0
+    rho_ref = DENSITY_0 if density_ref is None else jnp.asarray(density_ref)
     # depth z + the up-shifted Z[nz-1], both shaped (.,nl) — broadcast static or per-node live.
     if Z3d is None:
         Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])      # (nl,) pad invalid tail
@@ -142,7 +181,15 @@ def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None):
 
     # --- in-situ density − ρ0 (layer field) ------------------------------------
     density = _insitu(b0, bpz, bpz2, rhopot, z) - rho_ref
-    density = ops.mask_below_bottom(density, mesh.node_layer_mask)
+    if cavity:
+        k = jnp.arange(mesh.nl).reshape(1, -1)
+        top = (mesh.ulevels_nod2D - 1).reshape(-1, 1)
+        in_cav = k < top                                   # the shelf levels above the top wet cell
+        comp = [jnp.take_along_axis(c, top, axis=1) for c in (b0, bpz, bpz2, rhopot)]
+        fill = _insitu(*comp, z) - rho_ref                 # top water mass at each level's own depth
+        density = jnp.where(in_cav, fill, ops.mask_below_bottom(density, mesh.node_layer_mask))
+    else:
+        density = ops.mask_below_bottom(density, mesh.node_layer_mask)
 
     # --- hydrostatic pressure (layer field; downward cumulative) ---------------
     # surface BC at nzmin:  hp = -Z[nzmin]·ρ[nzmin]·g
@@ -155,7 +202,19 @@ def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None):
     nzmin = (mesh.ulevels_nod2D - 1).reshape(-1, 1)      # (nod2D,1); 0 for pi
     k = jnp.arange(mesh.nl).reshape(1, -1)
     incr = jnp.where(k == nzmin, surf_bc, interior)
-    incr = jnp.where(mesh.node_layer_mask, incr, 0.0)    # zero outside valid layers
+    if not cavity:
+        incr = jnp.where(mesh.node_layer_mask, incr, 0.0)    # zero outside valid layers
+    else:
+        # nzmin>0 (cavity node): hp(nzmin) = 0.5*(zbar(1)-zbar(2))*rho(1)*g
+        #   + sum_{nz=2..nzmin} 0.5*g*(rho(nz-1)*(zbar(nz-1)-zbar(nz)) + rho(nz)*(zbar(nz)-zbar(nz+1)))  (1-based)
+        zb = jnp.asarray(mesh.zbar_3d_n)
+        dz = zb - jnp.concatenate([zb[:, 1:], zb[:, -1:]], axis=1)          # zbar(k) - zbar(k+1)
+        cav0 = 0.5 * dz * density * g
+        cav_a = 0.5 * g * (rho_up * _shift_down(dz) + density * dz)
+        cav_incr = jnp.where(k == 0, cav0, cav_a)
+        is_cav = nzmin > 0
+        incr = jnp.where(is_cav & (k <= nzmin), cav_incr, incr)
+        incr = jnp.where(mesh.node_layer_mask | (is_cav & (k < nzmin)), incr, 0.0)
     hpressure = jnp.cumsum(incr, axis=1)
     hpressure = ops.mask_below_bottom(hpressure, mesh.node_layer_mask)
 
@@ -176,7 +235,7 @@ def pressure_bv(mesh: Mesh, T, S, hnode, Z3d=None):
     bulk_dn = b0 + zmean * (bpz + zmean * bpz2)
     rho_up_n = bulk_up * _shift_down(rhopot) / (bulk_up + 0.1 * zmean * _STATE_EQ_INT)
     rho_dn_n = bulk_dn * rhopot / (bulk_dn + 0.1 * zmean * _STATE_EQ_INT)
-    bv = -g * (1.0 / zdiff) * (rho_up_n - rho_dn_n) / rho_ref            # (nod2D,nl)
+    bv = -g * (1.0 / zdiff) * (rho_up_n - rho_dn_n) / DENSITY_0          # (nod2D,nl); density_0 also with use_density_ref (F90:295)
 
     # pad surface/bottom interfaces: bvfreq[nzmin]=bv[nzmin+1], bvfreq[nzmax]=bv[nzmax-1].
     # Equivalent to gathering bv at clip(nz, nzmin+1, nzmax-1) over the interface range.
@@ -233,12 +292,13 @@ def smooth_nod3D(mesh: Mesh, arr, n_smooth: int = 1, exch=None):
     return arr_s
 
 
-def compute_pressure_bv(mesh: Mesh, T, S, hnode, n_smooth: int = 1, Z3d=None):
+def compute_pressure_bv(mesh: Mesh, T, S, hnode, n_smooth: int = 1, Z3d=None, density_ref=None,
+                        cavity: bool = False):
     """Driver mirror of ``fesom_step.c:77-92``: raw EOS/pressure/N² then the N²
     smoother. Returns ``(density, hpressure, bvfreq_smoothed)`` — the substep-1
     dump fields, ready to compare. ``Z3d`` (zstar live mid-depths; ``None`` ⇒ static,
     byte-identical) re-points the density/N² depth (JZ.6)."""
-    density, hpressure, bvfreq = pressure_bv(mesh, T, S, hnode, Z3d=Z3d)
+    density, hpressure, bvfreq = pressure_bv(mesh, T, S, hnode, Z3d=Z3d, density_ref=density_ref, cavity=cavity)
     bvfreq = smooth_nod3D(mesh, bvfreq, n_smooth)
     return density, hpressure, bvfreq
 

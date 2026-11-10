@@ -325,8 +325,14 @@ def _halo_arrays(sm: ShardedMesh, ragged: bool = False, padded: bool = False,
     The coloured rounds are PACKED into one buffer per kind (round r at
     ``[offs[r], offs[r]+slots[r])``), so this adds 3 arrays per kind, not 2·K."""
     ha: dict = {}
+    from .halo import serial_skip_enabled
     for k in _RKINDS:
         src_dev, src_lane = sm.exchange[k]
+        if serial_skip_enabled() and np.asarray(src_dev).shape[0] == 1:
+            # gpu.serial_halo_skip: one device's exchange must be the identity for the skip to keep the bits
+            if not (np.all(np.asarray(src_dev) == 0)
+                    and np.array_equal(np.asarray(src_lane)[0], np.arange(np.asarray(src_lane).shape[1]))):
+                raise AssertionError(f"gpu.serial_halo_skip: the one-device {k} exchange map is not the identity")
         ha[f"sd_{k}"] = _fold(src_dev).astype(np.int32)       # mesh constants → host numpy
         ha[f"sl_{k}"] = _fold(src_lane).astype(np.int32)
         if ragged or padded or coloured:
@@ -495,12 +501,12 @@ def run_gm_diag_sharded(sm: ShardedMesh, T_p, S_p, bvfreq_p, hnode_new_p, helem_
     spread is the upwind-flip floor, not a missing exchange)."""
     from . import gm
     if params is None:
-        params = Params.defaults()
+        params = Params.defaults(gm_cfg)
     fm, fm_spec = folded_mesh(sm)
     ha, ha_spec = _halo_arrays(sm)
     fT, fS, fbv, fhn = _fold(T_p), _fold(S_p), _fold(bvfreq_p), _fold(hnode_new_p)
     fhe = _fold(helem_p)
-    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    jmesh = halo.device_mesh(devices=halo.first_devices(npes))
 
     def body(m, T, S, bv, hn, he, h):
         exch = {k: (h[f"sd_{k}"], h[f"sl_{k}"]) for k in ("nod", "elem", "edge")}
@@ -543,7 +549,7 @@ def run_step_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
     fstress = _fold(stress_p)
-    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    jmesh = halo.device_mesh(devices=halo.first_devices(npes))
     n_global = sm.nod2D
 
     # Optional CORE2 forcing + the GLOBAL ice boundary_node → sharded shard_map inputs
@@ -646,7 +652,7 @@ def run_steps_sharded(sm: ShardedMesh, state_p: State, sop: ShardedSSHOperator,
     fs, fs_spec = folded_state(state_p)
     fop, fop_spec = folded_operator(sop)
     fstress = _fold(stress_p)
-    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    jmesh = halo.device_mesh(devices=halo.first_devices(npes))
     n_global = sm.nod2D
     ha, ha_spec = _halo_arrays(sm, ragged=use_ragged, padded=use_padded,
                                coloured=use_coloured)
@@ -828,7 +834,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                              forcing_tables_folded: bool = False,
                              return_grad_fn: bool = False, ssh_gather=None,
                              mevp_wide=None, precision: str = "double", se_wide=None, ice_phase=None,
-                             recom_cfg=None):
+                             recom_cfg=None, cavity_cfg=None):
     """Multi-step sharded forward with **per-step time-varying forcing** (Task A4).
 
     ``ice_phase`` (an int, the ``ice_steps_since_upd`` the State carries into this chunk; ``ice_ave_steps > 1``
@@ -894,7 +900,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
         fs_spec = jax.tree.map(lambda _: _P, fs)
     else:
         fs, fs_spec = folded_state(state_p)               # [P,Lmax] (host cold-start) → [P*Lmax]
-    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    jmesh = halo.device_mesh(devices=halo.first_devices(npes))
     n_global = sm.nod2D
     _check_halo_mode(use_ragged, use_padded, use_coloured)
     boundary_node_p = _coast_mask(sm, ice_cfg, boundary_node_p)
@@ -1000,7 +1006,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             seq_folded = seq_folded._replace(co2_atm=co2)
         if use_tables:
             tab_folded = PR.cast_tree(tab_folded)
-        params = PR.cast_tree(params if params is not None else Params.defaults())
+        params = PR.cast_tree(params if params is not None else Params.defaults(gm_cfg))
 
     # forcing_static (device-constant) + the optional global boundary_node, as in run_steps_sharded.
     extras, extras_spec = [c["fsf"]], [c["fsf_spec"]]
@@ -1056,7 +1062,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                                 step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                 gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                 ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                halo_ctx=ctx, boundary_node=bn_, ice_update=upd, recom_cfg=recom_cfg)
+                                halo_ctx=ctx, boundary_node=bn_, ice_update=upd, recom_cfg=recom_cfg, cavity_cfg=cavity_cfg)
 
         sf0 = jax.tree.map(lambda x: x[0], seq)             # this chunk's first-step forcing
         if ice_phase is not None:
@@ -1170,7 +1176,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                                     step_forcing=sf_step, forcing_static=fs_, ice_cfg=ice_cfg,
                                     gm_cfg=gm_cfg, kpp_cfg=kpp_cfg, tke_cfg=tke_cfg,
                                     ale_cfg=ale_cfg, visc_cfg=visc_cfg, tracer_cfg=tracer_cfg,
-                                    halo_ctx=ctx, boundary_node=bn_, recom_cfg=recom_cfg)
+                                    halo_ctx=ctx, boundary_node=bn_, recom_cfg=recom_cfg, cavity_cfg=cavity_cfg)
 
             sf0 = jax.tree.map(lambda x: x[0], seq)
             st = one(s, bootstrap_ab2, sf0)
@@ -1223,6 +1229,8 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
             key = key + (id(se_wide),)
         if ice_phase is not None:
             key = key + (("ice_phase", int(ice_phase)),)
+        if cavity_cfg is not None:                    # the no-cavity key is unchanged
+            key = key + (("cavity", id(cavity_cfg)),)
         if recom_cfg is not None:                     # the REcoM-off key is unchanged
             key = key + (("recom", id(recom_cfg)),)
         hit = _FORCED_JIT_CACHE.get(key)

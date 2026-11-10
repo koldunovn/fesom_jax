@@ -109,17 +109,24 @@ def adv_flux_hor(mesh: Mesh, uv, helem, ttf):
     return -0.5 * (T1 * (vflux + av) + T2 * (vflux - av))
 
 
-def adv_flux_ver(mesh: Mesh, w_e, ttf):
+def adv_flux_ver(mesh: Mesh, w_e, ttf, *, cavity: bool = False):
     """Vertical upwind flux ``[nod2D, nl]`` at interfaces (``adv_tra_ver_upw1``,
     ``fesom_tracer_adv.c:701``), using ``W = w_e``. The unified interior formula
     ``-½(T[nz](w+|w|) + T[nz−1](w−|w|))·area`` with the edge-replicated ``T[nz−1]``
     reproduces the C's surface flux ``-W·T·area`` at ``nzmin`` (½·2w·T = w·T); the
     bottom interface ``flux_v[nzmax]=0`` falls out of the layer mask (support
-    ``[nzmin, nzmax)``)."""
+    ``[nzmin, nzmax)``).
+
+    ``cavity`` (ice-shelf cavities): the edge replication only gives ``T[nzmin]`` at ``k = 0``; under a shelf
+    (``nzmin > 0``) ``T[nz-1]`` is the dry shelf level, so the top-interface flux ``-W·T·area`` of FESOM
+    (``adv_tra_ver_upw1``) needs ``T[nzmin]`` there explicitly. ``False`` ⇒ the unchanged program."""
     w = w_e
     aw = jnp.abs(w)
     T_below = ttf                                         # T[nz]
     T_above = _shift_down(ttf)                            # T[nz-1] (→ T[nzmin] at top)
+    if cavity:
+        _k = jnp.arange(ttf.shape[1])[None, :]
+        T_above = jnp.where(_k == (mesh.ulevels_nod2D - 1)[:, None], ttf, T_above)
     flux = -0.5 * (T_below * (w + aw) + T_above * (w - aw)) * mesh.area
     return ops.mask_below_bottom(flux, mesh.node_layer_mask)
 
@@ -447,6 +454,10 @@ def zalesak_limit(mesh: Mesh, T, LO, adf_h, adf_v, hnode_new, *,
     em = mesh.elem_layer_mask
     aux_max = jnp.where(em, jnp.max(ttf_max[mesh.elem_nodes], axis=1), -_FCT_BIG)
     aux_min = jnp.where(em, jnp.min(ttf_min[mesh.elem_nodes], axis=1), _FCT_BIG)
+    if ops.env_switch("FESOM_FCT_AUX_BARRIER"):
+        # gpu.fct_aux_barrier: the element bounds computed once (a barrier), not again for each node slot of the
+        # ordered max/min below; max/min are exact
+        aux_max, aux_min = jax.lax.optimization_barrier((aux_max, aux_min))
 
     # a3: per-node cluster max/min over surrounding cells (element→node)
     seg = mesh.elem_nodes.reshape(-1)
@@ -532,6 +543,10 @@ def flux2dtracer_fct(mesh: Mesh, T, LO, adf_h, adf_v, hnode, hnode_new, *,
     transition ``−T·hnode + LO·hnode_new``, and the antidiffusive divergences are formed from float64 fluxes
     (``oce_adv_tra_driver.F90:514, 549``); the result is the float64 ``del_ttf``."""
     nlm = mesh.node_layer_mask
+    if ops.env_switch("FESOM_FCT_FLUX_BARRIER"):
+        # gpu.fct_flux_barrier: the limited edge fluxes computed once (a barrier), not again (with the limiter's
+        # node-factor gathers) for each node slot of the ordered edge->node sum below; the same operations
+        adf_h = jax.lax.optimization_barrier(adf_h)
     if lo_tend is not None:
         a = mesh.areasvol
         safe_a = PR.full(jnp.where(a > 0.0, a, 1.0))
@@ -599,7 +614,8 @@ def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
 
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
                    *, dt: float = DT_DEFAULT, exch=None, Z3d=None, zbar3=None, w_i=None,
-                   freeze_limited_flux: bool = False, freeze_limiter: bool = False, content: bool = False):
+                   freeze_limited_flux: bool = False, freeze_limiter: bool = False, content: bool = False,
+                   cavity: bool = False):
     """One tracer's FCT advection + ALE reconstruction
     (``fesom_tracer_advect_one_fct``, ``fesom_tracer_adv.c:1199``). Returns
     ``(T_new, T_old_new)`` with ``T_old_new = T`` (the AB2 ``valuesold`` save).
@@ -622,7 +638,7 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
     ttfAB, T_old_new = tracer_ab(T, T_old)
     # 2 — LO upwind fluxes from values
     flux_h_lo = adv_flux_hor(mesh, uv, helem, T)
-    flux_v_lo = adv_flux_ver(mesh, w_e, T)
+    flux_v_lo = adv_flux_ver(mesh, w_e, T, **({"cavity": True} if cavity else {}))
     # 3 — low-order ALE solution (its vertical flux used the EXPLICIT w_e)
     # single precision (``content=True``, the SP path of step.py): the flux-form low-order tendency (#1054/#1056),
     # the WP hnode_new for the limiter, and the float64 del_ttf returned for the carry reconstruction.

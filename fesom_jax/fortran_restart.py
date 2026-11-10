@@ -16,6 +16,12 @@ the element mean of ``hnode``; ``hbar_old`` = ``hbar``; ``hnode_new`` = ``hnode`
 fesom-jax step reads before it writes them (``scripts/fortran_restart/carried_fields.py``) are
 exactly the ones that need a value; the rest the first step recomputes.
 
+FESOM2 main (2.8, e.g. 0aaa2d73, the jaxcpl ocean) restarts more: ``d_eta`` (the CG warm start), the mEVP stresses
+``sigma11/12/22``, the Newton seed ``t_skin`` [degC] next to ``ice_temp`` [K], and ``hnode_new``. When a restart has
+them they are taken from it (``d_eta``, the stresses, ``t_skin``); a FESOM 2.7 restart without them converts exactly
+as before (``d_eta`` from the reference, stresses zero, ``t_skin`` from ``ice_temp``). With cavities the masks are the
+``ulevels``-aware wet lanes, so the levels inside the ice shelves keep the reference values (FESOM stores 0 there).
+
 Velocities stay in the model's (rotated) frame: FESOM writes ``u``/``v``/``uice``/``vice`` from
 its internal arrays, which are the frame fesom-jax computes in.
 """
@@ -64,6 +70,16 @@ SOURCES = {
     "bvfreq": "reference", "Kv": "reference", "Av": "reference", "pgf_x": "reference",
     "pgf_y": "reference",
 }
+# The optional State fields of other run modes, None in a converted restart (each mode's driver builds them: the
+# single-precision rounding carry starts at 0 in precision.cast_state, ice_ave_steps > 1 in ice_step.init_ice_avg,
+# the split-explicit SSH, REcoM, the coupled ocean's mode F).
+SOURCES.update({k: "optional" for k in (
+    "carry_T", "carry_S", "ice_steps_since_upd", "ice_update", "srfoce_temp", "srfoce_salt", "srfoce_ssh",
+    "srfoce_u", "srfoce_v", "ice_flx_h", "ice_flx_fw", "ice_evaporation", "ice_sublimation", "ice_thdgr",
+    "ice_thdgrsn", "ice_real_salt_flux", "ice_a_old", "se_eta", "se_ubt", "se_sbar_old", "bgc", "bgc_old",
+    "bgc_carry", "bgc_steps", "bgc_uvh", "bgc_we", "bgc_wi", "bgc_kv", "bgc_bc", "bgc_h0", "bgc_benthos",
+    "bgc_alk_surf", "bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget", "cpl_ice_temp", "cpl_ice_alb", "cpl_apnd",
+    "cpl_hpnd", "cpl_ipnd", "cpl_fw", "gm_kgm_stale")})
 #: the fields one step reads (the same measurement)
 STEP_READS = ("T", "S", "T_old", "S_old", "del_ttf", "uv", "uv_rhsAB", "uvnode_rhs", "w_e",
               "eta_n", "d_eta", "hnode", "helem", "hbar", "tke", "a_ice", "m_ice", "m_snow",
@@ -154,7 +170,8 @@ def state_from_fortran(mesh, oce: FortranRestart, ice: FortranRestart | None, re
     import dataclasses
     n, e, nl = int(mesh.nod2D), int(mesh.elem2D), int(mesh.nl)
     M = _masks(mesh)
-    ref = {f.name: np.asarray(getattr(ref, f.name)) for f in dataclasses.fields(ref)}
+    ref = {f.name: (None if getattr(ref, f.name) is None else np.asarray(getattr(ref, f.name)))
+           for f in dataclasses.fields(ref)}           # optional State fields (None) stay None
     out = dict(ref)
     rep = {"restart": [], "derived": [], "reference": [], "zeroed": [], "missing": []}
 
@@ -196,18 +213,28 @@ def state_from_fortran(mesh, oce: FortranRestart, ice: FortranRestart | None, re
     out["hbar_old"] = out["hbar"].copy()
     rep["derived"] += ["helem = element mean of hnode", "hnode_new = hnode", "hbar_old = hbar"]
     if ice is not None:
-        for name, var in ICE_MAP.items():
+        imap = dict(ICE_MAP)
+        if ice.has("t_skin"):                                              # FESOM main: the Newton seed itself
+            imap["t_skin"] = "t_skin"
+        for name, var in imap.items():
             if not ice.has(var):
                 rep["missing"].append(var)
                 continue
             a = ice.read(var, n)
-            if name == "t_skin" and np.nanmax(np.abs(a)) > 150.0:             # Kelvin on file
+            if name == "t_skin" and var == "ice_temp" and np.nanmax(np.abs(a)) > 150.0:   # Kelvin on file
                 a = a - 273.15
             out[name] = a
             rep["restart"].append(f"{name}<-{var}")
+    if oce.has("d_eta"):                                                   # FESOM main: CG warm start
+        out["d_eta"] = oce.read("d_eta", n)
+        rep["restart"].append("d_eta<-d_eta")
     for name in ("sigma11", "sigma12", "sigma22"):
-        out[name] = np.zeros_like(ref[name])
-        rep["zeroed"].append(name)
+        if ice is not None and ice.has(name):                              # FESOM main restarts them
+            out[name] = ice.read(name, e)
+            rep["restart"].append(f"{name}<-{name}")
+        else:
+            out[name] = np.zeros_like(ref[name])
+            rep["zeroed"].append(name)
     done = {r.split("<-")[0].split("=")[0].split(" ")[0] for r in rep["restart"] + rep["derived"]}
     rep["reference"] = sorted(k for k in out if k not in done and k not in rep["zeroed"])
     from .state import State

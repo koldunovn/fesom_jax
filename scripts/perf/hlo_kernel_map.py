@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 
 # model file -> area (first match wins)
 AREAS = (
+    ("coupled/flux.py", "coupled flux (thermo_cpl, fluxes)"), ("coupled/", "coupled driver"),
+    ("cavity.py", "ice-shelf cavity"),
     ("ssh.py", "SSH (CG solve, rhs)"),
     ("ice_mevp.py", "sea ice dynamics (mEVP)"), ("ice_evp.py", "sea ice dynamics (mEVP)"),
     ("ice_", "sea ice thermo, advection, coupling"), ("ice.py", "sea ice thermo, advection, coupling"),

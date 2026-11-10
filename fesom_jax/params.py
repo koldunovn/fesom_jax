@@ -158,14 +158,20 @@ class Params:
     ice_ctrl: object = None
 
     @staticmethod
-    def defaults() -> "Params":
+    def defaults(gm_cfg=None) -> "Params":
         """The config-constant baseline as float64 scalar arrays (the value used
-        when ``step``/``integrate`` are called with ``params=None``)."""
+        when ``step``/``integrate`` are called with ``params=None``).
+
+        ``gm_cfg`` (a :class:`fesom_jax.gm.GMConfig` or ``None``): its ``k_gm_max`` / ``redi_kmax_default`` are the
+        GM/Redi ceilings of a run that passes no ``params`` (namelist.oce K_GM_max / Redi_Kmax, e.g. jaxcpl's 2500 /
+        1000). ``None`` or the GMConfig defaults give the module constants, as before."""
+        k_gm = K_GM_MAX if gm_cfg is None else gm_cfg.k_gm_max
+        redi_kmax = REDI_KMAX if gm_cfg is None else gm_cfg.redi_kmax_default
         return Params(
             k_ver=jnp.asarray(K_VER, jnp.float64),
             a_ver=jnp.asarray(A_VER, jnp.float64),
-            k_gm=jnp.asarray(K_GM_MAX, jnp.float64),
-            redi_kmax=jnp.asarray(REDI_KMAX, jnp.float64),
+            k_gm=jnp.asarray(k_gm, jnp.float64),
+            redi_kmax=jnp.asarray(redi_kmax, jnp.float64),
             tke_c_k=jnp.asarray(TKE_C_K, jnp.float64),
             tke_c_eps=jnp.asarray(TKE_C_EPS, jnp.float64),
             tke_cd=jnp.asarray(TKE_CD, jnp.float64),

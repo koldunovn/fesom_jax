@@ -157,7 +157,7 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
     traces the identical program. Only the scanned steps are checkpointed: step 1 runs eagerly
     and keeps all of its residuals anyway."""
     if params is None:
-        params = Params.defaults()
+        params = Params.defaults(gm_cfg)
     _seg = remat_segments
     if _seg == -1:
         import math
@@ -198,6 +198,9 @@ def integrate(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: i
         # the ice counter + running means at the upstream init values unless the State has them
         from .ice_step import init_ice_avg
         state = init_ice_avg(state, ice_cfg)
+    if gm_cfg is not None and getattr(gm_cfg, "reproduce_fesom_bug_kgm_surface_level", False):
+        from .gm import init_kgm_bug_state      # a FESOM2 bug reproduced: 500 m2/s at every run start
+        state = init_kgm_bug_state(state, gm_cfg)
     sf0 = jax.tree.map(lambda x: x[0], step_forcings)
     state = step(state, mesh, op, stress_surf, params, dt=dt, is_first_step=True,
                  step_forcing=sf0, forcing_static=forcing_static, ice_cfg=ice_cfg,

@@ -98,6 +98,8 @@ class HaloCtx:
         ``all_to_all`` when ``use_padded`` (Phase 8c), the halo-only ``ragged_all_to_all``
         when ``use_ragged`` (Phase 8b), else ``all_gather``. ``FESOM_HALO_BARRIER``
         (:func:`halo_barrier_mode`) fences the exchange off from XLA fusion."""
+        if serial_identity(self.axis_name):
+            return field
         mode = halo_barrier_mode()
         if mode == "both":
             field = lax.optimization_barrier(field)
@@ -109,7 +111,7 @@ class HaloCtx:
         (``gpu.bgc_halo: grouped``), else :meth:`exchange`. The same values either way. Its exchanges carry 31
         tracers a call (bound by their bytes, where the grouped transport sends only the pairs' real rows); the rest
         of the step's (bound by their latency) stay with the run's transport."""
-        if self.bulk_maps is None:
+        if self.bulk_maps is None or serial_identity(self.axis_name):
             return self.exchange(field, kind)
         mode = halo_barrier_mode()
         if mode == "both":
@@ -202,6 +204,22 @@ def halo_exchange(field, src_dev, src_lane, axis_name: str = DEFAULT_AXIS):
         return field
     gathered = lax.all_gather(field, axis_name, axis=0, tiled=False)  # [P, Lmax, *rest]
     return gathered[src_dev, src_lane]
+
+
+def serial_skip_enabled() -> bool:
+    """``FESOM_SERIAL_HALO_SKIP=1`` (``gpu.serial_halo_skip``, read at trace time): on ONE device (axis size 1) every
+    halo exchange of :class:`HaloCtx` returns its field unchanged. The one-device exchange maps are the identity
+    (every lane its own owner; checked on the host by ``integrate_sharded._halo_arrays``), so the values are the same
+    bits; what goes is the all_gather over one device and its permutation gather, ~5 ms a step of the coupled CORE3
+    ocean on one GH200 (16 % of its kernel time). Off by default: the programs are byte-unchanged."""
+    return os.environ.get("FESOM_SERIAL_HALO_SKIP", "0").strip() not in ("", "0")
+
+
+def serial_identity(axis_name: str) -> bool:
+    """True when :func:`serial_skip_enabled` and the ``shard_map`` axis has one device (static at trace time)."""
+    if not serial_skip_enabled():
+        return False
+    return int(lax.psum(1, axis_name)) == 1
 
 
 def halo_none() -> bool:
@@ -422,6 +440,48 @@ def halo_exchange_coloured(field, c: dict, meta, axis_name: str = DEFAULT_AXIS, 
     gathered = recv[c["colpos"]]                                     # [Lmax, *rest]
     mask = c["halo_mask"].reshape(c["halo_mask"].shape + (1,) * len(rest))
     return jnp.where(mask, gathered, field)
+
+
+#: The first device of this process that a partition of N ranks is placed on (``first_devices``): 0 = the first N
+#: devices of :func:`jax.devices`, as always. awicm_jax's concurrent coupled run (the atmosphere on the first devices,
+#: the ocean on the next ones) sets it before :func:`fesom_jax.coupled.init_ocean`.
+DEVICE_OFFSET = 0
+#: An explicit device list (None: :data:`DEVICE_OFFSET` decides). awicm_jax's concurrent coupled run over several
+#: processes (one per node) puts the ocean on some GPUs of EVERY node, which is not a contiguous range of
+#: :func:`jax.devices`; it sets this list (global devices, the partition's rank order) before ``init_ocean``.
+DEVICES = None
+
+
+def first_devices(n):
+    """The ``n`` devices a partition of ``n`` ranks runs on: the first ``n`` of :data:`DEVICES` when set, else
+    ``jax.devices()[DEVICE_OFFSET:DEVICE_OFFSET + n]``."""
+    n = int(n)
+    if DEVICES is not None:
+        devs = list(DEVICES)[:n]
+        if len(devs) < n:
+            raise ValueError(f"need {n} devices, halo.DEVICES has {len(DEVICES)}")
+        return devs
+    o = int(DEVICE_OFFSET)
+    devs = jax.devices()[o:o + n]
+    if len(devs) < n:
+        raise ValueError(f"need {n} devices from device {o}, have {len(jax.devices())}")
+    return devs
+
+
+_BARRIERS = [0]
+
+
+def process_barrier(tag: str, timeout_s: int = 3600):
+    """Every process waits here until all have arrived; a no-op with one process. The distributed runtime's
+    coordination-service barrier, NOT a device collective (``multihost_utils.sync_global_devices`` runs a program on
+    every device of every process: with the coupled run's atmosphere and ocean on different devices of the same
+    processes, driven from two threads, such a program can be queued in different orders on different processes
+    and hang). A counter makes each use's id unique; every process must call it the same number of times."""
+    if jax.process_count() <= 1:
+        return
+    from jax._src import distributed
+    _BARRIERS[0] += 1
+    distributed.global_state.client.wait_at_barrier(f"fesom_{tag}_{_BARRIERS[0]}", int(timeout_s * 1000))
 
 
 def device_mesh(axis_name: str = DEFAULT_AXIS, devices=None) -> Mesh:

@@ -98,7 +98,11 @@ def mevp_setup(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, elevation,
     it = (cfg.rhoice * m_ice + cfg.rhosno * m_snow) / a_safe   # mean ice+snow thickness (:175)
     inv_thickness = jnp.where(ice_nod, 1.0 / jnp.maximum(it, 9.0), 0.0)   # limit small mass (:176)
     M = m_ice * cfg.rhoice + m_snow * cfg.rhosno              # per-area mass M (NOT /a_ice) (:178)
-    mass = jnp.where(ice_nod, M / ((1.0 + M * M) * area_safe), 0.0)        # T5 (:179)
+    if getattr(cfg, "mevp_mass_floor", False):
+        # FESOM main (ice_maEVP.F90:393-394): 1/(max(M, 9 kg/m²)·area)
+        mass = jnp.where(ice_nod, 1.0 / (jnp.maximum(M, 9.0) * area_safe), 0.0)
+    else:
+        mass = jnp.where(ice_nod, M / ((1.0 + M * M) * area_safe), 0.0)        # T5 (:179)
     # Derivative-only (IceConfig.adjoint_thin_mass; 0 = off, nothing traced): below that load the
     # velocity's dependence on the load leaves the tangent; the values are bitwise unchanged.
     thin = float(getattr(cfg, "adjoint_thin_mass", 0.0))
@@ -275,6 +279,15 @@ def mevp_unroll() -> int:
     return u
 
 
+def metric_factor_mesh(cfg, mesh):
+    """``mesh`` with ``metric_factor = 0`` under ``IceConfig.metric_factor_zero`` (FESOM2 &geometry
+    metric_factor_zero, read only by the sea-ice dynamics); else ``mesh`` itself (nothing traced)."""
+    if not getattr(cfg, "metric_factor_zero", False):
+        return mesh
+    import dataclasses
+    return dataclasses.replace(mesh, metric_factor=jnp.zeros_like(mesh.metric_factor))
+
+
 def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
                   a_ice, m_ice, m_snow,
                   u_ice, v_ice, sigma11, sigma12, sigma22,
@@ -305,6 +318,9 @@ def mevp_dynamics(cfg: IceConfig, mesh: Mesh, *, adjoint_subcycles: int = -1,
     per-subcycle path."""
     if boundary_node is None:
         boundary_node = boundary_node_mask(mesh)
+    mesh = metric_factor_mesh(cfg, mesh)
+    # gpu.mevp_wide carries its own lane mesh: _mevp_wide zeroes its metric_factor under metric_factor_zero as well
+    # (round-off, not bitwise, against the per-subcycle path: tests/test_mevp_wide_sharded.py)
     if getattr(cfg, "adjoint_damping", "none") == "frozen_sweep":
         # the same forward; a custom_vjp backward (ice_mevp_frozen, docs/PORTING_LESSONS.md I5g)
         if adjoint_subcycles >= 0:
@@ -428,6 +444,8 @@ def _mevp_wide(cfg: IceConfig, wide, st: MevpStatic, rdt, n: int,
     wst = MevpStatic(ice_nod=inod > 0.5, inv_thickness=ith, mass=mass, tilt_u=tu, tilt_v=tv,
                      ice_el=xe[:, 4] > 0.5, pressure_fac=xe[:, 3], bc_index=bci)
     lm = wide.lane_mesh()
+    if getattr(cfg, "metric_factor_zero", False):     # FESOM2 &geometry metric_factor_zero (metric_factor_mesh)
+        lm = lm._replace(metric_factor=jnp.zeros_like(lm.metric_factor))
 
     def body(c, _):
         return mevp_iterate(cfg, lm, *c, wst, u0, v0, su, sv, sax, say, rdt,

@@ -38,7 +38,18 @@ def _mm_times(mesh: Mesh, X):
     ``Σ_{elem∋row} area/12·(X[row] + ΣX_elem)``. Cavity elements contribute 0."""
     en = mesh.elem_nodes
     Xv = X[en]                                              # [elem,3]
-    contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + Xv.sum(axis=1, keepdims=True))
+    mm3 = ops.env_int("FESOM_ICE_MM_SUM3")
+    if mm3:
+        # gpu.ice_mm_sum3: the element sum as two explicit adds. XLA otherwise matches `Xv + Xv.sum(1)` as a
+        # Triton "softmax" fusion with one warp per element row: 257 us a call on a GH200 for 426k x 3 floats
+        # (9 calls a step, 7 % of the coupled CORE3 ocean's kernel time). 1: (X0 + X1) + X2, 2: (X0 + X2) + X1
+        # (the Triton warp reduction's butterfly order over the row padded to 4), 3: X0 + (X1 + X2)
+        x0, x1, x2 = Xv[:, 0], Xv[:, 1], Xv[:, 2]
+        s3 = {1: lambda: (x0 + x1) + x2, 2: lambda: (x0 + x2) + x1, 3: lambda: x0 + (x1 + x2),
+              4: lambda: jax.lax.optimization_barrier((x0 + x2) + x1)}[mm3]()   # 4: 2 behind a barrier
+        contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + s3[:, None])
+    else:
+        contrib = (mesh.elem_area / 12.0)[:, None] * (Xv + Xv.sum(axis=1, keepdims=True))
     contrib = jnp.where((mesh.ulevels <= 1)[:, None], contrib, 0.0)
     return ops.scatter_add(contrib, en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
 
@@ -170,13 +181,24 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
     s = wv.sum(axis=1, keepdims=True) - 3.0 * wv           # [elem,3] (q)
     icefluxes = jnp.where(nc_e[:, None], -s * (vol[:, None] * inv_area[en]) / 12.0, 0.0)
 
-    # cluster bounds: min/max over a node's element-neighbours of max(vals_l, vals).
+    # cluster bounds: min/max over a node's neighbours (FESOM2 nn_pos = the nodes of every element around it) of
+    # max(vals_l, vals). ALL elements count, cavity elements too: FESOM's tmax/tmin read nn_pos, which includes the
+    # cavity nodes next to the shelf front (ice_fct.F90:518-547, values 0 there), so a front node may lose all its
+    # ice to the antidiffusive flux. Without cavities every element is open and this is the old bound.
     elem_hi = jnp.maximum(vals_l[en].max(1), vals[en].max(1))   # [elem]
     elem_lo = jnp.minimum(vals_l[en].min(1), vals[en].min(1))
-    hi_flat = jnp.broadcast_to(jnp.where(nc_e, elem_hi, -jnp.inf)[:, None], (en.shape[0], 3))
-    lo_flat = jnp.broadcast_to(jnp.where(nc_e, elem_lo, jnp.inf)[:, None], (en.shape[0], 3))
-    hi = jax.ops.segment_max(hi_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
-    lo = jax.ops.segment_min(lo_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
+    hi_flat = jnp.broadcast_to(elem_hi[:, None], (en.shape[0], 3))
+    lo_flat = jnp.broadcast_to(elem_lo[:, None], (en.shape[0], 3))
+    if ops.env_switch("FESOM_ICE_FCT_EXTREME"):
+        # gpu.ice_fct_extreme: the cluster bounds as ordered gathers over the node's elements
+        # (ops.segment_extreme with the inverse map; max/min are exact in any order) instead of atomic
+        # scatter-max/min (1.7 ms an interval of the coupled CORE3 ocean on a GH200)
+        inv = getattr(mesh, "inv_elem_nodes", None)
+        hi = ops.segment_extreme(hi_flat.reshape(-1), en.reshape(-1), mesh.nod2D, "max", inv=inv)
+        lo = ops.segment_extreme(lo_flat.reshape(-1), en.reshape(-1), mesh.nod2D, "min", inv=inv)
+    else:
+        hi = jax.ops.segment_max(hi_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
+        lo = jax.ops.segment_min(lo_flat.reshape(-1), en.reshape(-1), num_segments=mesh.nod2D)
     # Pad / all-non-cell nodes keep the ±inf sentinel (empty/masked segment). The clipping
     # ratios below mask them (`fp>0`/`fm<0`), but ±inf poisons the AD backward (0·inf=NaN —
     # the sharded reverse pass exposes it). Clamp to finite (forward byte-identical; the

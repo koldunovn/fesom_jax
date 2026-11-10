@@ -559,6 +559,7 @@ def build_ssh_operator(
     edge_cross = np.asarray(mesh.edge_cross_dxdy)[:E]
     zbar = np.asarray(mesh.zbar)
     nlevels = np.asarray(mesh.nlevels)
+    ulevels_el = np.asarray(mesh.ulevels)
     ulevels_nod = np.asarray(mesh.ulevels_nod2D)
     areasvol = np.asarray(mesh.areasvol)
 
@@ -572,7 +573,9 @@ def build_ssh_operator(
         elis = np.where(valid, eli, 0)
         en = elem_nodes[elis]                      # (E,3) the cell's 3 nodes
         g = gradient_sca[elis]                     # (E,6) ∂N/∂x(0:3), ∂N/∂y(3:6)
-        depth = zbar[nlevels[elis] - 1] - zbar[0]  # (E,) zbar_bot − zbar_srf (<0)
+        # (E,) zbar_e_bot − zbar_e_srf (<0); FESOM's zbar_e_srf = zbar(ulevels(el)) (oce_ale.F90:1362): the
+        # water column below an ice shelf starts at the shelf base. Off the shelves ulevels = 1 ⇒ zbar[0], unchanged.
+        depth = zbar[nlevels[elis] - 1] - zbar[ulevels_el[elis] - 1]
         dx_i = edge_cross[:, 2 * i + 0]
         dy_i = edge_cross[:, 2 * i + 1]
         fy = depth[:, None] * (g[:, 0:3] * dy_i[:, None] - g[:, 3:6] * dx_i[:, None])
@@ -770,6 +773,11 @@ def compute_ssh_rhs(mesh: Mesh, uv, uv_rhs, helem, *, alpha: float = SSH_ALPHA,
     el1s = jnp.where(has1, el1, 0)
     el2s = jnp.where(has2, el2, 0)
     cross = mesh.edge_cross_dxdy
+    if os.environ.get("FESOM_SSH_RHS_SPLIT", "0").strip() not in ("", "0"):
+        # gpu.ssh_rhs_split: the edge terms read uv / uv_rhs / helem through an optimization barrier, so XLA does
+        # not sibling-fuse this level sum with the tracer advection's edge fluxes into one multi-output reduction
+        # (0.98 + 0.79 ms an interval on a GH200 for what is bandwidth-bound work); the same operations
+        uv, uv_rhs, helem = jax.lax.optimization_barrier((uv, uv_rhs, helem))
     U, V = uv[:, :, 0], uv[:, :, 1]
     Ur, Vr = uv_rhs[:, :, 0], uv_rhs[:, :, 1]
     lm = mesh.elem_layer_mask
@@ -811,6 +819,16 @@ def cg_batch() -> int:
     if k < 1:
         raise ValueError(f"FESOM_CG_BATCH must be >= 1, got {k}")
     return k
+
+
+def cg_prefix() -> int:
+    """``FESOM_CG_PREFIX=m`` (``gpu.cg_prefix``, read at trace time; default 0): the CG runs its first m iterations
+    unrolled ahead of the while loop, each masked by the stopping test (:func:`cg_batch`'s masking), so the
+    iterate and the iteration count are unchanged and the host reads the loop predicate only after them."""
+    m = int(os.environ.get("FESOM_CG_PREFIX", "0") or 0)
+    if m < 0:
+        raise ValueError(f"FESOM_CG_PREFIX must be >= 0, got {m}")
+    return m
 
 
 def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
@@ -873,6 +891,7 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
             return (x, r, z, p, sp0, resid, it + 1)
 
         k = cg_batch()
+        body_one = body
         if k > 1:
             # k iterations per trip of the while loop, each after the first masked by the stopping
             # test: the iterate is the one-at-a-time loop's (the masked steps are discarded by
@@ -887,6 +906,12 @@ def _pcg(matvec, precond, b, x0, soltol, maxiter, *, rtol_abs=None,
                 return c
 
         init = (x0, r0, z0, z0, sold0, resid0, jnp.array(0))
+        # gpu.cg_prefix (FESOM_CG_PREFIX=m): the first m iterations straight-line before the while loop, each
+        # masked by the stopping test as cg_batch masks its extra ones: the same iterate and count, and the
+        # loop's predicate is read by the host only after them
+        for _ in range(cg_prefix()):
+            live = cond(init)
+            init = jax.tree.map(lambda new, old: jnp.where(live, new, old), body_one(init), init)
         final = lax.while_loop(cond, body, init)
         # DIAGNOSTIC (env-gated, inert by default): report the PCG trip count + whether it
         # STOPPED ON maxiter rather than on the tolerance.  Added while chasing the ng5 x

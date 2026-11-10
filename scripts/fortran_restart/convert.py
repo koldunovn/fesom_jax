@@ -25,6 +25,10 @@ def main(argv=None) -> int:
     ap.add_argument("--ice", default=None)
     ap.add_argument("--mesh-dir", required=True)
     ap.add_argument("--ic-dir", default=None, help="T_ic.npy/S_ic.npy of the mesh (reference)")
+    ap.add_argument("--rest-reference", action="store_true",
+                    help="reference = a rest state with T = S = 0 instead of the PHC cold start (a mesh with no "
+                         "cached PHC IC, e.g. CORE3: every wet lane comes from the restart; dry and cavity lanes 0 "
+                         "as FESOM stores them)")
     ap.add_argument("--date", required=True, help="the restart's date, YYYY-MM-DD[THH:MM]")
     ap.add_argument("--start-year", type=int, required=True, help="the run's forcing start year")
     ap.add_argument("--dt", type=float, required=True)
@@ -44,11 +48,18 @@ def main(argv=None) -> int:
     when = datetime.datetime.fromisoformat(args.date)
     step = FR.restart_step(when, args.start_year, args.dt)
     mesh = load_mesh(args.mesh_dir)
-    ref = cold_start_state(mesh, args.ic_dir, xp=np)
+    if args.rest_reference:
+        from fesom_jax.state import State
+        ref = State.rest(mesh, T0=0.0, S0=0.0, xp=np)
+    else:
+        ref = cold_start_state(mesh, args.ic_dir, xp=np)
     oce = FR.FortranRestart(args.oce)
     ice = FR.FortranRestart(args.ice) if args.ice else None
     state, rep = FR.state_from_fortran(mesh, oce, ice, ref)
-    bad = [k for k, v in vars(state).items() if not np.all(np.isfinite(np.asarray(v)))]
+    # (density / hpressure / bvfreq stay at the reference, 0: FESOM2 does not restart density_m_rho0 either, so its
+    # first step after a restart (the cavity melt in oce_fluxes, before pressure_bv) reads rho = 0 + density_ref.)
+    bad = [k for k, v in vars(state).items() if v is not None and np.asarray(v).dtype.kind == "f"
+           and not np.all(np.isfinite(np.asarray(v)))]
     if bad:
         raise SystemExit(f"non-finite fields after the conversion: {bad}")
 

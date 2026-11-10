@@ -71,6 +71,7 @@ from .gm import GMConfig
 from .ice import IceConfig
 from .kpp import KppConfig
 from .recom.config import RecomConfig
+from .cavity import CavityConfig
 from .tke import TkeConfig
 
 
@@ -90,7 +91,7 @@ class DtRamp(NamedTuple):
 # Map each physics slot name → its sub-config type (the (de)serialization registry).
 _SUBCONFIGS = {
     "ale": AleConfig, "gm": GMConfig, "kpp": KppConfig,
-    "tke": TkeConfig, "ice": IceConfig, "recom": RecomConfig,
+    "tke": TkeConfig, "ice": IceConfig, "recom": RecomConfig, "cavity": CavityConfig,
 }
 # Non-physics scalar/spec fields that pass through YAML verbatim.
 _SPEC_FIELDS = ("dt", "mesh", "partition", "precision", "forcing", "ssh", "gpu", "output_dir",
@@ -111,7 +112,8 @@ _ARCHIVE_PERIODS = ("year", "month", "day")
 # `co2_file` (full REcoM with constant_CO2 off): the AtmCO2_<year> monthly time series; absent ⇒ the namelist's
 # nm_co2_data_file when that is an absolute path (as dust_file).
 _FORCING_KEYS = ("kind", "start_year", "jra_dir", "sss_path", "runoff_path", "chl_path",
-                 "on_device", "mslp", "dust_file", "co2_file")
+                 "on_device", "mslp", "dust_file", "co2_file",
+                 "chl")    # the coupled ocean's chlorophyll: "climatology" (default) or a constant [mg m-3]
 _FORCING_PATH_KEYS = ("jra_dir", "sss_path", "runoff_path", "chl_path")
 # The `ssh:` mapping — SSH CG solver options. `cheb_degree` (int ≥1) enables the degree-k
 # Chebyshev polynomial preconditioner (CGPOLY, ssh.enable_cheb_precond) in place of the
@@ -146,7 +148,32 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "forcing_ahead": "FESOM_FORCING_AHEAD", "restart_async": "FESOM_RESTART_ASYNC",
             "se_wide": "FESOM_SE_WIDE", "se_unroll": "FESOM_SE_UNROLL", "step_unroll": "FESOM_STEP_UNROLL",
             "ice_static": "FESOM_ICE_STATIC", "chunk_tail": "FESOM_CHUNK_TAIL", "bgc_layout": "FESOM_BGC_LAYOUT",
-            "bgc_halo": "FESOM_BGC_HALO"}
+            "bgc_halo": "FESOM_BGC_HALO", "cpl_forcing_jit": "FESOM_CPL_FORCING_JIT",
+            "serial_halo_skip": "FESOM_SERIAL_HALO_SKIP", "ice_mm_sum3": "FESOM_ICE_MM_SUM3",
+            "ice_fct_extreme": "FESOM_ICE_FCT_EXTREME", "ice_scatter_fuse": "FESOM_ICE_SCATTER_FUSE",
+            "cg_prefix": "FESOM_CG_PREFIX", "potit_unroll": "FESOM_POTIT_UNROLL",
+            "column_direct": "FESOM_COLUMN_DIRECT", "ssh_rhs_split": "FESOM_SSH_RHS_SPLIT",
+            "visc_upd_barrier": "FESOM_VISC_UPD_BARRIER", "fct_aux_barrier": "FESOM_FCT_AUX_BARRIER",
+            "fct_flux_barrier": "FESOM_FCT_FLUX_BARRIER", "o2a_surface": "FESOM_O2A_SURFACE",
+            "o2a_lanes_surface": "FESOM_O2A_LANES_SURFACE",
+            "mevp_wide_barrier": "FESOM_MEVP_WIDE_BARRIER", "cpl_forcing_lean": "FESOM_CPL_FORCING_LEAN"}
+# Lane ocean_speed2 (performance only, off when absent; configs/core3_cpl.yaml has the measurements):
+# `ice_mm_sum3` (an integer 1-4: the association; 4 = the Triton order behind a barrier) the ice FCT mass-matrix
+# element sum (ice_adv._mm_times); `ice_fct_extreme` the ice FCT cluster bounds as ordered gathers
+# (ops.segment_extreme) instead of atomic scatter-max/min; `ice_scatter_fuse` (an integer 0-3) the mEVP
+# stress-divergence ordered sums' barriers (ice_evp.stress_div_scatter); `cg_prefix` (an integer m >= 0) the CG's
+# first m masked iterations ahead of its while loop (ssh.cg_prefix); `potit_unroll` (an integer u) the cavity potit
+# iterations u per loop trip (cavity.potit); `column_direct` the column kernels on the [ncol, K] arrays without the
+# transpose kernels (column_kernel.direct); `ssh_rhs_split`, `visc_upd_barrier`, `fct_aux_barrier`,
+# `fct_flux_barrier` optimization barriers at the SSH rhs, the backscatter viscosity and the tracer FCT ordered sums;
+# `o2a_surface` ocean_to_atm's surface velocity from the surface level only (coupled.ocean._surface_vel_nodes).
+# Lane ocean_speed3: `o2a_lanes_surface` (dist_N) ocean_to_atm gathers only the surface level of T, S, uv from the lanes;
+# `mevp_wide_barrier` (dist_N, mevp_wide) the wide mEVP's element terms behind a barrier before its node sums;
+# `cpl_forcing_lean` (with cpl_forcing_jit) the coupled forcing build without eager ops or per-interval copies.
+# `serial_halo_skip`: on one device every halo exchange returns its field (the one-device maps are the identity,
+# checked on the host): fesom_jax.halo.serial_skip_enabled; the same bits, no all_gather and permutation gather.
+# `cpl_forcing_jit` (coupled ocean, mode F): the interval's forcing build and the monthly sums as compiled programs
+# instead of eager device ops (fesom_jax.coupled.flux.flux_step_forcing_jit; bitwise the eager build).
 # `bgc_layout`: how the REcoM tracer stage runs over the tracer axis (a string): "major" (default: one batched pass
 # over the stack held tracer-major in memory, one halo exchange per FCT stage), "vmap" (the batched pass over the
 # trailing tracer axis, XLA's layout) or "loop" (one tracer at a time, the reference; fesom_jax.recom.transport).
@@ -159,7 +186,7 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
 # (ice_ave_steps > 1): each step's ice update branch is fixed at trace time from the cycle's phase, no lax.cond and
 # no host sync a step (run_steps_sharded_forced ice_phase, FESOM_ICE_STATIC).
 _GPU_INT = ("mevp_wide", "cg_batch", "mevp_unroll", "forcing_procs", "forcing_ahead", "se_wide", "se_unroll",
-            "step_unroll", "chunk_tail")
+            "step_unroll", "chunk_tail", "ice_scatter_fuse", "cg_prefix", "potit_unroll", "ice_mm_sum3")
 # `chunk_tail` (an integer q >= 0): a chunk shorter than the chunk length whose length is a multiple of q runs as
 # q-chunks (run.split_tails, FESOM_CHUNK_TAIL): one compiled length less where month ends leave 2q.
 _GPU_STR = ("bgc_layout", "bgc_halo")        # string-valued switches, passed through as written
@@ -182,6 +209,7 @@ class RunConfig:
     tke: Optional[TkeConfig] = None        # None = no TKE (mutually exclusive with kpp)
     ice: Optional[IceConfig] = None        # None = no sea ice; IceConfig() = mEVP
     recom: Optional[RecomConfig] = None    # None = no REcoM biogeochemistry (fesom_jax.recom)
+    cavity: Optional[CavityConfig] = None  # None = no ice-shelf cavities (FESOM2 use_cavity; fesom_jax.cavity)
     # --- promoted run-dependent scalars ---
     visc: ViscConfig = ViscConfig()        # the horizontal-viscosity γ's (NG5: gamma1=0.2)
     tracer: TracerConfig = TracerConfig()  # the tracer scheme selector (implemented = NG5)
@@ -275,7 +303,7 @@ class RunConfig:
             return None
         from .gm_nn import load_gm_nn
         from .params import Params
-        return dataclasses.replace(Params.defaults(), gm_nn=load_gm_nn(self.params_file))
+        return dataclasses.replace(Params.defaults(self.gm), gm_nn=load_gm_nn(self.params_file))
 
     def ssh_cheb(self) -> tuple:
         """The CGPOLY knobs from the ``ssh:`` block as ``(degree, kappa_guess)``;
@@ -331,6 +359,14 @@ class RunConfig:
     def validate(self) -> None:
         """Cross-field validity (mirrors the in-kernel guards, fail-fast at config load)."""
         from .precision import PRECISIONS
+        if self.cavity is not None:
+            # FESOM2 dynamics_init (oce_setup_step.F90:649): split-explicit SSH refuses cavities; the cavity physics is
+            # wired for linfs (jaxcpl) only (the zstar fw2press / balance branches are not ported)
+            if self.ale is not None:
+                raise NotImplementedError("cavity: is wired for linfs only (ale: null); FESOM2's zstar cavity branches "
+                                          "(use_cavity_fw2press, the zstar freshwater balance) are not ported")
+            if self.ice is None:
+                raise NotImplementedError("cavity: needs the prognostic sea ice (the melt sits in its oce_fluxes)")
         if isinstance(self.forcing, dict) and not isinstance(self.forcing.get("mslp", False), bool):
             raise TypeError(f"forcing.mslp must be true or false, got {self.forcing['mslp']!r}")
         # REcoM's CO2 and O2 solubility read press_air, which is zero without l_mslp, and a zero air pressure
@@ -359,8 +395,8 @@ class RunConfig:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {self.precision!r}")
         if self.precision == "single":
             bad = []
-            if self.ale is None or self.ale.use_wsplit:
-                bad.append("zstar without w_split")
+            if self.ale is not None and self.ale.use_wsplit:
+                bad.append("zstar without w_split (or linfs)")
             if self.tke is None or self.kpp is not None:
                 bad.append("classical TKE")
             if self.ice is None or self.ice.whichEVP != 1:
@@ -452,6 +488,8 @@ class RunConfig:
                   ale_cfg=self.ale_cfg(), visc_cfg=self.visc, tracer_cfg=self.tracer)
         if self.recom is not None:      # only when on: a runner without REcoM support then refuses it loudly
             kw["recom_cfg"] = self.recom
+        if self.cavity is not None:     # likewise: only the runners wired for cavities accept it
+            kw["cavity_cfg"] = self.cavity
         return kw
 
     def dt_at(self, step: int) -> float:

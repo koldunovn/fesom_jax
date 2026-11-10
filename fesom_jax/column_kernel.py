@@ -37,6 +37,13 @@ def enabled() -> bool:
             and jax.default_backend() == "gpu")
 
 
+def direct() -> bool:
+    """``FESOM_COLUMN_DIRECT=1`` (``gpu.column_direct``, read at trace time): the column kernels read and write the
+    ``[ncol, K]`` arrays in place (each thread strides through its own row) instead of level-major copies made by
+    the transpose kernel. The same operations on the same values: only the memory access changes."""
+    return os.environ.get("FESOM_COLUMN_DIRECT", "0").strip() not in ("", "0")
+
+
 def _kdt(dtype):
     return jnp.int8 if dtype == jnp.bool_ else dtype
 
@@ -66,7 +73,7 @@ def transpose(x, interpret=False):
         interpret=interpret)(x)
 
 
-def _scan_body(*refs, body, reverse, nl, ncol, n, trees, dtypes):
+def _scan_body(*refs, body, reverse, nl, ncol, n, trees, dtypes, rowmajor=False):
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as plgpu
     ni, nx, ny = n
@@ -78,13 +85,16 @@ def _scan_body(*refs, body, reverse, nl, ncol, n, trees, dtypes):
     sl = pl.ds(i * KERNEL_COLS, KERNEL_COLS)
     ok = i * KERNEL_COLS + jnp.arange(KERNEL_COLS) < ncol
 
+    def at(idx):
+        return ((sl,) + idx) if rowmajor else (idx + (sl,))
+
     def ld(ref, dt, *idx):
         other = 0.0 if jnp.issubdtype(ref.dtype, jnp.floating) else 0
-        v = plgpu.load(ref.at[idx + (sl,)], mask=ok, other=other)
+        v = plgpu.load(ref.at[at(idx)], mask=ok, other=other)
         return v != 0 if dt == jnp.bool_ else v
 
     def st(ref, v, *idx):
-        plgpu.store(ref.at[idx + (sl,)], v.astype(ref.dtype), mask=ok)
+        plgpu.store(ref.at[at(idx)], v.astype(ref.dtype), mask=ok)
 
     carry0 = tuple(ld(r, d) for r, d in zip(ins, di))
 
@@ -101,20 +111,25 @@ def _scan_body(*refs, body, reverse, nl, ncol, n, trees, dtypes):
         st(r, v)
 
 
-def _scan_lm(body, reverse, interpret, init_t, xs_t, init_l, xs_lm):
+def _scan_lm(body, reverse, interpret, init_t, xs_t, init_l, xs_lm, rowmajor=False):
     """The sweep on LEVEL-MAJOR inputs ``xs_lm`` (leaves ``[K, ncol]``); returns (carry leaves, level-major y
-    leaves)."""
+    leaves). ``rowmajor``: inputs and outputs ``[ncol, K]`` instead (:func:`direct`)."""
     from jax.experimental import pallas as pl
     from jax.experimental.pallas import triton as plgpu
-    nl, ncol = xs_lm[0].shape
+    if rowmajor:
+        ncol, nl = xs_lm[0].shape
+    else:
+        nl, ncol = xs_lm[0].shape
     x0 = jax.tree.unflatten(xs_t, [jnp.zeros((ncol,), v.dtype) for v in xs_lm])
     c_ref, y_ref = jax.eval_shape(lambda c, x: body(c, x), jax.tree.unflatten(init_t, list(init_l)), x0)
     y_leaves = jax.tree.leaves(y_ref)
     dtypes = (tuple(v.dtype for v in init_l), tuple(v.dtype for v in xs_lm), tuple(v.dtype for v in y_leaves))
-    out_shape = tuple(jax.ShapeDtypeStruct((nl, ncol), _kdt(y.dtype)) for y in y_leaves) + \
+    out_shape = tuple(jax.ShapeDtypeStruct((ncol, nl) if rowmajor else (nl, ncol), _kdt(y.dtype))
+                      for y in y_leaves) + \
         tuple(jax.ShapeDtypeStruct(v.shape, _kdt(v.dtype)) for v in init_l)
     kern = functools.partial(_scan_body, body=body, reverse=reverse, nl=nl, ncol=ncol,
-                             n=(len(init_l), len(xs_lm), len(y_leaves)), trees=(init_t, xs_t), dtypes=dtypes)
+                             n=(len(init_l), len(xs_lm), len(y_leaves)), trees=(init_t, xs_t), dtypes=dtypes,
+                             rowmajor=rowmajor)
     out = pl.pallas_call(kern, out_shape=out_shape, grid=(pl.cdiv(ncol, KERNEL_COLS),),
                          compiler_params=None if interpret else plgpu.CompilerParams(num_warps=4),
                          interpret=interpret)(*(v.astype(_kdt(v.dtype)) for v in init_l),
@@ -130,6 +145,9 @@ def _float_mask(leaves):
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(0, 1, 2, 3, 4))
 def _column_scan(body, reverse, interpret, init_t, xs_t, init_l, xs_l):
+    if direct():
+        carry, ys, _ = _scan_lm(body, reverse, interpret, init_t, xs_t, init_l, xs_l, rowmajor=True)
+        return carry, ys
     xs_lm = tuple(transpose(v.astype(_kdt(v.dtype)), interpret).astype(v.dtype) for v in xs_l)
     carry, ys_lm, y_t = _scan_lm(body, reverse, interpret, init_t, xs_t, init_l, xs_lm)
     ys = tuple(transpose(v.astype(_kdt(v.dtype)), interpret).astype(v.dtype) for v in ys_lm)
@@ -176,13 +194,14 @@ def column_scan(body, init, xs, reverse: bool = False, interpret: bool = False):
 def _two_sweeps(fwd, bwd, a, b, c, d, interpret):
     """The Thomas solve: the forward elimination and the back-substitution, both on level-major copies, with one
     transpose in per input and one out."""
-    lm = tuple(transpose(v, interpret) for v in (a, b, c, d))
+    rm = direct()
+    lm = (a, b, c, d) if rm else tuple(transpose(v, interpret) for v in (a, b, c, d))
     zero = jnp.zeros(a.shape[:1], a.dtype)
     _, (cp, dp), _ = _scan_lm(fwd, False, interpret, jax.tree.structure((0, 0)),
-                              jax.tree.structure((0, 0, 0, 0)), (zero, zero), lm)
+                              jax.tree.structure((0, 0, 0, 0)), (zero, zero), lm, rowmajor=rm)
     _, (x,), _ = _scan_lm(bwd, True, interpret, jax.tree.structure(0), jax.tree.structure((0, 0)),
-                          (zero,), (cp, dp))
-    return transpose(x, interpret)
+                          (zero,), (cp, dp), rowmajor=rm)
+    return x if rm else transpose(x, interpret)
 
 
 @_two_sweeps.defjvp

@@ -319,8 +319,10 @@ def sss_runoff_fluxes(S_top, water_flux, Ssurf_month, runoff_node,
                                        owned_mask=owned_mask, axis_name=axis_name),
                              virtual_salt)
 
-    # relax_salt (C:404-417).
-    relax_salt = SURF_RELAX_S * (Ssurf_month - S_top)
+    # relax_salt (C:404-417). FESOM_SURF_RELAX_S (the coupled ocean, fesom_jax.coupled: "0" = surf_relax_S = 0,
+    # AWI-ESM3's namelist.tra) replaces the rate at trace time; unset = the constant, the unchanged program.
+    _rate = os.environ.get("FESOM_SURF_RELAX_S")
+    relax_salt = (SURF_RELAX_S if _rate is None else float(_rate)) * (Ssurf_month - S_top)
     relax_salt = jnp.where(open_water,
                            relax_salt - _area_mean(relax_salt, areasvol_surf, ocean_area,
                                        owned_mask=owned_mask, axis_name=axis_name),

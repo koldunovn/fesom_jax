@@ -175,13 +175,12 @@ def _write_state_global(out_dir, state_folded, sm, part, *, fields=None, attrs=N
         root.attrs.update(P=P, nod2D=int(sm.nod2D), elem2D=int(sm.elem2D), edge2D=int(sm.edge2D),
                           nl=int(sm.nl), layout="canonical_global", **(attrs or {}))
     if multiproc:
-        from jax.experimental import multihost_utils
-        multihost_utils.sync_global_devices("restart_global_meta")
+        halo.process_barrier("restart_global_meta")       # no device program (halo.process_barrier)
 
     gather = None
     if multiproc:
         from . import canonical_redist as cr
-        jmesh = halo.device_mesh("p", devices=jax.devices()[:P])
+        jmesh = halo.device_mesh("p", devices=halo.first_devices(P))
         gather = cr._allgather_callable(jmesh, "p")
 
     root = zarr.open_group(str(out_dir), mode="a")
@@ -201,8 +200,7 @@ def _write_state_global(out_dir, state_folded, sm, part, *, fields=None, attrs=N
         if r1 > r0:
             root[name][r0:r1] = g[r0:r1]
     if multiproc:
-        from jax.experimental import multihost_utils
-        multihost_utils.sync_global_devices("restart_global_data")
+        halo.process_barrier("restart_global_data")
     return out_dir
 
 
@@ -245,8 +243,10 @@ def _all_state_fields() -> tuple[str, ...]:
     ``uv_rhsAB`` / ``sigma*`` / ``tke``). Every reader that loops over it to rebuild a State
     (``core2_adj.load_state``, ...) keeps working on restarts with and without the optional
     fields."""
-    from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS, State
-    return tuple(f.name for f in dataclasses.fields(State) if f.name not in ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS)
+    from .state import BGC_FIELDS, CPL_FIELDS, FESOM_BUG_FIELDS, ICE_AVG_FIELDS, SE_FIELDS, State
+    # FESOM_BUG_FIELDS are never written: they restart at their FESOM2 value at every run start
+    return tuple(f.name for f in dataclasses.fields(State)
+                 if f.name not in ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS + FESOM_BUG_FIELDS)
 
 
 def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_stage,
@@ -274,9 +274,9 @@ def write_restart(out_dir, state_folded, sm, part, *, step, calendar_date, dt_st
     (a dt change across a restart invalidates the AB2 history; the driver re-bootstraps).
     Returns the store path."""
     if fields is None:      # every present leaf: the SP carry, ICE_AVG_FIELDS, SE_FIELDS and BGC_FIELDS only when they exist
-        from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+        from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
         from .state import RESTART_SKIP
-        fields = tuple(n for n in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS
+        fields = tuple(n for n in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS
                        if getattr(state_folded, n) is not None and n not in RESTART_SKIP)
     fields = tuple(fields)
     # On disk always float64 (FESOM2: netCDF restarts are double in both builds); a single-precision
@@ -358,17 +358,17 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
         raise ValueError("mesh and new_part disagree on global counts (nod2D/elem2D)")
 
     _, Lmax = local_sizes(new_part)
-    devs = jax.devices()[:new_part.npes] if devices is None else list(devices)
+    devs = halo.first_devices(new_part.npes) if devices is None else list(devices)
     if len(devs) < new_part.npes:
         raise ValueError(f"need {new_part.npes} devices, have {len(devs)}")
     jmesh = halo.device_mesh("p", devices=devs)
     sharding = NamedSharding(jmesh, PartitionSpec("p"))
 
     from .precision import CARRY_FIELDS
-    from .state import BGC_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+    from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
     out = {}
-    for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS:
-        if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS and name not in root:
+    for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS:
+        if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS and name not in root:
             # written by single-precision runs only (the carry), or an ice_ave_steps field the writer did not
             # use (ice_ave_steps == 1, or a restart from before Task 12): None; ice_step.init_ice_avg gives
             # the latter the upstream init values. The split-explicit rings: only an SE run writes them

@@ -20,6 +20,7 @@ step-1 dump gate). Coriolis/SSH/advection are exercised by the synthetic + AD te
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from . import precision as PR
@@ -99,7 +100,7 @@ def _horizontal_adv(mesh: Mesh, uv):
     return ops.scatter_add(vals, mesh.edges, mesh.nod2D, inv=mesh.inv_edges)                 # (nod2D, nl, 2)
 
 
-def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
+def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None, cavity: bool = False):
     """Momentum advection on scalar control volumes (momadv_opt=2). Returns the
     contribution added to ``uv_rhsAB`` at elements, ``[elem2D, nl, 2]``.
 
@@ -110,7 +111,12 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
     results (incomplete on the halo), and the final vertex→element average gathers them
     at the cell's 3 vertices (incl. HALO nodes) — so the C exchanges the node field
     (``uvnode_rhs``) before that gather (the Kokkos SYNC_MAP substep-4 D21 bracket).
-    ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``."""
+    ``exch=None`` ⇒ identity ⇒ byte-identical to ``v1.0``.
+
+    ``cavity`` (ice-shelf cavities): FESOM2 adds the top interface velocity of a cell only when the cell is open
+    (``if (ule==1) wu(ule) += UV(ule)``, oce_ale_vel_rhs.F90:momentum_adv_scalar); a cavity cell has no flux through
+    the shelf base, so its top interface contributes 0 (here the half-sum with the dry level above would give
+    ``0.5·uv``). ``False`` ⇒ the unchanged program."""
     _exch = exch if exch is not None else (lambda f, kind: f)
     lm_e = mesh.elem_layer_mask
     lm_n = mesh.node_layer_mask
@@ -120,6 +126,11 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
     uvu, uvv = uv[:, :, 0], uv[:, :, 1]
     cu = jnp.where(lm_e, 0.5 * (uvu + _shift_down(uvu)), 0.0)
     cv = jnp.where(lm_e, 0.5 * (uvv + _shift_down(uvv)), 0.0)
+    if cavity:
+        _ke = jnp.arange(mesh.nl)[None, :]
+        shelf_top = (_ke == (mesh.ulevels - 1)[:, None]) & (mesh.ulevels > 1)[:, None]
+        cu = jnp.where(shelf_top, 0.0, cu)
+        cv = jnp.where(shelf_top, 0.0, cv)
     area = mesh.elem_area[:, None]
     wu = _scatter3(mesh, area * cu) * w_e        # (nod2D, nl)
     wv = _scatter3(mesh, area * cv) * w_e
@@ -146,7 +157,7 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None):
 
 
 def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
-                    *, is_first_step, dt=DT_DEFAULT, exch=None, press_air=None):
+                    *, is_first_step, dt=DT_DEFAULT, exch=None, press_air=None, cavity: bool = False):
     """``(uv_rhs, uv_rhsAB_new)`` element fields ``[elem2D, nl, 2]``.
 
     ``uv``, ``w_e``, ``hnode`` and ``eta_n`` are the *previous-step* state (lagged,
@@ -184,7 +195,8 @@ def compute_vel_rhs(mesh: Mesh, uv, uv_rhsAB, eta_n, pgf_x, pgf_y, w_e, hnode,
     uv_rhsAB_new = jnp.stack([new_AB_u, new_AB_v], axis=-1)
 
     # (4) + momentum advection into the AB slot
-    uv_rhsAB_new = uv_rhsAB_new + momentum_adv_scalar(mesh, uv, w_e, hnode, exch=exch)
+    uv_rhsAB_new = uv_rhsAB_new + momentum_adv_scalar(mesh, uv, w_e, hnode, exch=exch,
+                                                      **({"cavity": True} if cavity else {}))
 
     # (5) assemble:  uv_rhs = dt·(rhs + uv_rhsAB·ff_step)/area
     ff_step = 1.0 if is_first_step else _AB2
@@ -277,6 +289,71 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_c
 
     out = PR.wp(PR.full(uv_rhs) + jnp.stack([delta_u, delta_v], axis=-1))
     return ops.mask_below_bottom(out, mesh.elem_layer_mask)
+
+
+def visc_filt_bcksct(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_cfg=None):
+    """Harmonic flow-aware horizontal viscosity with easy backscatter (``opt_visc = 5``), FESOM main 0aaa2d73
+    ``visc_filt_bcksct`` (oce_dyn.F90:318-460, the CPU branch; ``use_ssh_se_subcycl`` false). Returns ``uv_rhs``
+    with the viscous term added, ``[elem2D, nl, 2]``.
+
+    1. per interior edge and level of both elements: ``vi = dt·max(γ0, max(γ1|Δu|, γ2|Δu|²))·√(A1+A2)``,
+       ``U_b[el1] -= Δu·vi/A1``, ``U_b[el2] += Δu·vi/A2`` (``Δu = u[el1] − u[el2]``; boundary edges skipped);
+    2. ``U_c`` = the area-weighted mean of ``U_b`` over the elements around each node (the weights are the full
+       element areas, levels below an element's bottom contributing 0), on the node's levels;
+    3. ``uv_rhs += U_b − visc_easybsreturn·mean₃(U_c)`` on the element's levels.
+
+    Exchanges as the Fortran: ``U_b`` (elem) after 1, ``U_c`` (nod) after 2. Single precision as upstream: the edge
+    arithmetic and the node sums in float64 (``real(kind=8)`` locals), ``U_b``/``U_c``/``uv_rhs`` in WP."""
+    _exch = exch if exch is not None else (lambda f, kind: f)
+    vc = visc_cfg if visc_cfg is not None else _DEFAULT_VISC
+    el1s, el2s, a1, a2, length, emask, u1, v1, sq, _coef = _bidiff_edge_terms(mesh, uv, vc)
+    vi2 = u1 * u1 + v1 * v1
+    vi = dt * jnp.maximum(vc.gamma0, jnp.maximum(vc.gamma1 * sq, vc.gamma2 * vi2)) * length   # (edge,nl)
+    a1, a2 = PR.full(a1), PR.full(a2)
+    upd_u = jnp.where(emask, u1 * vi, 0.0)
+    upd_v = jnp.where(emask, v1 * vi, 0.0)
+    if ops.env_switch("FESOM_VISC_UPD_BARRIER"):
+        # gpu.visc_upd_barrier: the edge updates computed once per edge (a barrier), not again for every element
+        # slot of the ordered edge->element sums below (1.6 ms a step on a GH200 at 490 GB/s); the same operations
+        upd_u, upd_v = jax.lax.optimization_barrier((upd_u, upd_v))
+    du_u = jnp.stack([-upd_u / a1[:, None], upd_u / a2[:, None]], axis=1)          # (edge,2,nl)
+    du_v = jnp.stack([-upd_v / a1[:, None], upd_v / a2[:, None]], axis=1)
+    Ub = PR.wp(ops.scatter_add(du_u, mesh.edge_tri, mesh.elem2D, inv=mesh.inv_edge_tri))     # (elem2D,nl) WP
+    Vb = PR.wp(ops.scatter_add(du_v, mesh.edge_tri, mesh.elem2D, inv=mesh.inv_edge_tri))
+    Ub = _exch(Ub, "elem")
+    Vb = _exch(Vb, "elem")
+
+    # node smoothing: Σ_e A_e·U_b(e) / Σ_e A_e over the elements around the node (float64 sums, WP result)
+    area = PR.full(mesh.elem_area)
+    E, nl = mesh.elem2D, mesh.nl
+    inv_en = getattr(mesh, "inv_elem_nodes", None)
+    contrib = jnp.stack([area[:, None] * PR.full(Ub), area[:, None] * PR.full(Vb)], axis=-1)   # (E,nl,2)
+    vals = jnp.broadcast_to(contrib[:, None], (E, 3, nl, 2))
+    acc = ops.scatter_add(vals, mesh.elem_nodes, mesh.nod2D, inv=inv_en)                      # (N,nl,2)
+    wsum = ops.scatter_add(jnp.broadcast_to(area[:, None], (E, 3)), mesh.elem_nodes, mesh.nod2D, inv=inv_en)
+    wsum = jnp.where(wsum > 0.0, wsum, 1.0)
+    Uc = jnp.where(mesh.node_layer_mask[..., None], acc / wsum[:, None, None], 0.0)
+    Uc = PR.wp(Uc)
+    Uc = jnp.stack([_exch(Uc[..., 0], "nod"), _exch(Uc[..., 1], "nod")], axis=-1)
+
+    # back to the elements: uv_rhs += U_b − easybsreturn·Σ₃ U_c / 3 (WP arithmetic as the Fortran)
+    Uc_e = ops.gather_nodes_to_elem(Uc[..., 0], mesh.elem_nodes)                            # (E,3,nl)
+    Vc_e = ops.gather_nodes_to_elem(Uc[..., 1], mesh.elem_nodes)
+    su = (Uc_e[:, 0] + Uc_e[:, 1] + Uc_e[:, 2]) / 3.0
+    sv = (Vc_e[:, 0] + Vc_e[:, 1] + Vc_e[:, 2]) / 3.0
+    du = jnp.stack([Ub - vc.easybsreturn * su, Vb - vc.easybsreturn * sv], axis=-1)       # (E,nl,2)
+    out = uv_rhs + jnp.where(mesh.elem_layer_mask[..., None], du, 0.0)
+    return ops.mask_below_bottom(out, mesh.elem_layer_mask)
+
+
+def horizontal_viscosity(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_cfg=None):
+    """``viscosity_filter(opt_visc)``: 7 (default) :func:`visc_filt_bidiff`, 5 :func:`visc_filt_bcksct`."""
+    opt = 7 if visc_cfg is None else int(visc_cfg.opt_visc)
+    if opt == 7:
+        return visc_filt_bidiff(mesh, uv, uv_rhs, dt=dt, exch=exch, visc_cfg=visc_cfg)
+    if opt == 5:
+        return visc_filt_bcksct(mesh, uv, uv_rhs, dt=dt, exch=exch, visc_cfg=visc_cfg)
+    raise NotImplementedError(f"opt_visc={opt} is not ported (7 = bidiff, 5 = bcksct)")
 
 
 def impl_vert_visc(mesh: Mesh, uv, uv_rhs, Av, stress_surf, *, dt=DT_DEFAULT,

@@ -57,7 +57,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          halo_ctx=None, boundary_node=None, adjoint_cfg=None,
          remat_blocks: bool = False, bulk_uvnode_lag: bool = False, ice_update=None,
          recom_cfg=None, legacy_k33_weights: bool = False, legacy_sw_depth: bool = False,
-         pgf_batches: int = 1) -> State:
+         pgf_batches: int = 1, cavity_cfg=None) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -142,7 +142,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     per-step inputs, and ``forcing_static`` from :func:`fesom_jax.recom.wiring.with_recom_static`."""
     st = state
     if params is None:
-        params = PR.wp_tree(Params.defaults())       # WP leaves in single precision (identity in double)
+        params = PR.wp_tree(Params.defaults(gm_cfg))       # WP leaves in single precision (identity in double)
     # Backward-only simplifications, one flag per term. None ⇒ all off ⇒ every `if _adj.x`
     # below is a dead branch and the traced graph is exactly the pre-existing one.
     _adj = adjoint_cfg if adjoint_cfg is not None else adjoint_stab.AdjointConfig()
@@ -209,10 +209,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # identity in double precision, so the double-precision trace is unchanged.
     _sp = PR.sp()
     h_wp = PR.wp(st.hnode)
-    if _sp and (ale_cfg is None or tke_cfg is None or kpp_cfg is not None or ice_cfg is None
-                or ice_cfg.whichEVP != 1 or ale_cfg.use_wsplit):
+    if _sp and (tke_cfg is None or kpp_cfg is not None or ice_cfg is None
+                or ice_cfg.whichEVP != 1 or (ale_cfg is not None and ale_cfg.use_wsplit)):
         raise NotImplementedError(
-            "single precision supports the CORE2 production physics only (zstar without w_split, "
+            "single precision supports the CORE2 production physics only (zstar without w_split or linfs, "
             "classical TKE, mEVP sea ice); got ale/tke/kpp/ice = "
             f"{ale_cfg}/{tke_cfg}/{kpp_cfg}/{ice_cfg}")
     zbar3_live = Z3d_live = elem_geo_live = None
@@ -246,13 +246,20 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             st = dataclasses.replace(st, uvnode=_exch(pp.compute_vel_nodes(mesh, st.uv), "nod"))
         if ice_cfg is not None:
             from . import ice_step as _ice_step       # lazy: keep ice deps off the pi path
-            ice_out = _ice_step.ice_surface_step(
+            # the coupled ocean's mode F (fesom_jax.coupled.flux.CplForcing): FESOM2's coupled ice block; a trace-time
+            # branch on the forcing's type, so the standalone program is unchanged
+            _ice_fn = _ice_step.ice_surface_step
+            if getattr(type(step_forcing), "COUPLED_FLUX", False):
+                from .coupled import flux as _cpl_flux
+                _ice_fn = _cpl_flux.ice_surface_step_cpl
+            ice_out = _ice_fn(
                 ice_cfg, mesh, st, step_forcing, forcing_static, dt=dt,
                 owned_mask=_red_mask, axis_name=_red_axis, exch=_exch,
                 boundary_node=boundary_node, use_virt_salt=use_virt_salt, zbar3=zbar3_live,
                 params=params, ice_update=ice_update, legacy_sw_depth=legacy_sw_depth,
                 **({} if halo_ctx is None or halo_ctx.mevp_wide is None
-                   else {"mevp_wide": halo_ctx.mevp_wide}))
+                   else {"mevp_wide": halo_ctx.mevp_wide}),
+                **({} if cavity_cfg is None else {"cavity_cfg": cavity_cfg}))
             # Frozen-ice adjoint (paper §2): run the FULL mEVP ice in the forward but
             # stop_gradient the whole ice update so the backward never enters the (unstable)
             # mEVP rheology adjoint. stop_gradient is the identity in the forward ⇒ forward
@@ -299,6 +306,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             mesh, _sadj, bc_T=bc_T, heat_flux=heat_flux, stress_surf=stress_surf,
             stress_node_surf=stress_node_surf, dt=dt, halo_ctx=halo_ctx)
 
+    # Ice-shelf cavities (cavity_cfg; FESOM2 use_cavity, which forces use_density_ref): the density relative to the
+    # reference profile and the shelf-level fill / displaced-column pressure (eos.pressure_bv). None ⇒ no kwargs.
+    _cav_eos = ({} if cavity_cfg is None else
+                dict(density_ref=eos.reference_density(mesh, T_ref=cavity_cfg.density_ref_T,
+                                                       S_ref=cavity_cfg.density_ref_S), cavity=True))
     # 1 — EOS / hydrostatic pressure / N² (zstar: density compressibility + N² spacing on
     #     live geometry; hpressure unused under zstar). Z3d_live=None ⇒ static (byte-identical).
     bvfreq_raw = None
@@ -315,7 +327,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         # (raw EOS/N², then the one-sweep smoother), so the forward is bitwise. The raw field is a per-node map of halo-complete T/S, so it needs no
         # halo exchange (the smoothed one does, below).
         def _eos_with_raw():
-            d, h, b = eos.pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live)
+            d, h, b = eos.pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live, **_cav_eos)
             return d, h, eos.smooth_nod3D(mesh, b, 1), b
         density, hpressure, bvfreq, bvfreq_raw = _ckpt(_eos_with_raw)()
         if _tke_local:
@@ -323,7 +335,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         bvfreq_raw = jax.lax.stop_gradient(bvfreq_raw)
     else:
         density, hpressure, bvfreq = _ckpt(
-            lambda: eos.compute_pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live))()
+            lambda: eos.compute_pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live, **_cav_eos))()
     # ---- backward-only simplifications (adjoint_cfg) -----------------------------------
     # Every flag below replaces "differentiate this term as written" with "use the value it
     # computes, but omit its dependence on the ocean state in the adjoint". stop_gradient is
@@ -363,7 +375,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                                                   params, gm_cfg, exch=_exch,
                                                   Z3d=Z3d_live, zbar3=zbar3_live,
                                                   freeze_nn_features=_adj.freeze_nn_features,
-                                                  adj=_adj))()
+                                                  adj=_adj, kgm_stale=st.gm_kgm_stale))()
 
     # 3 — pressure-gradient force. zstar ⇒ the shchepetkin density-Jacobian on live geometry
     #     (NO hpressure under zstar — the C uses none); linfs ⇒ the hpressure gradient (byte-identical).
@@ -416,7 +428,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             tke_adj=_adj.tke_options(), freeze_state=_adj.freeze_mixing_state,
             bvfreq_raw=bvfreq_raw, conv_surrogate=_adj.conv_surrogate, dt=dt, exch=_exch,
             Z3d=Z3d_live,
-            ice_conc=None if _adj.tke_pr_ice_cut is None else st.a_ice, turner=_turner))()
+            ice_conc=None if _adj.tke_pr_ice_cut is None else st.a_ice, turner=_turner,
+            **({} if cavity_cfg is None else {"cavity": True})))()
     elif kpp_cfg is not None:
         if heat_flux is None:
             raise ValueError(
@@ -460,13 +473,14 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     uv_rhs, uv_rhsAB = _ckpt(lambda: momentum.compute_vel_rhs(
         mesh, st.uv, st.uv_rhsAB, st.eta_n, pgf_x, pgf_y, st.w_e, h_wp,
         is_first_step=is_first_step, dt=dt, exch=_exch,
-        press_air=getattr(step_forcing, "press_air", None)))()
+        press_air=getattr(step_forcing, "press_air", None),
+        **({} if cavity_cfg is None else {"cavity": True})))()
     uv_rhs = _exch(uv_rhs, "elem")
     uv_rhsAB = _exch(uv_rhsAB, "elem")
 
     # 6 — biharmonic horizontal viscosity (splits internally to exchange u_b/v_b)
-    uv_rhs = _ckpt(lambda: momentum.visc_filt_bidiff(mesh, st.uv, uv_rhs, dt=dt, exch=_exch,
-                                                     visc_cfg=visc_cfg))()
+    uv_rhs = _ckpt(lambda: momentum.horizontal_viscosity(mesh, st.uv, uv_rhs, dt=dt, exch=_exch,
+                                                         visc_cfg=visc_cfg))()
     uv_rhs = _exch(uv_rhs, "elem")
 
     # w_split config (static; ale_cfg=None ⇒ off ⇒ byte-identical). Used at substeps 7 + 13.
@@ -584,24 +598,26 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # the full w_e_adv+w_i. use_wsplit off ⇒ w_i=None ⇒ byte-identical. (w_i is the EULERIAN
     # implicit part; the GM bolus stays explicit in w_e_adv.)
     _wi_adv = w_i if _use_wsplit else None
+    _cav_adv = {} if cavity_cfg is None else {"cavity": True}    # the top-interface LO flux under the shelves
     carry_T = carry_S = None
     if _sp:
         T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff = _tracers_advect_sp(
             mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live, zbar3_new,
-            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj, legacy_k33_weights=legacy_k33_weights)
+            Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj, legacy_k33_weights=legacy_k33_weights,
+            **({} if cavity_cfg is None else {"cav_adv": {"cavity": True}}))
     else:
         T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, st.helem, st.hnode,
             hnode_new, st.T, st.T_old, dt=dt, exch=_exch,
             Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
             freeze_limited_flux=_adj.freeze_advection,
-                freeze_limiter=_adj.freeze_fct_limiter))()
+                freeze_limiter=_adj.freeze_fct_limiter, **_cav_adv))()
         S_adv, S_old = _ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, st.helem, st.hnode,
             hnode_new, st.S, st.S_old, dt=dt, exch=_exch,
             Z3d=Z3d_live, zbar3=zbar3_live, w_i=_wi_adv,
             freeze_limited_flux=_adj.freeze_advection,
-                freeze_limiter=_adj.freeze_fct_limiter))()
+                freeze_limiter=_adj.freeze_fct_limiter, **_cav_adv))()
         T_adv = _exch(T_adv, "nod")
         S_adv = _exch(S_adv, "nod")
 
@@ -744,6 +760,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # the ice precedent — so the tke_cfg=None path never touches state.tke ⇒ byte-identical).
     if tke_cfg is not None:
         new = dataclasses.replace(new, tke=tke_new)
+    # GMConfig.reproduce_fesom_bug_kgm_surface_level (a FESOM2 bug reproduced, not physics): the stale slot
+    if gm_diag is not None and gm_diag.kgm_stale is not None:
+        new = dataclasses.replace(new, gm_kgm_stale=gm_diag.kgm_stale)
     # Phase 6: carry the updated prognostic ice state (the ice step ran before the ocean step).
     if ice_out is not None:
         new = dataclasses.replace(
@@ -755,11 +774,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         if ice_out.ice_steps_since_upd is not None:
             from .state import ICE_AVG_FIELDS
             new = dataclasses.replace(new, **{f: getattr(ice_out, f) for f in ICE_AVG_FIELDS})
+        if ice_out.cpl is not None:                      # coupled mode F only (None otherwise: nothing traced)
+            new = dataclasses.replace(new, **ice_out.cpl)
     return new
 
 
 def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live,
-                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj, legacy_k33_weights=False):
+                       zbar3_new, Z3d_new, *, dt, exch, ckpt, adj, legacy_k33_weights=False, cav_adv=None):
     """Single-precision tracer advection + explicit Redi + ALE reconstruction (FESOM2 #1054/#1056/#1206/#1207).
 
     Upstream order (``oce_ale_tracer.F90``): the FCT advection fills the WP_full ``del_ttf`` (low-order tendency in
@@ -772,7 +793,7 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
         d, X_old_new = tracer_content_sp(mesh, X, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, helem=st.helem,
                                          hnode=st.hnode, hnode_new=hnode_new, h_wp=h_wp, gm_diag=gm_diag,
                                          zbar3_live=zbar3_live, Z3d_live=Z3d_live, dt=dt, exch=exch, ckpt=ckpt,
-                                         adj=adj)
+                                         adj=adj, **({} if cav_adv is None else {"cav_adv": cav_adv}))
         Xn, carry = tracer_adv.ale_reconstruct_carry(mesh, X, d, st.hnode, hnode_new, carry)
         return exch(Xn, "nod"), X_old_new, carry
 
@@ -787,7 +808,7 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
 
 
 def tracer_content_sp(mesh, X, X_old, *, uv_adv, w_e_adv, helem, hnode, hnode_new, h_wp, gm_diag, zbar3_live,
-                      Z3d_live, dt, exch, ckpt, adj):
+                      Z3d_live, dt, exch, ckpt, adj, cav_adv=None):
     """Single precision, one tracer: the float64 ``del_ttf`` of the FCT advection (flux-form low order, #1054/#1056)
     plus the explicit Redi content increments (``oce_ale_tracer.F90:1715-1720``, ``:1904``), from the WP tracer ``X``
     with the WP thicknesses ``h_wp`` / ``WP(hnode_new)`` for Redi. Returns ``(del_ttf, X_old_new)``; the caller rounds
@@ -798,7 +819,7 @@ def tracer_content_sp(mesh, X, X_old, *, uv_adv, w_e_adv, helem, hnode, hnode_ne
         mesh, uv_adv, w_e_adv, helem, hnode, hnode_new, X, X_old, dt=dt, exch=exch,
         Z3d=Z3d_live, zbar3=zbar3_live, w_i=None, freeze_limited_flux=adj.freeze_advection,
         freeze_limiter=adj.freeze_fct_limiter,
-        content=True))()
+        content=True, **(cav_adv or {})))()
     if gm_diag is not None:
         sl, Ki = gm_diag.slope_tapered, gm_diag.Ki
         d = (d + PR.full(ckpt(lambda: gm_redi.diff_ver_part_redi_expl(

@@ -1,0 +1,139 @@
+# The coupled ocean of awicm's `--setup jaxcpl` (plan ~/awicm_jax/docs/plans/20261103-jaxcpl-core3.md): FESOM2 CORE3
+# (220,509 nodes) with ice-shelf cavities, linfs, single precision, started from jaxcpl's 1855-01-01 spinup ocean and
+# sea ice (lane L-OCN, docs/lanes/core3.md), with jaxcpl's ocean physics blocks of lane L-SFC
+# (configs/core2_cpl_jaxcpl.yaml, docs/lanes/core3_sfc.md).
+#
+# * mesh: lane L-OCN's CORE3 bundle; global node order = FESOM's nod2d.out order (lane L-CPL's weights rely on it).
+# * partition: serial here; dist_N (N = 1, 2, 4, 8, 16, 128) lives in FESOM_DIST_DIR =
+#   /work/ba1583/a270088/awicm/core3/ocn/mesh_core3_raw (pass partition: dist_N / init_ocean(partition=...)).
+# * restart: the converted jaxcpl restart dated 1855-01-01, step 0 of 1855: init_ocean(year0=1855).
+# * cavity: jaxcpl's cavity_gamma_scale 0.6 (linfs only; the coupled path turns its cavity branches on from this block).
+
+ale: null          # linfs (jaxcpl which_ale)
+gm:
+  k_gm_max: 2500.0
+  redi_kmax_default: 1000.0
+  k_gm_max_nh: 1000.0
+  k_gm_hemi_trans: 10.0
+  # REPRODUCES A FESOM2 BUG, NOT PHYSICS: init_Redi_GM builds the GM profile from the wrong level at the ice-shelf
+  # front and under parts of the shelves (oce_fer_gm.F90:223,304-306 vs :349,439,443; fer_K = 500 from
+  # oce_setup_step.F90:1042). Only to compare with Fortran FESOM2 0aaa2d73 runs such as jaxcpl; the correct
+  # behaviour is false (the default). Filed upstream (FESOM/fesom2). See GMConfig and docs/lanes/core3_sfc.md.
+  reproduce_fesom_bug_kgm_surface_level: true
+kpp: null
+tke: {}
+ice:
+  whichEVP: 1
+  alpha_evp: 300.0
+  beta_evp: 300.0
+  ice_diff: 0.0
+  albsn: 0.82
+  albsnm: 0.65
+  albi: 0.70
+  albim: 0.68
+  albw: 0.1
+  mevp_mass_floor: true
+  metric_factor_zero: true
+  cpl_meltponds: true
+  snowmelt_tgate: false
+  alb_tramp: 1.0
+  pnd_rfracmax: 0.6
+  pnd_aspect: 1.6
+cavity:
+  gamma_scale: 0.6
+visc:
+  opt_visc: 5
+  easybsreturn: 1.5
+tracer: {}
+
+dt: 1800.0
+
+mesh: /work/ba1583/a270088/awicm/core3/ocn/mesh_core3
+partition: serial
+forcing:
+  kind: core2
+  start_year: 1855
+  # chlorophyll of the shortwave penetration: FESOM2's coupled build (__oasis) never calls sbc_ini / sbc_do, so chl
+  # stays at gen_forcing_init.F90's constant 0.1 mg m-3; namelist.forcing's chl_data_source='Sweeney' is not read
+  # there (jaxcpl's FESOM log has no "Updating chlorophyll climatology"). Default without this key: the Sweeney
+  # monthly climatology (fesom_jax.coupled.ocean, init_ocean)
+  chl: 0.1
+ssh:
+  cheb_degree: 3
+  cheb_kappa: 30.0
+  gathered: true
+# gpu: performance switches only, none changes the physics. Measured by lane ocean_speed (2026-11-04, the ocean alone
+# as the concurrent coupler drives it: scripts/core3/ocean_speed.py, 1855-07-01 restart, 27 intervals of 2 steps;
+# ms per interval on 1 GH200 unless noted; runs under /work/ba1583/a270088/awicm/core3/ocean_speed/runs). "bitwise" =
+# the final State identical in every field to the run without the switch.
+gpu:
+  column_unroll: true     # level sweeps unrolled (the standalone stack's default)
+  ssh_ell: true           # SSH matvecs on the ELL layout
+  cg_batch: 4             # 4 masked CG iterations per while trip; bitwise. 8 / 16: bitwise and slower (81.3 / 84.9
+                          # against 80.6): the masked iterations cost more than the host syncs they save
+  mevp_unroll: 12         # mEVP subcycles unrolled 12 per trip; 24 / 40: bitwise and slower (69.0 against 67.2)
+  column_kernel: true     # Pallas column kernels: off = 149.5 against 67.2 ms; bitwise on CORE3 (GH200)
+  ssh_inc_ell: true       # (zstar only: idle with linfs)
+  ordered_sums: true      # ordered gathers instead of atomic scatter-adds: off = 86.3 against 67.2 ms, and the atomics
+                          # are not reproducible run to run (their order varies); with it two runs are bitwise
+  output_async: true
+  restart_async: true
+  forcing_ahead: 2        # (the standalone runner's JRA prefetch: idle in the coupled ocean)
+  cpl_forcing_jit: true   # the interval's forcing build (stress rotation, broadcasts, casts, month rows) and the
+                          # monthly sums in 8 compiled programs instead of ~100 eager ops: 80.6 -> 67.2 ms (-17 %);
+                          # bitwise (products and the sums they feed in separate programs, so no FMA contraction)
+  serial_halo_skip: true  # one device: the halo exchanges return their field (identity maps): 67.6 -> 66.6 ms; bitwise
+  # --- dist_N only (--ocean-devices N; idle on one device). 2 GH200: all_gather 76.9 ms, halo_compact 46.1, padded
+  # 46.0, + mevp_wide 12: compact 44.0 / padded 44.8; all bitwise against each other. lane_order rcm 46.5 (no gain,
+  # round-off: it reorders the sums); ssh.gathered false (the sharded CG) 51.0 (bitwise, slower). dist_2 against one
+  # device is round-off (a different partition sums in another order; after 27 h the States differ like weather).
+  halo_compact: true      # the all_gather ships only the lanes other devices read; bitwise
+  mevp_wide: 12           # mEVP exchanges every 12 subcycles on 12-ring ice lanes; bitwise on 2 GH200 (on CPU with
+                          # metric_factor_zero: round-off, <= 2e-12 relative, tests/test_mevp_wide_sharded.py)
+  # --- lane ocean_speed2 (2026-11-05; same harness, runs under /work/ba1583/a270088/awicm/core3/ocean_speed2/runs;
+  # each alone against 65.0 ms on 1 GH200, "bitwise" = the final State and the last ocean_to_atm fields identical):
+  ice_mm_sum3: 4          # ice FCT mass-matrix element sum as (X0 + X2) + X1 behind a barrier: XLA had made the 3-sum
+                          # a Triton row reduction with one warp per row, 257 us a call, 9 a step: 60.2 ms; bitwise
+                          # (that order IS the Triton butterfly's; 1 = (X0 + X1) + X2 is as fast and round-off)
+  ice_fct_extreme: true   # ice FCT cluster max/min as ordered gathers, not atomic scatter-max/min: 64.7; bitwise
+  ice_scatter_fuse: 2     # mEVP stress divergence: element terms once (barrier), node solve fused into the sums:
+                          # 64.1 (A100 121.6 against 125.8); bitwise
+  potit_unroll: 10        # cavity potit 10 iterations a loop trip: 64.6 (A100 124.3); bitwise
+  visc_upd_barrier: true  # backscatter viscosity edge updates once per edge for the edge->element sums: 64.5; bitwise
+  fct_aux_barrier: true   # tracer FCT element bounds once for the ordered node max/min: 64.5; bitwise
+  fct_flux_barrier: true  # tracer FCT limited fluxes once for the ordered edge->node sum: 64.0; bitwise
+  o2a_surface: true       # ocean_to_atm's surface velocity from level 1 only, ordered sums (was a 48-level float64
+                          # atomic scatter, 1.7 ms an interval): 62.6; bitwise (State and the fields sent)
+  # all eight on: 55.3 / 54.9 against 64.9 / 64.5 (-15 %), bitwise; kernel time 31.1 -> 26.2 ms a step, 1,298 ->
+  # 1,223 kernels a step (nsys). 1 A100: 108.4 / 108.0 against 125.3 / 125.3 (-14 %), bitwise
+  # measured and left off: cg_prefix 12 / 16 (65.6, bitwise, slower: the masked straight-line iterations cost more
+  # than the 3-4 host syncs they save), column_direct (109.4, bitwise, the column kernels read [ncol, K] rows
+  # strided), ssh_rhs_split (65.2, bitwise, no gain), ice_scatter_fuse 1 / 3 (65.1 / 64.5)
+  # --- lane ocean_speed3 (2026-11-05/06; same harness, the lane's runs under
+  # /work/ba1583/a270088/awicm/core3/ocean_speed3/cpl; today's baseline 55.7 ms on 1 GH200, 38.4 on 2 GH200 (dist_2);
+  # "bitwise" as above):
+  o2a_lanes_surface: true # dist_N: ocean_to_atm gathers only level 1 of T, S, uv from the lanes (it all-reduced the
+                          # whole 3-D T, S and uv, 250 MB, for their surface level): 2 GH200 36.3 against 38.4; bitwise
+  mevp_wide_barrier: true # dist_N mevp_wide: the element terms of the wide mEVP's node sums once, behind a barrier
+                          # (ice_scatter_fuse 2 for the wide path): 2 GH200 37.5 against 38.4; bitwise
+  cpl_forcing_lean: true  # the interval's forcing build without eager ops or per-interval host-to-device copies
+                          # (broadcasts and casts inside the stage programs, scalars / month rows placed once;
+                          # dist_N: the lane gather inside the assembly program): 1 GH200 54.5 against 55.9, with
+                          # the two above on 2 GH200 35.8 against 38.3 (-6.5 %); bitwise
+  # the three on: 1 GH200 54.5 against 55.9 ms, 2 GH200 35.8 against 38.3; 1 A100 107.0 against 108.3, 2 A100 66.1
+  # against 70.1; all bitwise. Coupled jaxcpl --wam-concurrent 10 days (median s per day from day 4, the atmosphere
+  # State and every progress value bitwise against the baseline of the same job, job 28765573): GH200 1+1+1 1.50 / 1.50
+  # against 1.52 / 1.52; 1+2+1 1.52 / 1.56 against 1.52 / 1.53 (the same baseline ran 1.53-1.59 in other jobs: no
+  # change within the spread). Both coupled configurations are set by the atmosphere's step and its main thread, not
+  # by the ocean: with the ocean's forcing built ahead (measured, not kept) the main thread never waited for the ocean
+  # any more and the day did not get faster. "ocean busy" (AWICM_OCEAN_PARTS) counts, at each interval's start, the
+  # wait for the copy of the forcing from the atmosphere's device, held while that device runs its step.
+  # measured and left off: mevp_wide 20 / 30 with the first two on (2 GH200 35.2 / 34.9 against 35.1 with 12; bitwise,
+  # no clear gain)
+output_dir: /work/ba1583/a270088/awicm/core3/ocn/runs/cpl
+snapshot_every: 48
+checkpoint_every: 1440
+restart_in: /work/ba1583/a270088/awicm/core3/ocn/restart_jaxcpl_18550101_as_1855_v2
+restart_out: null
+duration: 31d
+precision: single

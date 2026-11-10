@@ -83,7 +83,7 @@ class Chunk(NamedTuple):
     bootstrap_ab2: bool  # True ⇒ this chunk's first step re-bootstraps AB2 (cold / post-ramp)
 
 
-def plan_chunks(n_steps: int, chunk_steps: int, *, start_step: int = 0, dt_ramp=None,
+def plan_chunks(n_steps: int, chunk_steps: int, *, start_step: int = 0, dt_ramp=None, restarted: bool = False,
                 dt: float, split_at=None) -> list:
     """Split ``[start_step, start_step+n_steps)`` into ``Chunk``s of ≤ ``chunk_steps``, also
     splitting at the **dt-ramp boundary** so no chunk straddles a dt change, and at each step in
@@ -94,7 +94,11 @@ def plan_chunks(n_steps: int, chunk_steps: int, *, start_step: int = 0, dt_ramp=
     first chunk) and (b) the chunk that begins exactly at ``dt_ramp.after_step`` (the dt changed ⇒
     the AB2 history is stale). A restart-continuation chunk (``start_step>0``, same dt) carries AB2
     forward ⇒ a chained run is bit-identical to a continuous one (the restart-seam invariant). A
-    ``split_at`` (year) boundary is forcing-only — same dt, AB2 continuous ⇒ it does NOT bootstrap."""
+    ``split_at`` (year) boundary is forcing-only — same dt, AB2 continuous ⇒ it does NOT bootstrap.
+
+    ``restarted``: the run starts from a restart, which carries the AB2 history even at step 0 (a converted FESOM2
+    restart dated at the forcing start, e.g. jaxcpl's 1855 ocean as 1958-01-01): its step 0 does not bootstrap.
+    ``False`` (a cold start, the default) keeps the rule above."""
     if chunk_steps <= 0:
         raise ValueError("chunk_steps must be > 0")
     end = start_step + n_steps
@@ -110,7 +114,7 @@ def plan_chunks(n_steps: int, chunk_steps: int, *, start_step: int = 0, dt_ramp=
             if s < sp < stop:
                 stop = sp
                 break
-        boot = (s == 0) or (s == ramp_at)
+        boot = (s == 0 and not restarted) or (s == ramp_at)
         chunks.append(Chunk(start=s, count=stop - s, dt=float(cdt), bootstrap_ab2=boot))
         s = stop
     return chunks
@@ -525,6 +529,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # carries them (resume mid-cycle), else the upstream init values; None when ice_ave_steps == 1
     from .ice_step import init_ice_avg
     state_p = init_ice_avg(state_p, cfg.ice)
+    # GMConfig.reproduce_fesom_bug_kgm_surface_level (a FESOM2 bug reproduced): 500 m2/s at every run start
+    from .gm import init_kgm_bug_state
+    state_p = init_kgm_bug_state(state_p, cfg.gm)
     # REcoM (fesom_jax.recom): the BGC tracers from the restart when it carries them, else (passive-tracer mode,
     # plan Task 1) copies of salinity
     if _recom_full:
@@ -582,12 +589,13 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         raise ValueError("run_from_config: set cfg.n_steps or cfg.duration")
     cs = int(chunk_steps) if chunk_steps else max(1, n_steps)
     _archive_targets = set()
+    _restarted = state0 is None and cfg.restart_in is not None   # a restart never re-bootstraps AB2 at step 0
     if unforced:
         # No forcing reader to roll and no calendar streams ⇒ no boundary splits; and the bare
         # runner has no folded-chaining/bootstrap plumbing, so an unforced run is ONE chunk
         # (chunk_steps is ignored — forward scan memory is O(1) in steps anyway).
         chunks = plan_chunks(n_steps, max(1, n_steps), start_step=start_step,
-                             dt_ramp=cfg.dt_ramp, dt=cfg.dt, split_at=[])
+                             dt_ramp=cfg.dt_ramp, dt=cfg.dt, split_at=[], restarted=_restarted)
         assert len(chunks) == 1, "unforced runs must plan to a single chunk"
     else:
         # split chunks at forcing-year boundaries AND (when a mean-output stream is active) at the
@@ -607,13 +615,16 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 length=restart_archive_length, dt_ramp=cfg.dt_ramp))
             _split += list(_archive_targets)
         chunks = plan_chunks(n_steps, cs, start_step=start_step, dt_ramp=cfg.dt_ramp, dt=cfg.dt,
-                             split_at=sorted(set(_split)))
+                             split_at=sorted(set(_split)), restarted=_restarted)
         chunks = split_tails(chunks, cs, int(os.environ.get("FESOM_CHUNK_TAIL", "0") or 0))
 
     _fstatic = None if unforced else forcing.static
     if _recom_full and _fstatic is not None:       # full REcoM's per-run node constants (fesom_jax.recom.wiring)
         from .recom import wiring as _rw
         _fstatic = _rw.with_recom_static(_fstatic, mesh)
+    if cfg.cavity is not None and _fstatic is not None:
+        from . import cavity as _cav
+        _fstatic = _cav.with_cavity_static(_fstatic, mesh)
     fs_p = None if unforced else shard_mesh.partition_forcing_static(_fstatic, part)
     stress_p = np.zeros((npes, sm.Lmax["elem"], 2))        # host (Phase-8b B.3; not on GPU 0)
 
@@ -625,6 +636,9 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     if cfg.ice is not None:
         from . import ice_evp
         bn = np.asarray(ice_evp.boundary_node_mask(mesh))   # GLOBAL [nod2D] bool (device→host, ~MB)
+        if cfg.cavity is not None:                          # the ice-shelf front is a coast for the sea ice
+            from . import cavity as _cav
+            bn = np.asarray(_cav.cavity_boundary_node_mask(mesh, bn))
         boundary_node_p = shard_mesh._shard_along_axis(
             bn, part.myList_nod2D, sm.Lmax["nod"], 0, False)
 

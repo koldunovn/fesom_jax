@@ -47,6 +47,12 @@ SUBSTEP_NAMES: dict[int, str] = {
     14: "gm_bolus",
     15: "solve_tracers",
     16: "update_thickness",
+    # FESOM2 main oracle (fesom_dump_core3.F90): the forcing / sea-ice stages before oce_timestep_ale
+    17: "atm_forcing",
+    18: "ice_step",
+    19: "oce_fluxes",
+    20: "pre_fluxes",   # the ocean state oce_fluxes_mom/oce_fluxes read (cavity melt inputs)
+    21: "tracer_adv",   # the tracer advection tendency del_ttf (+ its horizontal / vertical parts), T and S
 }
 SUBSTEP_IDS: dict[str, int] = {v: k for k, v in SUBSTEP_NAMES.items()}
 
@@ -154,6 +160,44 @@ def find_record(
             f"pass probe_gid="
         )
     return matches[0]
+
+
+def load_probe_dir(dirpath: Union[str, Path], kind: str = "nod") -> list[DumpRecord]:
+    """All probe records of a FESOM2 main oracle dump directory (``fesom_dump_core3.F90``).
+
+    ``kind`` is ``"nod"`` (``probe_nod.<rank>``) or ``"elem"`` (``probe_elem.<rank>``; ``probe_gid`` is then
+    the 1-based ELEMENT id). A node column covers levels ``1..nlevels_nod2D`` INCLUDING the cavity levels
+    ``1..ulevels_nod2D-1`` (as stored by FESOM), an element column ``1..nlevels-1``; a vector element field
+    ``x`` is the two records ``x_1`` / ``x_2``.
+    """
+    recs: list[DumpRecord] = []
+    for f in sorted(Path(dirpath).glob(f"probe_{kind}.*")):
+        recs.extend(read_records(f))
+    return recs
+
+
+def load_full_field(dirpath: Union[str, Path], step: int, substep: Union[int, str], name: str,
+                    n_global: int) -> np.ndarray:
+    """Assemble one FULL-field dump of the oracle (``full/s<step>_<substep>_<name>.<rank>``).
+
+    Each rank file is ``int32 n_owned, int32 ncol, int32 gid[n_owned], float64 vals[n_owned, ncol]`` (the
+    whole stored column, owned points only); returns the global ``(n_global, ncol)`` array (0-based rows;
+    ``n_global`` = nod2D or elem2D), NaN where no rank owned the point.
+    """
+    sub = _norm_substep(substep)
+    files = sorted((Path(dirpath) / "full").glob(f"s{step}_{sub}_{name}.*"))
+    if not files:
+        raise LookupError(f"no full dump s{step}_{sub}_{name}.* in {dirpath}/full")
+    out = None
+    for f in files:
+        buf = f.read_bytes()
+        n_own, ncol = np.frombuffer(buf, "<i4", count=2)
+        gid = np.frombuffer(buf, "<i4", count=n_own, offset=8)
+        vals = np.frombuffer(buf, "<f8", count=n_own * ncol, offset=8 + 4 * n_own).reshape(n_own, ncol)
+        if out is None:
+            out = np.full((n_global, ncol), np.nan)
+        out[gid - 1] = vals
+    return out
 
 
 def load_gm_dump(dirpath: Union[str, Path]) -> tuple[dict, dict]:
