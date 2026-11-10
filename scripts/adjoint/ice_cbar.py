@@ -13,7 +13,14 @@ stage-1 "ice bar" of the sea-ice adjoint track).
                                        --window-days 5 --base-dir BASE --grad-root G --tag T
     python scripts/adjoint/ice_cbar.py tkegrad --ice-mode M --setting TKE --cost T \\
                                        --window-days 5 --base-dir TKEBASE --run-dir D
+    python scripts/adjoint/ice_cbar.py cutcensus --ice-mode M --setting TKE --window-days 365 \\
+                                       --base-dir TKEBASE --run-dir D [--census-steps 48]
     python scripts/adjoint/ice_cbar.py summary --fd-root FD --grad-root G --out table.json
+
+``cutcensus`` builds the ``tkegrad`` model and counts, from its base boundaries, where the
+derivative cuts of the setting act (TKE Prandtl / mixing-length masks per criterion, the
+thin-ice mEVP cut) on the model's own forward values, globally, in the cost box and poleward of
+70°; no gradient program is built, so a gradient run costs nothing extra.
 
 Run from a checkout with ``PYTHONPATH=<checkout>`` (``scripts/adjoint/job_cpu.sbatch`` on CPU,
 the dolpung GH200 wrapper on GPU). Every output path is an argument and must lie outside the
@@ -1007,6 +1014,111 @@ def dump_primal(model, base_dir: Path, dump_dir: Path, boundaries,
 
 
 # ---------------------------------------------------------------------------
+# cutcensus: where the derivative cuts act (forward values only, no adjoint)
+
+#: ``polar`` region of the cut census: columns poleward of this latitude [degrees].
+CENSUS_POLAR_LAT = 70.0
+
+
+def census_regions(model, box=C.DEFAULT_BOX) -> dict:
+    """Column masks of the cut census: ``global``, ``box`` (the wet nodes inside the lon/lat
+    bounds of the cost box) and ``polar`` (|lat| > :data:`CENSUS_POLAR_LAT`)."""
+    node, _ = C.box_masks(model.mesh, box)
+    _, lat = C._lonlat_deg(model.mesh)
+    return {"global": jnp.ones(node.size, dtype=bool), "box": jnp.asarray(node),
+            "polar": jnp.asarray(np.abs(lat) > CENSUS_POLAR_LAT)}
+
+
+def thin_census(model, state, regions: dict) -> dict:
+    """Ice nodes (``a_ice ≥ 0.01``, the mEVP node mask) of ``state`` and, with
+    ``IceConfig.adjoint_thin_mass`` on, those under that cut (mean ice+snow load
+    ``(ρ_i·m_ice + ρ_s·m_snow)/a_ice`` below it), per region; host ints."""
+    cfg = model.phys["ice_cfg"]
+    a, m, s = (np.asarray(getattr(state, f)) for f in ("a_ice", "m_ice", "m_snow"))
+    ice = a >= 0.01
+    load = (cfg.rhoice * m + cfg.rhosno * s) / np.where(ice, a, 1.0)
+    thin = float(getattr(cfg, "adjoint_thin_mass", 0.0))
+    out = {}
+    for r, msk in regions.items():
+        msk = np.asarray(msk)
+        row = {"ice_nodes": int((ice & msk).sum())}
+        if thin > 0.0:
+            row["ice.thin"] = int((ice & msk & (load < thin)).sum())
+        out[r] = row
+    return out
+
+
+def census_summary(rows: list) -> dict:
+    """Per family (``tke``, ``ice``), region and key over the counted steps: ``mean``, ``max``
+    and ``share`` (mean of the count over the region's interior interfaces resp. ice nodes);
+    a ``<cut>.live`` key also gets ``share_live`` (over the interfaces where that derivative
+    is there: ``pr_band`` for ``pr.*``, ``ml_free`` for ``ml.*``)."""
+    out = {"n_counted_steps": len(rows),
+           "boundaries": sorted({int(r["boundary"]) for r in rows})}
+    for fam, total in (("tke", "interior"), ("ice", "ice_nodes")):
+        agg: dict = {}
+        for r in rows:
+            for reg, row in r[fam].items():
+                for k, v in row.items():
+                    agg.setdefault(reg, {}).setdefault(k, []).append(v)
+        res = {}
+        for reg, d in agg.items():
+            base = np.maximum(np.asarray(d[total], float), 1.0)
+            res[reg] = {}
+            for k, v in d.items():
+                v = np.asarray(v, float)
+                e = {"mean": float(v.mean()), "max": int(v.max()),
+                     "share": float((v / base).mean())}
+                if k.endswith(".live"):
+                    live = np.maximum(np.asarray(d["pr_band" if k.startswith("pr.")
+                                                   else "ml_free"], float), 1.0)
+                    e["share_live"] = float((v / live).mean())
+                res[reg][k] = e
+        out[fam] = res
+    return out
+
+
+def run_census(model, base_dir: Path, run_dir: Path, *, start, n_steps: int, steps: int,
+               every: int = 1, box=C.DEFAULT_BOX, budget_s: float) -> dict:
+    """The derivative-cut census of a window: from every ``every``-th saved base boundary
+    below the window end, ``steps`` model steps run one at a time
+    (:func:`tke_diag.step_tke_inputs`: the model's own TKE column inputs and next State), each
+    counted by :func:`tke_diag.cut_census` and :func:`thin_census` over
+    :func:`census_regions`. Rows go to ``<run_dir>/census.jsonl``; returns
+    :func:`census_summary`. Nothing of the gradient programs is built or run."""
+    import tke_diag as D
+    nc = model.chunks_for(n_steps)
+    saved = sorted(int(p.stem.split("_")[1]) for p in Path(base_dir).glob("boundary_*.npz"))
+    picks = [c for c in saved if c < nc][::max(1, int(every))]
+    if not picks:
+        raise FileNotFoundError(f"no base boundary below chunk {nc} in {base_dir}")
+    like = model.init_carry(host=True)
+    regions = census_regions(model, box)
+    t0 = C._parse_date(start)
+    clock = T.LegClock(budget_s)
+    rows = []
+    for c in picks:
+        if clock.out_of_time():
+            print(f"out of budget before boundary {c}", flush=True)
+            break
+        state = jax.device_put(model.state_of(
+            T._host_load(Path(base_dir) / f"boundary_{c}.npz", like)))
+        for j in range(steps):
+            n = c * model.chunk_steps + j
+            if n >= n_steps:
+                break
+            inp = D.step_tke_inputs(model, state, D.step_forcing(model, t0, n))
+            row = {"boundary": c, "step": n,
+                   "date": (t0 + datetime.timedelta(seconds=n * model.dt)).isoformat(),
+                   "tke": D.cut_census(model, inp, regions),
+                   "ice": thin_census(model, state, regions)}
+            C.append_row(run_dir / "census.jsonl", row)
+            rows.append(row)
+            state = inp["new_state"]
+    return census_summary(rows)
+
+
+# ---------------------------------------------------------------------------
 # summary
 
 
@@ -1269,7 +1381,8 @@ def _complete(d: Path) -> bool:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("action", choices=["fwd", "fdbatch", "grad", "tkegrad", "summary", "noise"])
+    ap.add_argument("action", choices=["fwd", "fdbatch", "grad", "tkegrad", "cutcensus",
+                                       "summary", "noise"])
     ap.add_argument("--start", default="2013-01-01")
     ap.add_argument("--config", default=None,
                     help="another model's config (e.g. configs/farc_full.yaml); its own dt")
@@ -1373,6 +1486,10 @@ def main(argv=None) -> int:
                          "regional sums in the grad trace)")
     ap.add_argument("--windows", default=",".join(f"{d:g}" for d in WINDOW_DAYS),
                     help="summary: windows in days")
+    ap.add_argument("--census-steps", type=int, default=48,
+                    help="cutcensus: model steps counted from each sampled base boundary")
+    ap.add_argument("--census-every", type=int, default=1,
+                    help="cutcensus: sample every Nth saved base boundary")
     ap.add_argument("--budget-hours", type=float, default=0.42,
                     help="wall-clock budget from the process start (30-min jobs)")
     ap.add_argument("--out", default=None, help="summary: JSON path (markdown next to it)")
@@ -1423,10 +1540,11 @@ def main(argv=None) -> int:
         print(markdown(table))
         return 0
 
-    if args.action in ("grad", "tkegrad") and args.setting is None:
+    if args.action in ("grad", "tkegrad", "cutcensus") and args.setting is None:
         ap.error(f"{args.action} needs --setting (the TKE derivative setting; 'none' allowed)")
     controls = parse_controls(args.controls if args.controls is not None
-                              else ("none" if args.action == "tkegrad" else "pstar,cd"))
+                              else ("none" if args.action in ("tkegrad", "cutcensus")
+                                    else "pstar,cd"))
 
     if args.action in ("fwd", "fdbatch"):
         n = int(round(args.days * 86400.0 / dt))
@@ -1470,6 +1588,24 @@ def main(argv=None) -> int:
     import tke_diag as D
     cfg = D.parse_setting(args.setting)
     n = int(round(args.window_days * 86400.0 / (C.fast_dt(args.fast) if C.parse_fast(args.fast) else dt)))
+    if args.action == "cutcensus":
+        # the tkegrad model (same settings, same base boundaries), forward values only
+        run_dir = out_path(args.run_dir)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        model = build(args.start, n, args.chunk_steps, adjoint_cfg=cfg, ice_mode=args.ice_mode,
+                      ice_settings=args.ice_settings, controls=controls, accs=T.accumulators,
+                      ice_adjoint=ice_adj, tke_settings=args.tke_settings)
+        t0 = time.time()
+        summ = run_census(model, Path(args.base_dir), run_dir, start=args.start, n_steps=n,
+                          steps=args.census_steps, every=args.census_every, budget_s=budget)
+        row = dict(_ice_prov(model), action="cutcensus", setting=args.setting,
+                   adjoint=cfg.describe(), window_days=args.window_days, slurm_job=job,
+                   base_dir=args.base_dir, census_steps=args.census_steps,
+                   census_every=args.census_every, box=C.DEFAULT_BOX,
+                   polar_lat=CENSUS_POLAR_LAT, wall_s=time.time() - t0, **summ)
+        (run_dir / "census.json").write_text(json.dumps(C._jsonable(row), indent=1))
+        print(json.dumps(C._jsonable({k: v for k, v in row.items() if k != "tke"}))[:3000])
+        return 0
     if args.action == "grad":
         if args.run_dir:
             run_dir = out_path(args.run_dir)

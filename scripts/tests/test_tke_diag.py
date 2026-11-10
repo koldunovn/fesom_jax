@@ -114,6 +114,30 @@ def test_regime_logger_runs_on_the_step_inputs(model, pins):
     assert set(present.tolist()) >= {0, 1, 2}, present
 
 
+def test_cut_census_on_the_step_inputs(model):
+    """``cut_census`` on the model's own step inputs under the year setting's TKE masks: the
+    step records the unsmoothed N² the ratio/raw cuts read, and every per-criterion count
+    equals the criterion recomputed from the recorded inputs and the mesh latitude."""
+    cfg = D.parse_setting("tke_pr_cut=1e-6+tke_pr_ratio=100+tke_pr_raw_cut=-1e-6+tke_ml_cut=1e-6"
+                          "+tke_ml_ratio=100+tke_ml_raw_cut=-1e-6+tke_pr_lat_cut=70")
+    m = D.with_adjoint(model, cfg)
+    inp = D.step_tke_inputs(m, m.s0, D.step_forcing(m, START, 0))
+    assert "Nsqr_raw" in inp
+    out = D.cut_census(m, inp)["global"]
+    interior = np.asarray(inp["is_interior"])
+    n2, raw = np.asarray(inp["Nsqr"]), np.asarray(inp["Nsqr_raw"])
+    lat = np.abs(np.asarray(m.mesh.geo_coord_nod2D[:, 1]))[:, None] > np.radians(70.0)
+    small, cancel, low = n2 < 1e-6, np.abs(raw) > 100.0 * np.abs(n2), raw < -1e-6
+    want = {"interior": interior, "pr.small": small, "pr.cancel": cancel, "pr.low": low,
+            "pr.lat": np.broadcast_to(lat, n2.shape), "ml.small": small, "ml.cancel": cancel,
+            "ml.low": low, "ml.any": small | cancel | low,
+            "pr.any": small | cancel | low | lat}
+    print({k: out[k] for k in sorted(out)})
+    for k, msk in want.items():
+        assert out[k] == int((interior & msk).sum()), k
+    assert 0 < out["pr.any.live"] <= out["pr_band"] and 0 < out["ml.any.live"] <= out["ml_free"]
+
+
 # ---------------------------------------------------------------------------
 # the actions on a 2-step window
 

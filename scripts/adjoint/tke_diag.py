@@ -68,6 +68,9 @@ class _StashingTke:
                    tke_min=jnp.asarray(cfg.tke_min, jnp.float64),
                    kappaM_max=jnp.asarray(cfg.kappaM_max, jnp.float64),
                    dt=jnp.asarray(kw["dt"], jnp.float64))
+        for name in ("ice_conc", "turner"):          # read by the ice / Turner Prandtl cuts
+            if kw.get(name) is not None:
+                inp[name] = kw[name]
         self.stash.append(inp)
         return tkemod.mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg, params,
                                  **kw)
@@ -162,6 +165,32 @@ def regimes(inp: dict) -> dict:
     """:func:`fesom_jax.cvmix_tke.tke_regimes` on a :func:`step_tke_inputs` dict (host arrays)."""
     args, kw = column_args(inp)
     return jax.device_get(cvmix_tke.tke_regimes(*args, **kw))
+
+
+_CENSUS: dict = {}
+
+
+def cut_census(model, inp: dict, regions: dict | None = None) -> dict:
+    """:func:`fesom_jax.cvmix_tke.cut_census` of ``model``'s TKE derivative cuts
+    (``model.adjoint_cfg.tke_options()``) on a :func:`step_tke_inputs` dict: host ints
+    ``out[region][key]``. ``regions``: ``{name: [N] bool}`` column masks (default global)."""
+    adj = model.adjoint_cfg.tke_options()
+    args, kw = column_args(inp)
+    static = tuple(sorted((k, kw.pop(k)) for k in ("mxl_min", "tke_min", "kappaM_max", "dt")))
+    extra = {k: inp[k] for k in ("Nsqr_raw", "ice_conc", "turner") if k in inp}
+    key = (id(model), static, tuple(sorted(extra)), tuple(sorted(regions or {})))
+    if key not in _CENSUS:
+        st = dict(static)
+        lat = jnp.asarray(model.mesh.geo_coord_nod2D[:, 1])
+
+        def fn(args, kw, extra, regions):
+            return cvmix_tke.cut_census(*args, **kw, **st, adj=adj, lat=lat,
+                                        n2_raw=extra.get("Nsqr_raw"),
+                                        ice_conc=extra.get("ice_conc"),
+                                        turner=extra.get("turner"), regions=regions)
+        _CENSUS[key] = (model, jax.jit(fn))
+    out = jax.device_get(_CENSUS[key][1](args, kw, extra, regions))
+    return {r: {k: int(v) for k, v in row.items()} for r, row in out.items()}
 
 
 # ---------------------------------------------------------------------------

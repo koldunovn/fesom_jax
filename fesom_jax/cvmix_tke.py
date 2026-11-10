@@ -169,6 +169,65 @@ def _prandtl_fn(Nsqr, Ssqr):
     return jnp.maximum(1.0, jnp.minimum(10.0, TKE_C66 * (Nsqr / jnp.maximum(Ssqr, 1.0e-12))))
 
 
+def n2_cut_masks(Nsqr, n2_raw, *, n2_star=None, ratio=None, raw_cut=None,
+                 what="tke_pr_ratio / tke_pr_raw_cut"):
+    """The N²-based derivative-cut masks (forward values), by name in their union order:
+    ``small`` (``N² < n2_star``), ``cancel`` (``|n2_raw| > ratio·|N²|``) and ``low``
+    (``n2_raw < raw_cut``); a criterion that is ``None`` is absent. Shared by the Prandtl and
+    the mixing-length cuts of :func:`integrate_tke_column` and by :func:`cut_census`. ``what``
+    names the settings in the error raised when ``n2_raw`` is missing."""
+    n2_fwd = lax.stop_gradient(Nsqr)
+    out = {}
+    if n2_star is not None:
+        out["small"] = n2_fwd < n2_star
+    if ratio is not None or raw_cut is not None:
+        if n2_raw is None:
+            raise ValueError(f"the {what} cuts need the unsmoothed N² (n2_raw)")
+        raw_fwd = lax.stop_gradient(n2_raw)
+        if ratio is not None:
+            # the smoothing-cancellation cut: the smoothed N² is a small residual of a
+            # much larger raw N² (|raw| > R*·|smoothed|)
+            out["cancel"] = jnp.abs(raw_fwd) > ratio * jnp.abs(n2_fwd)
+        if raw_cut is not None:
+            # the unsmoothed-N² cut: inverted / neutral cells, whatever the smoothed N² there
+            out["low"] = raw_fwd < raw_cut
+    return out
+
+
+def union_mask(masks: dict):
+    """``m1 | m2 | ...`` over ``masks`` in its order (``None`` when empty)."""
+    mask = None
+    for m in masks.values():
+        mask = m if mask is None else mask | m
+    return mask
+
+
+def pr_region_masks(adj, *, ice_conc=None, lat=None, turner=None) -> dict:
+    """The Prandtl cuts of ``adj`` that read other fields than N² (forward values), by name in
+    the order :func:`integrate_tke_column` applies them: ``ice`` (``tke_pr_ice_cut``, columns
+    whose sea-ice concentration exceeds a*), ``lat`` (``tke_pr_lat_cut``, columns poleward of
+    phi*) and ``tu`` (``tke_pr_tu_cut``, interfaces with ``-90 < Tu < Tu*``). Column masks are
+    ``[N, 1]``."""
+    out = {}
+    if adj is None:
+        return out
+    if adj.pr_ice is not None:
+        if ice_conc is None:
+            raise ValueError("the tke_pr_ice_cut cut needs the sea-ice concentration "
+                             "(ice_conc)")
+        out["ice"] = lax.stop_gradient(ice_conc)[:, None] > adj.pr_ice
+    if adj.pr_lat is not None:
+        if lat is None:
+            raise ValueError("the tke_pr_lat_cut cut needs the column latitude (lat)")
+        out["lat"] = jnp.abs(lax.stop_gradient(lat))[:, None] > math.radians(adj.pr_lat)
+    if adj.pr_tu is not None:
+        if turner is None:
+            raise ValueError("the tke_pr_tu_cut cut needs the Turner angle (turner)")
+        tu = lax.stop_gradient(turner)
+        out["tu"] = (tu > -90.0) & (tu < adj.pr_tu)
+    return out
+
+
 def mixing_length(tke_old, Nsqr, dzw, *, is_surf, is_bot, is_interior, is_wet_iface,
                   mxl_min, cuts=frozenset(), ml_n2_star=None, ml_ratio=None, ml_raw_cut=None,
                   n2_raw=None):
@@ -185,20 +244,9 @@ def mixing_length(tke_old, Nsqr, dzw, *, is_surf, is_bot, is_interior, is_wet_if
     if ml_n2_star is not None or ml_ratio is not None or ml_raw_cut is not None:
         # the mixing-length cut: near-neutral cells, where dmxl0/dN² = -mxl0/(2N²) is huge,
         # and inverted cells whose smoothed N² is a small residual of the raw one
-        n2_fwd = lax.stop_gradient(Nsqr)
-        mask = None if ml_n2_star is None else n2_fwd < ml_n2_star
-        if ml_ratio is not None or ml_raw_cut is not None:
-            if n2_raw is None:
-                raise ValueError("the tke_ml_ratio / tke_ml_raw_cut cuts need the unsmoothed "
-                                 "N² (n2_raw)")
-            raw_fwd = lax.stop_gradient(n2_raw)
-            if ml_ratio is not None:
-                cancel = jnp.abs(raw_fwd) > ml_ratio * jnp.abs(n2_fwd)
-                mask = cancel if mask is None else mask | cancel
-            if ml_raw_cut is not None:
-                low = raw_fwd < ml_raw_cut
-                mask = low if mask is None else mask | low
-        n2_ml = cut_where(n2_ml, mask)
+        n2_ml = cut_where(n2_ml, union_mask(n2_cut_masks(
+            Nsqr, n2_raw, n2_star=ml_n2_star, ratio=ml_ratio, raw_cut=ml_raw_cut,
+            what="tke_ml_ratio / tke_ml_raw_cut")))
     # unconstrained length √2·sqrttke/√max(1e-12,N²) (:671). At the surface+bottom the
     # driver zeroes N² ⇒ this blows up there, but the C overrides those endpoints to 0:
     mxl0 = (jnp.sqrt(2.0) * dcut(cuts, "tke.ml_e", sqrttke)
@@ -353,51 +401,17 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
         if adj.pr_mode == "cut" and n2_star == math.inf:
             prandtl = lax.stop_gradient(prandtl)        # everywhere: the tke.pr cut itself
         elif adj.pr_mode == "cut":
-            mask = None if n2_star is None else n2_fwd < n2_star
-            if pr_ratio is not None or pr_raw is not None:
-                if n2_raw is None:
-                    raise ValueError("the tke_pr_ratio / tke_pr_raw_cut cuts need the unsmoothed "
-                                     "N² (n2_raw)")
-                raw_fwd = lax.stop_gradient(n2_raw)
-            if pr_ratio is not None:
-                # the smoothing-cancellation cut: the smoothed N² is a small residual of a
-                # much larger raw N² (|raw| > R*·|smoothed|)
-                cancel = jnp.abs(raw_fwd) > pr_ratio * jnp.abs(n2_fwd)
-                mask = cancel if mask is None else mask | cancel
-            if pr_raw is not None:
-                # the unsmoothed-N² cut: no Pr derivative where the local N² is below N²_raw*
-                # (inverted / neutral cells, whatever the smoothed N² there)
-                low = raw_fwd < pr_raw
-                mask = low if mask is None else mask | low
-            prandtl = cut_where(prandtl, mask)
+            prandtl = cut_where(prandtl, union_mask(n2_cut_masks(
+                Nsqr, n2_raw, n2_star=n2_star, ratio=pr_ratio, raw_cut=pr_raw)))
         else:                                                           # "at"
             alt = (jnp.maximum(n2_fwd, n2_star), lax.stop_gradient(Ssqr_p))
             base = differentiate_at(_prandtl_fn, (Nsqr_b, Ssqr_p), alt)
             prandtl = lax.stop_gradient(prandtl) + (base - lax.stop_gradient(base))
-    pr_ice = None if adj is None else adj.pr_ice
-    if pr_ice is not None:
-        # the sea-ice Prandtl cut (AdjointConfig.tke_pr_ice_cut): no Pr derivative in the
-        # columns whose ice concentration exceeds a*, forward bitwise
-        if ice_conc is None:
-            raise ValueError("the tke_pr_ice_cut cut needs the sea-ice concentration "
-                             "(ice_conc)")
-        prandtl = cut_where(prandtl, lax.stop_gradient(ice_conc)[:, None] > pr_ice)
-    pr_lat = None if adj is None else adj.pr_lat
-    if pr_lat is not None:
-        # the latitude Prandtl cut (AdjointConfig.tke_pr_lat_cut): no Pr derivative poleward
-        # of phi*, forward bitwise
-        if lat is None:
-            raise ValueError("the tke_pr_lat_cut cut needs the column latitude (lat)")
-        prandtl = cut_where(prandtl, jnp.abs(lax.stop_gradient(lat))[:, None]
-                            > math.radians(pr_lat))
-    pr_tu = None if adj is None else adj.pr_tu
-    if pr_tu is not None:
-        # the diffusive-regime Prandtl cut (AdjointConfig.tke_pr_tu_cut): no Pr derivative at
-        # the interfaces with -90 < Tu < Tu* (stable, cold fresh over warm salty), forward bitwise
-        if turner is None:
-            raise ValueError("the tke_pr_tu_cut cut needs the Turner angle (turner)")
-        tu = lax.stop_gradient(turner)
-        prandtl = cut_where(prandtl, (tu > -90.0) & (tu < pr_tu))
+    # the sea-ice (tke_pr_ice_cut: columns whose ice concentration exceeds a*), latitude
+    # (tke_pr_lat_cut: poleward of phi*) and diffusive-regime (tke_pr_tu_cut: -90 < Tu < Tu*,
+    # stable, cold fresh over warm salty) Prandtl cuts, in that order, forward bitwise
+    for mask in pr_region_masks(adj, ice_conc=ice_conc, lat=lat, turner=turner).values():
+        prandtl = cut_where(prandtl, mask)
     prandtl = dcut(cuts, "tke.pr", prandtl)
     KappaH = KappaM / prandtl                                           # :720
 
@@ -624,3 +638,77 @@ def tke_regimes(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev, *, c_k, c_ep
             "regime": regime, "mxl": wet(mxl), "mxl0": wet(mxl0), "at_cap": at_cap,
             "dKm_dtke": wet(dKm), "Ssqr": wet(Ssqr), "Nsqr": wet(Nsqr), "Ri": wet(Ri),
             "Pr": wet(Pr), "F": wet(F)}
+
+
+# ---------------------------------------------------------------------------
+# census of the derivative cuts (forward values only)
+
+def cut_census(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev, *, adj, c_k, c_eps, cd,
+               alpha_tke, mxl_min, tke_min, kappaM_max, dt, n2_raw=None, ice_conc=None,
+               lat=None, turner=None, regions=None) -> dict:
+    """Where the TKE derivative cuts of ``adj`` (``AdjointConfig.tke_options()``) act on one
+    step's column inputs — forward values only, a diagnostic outside the model.
+
+    Same inputs as :func:`integrate_tke_column`; the masks are built by the same
+    :func:`n2_cut_masks` / :func:`pr_region_masks` the column core applies. ``regions``:
+    ``{name: [N] bool}`` column masks (default ``{"global": all}``). Returns
+    ``out[region][key]``, 0-d ``int32`` counts of wet interior interfaces:
+
+    * ``interior`` — all of them; ``pr_band`` — those with ``1 < 6.6·Ri < 10``, where the
+      Prandtl number is unclipped and has an N² derivative; ``ml_free`` — those whose mixing
+      length is the free ``√2·√tke/N`` (:func:`tke_regimes` ``free``) with ``N² > 1e-12``,
+      where the length has an N² derivative;
+    * per Prandtl cut ``pr.<small|cancel|low|ice|lat|tu>`` (``pr.all`` for the cut everywhere,
+      ``pr.at`` for the ``tke_pr_mode="at"`` shift) and mixing-length cut
+      ``ml.<small|cancel|low>`` that ``adj`` sets, and their unions ``pr.any`` / ``ml.any``:
+      ``<key>`` the interfaces the mask covers and ``<key>.live`` those of them where it removes
+      a derivative that is there (``pr_band`` resp. ``ml_free``).
+    """
+    sg = lax.stop_gradient
+    nl = tke_old.shape[-1]
+    k = jnp.arange(nl, dtype=jnp.int32)[None, :]
+    nlev_c = jnp.asarray(nlev).astype(jnp.int32)[:, None]
+    interior = (k >= 1) & (k <= nlev_c - 1)
+    reg = tke_regimes(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev, c_k=c_k, c_eps=c_eps,
+                      cd=cd, alpha_tke=alpha_tke, mxl_min=mxl_min, tke_min=tke_min,
+                      kappaM_max=kappaM_max, dt=dt)
+    n2 = sg(jnp.asarray(Nsqr))
+    x = TKE_C66 * (n2 / jnp.maximum(sg(jnp.asarray(Ssqr)), 1.0e-12))
+    pr_band = interior & (x > 1.0) & (x < 10.0)
+    ml_free = interior & (reg["regime"] == 0) & (n2 > 1.0e-12)
+
+    pr_parts, ml_parts = {}, {}
+    if adj is not None:
+        star = adj.pr_n2_star
+        if adj.pr_mode == "cut" and star == math.inf:
+            pr_parts["all"] = jnp.ones_like(interior)
+        elif adj.pr_mode == "cut":
+            pr_parts.update(n2_cut_masks(Nsqr, n2_raw, n2_star=star, ratio=adj.pr_ratio,
+                                         raw_cut=adj.pr_raw_cut))
+        elif star is not None:                                          # "at"
+            pr_parts["at"] = n2 < star
+        pr_parts.update(pr_region_masks(adj, ice_conc=ice_conc, lat=lat, turner=turner))
+        if (adj.ml_n2_star is not None or adj.ml_ratio is not None
+                or adj.ml_raw_cut is not None):
+            ml_parts = n2_cut_masks(Nsqr, n2_raw, n2_star=adj.ml_n2_star, ratio=adj.ml_ratio,
+                                    raw_cut=adj.ml_raw_cut, what="tke_ml_ratio / tke_ml_raw_cut")
+
+    def count(m):
+        return jnp.sum(m, dtype=jnp.int32)
+
+    if regions is None:
+        regions = {"global": jnp.ones(interior.shape[0], dtype=bool)}
+    out = {}
+    for rname, rmask in regions.items():
+        r = interior & jnp.asarray(rmask, dtype=bool)[:, None]
+        row = {"interior": count(r), "pr_band": count(r & pr_band),
+               "ml_free": count(r & ml_free)}
+        for fam, parts, live in (("pr", pr_parts, pr_band), ("ml", ml_parts, ml_free)):
+            if not parts:
+                continue
+            for name, m in dict(parts, any=union_mask(parts)).items():
+                m = r & jnp.broadcast_to(m, r.shape)
+                row[f"{fam}.{name}"] = count(m)
+                row[f"{fam}.{name}.live"] = count(m & live)
+        out[rname] = row
+    return out
