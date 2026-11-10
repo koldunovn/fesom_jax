@@ -508,6 +508,14 @@ def _pond_albedo(hsn, apnd, ipnd, alb_dry, pp: MeltPondParams):
     return jnp.maximum(albw, jnp.minimum(0.9, frac_ice * albedo_ice + frac_pond * albedo_pond))
 
 
+def _sqrt0(x):
+    """``sqrt(x)`` for ``x >= 0`` with a finite (zero) derivative at ``x == 0``: the double where. The primal is
+    bitwise ``sqrt(x)``; plain ``sqrt`` stores 0.5/sqrt(0) = Inf, which a discarded branch's zero cotangent turns
+    into NaN in the reverse pass (lane coupled_grad2: 94,446 nodes of the coupled CORE2 step, _pond_area's a_new)."""
+    pos = x > 0.0
+    return jnp.where(pos, jnp.sqrt(jnp.where(pos, x, 1.0)), 0.0 * x)
+
+
 def _pond_area(aice, hice, hsno, meltt, melts, frain, tsfc_k, fsurfn, dt, apnd, hpnd, ipnd, pp: MeltPondParams):
     """ice_meltponds.F90 ``meltpond_area`` (element-wise, every branch as the Fortran)."""
     puny = pp.puny
@@ -522,7 +530,7 @@ def _pond_area(aice, hice, hsno, meltt, melts, frain, tsfc_k, fsurfn, dt, apnd, 
     ts = tsfc_k - 273.15
     # dvn <= 0: the lid freezes when Ts < 0
     bdt = -2.0 * ts * pp.kice * dt / (pp.rhoice_p * pp.lfresh)
-    d_open = 0.5 * jnp.sqrt(jnp.maximum(bdt, 0.0))
+    d_open = 0.5 * _sqrt0(jnp.maximum(bdt, 0.0))
     d_cond = 0.5 * bdt / jnp.where(hlid > 0.0, hlid, 1.0)
     d_frz = jnp.where(hlid > d_open, d_cond, d_open)
     d_frz = jnp.minimum(d_frz, hpnd * pp.rhofresh / pp.rhoice_p)
@@ -539,7 +547,7 @@ def _pond_area(aice, hice, hsno, meltt, melts, frain, tsfc_k, fsurfn, dt, apnd, 
     has_p = apnd > puny
     a_ex = jnp.maximum(0.0, jnp.minimum(aice * 0.9, apnd + 0.5 * dvn * aice / (pp.pndaspect * jnp.where(has_p, apnd, 1.0))))
     h_ex = jnp.where(a_ex > puny, volpn / jnp.where(a_ex > puny, a_ex, 1.0), 0.0)
-    a_new = jnp.maximum(jnp.minimum(jnp.sqrt(jnp.maximum(volpn, 0.0) * aice / pp.pndaspect), aice * 0.9), puny)
+    a_new = jnp.maximum(jnp.minimum(_sqrt0(jnp.maximum(volpn, 0.0) * aice / pp.pndaspect), aice * 0.9), puny)
     h_new = volpn / jnp.maximum(a_new, puny)
     big = aice > 10.0 * puny
     apondn = jnp.where(gone, 0.0, jnp.where(has_p, a_ex, jnp.where(big, a_new, 0.0)))
