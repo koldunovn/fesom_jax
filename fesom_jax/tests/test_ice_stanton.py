@@ -46,14 +46,18 @@ core2 = pytest.mark.skipif(not _HAVE_CORE2,
 #: frozen-sweep damping); the zstar path (use_virt_salt=False)
 PROD = dict(whichEVP=1, adjoint_mode="exact", adjoint_damping="frozen_sweep")
 
-# sha256 of the canonicalised jaxpr text at af5413c (ice-calib after the fortran-restart and
-# adjoint-calib merges, before st_oce_ice existed), jax 0.10.1, CPU, x64, computed by
-# ``jaxpr_hashes`` below (job 28030375).
+# sha256 of the canonicalised jaxpr text, jax 0.10.1, CPU, x64, computed by ``jaxpr_hashes`` below.
+# First pinned at af5413c (ice-calib, before st_oce_ice existed; job 28030375). Re-pinned on
+# merge/adjoint_all (job 28882403/28882468): the calibration and farc commits on top of origin/main
+# ded5355 trace exactly ded5355's programs (thermo 50ada3f4, ice_step_evp 08959180,
+# ice_step_mevp_fs_zstar 098346a9); the coupled line (coupled/coupled_grad e39f2d4) changes both
+# ice-step programs (its switches and the shelf-front FCT bounds, CORE2 forward still bitwise over
+# 8 steps), and these are the hashes with it.
 PINNED_JAX = "0.10.1"
 PINNED = {
     "thermo": "50ada3f4d65b8e5fb913d11e206b5adc824c2413448e83010d3c253e6e6de838",
-    "ice_step_evp": "833aa1317c2cb019a58dc1af28a93cef05e9c8f0d040fe7b637f968a653b41f5",
-    "ice_step_mevp_fs_zstar": "443b2da259b08f21a37a619c93e330030f7fe1ec5d4d3737eb020b8bf96dd9ed",
+    "ice_step_evp": "d5525c43a7d8d95a4c99438ae222e6e28cdf42d8bb0fe737f4df429a70f17483",
+    "ice_step_mevp_fs_zstar": "8f4f2703ed8220e22d36a3d12d5554728fdba697643f7d0730ab7070f26609f5",
 }
 
 
@@ -124,9 +128,13 @@ def setup():
 def test_default_value():
     assert IceConfig().st_oce_ice == 0.006
     assert isinstance(IceConfig().st_oce_ice, float)
-    # not appended at the end: test_ice_frozen_sweep pins the last four fields
-    assert IceConfig._fields[-4:] == ("adjoint_alpha_kappa", "adjoint_theta",
-                                      "adjoint_thin_mass", "adjoint_sweep_guard")
+    # not appended at the end of the adjoint block: test_ice_frozen_sweep pins its order
+    # the adjoint block keeps its order; the farc ice work (adjoint_warm_ts) and the coupled
+    # ocean (mevp_mass_floor, the melt-pond fields, ...) appended fields after it
+    f = IceConfig._fields
+    i = f.index("adjoint_alpha_kappa")
+    assert f[i:i + 5] == ("adjoint_alpha_kappa", "adjoint_theta", "adjoint_thin_mass",
+                          "adjoint_sweep_guard", "adjoint_warm_ts")
 
 
 @core2

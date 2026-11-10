@@ -81,8 +81,12 @@ def test_defaults():
     c = IceConfig()
     assert (c.adjoint_alpha_kappa, c.adjoint_theta) == (1.0, 0.97)
     assert (c.adjoint_thin_mass, c.adjoint_sweep_guard) == (0.0, 0.0)
-    assert IceConfig._fields[-4:] == ("adjoint_alpha_kappa", "adjoint_theta",
-                                      "adjoint_thin_mass", "adjoint_sweep_guard")
+    # the adjoint block keeps its order; the farc ice work (adjoint_warm_ts) and the coupled
+    # ocean (mevp_mass_floor, the melt-pond fields, ...) appended fields after it
+    f = IceConfig._fields
+    i = f.index("adjoint_alpha_kappa")
+    assert f[i:i + 5] == ("adjoint_alpha_kappa", "adjoint_theta", "adjoint_thin_mass",
+                          "adjoint_sweep_guard", "adjoint_warm_ts")
 
 
 def test_mevp_dynamics_refuses_subcycles():
