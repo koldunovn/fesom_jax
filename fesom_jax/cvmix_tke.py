@@ -262,9 +262,10 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
     ``adj`` (:class:`fesom_jax.adjoint_stab.TkeAdjoint` or ``None``, from
     ``AdjointConfig.tke_options()``): the derivative-only candidate settings — the Prandtl-
     number cut (``pr_n2_star``/``pr_mode``), the near-floor km_e cut (``kme_tke``/
-    ``kme_scope``/``kme_term``) and the near-floor TKE cut (``floor_tke``: every derivative
-    with respect to ``tke_old`` where it is below tke*). Masks are built from forward values;
-    the forward is bitwise unchanged, and ``None`` traces the identical program.
+    ``kme_scope``/``kme_term``), the near-floor TKE cut (``floor_tke``: every derivative
+    with respect to ``tke_old`` where it is below tke*) and the buoyancy-N² cut
+    (``n2_star``/``n2_band``). Masks are built from forward values; the forward is bitwise
+    unchanged, and ``None`` traces the identical program.
 
     ``n2_raw`` (``[N, nl]`` or ``None``): the UNSMOOTHED N² at the same interfaces as ``Nsqr``
     (zero where ``Nsqr`` is zeroed), read only by the smoothing-cancellation and unsmoothed-N²
@@ -309,6 +310,16 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
     # separately, as tke.ml_n2). With no cut these are the inputs themselves.
     Ssqr_p = dcut(cuts, "tke.shear", Ssqr)
     Nsqr_b = dcut(cuts, "tke.n2", Nsqr)
+    n2b_star = None if adj is None else adj.n2_star
+    n2b_band = None if adj is None else adj.n2_band
+    if n2b_star is not None or n2b_band is not None:
+        # buoyancy-N² cut (AdjointConfig.tke_n2_cut / tke_n2_band), forward bitwise
+        n2_fwd = lax.stop_gradient(Nsqr)
+        mask = None if n2b_star is None else n2_fwd < n2b_star
+        if n2b_band is not None:
+            band = jnp.abs(n2_fwd) < n2b_band
+            mask = band if mask is None else mask | band
+        Nsqr_b = cut_where(Nsqr_b, mask)
 
     # ---- Part 2: diffusivities (:700-720) ----
     sqrttke_km = dcut(cuts, "tke.km_e", sqrttke)

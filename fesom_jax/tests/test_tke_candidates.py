@@ -140,6 +140,9 @@ VARIANTS = {
     "ml_raw": dict(tke_ml_raw_cut=RAW_STAR),
     "ml_below_raw": dict(tke_ml_cut=N2_STAR, tke_ml_raw_cut=RAW_STAR),
     "floor": dict(tke_floor_cut=TKE_STAR),
+    "n2_below": dict(tke_n2_cut=N2_STAR),
+    "n2_band": dict(tke_n2_band=N2_STAR),
+    "n2_all": dict(tke_n2_cut=math.inf),
 }
 
 
@@ -237,6 +240,12 @@ def test_every_candidate_changes_the_traced_core():
     (dict(tke_pr_tu_cut="-45"), TypeError),
     (dict(tke_floor_cut=math.nan), ValueError),
     (dict(tke_floor_cut="1e-6"), TypeError),
+    (dict(tke_n2_cut=math.nan), ValueError),
+    (dict(tke_n2_cut="1e-6"), TypeError),
+    (dict(tke_n2_band=0.0), ValueError),
+    (dict(tke_n2_band=-1e-6), ValueError),
+    (dict(tke_n2_band=math.inf), ValueError),
+    (dict(tke_n2_band=math.nan), ValueError),
 ])
 def test_validate_rejects_malformed_settings(bad, err):
     with pytest.raises(err):
@@ -274,6 +283,11 @@ def test_describe_active_and_options():
     assert f.describe() == "tke_floor_cut=1e-05"
     assert f.tke_options() == TkeAdjoint(pr_n2_star=None, pr_mode="cut", kme_tke=None,
                                          kme_scope="column", kme_term="km_e", floor_tke=1e-5)
+    b = AdjointConfig(tke_n2_cut=0.0, tke_n2_band=1e-7).validate()
+    assert b.describe() == "tke_n2_cut=0.0+tke_n2_band=1e-07"
+    assert (b.tke_options().n2_star, b.tke_options().n2_band) == (0.0, 1e-7)
+    alone = AdjointConfig(tke_n2_band=1e-7).validate().tke_options()
+    assert alone is not None and alone.n2_star is None and alone.pr_n2_star is None
     assert "freeze_mixing_state" in FREEZE_FLAGS
     assert set(TKE_CANDIDATE_FIELDS) <= set(AdjointConfig._fields)
 
@@ -693,6 +707,51 @@ def test_ml_masked_cut_needs_the_raw_n2(kw):
             x["tke_old"], x["Ssqr"], x["Nsqr"], x["dzw"], x["dzt"], x["forc_tke_surf"], nlev,
             c_k=x["c_k"], c_eps=x["c_eps"], cd=x["cd"], alpha_tke=x["alpha_tke"],
             adj=_opts(**kw), **KW)
+
+
+# ---------------------------------------------------------------------------
+# the buoyancy-N² cut
+# ---------------------------------------------------------------------------
+def test_n2_cut_limits():
+    """A threshold below every N² is exact; ``inf``, one above every N² or a band wider than
+    every |N²| is ``tke.n2``. A band narrower than every nonzero |N²| still holds the exact
+    zeros (the fixture's surface and bottom interfaces; the model pads those from the
+    interior, so its only zeros are the masked ones below the bottom)."""
+    assert _equal(_vjp(_opts(tke_n2_cut=-math.inf)), _vjp())
+    assert _equal(_vjp(_opts(tke_n2_cut=math.inf)), _vjp(cuts={"tke.n2"}))
+    assert _equal(_vjp(_opts(tke_n2_cut=1e30)), _vjp(cuts={"tke.n2"}))
+    assert _equal(_vjp(_opts(tke_n2_band=1e30)), _vjp(cuts={"tke.n2"}))
+    zero = np.asarray(_inputs()[0]["Nsqr"]) == 0
+    assert np.any(zero) and np.any(~zero)
+    _n2_masked_cells_propagate_as_the_diagnostic_cut(_opts(tke_n2_band=1e-300), zero)
+
+
+def _n2_masked_cells_propagate_as_the_diagnostic_cut(adj, mask):
+    for a, b in zip(_tangent_from_n2(mask, adj), _tangent_from_n2(mask, cuts={"tke.n2"})):
+        np.testing.assert_allclose(a, b, rtol=1e-12, atol=0)
+    for a, b in zip(_tangent_from_n2(~mask, adj), _tangent_from_n2(~mask)):
+        np.testing.assert_allclose(a, b, rtol=1e-12, atol=0)
+    live = [np.any(a != b) for a, b in zip(_tangent_from_n2(mask),
+                                           _tangent_from_n2(mask, cuts={"tke.n2"}))]
+    assert any(live), "the buoyancy / Ri N² derivative is not live on the masked cells"
+
+
+def test_n2_cut_acts_on_the_cells_below_the_threshold():
+    x, _ = _inputs()
+    below = np.asarray(x["Nsqr"]) < N2_STAR
+    assert np.any(below) and np.any(~below)
+    _n2_masked_cells_propagate_as_the_diagnostic_cut(_opts(tke_n2_cut=N2_STAR), below)
+
+
+def test_n2_band_acts_on_the_cells_inside_the_band_and_joins_the_cut():
+    x, _ = _inputs()
+    n2 = np.asarray(x["Nsqr"])
+    band = np.abs(n2) < N2_STAR
+    _n2_masked_cells_propagate_as_the_diagnostic_cut(_opts(tke_n2_band=N2_STAR), band)
+    # a one-sided cut at N²* / 2 joined with the band: the union of the two masks
+    both = band | (n2 < 0.5 * N2_STAR)
+    _n2_masked_cells_propagate_as_the_diagnostic_cut(
+        _opts(tke_n2_cut=0.5 * N2_STAR, tke_n2_band=N2_STAR), both)
 
 
 def test_pr_cut_keeps_the_constant_paths():

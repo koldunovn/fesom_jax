@@ -455,6 +455,23 @@ class AdjointConfig(NamedTuple):
     ``freeze_tke_state`` removes and the ``tke.km_e`` / ``tke.ml_e`` cuts only partly. ``0``
     (or below) is exact; ``math.inf`` zeroes the ``tke_old`` cotangent of the core."""
 
+    tke_n2_cut: float | None = None
+    """N^2* of the buoyancy-N^2 cut (``None`` = off). The derivative of the N^2 the buoyancy
+    term ``N^2·KappaH`` and the Richardson number read (the cut point ``tke.n2``) is omitted
+    where the column-input (smoothed) N^2 < N^2* (forward values); KappaH, the mixing length
+    and every other path keep theirs. On the near-neutral Kamchatka shelf at the January 2014
+    freeze-up (N^2 within ±1e-6 of zero) the loop through this N^2 grows the reverse sweep
+    x1e6 in a week; cutting the Prandtl derivative alone (``tke.pr``, or :attr:`tke_pr_cut`
+    raised from 1e-8 to 1e-6) also removes it, so the growth runs N^2 -> Ri -> Pr.
+    ``tke.n2`` everywhere spoils the 2013 30/90-day gradients (10-100 % errors, January
+    90-day signs flipped). Joined with :attr:`tke_n2_band` (a cut where either holds).
+    ``math.inf`` equals ``tke.n2``."""
+
+    tke_n2_band: float | None = None
+    """Half-width N^2* of the near-neutral buoyancy-N^2 cut (``None`` = off): as
+    :attr:`tke_n2_cut`, where ``|N^2| < N^2*`` (smoothed, forward values), so strongly
+    unstable cells keep the derivative. A finite N^2* > 0."""
+
     gm_n2_ratio: float | None = None
     """R* of the smoothing-cancellation cut on the N^2 the eddy-parameterization block reads
     (``None`` = off): the :attr:`tke_pr_ratio` mask, ``|raw N^2| > R* * |smoothed N^2|``
@@ -509,7 +526,8 @@ class AdjointConfig(NamedTuple):
                 and self.tke_ml_cut is None and self.tke_ml_ratio is None
                 and self.tke_ml_raw_cut is None and self.tke_pr_ice_cut is None
                 and self.tke_pr_lat_cut is None and self.tke_pr_tu_cut is None
-                and self.tke_floor_cut is None):
+                and self.tke_floor_cut is None and self.tke_n2_cut is None
+                and self.tke_n2_band is None):
             return None
         return TkeAdjoint(
             pr_n2_star=None if self.tke_pr_cut is None else float(self.tke_pr_cut),
@@ -525,7 +543,9 @@ class AdjointConfig(NamedTuple):
             pr_ice=None if self.tke_pr_ice_cut is None else float(self.tke_pr_ice_cut),
             pr_lat=None if self.tke_pr_lat_cut is None else float(self.tke_pr_lat_cut),
             pr_tu=None if self.tke_pr_tu_cut is None else float(self.tke_pr_tu_cut),
-            floor_tke=None if self.tke_floor_cut is None else float(self.tke_floor_cut))
+            floor_tke=None if self.tke_floor_cut is None else float(self.tke_floor_cut),
+            n2_star=None if self.tke_n2_cut is None else float(self.tke_n2_cut),
+            n2_band=None if self.tke_n2_band is None else float(self.tke_n2_band))
 
     def describe(self) -> str:
         on = [f.removeprefix("freeze_") for f in FREEZE_FLAGS if getattr(self, f)]
@@ -615,6 +635,10 @@ class AdjointConfig(NamedTuple):
         if tu is not None and not -90.0 < tu < 0.0:
             raise ValueError(f"AdjointConfig.tke_pr_tu_cut must be in (-90, 0), got {tu!r}")
         number("tke_floor_cut")
+        number("tke_n2_cut")
+        n2_band = number("tke_n2_band", finite=True)
+        if n2_band is not None and n2_band <= 0.0:
+            raise ValueError(f"AdjointConfig.tke_n2_band must be > 0, got {n2_band!r}")
         gm_ratio = number("gm_n2_ratio", finite=True)
         if gm_ratio is not None and gm_ratio <= 0.0:
             raise ValueError(f"AdjointConfig.gm_n2_ratio must be > 0, got {gm_ratio!r}")
@@ -752,7 +776,7 @@ these (not ``AdjointConfig._fields``) when iterating over flags: ``diag_cuts`` i
 TKE_CANDIDATE_FIELDS: tuple = ("tke_pr_cut", "tke_pr_mode", "tke_pr_ratio", "tke_pr_raw_cut",
                                "tke_kme_tke", "tke_kme_scope", "tke_kme_term", "tke_ml_cut",
                                "tke_ml_ratio", "tke_ml_raw_cut", "tke_pr_ice_cut", "tke_pr_lat_cut",
-                               "tke_pr_tu_cut", "tke_floor_cut",
+                               "tke_pr_tu_cut", "tke_floor_cut", "tke_n2_cut", "tke_n2_band",
                                "gm_n2_ratio", "gm_n2_raw_cut", "gm_slope_cut",
                                "conv_surrogate")
 """The non-boolean candidate settings of :class:`AdjointConfig` (``None`` = off): the
@@ -780,6 +804,8 @@ class TkeAdjoint(NamedTuple):
     pr_lat: float | None = None
     pr_tu: float | None = None
     floor_tke: float | None = None
+    n2_star: float | None = None
+    n2_band: float | None = None
 
 KNOWN_CUTS: dict = {
     "mix.kv_out": "Kv after the mixing closure and its halo exchange, before freeze_mixing "

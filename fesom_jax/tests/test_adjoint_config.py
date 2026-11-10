@@ -104,6 +104,7 @@ NON_FLAG_FIELDS = ["diag_cuts",
                    "tke_kme_term", "tke_ml_cut", "tke_ml_ratio", "tke_ml_raw_cut",
                    "tke_pr_ice_cut", "tke_pr_lat_cut", "tke_pr_tu_cut",
                    "tke_floor_cut",
+                   "tke_n2_cut", "tke_n2_band",
                    # the GM/Redi-input cuts (None = off): test_adjoint_diag_cuts.py,
                    # test_adjoint_config_prod.py
                    "gm_n2_ratio", "gm_n2_raw_cut", "gm_slope_cut",
