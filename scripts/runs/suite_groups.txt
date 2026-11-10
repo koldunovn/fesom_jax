@@ -243,3 +243,10 @@ scripts scripts/tests/test_icecal_chain.py
 scripts scripts/tests/test_icecal_parity.py
 scripts scripts/tests/test_icecal_s1sum.py
 scripts scripts/tests/test_icecal_fdgn.py
+# Classified 2026-11-10 (merge/adjoint_all): the merged test files without a manifest line
+ice fesom_jax/tests/test_ice_dyn_ctrl.py
+unit fesom_jax/tests/test_tke_cut_census.py
+core2 fesom_jax/tests/test_ocean_speed2_switches.py
+sharding fesom_jax/tests/test_ocean_speed3_switches.py
+sharding_slow scripts/tests/test_cbar_ice_sharded.py
+sharding_slow scripts/tests/test_cbar_ice_sharded_fd.py
