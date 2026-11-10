@@ -79,7 +79,7 @@ SOURCES.update({k: "optional" for k in (
     "ice_thdgrsn", "ice_real_salt_flux", "ice_a_old", "se_eta", "se_ubt", "se_sbar_old", "bgc", "bgc_old",
     "bgc_carry", "bgc_steps", "bgc_uvh", "bgc_we", "bgc_wi", "bgc_kv", "bgc_bc", "bgc_h0", "bgc_benthos",
     "bgc_alk_surf", "bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget", "cpl_ice_temp", "cpl_ice_alb", "cpl_apnd",
-    "cpl_hpnd", "cpl_ipnd", "cpl_fw", "gm_kgm_stale")})
+    "cpl_hpnd", "cpl_ipnd", "cpl_fw", "gm_kgm_stale", "diag_fer_k_top", "diag_fw")})
 #: the fields one step reads (the same measurement)
 STEP_READS = ("T", "S", "T_old", "S_old", "del_ttf", "uv", "uv_rhsAB", "uvnode_rhs", "w_e",
               "eta_n", "d_eta", "hnode", "helem", "hbar", "tke", "a_ice", "m_ice", "m_snow",

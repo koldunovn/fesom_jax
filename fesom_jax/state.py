@@ -172,6 +172,11 @@ class State:
     # --- REPRODUCTION OF A FESOM2 BUG, NOT PHYSICS (GMConfig.reproduce_fesom_bug_kgm_surface_level): FESOM2's stale
     # fer_k(ulevels_nod2D) slot of init_Redi_GM, 500 m2/s at every run start, never restarted (as FESOM2) ---
     gm_kgm_stale: jax.Array | None = None         # (nod2D,) [m2/s]
+    # --- optional output diagnostics (FESOM_DIAG_GM_MELT=1 with monthly output; None otherwise, never restarted):
+    # the step's GM coefficient at the node's top wet level and its surface water flux (FESOM2's `fw`, the basal
+    # melt at the cavity nodes) ---
+    diag_fer_k_top: jax.Array | None = None       # (nod2D,) fer_K(ulevels_nod2D) [m2/s]
+    diag_fw: jax.Array | None = None              # (nod2D,) water_flux [m s-1]; + = the ocean loses fresh water
 
     # ---- constructors -----------------------------------------------------
     @classmethod
@@ -282,6 +287,8 @@ RESTART_SKIP = ("bgc_carb", "bgc_mstep", "bgc_diag", "bgc_budget", "cpl_fw")
 CPL_FIELDS = ("cpl_ice_temp", "cpl_ice_alb", "cpl_apnd", "cpl_hpnd", "cpl_ipnd", "cpl_fw")
 # The optional fields of reproduced FESOM2 bugs (None unless switched on; never restarted).
 FESOM_BUG_FIELDS = ("gm_kgm_stale",)
+# The optional output diagnostics (None unless FESOM_DIAG_GM_MELT=1; never restarted).
+DIAG_OUT_FIELDS = ("diag_fer_k_top", "diag_fw")
 
 
 def present_fields(state) -> tuple[str, ...]:
