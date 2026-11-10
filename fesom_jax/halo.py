@@ -471,17 +471,21 @@ def first_devices(n):
 _BARRIERS = [0]
 
 
-def process_barrier(tag: str, timeout_s: int = 3600):
+def process_barrier(tag: str, timeout_s: int = 3600, key: str | None = None):
     """Every process waits here until all have arrived; a no-op with one process. The distributed runtime's
     coordination-service barrier, NOT a device collective (``multihost_utils.sync_global_devices`` runs a program on
     every device of every process: with the coupled run's atmosphere and ocean on different devices of the same
     processes, driven from two threads, such a program can be queued in different orders on different processes
-    and hang). A counter makes each use's id unique; every process must call it the same number of times."""
+    and hang). A counter makes each use's id unique; every process must call it the same number of times.
+    ``key`` (e.g. the store being written) makes the id unique instead of the counter, so that two threads of a
+    process (a background writer and the ocean's thread) can each have barriers without sharing the count."""
     if jax.process_count() <= 1:
         return
     from jax._src import distributed
-    _BARRIERS[0] += 1
-    distributed.global_state.client.wait_at_barrier(f"fesom_{tag}_{_BARRIERS[0]}", int(timeout_s * 1000))
+    if key is None:
+        _BARRIERS[0] += 1
+        key = str(_BARRIERS[0])
+    distributed.global_state.client.wait_at_barrier(f"fesom_{tag}_{key}", int(timeout_s * 1000))
 
 
 def device_mesh(axis_name: str = DEFAULT_AXIS, devices=None) -> Mesh:
