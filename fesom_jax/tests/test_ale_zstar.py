@@ -886,6 +886,36 @@ def test_shchepetkin_grad_finite(mesh):
     assert bool(np.all(np.isfinite(np.asarray(g))))
 
 
+def test_shchepetkin_batches_leave_values_and_vjp(mesh):
+    """``batches > 1`` (element blocks, each checkpointed, for the farc one-step VJP memory)
+    gives the ``batches=1`` PGF and its VJP in ρ, Z and helem, also when the block size does
+    not divide elem2D (the padded last block)."""
+    from fesom_jax import pgf
+    rest = State.rest(mesh)
+    Z3, _ = ale.live_geometry(mesh, rest.hnode)
+    rng = np.random.default_rng(52)
+    lm = jnp.asarray(mesh.node_layer_mask)
+    rho = jnp.where(lm, -0.02 * Z3 + 28.0 + rng.normal(size=(mesh.nod2D, 1)) * 0.05, 0.0)
+    hel = rest.helem * (1.0 + 0.01 * rng.normal(size=rest.helem.shape))
+
+    def run(b):
+        return lambda r, z, h: pgf.pressure_force_shchepetkin(mesh, r, z, h, batches=b)
+
+    ref, vjp = jax.vjp(run(1), rho, Z3, hel)
+    ct = tuple(jnp.asarray(rng.normal(size=x.shape)) for x in ref)
+    g_ref = vjp(ct)
+    ne = mesh.elem_nodes.shape[0]
+    odd = next(b for b in (7, 11, 13) if ne % b)
+    for b in (2, odd):
+        out, vjp_b = jax.vjp(run(b), rho, Z3, hel)
+        for x, y in zip(out, ref):
+            np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=0,
+                                       atol=1e-13 * float(jnp.abs(y).max()))
+        for x, y in zip(vjp_b(ct), g_ref):
+            np.testing.assert_allclose(np.asarray(x), np.asarray(y), rtol=0,
+                                       atol=1e-12 * float(jnp.abs(y).max()))
+
+
 # ==========================================================================
 # 12. JZ.7 — assembled CORE2 zstar step vs z2_cdump (config-clean subset, compute-node)
 # ==========================================================================

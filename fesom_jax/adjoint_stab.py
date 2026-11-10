@@ -442,6 +442,19 @@ class AdjointConfig(NamedTuple):
     thermally stratified North Atlantic summer interfaces (Tu > -45) keep the derivative.
     Joined with the masks above. Tu* = -45 is the regime boundary; Tu* in (-90, 0)."""
 
+    tke_floor_cut: float | None = None
+    """tke* of the near-floor TKE cut (``None`` = off). At interfaces whose ``tke_old < tke*``
+    (forward values) every derivative with respect to ``tke_old`` in the column core is
+    omitted: the TKE memory there carries no tangent into the step, as
+    :attr:`freeze_tke_state` does everywhere; interfaces at or above tke* keep it, and every
+    N^2 / shear / constant path is kept. Near the floor the closure switches between the
+    clamp ``max(tke_solve, tke_min)`` (no derivative) and the onset of a turbulent layer, whose
+    tangent grows like the linear instability of turbulence itself: in the 151-day 2012 NH
+    ice-volume sweep the bottom layer of a stratified ice-free shelf (Shelikof Strait, day 105,
+    tke 1e-6 <-> 3e-4 at the two interfaces above the bottom) grows x5e5 in six chunks, which
+    ``freeze_tke_state`` removes and the ``tke.km_e`` / ``tke.ml_e`` cuts only partly. ``0``
+    (or below) is exact; ``math.inf`` zeroes the ``tke_old`` cotangent of the core."""
+
     gm_n2_ratio: float | None = None
     """R* of the smoothing-cancellation cut on the N^2 the eddy-parameterization block reads
     (``None`` = off): the :attr:`tke_pr_ratio` mask, ``|raw N^2| > R* * |smoothed N^2|``
@@ -495,7 +508,8 @@ class AdjointConfig(NamedTuple):
                 and self.tke_pr_raw_cut is None and self.tke_kme_tke is None
                 and self.tke_ml_cut is None and self.tke_ml_ratio is None
                 and self.tke_ml_raw_cut is None and self.tke_pr_ice_cut is None
-                and self.tke_pr_lat_cut is None and self.tke_pr_tu_cut is None):
+                and self.tke_pr_lat_cut is None and self.tke_pr_tu_cut is None
+                and self.tke_floor_cut is None):
             return None
         return TkeAdjoint(
             pr_n2_star=None if self.tke_pr_cut is None else float(self.tke_pr_cut),
@@ -510,7 +524,8 @@ class AdjointConfig(NamedTuple):
             ml_raw_cut=None if self.tke_ml_raw_cut is None else float(self.tke_ml_raw_cut),
             pr_ice=None if self.tke_pr_ice_cut is None else float(self.tke_pr_ice_cut),
             pr_lat=None if self.tke_pr_lat_cut is None else float(self.tke_pr_lat_cut),
-            pr_tu=None if self.tke_pr_tu_cut is None else float(self.tke_pr_tu_cut))
+            pr_tu=None if self.tke_pr_tu_cut is None else float(self.tke_pr_tu_cut),
+            floor_tke=None if self.tke_floor_cut is None else float(self.tke_floor_cut))
 
     def describe(self) -> str:
         on = [f.removeprefix("freeze_") for f in FREEZE_FLAGS if getattr(self, f)]
@@ -599,6 +614,7 @@ class AdjointConfig(NamedTuple):
         tu = number("tke_pr_tu_cut", finite=True)
         if tu is not None and not -90.0 < tu < 0.0:
             raise ValueError(f"AdjointConfig.tke_pr_tu_cut must be in (-90, 0), got {tu!r}")
+        number("tke_floor_cut")
         gm_ratio = number("gm_n2_ratio", finite=True)
         if gm_ratio is not None and gm_ratio <= 0.0:
             raise ValueError(f"AdjointConfig.gm_n2_ratio must be > 0, got {gm_ratio!r}")
@@ -736,7 +752,7 @@ these (not ``AdjointConfig._fields``) when iterating over flags: ``diag_cuts`` i
 TKE_CANDIDATE_FIELDS: tuple = ("tke_pr_cut", "tke_pr_mode", "tke_pr_ratio", "tke_pr_raw_cut",
                                "tke_kme_tke", "tke_kme_scope", "tke_kme_term", "tke_ml_cut",
                                "tke_ml_ratio", "tke_ml_raw_cut", "tke_pr_ice_cut", "tke_pr_lat_cut",
-                               "tke_pr_tu_cut",
+                               "tke_pr_tu_cut", "tke_floor_cut",
                                "gm_n2_ratio", "gm_n2_raw_cut", "gm_slope_cut",
                                "conv_surrogate")
 """The non-boolean candidate settings of :class:`AdjointConfig` (``None`` = off): the
@@ -763,6 +779,7 @@ class TkeAdjoint(NamedTuple):
     pr_ice: float | None = None
     pr_lat: float | None = None
     pr_tu: float | None = None
+    floor_tke: float | None = None
 
 KNOWN_CUTS: dict = {
     "mix.kv_out": "Kv after the mixing closure and its halo exchange, before freeze_mixing "

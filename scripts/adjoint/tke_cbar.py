@@ -372,14 +372,16 @@ def fwd_records(run_dir: Path) -> tuple[dict, dict]:
 # grad: the reverse sweep over the shared base boundaries
 
 
-def link_base(base_dir: Path, run_dir: Path, n_chunks: int, stride: int = 1) -> None:
+def link_base(base_dir: Path, run_dir: Path, n_chunks: int, stride: int = 1,
+              factor: int = 1) -> None:
     """Symlink the base run's boundaries ``0..n_chunks`` (every ``stride``-th and the last) into
-    ``run_dir`` (never replacing)."""
+    ``run_dir`` (never replacing). ``factor``: the run's chunk is ``factor`` base chunks, so the
+    run's boundary ``c`` is the base's ``c * factor``."""
     run_dir.mkdir(parents=True, exist_ok=True)
     for c in range(n_chunks + 1):
         if c % stride and c != n_chunks:
             continue
-        src = base_dir / f"boundary_{c}.npz"
+        src = base_dir / f"boundary_{c * factor}.npz"
         if not src.exists():
             raise FileNotFoundError(f"base boundary missing: {src}")
         dst = run_dir / f"boundary_{c}.npz"

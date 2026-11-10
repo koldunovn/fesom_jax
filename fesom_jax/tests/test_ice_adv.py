@@ -147,3 +147,84 @@ def test_fct_derivative_options(fct):
           f"{mesh.nod2D} nodes; low-order tangent max |dm| {np.abs(np.asarray(t1[1])).max():.3e} "
           f"vs full {np.abs(m_full).max():.3e}")
     assert np.all(np.isfinite(m_frz)) and changed.any() and not changed.all()
+
+
+def test_fct_bound_options(fct):
+    """The derivative-only bound options (``IceConfig.adjoint_cuts`` "fct_pin", "fct_bound",
+    "fct_hilo") leave the forward bitwise unchanged. "fct_bound" (the bounds tmax/tmin constant in the
+    clipping ratios) changes the m tangent wherever a clipping ratio below 1 decides a limiter
+    factor; "fct_pin" (only the bounds a node attains itself, tmax = 0 or tmin = 0) changes it on
+    a subset of those nodes, and in open water (m_in = 0 on a whole element patch, where every
+    clipping ratio is a tie at 0) its tangent is the "fct_bound" one."""
+    import jax
+    import jax.numpy as jnp
+    from fesom_jax.ice import IceConfig
+    from fesom_jax import ice_adv, ice_evp
+    mesh, col, _outs = fct
+    cfg = IceConfig(scale_area=2.0e8)        # the dump's value (see test_fct_ad_finite)
+    a_in = jnp.asarray(col["a_in"]); m_in = jnp.asarray(col["m_in"])
+    ms_in = jnp.asarray(col["ms_in"]); u = jnp.asarray(col["u_ice"]); v = jnp.asarray(col["v_ice"])
+    rng = np.random.default_rng(7)
+    dm = jnp.asarray(rng.standard_normal(mesh.nod2D)) * 1e-2
+    prim = (a_in, m_in, ms_in, u, v)
+    zero = jnp.zeros_like(a_in)
+    tan = (zero, dm, zero, zero, zero)
+
+    def jvp(**kw):
+        f = lambda a, m, ms, uu, vv: ice_adv.fct_solve(cfg, mesh, a, m, ms, uu, vv, **kw)  # noqa: E731
+        return jax.jvp(f, prim, tan)
+
+    out0, t0 = jvp()
+    out_p, t_p = jvp(pin_bounds=True)
+    out_b, t_b = jvp(freeze_bounds=True)
+    out_h, t_h = jvp(pin_bounds=True, freeze_extremes=True)
+    coast = np.asarray(ice_evp.boundary_node_mask(mesh))
+    out_c, t_c = jvp(pin_bounds=True, freeze_extremes_at=jnp.asarray(coast))
+    cring = np.asarray(ice_adv.coast_ring(mesh, jnp.asarray(coast)))
+    out_r, t_r = jvp(pin_bounds=True, freeze_bounds_at=jnp.asarray(cring))
+    for x, y, z, w, c, r in zip(out0, out_p, out_b, out_h, out_c, out_r):
+        assert (np.asarray(x).tobytes() == np.asarray(y).tobytes() == np.asarray(z).tobytes()
+                == np.asarray(w).tobytes() == np.asarray(c).tobytes() == np.asarray(r).tobytes())
+    m0, mp, mb, mh = (np.asarray(t[1]) for t in (t0, t_p, t_b, t_h))
+    assert all(np.all(np.isfinite(t)) for t in (mp, mb, mh))
+    ch_p, ch_b = mp != m0, mb != m0
+    # open-water nodes: m_in = 0 within three element rings, so that m_l = 0 on the patch of
+    # every vertex of the node's elements and those vertices' bounds are pinned (tmax = tmin = 0)
+    en = np.asarray(mesh.elem_nodes)
+    deep = np.asarray(m_in) == 0.0
+    for _ in range(3):
+        ring = np.ones(mesh.nod2D, bool)
+        np.logical_and.at(ring, en.reshape(-1), np.repeat(deep[en].all(axis=1), 3))
+        deep = ring
+    print(f"[fct bound options] fct_pin changes the m tangent on {ch_p.sum()}, fct_bound on "
+          f"{ch_b.sum()} of {mesh.nod2D} nodes; open-water nodes {deep.sum()}; max |dm| live "
+          f"{np.abs(m0).max():.3e}, pin {np.abs(mp).max():.3e}, bound {np.abs(mb).max():.3e}")
+    assert ch_b.any() and not ch_b.all()
+    assert ch_p.sum() <= ch_b.sum()
+    assert ((mh != m0) | ~ch_p).all()        # pin + extremes changes at least what pin does
+    np.testing.assert_array_equal(mp[deep], mb[deep])
+    np.testing.assert_array_equal(mh[deep], mb[deep])
+    # coast only: the tangent differs from the pinned one only on vertices of coastal elements
+    mc = np.asarray(t_c[1])
+    near = np.zeros(mesh.nod2D, bool)
+    np.logical_or.at(near, en.reshape(-1), np.repeat(coast[en].any(axis=1), 3))
+    print(f"[fct bound options] fct_hilo_coast: {coast.sum()} coastal nodes, changes the pinned "
+          f"tangent on {(mc != mp).sum()} nodes, max |dm| {np.abs(mc).max():.3e}")
+    assert np.all(np.isfinite(mc))
+    np.testing.assert_array_equal(mc[~near], mp[~near])
+    assert (mc != mp).any()
+    # fct_bound_coast: coast_ring = the coastal nodes + every vertex of a cell element with a
+    # coastal vertex; the tangent differs from the pinned one only on vertices of elements that
+    # touch the ring
+    cell = np.asarray(mesh.ulevels) <= 1
+    want = coast.copy()
+    np.logical_or.at(want, en.reshape(-1), np.repeat(coast[en].any(axis=1) & cell, 3))
+    np.testing.assert_array_equal(cring, want)
+    mr = np.asarray(t_r[1])
+    near2 = np.zeros(mesh.nod2D, bool)
+    np.logical_or.at(near2, en.reshape(-1), np.repeat(cring[en].any(axis=1), 3))
+    print(f"[fct bound options] fct_bound_coast: {cring.sum()} coast+ring nodes, changes the pinned "
+          f"tangent on {(mr != mp).sum()} nodes, max |dm| {np.abs(mr).max():.3e}")
+    assert np.all(np.isfinite(mr))
+    np.testing.assert_array_equal(mr[~near2], mp[~near2])
+    assert (mr != mp).any()

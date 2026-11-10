@@ -89,6 +89,16 @@ def test_model_is_the_reference_configuration(model):
         C.build_model(START, 3, 2)
 
 
+def test_another_config_keeps_its_own_dt():
+    """``build_model(config=...)`` checks the physics with that config's dt (farc: 900 s); the
+    reference check still refuses it."""
+    from fesom_jax.run_config import load_yaml
+    farc = load_yaml(ROOT / "configs" / "farc_full.yaml")
+    C.assert_physics(farc, dt=None)
+    with pytest.raises(AssertionError, match="dt 900"):
+        C.assert_physics(farc)
+
+
 def test_the_driver_builds_and_validates_the_dynamics_mode():
     """``ice_mode="dynamics"`` with the stage-1 damping merges into the IceConfig via
     ``_replace`` and is validated at build time; unknown fields and damping under a mode that

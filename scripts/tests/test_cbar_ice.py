@@ -39,6 +39,28 @@ def test_windows_and_drift_algebra():
     assert I.j_drift(S, 48) == 4.8 / 48 and I.j_drift(S, 96) == 19.2 / 96
 
 
+def test_another_config_brings_its_own_time_step(monkeypatch):
+    """Task 26 (farc, dt 900): ``run_dt`` reads the config's dt, the windows are counted in its
+    steps, and ``build`` hands ``config`` / ``restart`` to ``core2_adj.build_model``."""
+    assert I.run_dt() == C.DT
+    assert I.run_dt(ROOT / "configs" / "farc_full.yaml") == 900.0
+    assert T.window_steps([2, 90], 900.0) == [192, 8640]
+    assert T.window_steps([2]) == [96]
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake(*a, **kw):
+        seen.update(args=a, kw=kw)
+        raise Stop
+
+    monkeypatch.setattr(C, "build_model", fake)
+    with pytest.raises(Stop):
+        I.build("2013-01-02", 192, 24, config="configs/farc_full.yaml", restart="/r")
+    assert seen["args"][3] == "/r" and seen["kw"]["config"] == "configs/farc_full.yaml"
+
+
 def test_central_fd_cancels_the_even_part():
     a, b, n = 0.7, 3.0, 48
     for h in (3e-3, 1e-2, 3e-2):
@@ -345,13 +367,48 @@ def test_save_every_resume_keeps_a_carry_only_between_boundaries(toy, base, tmp_
 def test_grad_links_every_stride_th_base_boundary(monkeypatch, tmp_path):
     seen = {}
 
-    def link(base_dir, run_dir, n_chunks, stride=1):
-        seen.update(n_chunks=n_chunks, stride=stride)
+    def link(base_dir, run_dir, n_chunks, stride=1, factor=1):
+        seen.update(n_chunks=n_chunks, stride=stride, factor=factor)
         raise RuntimeError("linked")
     monkeypatch.setattr(I.T, "link_base", link)
     with pytest.raises(RuntimeError, match="linked"):
         I.run_grad(_Toy(), tmp_path / "g", tmp_path / "base", n_steps=12, budget_s=1.0, stride=2)
-    assert seen == {"n_chunks": 4, "stride": 2}
+    assert seen == {"n_chunks": 4, "stride": 2, "factor": 1}
+
+
+def test_grad_chunk_spans_several_base_chunks(tmp_path):
+    """A base at chunk 1 saved every 24 steps (farc ``base*_k1``) serves a gradient at chunk 24:
+    the gradient's boundary c is the base's 24·c."""
+    base, run = tmp_path / "base", tmp_path / "run"
+    base.mkdir()
+    assert I.base_factor(base, 24) == 1                      # no rows: same chunk
+    (base / "results.jsonl").write_text(json.dumps({"chunk_steps": 1}) + "\n")
+    assert I.base_factor(base, 24) == 24 and I.base_factor(base, 1) == 1
+    (base / "results.jsonl").write_text(json.dumps({"chunk_steps": 24}) + "\n")
+    with pytest.raises(ValueError, match="multiple"):
+        I.base_factor(base, 36)
+    for c in (0, 24, 48, 72, 96):
+        (base / f"boundary_{c}.npz").write_bytes(b"")
+    T.link_base(base, run, 4, stride=2, factor=24)
+    got = {p.name: Path(p.readlink()).name for p in run.glob("boundary_*.npz")}
+    assert got == {"boundary_0.npz": "boundary_0.npz", "boundary_2.npz": "boundary_48.npz",
+                   "boundary_4.npz": "boundary_96.npz"}
+
+
+def test_cli_passes_the_partition_to_build(monkeypatch, tmp_path):
+    seen = {}
+
+    def build(*a, **k):
+        seen.update(k)
+        raise RuntimeError("built")
+    monkeypatch.setattr(I, "build", build)
+    with pytest.raises(RuntimeError, match="built"):
+        I.main(["grad", "--run-dir", str(tmp_path / "g"), "--setting", "none", "--dist", "4",
+                "--dist-dir", "/pool/x", "--transport", "padded", "--window-days", "1"])
+    assert (seen["dist"], seen["dist_dir"], seen["transport"]) == (4, "/pool/x", "padded")
+    with pytest.raises(SystemExit):
+        I.main(["grad", "--run-dir", str(tmp_path / "g"), "--setting", "none", "--dist", "4",
+                "--dump-cot", "1", "--dump-primal", "--window-days", "1"])
 
 
 def test_nan_run_propagates_to_the_fd(toy, base, tmp_path):
@@ -653,3 +710,112 @@ def test_provenance_records_the_fct_switch(monkeypatch):
     assert I._ice_prov(_M())["fct_stopgrad_ae"] is False
     monkeypatch.setattr(I.tracer_adv, "FCT_STOP_GRADIENT_AE", True)
     assert I._ice_prov(_M())["fct_stopgrad_ae"] is True
+
+
+# ---------------------------------------------------------------------------
+# terminal ice costs: volume and area
+
+
+class _Mesh7:
+    """The toy's seven nodes: three north of 70N, two in 0-70N, two south; unit areas."""
+    geo_coord_nod2D = np.radians(np.array([[0.0, 85.0], [10.0, 75.0], [20.0, 71.0],
+                                           [30.0, 60.0], [40.0, 10.0], [50.0, -10.0],
+                                           [60.0, -70.0]]))
+    node_layer_mask = np.ones((NOD, 2), bool)
+    areasvol = np.ones((NOD, 2))
+    Z = np.array([-5.0])
+    nl = 2
+
+
+def test_cost_boxes_select_their_nodes():
+    assert np.flatnonzero(I.arctic_weights(_Mesh7(), "nh")).tolist() == [0, 1, 2, 3, 4]
+    assert np.flatnonzero(I.arctic_weights(_Mesh7(), "arctic")).tolist() == [0, 1, 2]
+
+
+def test_ice_cost_value_is_the_weighted_sum():
+    st = _Toy().s0
+    w = np.linspace(1e9, 3e9, NOD)
+    assert float(I.ice_cost_value(st, w, "vol")) == pytest.approx(np.sum(w * st.m_ice) / 1e12,
+                                                                  rel=1e-15)
+    assert float(I.ice_cost_value(st, w, "area")) == pytest.approx(np.sum(w * st.a_ice) / 1e12,
+                                                                   rel=1e-15)
+    with pytest.raises(ValueError, match="unknown ice cost"):
+        I.ice_cost_loss(_Toy(), "thickness", "nh")
+
+
+def test_ice_cost_seed_is_the_weights_on_its_field():
+    """d J / d final carry: ``w / divisor`` on the cost's field, zero on every other leaf."""
+    toy = _Toy()
+    toy.mesh = _Mesh7()
+    w = I.arctic_weights(toy.mesh, "nh")
+    carry = jax.tree.map(jnp.asarray, toy.init_carry(host=True))
+    for cost, (field, div) in I.ICE_COSTS.items():
+        st, acc = jax.grad(I.ice_cost_loss(toy, cost, "nh"))(carry)
+        for f in dataclasses.fields(st):
+            want = w / div if f.name == field else np.zeros(NOD)
+            np.testing.assert_allclose(np.asarray(getattr(st, f.name)), want, rtol=1e-15, atol=0)
+        assert float(acc["drift"]) == 0.0
+
+
+def test_fwd_rows_carry_the_ice_values_of_the_boundary_state(tmp_path):
+    toy = _Toy()
+    toy.mesh = _Mesh7()
+    d = tmp_path / "b"
+    assert _run(toy, d, save_boundaries=True)["status"] == "complete"
+    like = toy.init_carry(host=True)
+    for c in (1, 4):
+        st = toy.state_of(T._host_load(d / f"boundary_{c}.npz", like))
+        for b in I.COST_BOXES:
+            w = I.arctic_weights(toy.mesh, b)
+            for cost, (f, div) in I.ICE_COSTS.items():
+                got = I.ice_values(d, f"{cost}_{b}")[3 * c]
+                assert got == pytest.approx(np.sum(w * np.asarray(getattr(st, f))) / div,
+                                            rel=1e-14), (cost, b, c)
+
+
+def test_a_model_without_a_mesh_writes_no_ice_values(toy, base):
+    assert I.ice_values(base, "vol_nh") == {}
+
+
+def test_grad_dir_names_the_cost():
+    assert I.grad_dir(Path("/g"), "t", 90) == Path("/g/t/drift_w90")
+    assert I.grad_dir(Path("/g"), "t", 256, "vol", "nh") == Path("/g/t/vol_nh_w256")
+    assert I.grad_dir(Path("/g"), "t", 90.5, "area", "arctic") == Path("/g/t/area_arctic_w90.5")
+
+
+def test_folded_node_weights_on_one_device_are_the_weights():
+    class _M:
+        sharded = None
+    w = np.arange(4.0)
+    assert np.array_equal(I.folded_node_weights(_M(), w), w)
+
+
+def test_grad_refuses_an_unknown_cost_box(tmp_path):
+    with pytest.raises(ValueError, match="unknown cost box"):
+        I.run_grad(_Toy(), tmp_path / "g", tmp_path / "base", n_steps=12, budget_s=1.0,
+                   cost="vol", cost_box="tropics")
+
+
+def test_cli_passes_the_ice_cost_to_the_gradient(monkeypatch, tmp_path):
+    seen = {}
+
+    class _M:
+        def chunks_for(self, n):
+            return 1
+
+    def run_grad(model, run_dir, base_dir, **kw):
+        seen.update(run_dir=run_dir, **kw)
+        raise RuntimeError("grad")
+    monkeypatch.setattr(I, "build", lambda *a, **k: _M())
+    monkeypatch.setattr(I, "run_grad", run_grad)
+    common = ["grad", "--grad-root", str(tmp_path), "--tag", "t", "--setting", "none",
+              "--base-dir", str(tmp_path / "b"), "--window-days", "256"]
+    with pytest.raises(RuntimeError, match="grad"):
+        I.main(common + ["--ice-cost", "vol"])
+    assert (seen["cost"], seen["cost_box"]) == ("vol", "nh")
+    assert seen["run_dir"] == tmp_path / "t" / "vol_nh_w256"
+    with pytest.raises(RuntimeError, match="grad"):
+        I.main(common)
+    assert seen["cost"] == "drift" and seen["run_dir"] == tmp_path / "t" / "drift_w256"
+    with pytest.raises(SystemExit):
+        I.main(common + ["--ice-cost", "vol", "--cost-box", "tropics"])

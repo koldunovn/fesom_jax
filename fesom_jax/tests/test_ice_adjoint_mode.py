@@ -435,6 +435,8 @@ CUT_CHECKS = {
     "ocean_vel": ("uvnode", "u_ice", ()),
     "advect": ("u_ice", "water_flux", ()),
     "ice2ocean": ("u_ice", "stress_surf", ("advect",)),
+    "ocean_ts": ("S", "heat_flux", ()),
+    "water_flux": ("u_ice", "water_flux", ()),
 }
 
 
@@ -442,7 +444,7 @@ CUT_CHECKS = {
 def ice_step_jvp(core2_setup):
     """``(cuts, field, output) -> (primal outputs, tangent of output)`` for one ice step under
     "dynamics" + local κ = 0.25 with ``adjoint_cuts=cuts``; the perturbation of ``field`` is
-    a fixed random pattern on the icy nodes (uvnode: its surface level)."""
+    a fixed random pattern on the icy nodes (uvnode and the 3-D tracers: their surface level)."""
     from fesom_jax import ice_step as ice_step_mod
     mesh, state, op, fs, sf0, wet0 = core2_setup
     icy = np.asarray(state.a_ice > 0.0)
@@ -453,6 +455,8 @@ def ice_step_jvp(core2_setup):
         z = jax.tree.map(jnp.zeros_like, state)
         if field == "uvnode":
             return dataclasses.replace(z, uvnode=z.uvnode.at[:, 0, 0].set(0.01 * pat))
+        if getattr(z, field).ndim == 2:
+            return dataclasses.replace(z, **{field: getattr(z, field).at[:, 0].set(0.01 * pat)})
         return dataclasses.replace(z, **{field: 0.01 * pat})
 
     cache = {}
@@ -515,7 +519,8 @@ def test_empty_cuts_trace_the_same_step(core2_setup):
     assert jaxpr(adjoint_cuts=("ssh",)) != base
 
 
-@pytest.mark.parametrize("cut", ["fct_limiter", "fct_flux"])
+@pytest.mark.parametrize("cut", ["fct_limiter", "fct_flux", "fct_pin", "fct_bound", "fct_hilo",
+                                 "fct_hilo_coast", "fct_bound_coast"])
 def test_fct_cuts_under_exact(core2_setup, cut):
     """``adjoint_cuts=("fct_limiter",)`` (the ice advection's Zalesak limiter factors enter the
     tangent as constants) and ``("fct_flux",)`` (the whole limited antidiffusive correction
@@ -633,6 +638,68 @@ def test_thin_mass_validation(kw):
     base = dict(whichEVP=1, adjoint_mode="exact")
     base.update(kw)
     with pytest.raises(ValueError, match="adjoint_thin_mass"):
+        ice_step_mod.validate_adjoint_settings(IceConfig()._replace(**base))
+
+
+def test_warm_ts_cuts_the_ocean_ts_path_on_warm_nodes_only(core2_setup):
+    """``IceConfig.adjoint_warm_ts``: the tangent from the surface S into the heat flux handed to
+    the ocean (its one path is the ice thermodynamics, as for the cut "ocean_ts") is exactly zero
+    on the nodes whose surface is warmer than T_f(S) + ΔT and bitwise the uncut one elsewhere;
+    the forward is bitwise unchanged (CPU)."""
+    from fesom_jax import ice_step as ice_step_mod
+    from fesom_jax import ice_thermo
+    mesh, state, op, fs, sf0, wet0 = core2_setup
+    icy = np.asarray(state.a_ice > 0.0)
+    d = np.asarray(state.T[:, 0] - ice_thermo.tfrez(IceConfig(), state.S[:, 0]))
+    warm_ts = float(np.median(d[icy & (d > 0.0)]))
+    pat = jnp.asarray(np.where(icy, np.random.default_rng(8).standard_normal(mesh.nod2D), 0.0))
+    z = jax.tree.map(jnp.zeros_like, state)
+    tan = dataclasses.replace(z, S=z.S.at[:, 0].set(0.01 * pat))
+
+    def run(w):
+        cfg = IceConfig(whichEVP=1, adjoint_mode="dynamics")._replace(
+            adjoint_damping="local", adjoint_kappa=0.25, adjoint_warm_ts=w)
+
+        def f(st):
+            return ice_step_mod.ice_surface_step(cfg, mesh, st, sf0, fs, dt=DT)
+        out, tout = jax.jit(lambda st, t: jax.jvp(f, (st,), (t,)))(state, tan)
+        return out, np.asarray(tout.heat_flux)
+
+    (o0, t0), (o1, t1) = run(0.0), run(warm_ts)
+    for a, b in zip(o0, o1):
+        assert np.asarray(a).tobytes() == np.asarray(b).tobytes()
+    hot = d > warm_ts
+    assert np.count_nonzero(t0[hot & icy]) > 10 and np.count_nonzero(t0[~hot & icy]) > 10
+    assert np.all(t1[hot] == 0.0), np.max(np.abs(t1[hot]))
+    # elsewhere the uncut tangent up to round-off (the masked program fuses differently)
+    np.testing.assert_allclose(t1[~hot], t0[~hot], rtol=1e-12,
+                               atol=1e-12 * np.max(np.abs(t0[~hot])))
+
+
+def test_warm_ts_zero_is_the_same_step(core2_setup):
+    from fesom_jax import ice_step as ice_step_mod
+    mesh, state, op, fs, sf0, wet0 = core2_setup
+
+    def jaxpr(**kw):
+        cfg = IceConfig(whichEVP=1, adjoint_mode="dynamics")._replace(**kw)
+        return str(jax.make_jaxpr(
+            lambda st: ice_step_mod.ice_surface_step(cfg, mesh, st, sf0, fs, dt=DT))(state))
+
+    base = jaxpr()
+    assert jaxpr(adjoint_warm_ts=0.0) == base
+    assert jaxpr(adjoint_warm_ts=0.5) != base
+
+
+@pytest.mark.parametrize("kw", [dict(adjoint_warm_ts=-1.0),
+                                dict(adjoint_warm_ts=float("inf")),
+                                dict(adjoint_warm_ts="x"),
+                                dict(adjoint_warm_ts=0.5, adjoint_mode="prescribed")],
+                         ids=["negative", "inf", "text", "prescribed"])
+def test_warm_ts_validation(kw):
+    from fesom_jax import ice_step as ice_step_mod
+    base = dict(whichEVP=1, adjoint_mode="exact")
+    base.update(kw)
+    with pytest.raises(ValueError, match="adjoint_warm_ts"):
         ice_step_mod.validate_adjoint_settings(IceConfig()._replace(**base))
 
 

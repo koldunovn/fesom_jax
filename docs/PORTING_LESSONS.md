@@ -9074,6 +9074,301 @@ Lesson: the spikes are the cotangent of a tracer at a node where that tracer is 
 * Not pinned: which operation inside the half-day chunk makes the derivative at the m = 0 or m_snow = 0 boundary
   (thermodynamics or advection).
 
+### 2026-10-11 (sea-ice adjoint, task 26, farc) — the farc ice adjoint runs sharded over the 4 GH200 of one node
+
+Setup: the farc one-step VJP needs ~100 GiB against ~80 on one GH200, even at chunk 1 with nested remat and the
+batched PGF. Unified memory fits it but runs no reverse step in 3 h. The step had long been sharded and its gradient
+tested, but only as one `jax.grad` over a short window; the long-window driver (`adjoint.chunked_grad`: chunks,
+host boundaries, resumable legs) was one-device only. The joint is `adjoint.ChunkProgram`,
+`integrate_sharded.sharded_chunk_program`, `core2_adj.build_model(dist=)` and `ice_cbar grad --dist N --transport`.
+The dense base boundaries are folded on load, and a gradient chunk may span several base chunks (`base_factor`).
+
+* **farc dist_4, coloured, per GPU:**
+
+  | chunk | bwd temp | peak | reverse |
+  |---|---|---|---|
+  | 1 step | 31 GiB | 42 GiB | 0.9 s/step |
+  | 24 steps | 40 GiB | 52 GiB | 1.2 s/step |
+
+  With allgather the peak at chunk 24 is 70 GiB. A 2-day gradient takes 11 min.
+* **Against the dense FD (fd_jan10):**
+
+  | θ | window | P* | C_d | trace growth |
+  |---|---|---|---|---|
+  | 0.97 | 2 d | 1.017 | 0.999 | ×2 |
+  | 0.97 | 5 d | 1.146 | 1.002 | ×961 |
+  | 0.97 | 10 d | blows up | blows up | ×1.7e11, in u_ice/v_ice |
+  | 0.9 | 2 d | 0.927 | 0.989 | ×1.05 |
+  | 0.9 | 10 d | 0.936 | 0.978 | ×19 |
+
+  The farc frozen sweep (4 km, α 500) contracts less than CORE2's, so farc uses θ 0.9.
+
+Traps, in the order they were hit:
+
+* **`jax.jit` embeds closed-over arrays in the program as literal constants.** A 400 k-element sharded array came out
+  as one dense HLO constant. A sharded chunk program therefore takes its mesh, operator and halo maps as jit
+  ARGUMENTS (`ChunkProgram.consts`).
+* **A custom_vjp that closes over the mesh or the halo exchanger is fine on one device and broken when sharded.**
+  On one device those are constants. Under `shard_map` they are tracers of the body, and remat re-traces the rule
+  in the reverse sweep. Lowering then fails with `TypeError: No constant handler for type: DynamicJaxprTracer`.
+  The frozen-sweep rule now takes both as explicit arguments (`halo.exchange_arrays`), as `ssh._ssh_implicit` already
+  did.
+* **XLA:CPU fake devices start independent collectives in a different order on each device.**
+  * The 4-step chunk VJP deadlocked in a rendezvous (all-reduce against all-to-all or all-gather).
+  * Worse, the padded and coloured transports returned wrong cotangents with no error: u_ice relative 0.9 and 1e5,
+    d ln P* −1.6e6 against −0.0097.
+  * With `XLA_FLAGS=--xla_cpu_enable_concurrency_optimized_scheduler=false` the three transports agree to 2e-7
+    (gradients). The same programs agreed on GH200 throughout.
+* **The sharded gradient equals the dense one only to the trajectory noise, not to rounding.** The sharded forward is
+  not bitwise (FCT upwind flips, SSH cancellation; test_step_sharded gates the ice scalars at 2e-2), and the drift
+  adjoint amplifies that:
+  * one step: 1e-15;
+  * 4 steps on CPU: 4.7e-5 (P*) and 2.5e-4 (C_d), and 0.23 relative L2 on the frozen-sweep u_ice cotangent;
+  * GH200: the dense gradient alone spreads 7e-4 between runs.
+
+  The check of the sharded adjoint itself is its own FD with an exact adjoint: C_d 3.8e-7, P* 2.1e-5.
+* **An FD check under `freeze_mixing + freeze_gm_slope + freeze_fct_limiter` is not an adjoint check.** C_d reaches
+  the ocean through the ice-ocean stress, so the frozen terms put the 4-step AD 1.7 % off the FD. At the same time
+  the sharded and dense AD agreed to 3e-8. That 1.7 % was read as a sharding bug for an hour.
+
+Lesson: the sharding of a long adjoint is glue around a tested sharded step, and its bugs are in the glue: closures,
+placement, and the test harness's own device runtime. Check a sharded adjoint against its own FD with an exact
+adjoint setting, and against the dense one only to the trajectory noise.
+
+### 2026-10-12 (sea-ice adjoint, task 26, farc) — the farc long-window bursts were the ice FCT limiter's derivative; the low-order tangent ("fct_flux") removes them
+
+Setup: the sharded farc ice adjoint (θ 0.9, exact ice mode, frozen sweep, `freeze_mixing + freeze_gm_slope +
+freeze_fct_limiter`) passed at 2 and 10 days but blew up at 90 d (P* −9.67 and C_d +115 against FD −0.0244 and
+−0.0385 at 10 d). Its reverse trace showed separate m_ice and m_snow events at days 3.25 (×278 and ×345), 12.5, 18,
+24.5 (×7760) and 37.5 (×1200). The 10 d run at stride 1 had the day-3.25 event too (trace ×19), with AD/FD still
+0.936/0.978.
+
+* **Where:** a field-cotangent dump at day 3.5 put 99.6 % of |cot m_ice|² on ten coastal nodes in the Gulf of
+  Anadyr (62° N, 175° E). The signs alternated, u_ice was 0 on the coast and 0.3 m/s offshore.
+* **What:** one ice FCT step linearized offline at the base state (`runs/ice/shard_diag/fct_jac.py`, m_ice, other
+  inputs held). Top singular value σ of the one-step tangent and the growth of (Jᵀ)²⁴, one 6 h chunk:
+
+  | tangent | σ_max | (Jᵀ)²⁴ random | (Jᵀ)²⁴ Anadyr pattern |
+  |---|---|---|---|
+  | live limiter (the model) | 3.1e3–3.9e3 | 5e46–2e51 | 71 – 7.5e8 |
+  | limiter factor ae frozen | 1.0007 | 0.81 | 0.27–0.29 |
+  | low-order only | 1.0026 | 0.16 | 0.16 |
+  | unlimited high-order (ae = 1) | 1.032 | 0.99 | 0.89–0.90 |
+
+  The Zalesak factor ae = min over the element's vertices of min(tmax/fp, 1) has a derivative that the forward
+  never sees: it divides by the antidiffusive flux sums and switches with the minimizing vertex.
+* **A ratio mask is not the cure.** Freezing ae only where max|flux|/fp > R (R = 10, 100) left σ_max unchanged;
+  R = 3 damped the Anadyr pattern but not the random one.
+* **Freezing ae alone makes it worse.** The `IceConfig.adjoint_cuts` entry "fct_limiter" (ae under
+  stop_gradient) blew the 10 d gradient up to P* −71, C_d −63, trace ×1.7e6, although its offline m → m tangent is
+  stable. With ae frozen the limited flux stays linear in the antidiffusive flux, and that flux depends on u_ice: the
+  loop u_ice → antidiffusive flux → m, a → ice strength → u_ice is then open. Cutting that path as well
+  ("fct" + "fct_limiter") gives trace ×1.16 at 10 d.
+* **The cut that holds is "fct_flux":** the whole limited antidiffusive correction enters the tangent as a constant,
+  so the tangent of the ice FCT is the low-order tangent. It is the ice twin of the ocean's
+  `AdjointConfig.freeze_advection`. The forward is bitwise unchanged. On CPU (CORE2 C-dump inputs) the cut's tangent
+  equals the `_solve_low_order` tangent to 1e-15 (test_ice_adv::test_fct_derivative_options).
+
+  | window | P* AD/FD | C_d AD/FD | trace max/first |
+  |---|---|---|---|
+  | 10 d, no cut | 0.936 | 0.978 | 19 |
+  | 10 d, fct_limiter | blows up | blows up | 1.7e6 |
+  | 10 d, fct + fct_limiter | 0.940 | 0.965 | 1.16 |
+  | 10 d, fct_flux | 0.944 | 0.980 | 1.12 |
+  | 30 d, fct_flux | 0.937 | 0.964 | 1.33 (largest chunk jump ×1.022) |
+
+Lesson: an FCT limiter has three tangents, and only the low-order one stayed bounded here: the live limiter's
+derivative is unbounded where the flux sums nearly cancel, and a frozen limiter factor leaves the antidiffusive flux
+live and coupled back to the velocity. (It removed every FCT event; the 90 d window then failed on a different
+burst, at day 35.75, in the next entry.) The ocean tracer advection had taught this already (freeze_advection); the
+ice advection needed the same cut, and the measurement that decided it was a one-step tangent spectrum, which took
+minutes on one CPU node, not another 90 d GPU run.
+
+### 2026-10-12 (sea-ice adjoint, task 26, farc) — the day-35.75 and spring bursts were the mEVP load derivative on flickering thin ice; `adjoint_thin_mass` removes them
+
+Setup: the farc ice adjoint of the previous entry (θ 0.9, exact ice, frozen sweep, cut "fct_flux") at 90 d gave
+P* +0.0432 and C_d +0.0063 against FD −0.0305 and −0.0301. The reverse trace grew ×332 and the jump started at
+day 35.75: chunks 143–140 grew ×6.4, ×5.9, ×2.7 and ×2.2, with m_ice in the lead (×28 in chunk 144 → 143).
+
+* **Where:** a cotangent dump from a 37 d window reproduced the jump. 79 % of |cot m_ice|² sat on node 483043, a
+  Franz Josef Land polynya at 63.9° E 81.0° N, 65 m deep. The node is nearly ice-free: concentration 0.002–0.05,
+  thickness 0.03–0.7 mm in a saw-tooth with a period of about six steps.
+* **The first guess was wrong.** cot m_ice ≈ 13 cot T(top) is the latent-heat ratio, which pointed at the
+  thermodynamics and the top ocean layer. The tangent with the mEVP solve dark (every input stop_gradient) decays at
+  the node instead: m 1 → 0.05 and T 1 → 0.007 in 24 steps.
+* **Per-step VJP.** Walking 24 steps back from the dumped cotangent (sharded one-step VJP; the dense one needs
+  ~85 GiB) showed the following:
+  * a seed on the node alone reproduces the growth (cot m ×34, cot T ×56 in 24 steps), so the loop is local;
+  * the growth is removed by:
+    * the mEVP dark;
+    * the cut of the new ice velocity into advection;
+    * the cut of the velocity into the ice FCT;
+    * stop_gradient of the mEVP load where it is below 50 or 200 kg/m²;
+  * the ice–ocean stress cut and the ssh/ocean-velocity cut leave it.
+* **The loop:** the node's m_ice changes its load (ρᵢm + ρₛmₛ)/a. Through the inverse load 1/max(load, 9 kg/m²) and
+  the regularized mass in `mevp_setup`, the load sets the free-drift velocity of the nearly ice-free node. That
+  velocity advects thicker neighbour ice into the node, and the incoming ice changes m_ice again. The node's load
+  was 15–35 kg/m², above the 9 kg/m² floor, which bounds the forward velocity but not its derivative.
+* **The cut:** `IceConfig.adjoint_thin_mass` [kg/m², 0 = off] puts inv_thickness and mass under stop_gradient
+  where the load is below it, in the forward and in the frozen-sweep backward (which calls `mevp_setup` again). The
+  values are bitwise unchanged. The setting is validated for mEVP under "dynamics" and "exact", and is available as
+  `--ice-thin-mass`. Its tests are in `test_ice_adjoint_mode.py`:
+  * the tangent is exactly 0 on thin-ice nodes and unchanged elsewhere;
+  * a threshold of 0 traces the same step;
+  * a positive threshold keeps the forward.
+* **The spring bursts are the same thing.** The 180 d run with fct_flux alone blew up (P* −1.8e15). Going back from
+  the window end, it first met one-chunk jumps at day 137.75 (×2e6), 133.25 (×25) and 124 (×5e5). A 139 d window
+  reproduces all of them at the same boundaries. At day 137.75, 86 % of |cot m_ice|² is on node 592309 (135.0° E
+  71.7° N, Laptev Sea near the Yana mouth), where the ice flickers: concentration 0, then 0.18 with 3 mm (load
+  16 kg/m²), then 0 again, over two 6 h chunks. With the cut at 100 kg/m² the same 80 reverse chunks stay clean: the
+  trace grows ×1.41 at most and no chunk jumps more than ×1.25.
+
+  | run | P* AD/FD | C_d AD/FD | trace max/first |
+  |---|---|---|---|
+  | 30 d, fct_flux | 0.937 | 0.964 | 1.33 |
+  | 30 d, fct_flux + thin 100 | 0.939 | 0.964 | 1.33 |
+  | 90 d, fct_flux | −1.42 | −0.21 | 332 |
+  | 90 d, fct_flux + thin 100 | 0.917 (0.890) | 0.880 (0.900) | 2.05 (largest chunk jump ×1.04) |
+  | 139 d → 119 d reverse, fct_flux | — | — | 1.1e20 |
+  | 139 d → 119 d reverse, fct_flux + thin 100 | — | — | 1.41 |
+
+  The FD reference is fd_jan90; the values in brackets use fd_jan365. The two FD runs differ by 2–3 % at 90 d.
+
+Lesson: a floor that regularizes a division bounds the forward, but not the derivative just above it. Ice that
+appears and vanishes inside one chunk sits in exactly that range. A cotangent ratio is a hint, not a mechanism: the
+latent-heat ratio pointed at the thermodynamics, and only the tangent with candidate paths cut, one step at a time
+on the burst node, found the loop.
+
+### 2026-10-13 (sea-ice adjoint, task 26, farc) — toward a year: θ trades accuracy for margin, a summer loop runs through the strength, and the freeze-up burst is a round-off lottery
+
+Setup: the farc ice adjoint of the previous entry (exact ice, frozen sweep, κ0 1, cuts fct_flux, thin mass 100,
+TKE and the GM slope's N² frozen), January start, Arctic drift cost.
+
+* **180 d is stable at θ 0.9, but the ratio drifts down with the window.** It goes P* 0.939 / C_d 0.964 at 30 d,
+  0.917 / 0.880 at 90 d and 0.865 / 0.854 at 180 d (fd_jan365), with no chunk jump above ×1.04. Thin mass 50
+  gives the 90 d numbers to a relative 3e-5, so the thin cut costs nothing.
+* **θ is the P* knob, not the C_d one.** θ 0.95 gives P* 1.015 / C_d 0.976 at 30 d and 1.026 (0.997 against
+  fd_jan365) / 0.894 at 90 d. The 90 d trace has one u_ice spike at day 21.5 (×5, back to the background two
+  chunks later). θ 0.97 blows up at 30 and 90 d (smooth u_ice-led growth from day ~27), although it is the default
+  that passes on CORE2: the 4 km mesh has less margin. The TKE adjoint live with the C4 masks (long_window_tke)
+  bursts on farc (S/T-led, days 60–70), so whether freeze_mixing explains the C_d shortfall is still open.
+* **A year fails twice, for two different reasons.** The 365 d trace jumps ×3.5e49 in one chunk at day 279.5, and
+  a 215 d window shows that days 213 → 204 also grow ×2 per chunk on their own (×1.7e5 in all). Both sit in thick
+  compact ice (Chukchi Sea, west of Banks Island; A 0.8–0.98, h 2.4–3.2 m), not in thin ice.
+  * **Summer: a loop through the strength.** Per step over one chunk (×1.85): the mEVP dark ×0.74, the whole
+    strength frozen ×0.83, only its concentration factor exp(−C(1−A)) frozen ×0.84, only its thickness factor
+    ×1.80, θ 0.5 or 0 ×1.25, cut "advect" ×1.22, κ0 0.5 or 0.25 ×1.83–1.90. The loop is A → strength → stress →
+    u_ice → advection → A through the steep exp(−20(1−A)). New cut "strength_conc" (fffc271): ×0.83 at any θ
+    0.9–0.97.
+  * **Freeze-up: single ice steps, and not reproducible.** The day-279.5 chunk bursts ×1e21–1e34 in ONE ice step
+    (one sweep's tangent |λ| ~1.5–2 at the frozen point, over 120 sweeps). In the first probe θ 0.9, 0.95 and 0
+    burst and θ 0.8, 0.5 and κ0 0.5, 0.25 do not. In the second, from another checkout with the same code, θ 0.9
+    is clean and θ 0.95 with κ0 0.25 bursts. GPU round-off moves the final iterate of the near-rigid, unconverged
+    sweep, and with it the linearization. κ0 0.5, clean in the first probe, blows the full 30 d gradient up at
+    day 25. No setting is safe, so the backward now checks itself: `adjoint_sweep_guard` (dfcda33) drops a
+    step's mEVP derivative when its transposed sweeps grow past G (a contracting CORE2 step reaches 0.7–0.9).
+
+Lesson: a per-step probe answers only for the round-off it ran with. When two probes of the same setting disagree,
+the instability is a property of where the unconverged forward happens to stop, and a fix that "removes it" in one
+probe has not been tested. Guard the step that can diverge, and measure how often the guard fires, instead of
+tuning a parameter on one realization.
+
+### 2026-10-14 (sea-ice adjoint, task 26, farc) — the year adjoint verified: the 1e-2 FD was summer noise, and the C_d shortfall is a constant bias, not frozen mixing
+
+Setup: the year candidate of the previous entry (θ 0.95, κ0 1, cuts fct_flux + strength_conc, thin mass 100,
+sweep guard 1e3; TKE, the GM slope and the FCT limiter frozen), January 2013 start, Arctic drift cost.
+
+* **The year is stable.** Three legs, no burst, the guard never fired; the largest one-chunk jumps (×3.4 at days
+  230–236) return to the background. Backward through the first half-year the cotangent becomes ocean-led and
+  grows about ×1.04 per day (w_e, S, uv) while the ice cotangents stay at their 90 d size: the chaotic ocean.
+* **The first year verdict (P* 1.22, C_d 0.73 against an h 1e-2 FD) was FD noise.** A twin forward restarted
+  from the same day-90 boundary, with nothing perturbed, differs from the base by 0.00001–0.00035 (in h 1e-2 FD
+  units) at 100–180 d, then 0.0039 at 210 d, 0.022 at 240 d and 0.007–0.010 at 270–365 d: 58 % of the FD of P*
+  and 29 % of that of C_d at 365 d. GPU run-to-run round-off, amplified by the summer.
+* **A larger step fixes it, if the forward survives the step.** At h 0.1 the noise drops tenfold and the central
+  FD of P* agrees with h 1e-2 to 1–6 % through 240 d (linear); the year adjoint gives P* 1.033. The C_d ×1.105
+  forward goes NaN at day 214 (summer, dt 900). The one-sided h 0.1 difference (0.913) and the central h 0.03
+  pair (−0.02756 vs −0.02751 one-sided) agree: year adjoint C_d 0.911.
+* **The C_d shortfall does not grow with the window.** Against the central h 0.03 FD it is 0.908 / 0.900 / 0.911
+  at 90 / 180 / 365 d (30 d: 0.977). The FD itself moves ~3 % between h 0.01 and 0.03 at 60–180 d. A constant
+  ratio points at the cost of a cut, not at an instability.
+* **Frozen mixing is not the cause.** With the TKE + GM-live preset long_window_combined (merge of adjoint-gm4,
+  branch ice-farc-tke 10419fa) the 90 d reverse bursts ×80 in one day at day 62, in one place: a polynya in a
+  Franz Josef Land strait (47.7°E 80.7°N, a 0.015) where the convective column has weak stable interfaces,
+  N² 1e-7–3.5e-7 at 70–80 m and 135–190 m, with Kv dropping from 0.1 to ~3e-3. These interfaces lie between the
+  preset's 1e-8 cut and 1e-6. The TKE session's year masks ml6 (tke_pr_cut and tke_ml_cut 1e-6) remove the
+  burst: 90 d stable (max/first 23, transient ×2–3 jumps), P* −0.03064 and C_d −0.02600 against −0.03075 and
+  −0.02593 with mixing frozen (0.3 %). The bias sits in the ice cuts (strength_conc ~3 points at 90 d, θ 0.9 → 0.95
+  +1.4 points, the low-order ice advection tangent, the raised α/β of the backward sweeps).
+* **θ 0.95 is the farc limit.** θ 0.97 with strength_conc and the guard still blows up at 90 d (×4e133): smooth
+  ice-velocity-led growth of ×10–80 per 6 h from the first reverse day (~30 March), with no single-step event and
+  no guard trip, since each step's sweeps stay below 1e3 and the growth runs across steps.
+* **Plotting a sharded cotangent.** The dense cotangent of an entity is the SUM over all its copies, owned and halo
+  lanes (`core2_adj.dense_cotangent`). Taking the owned lanes only draws the partition seams as lines across the
+  sensitivity maps.
+
+Lesson: before blaming the adjoint on a long window, rerun the base from a shared boundary and measure the FD noise.
+The FD step then has to beat that noise, stay linear, and keep the perturbed forward alive; on farc in summer no single
+h does all three for C_d, so two different FDs (one-sided h 0.1, central h 0.03) were needed to pin the year value.
+
+### 2026-10-15 (sea-ice adjoint, task 26, farc) — a 6 h chunk from a fixed start does not measure the window bias
+
+Setup: the year candidate (θ 0.95, κ0 1, cuts fct_flux + strength_conc, thin mass 100, sweep guard 1e3; TKE, the
+GM slope and the FCT limiter frozen), January 2013 start, Arctic drift cost; C_d 0.908 at 90 d against the central
+h 0.03 FD.
+
+* **The probe.** For 6 h chunks started from the stored base boundary (12 January, 3 March, 23 March), the AD
+  derivative of the chunk's own drift contribution, compared with a central FD at h 1e-2. Running the base twice
+  puts the GPU noise at ≤ 0.4 % of the difference (`runs/ice/shard_diag/step_cd.py`, `step_cd2.py`).
+* **What the chunks say.** The candidate gives C_d 0.95–0.97. Without strength_conc, or without both cuts, the
+  ratio is the same to three digits; θ 0.97 and 0.99 do not move it; θ 0 loses 10–17 %. Two or four times as many
+  transposed sweeps overshoot (1.16–1.43), because the fixed point of the linearised sweep map responds more than
+  the unconverged 120-subcycle forward does. κ0 2 (half the raise of α/β) gives 0.992 on all three chunks with no
+  guard trip; κ0 4 and κ0 → ∞ (no raise) trip the guard on every step.
+* **The 90 d window does not follow.** κ0 2 and 1.5 at 90 d give C_d −0.02595 / −0.02594 and P* −0.03086 /
+  −0.03083, against −0.02593 / −0.03075 with κ0 1 (< 0.4 %); both stable (max/first 2.07, no guard trip). The λ
+  that the 120 transposed sweeps leave unconverged passes to the start state of the iteration, the previous step's
+  u_ice and σ, and is collected there. A chunk started from a fixed state drops that remainder, the window counts
+  it: κ0 moves sensitivity between steps without losing any. The cuts are invisible per chunk for a related reason,
+  since strength_conc and fct_flux act through the ice state that later steps inherit.
+
+Lesson: a per-step or per-chunk derivative check from a fixed start state tests how the gradient is split in time,
+not the total over the window. When the backward of an iterative solver hands its unconverged remainder to the
+previous step, a deficit at the chunk level can vanish on the long window. Before acting on a chunk-level bias,
+check it on the window it is meant to explain.
+
+### 2026-10-16 (sea-ice adjoint, task 26, farc) — the C_d shortfall is the sum of the cut costs
+
+Setup as in the previous entry (θ 0.95, κ0 1, thin mass 100, sweep guard 1e3, January 2013, 90 d, Arctic drift
+cost). One 90 d run per variant, ratios against the central h 0.03 FD for C_d (−0.02857) and the h 0.1 FD for P*
+(−0.03003):
+
+| ice cuts | ocean FCT limiter | C_d | P* | reverse max/first |
+|---|---|---|---|---|
+| fct_flux + strength_conc (year candidate) | frozen | 0.908 | 1.024 | 2.1 |
+| fct_flux + strength_conc | live | 0.907 | 1.024 | 2.1 |
+| fct_flux | frozen | 0.942 | 1.042 | 15 |
+| fct_limiter + strength_conc | frozen | 0.921 | 1.013 | 112 |
+| fct_limiter | frozen | 0.960 | 1.021 | 11 |
+
+* **The costs add up.** strength_conc costs 3.4 points of C_d with fct_flux and 3.9 with fct_limiter; the low-order
+  ice advection tangent (fct_flux instead of fct_limiter) costs 1.8 without strength_conc and 1.3 with it. Freezing
+  the ocean FCT limiter costs nothing (0.1 point), frozen mixing 0.3 % (earlier entry). θ 0.9 → 0.95 added 1.4
+  points; the remaining ~4 % at θ 0.95 with fct_limiter alone is within what θ < 1 and the FD itself (~3 % between
+  h 0.01 and 0.03) can explain. No hidden error is left.
+* **Accuracy costs stability.** fct_limiter keeps the high-order ice advection tangent but brings back transient
+  u_ice-led spikes (×4 per chunk with fct_limiter alone, ×13–77 above the candidate with strength_conc, each gone in
+  1–2 days, no guard trip). Without strength_conc the year fails in summer. The year candidate keeps fct_flux +
+  strength_conc; for winter windows up to 90 d, fct_limiter alone gives C_d 0.96 and P* 1.02.
+* **The summer year reverse is not reproducible.** A 6-hourly repeat of the year candidate (for an animation) has a
+  u_ice-led burst on 19–21 August (max |λ_u| ×1e4, no guard trip, since the growth runs across steps), absent from
+  the verified year run. It leaves a local m_ice sensitivity patch in the Lincoln Sea that holds 60–90 % of
+  Σ|λ_m|² from 20 August back to June. One guard trip (×2.9e80) in the repeat's first leg, none in the verified run.
+
+Lesson: when an adjoint is stabilised by several derivative cuts, measure each one's cost on the window that
+matters, one run per cut, before looking for a deeper error. Here the cuts explained the whole C_d shortfall, and
+the trade-off between them (accuracy against summer stability) is a choice to state, not a bug to fix.
+
 ### 2026-10-10 (combined adjoint, branch adjoint-combined) — the TKE preset and the frozen-sweep ice adjoint run together to 90 days; freezing the GM slope is what costs accuracy
 
 Setting `comb`: `long_window_tke()` cuts + `freeze_gm_slope`, ice `adjoint_mode="exact"` with
@@ -10660,3 +10955,209 @@ transform. Only one direction is identifiable at this truth (eigenvalue 28, most
 only by the runs that happen to get close. The log controls of `controls.py` stay; a linear option is not needed.
 Five twin jobs first died at start-up because argparse read the forwarded `--mode` as an abbreviation of the driver's
 own `--model-budget`: a driver that forwards unknown options to another parser needs `allow_abbrev=False`.
+
+### 2026-10-17 (sea-ice adjoint, farc) — the ice volume cost: the cuts that were free for the drift flip its sign
+
+The terminal NH ice volume J = Σ w m_ice (2 Jan 2013 start, `grad --ice-cost vol`) with the year candidate (θ 0.95,
+κ0 1, fct_flux + strength_conc, thin mass 100, guard 1e3, frozen mixing/GM slope/ocean FCT limiter). The reverse
+traces are flat in every run below; the errors are biases, not instabilities. The FD is converged in h (10 d P*
+−0.0334/−0.0297/−0.0306 at h 0.01/0.03/0.1; C_d −0.0225/−0.0199 at h 0.01/0.03; noise between two identical
+forwards 3e-5 at 10 d, 8e-4 at 90 d).
+
+| window | setting | P* AD/FD | C_d AD/FD |
+|---|---|---|---|
+| 90 d | candidate | 1.15 | −0.41 (sign) |
+| 10 d | candidate | 2.04 | −0.77 (sign) |
+| 10 d | fct_flux alone / fct_limiter + strength_conc / fct_limiter | 2.07 / 1.70 / 2.05 | −0.81 / 1.67 / 1.13 |
+| 10 d | fct_limiter, θ 0.9 / ocean FCT limiter live / thin mass 0 (cand.) | 1.98 / 2.05 / 2.08 | 1.13 / 1.14 / −0.74 |
+| 10 d | fct_limiter + TKE/GM live (ml6 masks) | 1.29 | 1.82 |
+| 1 d | fct_limiter, frozen mixing | AD −0.00138, FD +0.00018 | AD −0.00005, FD +0.00114 |
+| 1 d | fct_limiter, ocean adjoint exact (or ml6) | AD −0.00020 | AD −0.00106 |
+| 1 d | everything exact except the frozen sweep (θ 0.95, κ0 1) | AD −0.00001 | AD +0.00115 (1.01) |
+
+* **Two cuts carry the whole error, and both are needed for stability.** Frozen mixing removes the path P* →
+  internal ice stress → less ice–ocean stress → less TKE entrainment → more growth (90 % of the 1 d P* error); the
+  ice FCT limiter cut costs −0.0022 in the 1 d C_d. With both derivatives live the 1 d gradient matches the FD
+  (C_d 1.01, P* within the θ < 1 shortfall), but the full ice FCT tangent bursts on day 3.25 (the ten coastal Gulf
+  of Anadyr nodes, ×4e4 in m_ice) and the unmasked TKE adjoint spikes ×70 within a day. Without the raised α in the
+  frozen-sweep backward (κ0 1e12) the 1 d C_d is −0.0123.
+* **The NH volume is a residual.** Over a day the volume north of 70N rises with P* (+0.0036) and the volume south of
+  it falls by almost as much (−0.0034): the export across 70N cancels in the total, which keeps only the thermo
+  growth response. The ≥70N volume is not better off: at 10 d its FD is P* +0.0099, and the AD gives −0.0275
+  (candidate), −0.0177 (fct_limiter) and +0.0014 (ml6 + fct_limiter), because the growth error is common to both.
+  The concentration is fine: the 1 d area gradient is 0.87 (P*) and 0.83 (C_d) of the FD.
+* **A September terminal cost is a lottery on farc.** Two identical forwards agree to 2e-3 in the NH volume up to
+  day 200 and then split in late July (the a_ice fingerprint from day 206–207, saturated by day 218): by 15 Sep the
+  runs fall into two groups 0.25 (1e3 km³) apart, while the response to a 10 % change of P* is 0.016. One FD forward
+  (P* +10 %) went NaN on day 230.25 (20 Aug).
+
+Lesson: a derivative cut validated on one cost is validated for that cost only. The cuts that cost the drift 1–4 %
+reverse the sign of the volume gradient, because the volume over a winter window is a small residual of growth
+responses that run through exactly the cut paths (mixing, lead-scale advection). For each new cost, compare the
+stabilised adjoint with the fully exact one over a window short enough for the exact one to survive (here 1 day)
+before trusting longer windows.
+
+### 2026-10-17 (sea-ice adjoint, farc) — the volume cost keeps the ice FCT limiter derivative except at ties and near the coast; atmospheric forcing controls
+
+Follow-up of the entry above. The NH volume gradient needs both the live mixing (ml6 masks) and the ice FCT limiter
+derivative, and the full limiter tangent bursts on day 3.25. Offline (`runs/ice/shard_diag/fct_jac2..6.py`, the
+one-step m_ice tangent of `_fem_fct` at ten base365_k1 boundaries, day 3.25 to 200) the live map has σ_max 77–3956.
+
+* **The amplifier is the bound term at ties.** In pplus = min(t/f, 1), t = hi − vals_l, cutting d f leaves σ_max
+  unchanged and cutting d t brings it to 1.6–2.2. The large d t / f sits at open-water elements where t = 0 on all
+  three vertices: the element factor ae = min over the vertices is a tie (0, −0, −0), JAX's min derivative averages
+  over the tied entries, and one of them has a flux sum |f| ≈ 1e-11. The factor is zero whichever vertex wins, so
+  its derivative there is an artefact of the tie. A second mode lives on the coast: the cluster extremes hi/lo of
+  the ten Gulf of Anadyr coastal nodes (u_ice = 0 at the coast), 24-step growth 8e8.
+* **What each cut does** (new `adjoint_cuts`, forward bitwise unchanged):
+
+  | cut | offline | full model |
+  |---|---|---|
+  | `fct_pin` (t = 0 carries no tangent) | σ 5–10, Anadyr mode 8e8 left | 1 d = exact (C_d 1.00); 10 d bursts like no cut |
+  | near-pin t < c f, c 0.03–0.3 / 1 | = pin / = `fct_bound` | not a separate option |
+  | `fct_bound` (t constant) | σ 1.7, growth 0.8 | 1 d broken: trace ×4.2e3, C_d +0.0089 vs FD +0.00114 |
+  | `fct_pin` + `fct_hilo` (hi/lo constant) | stable | 1 d C_d 0.82; 10 d P* 0.55, C_d 1.52 |
+  | `fct_pin` + `fct_hilo_coast` (hi/lo constant on the 24022 of 638387 boundary nodes) | Anadyr 0.23, summer b19200 46 | see below |
+
+* **pin + hilo_coast with ml6, NH volume from 2 Jan 2013** (FD ranges over h; the FD itself spreads 10–15 % in h at
+  2 and 10 days):
+
+  | window | P* AD/FD | C_d AD/FD | reverse trace |
+  |---|---|---|---|
+  | 1 d (ocean adjoint exact) | AD +0.000064, FD +0.00007/+0.00018 | 1.01 | — |
+  | 1 d | AD +0.000106 | 0.95–0.98 | — |
+  | 2 d | 1.21–1.58 | 0.70–1.20 | ocean adjoint exact: TKE bursts (1.8e12) |
+  | 10 d | 0.70–0.79 | 1.20–1.36 | max 16, final 0.15 |
+  | 30 d | 0.95 | 1.12 | max/first 1.7, final 0.11 |
+  | 90 d | — | — | bursts from day ~50 (m_snow cotangent ×8 per 6 h), see below |
+
+* **The 90 d failure and `fct_bound_coast`.** A rerun with dumps of the cotangent at every boundary placed 98–100 %
+  of |cot m_snow|² on five nodes of a Baffin Island fjord (64.4–63.4°W, 64.8–65.2°N): three coastal nodes (u_ice = 0)
+  and two in the first ring, a 0.87, m 0.82, m_snow 0.02–0.07, two snow values equal to four digits. Seeded with the
+  dumped cotangent (`runs/ice/shard_diag/fct_jac8.py`, `fct_jac9.py`; a random seed does not see a five-node mode),
+  pin + hilo_coast grows ×8.3 over 24 steps, the rate of the full run. Holding hi/lo constant leaves d t = −d X_l,
+  and where t and f are both small the ratio d t / f is still large. Holding hi/lo on one ring of nodes beyond the
+  coast stops the snow mode (0.89) but adds an m_ice mode at an Antarctic ring node (×94). The cut that works is
+  `fct_bound_coast`: the whole bound t = hi − X_l (tmax/tmin) carries no tangent on the coastal nodes and their first
+  ring (`ice_adv.coast_ring`, 48664 of 638387 nodes, 7.6 %), with `fct_pin` everywhere else. Offline, 24-step growth
+  is 0.63 (snow, day 50), 0.96 (m_ice, day 51) and 0.24 (Anadyr, day 3.5). The summer state (day 200) still grows ×46
+  from a random seed under every variant, so windows reaching into the melt season are not covered by this check.
+  Forward bitwise unchanged; sharded (2 devices) equals dense.
+
+  **pin + bound_coast with ml6, NH volume from 2 Jan 2013** (same FD as above; trace = max over the reverse sweep /
+  first chunk):
+
+  | window | P* AD/FD | C_d AD/FD | Tair | LW | u_air | trace |
+  |---|---|---|---|---|---|---|
+  | 1 d | AD −0.00041, FD +0.00007/+0.00018 | 1.24–1.28 | 1.013 | — | — | 1.00 |
+  | 10 d | 0.87–0.98 | 1.21–1.37 | 0.998 | 0.996 | 0.85 | 1.9 |
+  | 30 d | 1.09 | 1.10 | 0.995 | — | 1.85 | 1.00 |
+  | 90 d | 1.15 | 1.04 | 0.986 | — | AD −0.00034, FD −0.0023 | 6.1 (TKE, day 12, decays to ~1) |
+
+  The 90 d run is stable (m_snow cotangent ≤ 0.2 of the seed throughout), and C_d, which had the wrong sign at 90 d
+  without the limiter derivative, is now within 4 %. The price is the response next to the coast: at 1 d C_d moves from
+  0.95–0.98 (hilo_coast) to 1.24–1.28, and the zonal-wind gradient, a small residual of opposing contributions whose
+  FD changes sign with the window, moves from 1.01/1.09 (10/30 d) to 0.85/1.85. Wind controls need their own FD check
+  before they are used.
+
+* **Atmospheric forcing controls** (`Params.forcing_adj`, `--controls tair,lw,sw,uair,vair,shum,snow,rain`):
+  window-constant anomaly fields added to the step forcing ahead of the bulk formulae and the ice. Sharded, the
+  global field is replicated and each lane cuts its nodes out with (gid, valid) constants; the transpose and the
+  shard_map psum of a replicated input return the global gradient map. CORE2 4-step volume vs FD 6e-5 (Tair) and
+  3.6e-4 (u_air); sharded vs dense Tair 1.3e-8, u_air 2.3e-3 (the dynamics path amplifies rounding as for P*).
+  farc NH volume vs box-uniform FD over ≥70N: 10 d Tair 1.006, LW 1.004, u_air 1.010 (area 0.82–0.85); 30 d Tair
+  1.007, u_air 1.09, where the u_air FD changes sign between 10 d (−0.0084) and 30 d (+0.0058) and the adjoint
+  follows it.
+
+Lesson: when a limiter's derivative explodes, find which input of which branch carries it before cutting the
+limiter. Here the explosive part was the derivative of a factor that is zero either way (a tie at open water) plus
+one coastal stencil; cutting exactly those keeps the limiter's real response to the state, which the volume needs
+and which the broader cuts (`fct_limiter`, `fct_bound`) remove. A cut that is clean on the offline one-step map can
+still break the full model (`fct_bound`: σ 1.7 offline, ×4e3 in a day), so every candidate goes through a 1-day
+full-model check against the exact adjoint before any long window.
+A long-window failure that a random-seed offline check does not reproduce is localised by dumping the cotangent
+during the failing run and seeding the offline map with it: the day-50 snow mode lives on five nodes and is invisible
+to power iteration from noise over 638387 nodes.
+
+### 2026-10-20 (sea-ice adjoint, farc) — the 2012 spring volume adjoint: three separate errors, and a windowed FD that says where each one sits
+
+The 2012 study: a 151 d window from 2 Jan 2012 (restart from the Fortran spin-up) to the NH ice volume on 1 Jun,
+setting ml6 + `fct_pin+fct_bound_coast` (the 90 d-verified 2013 volume setting, entry above), controls ln P*,
+ln C_d and the atmospheric forcing. Central FD over the whole window (h 0.1 / 0.1 / 1 K): ln P* −0.562,
+ln C_d +0.267, Tair (≥70N) −0.322. The first full reverse sweep burst at day ~105; with that fixed, day 0 gave
+P* 3.39 × FD, C_d 0.86, Tair 0.82. Three unrelated faults were behind it.
+
+* **Day ~105, Shelikof Strait (ocean TKE at the floor).** Seven ice-free shelf nodes (80–170 m), the two interfaces
+  above the bottom; the bottom layer switches between tke 1e-6 and 3e-4, and just above the floor clamp the tangent
+  grows like turbulence onset. Attribution by resuming a clean pre-burst reverse leg with a different `--setting`
+  (the leg's files are symlinked into a new tag; ~0.6 node-h each): `freeze_tke_state` clean, `tke.km_e` /
+  `tke.ml_e` partial, `tke.shear` explodes (1e27; the shear derivative was damping). Fix
+  **`AdjointConfig.tke_floor_cut`** (353efae): no derivative with respect to tke_old where tke_old < tke*,
+  forward bitwise. 1e-5 is clean (trace back to 0.1), 2e-6 is not enough.
+* **Day 68, Labrador Sea ice edge, and a round-off lottery.** A second TKE burst at the base of a 15–20 m cold cap
+  under 7 cm ice over warm convecting water (node 350817, 55.8°W 62.6°N; tke 5e-4, so not the floor mechanism),
+  m_ice cotangent first. Three reverse runs from the same stored leg (day 98) gave trace maxima 1.1, 6.2 and 380
+  over days 98→74. Every mixing cut removes the burst (`freeze_mixing`, `freeze_tke_state`, `tke.n2`, `tke.km_e`),
+  but to day 0 they disagree wildly: P* 1.87 / 2.25 / – / 2.72 × FD, C_d 0.05 / 3.2 / – / 4.5. The gradient is
+  hypersensitive to the TKE-derivative treatment, so the trace alone cannot pick a cut. `freeze_mixing` was kept.
+* **January, NW Svalbard (days 25→10).** Even with mixing frozen the cotangent grows ×10: w_e at the surface first,
+  then a/m/u_ice, then S and T in the Atlantic layer (300–500 m), at the ice edge over the Atlantic Water inflow
+  (Whalers Bay, 9–11.4°E 80.1–80.3°N). Forward: 1.2 m ice over water 0.4–0.6 K above freezing melts out or drifts
+  off within a day or two. New diagnostic cuts `ocean_ts` (the surface T, S the ice thermodynamics sees) and
+  `water_flux` (6b2fe76): `ocean_ts` or the ice `advect` cut keep the trace flat, `water_flux` does nothing,
+  `freeze_advection` halves it ⇒ the loop is melt → ocean heat and salt → thermodynamics. Masked form
+  **`IceConfig.adjoint_warm_ts`** (c11923f; the ocean_ts cut only where T − T_f(S) > ΔT): 0.2 K equals the full
+  cut, 0.5 and 1.0 K leave the growth.
+
+**Windowed FD.** With several faults in one window the day-0 ratio cannot say which fix worked (one variant's
+1.41 × FD at day 0 turned out to be partly cancellation). The forward base stores the state at every chunk
+boundary, so `ice_cbar.py fwd` can resume from boundary 24c with the control perturbed from day c/4 on. The
+central difference of that forward, FD_c, is exactly what the reverse sweep has accumulated at leg c
+(`runs/ice/farc/submit_wfd2012.sh`, `wfd_table.py`; restart check: unperturbed resume differs from the base by 2e-4
+of the signal). ln P*:
+
+| window (days back from 1 Jun) | FD increment | AD increment (old chained legs) |
+|---|---|---|
+| 0 → 42 (legs 604 → 437) | +0.063 | −0.154 |
+| 42 → 53 | −0.001 | −0.030 |
+| 53 → 88 | −0.158 | −0.339 |
+| 88 → 123 | −0.280 | −0.278 |
+| 123 → 151 | −0.186 | −0.207 (ocean_ts cut) |
+
+The two wrong windows were the ones inherited from legs with bursts, but a fresh one-setting rerun of the last
+42 days has a clean trace (max 0.13) and still the wrong sign (−0.199 at leg 411, FD +0.06). A clean trace screens
+for bursts, not for a bias.
+
+* **The late-May error is a steady spurious accrual of about −0.005 per day.** Short legs: FD +0.0003 / −0.0015 /
+  −0.0036 at 1 / 6.25 / 14.75 d, AD −0.0012 / −0.037 / −0.068. At 8.25 d the FD is linear in h (0.01 / 0.03 / 0.1 /
+  0.3: −0.0015 / −0.0035 / −0.0024 / −0.0019), so the adjoint (−0.047) is about 20× too large. 8.25 d variants
+  (FD: P* −0.0024, C_d +0.0220):
+
+  | extra cut | ln P* | ln C_d | Tair (map summed globally) |
+  |---|---|---|---|
+  | none (6.25 d) | −0.037 | +0.024 | −0.049 |
+  | ice `fct` | +0.0006 | +0.0002 | −0.066 |
+  | ice `advect` | +0.0002 | −0.0010 | −0.066 |
+  | ice `ice2ocean` | −0.047 | +0.012 | −0.065 |
+  | `fct_pin+fct_bound` | −0.134 | +0.012 | −0.060 |
+  | `+fct_flux` (low-order tangent) | −0.112 | +0.0045 | −0.056 |
+  | `strength_conc` | −0.054 | +0.026 | −0.066 |
+  | θ 1.0, thin_mass 0 | blow up | | |
+
+  The spurious P* runs u_ice → ice advection → thermodynamics. Cutting the advection tangent removes it but also
+  the real C_d response, and cutting more of the FCT limiter makes it worse, so it is not the limiter derivative.
+  The FCT cuts cannot leak volume: the limited fluxes are the element factor times fluxes that sum to zero per
+  element. Nor is it the summer strength loop (A → P exp(−20(1 − A)) → stress → u_ice → advection → A): its cut
+  `strength_conc`, part of the year-verified drift setting, leaves P* at −0.054. The error is open at this entry;
+  next candidates are θ 0.9 and separating the two uses of u_ice (FCT transport, thermodynamics).
+  The Tair column sums the gradient map over the globe; the FD direction is the ≥70N box (−0.017 to −0.022).
+
+The farc adjoint (`--dist 4`) also runs on one Levante node with 4 × A100 80 GB at
+`XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`: compile 323 s, 8 days of reverse sweep in 49 min.
+
+Lesson: in a long window with more than one fault, measure the error per window, not at day 0. Resuming the stored
+forward with the control switched on at a leg boundary gives the exact target for that leg's partial at the cost of
+one forward over the remaining days, and the increments between legs show which window is wrong and whether it is a
+burst or a steady bias. Before blaming the adjoint in a window, check that the FD there is linear in h. And a cut
+that cured a loop for one cost is not the cure for the next by default: the summer strength cut that the drift year
+needed does nothing for the May volume bias, although both run through u_ice and advection.

@@ -499,8 +499,10 @@ class IceMap:
 
     def __init__(self, date: str, n_sweeps: int | None = None, forward: str = "mevp",
                  aevp_c: float = AEVP_C, aevp_alpha_min: float = AEVP_ALPHA_MIN,
-                 alpha_const: float | None = None):
-        """``forward``: "mevp" (the model's map), "aevp" (the same sweep with per-element α and
+                 alpha_const: float | None = None, config=None, restart=None):
+        """``config`` / ``restart``: another model than the CORE2 reference (e.g.
+        ``configs/farc_full.yaml`` and a restart directory at ``date``), passed to
+        ``core2_adj.build_model``. ``forward``: "mevp" (the model's map), "aevp" (the same sweep with per-element α and
         per-node β from :func:`aevp_alpha_beta` at the step's entry velocity; ``aevp_c = 0``
         with ``aevp_alpha_min = alpha_evp`` makes α ≡ alpha_evp, the mEVP map) or "const" (the
         mEVP sweep with the scalar α = β = ``alpha_const``: the same fixed point, the implicit VP
@@ -525,7 +527,8 @@ class IceMap:
 
         self.jax, self.jnp = jax, jnp
         t0 = time.time()
-        model = C.build_model(start=date, n_steps=1, chunk_steps=1, ice_mode="prescribed")
+        model = C.build_model(start=date, n_steps=1, chunk_steps=1, ice_mode="prescribed",
+                              config=config, restart=restart)
         self.model, self.mesh = model, model.mesh
         mesh = model.mesh
         x0f = jax.tree.map(lambda a: a[0], model.stack_forcing([model.date(model.start, 0)]))
@@ -1966,7 +1969,7 @@ def why_study(args) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     t_start = time.time()
     M = IceMap(args.date, n_sweeps=args.n_sweeps, forward=args.forward,
-               alpha_const=args.alpha_const)
+               alpha_const=args.alpha_const, config=args.config, restart=args.restart)
     jax, jnp = M.jax, M.jnp
     N = M.n_sweeps
     tag = args.tag or (args.forward + (f"{M.alpha_const:g}" if M.alpha_const else "") + f"_n{N}")
@@ -1979,6 +1982,7 @@ def why_study(args) -> int:
         "device": getattr(dev, "device_kind", str(dev)), "platform": dev.platform,
         "jax": jax.__version__, "date": args.date, "tag": tag, "forward": args.forward,
         "alpha": M.alpha_const or M.cfg.alpha_evp, "n_sweeps": N, "kappa0": args.kappa0,
+        "config": str(M.model.config_path), "restart": str(M.model.restart), "dt": M.model.dt,
         "time": datetime.datetime.now().isoformat(timespec="seconds"), "settings": vars(args),
         "n_box_nodes": int(M.box.sum()), "n_ice_nodes": int(M.ice_nod.sum()),
         "n_ice_elems": int(M.ice_el.sum()),
@@ -2434,6 +2438,8 @@ def _parse(argv=None):
     w.add_argument("--kappa0", type=float, default=1.0)
     w.add_argument("--repeats", type=int, default=2)
     w.add_argument("--tag", default=None)
+    w.add_argument("--config", default=None, help="another model's config (default CORE2)")
+    w.add_argument("--restart", default=None, help="restart directory at --date (with --config)")
     s = sub.add_parser("why-summary")
     s.add_argument("--dir", required=True)
     s.add_argument("--out", default=None)

@@ -29,6 +29,7 @@ import jax.numpy as jnp
 
 from . import forcing as _forcing
 from . import ice_adv, ice_coupling, ice_evp, ice_mevp, ice_thermo
+from .adjoint_stab import cut_where
 from .config import VCPW
 from .ice import IceConfig, check_ice_ctrl
 from .mesh import Mesh
@@ -48,7 +49,8 @@ ADJOINT_MODES = ("exact", "rheology", "prescribed", "frozen", "dynamics")
 ADJOINT_DAMPINGS = ("none", "local", "frozen_sweep")
 #: IceConfig.adjoint_cuts names ("exact" and "dynamics"; see IceConfig)
 ADJOINT_CUTS = ("advect", "fct", "ssh", "ocean_vel", "ice2ocean", "fct_limiter", "fct_flux",
-                "strength_conc")
+                "strength_conc", "fct_pin", "fct_bound", "fct_hilo", "fct_hilo_coast",
+                "fct_bound_coast", "ocean_ts", "water_flux")
 
 
 def validate_adjoint_settings(cfg: IceConfig) -> None:
@@ -59,7 +61,8 @@ def validate_adjoint_settings(cfg: IceConfig) -> None:
     < −1, "dynamics" / damping / ``adjoint_sweeps`` with standard EVP (``whichEVP=0``: the hooks
     are mEVP's), and damping / ``adjoint_sweeps`` under a mode that does not unroll the sweeps
     ("rheology", "prescribed", "frozen"), where they would be silently ignored; likewise a
-    negative ``adjoint_thin_mass``, or a positive one outside mEVP under "dynamics"/"exact"."""
+    negative ``adjoint_thin_mass``, or a positive one outside mEVP under "dynamics"/"exact", and
+    a negative ``adjoint_warm_ts``, or a positive one outside "dynamics"/"exact"."""
     mode = cfg.adjoint_mode
     damping = getattr(cfg, "adjoint_damping", "none")
     kappa = getattr(cfg, "adjoint_kappa", 0.25)
@@ -123,6 +126,16 @@ def validate_adjoint_settings(cfg: IceConfig) -> None:
         raise ValueError(f"IceConfig.adjoint_thin_mass={thin!r} acts on the mEVP momentum solve "
                          f"(whichEVP=1) under adjoint_mode 'dynamics' or 'exact' only, not "
                          f"{mode!r} with whichEVP={cfg.whichEVP}")
+    warm = getattr(cfg, "adjoint_warm_ts", 0.0)
+    try:
+        warm_f = float(warm)
+    except (TypeError, ValueError):
+        raise ValueError(f"IceConfig.adjoint_warm_ts={warm!r} is not a number") from None
+    if not (0.0 <= warm_f < float("inf")):
+        raise ValueError(f"IceConfig.adjoint_warm_ts={warm!r}: need a finite ΔT ≥ 0 [K]")
+    if warm_f > 0.0 and mode not in ("dynamics", "exact"):
+        raise ValueError(f"IceConfig.adjoint_warm_ts={warm!r} acts under adjoint_mode "
+                         f"'dynamics' or 'exact' only, not {mode!r}")
     tuned = damping != "none" or sweeps != -1
     if cfg.whichEVP != 1 and (mode == "dynamics" or tuned):
         raise ValueError(
@@ -429,15 +442,28 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
             **_evp_kw)
 
         _fct_u, _fct_v = _cut(("advect", "fct"), u_ice, v_ice)
+        _bn = (None if not {"fct_hilo_coast", "fct_bound_coast"} & set(_cuts) else
+               ice_evp.boundary_node_mask(mesh) if boundary_node is None else boundary_node)
         a_adv, m_adv, ms_adv = ice_adv.fct_solve(
             cfg, mesh, state.a_ice, state.m_ice, state.m_snow, _fct_u, _fct_v, exch=exch,
-            freeze_limiter="fct_limiter" in _cuts, freeze_limited_flux="fct_flux" in _cuts)
+            freeze_limiter="fct_limiter" in _cuts, freeze_limited_flux="fct_flux" in _cuts,
+            pin_bounds="fct_pin" in _cuts, freeze_bounds="fct_bound" in _cuts,
+            freeze_extremes="fct_hilo" in _cuts,
+            freeze_extremes_at=None if "fct_hilo_coast" not in _cuts else _bn,
+            freeze_bounds_at=(None if "fct_bound_coast" not in _cuts
+                              else ice_adv.coast_ring(mesh, _bn)))
         _th_u, _th_v = _cut(("advect",), u_ice, v_ice)
         a_co, m_co, ms_co = ice_thermo.cut_off(a_adv, m_adv, ms_adv)
+        _oc_t, _oc_s = _cut(("ocean_ts",), srf.temp, srf.salt)
+        _warm = (float(getattr(cfg, "adjoint_warm_ts", 0.0))
+                 if cfg.adjoint_mode in ("dynamics", "exact") else 0.0)
+        if _warm > 0.0:                # IceConfig.adjoint_warm_ts: "ocean_ts" on warm nodes only
+            _hot = _sg(srf.temp - ice_thermo.tfrez(cfg, srf.salt)) > _warm
+            _oc_t, _oc_s = cut_where(_oc_t, _hot), cut_where(_oc_s, _hot)
 
         th = ice_thermo.thermodynamics(
             cfg, m_ice=m_co, m_snow=ms_co, a_ice=a_co, u_ice=_th_u, v_ice=_th_v,
-            t_skin=state.t_skin, srfoce_temp=srf.temp, srfoce_salt=srf.salt,
+            t_skin=state.t_skin, srfoce_temp=_oc_t, srfoce_salt=_oc_s,
             srfoce_u=srf.u, srfoce_v=srf.v,
             fsh=sf.shortwave, flo=sf.longwave, Tair=sf.Tair, qa=sf.shum,
             u_wind=sf.u_air, v_wind=sf.v_air, rain=sf.prec_rain, snow=sf.prec_snow,
@@ -523,6 +549,8 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
             a_old, fs.runoff_node, thdgr, thdgrsn,
             fs.areasvol_surf, fs.ocean_area, cfg,
             owned_mask=owned_mask, axis_name=axis_name)
+
+    water_flux = _cut(("water_flux",), water_flux)
 
     # --- oce_fluxes_mom: ice-ocean stress blend (prognostic a_ice/u_ice; halo-complete a_ice) ---
     _mom_u, _mom_v = _cut(("ice2ocean",), u_ice, v_ice)

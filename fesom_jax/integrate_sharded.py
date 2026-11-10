@@ -1252,3 +1252,193 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
         state_out, acc_out = out
         return (state_out, acc_out) if return_folded else (unfold_state(state_out, npes), acc_out)
     return out if return_folded else unfold_state(out, npes)
+
+
+# --------------------------------------------------------------------------
+# The sharded chunk program of a chunked reverse sweep (fesom_jax.adjoint.chunked_grad)
+# --------------------------------------------------------------------------
+_TRANSPORTS = ("coloured", "padded", "allgather")
+
+
+def fold_host_state(state, partition):
+    """A dense host :class:`State` → the folded ``[P*Lmax, …]`` host State of the sharded
+    programs (:func:`shard_mesh.partition_state`, then the fold; pad lanes as there)."""
+    from .shard_mesh import partition_state
+    return jax.tree.map(_fold, partition_state(jax.device_get(state), partition))
+
+
+def owned_host_state(folded, partition, n_kind: dict):
+    """A folded host State → the dense one, every entity from its OWNER's copy (a primal).
+    ``n_kind``: ``{"nod": nod2D, "elem": elem2D}``."""
+    return _unfold_host(folded, partition, n_kind, add=False)
+
+
+def summed_host_cotangent(folded, partition, n_kind: dict):
+    """A folded host State COTANGENT → the dense one: every copy of an entity (owner, halo,
+    extended halo) adds into it. The sharded program reads ``E x`` (``E`` copies each entity to
+    every lane that holds it), so the dense cotangent is ``Eᵀ`` of the folded one."""
+    return _unfold_host(folded, partition, n_kind, add=True)
+
+
+def _unfold_host(folded, partition, n_kind, *, add: bool):
+    from .shard_mesh import local_sizes
+    n_local, Lmax = local_sizes(partition)
+    P = partition.npes
+    lists = {"nod": partition.myList_nod2D, "elem": partition.myList_elem2D}
+    owned = {"nod": partition.myDim_nod2D, "elem": partition.myDim_elem2D}
+
+    def one(a):
+        a = np.asarray(a)
+        kind = next((k for k in ("nod", "elem") if a.shape[0] == P * Lmax[k]), None)
+        if kind is None:
+            raise ValueError(f"leading dim {a.shape[0]} is neither P*Lmax_nod nor P*Lmax_elem")
+        if Lmax["nod"] == Lmax["elem"]:
+            raise ValueError("Lmax_nod == Lmax_elem: the entity kind of a leaf is ambiguous")
+        a = a.reshape((P, Lmax[kind]) + a.shape[1:])
+        out = np.zeros((n_kind[kind],) + a.shape[2:], a.dtype)
+        for d in range(P):
+            n = int(n_local[kind][d]) if add else int(owned[kind][d])
+            ids = np.asarray(lists[kind][d][:n])
+            if add:
+                np.add.at(out, ids, a[d, :n])
+            else:
+                out[ids] = a[d, :n]
+        return out
+    return jax.tree.map(one, folded)
+
+
+def localize_forcing_adj(params, gid, valid):
+    """``params`` with a GLOBAL ``Params.forcing_adj`` (``{name: [nod2D]}``, replicated on every
+    device) cut to this device's lanes: ``field[gid]`` on the owned and halo lanes, 0 on the pad
+    lanes. ``gid``/``valid``: the local ``[Lmax_nod]`` global node ids and live-lane mask
+    (:func:`node_gid`). The transpose scatters each lane's cotangent back to its global node, so
+    the gradient that leaves the ``shard_map`` (replicated input ⇒ summed over devices) is the
+    global one, the halo copies' uses included. ``None`` ⇒ ``params`` unchanged.
+
+    The work is :func:`fesom_jax.adjoint_sharded.localize_forcing_adj` (the later, general form:
+    a leading window-month axis and negative pad ids allowed); imported here at call time, since
+    that module imports this one."""
+    from .adjoint_sharded import localize_forcing_adj as _localize
+    return _localize(params, gid, valid)
+
+
+def node_gid(sm: ShardedMesh, partition):
+    """``([P, Lmax_nod] int32 global node id, [P, Lmax_nod] bool live lane)`` for
+    :func:`localize_forcing_adj` (pad lanes: id 0, not live)."""
+    from .shard_mesh import _shard_along_axis
+    gid = _shard_along_axis(np.arange(sm.nod2D, dtype=np.int32), partition.myList_nod2D,
+                            sm.Lmax["nod"], 0, False)
+    return np.asarray(gid, np.int32), np.asarray(sm.valid_mask["nod"], bool)
+
+
+def sharded_chunk_program(sm: ShardedMesh, sop: ShardedSSHOperator, forcing_static_p,
+                          boundary_node_p, *, npes: int, dt: float, to_params,
+                          step_kw: dict, adjoint_cfg=None, accumulators=None,
+                          acc_inputs=None, rematerialize: bool = True,
+                          save_names: tuple = (), transport: str = "coloured",
+                          node_ids=None):
+    """The chunk program of :func:`fesom_jax.adjoint.chunked_grad` on ``npes`` devices.
+
+    The sharded twin of ``core2_adj``'s dense chunk: ``K`` forced steps
+    (``is_first_step=False``, the bulk stress) under one :func:`jax.shard_map`, with
+    :func:`fesom_jax.adjoint.scan_steps` (√K remat) inside, the halo exchanges of
+    :func:`run_steps_sharded_forced` and the GLOBAL coastal mask ``boundary_node_p``
+    (``[P, Lmax_nod]``; a local recompute flags partition cuts as coast).
+
+    Returns a :class:`fesom_jax.adjoint.ChunkProgram`. Its constants — the folded mesh, SSH
+    operator, halo maps, forcing statics, coastal mask and accumulator inputs — are placed on
+    the devices once, here, and enter the compiled program as sharded ARGUMENTS. Its ``place``
+    puts a folded host carry (:func:`fold_host_state`) onto the devices.
+
+    * carry: the folded State, or ``(State, {name: scalar})`` with ``accumulators``;
+    * ``xs``: the chunk's forcing ``[K, P*Lmax_nod]`` (:func:`sharded_forcing`);
+    * ``params``: the control pytree, replicated; ``to_params(params) -> Params`` in-program.
+
+    ``accumulators``: ``{name: fn(state, mesh, halo_ctx, acc_in) -> scalar}`` evaluated on the
+    LOCAL shard after every step and added to the carry. A value must be the same on every
+    device (a :func:`fesom_jax.reductions.global_sum` over owned lanes); it leaves the program
+    replicated. ``acc_inputs``: ``{name: [P, Lmax_nod, …] host array}`` handed to every
+    accumulator as ``acc_in`` (local ``[Lmax_nod, …]``).
+
+    ``transport``: ``"coloured"`` (default) or ``"padded"``, both AD-correct, or
+    ``"allgather"`` (replicates each exchanged field on every device; small meshes only). The
+    ragged transport has a broken transpose and is refused.
+
+    ``node_ids``: :func:`node_gid` ``(gid, valid)``, needed when ``to_params`` returns a
+    ``Params.forcing_adj`` (global ``[nod2D]`` fields in the replicated control pytree): each
+    device then cuts them to its lanes (:func:`localize_forcing_adj`). ``None`` ⇒ the program is
+    the one without it."""
+    from . import adjoint
+    if transport not in _TRANSPORTS:
+        raise ValueError(f"transport must be one of {_TRANSPORTS} (ragged has a broken "
+                         f"autodiff transpose), got {transport!r}")
+    if boundary_node_p is None:
+        raise ValueError("boundary_node_p (the global coastal mask, partitioned) is required")
+    use_padded, use_coloured = transport == "padded", transport == "coloured"
+    accs = dict(accumulators or {})
+    jmesh = halo.device_mesh(devices=jax.devices()[:npes])
+    n_global = sm.nod2D
+    fm, fm_spec = folded_mesh(sm)
+    fop, fop_spec = folded_operator(sop)
+    ha, ha_spec = _halo_arrays(sm, padded=use_padded, coloured=use_coloured)
+    col_meta = _col_meta(sm) if use_coloured else None
+    fsf, fsf_spec = _fold_forcing(forcing_static_p)
+    ai = {k: _fold(np.asarray(v)) for k, v in (acc_inputs or {}).items()}
+    consts = (fm, fop, ha, fsf, _fold(np.asarray(boundary_node_p)), ai)
+    consts_spec = (fm_spec, fop_spec, ha_spec, fsf_spec, _P, {k: _P for k in ai})
+    if node_ids is not None:
+        consts += ((_fold(np.asarray(node_ids[0], np.int32)), _fold(np.asarray(node_ids[1], bool))),)
+        consts_spec += ((_P, _P),)
+    consts = tuple(_to_global_sharded(a, sp, jmesh) for a, sp in zip(consts, consts_spec))
+    carry_spec = (_P, {k: _R for k in accs}) if accs else _P
+
+    def body(carry, xs, u, k):
+        m, o, h, fs_, bn_, ai_ = k[:6]
+        ctx = _make_halo_ctx(h, n_global, False, use_padded, None, use_coloured, col_meta)
+        p = to_params(u)
+        if node_ids is not None:
+            p = localize_forcing_adj(p, *k[6])
+        elif getattr(p, "forcing_adj", None) is not None:
+            raise ValueError("Params.forcing_adj under shard_map needs node_ids= (the global "
+                             "fields must be cut to the local lanes)")
+
+        def one_step(s, x):
+            return stepmod.step(s, m, o, None, p, dt=dt, is_first_step=False,
+                                step_forcing=x, forcing_static=fs_, adjoint_cfg=adjoint_cfg,
+                                halo_ctx=ctx, boundary_node=bn_, **step_kw)
+
+        if accs:
+            def stepper(c, x):
+                st, acc = c
+                new = one_step(st, x)
+                vals = {name: fn(new, m, ctx, ai_) for name, fn in accs.items()}
+                bad = [name for name, v in vals.items() if jnp.ndim(v) != 0]
+                if bad:
+                    raise ValueError(f"sharded accumulators must be scalars, got {bad}")
+                return new, {name: acc[name] + vals[name] for name in acc}
+        else:
+            stepper = one_step
+        return adjoint.scan_steps(stepper, carry, xs, rematerialize=rematerialize,
+                                  save_names=tuple(save_names) if rematerialize else ())
+
+    fn = jax.shard_map(body, mesh=jmesh, in_specs=(carry_spec, _TP, _R, consts_spec),
+                       out_specs=carry_spec, check_vma=False)
+
+    def place(tree):
+        if accs:
+            st, acc = tree
+            spec = (jax.tree.map(lambda _: _P, st), {name: _R for name in acc})
+        else:
+            spec = jax.tree.map(lambda _: _P, tree)
+        return _to_global_sharded(tree, spec, jmesh)
+
+    return adjoint.ChunkProgram(fn=fn, consts=consts, place=place)
+
+
+def sharded_forcing(sf_stack, partition, npes: int):
+    """A dense host ``StepForcing`` stack ``[K, nod2D, …]`` → the sharded ``xs`` of
+    :func:`sharded_chunk_program` (``[K, P*Lmax_nod, …]``, ``PartitionSpec(None, 'p')``),
+    placed shard by shard from the host."""
+    from .shard_mesh import partition_step_forcing
+    folded, spec = _fold_forcing_seq(partition_step_forcing(sf_stack, partition))
+    return _to_global_sharded(folded, spec, halo.device_mesh(devices=jax.devices()[:npes]))

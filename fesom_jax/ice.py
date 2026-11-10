@@ -249,6 +249,35 @@ class IceConfig(NamedTuple):
     #       "fct_limiter" alone blows the 10 d farc gradient up (x1.7e6): with the factors
     #       frozen, the unlimited response of the antidiffusive flux to u_ice feeds the
     #       ice-dynamics loop.
+    #       "fct_pin" — in the ice advection's limiter (ice_adv._fem_fct), a bound that a node
+    #                  attains itself (tmax = 0 or tmin = 0) enters the tangent as a constant;
+    #       "fct_bound" — all the limiter bounds tmax/tmin enter as constants, while their
+    #                  flux-sum denominators stay differentiated;
+    #       "fct_hilo" — the cluster extremes hi/lo inside tmax = hi - X_l enter as constants
+    #                  (X_l, the low-order value, stays live); meant with "fct_pin";
+    #       "fct_hilo_coast" — "fct_hilo" on the coastal nodes only (the mEVP boundary mask, the
+    #                  global one under sharding); meant with "fct_pin".
+    #       Why: the farc NH ice VOLUME cost needs the limiter derivative ("fct_flux" flips the
+    #       sign of its C_d gradient, "fct_limiter" costs -0.0022 of a +0.0011 one-day C_d). The
+    #       live limiter's one-step m_ice tangent has a top singular value of 77-4e3 at all
+    #       ten farc states tried (days 3-200), and all of it is the bound term d t / f of the
+    #       clipping ratios t/f. Open water is a tie (every value 0) and the min/max derivatives
+    #       average over the tied vertices, one of which has a flux sum ~1e-11: "fct_pin"
+    #       brings σ to 5-10, but a coastal Gulf of Anadyr pattern still grows x2.4 per step.
+    #       "fct_bound": σ 1.6-2.2, the 24-step reverse product 0.8 at every state.
+    #       "fct_pin" + "fct_hilo": σ 5-7, the 24-step product 0.8 at three of four states.
+    #       In the full model (10 d, TKE/GM live): "fct_pin" alone blows up as the uncut
+    #       limiter does (the coastal Anadyr pattern), "fct_pin" + "fct_hilo" is stable but
+    #       biased (P* 0.55, C_d 1.52 of the FD; 1 d C_d 0.82, "fct_pin" alone 1.01).
+    #       "fct_pin" + "fct_hilo_coast" (3.8 % of the farc nodes): the Anadyr pattern 7e8 ->
+    #       0.2 over 24 steps offline, 0.85-0.87 at the two other winter states.
+    #       "fct_bound_coast" — "fct_bound" on the coastal nodes and their first ring
+    #                  (ice_adv.coast_ring, 7.6 % of the farc nodes); meant with "fct_pin".
+    #       Why: with "fct_pin" + "fct_hilo_coast" the 90 d NH volume adjoint bursts at day 50
+    #       (x8 per 6 h, m_snow on three coastal nodes of a Baffin Island fjord): at a node that
+    #       attains its own cluster extreme, a constant hi leaves -d X_l / f in the ratio. Offline
+    #       (24 steps from the dumped cotangent): that pattern x8.3 -> 0.63; no state of nine
+    #       (days 3-200, m_ice / m_snow / a_ice) grows more than with "fct_hilo_coast".
     #       "strength_conc" — mEVP only: the concentration factor exp(−C(1−A)) of the ice
     #                  strength (ice_mevp.mevp_setup, A the element mean) enters the tangent as a
     #                  constant; its thickness factor and P* stay live.
@@ -260,6 +289,17 @@ class IceConfig(NamedTuple):
     #       constant x0.83, the mEVP solve dark x0.74; its thickness factor frozen x1.80, θ 0.5
     #       or 0 x1.25, cut "advect" x1.22, adjoint_alpha_kappa 0.5 or 0.25 x1.83-1.90. A loop
     #       A -> strength -> stress -> u_ice -> advection -> A, through the steep exp(−20(1−A)).
+    #       "ocean_ts" — DIAGNOSTIC: the ocean surface temperature and salinity the ice
+    #                  thermodynamics sees (the ocean-to-ice heat flux and the freezing point);
+    #       "water_flux" — DIAGNOSTIC: the freshwater flux handed to the ocean (the zstar
+    #                  surface volume flux w[0] = −water_flux and the bc_T term −dt·T·water_flux).
+    #       Why: farc 2012, 151 d NH volume, mixing frozen: the reverse trace grows x8 in the
+    #       last 25 days (Jan 14-27) at the NW Svalbard ice edge over the Atlantic Water inflow
+    #       (Whalers Bay, a 0 <-> 0.9 on the same nodes), w_e at the surface leading, then ice and
+    #       Atlantic-layer S. Resumed from day 28 to day 7: "ocean_ts" or "advect" keep the trace
+    #       flat (0.14, x10 without), "water_flux" does nothing, AdjointConfig.freeze_advection
+    #       x0.7 — the loop returns to the ocean through heat and salt, not the volume flux
+    #       (the masked form: adjoint_warm_ts).
     adjoint_damping: str = "none"
     adjoint_kappa: float = 0.25
     adjoint_sweeps: int = -1
@@ -314,6 +354,16 @@ class IceConfig(NamedTuple):
     adjoint_theta: float = 0.97
     adjoint_thin_mass: float = 0.0
     adjoint_sweep_guard: float = 0.0
+    #   adjoint_warm_ts ΔT [K] ≥ 0 (default 0 = off, the unchanged program), "dynamics" or
+    #       "exact": the ocean surface T and S the ice thermodynamics sees enter the tangent as
+    #       constants on the nodes where T − T_f(S) > ΔT (the masked form of the cut "ocean_ts";
+    #       the forward is unchanged).
+    #       Why: farc 2012, 151 d NH volume, mixing frozen, the January growth (see "ocean_ts"):
+    #       at the NW Svalbard ice edge 1.2 m ice (a 0.85) over water 0.4-0.6 K above freezing
+    #       melts out or drifts off within 1-2 days and the surface warms to +2-5 K (Atlantic
+    #       Water at the surface); the reverse growth coincides with these melt-outs, while
+    #       under the pack T − T_f stays below ~0.05 K.
+    adjoint_warm_ts: float = 0.0
 
     # ---- derived (fesom_ice.c:85-86, 233, 84) ----
     @property

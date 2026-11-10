@@ -789,6 +789,27 @@ def test_why_parser_needs_the_reference_h_and_the_constant():
     assert a.alpha_const == 3000.0 and a.n_sweeps == 24000 and IM.WHY_REF_H in a.hs
 
 
+def test_why_takes_another_model_and_icemap_passes_it_to_build_model(monkeypatch):
+    """Task 26: `why --config/--restart` reaches ``core2_adj.build_model`` unchanged (farc)."""
+    a = IM._parse(["why", "--date", "2013-01-02", "--out", "/tmp/x", "--config",
+                   "configs/farc_full.yaml", "--restart", "/some/restart"])
+    assert (a.config, a.restart) == ("configs/farc_full.yaml", "/some/restart")
+    import core2_adj as C
+    seen = {}
+
+    class Stop(Exception):
+        pass
+
+    def fake_build_model(**kw):
+        seen.update(kw)
+        raise Stop
+
+    monkeypatch.setattr(C, "build_model", fake_build_model)
+    with pytest.raises(Stop):
+        IM.IceMap("2013-01-02", config=a.config, restart=a.restart)
+    assert (seen["config"], seen["restart"], seen["start"]) == (a.config, a.restart, "2013-01-02")
+
+
 def test_core2_const_forward_at_250_is_the_mevp_map(icemap):
     """forward 'const' with α = β = alpha_evp is the model's mEVP sweep (bitwise: the same
     scalar config); its TLa coefficients equal mEVP's up to the rounding of γ/(αβ); at

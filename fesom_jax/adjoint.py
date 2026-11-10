@@ -32,6 +32,7 @@ Measurements: ``docs/ADJOINT_HORIZON.md``.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import math
 import time
@@ -46,7 +47,8 @@ from . import precision as PR
 from .integrate import _run_steps
 
 __all__ = ["scan_steps", "chunked_forward", "chunked_grad", "ChunkedGrad", "chunked_grad_multi",
-           "ChunkedGradMulti", "ReverseCheckpoint", "LegIncomplete", "INFORMATIVE_SPREAD"]
+           "ChunkedGradMulti", "ChunkProgram", "ReverseCheckpoint", "LegIncomplete",
+           "INFORMATIVE_SPREAD"]
 
 
 # ---------------------------------------------------------------------------
@@ -205,16 +207,57 @@ def _precision(chunk_fn) -> str:
     return getattr(chunk_fn, "precision", "double")
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
+class ChunkProgram:
+    """A ``chunk_fn`` whose large constant inputs are ARGUMENTS of the compiled program.
+
+    ``fn(state, xs, params, consts) -> state``; the object itself is the usual
+    ``chunk_fn(state, xs, params)`` and supplies ``consts``. ``place(host_tree)`` puts a host
+    state (a boundary, a resumed cotangent) where ``fn`` expects it; ``None`` means
+    :func:`jax.device_put`.
+
+    Why it exists: :func:`jax.jit` embeds the arrays a function closes over in the program as
+    literal constants. Measured on JAX 0.10.1: a closed-over 400 k-element array sharded over 4
+    devices came out as one dense HLO constant, and the compiled program had a single argument.
+    A one-device ``chunk_fn`` that closes over its mesh lives with that. A sharded one cannot:
+    its mesh, SSH operator and halo maps are device-sharded arrays, and they must reach the
+    program as sharded arguments (:func:`fesom_jax.integrate_sharded.sharded_chunk_program`)."""
+
+    fn: Callable
+    consts: Any = ()
+    place: Callable | None = None
+
+    def __call__(self, state, xs, params):
+        return self.fn(state, xs, params, self.consts)
+
+
+def _place(chunk_fn, tree):
+    """A host state onto the device(s) ``chunk_fn`` runs on (:attr:`ChunkProgram.place`)."""
+    place = getattr(chunk_fn, "place", None)
+    return jax.device_put(tree) if place is None else place(tree)
+
+
 @functools.lru_cache(maxsize=_JIT_CACHE)
 def _jitted_forward(chunk_fn):
     # single precision: compiled with precision.compiler_options and traced/run inside precision.scope (the
     # production runner's PR.scoped(PR.jit(...))); double: exactly jax.jit(chunk_fn)
     prec = _precision(chunk_fn)
+    if isinstance(chunk_fn, ChunkProgram):
+        f, k = PR.scoped(PR.jit(chunk_fn.fn, prec), prec), chunk_fn.consts
+        return lambda state, xs, params: f(state, xs, params, k)
     return PR.scoped(PR.jit(chunk_fn, prec), prec)
 
 
 @functools.lru_cache(maxsize=_JIT_CACHE)
 def _jitted_backward(chunk_fn):
+    if isinstance(chunk_fn, ChunkProgram):
+        fn, k, prec_k = chunk_fn.fn, chunk_fn.consts, _precision(chunk_fn)
+
+        def bwd_k(state, xs, params, cot, consts):
+            _, vjp = jax.vjp(lambda s, p: fn(s, xs, p, consts), state, params)
+            return vjp(cot)
+        bwd_kj = PR.scoped(PR.jit(bwd_k, prec_k), prec_k)
+        return lambda state, xs, params, cot: bwd_kj(state, xs, params, cot, k)
     def bwd(state, xs, params, cot):
         _, vjp = jax.vjp(lambda s, p: chunk_fn(s, xs, p), state, params)
         return vjp(cot)
@@ -491,6 +534,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     free = _free if free_xs else (lambda _t: None)
     fwd_chunk = _jitted_forward(chunk_fn)
     bwd_chunk = _jitted_backward(chunk_fn)
+    place = functools.partial(_place, chunk_fn)
 
     # --- forward, boundaries to the host ------------------------------------
     ta = time.time()
@@ -500,7 +544,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         s_fin = None
     else:
         s_fin, boundaries = _forward(fwd_chunk, params, init_state, n_chunks, get_xs,
-                                     stride, free, checkpoint)
+                                     stride, free, checkpoint, place=place)
         loss_v = float(loss_fn(s_fin))
         fwd_t = time.time() - ta
         if checkpoint is not None:
@@ -513,7 +557,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     # `_forward` always keeps the LAST boundary whatever the stride, so the final state is
     # available on a resume too and never has to be recomputed.
     if s_fin is None:
-        s_fin = jax.device_put(boundaries[n_chunks])
+        s_fin = place(boundaries[n_chunks])
     _, vjp_loss = jax.vjp(loss_fn, s_fin)
     cot = jax.block_until_ready(vjp_loss(1.0)[0])
     _free(s_fin)
@@ -530,7 +574,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         resumed, grad, c_start, trace = checkpoint.reverse_start(cot, n_chunks, like=init_state)
         if resumed is not cot:
             _free(cot)
-            cot = jax.device_put(resumed)
+            cot = place(resumed)
         fresh = not trace
         trace = list(trace) if trace else [float(adjoint_stab.cotangent_norm(cot))]
     # boundaries reported by an earlier leg are placeholders, so field_trace aligns with trace
@@ -549,9 +593,10 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         # `boundaries` holds only every stride-th state; rebuild the span in between from the
         # nearest stored one. stride == 1 => the span IS `boundaries`.
         span = (boundaries if stride == 1
-                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, get_xs, free))
+                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, get_xs, free,
+                                   place))
         for c in reversed(range(sup_lo, min(sup_hi, c_start + 1))):
-            s_in = jax.device_put(span[c])
+            s_in = place(span[c])
             xs_c = get_xs(c)
             g_s, g_p = bwd_chunk(s_in, xs_c, params, cot)
             # ⚠️ ORDER MATTERS: `s_in`, `xs_c` and the OLD `cot` are live inputs to the VJP until
@@ -654,11 +699,12 @@ def chunked_grad_multi(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     free = _free if free_xs else (lambda _t: None)
     fwd_chunk = _jitted_forward(chunk_fn)
     bwd_chunk = _jitted_backward(chunk_fn)
+    place = functools.partial(_place, chunk_fn)
 
     # --- forward, boundaries to the host (once for all costs) ------------------
     ta = time.time()
     s_fin, boundaries = _forward(fwd_chunk, params, init_state, n_chunks, xs_fn, stride, free,
-                                 None)
+                                 None, place=place)
     losses = [float(f(s_fin)) for f in loss_fns]
     fwd_t = time.time() - ta
     host_gb = _host_gb(boundaries)
@@ -687,12 +733,13 @@ def chunked_grad_multi(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     for sup_lo in reversed(range(0, n_chunks, stride)):
         sup_hi = min(sup_lo + stride, n_chunks)
         span = (boundaries if stride == 1
-                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, xs_fn, free))
+                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, xs_fn, free,
+                                   place))
         for c in reversed(range(sup_lo, sup_hi)):
-            s_in = jax.device_put(span[c])
+            s_in = place(span[c])
             xs_c = xs_fn(c)
             for k in range(K):
-                cot = jax.device_put(cots[k])
+                cot = place(cots[k])
                 g_s, g_p = jax.block_until_ready(bwd_chunk(s_in, xs_c, params, cot))
                 if lin_mode is not None and lin_info is None:
                     lin_info = _check_linear(bwd_chunk, s_in, xs_c, params, cot, g_s, g_p,
@@ -741,22 +788,24 @@ def chunked_forward(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     """
     free = _free if free_xs else (lambda _t: None)
     s, _ = _forward(_jitted_forward(chunk_fn), params, init_state, n_chunks, xs_fn,
-                    stride=1, free=free, checkpoint=None, keep_boundaries=False)
+                    stride=1, free=free, checkpoint=None, keep_boundaries=False,
+                    place=functools.partial(_place, chunk_fn))
     return s
 
 
 def _forward(fwd_chunk, params, init_state, n_chunks, xs_fn, stride, free, checkpoint,
-             keep_boundaries=True):
+             keep_boundaries=True, place=jax.device_put):
     """Run the window, returning ``(final_state, {chunk_index: host_state} | None)``.
 
-    The window start and the window end are always kept, whatever the stride."""
+    The window start and the window end are always kept, whatever the stride. ``place`` puts a
+    resumed host state on the device(s) (:func:`_place`)."""
     s, c0 = init_state, 0
     kept = {0: jax.device_get(s)} if keep_boundaries else None
     if checkpoint is not None:
         st_r, c0 = checkpoint.forward_resume(like=init_state)
         if st_r is not None:
             kept = checkpoint.load_boundaries(like=init_state)
-            s = jax.device_put(st_r)
+            s = place(st_r)
         elif checkpoint.put_boundary(0, kept[0]):
             raise LegIncomplete("forward", 0)
     for c in range(c0, n_chunks):
@@ -774,14 +823,19 @@ def _forward(fwd_chunk, params, init_state, n_chunks, xs_fn, stride, free, check
 
 
 def _host_gb(boundaries) -> float:
-    """GB of boundary states on the host; a lazy store counts what it holds."""
+    """GB of boundary states on the host; a lazy store counts what it holds, through a
+    ``resident_bytes()`` method or a ``host_gb`` attribute (``scripts/adjoint/ice_cbar.py``'s
+    ``LazyBoundaries``)."""
     resident = getattr(boundaries, "resident_bytes", None)
     if resident is not None:
         return resident() / 1e9
+    gb = getattr(boundaries, "host_gb", None)
+    if gb is not None:
+        return float(gb)
     return sum(a.nbytes for a in jax.tree.leaves(boundaries)) / 1e9
 
 
-def _rebuild_span(fwd_chunk, params, stored, lo, hi, xs_fn, free):
+def _rebuild_span(fwd_chunk, params, stored, lo, hi, xs_fn, free, place=jax.device_put):
     """Re-run chunks ``lo..hi-1`` from the stored boundary at ``lo``; host states by chunk index.
 
     The second level of checkpointing, and the reason a year is reachable. Level one trades device
@@ -793,7 +847,7 @@ def _rebuild_span(fwd_chunk, params, stored, lo, hi, xs_fn, free):
     at most once across the whole sweep. The gradient is unchanged; these are the same states.
     ``stored[lo]`` is read once: a lazy store reads it from disk on that access."""
     first = stored[lo]
-    s = jax.device_put(first)
+    s = place(first)
     local = {lo: first}
     for c in range(lo, hi - 1):
         xs_c = xs_fn(c)

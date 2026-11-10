@@ -56,7 +56,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
          kpp_cfg=None, tke_cfg=None, ale_cfg=None, visc_cfg=None, tracer_cfg=None,
          halo_ctx=None, boundary_node=None, adjoint_cfg=None,
          remat_blocks: bool = False, bulk_uvnode_lag: bool = False, ice_update=None,
-         recom_cfg=None, legacy_k33_weights: bool = False, legacy_sw_depth: bool = False) -> State:
+         recom_cfg=None, legacy_k33_weights: bool = False, legacy_sw_depth: bool = False,
+         pgf_batches: int = 1) -> State:
     """Advance ``state`` one ocean timestep. ``op`` is the static linfs SSH operator
     (:func:`ssh.build_ssh_operator`, built once outside the loop); ``stress_surf`` is
     the element wind stress (:func:`forcing.surface_stress`, static analytical, or
@@ -193,6 +194,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # the live tracers; remat differentiates closed-over tracers correctly (the integrate() body
     # closes over ``params`` the same way).
     _ckpt = jax.checkpoint if remat_blocks else (lambda f: f)
+    # ``pgf_batches > 1``: the zstar Shchepetkin PGF runs over that many element blocks, each in
+    # its own checkpoint (pgf.pressure_force_shchepetkin): its [elem2D, 3, nl] stencil
+    # temporaries were ~37 GiB of the farc one-step VJP peak. Forward values to rounding.
 
     # zstar live geometry (D1): the per-node zbar_3d_n/Z_3d_n + the per-element zbar_n/Z_n,
     # both derived from the carried (pre-commit) st.hnode/st.helem. Hoisted ONCE here — BEFORE
@@ -369,7 +373,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     difference ulp ~30× and diverged from the pgf.py ρ−ρ0 contract).
     if ale_cfg is not None:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_shchepetkin(
-            mesh, density, Z3d_live, st.helem))()
+            mesh, density, Z3d_live, st.helem, batches=pgf_batches))()
         if _adj.freeze_pgf:
             pgf_x, pgf_y = jax.lax.stop_gradient(pgf_x), jax.lax.stop_gradient(pgf_y)
     else:
@@ -877,7 +881,7 @@ step_jit = jax.jit(step,
                    static_argnames=("dt", "is_first_step", "ice_cfg", "gm_cfg", "kpp_cfg",
                                     "tke_cfg", "ale_cfg", "visc_cfg", "tracer_cfg",
                                     "remat_blocks", "recom_cfg", "legacy_k33_weights",
-                                    "legacy_sw_depth"))
+                                    "legacy_sw_depth", "pgf_batches"))
 
 
 def run(state: State, mesh: Mesh, op: SSHOperator, stress_surf, n_steps: int,

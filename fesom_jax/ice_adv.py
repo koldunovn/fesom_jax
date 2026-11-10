@@ -109,7 +109,9 @@ def _solve_high_order(cfg: IceConfig, mesh: Mesh, rhs_a, rhs_m, rhs_ms, exch=Non
 
 
 def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
-             freeze_limiter=False, freeze_limited_flux=False):
+             freeze_limiter=False, freeze_limited_flux=False, pin_bounds=False,
+             freeze_bounds=False, freeze_extremes=False, freeze_extremes_at=None,
+             freeze_bounds_at=None):
     """The Zalesak limiter for one tracer (``ice_fem_fct``, ``:351-518``). Returns the
     flux-corrected tracer ``= vals_l + limited antidiffusive flux``.
 
@@ -124,7 +126,35 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
     FCT; the antidiffusive fluxes and the low-order solution stay differentiated.
     ``freeze_limited_flux`` (derivative only): the whole limited antidiffusive correction
     enters as a constant, so the tangent is that of the low-order solution, as
-    ``AdjointConfig.freeze_advection`` does for the ocean FCT."""
+    ``AdjointConfig.freeze_advection`` does for the ocean FCT.
+    ``pin_bounds`` (derivative only): a bound the node attains itself (``tmax = 0`` or
+    ``tmin = 0``) has no tangent. There the forward value is a tie (open water: every value of
+    the patch is 0, and the clipping ratios of all three vertices are 0), the min/max
+    derivatives average over the tied entries, and a vertex whose flux sum is ~1e-11 gets into
+    the average: the farc one-step m_ice tangent has a top singular value of 2e2-4e3 from
+    this alone, 5-10 with it removed.
+    ``freeze_bounds`` (derivative only): the bounds ``tmax``/``tmin`` enter the clipping ratios
+    as constants everywhere; their flux-sum denominators stay differentiated, so a clipped
+    node's limited correction still saturates in the tangent (unlike ``freeze_limiter``). The
+    one-step top singular value is 1.6-2.2 and the 24-step reverse product contracts (0.8) at
+    every farc state tried, including the Gulf of Anadyr pattern that ``pin_bounds`` leaves
+    growing (x2.4 per step).
+    ``freeze_extremes`` (derivative only): the cluster extremes ``hi``/``lo`` enter as constants,
+    the low-order value inside ``tmax = hi - vals_l`` stays differentiated. Alone it leaves the
+    open-water ties (σ 1e3-6e3); with ``pin_bounds`` σ is 5-7 and the 24-step reverse product
+    0.8 at three of four farc states (4.4 at the fourth, day 200).
+    ``freeze_extremes_at`` (a ``[nod2D]`` bool mask, derivative only): ``freeze_extremes`` on
+    those nodes only (the coast, ``IceConfig.adjoint_cuts`` "fct_hilo_coast"). With
+    ``pin_bounds`` it removes the Gulf of Anadyr pattern (24-step product 7e8 -> 0.2) while 96 %
+    of the farc nodes keep the exact bound derivative.
+    ``freeze_bounds_at`` (a ``[nod2D]`` bool mask, derivative only): ``freeze_bounds`` on those
+    nodes only (the coast and its first ring, :func:`coast_ring`, ``IceConfig.adjoint_cuts``
+    "fct_bound_coast"). Freezing only the extremes there is not enough: at a node that attains
+    its own cluster extreme, a constant ``hi`` leaves ``-d vals_l / f`` in the clipping ratio.
+    On farc that grew a snow pattern on a Baffin Island fjord (day 50 of 2013, x8.3 over 24
+    steps with the extremes frozen on the coast, x94 at an Antarctic ring node with them frozen
+    on the first ring as well); with the whole bound constant on the coast and its first ring
+    (7.6 % of the nodes) every state tried contracts or stays at the pin-only level."""
     _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
     en = mesh.elem_nodes
     g = cfg.ice_gamma_fct
@@ -153,8 +183,21 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
     # masked ratios are unchanged on every live node, where hi/lo are finite).
     hi = jnp.where(jnp.isfinite(hi), hi, 0.0)
     lo = jnp.where(jnp.isfinite(lo), lo, 0.0)
+    if freeze_extremes:
+        hi, lo = jax.lax.stop_gradient(hi), jax.lax.stop_gradient(lo)
+    if freeze_extremes_at is not None:
+        hi = jnp.where(freeze_extremes_at, jax.lax.stop_gradient(hi), hi)
+        lo = jnp.where(freeze_extremes_at, jax.lax.stop_gradient(lo), lo)
     tmax = hi - vals_l
     tmin = lo - vals_l
+    if pin_bounds:
+        tmax = jnp.where(tmax > 0.0, tmax, jax.lax.stop_gradient(tmax))
+        tmin = jnp.where(tmin < 0.0, tmin, jax.lax.stop_gradient(tmin))
+    if freeze_bounds:
+        tmax, tmin = jax.lax.stop_gradient(tmax), jax.lax.stop_gradient(tmin)
+    if freeze_bounds_at is not None:
+        tmax = jnp.where(freeze_bounds_at, jax.lax.stop_gradient(tmax), tmax)
+        tmin = jnp.where(freeze_bounds_at, jax.lax.stop_gradient(tmin), tmin)
 
     # +/- flux sums per node, then the clipping ratios (C lines 440-472).
     fp = ops.scatter_add(jnp.maximum(icefluxes, 0.0), en, mesh.nod2D, inv=getattr(mesh, "inv_elem_nodes", None))
@@ -184,8 +227,24 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
     return vals_l + corr
 
 
+def coast_ring(mesh: Mesh, boundary_node) -> jnp.ndarray:
+    """The coastal nodes and their first ring (``[nod2D]`` bool): ``boundary_node`` plus every
+    vertex of a cell element (``ulevels <= 1``, the elements the limiter reads) that has a
+    coastal vertex. Sharding: pass the partitioned global ``boundary_node``; the ring is right
+    on the owned nodes (all their elements are local), and the halo copies of the clipping
+    ratios it masks are refreshed from the owners."""
+    bn = jnp.asarray(boundary_node, bool)
+    en = mesh.elem_nodes
+    touch = jnp.where(mesh.ulevels <= 1, bn[en].any(axis=1), False)              # [elem]
+    hits = ops.scatter_add(jnp.broadcast_to(touch[:, None], en.shape).astype(jnp.int32), en,
+                           mesh.nod2D)
+    return bn | (hits > 0)
+
+
 def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, exch=None,
-              freeze_limiter=False, freeze_limited_flux=False):
+              freeze_limiter=False, freeze_limited_flux=False, pin_bounds=False,
+              freeze_bounds=False, freeze_extremes=False, freeze_extremes_at=None,
+              freeze_bounds_at=None):
     """Advance the 3 ice tracers one step by FCT (``fesom_ice_fct_solve``). Returns the
     advected ``(a_ice, m_ice, m_snow)`` (before ``cut_off``).
 
@@ -195,8 +254,10 @@ def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, ex
     refresh them before the limiter (``SYNC_MAP`` M4.3c: the low-order ``a_l/m_l/ms_l`` + the
     high-order ``dvalues`` halos). The high-order solve's per-iteration ``dvalues`` refresh +
     the limiter's ``icepplus/icepminus`` refresh are owned by ``_solve_high_order``/``_fem_fct``.
-    ``freeze_limiter``, ``freeze_limited_flux``: see ``_fem_fct`` (``IceConfig.adjoint_cuts``
-    "fct_limiter", "fct_flux")."""
+    ``freeze_limiter``, ``freeze_limited_flux``, ``pin_bounds``, ``freeze_bounds``,
+    ``freeze_extremes``, ``freeze_extremes_at``, ``freeze_bounds_at``: see ``_fem_fct``
+    (``IceConfig.adjoint_cuts`` "fct_limiter", "fct_flux", "fct_pin", "fct_bound", "fct_hilo",
+    "fct_hilo_coast", "fct_bound_coast")."""
     _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
     rhs_m, rhs_a, rhs_ms = _tg_rhs(cfg, mesh, u_ice, v_ice, a_ice, m_ice, m_snow)
     da, dm, dms = _solve_high_order(cfg, mesh, rhs_a, rhs_m, rhs_ms, exch=exch)
@@ -204,10 +265,10 @@ def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, ex
     # refresh the low- + high-order halos read at element vertices inside the limiter.
     a_l, m_l, ms_l = _exch(a_l, "nod"), _exch(m_l, "nod"), _exch(ms_l, "nod")
     da, dm, dms = _exch(da, "nod"), _exch(dm, "nod"), _exch(dms, "nod")
-    m_new = _fem_fct(cfg, mesh, m_ice, m_l, dm, exch=exch, freeze_limiter=freeze_limiter,
-                     freeze_limited_flux=freeze_limited_flux)
-    a_new = _fem_fct(cfg, mesh, a_ice, a_l, da, exch=exch, freeze_limiter=freeze_limiter,
-                     freeze_limited_flux=freeze_limited_flux)
-    ms_new = _fem_fct(cfg, mesh, m_snow, ms_l, dms, exch=exch, freeze_limiter=freeze_limiter,
-                      freeze_limited_flux=freeze_limited_flux)
+    kw = dict(exch=exch, freeze_limiter=freeze_limiter, freeze_limited_flux=freeze_limited_flux,
+              pin_bounds=pin_bounds, freeze_bounds=freeze_bounds, freeze_extremes=freeze_extremes,
+              freeze_extremes_at=freeze_extremes_at, freeze_bounds_at=freeze_bounds_at)
+    m_new = _fem_fct(cfg, mesh, m_ice, m_l, dm, **kw)
+    a_new = _fem_fct(cfg, mesh, a_ice, a_l, da, **kw)
+    ms_new = _fem_fct(cfg, mesh, m_snow, ms_l, dms, **kw)
     return a_new, m_new, ms_new

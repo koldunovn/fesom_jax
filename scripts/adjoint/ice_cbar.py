@@ -27,6 +27,15 @@ After every step ``k`` the accumulator ``drift`` adds
 the AD-safe speed). ``J_drift(n) = S(n)/n``: one sweep serves every window, as for
 ``tke_cbar``'s ``J_Tfull``.
 
+**Ice volume and area.** ``grad --ice-cost vol|area [--cost-box nh|arctic]`` replaces the drift
+cost by a TERMINAL one: the ice volume ``sum_i w_i m_i / 1e12`` [1e3 km³] (``m`` is the ice
+volume per unit area) or area ``sum_i w_i a_i / 1e12`` [1e6 km²] at the window end, ``w`` the node
+area of the wet surface nodes of the cost box (``nh``, the default: the Northern Hemisphere;
+``arctic``: >= 70N). One reverse sweep per window end. The model keeps its drift accumulator, so
+the drift bases serve these costs unchanged (the box checks stay on the drift box). Every
+forward row carries both in both boxes (``ice``: ``vol_nh``, ``area_nh``, ``vol_arctic``,
+``area_arctic``), so one set of FD forwards serves every window end (:func:`ice_values`).
+
 **Controls.** The default log controls of ``core2_adj`` plus, opt-in (``--controls``),
 ``ln_ice_pstar`` and ``ln_ice_cd``: ``p = p_cfg * exp(ln p)`` with ``p_cfg`` the model's
 ``IceConfig.pstar`` / ``cd_oce_ice``, handed to the ice step as ``Params.ice_pstar`` /
@@ -82,6 +91,7 @@ import json  # noqa: E402
 import math  # noqa: E402
 import os  # noqa: E402
 import time  # noqa: E402
+from collections.abc import MutableMapping  # noqa: E402
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -94,6 +104,7 @@ from fesom_jax import tracer_adv  # noqa: E402
 from fesom_jax.adjoint_stab import AdjointConfig, amplification  # noqa: E402
 from fesom_jax.forcing import _safe_speed  # noqa: E402
 from fesom_jax.ice import IceConfig  # noqa: E402
+from fesom_jax.run_config import load_yaml  # noqa: E402
 
 BOX = "arctic"
 #: drift-cost boxes, picked with ``--box`` (default :data:`BOX`)
@@ -101,9 +112,24 @@ DRIFT_BOXES = {"arctic": C.Box(70.0, 90.0, -180.0, 180.0, 0.0, 50.0),
                "antarctic": C.Box(-90.0, -60.0, -180.0, 180.0, 0.0, 50.0)}
 for _name, _b in DRIFT_BOXES.items():
     C.BOXES.setdefault(_name, _b)
+#: terminal ice costs (``grad --ice-cost``): name -> (State field, divisor); ``J = sum_i w_i x_i /
+#: divisor`` over the cost box: ice volume [1e3 km³], ice area [1e6 km²]
+ICE_COSTS = {"vol": ("m_ice", 1e12), "area": ("a_ice", 1e12)}
+#: boxes of the terminal ice costs (``--cost-box``) and of the forward rows' ``ice`` values
+COST_BOXES = {"nh": C.Box(0.0, 90.0, -180.0, 180.0, 0.0, 50.0), "arctic": DRIFT_BOXES["arctic"]}
+for _name, _b in COST_BOXES.items():
+    C.BOXES.setdefault(_name, _b)
 #: control name -> (control-pytree key, IceConfig field, Params field)
 ICE_CONTROLS = {"pstar": ("ln_ice_pstar", "pstar", "ice_pstar"),
                 "cd": ("ln_ice_cd", "cd_oce_ice", "ice_cd")}
+#: atmospheric-forcing controls (``--controls``): name -> ``Params.forcing_adj`` field
+#: (``step.FORCING_ADJ_KEYS``). Each is a window-constant ``[nod2D]`` anomaly in the field's own
+#: units (K, W/m², m/s in the model frame, kg/kg, m/s of water), zero in the base; its gradient
+#: is a map (``grad_forcing.npz``). An FD direction is a uniform anomaly over a box,
+#: ``--control <name>:<box>`` with a box of :data:`COST_BOXES`, so the FD matches the sum of the
+#: map over the box's nodes (``grads["<name>:<box>"]``).
+FORCING_CONTROLS = {"tair": "Tair", "lw": "longwave", "sw": "shortwave", "uair": "u_air",
+                    "vair": "v_air", "shum": "shum", "snow": "prec_snow", "rain": "prec_rain"}
 REPLAY_FIELDS = ("a_ice", "m_ice", "m_snow", "t_skin")
 FP_FIELDS = ("T", "u_ice", "v_ice", "a_ice", "eta_n")   #: per-boundary state fingerprints
 WINDOW_DAYS = (1.0, 2.0, 5.0, 10.0)
@@ -153,6 +179,68 @@ def accumulators(mesh, box=BOX):
     return {"drift": lambda s: drift_value(s, w)}
 
 
+def sharded_accumulators(mesh, part, sm, box=BOX):
+    """:func:`accumulators` for the sharded chunk program (``core2_adj.build_model(dist=)``):
+    the box weights partitioned and zeroed off the owned lanes, so the local sums ``psum`` to
+    the dense sums with every node counted once."""
+    from fesom_jax.shard_mesh import _shard_along_axis, local_sizes
+    _, Lmax = local_sizes(part)
+    w_p = _shard_along_axis(arctic_weights(mesh, box), part.myList_nod2D, Lmax["nod"], 0, 0.0)
+    w_p = np.where(np.asarray(sm.owned_mask["nod"]), w_p, 0.0)
+
+    def drift(state, m, ctx, a):
+        wa = a["w"] * state.a_ice
+        den = jax.lax.psum(jnp.sum(wa), ctx.axis_name)
+        num = jax.lax.psum(jnp.sum(wa * _safe_speed(state.u_ice, state.v_ice)), ctx.axis_name)
+        empty = den == 0.0
+        return jnp.where(empty, 0.0, num / jnp.where(empty, 1.0, den))
+    return {"drift": drift}, {"w": w_p}
+
+
+def ice_cost_value(state, w, cost: str):
+    """The terminal ice cost ``cost`` (:data:`ICE_COSTS`) of one state with node weights ``w``."""
+    field, div = ICE_COSTS[cost]
+    return jnp.sum(w * getattr(state, field)) / div
+
+
+def ice_diag_fn(mesh):
+    """``state -> {"<cost>_<box>": value}`` for every :data:`ICE_COSTS` x :data:`COST_BOXES`
+    (the ``ice`` entry of a forward row)."""
+    ws = {b: jnp.asarray(arctic_weights(mesh, b)) for b in COST_BOXES}
+
+    def diag(state):
+        return {f"{c}_{b}": float(ice_cost_value(state, w, c))
+                for b, w in ws.items() for c in ICE_COSTS}
+    return diag
+
+
+def folded_node_weights(model, w) -> np.ndarray:
+    """Dense node weights ``w`` [nod2D] in the layout of the model's carry: unchanged on one
+    device; sharded, the folded ``[P*Lmax]`` lanes with every node on its OWNER lane only (halo
+    and pad lanes zero), so a sum over the folded carry counts each node once."""
+    w = np.asarray(w)
+    if getattr(model, "sharded", None) is None:
+        return w
+    from fesom_jax.shard_mesh import _shard_along_axis, local_sizes
+    part, sm = model.sharded.part, model.sharded.sm
+    _, Lmax = local_sizes(part)
+    w_p = _shard_along_axis(w, part.myList_nod2D, Lmax["nod"], 0, 0.0)
+    return np.where(np.asarray(sm.owned_mask["nod"]), w_p, 0.0).reshape(-1)
+
+
+def ice_cost_loss(model, cost: str, box: str):
+    """The terminal ice cost as a loss on the model's (dense or folded) final carry."""
+    if cost not in ICE_COSTS:
+        raise ValueError(f"unknown ice cost {cost!r}; known: {sorted(ICE_COSTS)}")
+    w = jnp.asarray(folded_node_weights(model, arctic_weights(model.mesh, box)))
+    return lambda carry: ice_cost_value(model.state_of(carry), w, cost)
+
+
+def ice_values(run_dir: Path, key: str) -> dict:
+    """``{steps: value}`` of the forward rows' ``ice[key]`` (e.g. ``vol_nh``)."""
+    return {n: float(r["ice"][key]) for n, r in fwd_records(run_dir).items() if "ice" in r}
+
+
 def run_box(run_dir: Path):
     """The drift box a run directory was made with, from its ``results.jsonl`` rows: None
     without rows, :data:`BOX` for rows written before the box became a choice."""
@@ -187,18 +275,52 @@ def drift_loss(n: int):
 
 def parse_controls(spec) -> tuple:
     names = tuple(x for x in (spec or "").split(",") if x and x != "none")
-    bad = [x for x in names if x not in ICE_CONTROLS]
+    known = {**ICE_CONTROLS, **FORCING_CONTROLS}
+    bad = [x for x in names if x not in known]
     if bad:
-        raise ValueError(f"unknown ice control(s) {bad}; known: {sorted(ICE_CONTROLS)}")
+        raise ValueError(f"unknown ice control(s) {bad}; known: {sorted(known)}")
     return names
 
 
-def ice_params0(controls) -> dict:
-    """The default control pytree plus ``ln_ice_<c>`` = 0 for each requested ice control."""
+def ice_params0(controls, nod2D: int | None = None) -> dict:
+    """The default control pytree plus ``ln_ice_<c>`` = 0 for each requested ice control and,
+    for the forcing controls, ``forcing_adj = {field: zeros(nod2D)}``."""
     u = dict(C.default_params0(0))
     for c in controls:
-        u[ICE_CONTROLS[c][0]] = np.zeros((), np.float64)
+        if c in ICE_CONTROLS:
+            u[ICE_CONTROLS[c][0]] = np.zeros((), np.float64)
+    forc = [FORCING_CONTROLS[c] for c in controls if c in FORCING_CONTROLS]
+    if forc:
+        if nod2D is None:
+            raise ValueError(f"forcing controls {forc} need the mesh size nod2D")
+        u["forcing_adj"] = {f: np.zeros(int(nod2D), np.float64) for f in forc}
     return u
+
+
+def mesh_nod2D(config=None) -> int:
+    """The node count of the config's mesh, read from the mesh export without loading it."""
+    cfg = load_yaml(Path(config) if config is not None else C.CONFIG)
+    mdir = Path(cfg.mesh) if Path(cfg.mesh).is_absolute() else C.ROOT / cfg.mesh
+    return int(np.load(mdir / "nlevels_nod2D.npy", mmap_mode="r").shape[0])
+
+
+def parse_fd_control(control: str):
+    """``"pstar"`` -> ``("pstar", None)``; ``"tair:arctic"`` -> ``("tair", "arctic")`` (a forcing
+    control needs a box of :data:`COST_BOXES`, an ice control takes none)."""
+    name, _, box = control.partition(":")
+    if name in FORCING_CONTROLS:
+        if box not in COST_BOXES:
+            raise ValueError(f"forcing FD control {control!r} needs ':<box>', box in "
+                             f"{sorted(COST_BOXES)}")
+        return name, box
+    if box:
+        raise ValueError(f"ice control {control!r} takes no box")
+    return name, None
+
+
+def forcing_box_nodes(mesh, box: str) -> np.ndarray:
+    """The nodes of a forcing FD direction: the wet surface nodes of ``box`` (bool [nod2D])."""
+    return np.asarray(C.box_masks(mesh, COST_BOXES[box])[0], bool)
 
 
 def make_to_params(ice_cfg, controls):
@@ -215,19 +337,34 @@ def make_to_params(ice_cfg, controls):
         cfg = get()
         repl = {}
         for c in controls:
-            key, field, pfield = ICE_CONTROLS[c]
-            repl[pfield] = jnp.asarray(getattr(cfg, field), jnp.float64) * jnp.exp(u[key])
+            if c in ICE_CONTROLS:
+                key, field, pfield = ICE_CONTROLS[c]
+                repl[pfield] = jnp.asarray(getattr(cfg, field), jnp.float64) * jnp.exp(u[key])
+        if "forcing_adj" in u:
+            repl["forcing_adj"] = dict(u["forcing_adj"])
         return dataclasses.replace(p, **repl)
     return to_params
 
 
-def perturbed(params0: dict, control: str, h: float, sign: int) -> dict:
-    u = {k: np.array(v) for k, v in params0.items()}
+def perturbed(params0: dict, control: str, h: float, sign: int, mesh=None) -> dict:
+    """``params0`` with ``control`` set to ``sign * h``: an ice control's log multiplier, or a
+    forcing control ``<name>:<box>`` as a uniform anomaly ``sign * h`` on the box's nodes
+    (:func:`forcing_box_nodes`; needs ``mesh``)."""
+    u = jax.tree.map(np.array, params0)
     if control != "none":
-        key = ICE_CONTROLS[control][0]
-        if key not in u:
-            raise ValueError(f"control {control!r} is not in this model's controls")
-        u[key] = np.asarray(sign * h, np.float64)
+        name, box = parse_fd_control(control)
+        if box is None:
+            key = ICE_CONTROLS[name][0]
+            if key not in u:
+                raise ValueError(f"control {control!r} is not in this model's controls")
+            u[key] = np.asarray(sign * h, np.float64)
+        else:
+            field = FORCING_CONTROLS[name]
+            if field not in u.get("forcing_adj", {}):
+                raise ValueError(f"control {control!r} is not in this model's controls")
+            if mesh is None:
+                raise ValueError(f"forcing FD control {control!r} needs the mesh")
+            u["forcing_adj"][field] = np.where(forcing_box_nodes(mesh, box), sign * h, 0.0)
     return C._strong_f64(u)
 
 
@@ -292,25 +429,40 @@ def apply_ice_settings(model, settings: dict) -> None:
 
 def build(start, n_steps, chunk_steps, *, adjoint_cfg=None, ice_mode="prescribed",
           ice_settings=None, controls=("pstar", "cd"), accs=None, ice_adjoint=None, box=BOX,
-          tke_settings=None, fast=None, restart=None, devices=1, **schedule):
+          tke_settings=None, fast=None, restart=None, devices=1, config=None,
+          remat_blocks=False, pgf_batches=1, dist=0, dist_dir=None, transport="coloured",
+          **schedule):
     """The CORE2 reference model with the drift accumulator over ``box`` (or ``accs``), the
     ice adjoint mode, its derivative-only mEVP settings (``ice_adjoint``,
     ``core2_adj.build_model``), the extra ``IceConfig`` settings and the opt-in ice controls;
-    ``schedule``: ``build_model``'s forcing controls and cost interval (``tke_cbar.schedule_kwargs``)."""
+    ``schedule``: ``build_model``'s forcing controls and cost interval (``tke_cbar.schedule_kwargs``).
+    ``config`` / ``restart``: another model with the same physics (farc: ``configs/
+    farc_full.yaml`` and a restart directory at ``start``), see :func:`run_dt`. ``dist``,
+    ``dist_dir``, ``transport``: the chunk program on ``dist`` devices
+    (``core2_adj.build_model``; the drift accumulator via :func:`sharded_accumulators`);
+    ``devices``: the other sharded path (``fesom_jax.adjoint_sharded``, its own transport default)."""
     if box not in DRIFT_BOXES:
         raise ValueError(f"unknown drift box {box!r}; known: {sorted(DRIFT_BOXES)}")
+    sharded_accs = None
     if accs is None:
         accs = functools.partial(accumulators, box=box)
+        sharded_accs = functools.partial(sharded_accumulators, box=box)
+    elif dist:
+        raise ValueError("dist with custom accumulators needs their sharded versions")
     controls = tuple(controls)
     holder = {}
     kw = {}
     if controls:
-        kw = dict(params0=ice_params0(controls),
+        nod = mesh_nod2D(config) if any(c in FORCING_CONTROLS for c in controls) else None
+        kw = dict(params0=ice_params0(controls, nod),
                   to_params=make_to_params(lambda: holder["ice"], controls))
     model = C.build_model(start, n_steps, chunk_steps, restart,
                           adjoint_cfg or AdjointConfig.exact(), ice_mode,
                           accumulators=accs, rematerialize=True, ice_adjoint=ice_adjoint,
-                          tke_settings=tke_settings, fast=fast, devices=devices, **kw, **schedule)
+                          tke_settings=tke_settings, fast=fast, devices=devices,
+                          config=config, remat_blocks=remat_blocks, pgf_batches=pgf_batches,
+                          dist=dist, dist_dir=dist_dir, sharded_accumulators=sharded_accs,
+                          **({"transport": transport} if dist else {}), **kw, **schedule)
     apply_ice_settings(model, parse_ice_settings(ice_settings))
     holder["ice"] = model.phys["ice_cfg"]
     model.ice_settings = parse_ice_settings(ice_settings)
@@ -392,8 +544,9 @@ def missing_replay_chunks(base_dir: Path, chunks) -> list:
 def run_fwd(model, run_dir: Path, *, params, n_steps: int, save_boundaries: bool = False,
             save_ice: bool = False, replay_dir: Path | None = None,
             budget_s: float = math.inf, prog=None, save_every: int = 1) -> dict:
-    """Advance chunk by chunk, appending ``S(steps)`` (``drift_sum``) and state fingerprints to
-    ``fwd.jsonl`` at every boundary; ``save_boundaries`` writes ``boundary_<c>.npz`` (the
+    """Advance chunk by chunk, appending ``S(steps)`` (``drift_sum``), the ice volume and area
+    (``ice``, :func:`ice_diag_fn`; models with a mesh) and state fingerprints to ``fwd.jsonl``
+    at every boundary; ``save_boundaries`` writes ``boundary_<c>.npz`` (the
     :class:`core2_adj.DiskCheckpoint` layout) at every ``save_every``-th boundary and the last
     (a grad over it needs a ``stride`` that is a multiple of ``save_every``), ``save_ice`` the
     per-step replay fields ``icestate_<c>.npz`` of chunk ``c``; ``replay_dir`` overwrites them
@@ -425,6 +578,7 @@ def run_fwd(model, run_dir: Path, *, params, n_steps: int, save_boundaries: bool
         if save_boundaries:
             T._host_save(run_dir / "boundary_0.npz", jax.device_get(carry))
     flag = jnp.asarray(replay_dir is not None)
+    diag = ice_diag_fn(model.mesh) if getattr(model, "mesh", None) is not None else None
     zeros = None
     xs_fn = model.xs_fn()
     clock = T.LegClock(budget_s)
@@ -455,6 +609,8 @@ def run_fwd(model, run_dir: Path, *, params, n_steps: int, save_boundaries: bool
         st = model.state_of(carry)
         row = {"chunk": c + 1, "steps": steps, "drift_sum": float(carry[1]["drift"]),
                "fp": _fingerprint(st), "wall_s": time.time() - t0}
+        if diag is not None:
+            row["ice"] = diag(st)
         with open(run_dir / "fwd.jsonl", "a") as f:
             f.write(json.dumps(row) + "\n")
         if save_ice:
@@ -524,42 +680,150 @@ class _NoSave(Exception):
     pass
 
 
+class LazyBoundaries(MutableMapping):
+    """``{chunk: host carry}`` that calls ``read(c)`` on every lookup of a key it was built with
+    and keeps nothing of those (``host_gb`` = 0 for ``chunked_grad``'s report). A boundary the
+    caller stores (a resumed forward adds them) is held like a dict entry."""
+
+    host_gb = 0.0
+
+    def __init__(self, read, keys):
+        self._read, self._keys, self._held = read, list(keys), {}
+
+    def __getitem__(self, c):
+        if c in self._held:
+            return self._held[c]
+        if c not in self._keys:
+            raise KeyError(c)
+        return self._read(c)
+
+    def __setitem__(self, c, v):
+        self._held[c] = v
+
+    def __delitem__(self, c):
+        del self._held[c]
+
+    def __iter__(self):
+        return iter(sorted(set(self._keys) | set(self._held)))
+
+    def __len__(self):
+        return len(set(self._keys) | set(self._held))
+
+
+class FoldingLegCheckpoint(T.LegCheckpoint):
+    """:class:`tke_cbar.LegCheckpoint` for a sharded model over a one-device base run: the
+    ``boundary_<c>`` files hold DENSE carries and are folded on load (``fold``:
+    ``core2_adj.Model.fold_carry``); the reverse-leg files are this run's own, already folded."""
+
+    def __init__(self, directory, params_like, *, budget_s=math.inf, stride=1, fold):
+        super().__init__(directory, params_like, budget_s=budget_s, stride=stride)
+        self.fold = fold
+
+    def load_boundaries(self, like):
+        """The kept boundaries as a :class:`LazyBoundaries`: each is read and folded when the
+        sweep asks for it. A dolpung node has ~480 GB of CPU memory (its 877 GB include the four
+        GPUs' HBM); the 90-day farc window at stride 20 held 19 boundaries plus a 20-state span
+        of 9.3 GB each and thrashed (job 28048633). Over a base saved at every gradient chunk,
+        stride 1 needs no span and keeps one or two states on the host."""
+        saved = self._saved()
+        keep = [c for c in saved if c % self.stride == 0 or c == saved[-1]]
+        return LazyBoundaries(lambda c: self.fold(self._load(self.dir / f"boundary_{c}.npz",
+                                                             like)), keep)
+
+    def forward_resume(self, like):
+        st, c = super().forward_resume(like)
+        return (None if st is None else self.fold(st)), c
+
+
+def base_factor(base_dir: Path, chunk_steps: int) -> int:
+    """How many base chunks one gradient chunk of ``chunk_steps`` spans, from the base run's
+    ``results.jsonl`` (1 without rows: the base's chunk is taken to be the gradient's). A base
+    at chunk 1 saved every 24 steps serves a gradient at chunk 24 with factor 24."""
+    p = Path(base_dir) / "results.jsonl"
+    rows = ([json.loads(x) for x in p.read_text().splitlines() if x.strip()]
+            if p.exists() else [])
+    ks = {int(r["chunk_steps"]) for r in rows if r.get("chunk_steps")}
+    if not ks:
+        return 1
+    if len(ks) > 1:
+        raise ValueError(f"base {base_dir} mixes chunk lengths {sorted(ks)}")
+    kb = ks.pop()
+    if chunk_steps % kb:
+        raise ValueError(f"gradient chunk {chunk_steps} is not a multiple of the base chunk {kb}")
+    return chunk_steps // kb
+
+
+def dense_boundary_state(model, path: Path):
+    """The State of a (dense) base boundary file, also for a sharded model (its ``s0`` is the
+    dense start State; the carry's State leaves come first in the file)."""
+    leaves, tdef = jax.tree.flatten(jax.device_get(model.s0))
+    with np.load(path) as z:
+        return jax.tree.unflatten(tdef, [np.asarray(z[f"arr_{i}"]) for i in range(len(leaves))])
+
+
 def run_grad(model, run_dir: Path, base_dir: Path, *, n_steps: int, budget_s: float,
-             stride: int = 1, on_cot=None, lazy: bool = True) -> dict:
-    """Reverse sweep of ``J_drift(n_steps)`` over the base boundaries (linked into
-    ``run_dir``); resumable legs (``tke_cbar.LegCheckpoint``). ``on_cot(c, cot)``: called at
-    every chunk boundary with the carry cotangent (:func:`dump_cot_hook`)."""
+             stride: int = 1, on_cot=None, lazy: bool = True, cost: str = "drift",
+             cost_box: str = "nh") -> dict:
+    """Reverse sweep of ``J_drift(n_steps)`` (``cost="drift"``) or of the terminal ice cost
+    ``cost`` over ``cost_box`` (:data:`ICE_COSTS`, :data:`COST_BOXES`) over the base boundaries
+    (linked into ``run_dir``); resumable legs (``tke_cbar.LegCheckpoint``; ``lazy``: each stored
+    boundary read when its span is rebuilt). ``on_cot(c, cot)``: called at every chunk boundary
+    with the carry cotangent (:func:`dump_cot_hook`)."""
     run_dir = out_path(run_dir)
     box = getattr(model, "drift_box", BOX)
     check_box(base_dir, box, "base")
     check_box(run_dir, box, "gradient run")
+    if cost != "drift" and cost_box not in COST_BOXES:
+        raise ValueError(f"unknown cost box {cost_box!r}; known: {sorted(COST_BOXES)}")
     nc = model.chunks_for(n_steps)
-    T.link_base(Path(base_dir), run_dir, nc, stride)
-    loss = drift_loss(n_steps)
+    T.link_base(Path(base_dir), run_dir, nc, stride,
+                factor=base_factor(Path(base_dir), model.chunk_steps))
+    loss = drift_loss(n_steps) if cost == "drift" else ice_cost_loss(model, cost, cost_box)
     fj = run_dir / "forward.json"
     if not fj.exists():
-        last = jax.device_put(T._host_load(run_dir / f"boundary_{nc}.npz",
-                                           model.init_carry(host=True)))
-        fj.write_text(json.dumps({"loss": float(loss(last))}))
-        adjoint._free(last)
+        if cost == "drift":
+            last = jax.device_put(T._host_load(run_dir / f"boundary_{nc}.npz",
+                                               model.init_carry(host=True)))
+            fj.write_text(json.dumps({"loss": float(loss(last))}))
+            adjoint._free(last)
+        else:                                  # the base boundary is dense: the dense weights
+            st = dense_boundary_state(model, run_dir / f"boundary_{nc}.npz")
+            w = arctic_weights(model.mesh, cost_box)
+            fj.write_text(json.dumps({"loss": float(ice_cost_value(st, w, cost))}))
+    if getattr(model, "sharded", None) is None:
+        factory = lambda d, p, b: T.LegCheckpoint(d, p, budget_s=b, stride=stride,  # noqa: E731
+                                                  lazy=lazy)
+    else:
+        factory = lambda d, p, b: FoldingLegCheckpoint(d, p, budget_s=b, stride=stride,  # noqa: E731
+                                                       fold=model.fold_carry)
     rows = C.run_grad(model, (loss,), n_steps=n_steps, stride=stride, check_linear=False,
                       resume_dir=run_dir, budget_s=budget_s, action="ice_grad", on_cot=on_cot,
-                      checkpoint_factory=lambda d, p, b: T.LegCheckpoint(d, p, budget_s=b,
-                                                                         stride=stride,
-                                                                         lazy=lazy))
+                      checkpoint_factory=factory)
     r = rows[0]
-    r["cost"] = "drift"
+    r["cost"] = cost
+    r["cost_box"] = None if cost == "drift" else cost_box
     if r.get("status") == "ok":
         g = r["_result"]["grad"]
         r["grads"] = {c: float(np.asarray(g[ICE_CONTROLS[c][0]]))
-                      for c in getattr(model, "ice_controls", ()) if ICE_CONTROLS[c][0] in g}
+                      for c in getattr(model, "ice_controls", ())
+                      if c in ICE_CONTROLS and ICE_CONTROLS[c][0] in g}
+        fg = {c: np.asarray(g["forcing_adj"][FORCING_CONTROLS[c]])
+              for c in getattr(model, "ice_controls", ()) if c in FORCING_CONTROLS}
+        for c, field in fg.items():
+            for b in COST_BOXES:
+                r["grads"][f"{c}:{b}"] = float(field[forcing_box_nodes(model.mesh, b)].sum())
+        if fg:
+            r["_forcing_grad"] = fg
         r["grads_log_controls"] = {k: float(np.asarray(v)) for k, v in g.items()
-                                   if np.ndim(v) == 0}
+                                   if not isinstance(v, dict) and np.ndim(v) == 0}
     return r
 
 
-def grad_dir(grad_root: Path, tag: str, days: float) -> Path:
-    return Path(grad_root) / tag / f"drift_w{days:g}"
+def grad_dir(grad_root: Path, tag: str, days: float, cost: str = "drift",
+             cost_box: str = "nh") -> Path:
+    """``<tag>/drift_w<days>``; a terminal ice cost: ``<tag>/<cost>_<box>_w<days>``."""
+    name = "drift" if cost == "drift" else f"{cost}_{cost_box}"
+    return Path(grad_root) / tag / f"{name}_w{days:g}"
 
 
 # ---------------------------------------------------------------------------
@@ -645,15 +909,19 @@ def global_carry(model):
     return unfold
 
 
-def dump_cot_hook(dump_dir: Path, boundaries, fields=DUMP_FIELDS, unfold=None):
+def dump_cot_hook(dump_dir: Path, boundaries, fields=DUMP_FIELDS, unfold=None, dense=None):
     """``on_cot(c, cot)`` for :func:`run_grad`: at each listed chunk boundary ``c`` (the
     ``boundary`` of ``field_trace``) the chosen fields of the carry cotangent go to
-    ``<dump_dir>/cot_<c>.npz`` (``unfold``: a sharded model's :func:`global_carry`)."""
+    ``<dump_dir>/cot_<c>.npz`` (``unfold``: a ``--devices`` model's :func:`global_carry`; ``dense``: host carry
+    cotangent -> dense one, a ``--dist`` model's ``dense_cotangent``)."""
     want = frozenset(boundaries)
 
     def on_cot(c, cot):
         if c in want:
-            _save_dump(Path(dump_dir) / f"cot_{c}.npz", cot if unfold is None else unfold(cot), fields)
+            path = Path(dump_dir) / f"cot_{c}.npz"
+            if dense is not None and not path.exists():
+                cot = dense(jax.device_get(cot))
+            _save_dump(path, cot if unfold is None else unfold(cot), fields)
     return on_cot
 
 
@@ -936,10 +1204,19 @@ def git_head() -> str:
     return ""
 
 
+def run_dt(config=None) -> float:
+    """The time step of the model: ``core2_adj.DT`` (CORE2), or that of ``config``."""
+    return C.DT if config is None else float(C.load_yaml(Path(config)).dt)
+
+
 def _ice_prov(model) -> dict:
     """The ice-specific provenance fields (added to ``core2_adj.provenance``'s)."""
     sets = getattr(model, "ice_settings", {})
-    return {"ice_settings": sets, "ice_controls": list(getattr(model, "ice_controls", ())),
+    return {"config": str(getattr(model, "config_path", None)),
+            "restart": str(getattr(model, "restart", None)),
+            "remat_blocks": bool(getattr(model, "phys", {}).get("remat_blocks", False)),
+            "pgf_batches": int(getattr(model, "phys", {}).get("pgf_batches", 1)),
+            "ice_settings": sets, "ice_controls": list(getattr(model, "ice_controls", ())),
             "ice_cfg": {k: v for k, v in model.phys["ice_cfg"]._asdict().items()
                         if k in ("pstar", "cd_oce_ice", "evp_rheol_steps", "whichEVP",
                                  "adjoint_mode") + C.ICE_ADJOINT_FIELDS or k in sets},
@@ -967,7 +1244,7 @@ def _fwd_one(model, d: Path, *, control, h, sign, n, replay, save_boundaries, sa
     check_box(d, getattr(model, "drift_box", BOX), "run")
     if replay is not None:
         check_box(replay, getattr(model, "drift_box", BOX), "replay base")
-    params = perturbed(model.params0, control, h, sign)
+    params = perturbed(model.params0, control, h, sign, mesh=model.mesh)
     r = run_fwd(model, d, params=params, n_steps=n, save_boundaries=save_boundaries,
                 save_ice=save_ice, replay_dir=replay, budget_s=budget, save_every=save_every)
     row = _prov(model, "ice_fwd", n_steps=n, h=h, control=control, sign=sign,
@@ -994,8 +1271,31 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("action", choices=["fwd", "fdbatch", "grad", "tkegrad", "summary", "noise"])
     ap.add_argument("--start", default="2013-01-01")
+    ap.add_argument("--config", default=None,
+                    help="another model's config (e.g. configs/farc_full.yaml); its own dt")
+    ap.add_argument("--restart", default=None,
+                    help="restart directory at --start (with --config); tkegrad: the start restart (directory "
+                         "or tag; default: the tag of --start)")
+    ap.add_argument("--remat-blocks", action="store_true",
+                    help="grad: nested in-step remat (step(remat_blocks=True)); farc needs it")
+    ap.add_argument("--pgf-batches", type=int, default=1,
+                    help="grad: the Shchepetkin PGF over N element blocks, each checkpointed "
+                         "(step(pgf_batches=N)); farc needs it on one GH200")
+    ap.add_argument("--dist", type=int, default=0,
+                    help="grad: the chunk program on N devices with the FESOM partition "
+                         "dist_N (0 = one device)")
+    ap.add_argument("--dist-dir", default=None,
+                    help="grad: the mesh directory holding dist_N (default: the /pool mesh "
+                         "of the config's mesh name)")
+    ap.add_argument("--transport", default="coloured", choices=("coloured", "padded", "allgather"),
+                    help="grad with --dist: the halo transport")
     ap.add_argument("--box", default=BOX, choices=sorted(DRIFT_BOXES),
                     help="drift cost box (fwd, fdbatch, grad)")
+    ap.add_argument("--ice-cost", default="drift", choices=("drift",) + tuple(ICE_COSTS),
+                    help="grad: drift (J_drift over --box) or the terminal ice volume / area "
+                         "over --cost-box")
+    ap.add_argument("--cost-box", default="nh", choices=sorted(COST_BOXES),
+                    help="grad --ice-cost vol/area: the cost box")
     ap.add_argument("--chunk-steps", type=int, default=24)
     ap.add_argument("--days", type=float, default=10.0, help="fwd/fdbatch: forward length")
     ap.add_argument("--controls", default=None,
@@ -1037,8 +1337,6 @@ def main(argv=None) -> int:
                     help="grad/tkegrad (required): tke_diag.parse_setting spec")
     ap.add_argument("--tke-settings", default=None,
                     help="TkeConfig forward options, name=value+name=value (changes the model)")
-    ap.add_argument("--restart", default=None,
-                    help="tkegrad: the start restart (directory or tag; default: the tag of --start)")
     ap.add_argument("--devices", type=int, default=1,
                     help="tkegrad: > 1 shards every chunk over that many devices (MLD costs, scalar controls)")
     ap.add_argument("--fast", default=None,
@@ -1055,7 +1353,8 @@ def main(argv=None) -> int:
     ap.add_argument("--run-dir", default=None)
     ap.add_argument("--fd-root", default=None)
     ap.add_argument("--grad-root", default=None)
-    ap.add_argument("--tag", default=None, help="grad: run dir = <grad-root>/<tag>/drift_w<d>")
+    ap.add_argument("--tag", default=None, help="grad: run dir = <grad-root>/<tag>/drift_w<d> "
+                                                "(<cost>_<box>_w<d> for vol/area)")
     ap.add_argument("--dump-cot", default=None,
                     help="grad/tkegrad: chunk boundaries (e.g. 29-34) whose carry cotangent "
                          "goes to <run dir>/dump/cot_<c>.npz")
@@ -1079,9 +1378,9 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None, help="summary: JSON path (markdown next to it)")
     T.add_schedule_args(ap)
     args = ap.parse_args(argv)
-    if ((C.parse_fast(args.fast) or args.restart or args.devices != 1 or args.forcing_controls or args.cost_from
+    if ((C.parse_fast(args.fast) or args.devices != 1 or args.forcing_controls or args.cost_from
          or args.cost_to) and args.action != "tkegrad"):
-        ap.error("--fast / --restart / --devices / --forcing-controls / --cost-from / --cost-to are for tkegrad "
+        ap.error("--fast / --devices / --forcing-controls / --cost-from / --cost-to are for tkegrad "
                  "(the FD forwards: tke_cbar.py fwd ...)")
     if args.devices != 1 and (args.field_controls or args.cost not in ("MLD", "MLDm", "FRAM")):
         ap.error("--devices > 1: MLD / FRAM costs and scalar or forcing controls only (no --field-controls)")
@@ -1089,11 +1388,13 @@ def main(argv=None) -> int:
     job = os.environ.get("SLURM_JOB_ID") or datetime.datetime.now().strftime("%Y%m%d%H%M%S")
     budget = args.budget_hours * 3600.0
     hs = [float(x) for x in args.hs.split(",") if x]
+    dt = run_dt(args.config)
+    mkw = dict(config=args.config, restart=args.restart)
 
     if args.action == "noise":
-        windows = T.window_steps([float(x) for x in args.windows.split(",") if x])
+        windows = T.window_steps([float(x) for x in args.windows.split(",") if x], dt)
         out = out_path(args.out)
-        res = noise_floor(Path(args.base_dir), Path(args.run_dir), windows)
+        res = noise_floor(Path(args.base_dir), Path(args.run_dir), windows, dt=dt)
         res["provenance"] = {"git_head": git_head(), "slurm_job": job,
                              "base": args.base_dir, "repeat": args.run_dir,
                              "time": datetime.datetime.now().isoformat(timespec="seconds")}
@@ -1109,10 +1410,10 @@ def main(argv=None) -> int:
         return 0
 
     if args.action == "summary":
-        windows = T.window_steps([float(x) for x in args.windows.split(",") if x])
+        windows = T.window_steps([float(x) for x in args.windows.split(",") if x], dt)
         out = out_path(args.out)
         table = summarize(Path(args.fd_root), Path(args.grad_root) if args.grad_root else None,
-                          windows=windows, hs=hs, chunk_steps=args.chunk_steps)
+                          windows=windows, hs=hs, chunk_steps=args.chunk_steps, dt=dt)
         table["provenance"] = {"git_head": git_head(), "slurm_job": job,
                                "fd_root": args.fd_root, "grad_root": args.grad_root,
                                "time": datetime.datetime.now().isoformat(timespec="seconds")}
@@ -1128,10 +1429,10 @@ def main(argv=None) -> int:
                               else ("none" if args.action == "tkegrad" else "pstar,cd"))
 
     if args.action in ("fwd", "fdbatch"):
-        n = int(round(args.days * 86400.0 / C.DT))
+        n = int(round(args.days * 86400.0 / dt))
         model = build(args.start, n, args.chunk_steps, ice_mode=args.ice_mode,
                       ice_settings=args.ice_settings, controls=controls,
-                      ice_adjoint=ice_adj, box=args.box)
+                      ice_adjoint=ice_adj, box=args.box, **mkw)
         if args.action == "fwd":
             d = out_path(args.run_dir)
             check = args.check_base or (args.replay if (args.replay and (
@@ -1168,12 +1469,13 @@ def main(argv=None) -> int:
 
     import tke_diag as D
     cfg = D.parse_setting(args.setting)
-    n = int(round(args.window_days * 86400.0 / C.fast_dt(args.fast)))
+    n = int(round(args.window_days * 86400.0 / (C.fast_dt(args.fast) if C.parse_fast(args.fast) else dt)))
     if args.action == "grad":
         if args.run_dir:
             run_dir = out_path(args.run_dir)
         elif args.grad_root and args.tag:
-            run_dir = out_path(grad_dir(Path(args.grad_root), args.tag, args.window_days))
+            run_dir = out_path(grad_dir(Path(args.grad_root), args.tag, args.window_days,
+                                        args.ice_cost, args.cost_box))
         else:
             ap.error("grad needs --run-dir or --grad-root and --tag")
         done = run_dir / "done.json"
@@ -1183,9 +1485,13 @@ def main(argv=None) -> int:
         dumps, fields = parse_boundaries(args.dump_cot), parse_fields(args.dump_fields)
         if args.dump_primal and not dumps:
             ap.error("--dump-primal needs --dump-cot boundaries")
+        if args.dump_primal and args.dist:
+            ap.error("--dump-primal is one-device only")
         model = build(args.start, n, args.chunk_steps, adjoint_cfg=cfg, ice_mode=args.ice_mode,
                       ice_settings=args.ice_settings, controls=controls,
-                      ice_adjoint=ice_adj, box=args.box)
+                      ice_adjoint=ice_adj, box=args.box, remat_blocks=args.remat_blocks,
+                      pgf_batches=args.pgf_batches, dist=args.dist, dist_dir=args.dist_dir,
+                      transport=args.transport, **mkw)
         if dumps and dumps[-1] > model.chunks_for(n):
             ap.error(f"--dump-cot boundary {dumps[-1]} beyond the window's "
                      f"{model.chunks_for(n)} chunks")
@@ -1194,16 +1500,21 @@ def main(argv=None) -> int:
             dump_primal(model, Path(args.base_dir), run_dir / "dump", dumps, fields)
         r = run_grad(model, run_dir, Path(args.base_dir), n_steps=n, budget_s=budget,
                      stride=args.stride, lazy=not args.host_boundaries,
-                     on_cot=dump_cot_hook(run_dir / "dump", dumps, fields) if dumps else None)
+                     cost=args.ice_cost, cost_box=args.cost_box,
+                     on_cot=dump_cot_hook(run_dir / "dump", dumps, fields,
+                                          dense=model.dense_cotangent if args.dist else None)
+                     if dumps else None)
         r.update(_ice_prov(model))
         r.update(setting=args.setting, adjoint=cfg.describe(), window_days=args.window_days,
-                 slurm_job=job, base_dir=args.base_dir, cost="drift")
+                 slurm_job=job, base_dir=args.base_dir)
         if dumps:
             r.update(dump_cot=list(dumps), dump_primal=bool(args.dump_primal),
                      dump_fields=None if fields is None else list(fields))
         row = {k: v for k, v in r.items() if not k.startswith("_")}
         C.append_row(run_dir / "results.jsonl", row)
         if r.get("status") == "ok":
+            if "_forcing_grad" in r:        # the maps, before done.json marks the run complete
+                np.savez(run_dir / "grad_forcing.npz", **r["_forcing_grad"])
             done.write_text(json.dumps(C._jsonable(row)))
         print(json.dumps(C._jsonable(row))[:3000])
         return 0 if r.get("status") == "ok" else 3

@@ -125,6 +125,8 @@ RESTART_ARCHIVE = Path("/work/ab0995/a270088/port_jax/runs/core2_hindcast_v3/res
 CORE2_DIST = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1/core2")   #: the dist_<N> partitions (build_model devices)
 STATES_DIR = Path("/work/ab0995/a270088/fesom_jax_dev/states_2013")
 RUNS_DIR = Path("/work/ab0995/a270088/fesom_jax_dev/runs/p0")
+#: the FESOM mesh directories with the ``dist_<N>`` partitions (``partit.read_partition``)
+POOL_MESHES = Path("/pool/data/AWICM/FESOM2/MESHES_FESOM2.1")
 DT = 1800.0
 ICE_MODES = ("prescribed", "rheology", "frozen", "exact", "dynamics")
 #: the IceConfig fields ``build_model(ice_adjoint=...)`` may set (derivative-only, mEVP sweeps)
@@ -471,10 +473,11 @@ def with_fast_physics(cfg, fast):
     return dataclasses.replace(cfg, **kw)
 
 
-def assert_physics(cfg, fast=()) -> None:
+def assert_physics(cfg, fast=(), dt: float | None = DT) -> None:
     """The reference configuration: zstar, classical TKE (no KPP), GM, mEVP sea ice every step, dt 1800 s,
     JRA55-do forcing, the CG SSH solve with the default preconditioner, no dt ramp, double precision; each piece
-    named in ``fast`` (:data:`FAST_PHYSICS`) may instead be :data:`FAST_CONFIG`'s."""
+    named in ``fast`` (:data:`FAST_PHYSICS`) may instead be :data:`FAST_CONFIG`'s. ``dt=None`` accepts the
+    config's own time step (another mesh's config, e.g. farc at 900 s)."""
     fast = parse_fast(fast)
     bad = []
     if cfg.ale is None:
@@ -491,8 +494,8 @@ def assert_physics(cfg, fast=()) -> None:
     if fcfg is not None and "ice2" in fast and cfg.ice is not None \
             and int(cfg.ice.ice_ave_steps) != int(fcfg.ice.ice_ave_steps):
         bad.append(f"ice_ave_steps {cfg.ice.ice_ave_steps}, not the fast configuration's")
-    want_dt = fast_dt(fast)
-    if float(cfg.dt) != want_dt or cfg.dt_ramp is not None:
+    want_dt = fast_dt(fast) if dt is not None else None
+    if (want_dt is not None and float(cfg.dt) != want_dt) or cfg.dt_ramp is not None:
         bad.append(f"dt {cfg.dt} / ramp {cfg.dt_ramp}")
     if cfg.split_explicit() is not None and "se" not in fast:
         bad.append("split-explicit SSH (fast piece se)")
@@ -546,6 +549,8 @@ class Model:
     forcing_seconds: float = 0.0
     _chunk_fn_tl: Callable = None
     _forcing_lock: Any = dataclasses.field(default_factory=threading.Lock, repr=False)   #: see stack_forcing
+    #: the sharded run (:func:`_build_sharded`), ``None`` on one device
+    sharded: Any = None
 
     @property
     def dt(self) -> float:
@@ -575,7 +580,9 @@ class Model:
 
     def init_carry(self, state=None, *, host: bool = False):
         """The chunk carry at a window start: ``state`` (default: the model's start State, a global State) with
-        zero accumulators if any. On the device unless ``host``. Sharded: the folded State and folded sums."""
+        zero accumulators if any. On the device unless ``host``. Sharded (``devices``): the folded State and folded
+        sums; sharded (``dist``): ``state`` is a dense State and the carry is folded (:meth:`fold_carry`) and placed
+        on the devices."""
         st = self.s0 if state is None else state
         if self.shard is not None:
             from fesom_jax import adjoint_sharded
@@ -592,7 +599,42 @@ class Model:
             carry = (st, acc)
         else:
             carry = st
+        if self.sharded is not None:
+            if state is None:
+                if self.sharded.carry0 is None:
+                    self.sharded.carry0 = self.fold_carry(jax.device_get(carry))
+                carry = self.sharded.carry0
+            else:
+                carry = self.fold_carry(jax.device_get(carry))
+            return carry if host else self.chunk_fn.place(carry)
         return jax.device_get(carry) if host else jax.device_put(carry)
+
+    def fold_carry(self, carry):
+        """A dense host carry → the folded host carry of the sharded program (the identity on
+        one device)."""
+        if self.sharded is None:
+            return carry
+        from fesom_jax import integrate_sharded as ish
+        part = self.sharded.part
+        if self.accumulators:
+            st, acc = carry
+            return ish.fold_host_state(st, part), {k: np.asarray(v) for k, v in acc.items()}
+        return ish.fold_host_state(carry, part)
+
+    def dense_cotangent(self, cot):
+        """A host carry cotangent of the sharded program → the dense one (every copy of an
+        entity adds into it; :func:`integrate_sharded.summed_host_cotangent`). The identity on
+        one device."""
+        if self.sharded is None:
+            return cot
+        from fesom_jax import integrate_sharded as ish
+        n_kind = {"nod": self.mesh.nod2D, "elem": self.mesh.elem2D}
+        part = self.sharded.part
+        if self.accumulators:
+            st, acc = cot
+            return (ish.summed_host_cotangent(st, part, n_kind),
+                    {k: np.asarray(v) for k, v in acc.items()})
+        return ish.summed_host_cotangent(cot, part, n_kind)
 
     def state_of(self, carry):
         return carry[0] if self.accumulators else carry
@@ -635,6 +677,12 @@ class Model:
             sched = None if self.schedule is None else self.sched(start, c * K, dates)
             if self.shard is not None:
                 return self.shard.forcing_xs(sf, sched)
+            if self.sharded is not None:          # the dist= chunk program (integrate_sharded)
+                if sched is not None:
+                    raise ValueError("the dist= sharded chunk program takes no forcing schedule; "
+                                     "use devices= (fesom_jax.adjoint_sharded)")
+                from fesom_jax import integrate_sharded as ish
+                return ish.sharded_forcing(sf, self.sharded.part, self.sharded.npes)
             return jax.device_put(sf if sched is None else (sf, sched))
         if os.environ.get("FESOM_FORCING_PREFETCH", "1") == "0":
             return fn
@@ -697,6 +745,8 @@ def _make_chunk_fn(model: Model, *, rematerialize: bool) -> Callable:
         return model.shard.make_chunk_fn(dt=model.dt, phys=model.phys, adjoint_cfg=model.adjoint_cfg,
                                          to_params=model.to_params, accumulators=model.acc_factories,
                                          rematerialize=rematerialize, save_names=tuple(model.save_names))
+    if model.sharded is not None:
+        return _make_sharded_chunk_fn(model, rematerialize=rematerialize)
     mesh, op, fs, phys = model.mesh, model.op, model.forcing.static, model.phys
     adj, dt, to_params = model.adjoint_cfg, model.dt, model.to_params
     accs, save_names = dict(model.accumulators), tuple(model.save_names)
@@ -723,6 +773,69 @@ def _make_chunk_fn(model: Model, *, rematerialize: bool) -> Callable:
     return chunk_fn
 
 
+@dataclasses.dataclass(eq=False)
+class Sharded:
+    """The partitioned pieces of a sharded :class:`Model` (host numpy, built once)."""
+
+    npes: int
+    dist_dir: Path
+    transport: str
+    part: Any
+    sm: Any
+    sop: Any
+    fs_p: Any
+    bn_p: Any
+    acc_fns: dict
+    acc_inputs: dict
+    carry0: Any = None
+    node_ids: Any = None        # integrate_sharded.node_gid: (gid, valid) [P, Lmax_nod]
+
+
+def _build_sharded(model: Model, npes: int, dist_dir, transport: str,
+                   sharded_accumulators) -> Sharded:
+    """Partition the model for ``npes`` devices from the FESOM ``dist_<npes>`` partition under
+    ``dist_dir`` (default :data:`POOL_MESHES` / the mesh name)."""
+    from fesom_jax import ice_evp
+    if len(jax.devices()) < npes:
+        raise ValueError(f"dist {npes} needs {npes} devices, have {len(jax.devices())}")
+    if dist_dir is None:
+        mesh_dir = Path(model.cfg.mesh)
+        dist_dir = POOL_MESHES / mesh_dir.name.removeprefix("mesh_")
+    dist_dir = Path(dist_dir)
+    part = partit.read_partition(dist_dir, npes)
+    sm = shard_mesh.build_sharded_mesh(model.mesh, part)
+    sop = ssh.partition_ssh_operator(model.op, part)
+    fs_p = shard_mesh.partition_forcing_static(model.forcing.static, part)
+    _, Lmax = shard_mesh.local_sizes(part)
+    bn = np.asarray(ice_evp.boundary_node_mask(model.mesh))
+    bn_p = shard_mesh._shard_along_axis(bn, part.myList_nod2D, Lmax["nod"], 0, False)
+    if model.accumulators:
+        if sharded_accumulators is None:
+            raise ValueError(f"accumulators {sorted(model.accumulators)} need their sharded "
+                             f"versions (sharded_accumulators=)")
+        acc_fns, acc_in = sharded_accumulators(model.mesh, part, sm)
+        if set(acc_fns) != set(model.accumulators):
+            raise ValueError(f"sharded accumulators {sorted(acc_fns)} != "
+                             f"{sorted(model.accumulators)}")
+    else:
+        acc_fns, acc_in = {}, {}
+    from fesom_jax import integrate_sharded as ish
+    return Sharded(npes=int(npes), dist_dir=dist_dir, transport=transport, part=part, sm=sm,
+                   sop=sop, fs_p=fs_p, bn_p=bn_p, acc_fns=dict(acc_fns),
+                   acc_inputs=dict(acc_in), node_ids=ish.node_gid(sm, part))
+
+
+def _make_sharded_chunk_fn(model: Model, *, rematerialize: bool):
+    from fesom_jax import integrate_sharded as ish
+    sh = model.sharded
+    return ish.sharded_chunk_program(
+        sh.sm, sh.sop, sh.fs_p, sh.bn_p, npes=sh.npes, dt=model.dt, to_params=model.to_params,
+        step_kw=dict(model.phys), adjoint_cfg=model.adjoint_cfg, accumulators=sh.acc_fns,
+        acc_inputs=sh.acc_inputs, rematerialize=rematerialize,
+        save_names=tuple(model.save_names), transport=sh.transport,
+        node_ids=sh.node_ids if "forcing_adj" in model.params0 else None)
+
+
 #: Registered running accumulators: name -> factory(mesh) -> fn(State).
 ACCUMULATORS: dict = {
     "mld": lambda mesh: (lambda s: AC.mld_field(s, mesh, invalid="column")),
@@ -738,7 +851,9 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
                 config=None, state=None, ice_adjoint: Mapping | None = None,
                 tke_settings=None, fast=None, devices: int = 1, transport: str = "padded",
                 forcing_ctrl=(), n_months: int = 0, cost_from: int | None = None,
-                cost_to: int | None = None) -> Model:
+                cost_to: int | None = None, remat_blocks: bool = False, pgf_batches: int = 1,
+                dist: int = 0, dist_dir=None,
+                sharded_accumulators: Callable | None = None) -> Model:
     """Assemble the reference CORE2 model (see the module docstring).
 
     :param start: window start (ISO date/time or ``datetime``); the restart must be at it.
@@ -776,6 +891,25 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
     :param devices: > 1 runs every chunk sharded over that many devices (the ``dist_<devices>`` partition of
         :data:`CORE2_DIST`, :mod:`fesom_jax.adjoint_sharded`, halo ``transport`` padded or coloured): the carry is
         the folded State, the accumulators per-node fields only (names or a factory), the controls scalars.
+    :param config: another config than :data:`CONFIG` with the same physics (e.g.
+        ``configs/farc_full.yaml``); its own dt is accepted. Pass its ``restart`` as a path.
+    :param remat_blocks: ``step(remat_blocks=True)``: the heavy sub-blocks of a step get their own
+        ``jax.checkpoint``, so a step's VJP holds one block's tape at a time (forward values and
+        gradient unchanged; needed for farc, whose one-step VJP is ~150 GiB without it).
+    :param pgf_batches: ``step(pgf_batches=)``: the Shchepetkin PGF over that many element
+        blocks, each its own checkpoint (farc: the PGF stencil temporaries are ~37 GiB of the
+        ~80 GiB one-step VJP peak that remat_blocks leaves). Forward values to rounding.
+    :param dist: run the chunk program on ``dist`` devices with the FESOM partition
+        ``<dist_dir>/dist_<dist>`` (default ``dist_dir``: :data:`POOL_MESHES` / the mesh name,
+        e.g. ``.../farc``); 0 = one device. The carry is then the folded State
+        (:meth:`Model.fold_carry`), the forcing is partitioned per chunk, and the halo uses
+        ``transport`` (``"coloured"`` or ``"padded"``, both AD-correct; ``"allgather"`` for
+        small meshes). ``dist`` is the earlier sharded path of the farc ice work (scripts/adjoint/ice_cbar.py);
+        ``devices`` the later one of the CORE2 fast adjoint (:mod:`fesom_jax.adjoint_sharded`). Not both.
+    :param sharded_accumulators: with ``dist`` and accumulators: ``(mesh, partition,
+        sharded_mesh) -> ({name: fn(state, mesh, halo_ctx, acc_in)}, {name: [P, Lmax_nod]
+        input})`` — the same running sums on the local shards, each a global sum over owned
+        lanes (``integrate_sharded.sharded_chunk_program``).
     """
     fast = parse_fast(fast)
     todo = [n for n in fast if n not in FAST_IMPLEMENTED and _piece_dt(n) is None]
@@ -787,7 +921,7 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
     config_path = Path(config) if config is not None else CONFIG
     cfg = with_fast_physics(load_yaml(config_path), fast)
     cfg.validate()
-    assert_physics(cfg, fast)
+    assert_physics(cfg, fast, dt=DT if config is None else None)
     if ice_mode not in ICE_MODES:
         raise ValueError(f"ice_mode must be one of {ICE_MODES}, got {ice_mode!r}")
     ice_kw = dict(ice_adjoint or {})
@@ -832,6 +966,10 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
     tke_kw = parse_tke_settings(tke_settings)
     if tke_kw:
         phys["tke_cfg"] = phys["tke_cfg"]._replace(**tke_kw).validate()
+    if remat_blocks:
+        phys["remat_blocks"] = True
+    if pgf_batches > 1:
+        phys["pgf_batches"] = int(pgf_batches)
     adj = (adjoint_cfg if adjoint_cfg is not None else AdjointConfig.exact()).validate()
     if accumulators is None:
         accs, acc_fac = {}, {}
@@ -878,6 +1016,11 @@ def build_model(start="2013-01-01", n_steps: int = 48, chunk_steps: int = 48, re
         model.shard = adjoint_sharded.build(mesh, part, op, forcing.static, phys=phys, transport=transport,
                                             precision="single" if sp else "double", node_ids=bool(forcing_ctrl))
         model.acc_factories = acc_fac
+    if dist:
+        if int(devices) > 1:
+            raise ValueError("dist and devices are two sharded paths; give one")
+        model.sharded = _build_sharded(model, int(dist), dist_dir, transport,
+                                       sharded_accumulators)
     model.chunk_fn = _make_chunk_fn(model, rematerialize=bool(rematerialize))
     return model
 
@@ -1052,6 +1195,9 @@ def provenance(model: Model, action: str, *, n_steps: int | None = None, start=N
         "chunk_steps": model.chunk_steps, "n_chunks": n // model.chunk_steps, "stride": stride,
         "direction": direction, "h": h, "save_names": list(model.save_names),
         "rematerialize": model.rematerialize, "accumulators": sorted(model.accumulators),
+        "dist": 0 if model.sharded is None else model.sharded.npes,
+        "dist_dir": None if model.sharded is None else str(model.sharded.dist_dir),
+        "transport": None if model.sharded is None else model.sharded.transport,
         "compile_s": None, "run_s": None,
         "time": datetime.datetime.now().isoformat(timespec="seconds"),
     }

@@ -12,11 +12,19 @@ Two independent halves, each one model (run them as two jobs with ``-k``):
   ``tke_cbar``'s (so the TKE CPU base boundaries load);
 * ``exact4`` — ``--ice-mode exact`` with the settings pass-through ``evp_rheol_steps=4``: the
   drift gradient w.r.t. ln P* and ln C_d agrees with a central FD of the same model, also when
-  the reverse sweep is cut into legs by a zero budget and resumed.
+  the reverse sweep is cut into legs by a zero budget and resumed; and the terminal ice volume
+  (>= 70N) gradient w.r.t. ln C_d against a central FD of the forward rows' ``ice`` values
+  (``-k ice_cost``; measured 2.8e-4 at h 1e-4, job 28195464). The other three are PRINTED, not
+  gated: over 4 steps their FD does not converge in h, the response is a few 1e-7 of J and
+  crosses the model's kinks (a_ice clipped to [0, 1]): volume ln P* FD 1.78e-6 (h 1e-3) /
+  1.59e-6 (h 1e-4) vs AD 1.77e-6; area ln P* 1.8e-5 / -2.8e-6 vs 1.5e-5; area ln C_d 5.40e-5 /
+  5.18e-5 vs 5.55e-5. The seed itself (d J / d final carry = weights on m_ice or a_ice) is gated
+  exactly in test_cbar_ice.py.
 """
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -140,3 +148,108 @@ def test_exact4_drift_gradient_matches_fd(exact4, tmp_path):
         print(f"[smoke] exact4 {c}: J {I.j_drift(S0, N):.15e} ad {ad:.15e} fd {fds} rel {rel:.3e}")
         assert np.isfinite(ad) and ad != 0.0
         assert rel < 1e-3, (c, ad, fds)
+
+
+def test_exact4_ice_cost_gradients_match_fd(exact4, tmp_path):
+    m = exact4
+    base = tmp_path / "base"
+    assert I.run_fwd(m, base, params=m.params0, n_steps=N,
+                     save_boundaries=True)["status"] == "complete"
+    runs = {}
+    for c in ("pstar", "cd"):
+        for h in (1e-3, 1e-4):
+            for s in (1, -1):
+                d = tmp_path / f"{c}_{h:g}_{s}"
+                assert I.run_fwd(m, d, params=I.perturbed(m.params0, c, h, s),
+                                 n_steps=N)["status"] == "complete"
+                runs[c, h, s] = d
+    bad = []
+    for cost, box in (("vol", "arctic"), ("area", "nh")):
+        g = tmp_path / f"g_{cost}"
+        r = I.run_grad(m, g, base, n_steps=N, budget_s=1e9, cost=cost, cost_box=box)
+        assert r["status"] == "ok" and (r["cost"], r["cost_box"]) == (cost, box)
+        key = f"{cost}_{box}"
+        J0 = I.ice_values(base, key)[N]
+        assert json.loads((g / "forward.json").read_text())["loss"] == pytest.approx(J0,
+                                                                                    rel=1e-12)
+        for c in ("pstar", "cd"):
+            ad = r["grads"][c]
+            fds = {h: (I.ice_values(runs[c, h, 1], key)[N] - I.ice_values(runs[c, h, -1], key)[N])
+                   / (2 * h) for h in (1e-3, 1e-4)}
+            rel = min(abs(v - ad) / abs(ad) for v in fds.values()) if ad else float("inf")
+            print(f"[smoke] exact4 {key} {c}: J {J0:.15e} ad {ad:.15e} fd {fds} rel {rel:.3e}")
+            gated = (key, c) == ("vol_arctic", "cd")
+            if not (np.isfinite(ad) and ad != 0.0 and (rel < 1e-3 or not gated)):
+                bad.append((key, c, ad, fds))
+    assert not bad, bad
+
+
+def test_remat_blocks_leaves_the_drift_gradient_unchanged():
+    """``--remat-blocks`` (farc's memory fix): the one-chunk drift gradient w.r.t. ln P* and ln C_d
+    under the frozen-sweep ice adjoint equals the one without nested remat (same forward) to
+    rounding: the recomputed blocks are a different XLA program, and the ice map amplifies a
+    one-ulp change (CPU 2026-10-11: ln C_d -0.0175920147 vs -0.0175920143, 2e-8 relative)."""
+    grads = []
+    for rb in (False, True):
+        m = I.build("2013-01-01", 2, 2, adjoint_cfg=AdjointConfig.exact(), ice_mode="exact",
+                    controls=("pstar", "cd"), ice_adjoint={"adjoint_damping": "frozen_sweep"},
+                    remat_blocks=rb)
+        assert m.phys.get("remat_blocks", False) is rb
+        carry, xs, loss = m.init_carry(), m.xs_fn()(0), I.drift_loss(2)
+        g = jax.grad(lambda u: loss(m.chunk_fn(carry, xs, u)))(m.params0)
+        grads.append({k: float(np.asarray(v)) for k, v in g.items() if np.ndim(v) == 0})
+    assert grads[0].keys() == grads[1].keys() and grads[0]
+    for k in grads[0]:
+        assert grads[1][k] == pytest.approx(grads[0][k], rel=1e-6, abs=1e-12), k
+
+
+FORCING_FD = (("tair", 1e-2, 1e-3), ("uair", 1e-2, 1e-3))   # control, two h (K, m/s)
+
+
+def test_exact4_forcing_gradients_match_fd(exact4, tmp_path):
+    """Forcing controls (``--controls ...,tair,uair``: window-constant ``[nod2D]`` anomalies of
+    Tair and the model-frame u wind in ``Params.forcing_adj``): with zero anomalies the forward
+    rows equal those of the model without them (the seam adds nothing); the terminal ice volume
+    (>= 70N) gradient summed over the box nodes (``grads["tair:arctic"]``) agrees with a central
+    FD of a uniform anomaly over the box (``perturbed(.., "tair:arctic", h, ±1, mesh)``), and the
+    saved map is that gradient."""
+    m = I.build("2013-01-01", N, K, ice_mode="exact", ice_settings="evp_rheol_steps=4",
+                controls=("pstar", "cd", "tair", "uair"))
+    assert set(m.params0["forcing_adj"]) == {"Tair", "u_air"}
+    base = tmp_path / "base"
+    assert I.run_fwd(m, base, params=m.params0, n_steps=N,
+                     save_boundaries=True)["status"] == "complete"
+    ref = tmp_path / "ref"
+    assert I.run_fwd(exact4, ref, params=exact4.params0, n_steps=N)["status"] == "complete"
+    key = "vol_arctic"
+    assert I.ice_values(base, key) == I.ice_values(ref, key)
+    assert I.drift_sums(base) == I.drift_sums(ref)
+    r = I.run_grad(m, tmp_path / "g", base, n_steps=N, budget_s=1e9, cost="vol",
+                   cost_box="arctic")
+    assert r["status"] == "ok"
+    fg = r["_forcing_grad"]
+    nodes = I.forcing_box_nodes(m.mesh, "arctic")
+    bad = []
+    for c, *hs in FORCING_FD:
+        assert r["grads"][f"{c}:arctic"] == pytest.approx(float(fg[c][nodes].sum()), rel=1e-15)
+        ad = r["grads"][f"{c}:arctic"]
+        fds = {}
+        for h in hs:
+            J = {}
+            for s in (1, -1):
+                d = tmp_path / f"{c}_{h:g}_{s}"
+                u = I.perturbed(m.params0, f"{c}:arctic", h, s, mesh=m.mesh)
+                assert np.count_nonzero(u["forcing_adj"][I.FORCING_CONTROLS[c]]) == nodes.sum()
+                assert I.run_fwd(m, d, params=u, n_steps=N)["status"] == "complete"
+                J[s] = I.ice_values(d, key)[N]
+            fds[h] = (J[1] - J[-1]) / (2 * h)
+        rel = min(abs(v - ad) / abs(ad) for v in fds.values()) if ad else float("inf")
+        print(f"[smoke] exact4 {key} {c}:arctic: ad {ad:.15e} fd {fds} rel {rel:.3e} "
+              f"map max|g| {np.abs(fg[c]).max():.3e} outside-box sum {fg[c][~nodes].sum():.3e}")
+        if not (np.isfinite(ad) and ad != 0.0 and rel < 1e-3):
+            bad.append((c, ad, fds))
+    assert not bad, bad
+    with pytest.raises(ValueError, match="box"):
+        I.perturbed(m.params0, "tair", 1.0, 1, mesh=m.mesh)
+    with pytest.raises(ValueError, match="no box"):
+        I.perturbed(m.params0, "pstar:arctic", 1.0, 1, mesh=m.mesh)

@@ -23,8 +23,8 @@ import numpy as np
 import pytest
 
 from fesom_jax import adjoint_stab, forcing, ic, ssh
-from fesom_jax.adjoint import (ChunkedGrad, LegIncomplete, chunked_forward, chunked_grad,
-                               scan_steps)
+from fesom_jax.adjoint import (ChunkedGrad, ChunkProgram, LegIncomplete, chunked_forward,
+                               chunked_grad, scan_steps)
 from fesom_jax.config import A_VER
 # the private function scan_steps replaces — imported HERE, in the test that proves the two build
 # the same graph, and nowhere else in the library or the scripts.
@@ -457,6 +457,46 @@ def test_the_jitted_chunk_is_reused_across_calls():
     assert A._jitted_forward(f) is A._jitted_forward(f)
     assert A._jitted_backward(f) is A._jitted_backward(f)
     assert A._jitted_forward(f) is not A._jitted_forward(g)
+
+
+def test_chunk_program_passes_constants_as_arguments(fixture, baseline, capsys):
+    """:class:`~fesom_jax.adjoint.ChunkProgram`: the mesh, the SSH operator and the stress reach
+    the compiled chunk as ARGUMENTS (``jax.jit`` embeds closed-over arrays as literal constants,
+    and a device-sharded mesh cannot be one), and ``place`` puts every host state the sweep
+    re-reads — each reverse input, and with a stride the start of each rebuilt span. Same loss
+    and gradient as the closure chunk, at stride 1 and 2."""
+    mesh, op, stress, st0 = fixture
+    _, xs_fn, loss_fn, n_chunks, _ = _harness(fixture, K)
+    placed = []
+
+    def fn(state, xs, params, k):
+        m, o, s_ = k
+        return scan_steps(lambda s, x: step(s, m, o, s_ * x, params, dt=DT, is_first_step=False),
+                          state, xs, rematerialize=True)
+
+    def place(tree):
+        placed.append(1)
+        return jax.device_put(tree)
+
+    prog = ChunkProgram(fn=fn, consts=(mesh, op, stress), place=place)
+    n_const = len(jax.tree.leaves(prog.consts))
+    low = jax.jit(fn).lower(st0, xs_fn(0), _params(KVER), prog.consts)
+    n_args = len(jax.tree.leaves(low.args_info))
+    assert n_args >= n_const + len(jax.tree.leaves(st0)), (n_args, n_const)
+    g_ref = float(baseline.grad.k_ver)
+    for stride in (1, 2):
+        placed.clear()
+        res = chunked_grad(prog, _params(KVER), init_state=st0, n_chunks=n_chunks, xs_fn=xs_fn,
+                           loss_fn=loss_fn, chunk_steps=K, boundary_stride=stride)
+        g = float(res.grad.k_ver)
+        rel = abs(g - g_ref) / max(abs(g_ref), 1e-300)
+        print(f"\nChunkProgram stride {stride}: dL/dk_ver={g:+.17e} rel={rel:.3e} "
+              f"place calls {len(placed)} (program args {n_args}, constants {n_const})")
+        assert abs(res.loss - baseline.loss) <= 1e-14 * abs(baseline.loss)
+        assert rel < 1e-12, rel
+        # each of the n_chunks reverse inputs, plus with a stride the start of each rebuilt
+        # span (the final state of a fresh forward is still on the device: not re-placed)
+        assert len(placed) == n_chunks + (0 if stride == 1 else n_chunks // stride)
 
 
 def test_progress_hooks_fire_once_per_chunk(fixture, capsys):

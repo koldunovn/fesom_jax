@@ -1,7 +1,7 @@
 """Candidate derivative-only settings of the classical-TKE adjoint (``AdjointConfig``
 ``tke_pr_cut``/``tke_pr_mode``/``tke_pr_ratio``/``tke_pr_raw_cut``/``tke_pr_ice_cut``, ``tke_kme_tke``/
 ``tke_kme_scope``/``tke_kme_term``, ``tke_ml_cut``/``tke_ml_ratio``/``tke_ml_raw_cut``,
-``freeze_mixing_state``) on the column core (hand-built
+``tke_floor_cut``, ``freeze_mixing_state``) on the column core (hand-built
 columns of ``test_tke_cuts.py``; ``ci`` group). ``freeze_mixing_state`` on the assembled
 ``mixing_tke`` (pi mesh) is in ``test_tke_candidates_pi.py`` (``unit``), the CORE2 step in
 ``test_tke_candidates_core2.py``.
@@ -31,7 +31,9 @@ Properties:
   cut bitwise, and an N² tangent on cells below N²* propagates as under ``tke.ml_n2``, one on
   cells at or above it as in the exact core; ``tke_ml_ratio`` / ``tke_ml_raw_cut`` do the same
   on the cells where ``|raw N²| > R*·|N²|`` / raw N² < N²_raw*, are exact for a threshold no cell
-  passes and refuse to run without the raw N²;
+  passes and refuse to run without the raw N²; ``tke_floor_cut = 0`` ⇒ exact, ``+inf`` ⇒ a
+  zero ``tke_old`` cotangent with every other cotangent exact, and a finite tke* zeroes the
+  ``tke_old`` cotangent exactly where ``tke_old < tke*``;
 * ``validate()`` rejects malformed settings; ``describe()`` renders them;
 * every VJP finite on every column (padding and dry lanes included).
 """
@@ -48,8 +50,8 @@ import pytest
 from fesom_jax import cvmix_tke, eos
 from fesom_jax.adjoint_stab import (FREEZE_FLAGS, TKE_CANDIDATE_FIELDS, AdjointConfig,
                                     TkeAdjoint)
-from fesom_jax.tests.test_tke_cuts import (COL_NEUTRAL, COL_RI, COL_STRAT, COL_WALLTOP, KW,
-                                           NCOL, NL, PINNED, _inputs, _sha, check_pin)
+from fesom_jax.tests.test_tke_cuts import (COL_NEUTRAL, COL_RI, COL_SINK, COL_STRAT, COL_WALLTOP,
+                                           KW, NCOL, NL, PINNED, _inputs, _sha, check_pin)
 
 
 def _opts(**kw):
@@ -137,6 +139,7 @@ VARIANTS = {
     "ml_ratio": dict(tke_ml_ratio=R_STAR),
     "ml_raw": dict(tke_ml_raw_cut=RAW_STAR),
     "ml_below_raw": dict(tke_ml_cut=N2_STAR, tke_ml_raw_cut=RAW_STAR),
+    "floor": dict(tke_floor_cut=TKE_STAR),
 }
 
 
@@ -232,6 +235,8 @@ def test_every_candidate_changes_the_traced_core():
     (dict(tke_pr_tu_cut=0.0), ValueError),
     (dict(tke_pr_tu_cut=math.nan), ValueError),
     (dict(tke_pr_tu_cut="-45"), TypeError),
+    (dict(tke_floor_cut=math.nan), ValueError),
+    (dict(tke_floor_cut="1e-6"), TypeError),
 ])
 def test_validate_rejects_malformed_settings(bad, err):
     with pytest.raises(err):
@@ -265,6 +270,10 @@ def test_describe_active_and_options():
     assert o.pr_ratio is None and o.pr_raw_cut is None
     alone = AdjointConfig(tke_ml_raw_cut=-1e-6).validate().tke_options()
     assert alone is not None and alone.ml_n2_star is None and alone.ml_raw_cut == -1e-6
+    f = AdjointConfig(tke_floor_cut=1e-5).validate()
+    assert f.describe() == "tke_floor_cut=1e-05"
+    assert f.tke_options() == TkeAdjoint(pr_n2_star=None, pr_mode="cut", kme_tke=None,
+                                         kme_scope="column", kme_term="km_e", floor_tke=1e-5)
     assert "freeze_mixing_state" in FREEZE_FLAGS
     assert set(TKE_CANDIDATE_FIELDS) <= set(AdjointConfig._fields)
 
@@ -700,3 +709,37 @@ def test_fixture_columns_are_live():
                                                    & (n2[COL_WALLTOP] > 0))
     assert t[COL_WALLTOP, 1] < TKE_STAR
     assert all(t[i, 1] > TKE_STAR for i in (COL_STRAT, COL_RI, COL_NEUTRAL))
+
+
+# ---------------------------------------------------------------------------
+# limits: the near-floor TKE cut
+# ---------------------------------------------------------------------------
+def _floor_cut_matches(got, exact, mask):
+    """``tke_old`` cotangent zero on ``mask`` and exact elsewhere, every other input exact
+    (the cut sits on an input of the core, so the other cotangents are untouched)."""
+    t, e = np.asarray(got["tke_old"]), np.asarray(exact["tke_old"])
+    assert np.all(t[mask] == 0.0)
+    assert np.array_equal(t[~mask], e[~mask])
+    for k in exact:
+        if k != "tke_old":
+            assert np.array_equal(np.asarray(got[k]), np.asarray(exact[k])), k
+
+
+def test_floor_cut_limits():
+    """tke* = 0 is exact (tke_old >= 0); inf zeroes the whole tke_old cotangent."""
+    exact = _vjp()
+    assert _equal(_vjp(_opts(tke_floor_cut=0.0)), exact)
+    x, _ = _inputs()
+    _floor_cut_matches(_vjp(_opts(tke_floor_cut=math.inf)), exact,
+                       np.ones(np.shape(x["tke_old"]), bool))
+
+
+def test_floor_cut_acts_on_the_interfaces_below_the_threshold():
+    x, _ = _inputs()
+    tke = np.asarray(x["tke_old"])
+    low = tke < TKE_STAR
+    exact = _vjp()
+    # live: some near-floor interfaces carry an exact tke_old cotangent, and some above tke*
+    assert np.any(np.asarray(exact["tke_old"])[low] != 0.0)
+    assert np.any(low[COL_WALLTOP]) and np.any(low[COL_SINK]) and not np.any(low[COL_RI])
+    _floor_cut_matches(_vjp(_opts(tke_floor_cut=TKE_STAR)), exact, low)

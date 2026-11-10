@@ -167,6 +167,7 @@ NON_BOOL_CASES = {
     "tke_pr_ice_cut": dict(tke_pr_ice_cut=0.15),
     "tke_pr_lat_cut": dict(tke_pr_lat_cut=70.0),
     "tke_pr_tu_cut": dict(tke_pr_tu_cut=-45.0),
+    "tke_floor_cut": dict(tke_floor_cut=1.0e-2),
     # GM-input cuts: inert in this fixture (no gm_cfg); test_adjoint_config_prod.py tests them
     "gm_n2_ratio": dict(gm_n2_ratio=100.0),
     "gm_n2_raw_cut": dict(gm_n2_raw_cut=-1.0e-6),

@@ -261,9 +261,10 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
 
     ``adj`` (:class:`fesom_jax.adjoint_stab.TkeAdjoint` or ``None``, from
     ``AdjointConfig.tke_options()``): the derivative-only candidate settings — the Prandtl-
-    number cut (``pr_n2_star``/``pr_mode``) and the near-floor km_e cut (``kme_tke``/
-    ``kme_scope``/``kme_term``). Masks are built from forward values; the forward is bitwise
-    unchanged, and ``None`` traces the identical program.
+    number cut (``pr_n2_star``/``pr_mode``), the near-floor km_e cut (``kme_tke``/
+    ``kme_scope``/``kme_term``) and the near-floor TKE cut (``floor_tke``: every derivative
+    with respect to ``tke_old`` where it is below tke*). Masks are built from forward values;
+    the forward is bitwise unchanged, and ``None`` traces the identical program.
 
     ``n2_raw`` (``[N, nl]`` or ``None``): the UNSMOOTHED N² at the same interfaces as ``Nsqr``
     (zero where ``Nsqr`` is zeroed), read only by the smoothing-cancellation and unsmoothed-N²
@@ -290,6 +291,11 @@ def integrate_tke_column(tke_old, Ssqr, Nsqr, dzw, dzt, forc_tke_surf, nlev,
     is_interior = (k >= 1) & (k <= nlev_c - 1)
     is_wet_iface = (k <= nlev_c)                 # interfaces 0..nlev
     fcol = forc_tke_surf[:, None]
+    floor_tke = None if adj is None else adj.floor_tke
+    if floor_tke is not None:
+        # near-floor TKE cut (AdjointConfig.tke_floor_cut): no derivative with respect to
+        # tke_old where tke_old < tke* (forward values); the forward reads the same values
+        tke_old = cut_where(tke_old, lax.stop_gradient(tke_old) < floor_tke)
 
     # ---- Part 1: mixing length (:666-698) ----
     mxl, sqrttke = mixing_length(

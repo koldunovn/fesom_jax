@@ -58,6 +58,14 @@ The adjoint foundation adds a forcing-direction seam (not a physics parameter):
   wind-stress direction. ``heat`` is in W/m², POSITIVE INTO the ocean (warming); the stresses
   are in N/m² in the model (rotated) frame. ``None`` (default) ⇒ nothing is traced.
 
+* ``forcing_adj`` — an optional dict of ATMOSPHERIC-STATE anomalies ``{name: field}`` added to
+  the step forcing (:class:`fesom_jax.surface_forcing.StepForcing`) before the bulk formulae
+  and the sea ice see it, so that the ice and the ocean respond to it as to the forcing itself
+  (for sea-ice sensitivities to the atmosphere; ``surface_adj`` acts on the ocean fluxes after
+  them). Names from :data:`fesom_jax.step.FORCING_ADJ_KEYS`; each field has the shape of the
+  forcing field (``[nod2D]`` dense, the local lanes under ``shard_map``). ``None`` (default) ⇒
+  nothing is traced.
+
 The sea-ice adjoint track adds two ice parameters (optional, ``None`` ⇒ nothing traced):
 
 * ``ice_pstar`` — the ice strength P* [N/m²] (``IceConfig.pstar``);

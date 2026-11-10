@@ -15,6 +15,7 @@ map/gather class (~1e-15). Output is an element **layer** field
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from . import ops
@@ -76,7 +77,7 @@ def _drho_dz(R0, Rm, Rp, Z0, Zm, Zp, Zn):
     return lin + curv * ((Zn - Z0) + (Zn - Zm))
 
 
-def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem):
+def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem, *, batches: int = 1):
     """Shchepetkin density-Jacobian PGF (substep 3 under zstar; ``fesom_eos.c:348-503``).
     ``(pgf_x, pgf_y)`` element layer fields ``[elem2D, nl]`` from the node density anomaly
     ``density_m_rho0 = ρ − ρ0`` ``[nod2D, nl]``, the live per-node mid-depths ``Z_3d_n``
@@ -95,19 +96,53 @@ def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem):
     ``(k−2,k−1,k)`` at the bottom layer, **centered** ``(k−1,k,k+1)`` elsewhere. Edge-padded
     shifts + safe denominators keep the overridden/below-bottom lanes finite (AD-safe).
     nlevels≤2 single-mid-layer elements (surface≡bottom) are a degenerate C edge case (UB in
-    the C's backward stencil) — masked/rare on CORE2; gate tests on ``nlevels≥3``."""
+    the C's backward stencil) — masked/rare on CORE2; gate tests on ``nlevels≥3``.
+
+    ``batches > 1``: the same per-element arithmetic over ``batches`` equal element blocks
+    (the last padded with repeats of the first elements, dropped on return), each block in its
+    own ``jax.checkpoint`` inside a ``lax.map``. Forward values are those of ``batches=1`` to
+    rounding (other XLA fusions: 2e-18 on pi, not bitwise); the backward holds one block's
+    ``[elem2D/batches, 3, nl]`` stencil temporaries at a time instead of all of them (farc:
+    ~37 GiB of the ~80 GiB one-step VJP peak)."""
+    en = mesh.elem_nodes                                   # (elem2D,3)
+    elem = dict(en=en, ulev=mesh.ulevels, nlev=mesh.nlevels, gs=mesh.gradient_sca,
+                zbot=mesh.zbar[mesh.nlevels - 1], emask=mesh.elem_layer_mask, hel_in=helem)
+    nod = (density_m_rho0, Z_3d_n, jnp.asarray(mesh.ulevels_nod2D), jnp.asarray(mesh.nlevels_nod2D))
+    nl = mesh.zbar.shape[0]
+    if batches <= 1:
+        return _shchepetkin_elems(nod, nl, **elem)
+    ne = en.shape[0]
+    size = -(-ne // batches)
+    pad = size * batches - ne
+
+    def blocks(x):
+        x = jnp.asarray(x)
+        if pad:
+            x = jnp.concatenate([x, x[:pad]], axis=0)
+        return x.reshape((batches, size) + x.shape[1:])
+
+    one = jax.checkpoint(lambda e: _shchepetkin_elems(nod, nl, **e))
+    px, py = jax.lax.map(one, {k: blocks(v) for k, v in elem.items()})
+    return (px.reshape((batches * size,) + px.shape[2:])[:ne],
+            py.reshape((batches * size,) + py.shape[2:])[:ne])
+
+
+def _shchepetkin_elems(nod, nl, *, en, ulev, nlev, gs, zbot, emask, hel_in):
+    """:func:`pressure_force_shchepetkin` on the elements whose per-element arrays are given:
+    vertices ``en``, level indices ``ulev``/``nlev``, shape-function gradients ``gs``, static
+    bottom interface ``zbot``, layer mask ``emask``, thickness ``hel_in``; ``nod`` = (ρ−ρ0,
+    live mid-depths, node ``ulevels``, node ``nlevels``) on all nodes."""
+    rho_n, Z_n3, ulev_nod, nlev_nod = nod
     inv_r = 1.0 / DENSITY_0
     g = float(G)
-    nl = mesh.zbar.shape[0]
-    en = mesh.elem_nodes                                   # (elem2D,3)
 
     # gather node fields to elements: R/Zd are [elem2D, 3, nl] (vertex × level)
-    R = ops.gather_nodes_to_elem(density_m_rho0, en)       # ρ−ρ0 at the 3 vertices
-    Zd = ops.gather_nodes_to_elem(Z_3d_n, en)              # live node mid-depths
+    R = ops.gather_nodes_to_elem(rho_n, en)                # ρ−ρ0 at the 3 vertices
+    Zd = ops.gather_nodes_to_elem(Z_n3, en)                # live node mid-depths
 
     # element mid-depth Z_n[e,k] from helem, anchored at the STATIC bottom zbar[nlevels-1].
-    hel = jnp.where(mesh.elem_layer_mask, helem, 0.0)      # 0 below bottom
-    zbar_bot = mesh.zbar[mesh.nlevels - 1][:, None]        # (elem2D,1) static bottom interface
+    hel = jnp.where(emask, hel_in, 0.0)                    # 0 below bottom
+    zbar_bot = zbot[:, None]                               # (elem2D,1) static bottom interface
     revcum = jnp.cumsum(hel[:, ::-1], axis=1)[:, ::-1]     # Σ_{j≥k} hel[j] (reverse cumsum)
     zbar_n = zbar_bot + revcum                             # interface depths [e,k]
     zbar_n_below = jnp.concatenate([zbar_n[:, 1:], zbar_bot], axis=1)   # zbar_n[k+1]
@@ -128,10 +163,10 @@ def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem):
 
     # static stencil-case masks [elem2D, 3, nl] from the integer level arrays.
     k = jnp.arange(nl)[None, None, :]                      # (1,1,nl) 0-based layer
-    surf_e = (mesh.ulevels - 1)[:, None, None]             # element surface layer (0-based)
-    bot_e = (mesh.nlevels - 2)[:, None, None]              # element bottom mid-layer (0-based)
-    surf_nod = (mesh.ulevels_nod2D[en] - 1)[:, :, None]    # each vertex's surface layer
-    bot_nod = (mesh.nlevels_nod2D[en] - 2)[:, :, None]     # each vertex's bottom mid-layer
+    surf_e = (ulev - 1)[:, None, None]                     # element surface layer (0-based)
+    bot_e = (nlev - 2)[:, None, None]                      # element bottom mid-layer (0-based)
+    surf_nod = (ulev_nod[en] - 1)[:, :, None]              # each vertex's surface layer
+    bot_nod = (nlev_nod[en] - 2)[:, :, None]               # each vertex's bottom mid-layer
     fwd_m = (k == surf_e) & (k == surf_nod)                # surface block, node-surface matches
     bwd_m = (k == bot_e) & (k == bot_nod)                  # bottom block, node-bottom matches
     bwd_m = bwd_m & ~fwd_m                                 # bottom wins single-layer overlap
@@ -139,8 +174,8 @@ def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem):
     drho_dz = jnp.where(bwd_m, dz_bwd, jnp.where(fwd_m, dz_fwd, dz_ctr))
     mdz = (drho_dz[:, 0] + drho_dz[:, 1] + drho_dz[:, 2]) / 3.0          # (elem2D,nl)
 
-    gx = mesh.gradient_sca[:, 0:3]                         # ∂N/∂x (elem2D,3)
-    gy = mesh.gradient_sca[:, 3:6]                         # ∂N/∂y
+    gx = gs[:, 0:3]                                        # ∂N/∂x (elem2D,3)
+    gy = gs[:, 3:6]                                        # ∂N/∂y
     drho_dx = gx[:, 0:1] * R[:, 0] + gx[:, 1:2] * R[:, 1] + gx[:, 2:3] * R[:, 2]
     drho_dy = gy[:, 0:1] * R[:, 0] + gy[:, 1:2] * R[:, 1] + gy[:, 2:3] * R[:, 2]
     dz_dx = gx[:, 0:1] * Zd[:, 0] + gx[:, 1:2] * Zd[:, 1] + gx[:, 2:3] * Zd[:, 2]
@@ -152,6 +187,6 @@ def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem):
     # vertical integral: pgf[k] = Σ_{j<k} aux_j + ½ aux_k = cumsum_incl(aux) − ½ aux.
     pgf_x = jnp.cumsum(aux_x, axis=1) - 0.5 * aux_x
     pgf_y = jnp.cumsum(aux_y, axis=1) - 0.5 * aux_y
-    pgf_x = ops.mask_below_bottom(pgf_x, mesh.elem_layer_mask)
-    pgf_y = ops.mask_below_bottom(pgf_y, mesh.elem_layer_mask)
+    pgf_x = ops.mask_below_bottom(pgf_x, emask)
+    pgf_y = ops.mask_below_bottom(pgf_y, emask)
     return pgf_x, pgf_y
