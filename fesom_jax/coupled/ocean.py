@@ -705,5 +705,10 @@ def ocean_restart_writer(state, static: OceanStatic):
 
 def _restart_writer(static):
     y, d, _, _ = static.dates(1)[0]
+    # FESOM_CPL_RESTART_LAYOUT=folded (lane tco319_dars): the gather-free sharded write (zarr_output.write_state_zarr,
+    # read back onto any device count by read_restart). The default "global" all-gathers every leaf to every device
+    # first: on DARS (3.16 M nodes, double, dist_16) that is a ~10 GiB device buffer per leaf, which ran out of memory
+    # at the second daily restart (job 28795999)
+    layout = os.environ.get("FESOM_CPL_RESTART_LAYOUT", "global")
     return functools.partial(zarr_output.write_restart, step=static.step, calendar_date=f"{y}-doy{d:03d}",
-                             dt_stage=static.dt, layout="global", attrs={"coupled_mode": static.mode})
+                             dt_stage=static.dt, layout=layout, attrs={"coupled_mode": static.mode})

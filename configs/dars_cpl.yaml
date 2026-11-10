@@ -1,0 +1,63 @@
+# The coupled ocean of awicm's `--setup tco319_dars` (lane tco319_dars, ~/awicm_jax docs/lanes/tco319_dars.md):
+# FESOM2 DARS (3,160,340 surface nodes, 57 levels, no ice-shelf cavities), single precision, cold start from PHC with
+# FESOM's initial sea ice (init_ocean(restart_in=None)), coupled in mode F to TCo319.
+#
+# * physics: the dars long-run set of the model paper (configs/dars_tke_mevp_wsplit_dt120.yaml: zstar + w_split,
+#   TKE, mEVP, GM off, dt 120 s: dt 180 from cold PHC is not stable on this mesh), plus jaxcpl's coupled sea-ice
+#   albedos and melt-pond switches (configs/core3_cpl.yaml); no cavity block (DARS has none).
+# * chlorophyll: the constant 0.1 mg m-3 of FESOM2's coupled build (as core3_cpl.yaml).
+# * partition: dist_N of the pool's dars mesh (FESOM_DIST_DIR = /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/dars).
+# * gpu: the coupled CORE2 multi-device switches (core2_cpl_multi.yaml).
+ale: {use_wsplit: true, wsplit_maxcfl: 1.0}
+gm: null
+kpp: null
+tke: {}
+ice:
+  whichEVP: 1
+  albsn: 0.82
+  albsnm: 0.65
+  albi: 0.70
+  albim: 0.68
+  albw: 0.1
+  mevp_mass_floor: true
+  metric_factor_zero: true
+  cpl_meltponds: true
+  snowmelt_tgate: false
+  alb_tramp: 1.0
+  pnd_rfracmax: 0.6
+  pnd_aspect: 1.6
+visc: {}
+tracer: {}
+
+dt: 120.0
+
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_dars
+partition: dist_16
+forcing:
+  kind: core2
+  start_year: 1990
+  chl: 0.1
+ssh:
+  cheb_degree: 3
+  cheb_kappa: 30.0
+  gathered: true
+gpu:
+  halo_compact: true
+  column_unroll: true
+  mevp_wide: 12
+  ssh_ell: true
+  cg_batch: 4
+  mevp_unroll: 12
+  column_kernel: true
+  ssh_inc_ell: true
+  ordered_sums: true
+  output_async: true
+  restart_async: true
+  forcing_ahead: 2
+output_dir: /work/ba1583/a270088/awicm/dars/runs/ocn
+snapshot_every: 720
+checkpoint_every: 7200
+restart_in: null
+restart_out: null
+duration: 31d
+precision: double
