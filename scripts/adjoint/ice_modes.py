@@ -549,9 +549,9 @@ class IceMap:
             cap["out"] = out
             return out
 
-        def spy_stress(u_air, v_air, u_ice, v_ice):
+        def spy_stress(u_air, v_air, u_ice, v_ice, **kw):     # kw: cd (IceConfig.cd_atm_ice)
             cap["air"] = (u_air, v_air, u_ice, v_ice)
-            return orig_stress(u_air, v_air, u_ice, v_ice)
+            return orig_stress(u_air, v_air, u_ice, v_ice, **kw)
 
         def one_step(s, x, u):
             ice_mevp.mevp_dynamics, _forcing.atm_ice_stress = spy_mevp, spy_stress

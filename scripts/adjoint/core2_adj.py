@@ -677,12 +677,13 @@ class Model:
             sched = None if self.schedule is None else self.sched(start, c * K, dates)
             if self.shard is not None:
                 return self.shard.forcing_xs(sf, sched)
-            if self.sharded is not None:          # the dist= chunk program (integrate_sharded)
+            sharded = getattr(self, "sharded", None)
+            if sharded is not None:               # the dist= chunk program (integrate_sharded)
                 if sched is not None:
                     raise ValueError("the dist= sharded chunk program takes no forcing schedule; "
                                      "use devices= (fesom_jax.adjoint_sharded)")
                 from fesom_jax import integrate_sharded as ish
-                return ish.sharded_forcing(sf, self.sharded.part, self.sharded.npes)
+                return ish.sharded_forcing(sf, sharded.part, sharded.npes)
             return jax.device_put(sf if sched is None else (sf, sched))
         if os.environ.get("FESOM_FORCING_PREFETCH", "1") == "0":
             return fn
