@@ -43,6 +43,9 @@ gpu:
                           # override it)
   ordered_sums: true
   o2a_lanes_surface: true
+  o2a_surface: true       # ocean_to_atm: the surface velocity from level 1 only; without it the whole 3-D uv (8.3 GB
+                          # at NG5) is gathered and replicated and compute_vel_nodes runs on all levels: a 30.8 GiB
+                          # allocation on one A100 and a hang in the next collective (lane tco319_ng5, job 28909116)
   cpl_forcing_jit: true
   cpl_forcing_lean: true
   output_async: true
