@@ -36,13 +36,12 @@ output_dir: /work/ba1583/a270088/awicm/tco319_ng5/ocn
 snapshot_every: 0
 checkpoint_every: 0
 # gpu: performance switches only (configs/core3_cpl.yaml has the measurements at CORE3); the dist_N ones that keep
-# NG5 off a single device: o2a_lanes_surface (ocean_to_atm gathers level 1 only, not the 3-D T, S, uv) and
-# halo_compact
+# NG5 off a single device: o2a_lanes_surface (ocean_to_atm gathers level 1 only, not the 3-D T, S, uv); the halo
+# as the standalone NG5 runs (ragged; halo_compact belongs to the all_gather transport)
 gpu:
   halo_transport: ragged  # the NG5 standalone runs' transport (run_ng5.sbatch --ragged; XLA:CPU lacks it: CPU tests
                           # override it)
   ordered_sums: true
-  halo_compact: true
   o2a_lanes_surface: true
   cpl_forcing_jit: true
   cpl_forcing_lean: true
