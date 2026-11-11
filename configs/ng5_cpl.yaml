@@ -1,0 +1,50 @@
+# The coupled NG5 ocean of awicm_jax `--setup tco319_ng5` (lane tco319_ng5, ~/awicm_jax docs/lanes/tco319_ng5.md):
+# FESOM2 NG5 (7,402,886 nodes) under the plain TCo319 L137 atmosphere in mode B (the atmosphere's near-surface state
+# through the NG5 OASIS weights, this ocean's bulk formulae). A feasibility configuration, not a tuned one.
+#
+# * physics: configs/ng5.yaml's (zstar, GM off, TKE, mEVP, visc gamma1 0.2, MFCT/QR4C/FCT) without its dt ramp (the
+#   coupled ocean refuses dt_ramp). Jan's Fortran NG5 runs (awicm3-develop/ng5_x16) have the same zstar / TKE / GM off /
+#   gamma1 0.2, with aEVP (whichevp 2) and dt 360; here mEVP (the coupled path's tested sea ice) and dt 180 (the
+#   stable fesom_jax NG5 step: R0 was run at 180).
+# * start: the R0 restart (fesom_jax's 3-day cold PHC spin-up, KPP, 64 GPUs, step 1440 of 1958), read field by field
+#   onto dist_N (zarr_output.read_restart: multi-process safe). awicm_jax sets the calendar to the atmosphere's start.
+# * partition: dist_32 (16 GPUs run out of memory at NG5), FESOM2's partitions under FESOM_DIST_DIR =
+#   /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/ng5.
+# * double precision (as R0).
+
+ale: {}            # zstar
+gm: null           # GM off
+kpp: null
+tke: {}            # TKE (Jan's NG5: cvmix_TKE)
+ice: {whichEVP: 1} # mEVP, ice every step
+visc:
+  gamma1: 0.2
+tracer: {}
+
+dt: 180.0
+
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_ng5
+partition: dist_32
+forcing:
+  kind: core2
+  start_year: 1990
+  # FESOM2's coupled build keeps chlorophyll at 0.1 mg m-3 (configs/core3_cpl.yaml has the reason)
+  chl: 0.1
+restart_in: /work/ab0995/a270088/port_jax/runs/ng5/r0
+restart_out: null
+output_dir: /work/ba1583/a270088/awicm/tco319_ng5/ocn
+snapshot_every: 0
+checkpoint_every: 0
+# gpu: performance switches only (configs/core3_cpl.yaml has the measurements at CORE3); the dist_N ones that keep
+# NG5 off a single device: o2a_lanes_surface (ocean_to_atm gathers level 1 only, not the 3-D T, S, uv) and
+# halo_compact
+gpu:
+  halo_transport: ragged  # the NG5 standalone runs' transport (run_ng5.sbatch --ragged; XLA:CPU lacks it: CPU tests
+                          # override it)
+  ordered_sums: true
+  halo_compact: true
+  o2a_lanes_surface: true
+  cpl_forcing_jit: true
+  cpl_forcing_lean: true
+  output_async: true
+  restart_async: true
