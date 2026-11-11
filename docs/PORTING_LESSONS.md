@@ -11161,3 +11161,34 @@ one forward over the remaining days, and the increments between legs show which 
 burst or a steady bias. Before blaming the adjoint in a window, check that the FD there is linear in h. And a cut
 that cured a loop for one cost is not the cure for the next by default: the summer strength cut that the drift year
 needed does nothing for the May volume bias, although both run through u_ice and advection.
+
+### 2026-11-10 (merge/adjoint_all) — the adjoint, calibration and coupled lines merged onto the published main
+
+origin/main (ded5355) is four squash commits, so the old branches share no history with it and their
+ahead/behind counts mean nothing. The pre-squash history behind it is `recom/port` (every published branch
+is its ancestor; its tree is ded5355's apart from the suite fixes). Each line was merged onto `recom/port`,
+where the conflicts are between close relatives, and the delta carried onto origin/main with
+`cherry-pick -m1`, which applied without conflict. The coupled branches are built on origin/main and are
+merged as they are.
+
+- Lines merged: the calibration (ice-calib-dyn d526b73, with adjoint-calib, ice-calib-obs, fortran-restart,
+  ice-calib, ice-calib-cuts), norm-ab, the farc sea-ice adjoint (ice-farc-forcing cd6e3df with the other
+  ice-farc branches), adjoint-n2b, adjoint-yr-census, coupled/coupled_grad e39f2d4, coupled/dars,
+  coupled/gm_impact, coupled/multinode_async. Where main already had a feature in a later form (forcing_adj,
+  the fct_limiter/fct_flux, thin-mass, strength_conc and sweep-guard ice cuts, exchange_arrays, the lazy
+  boundary store) main's form is kept.
+- Two sharded CORE2 adjoint paths are kept on purpose: `core2_adj.build_model(devices=)`
+  (`fesom_jax.adjoint_sharded`, the CORE2 fast adjoint and the Fram work) and `build_model(dist=)`
+  (`integrate_sharded.sharded_chunk_program`, the farc ice work driven by `ice_cbar.py --dist`). Giving both
+  raises. `integrate_sharded.localize_forcing_adj` calls the general `adjoint_sharded` one.
+- The coupled line changes the traced program of the default ice step (standard EVP, and mEVP with the
+  frozen-sweep adjoint): the jaxpr hashes of `test_ice_stanton` differ from ded5355's, while the calibration
+  and farc commits trace ded5355's programs exactly. The CORE2 forward stays bitwise (core2_full, cold start,
+  8 steps, serial and dist_4 on CPU). This is accepted; the hashes are re-pinned with the coupled line in.
+- Gates: the forward above; the CORE2 January 2013 30-day Arctic drift gradient (ice exact + frozen_sweep
+  θ 0.97, `long_window_combined()`, one A100): ln P* AD/FD 1.0065, ln C_d 1.0012, and the merge equals
+  origin/main to 8e-5 / 3e-5 relative (jobs 28877099, 28878203).
+
+Lesson: with squash-published history, compare by content and replay onto the pre-squash tip, not onto the
+squash. And a CPU test job on a 128-core node needs its XLA pools sized to the cores it is given: two groups
+run with 128 threads were time-cut at 3 h, about four times the suite's measured cost.
