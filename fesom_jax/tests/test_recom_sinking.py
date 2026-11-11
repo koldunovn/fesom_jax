@@ -524,3 +524,39 @@ def test_fork_cfl_cap_experiment_switch(toy, monkeypatch):
     w = np.asarray(S.sinking_velocity(1025, bal, geom, dt, p, fork))
     np.testing.assert_array_equal(w, np.asarray(S.sinking_velocity(1025, bal, geom, dt, p, sw)))
     assert np.any(np.abs(w) < np.abs(w_free))
+
+
+def test_sink_dst3_sign_and_upwind_grad_switches(toy, monkeypatch):
+    """FESOM_RECOM_SINK_DST3_SIGN=mitgcm flips the downward DST3 correction (a forward change, still mass conserving);
+    FESOM_RECOM_SINK_GRAD=upwind leaves the forward flux unchanged and gives the derivative of upwind sinking. Unset
+    or set to anything else, the traced program is unchanged (plan 20261105, sign audit 2026-11-11)."""
+    sw, p, geom, bgc, temp, salt, decay, benthos = toy
+    ctx = S.loop_context(temp, salt, geom)
+    bal = S.ballast(*S.particle_densities(bgc, geom.nlev, p), ctx.rho_seawater, ctx.visc, geom.nlev, p)
+    dt = 2700.0
+    w = S.sinking_velocity(1025, bal, geom, dt, p, sw)
+    v = bgc[..., T.SLOT[1025]]
+    f = lambda x: S.ver_sinking_recom(1025, x, w, geom, dt, p)
+    for name in ("FESOM_RECOM_SINK_DST3_SIGN", "FESOM_RECOM_SINK_GRAD"):
+        monkeypatch.delenv(name, raising=False)
+    jx = str(jax.make_jaxpr(f)(v))
+    base = np.asarray(f(v))
+    monkeypatch.setenv("FESOM_RECOM_SINK_DST3_SIGN", "fortran")
+    monkeypatch.setenv("FESOM_RECOM_SINK_GRAD", "full")
+    assert str(jax.make_jaxpr(f)(v)) == jx
+    monkeypatch.setenv("FESOM_RECOM_SINK_GRAD", "upwind")
+    np.testing.assert_array_equal(np.asarray(f(v)), base)
+    # the upwind tangent is linear in the tracer: it does not depend on the state it is taken at; the limited one does
+    t = jnp.asarray(np.random.default_rng(1).normal(size=v.shape))
+    other = jnp.asarray(np.random.default_rng(2).uniform(0.0, 2.0, size=v.shape)) * jnp.mean(v)   # an unrelated column
+    tan = lambda at: np.asarray(jax.jvp(f, (at,), (t,))[1])
+    np.testing.assert_allclose(tan(other), tan(v), rtol=1e-12, atol=1e-18)
+    monkeypatch.setenv("FESOM_RECOM_SINK_GRAD", "full")
+    assert not np.allclose(tan(other), tan(v), rtol=1e-6)
+    monkeypatch.delenv("FESOM_RECOM_SINK_GRAD")
+    monkeypatch.setenv("FESOM_RECOM_SINK_DST3_SIGN", "mitgcm")
+    flipped = np.asarray(f(v))
+    assert np.any(flipped != base)
+    vol = np.asarray(geom.hnode_new) * np.asarray(S._wet_areasvol(geom, np.arange(v.shape[1])[None, :] < np.asarray(geom.nlev)[:, None]))
+    scale = np.abs(base * vol).sum(axis=1).max()   # the sinking only moves tracer within a column: totals stay at round-off
+    np.testing.assert_allclose((flipped * vol).sum(axis=1), (base * vol).sum(axis=1), rtol=0, atol=1e-12 * scale)

@@ -287,6 +287,117 @@ def window_scan(fx, st0, cf, day, kinds, lengths, starts, out, h=1e-2):
                       f"along p sign(g): adjoint {ad:.4e}  FD {fd:.4e}", flush=True)
 
 
+def term_split(fx, st0, cf, day, jac_days, steps_in_day, nodes, names, out, batch=32):
+    """Which term of the step holds the expanding column modes? The one-step column Jacobian of :func:`column_jacobian`
+    on the SAME forward states, once per variant, each with one term's dependence on the BGC state cut by
+    ``stop_gradient`` (its values untouched): the FCT limiter factors, the whole limited antidiffusive flux, the sources
+    and sinks of stage 1, the sinking, the implicit vertical mixing, Redi. The patches live here, the library is not
+    changed. A radius that collapses when one term is cut names that term; the variants do not add up, the term
+    products are not linear. Summary lines to OUT/term_split.jsonl, matrices to OUT/split_d<day>_s<step>_n<node>_<v>.npz."""
+    from fesom_jax import adjoint_stab, gm_redi, tracer_diff
+    from fesom_jax.recom import sinking as sink_mod
+    mesh, dt = fx["mesh"], fx["cfg"].dt
+    zero = jnp.zeros((mesh.elem2D, 2))
+    params = dataclasses.replace(Params.defaults(), recom=fx["cfg"].recom.load()[1])
+    nzmax = np.asarray(mesh.nlevels_nod2D) - 1
+    ntr = st0.bgc.shape[-1]
+    last = max(jac_days) * STEPS_PER_DAY + max(steps_in_day) + 1
+    full = cf.stack(surface_forcing.dates_for_steps(1958, dt, last, start_day=day))
+    stop = lambda t: jax.tree.map(lambda l: jax.lax.stop_gradient(l) if isinstance(l, jax.Array) else l, t)
+
+    def one(s, sf, **extra):
+        return stepmod.step(s, mesh, fx["op"], zero, params, dt=dt, is_first_step=False, step_forcing=sf,
+                            forcing_static=fx["fs"], **{**fx["phys"], **extra}), None
+
+    advance = jax.jit(lambda st, stack: jax.lax.scan(one, st, stack)[0])
+    samples, st, done = [], st0, 0
+    for d in jac_days:
+        for s in steps_in_day:
+            k = d * STEPS_PER_DAY + s
+            st = jax.block_until_ready(advance(st, jax.tree.map(lambda a: a[done:k], full)))
+            done = k
+            samples.append((d, s, st, jax.tree.map(lambda a: a[k], full)))
+
+    def cut_output(orig):                                # the term's output, a constant
+        return lambda *a, **k: stop(orig(*a, **k))
+
+    def cut_diffusion(orig):                             # x_new = r with d x_new / d x_adv = I
+        def f(mesh_, x, *a, **k):
+            return stop(orig(mesh_, x, *a, **k)) + (x - stop(x))
+        return f
+
+    def cut_sms(orig):                                   # stage 1: bgc = r.bgc with d bgc / d X = I, the rest constant
+        def f(x, *a, **k):
+            r = stop(orig(x, *a, **k))
+            return r._replace(bgc=r.bgc + (x - stop(x)))
+        return f
+
+    variants = {"full": ({}, []),
+                "no_limiter": ({"freeze_fct_limiter": True}, []),
+                "no_antidiff": ({"freeze_advection": True}, []),
+                "no_sms": ({}, [(wiring, "recom_sources_sinks_fork", cut_sms)]),
+                "no_sinking": ({}, [(sink_mod, "ver_sinking_recom", cut_output)]),
+                "no_mixing": ({}, [(tracer_diff, "impl_vert_diff_one", cut_diffusion)]),
+                "no_redi": ({}, [(gm_redi, "diff_ver_part_redi_expl", cut_output), (gm_redi, "diff_part_hor_redi", cut_output)])}
+    reference = {}
+    for name, (flags, patches) in variants.items():
+        saved = [(m, a, getattr(m, a)) for m, a, _ in patches]
+        hits = [0]
+
+        def counted(wrap, orig):
+            w = wrap(orig)
+            def f(*a, **k):
+                hits[0] += 1
+                return w(*a, **k)
+            return f
+        for m, a, wrap in patches:
+            setattr(m, a, counted(wrap, getattr(m, a)))
+        extra = {"adjoint_cfg": adjoint_stab.AdjointConfig(**flags)} if flags else {}
+        step_bgc = lambda st, bgc, sf: one(dataclasses.replace(st, bgc=bgc), sf, **extra)[0].bgc
+
+        @functools.partial(jax.jit, static_argnames=("L",))
+        def tangents(st, x, sf, E, n, L):
+            def tan(e):
+                t = jnp.zeros_like(x).at[n, :L, :].set(e.reshape(L, ntr))
+                return jax.jvp(lambda b: step_bgc(st, b, sf), (x,), (t,))[1][n, :L, :].reshape(-1)
+            return jax.vmap(tan)(E)
+        try:
+            for d, s, st, sf in samples:
+                x = st.bgc
+                for n in nodes:
+                    L = int(nzmax[n])
+                    m = L * ntr
+                    eye = np.eye(m, m + (-m) % batch).T
+                    J = np.concatenate([np.asarray(tangents(st, x, sf, jnp.asarray(eye[i:i + batch]), n, L))
+                                        for i in range(0, eye.shape[0], batch)])[:m].T
+                    w, V = np.linalg.eig(J.T)                     # left eigenvectors: the modes of the reverse step
+                    modes = []
+                    for i in np.argsort(-np.abs(w))[:4]:
+                        v = np.abs(V[:, i].reshape(L, ntr)) ** 2
+                        tr, lv = v.sum(axis=0), v.sum(axis=1)
+                        modes.append(dict(w=[float(w[i].real), float(w[i].imag)], tracer=names[int(tr.argmax())],
+                                          tracer_share=float(tr.max()), levels=[int(l) for l in np.argsort(-lv)[:2]]))
+                    key = (d, s, int(n))
+                    reference.setdefault(key, J)
+                    det = names.index("DetN")
+                    B = J.reshape(L, ntr, L, ntr)[:, det, :, det]
+                    rec = dict(variant=name, day=day + d, step=s, node=int(n), patch_calls=hits[0], rho=float(np.abs(w).max()),
+                               n_above_1p02=int((np.abs(w) > 1.02).sum()), modes=modes,
+                               dist_from_full=float(np.linalg.norm(J - reference[key])),
+                               detn={"8<-8": float(B[8, 8]), "8<-9": float(B[8, 9]), "9<-9": float(B[9, 9]), "9<-10": float(B[9, 10]),
+                                     "10<-9": float(B[10, 9]), "10<-10": float(B[10, 10])})
+                    np.savez_compressed(out / f"split_d{day + d}_s{s}_n{n}_{name}.npz", J=J.astype(np.float32))
+                    with open(out / "term_split.jsonl", "a") as f:
+                        f.write(json.dumps(rec) + "\n")
+                    print(f"{name:12s} day {day + d} step {s:2d} node {n}: rho {rec['rho']:.4f}  n>1.02 {rec['n_above_1p02']}  "
+                          f"|J-Jfull| {rec['dist_from_full']:.3e}  patched calls {hits[0]}  DetN 9<-10 {rec['detn']['9<-10']:+.3f} "
+                          f"9<-9 {rec['detn']['9<-9']:+.3f} | " + "  ".join(
+                              f"{q['w'][0]:+.3f} {q['tracer']} L{q['levels'][0]}" for q in modes[:3]), flush=True)
+        finally:
+            for m, a, orig in saved:
+                setattr(m, a, orig)
+
+
 def tracer_report(names, bgc0, gx, top=6):
     """Per tracer: raw and reference-normalised reverse-field norms, the raw peak and the tracer's value there."""
     x, g = np.asarray(bgc0), np.asarray(gx)
@@ -319,6 +430,8 @@ def main():
                     help="one-step column Jacobians at these nodes on --jac-days (from the start); no windows are run")
     ap.add_argument("--jac-days", type=int, nargs="+", default=[150, 180, 210, 240, 270])
     ap.add_argument("--jac-steps", type=int, nargs="+", default=[0, 16], help="steps of the day (32 a day; 16 = noon)")
+    ap.add_argument("--term-split", action="store_true",
+                    help="with --column-jacobian: the Jacobians again with one term's state dependence cut at a time")
     ap.add_argument("--batch", type=int, default=32, help="column tangents per vmap batch")
     ap.add_argument("--window-scan", type=int, nargs="+", default=None, metavar="LENGTH",
                     help="seasonal scan: these window lengths [days] at every --scan-starts; no other windows are run")
@@ -344,6 +457,9 @@ def main():
         tangent_check(fx, st0, cf, day)
     if a.window_scan:
         window_scan(fx, st0, cf, day, a.cost, a.window_scan, sorted(a.scan_starts), a.out)
+        return
+    if a.column_jacobian and a.term_split:
+        term_split(fx, st0, cf, day, a.jac_days, a.jac_steps, a.column_jacobian, fx["lay"].names, a.out, a.batch)
         return
     if a.column_jacobian:
         column_jacobian(fx, st0, cf, day, a.jac_days, a.jac_steps, a.column_jacobian, fx["lay"].names, a.out, a.batch)

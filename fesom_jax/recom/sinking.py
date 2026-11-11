@@ -745,7 +745,19 @@ def ver_sinking_recom(tracer_id: int, values, wvel, geom: SinkingGeometry, dt, p
     theta_m = rjp / (1.0e-20 + rj)
     psi_m = d0 + d1 * theta_m
     psi_m = jnp.maximum(0.0, jnp.minimum(jnp.minimum(1.0, psi_m), (1.0 - cfl) / (1.0e-20 + cfl) * theta_m))
-    tv = (0.5 * wps * (t_k + psi_m * rj) + 0.5 * wm * (t_m1 + psi_p * rj))
+    # Experiments (plan 20261105 Phase 1, the sign audit of 2026-11-11), read at trace time; unset (the default), the
+    # traced program is unchanged. FESOM_RECOM_SINK_DST3_SIGN=mitgcm: the downward correction of MITgcm
+    # gad_dst3fl_adv_r.F, ``t(km1) - psiP*Rj`` with the same Rj; recom_sinking.F90:665-666 has ``+ psiP*Rj``, which
+    # moves the face value away from the downstream cell (a forward change). FESOM_RECOM_SINK_GRAD=upwind: the forward
+    # flux as before, but the limiter correction is held constant in the derivative, so the tracer derivative is that of
+    # first-order upwind sinking (its one-step Jacobian is bounded; the limited one expands, radius up to 1.7-6 in a
+    # 1-D column); the derivative through the sinking speed keeps the full face value.
+    corr_m, corr_p = psi_m * rj, psi_p * rj
+    if os.environ.get("FESOM_RECOM_SINK_DST3_SIGN", "").strip() == "mitgcm":
+        corr_p = -corr_p
+    if os.environ.get("FESOM_RECOM_SINK_GRAD", "").strip() == "upwind":
+        corr_m, corr_p = jax.lax.stop_gradient(corr_m), jax.lax.stop_gradient(corr_p)
+    tv = (0.5 * wps * (t_k + corr_m) + 0.5 * wm * (t_m1 + corr_p))
     vd = jnp.where(flux_if, -tv * geom.area, 0.0)
     wet = kk[:, :nl1] < nlev
     out = (vd[:, :nl1] - vd[:, 1:]) * dt / _wet_areasvol(geom, wet) / jnp.where(wet, geom.hnode_new, 1.0)
