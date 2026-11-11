@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import functools
 import math
+import os
 from typing import Optional
 
 import jax
@@ -235,6 +236,25 @@ def recom_params(rcfg, params):
     return sw, (p if pr is None else pr)
 
 
+def _freeze_extinct(X, lay):
+    """Experiment (plan 20261105 Phase 1, 2026-11-11): FESOM_RECOM_GRAD_FREEZE_EXTINCT=<threshold> holds the second
+    zooplankton and its detritus (``ZOO2_NAMES``) out of the derivative wherever ``|x| < threshold``: the forward
+    values are unchanged, the step's derivative with respect to those cells is zero. On pi that compartment has died
+    out (surface Zoo2N about 2e-8, DetZ2 about 1e-16) and the adjoint grows in its round-off noise. Read at trace
+    time; unset (the default), ``X`` is returned as is and the traced program is unchanged."""
+    thr = os.environ.get("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "").strip()
+    if not thr or X is None:
+        return X
+    from .layout import ZOO2_NAMES
+    ids = [i for i, n in enumerate(lay.names) if n in ZOO2_NAMES]
+    if not ids:
+        return X
+    sel = np.zeros(X.shape[-1], bool)
+    sel[ids] = True
+    mask = jnp.asarray(sel) & (jnp.abs(X) < float(thr))
+    return jnp.where(mask, jax.lax.stop_gradient(X), X)
+
+
 def full_bgc_step(mesh, st, rcfg, *, params, h0, zbar0, Z0, helem, helem_flux, uv_adv, w_e_adv, w_i, hnode_new,
                   Z3d_new, gm_diag, Kv_eff, T0, S0, T_fin, S_fin, a_ice, sf, fs, dt_bgc, reduce_sum, exch, ckpt,
                   adj, legacy_fct_bounds: bool = False) -> dict:
@@ -266,6 +286,7 @@ def full_bgc_step(mesh, st, rcfg, *, params, h0, zbar0, Z0, helem, helem_flux, u
     nlev = (jnp.asarray(mesh.nlevels_nod2D) - 1).astype(jnp.int32)
     lat_rad = jnp.asarray(mesh.geo_coord_nod2D[:, 1], f64)
     X, X_old = transport.hold_major(st.bgc), st.bgc_old          # stage 1 reads each tracer's columns contiguously
+    X, X_old = _freeze_extinct(X, lay), _freeze_extinct(X_old, lay)
     h = h0[:, :nl1]
     full = PR.full                         # the identity in double precision: the double-precision trace is unchanged
     areasvol, area = full(mesh.areasvol), full(mesh.area)

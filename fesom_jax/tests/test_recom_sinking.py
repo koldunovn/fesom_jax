@@ -560,3 +560,21 @@ def test_sink_dst3_sign_and_upwind_grad_switches(toy, monkeypatch):
     vol = np.asarray(geom.hnode_new) * np.asarray(S._wet_areasvol(geom, np.arange(v.shape[1])[None, :] < np.asarray(geom.nlev)[:, None]))
     scale = np.abs(base * vol).sum(axis=1).max()   # the sinking only moves tracer within a column: totals stay at round-off
     np.testing.assert_allclose((flipped * vol).sum(axis=1), (base * vol).sum(axis=1), rtol=0, atol=1e-12 * scale)
+
+
+def test_freeze_extinct_gradient_switch(monkeypatch):
+    """FESOM_RECOM_GRAD_FREEZE_EXTINCT=<thr> (plan 20261105, 2026-11-11): the Zoo2 tracers below thr keep their
+    values and lose their derivative; other tracers and larger values are untouched; unset, nothing is traced."""
+    from types import SimpleNamespace
+    from fesom_jax.recom import wiring as W
+    lay = SimpleNamespace(names=("DIN", "Zoo2N", "DetZ2C", "PhyN"))
+    X = jnp.asarray([[[1.0, 1e-12, 1e-3, 1e-12], [2.0, 5e-9, -1e-16, 0.3]]])     # (node, level, tracer)
+    monkeypatch.delenv("FESOM_RECOM_GRAD_FREEZE_EXTINCT", raising=False)
+    assert W._freeze_extinct(X, lay) is X
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "1e-6")
+    np.testing.assert_array_equal(np.asarray(W._freeze_extinct(X, lay)), np.asarray(X))
+    g = np.asarray(jax.grad(lambda x: jnp.sum(W._freeze_extinct(x, lay) ** 2 / 2))(X))
+    frozen = np.array([[[0, 1, 0, 0], [0, 1, 1, 0]]], bool)
+    np.testing.assert_array_equal(g[frozen], 0.0)
+    np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
+    assert W._freeze_extinct(None, lay) is None
