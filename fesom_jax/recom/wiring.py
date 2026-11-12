@@ -239,14 +239,21 @@ def recom_params(rcfg, params):
 def _freeze_extinct(X, lay):
     """Experiment (plan 20261105 Phase 1, 2026-11-11): FESOM_RECOM_GRAD_FREEZE_EXTINCT=<threshold> holds the second
     zooplankton and its detritus (``ZOO2_NAMES``) out of the derivative wherever ``|x| < threshold``: the forward
-    values are unchanged, the step's derivative with respect to those cells is zero. On pi that compartment has died
-    out (surface Zoo2N about 2e-8, DetZ2 about 1e-16) and the adjoint grows in its round-off noise. Read at trace
-    time; unset (the default), ``X`` is returned as is and the traced program is unchanged."""
+    values are unchanged, the step's derivative with respect to those cells is zero. On the 2-year pi state that
+    compartment had not yet established (surface Zoo2N about 2e-8, DetZ2 about 1e-16). FESOM_RECOM_GRAD_FREEZE_TRACERS
+    (comma-separated tracer names, 2026-11-12) replaces the Zoo2 set, e.g. with HetN/HetC and the detritus pools
+    that the backward scans from the 5-year state found near zero. Read at trace time; unset (the default), ``X``
+    is returned as is and the traced program is unchanged."""
     thr = os.environ.get("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "").strip()
     if not thr or X is None:
         return X
     from .layout import ZOO2_NAMES
-    ids = [i for i, n in enumerate(lay.names) if n in ZOO2_NAMES]
+    which = [n.strip() for n in os.environ.get("FESOM_RECOM_GRAD_FREEZE_TRACERS", "").split(",") if n.strip()]
+    unknown = [n for n in which if n not in lay.names]
+    if unknown:
+        raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_TRACERS: unknown tracers {unknown}")
+    which = which or list(ZOO2_NAMES)
+    ids = [i for i, n in enumerate(lay.names) if n in which]
     if not ids:
         return X
     sel = np.zeros(X.shape[-1], bool)
