@@ -1,0 +1,64 @@
+# The coupled NG5 ocean in MODE F (flux coupling, as AWI-CM3 with OASIS) for awicm_jax `--setup tco319_ng5
+# --cpl-mode F` (lane tco319_ng5, ~/awicm_jax docs/lanes/tco319_ng5.md section 7): FESOM2 NG5 (7,402,886 nodes)
+# under the coupled TCo319 L137 atmosphere (ifs_jax case tco319_cpl, the AWI fork's ECE_FESOM_SET_OCEAN_FLUXES
+# puts). The ocean takes the atmosphere's fluxes through fesom_jax.coupled.flux (init_ocean(mode="flux")) and the
+# runoff mapper's hydr_oce / calv_oce (init_ocean(cpl_runoff="coupled"), awicm_jax --runoff mapper).
+#
+# This file = configs/ng5_cpl.yaml (mode B) + the mode-F-only switches of Jan's AWI-CM3 NG5 run
+# (/work/bb1469/a270092/runtime/awicm3-develop/ng5_x16, namelist.ice / namelist.config). Nothing in the PHYSICS
+# block below is decided here.
+#
+# * start: the R0 restart, as mode B (fesom_jax's 3-day cold PHC spin-up). R0 has no mode F fields, so
+#   fesom_jax.coupled.flux.init_flux gives them FESOM2's initial values (ice_temp 265.15 K, ice_alb 0.6, ponds 0).
+# * partition: dist_32 (FESOM_DIST_DIR = /pool/data/AWICM/FESOM2/MESHES_FESOM2.1/ng5), ragged halo, double precision.
+
+# ---- PHYSICS: to be set by the ng5_lowvisc mapping (fesom3_jax's NG5 parameters: GM off, visc gamma0 0.001,
+# gamma1 0.05, no momentum upwind, dt 360). NOT decided here: the values below are ng5_cpl.yaml's (mode B), unchanged.
+# dt also sets the ocean steps per 3600-s exchange (awicm_jax run_coupled.py reads it from this file: 180 -> 20,
+# 360 -> 10).
+ale: {}            # zstar
+gm: null           # GM off
+kpp: null
+tke: {}            # TKE (Jan's NG5: cvmix_TKE)
+visc:
+  gamma1: 0.2
+tracer: {}
+dt: 180.0
+# ---- end of PHYSICS
+
+# ---- sea ice. Dynamics as ng5_cpl.yaml (mEVP; Jan's NG5 runs aEVP, whichevp 2, which fesom_jax does not port).
+# The coupled thermodynamics (read in mode F only, fesom_jax.coupled.flux.thermo_cpl) from ng5_x16's namelist.ice:
+# use_meltponds .true., &meltpond pndaspect 1.3, rfracmax 0.75, albpnd 0.28 (the others = the module defaults that
+# IceConfig already has: hi_min 0.1, hs1 0.03, rfracmin 0.15, albpnd_frz 0.36), h_snowscale 0; albedos albsn 0.81,
+# albsnm 0.77, albi 0.70, albim 0.68, albw 0.1 = IceConfig's defaults. ng5_x16 also sets ice_diff 0.0, alpha/beta_evp
+# 500 (aEVP) and metric_factor_zero .true. (namelist.config); those change the sea-ice dynamics in both modes and
+# are left with the PHYSICS decision above.
+ice:
+  whichEVP: 1
+  cpl_meltponds: true
+  pnd_aspect: 1.3
+  pnd_rfracmax: 0.75
+  pnd_albpnd: 0.28
+
+mesh: /work/ab0995/a270088/fesom_jax_meshes/mesh_ng5
+partition: dist_32
+forcing:
+  kind: core2
+  start_year: 1990
+  # FESOM2's coupled build keeps chlorophyll at 0.1 mg m-3 (configs/core3_cpl.yaml has the reason)
+  chl: 0.1
+restart_in: /work/ab0995/a270088/port_jax/runs/ng5/r0
+restart_out: null
+output_dir: /work/ba1583/a270088/awicm/tco319_ng5/ocn
+snapshot_every: 0
+checkpoint_every: 0
+# gpu: performance switches only, as ng5_cpl.yaml (its comments have the reasons)
+gpu:
+  halo_transport: ragged  # (XLA:CPU lacks it: CPU checks override it with padded)
+  ordered_sums: true
+  o2a_lanes_surface: true
+  o2a_surface: true
+  cpl_forcing_jit: true   # mode F: the interval's forcing build (stress rotation, runoff, enthalpy) compiled
+  cpl_forcing_lean: true  # and gathered onto the lanes in its assembly program
+  output_async: true
+  restart_async: true
