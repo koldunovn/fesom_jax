@@ -29,7 +29,7 @@ echo "C compiler: $CC ($($CC --version | head -1))"
 rm -rf "$VENV"
 "$PYARM" -m venv "$VENV"
 "$VENV/bin/python" -m pip install --no-index --find-links "$WHEELS" --upgrade pip setuptools wheel || true
-"$VENV/bin/python" -m pip install --no-index --find-links "$WHEELS" -r "$WT/scripts/levante/requirements_gh200.txt"
+"$VENV/bin/python" -m pip install --no-index --find-links "$WHEELS" -r "$WT/scripts/levante/requirements_levante.txt"
 "$VENV/bin/python" -m pip install --no-index --no-deps --no-build-isolation -e "$WT"
 "$VENV/bin/python" -m pip freeze > "$VENV/freeze.txt"
 "$VENV/bin/python" - <<'EOF'
