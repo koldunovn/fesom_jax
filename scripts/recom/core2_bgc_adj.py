@@ -75,6 +75,9 @@ def main():
     ap.add_argument("--npes", type=int, default=4)
     ap.add_argument("--days", type=int, default=1)
     ap.add_argument("--chunk-steps", type=int, default=8, help="steps per chunk (32 a day); divides the window")
+    ap.add_argument("--boundary-stride", type=int, default=1,
+                    help="keep every k-th chunk boundary on the host and rebuild the others in the reverse (about 6.4 GB "
+                         "per CORE2 boundary: a 15-day window of 2-step chunks needs k = 8 to stay near 200 GB)")
     ap.add_argument("--transport", default="padded", choices=adjoint_sharded.TRANSPORTS)
     ap.add_argument("--remat-blocks", action="store_true", help="step(remat_blocks=True), as the horizon driver")
     ap.add_argument("--h", type=float, default=1e-2, help="the FD step in log p")
@@ -147,8 +150,9 @@ def main():
         clock["build"] += t1 - t0
         clock["calls"] += 1
         clock["last"] = t1
-        print(f"   xs chunk {c}: built in {t1 - t0:.1f} s (calls {clock['calls']}, inputs {clock['build']:.0f} s, "
-              f"between calls {clock['gap']:.0f} s)", flush=True)
+        if clock["calls"] % 16 == 1 or n_chunks <= 32:
+            print(f"   xs chunk {c}: built in {t1 - t0:.1f} s (calls {clock['calls']}, inputs {clock['build']:.0f} s, "
+                  f"between calls {clock['gap']:.0f} s)", flush=True)
         return out
 
     host_carry = (chunk.fold_state(st), adjoint_sharded.init_accumulators(chunk, {k: (mesh.nod2D,) for k in COSTS}))
@@ -157,7 +161,8 @@ def main():
 
     t = time.time()
     res = adjoint.chunked_grad_multi(chunk_fn, u0, init_state=carry0(), n_chunks=n_chunks, xs_fn=xs_fn,
-                                     loss_fns=loss_fns, chunk_steps=K, check_linear=False, field_trace=False)
+                                     loss_fns=loss_fns, chunk_steps=K, boundary_stride=a.boundary_stride,
+                                     check_linear=False, field_trace=False)
     t_grad = time.time() - t
     print(f"gradient: forward {res.forward_seconds:.0f} s, reverse {res.reverse_seconds:.0f} s, host "
           f"{res.host_gb:.1f} GB, device peaks {memory()} GiB", flush=True)
@@ -171,7 +176,7 @@ def main():
         row = dict(cost=name, start=start.isoformat(), days=a.days, J=float(res.losses[k]), dJ_dlogp=g,
                    x0_norm=None if gx is None else float(np.linalg.norm(gx)),
                    x0_scaled_norm=None if gx is None else float(np.linalg.norm(x0 * gx)),
-                   npes=a.npes, chunk_steps=K, t_grad=t_grad, host_gb=res.host_gb, device_peak_gib=memory())
+                   npes=a.npes, chunk_steps=K, boundary_stride=a.boundary_stride, t_grad=t_grad, host_gb=res.host_gb, device_peak_gib=memory())
         print(f"{a.days} d {name}: J {row['J']:.7e}  |dJ/dx0| {row['x0_norm']}  scaled {row['x0_scaled_norm']}", flush=True)
         for p in NAMES:
             print(f"   {p:10s} dJ/dlog p {g[p]: .6e}", flush=True)
