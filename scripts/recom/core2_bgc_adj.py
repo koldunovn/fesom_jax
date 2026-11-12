@@ -159,10 +159,37 @@ def main():
     carry0 = lambda: chunk.place(host_carry)                     # noqa: E731  (a fresh device copy per use)
     u0 = {k: jnp.asarray(0.0, jnp.float64) for k in NAMES}
 
+    # The reverse trace: at every chunk boundary, per cost, the norm of the BGC cotangent (raw and times the state
+    # there) and where its largest entry sits (global node, level, tracer, the tracer's value). The boundary states
+    # come from the forward's host copies; the cotangent is read on the device (read-only, the library's on_cot).
+    gid = np.asarray(chunk.gid["nod"])
+    names = list(lay.names)
+    trace_path = a.out / f"trace_{start.strftime('%Y%m%d')}_{a.days}d.jsonl"
+
+    @jax.jit
+    def _peak(b):
+        a_ = jnp.abs(b)
+        i = jnp.argmax(a_)
+        return jnp.sqrt(jnp.sum(b * b)), i, a_.reshape(-1)[i], jnp.sqrt(jnp.sum(b * b, axis=(0, 1)))
+
+    def on_cot(k, c, cot):
+        b = cot[0].bgc if isinstance(cot, tuple) else cot.bgc
+        norm, i, peak, per_tr = jax.device_get(_peak(b))
+        lane, lev, tr = np.unravel_index(int(i), b.shape)
+        top = np.argsort(-per_tr)[:3]
+        rec = dict(cost=COSTS[k], boundary=int(c), day=c * K / spd, norm=float(norm), peak=float(peak),
+                   node=int(gid[lane]), level=int(lev), tracer=names[tr],
+                   top_tracers=[(names[t], float(per_tr[t])) for t in top])
+        with open(trace_path, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+        if c % (n_chunks // 8 or 1) == 0 or c == n_chunks:
+            print(f"   trace {COSTS[k]} boundary {c:4d} (day {rec['day']:5.2f}): |cot bgc| {norm:.3e}  peak {peak:.2e} "
+                  f"at node {rec['node']} level {lev} {names[tr]}", flush=True)
+
     t = time.time()
     res = adjoint.chunked_grad_multi(chunk_fn, u0, init_state=carry0(), n_chunks=n_chunks, xs_fn=xs_fn,
                                      loss_fns=loss_fns, chunk_steps=K, boundary_stride=a.boundary_stride,
-                                     check_linear=False, field_trace=False)
+                                     check_linear=False, field_trace=False, on_cot=on_cot)
     t_grad = time.time() - t
     print(f"gradient: forward {res.forward_seconds:.0f} s, reverse {res.reverse_seconds:.0f} s, host "
           f"{res.host_gb:.1f} GB, device peaks {memory()} GiB", flush=True)
