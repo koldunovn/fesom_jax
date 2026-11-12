@@ -1,0 +1,80 @@
+# Levante (GH200) version of configs/albedo/core2_recom_spectral_w28sl1.yaml, written by scripts/albedo/levante_pool.py for the pool /work/bk1415/a270044/fesom_jax_pool.
+# Edit the Albedo config and rerun the script instead of editing this file.
+# Albedo: the fesom-jax half of the FESOM 2.8 reference pair of the parameter estimation (the Fortran half is
+# /albedo/work/user/sloza/SPECTRAL/tmp_run_kdind15w28sl1; docs/plans/20261105-recom-parameter-estimation.md, Phase 0.1):
+# core2_recom_spectral_warm1998_fesom28.yaml with the REcoM settings of the user's reference kdind15wco2sl1: L1 OASIM (rsds x
+# 0.43), CO2 limitation of the spectral growth, the Phaeocystis CO2 set. 1998-2000. Its header follows.
+# Albedo: the fesom-jax half of the physics-matched CORE2 pair after the fork's move to FESOM 2.8
+# (docs/plans/completed/20261102-fortran-spectral-on-fesom28.md, step 5.5). The Fortran half is
+# /albedo/work/user/sloza/SPECTRAL/tmp_run_kdind15w28 (README.w28: the 2.8 build, namelists
+# scripts/recom/fortran/namelists_albedo_fesom28_core2_warm1998/). As core2_recom_spectral_warm1998_jaxphys_groups.yaml
+# (the pair on the fork's old FESOM2 base) except:
+#   gm: {}         GM/Redi on, as the 2.8 Fortran run: the 2.8 host has the GM/Redi fesom-jax follows (the pi twin of
+#                  the same build passes G4b with GM/Redi on at 4.1e-8, job 48698151)
+#   no legacy      FESOM 2.8 has #944, #1116 and 18346243
+# What remains different: fesom-jax's stated REcoM deviations (the whole-mesh ballast reset, the skipped first-call
+# reset), chaos.
+# Albedo: configs/albedo/core2_recom_spectral_warm1998_jaxphys.yaml (the fesom-jax half of the physics-matched pair,
+# jobs 48627146-47) rerun with the four phytoplankton groups in the monthly output, as
+# core2_recom_spectral_kdind15_groups.yaml does for the cold run: the Fortran kdind15wjp writes NPPn, NPPd, NPPp but no
+# NPPc, so per-group NPP compares like with like (docs/recom/FORTRAN_JAX_DIFFERENCES.md). Everything else as that config.
+# Albedo: the fesom-jax half of the physics-matched CORE2 pair (docs/recom/FORTRAN_JAX_DIFFERENCES.md). The Fortran
+# half is /albedo/work/user/sloza/SPECTRAL/tmp_run_kdind15wjp (its README.jaxphys: kdind15w with cvmix TKE, no
+# Monin-Obukhov mixing, GM/Redi off, opt_visc 7, mEVP, ice_diff 10, advection weights 0., 1., no partial cells, the
+# fork + the upstream REcoM fixes executable of the G4b twins). As core2_recom_spectral_warm1998_noco2lim.yaml except:
+#   gm: null       the fork's GM/Redi (FESOM 1.4-style init_Redi_GM) is not matchable: off on both sides
+#   legacy: {}     the fork base's Redi K33 weights, FCT limiter bounds and absolute shortwave depth
+# What remains different: the fork's 2025-10 sea-ice code (the one-day pair's floor, a_ice 3.2e-4), chaos.
+# Albedo: CORE2 + the spectral REcoM fork warm-started from the user's 1997 4-PFT Fortran restart
+# (/albedo/work/projects/p_specbic/sloza/restart_1997_4pft, its README), converted by
+# scripts/recom/fortran_restart_to_jax.py into restart_in below; the forcing of the user's Fortran runs
+# (tmp_run_kdind15 and its warm clones): the JRA55-do repeat-year climatology clim61 (FESOM2 y_perpetual ->
+# forcing.repeat_year), CORE2 runoff and PHC2 SSS from the FESOM2 pool, a constant chlorophyll 0.1 (chl_data_source
+# 'None'), the OASIM climatology. Model years 1998- are forced like every year. Physics and GPU options as
+# configs/albedo/core2_recom_spectral.yaml. Known differences from the Fortran run: no partial cells (the restart's
+# layer thicknesses are rebuilt from hbar), the current FESOM2 physics (docs/recom/VALIDATION.md).
+ale: {}
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1}
+visc: {}
+tracer: {}
+
+dt: 2700.0                # the user's runs: step_per_day 32
+
+mesh: /work/bk1415/a270044/fesom_jax_pool/fesom_jax_data/core2_mesh_ic/mesh_core2
+partition: null
+forcing:
+  kind: core2
+  start_year: 1998
+  mslp: true
+  jra_dir: /work/bk1415/a270044/fesom_jax_pool/forcing/jra55_clim61
+  repeat_year: clim61
+  chl_const: 0.1
+  sss_path: /work/bk1415/a270044/fesom_jax_pool/forcing/core2_pool/PHC2_salx.nc
+  runoff_path: /work/bk1415/a270044/fesom_jax_pool/forcing/core2_pool/runoff.nc
+  dust_file: /work/bk1415/a270044/fesom_jax_pool/recom_pool/CORE2/DustClimMonthlyAlbani.nc
+  co2_file: /work/bk1415/a270044/fesom_jax_pool/forcing/recom_maresys/MonthlyAtmCO2_gcb2024.nc
+  oasim_dir: /work/bk1415/a270044/fesom_jax_pool/forcing/oasim_v2_rsds
+  oasim_pattern: oasim_clim1998-2012_darwin400_rsds043.nc
+
+recom:
+  namelist: scripts/recom/fortran/namelists_albedo_fesom28_core2_sl1/namelist.recom   # 37 tracers: 3zoo2det + coccos + CDOM
+  spectral: true
+  spectral_co2lim: true                 # RECOM_CO2LIM_SPECTRAL in the namelist
+  optics_dir: /work/bk1415/a270044/fesom_jax_pool/fesom_jax_data/recom_pi/optics
+  ic_set: core2                         # only Alk_surf (the restoring target) is taken from the IC at the conversion
+  ic_dir: /work/bk1415/a270044/fesom_jax_pool/recom_pool
+  output: [DIC, Alk, DIN, DSi, DFe, O2, Chl, co2flux, pco2surf, npp, export100, PhyC, PhyChl, DiaC, DiaChl, CoccoC, CoccoChl, PhaeoC, PhaeoChl, npp_phy, npp_dia, npp_cocco, npp_phaeo]
+
+gpu:
+  column_unroll: true
+  column_kernel: true
+  chunk_steps: 48
+output_dir: /work/bk1415/a270044/fesom_jax_pool/runs/core2_recom_spectral_w28sl1
+snapshot_every: 0
+checkpoint_every: 0
+restart_in: /work/bk1415/a270044/fesom_jax_pool/restarts/restart_1997_4pft_jax
+restart_out: null
+duration: 1yr             # overridden by --steps
