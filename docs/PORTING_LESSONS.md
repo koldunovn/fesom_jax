@@ -10063,3 +10063,20 @@ Three findings from the spectral fork's sharded and gradient gates, one afternoo
    on the unmerged branch, jobs 48635024/48635030; the merge branch passed 4 of 4, 48635023/27/29/31). Same env,
    same test, both branches: a jaxlib CPU collectives race, not a regression; every completed run agrees to 5e-15.
    Rerun before bisecting a merge on a crash in `integrate_sharded`.
+
+### 2026-11-12 (branch recom-spectral, the CORE2 REcoM gradient) — memory on one GPU, an OOM that hangs, and the step's own remat
+
+1. **The CORE2 REcoM gradient does not fit one A100 80GB even for one day.** XLA asks 187 GiB for a 1-day window
+   (48971904), 104 GiB with `remat_blocks` (48972387), 89 GiB with the one-tracer BGC layout too (48972388); its floor
+   for the program is 51-66 GiB, and a stored CORE2 state with 37 tracers is about 12 GiB. Sharded over four GPUs with the
+   chunk boundaries on the host (`scripts/recom/core2_bgc_adj.py`: `adjoint_sharded` + `adjoint.chunked_grad_multi`) it
+   fits with `remat_blocks`, `FESOM_BGC_LAYOUT=loop` and 2-step chunks: 64.7 / 45.9 GiB per GPU (49013169), FD ratios
+   0.9999 / 0.9997 (49013205). The first GPU carries more than the others (the cost reduction and the replicated inputs).
+2. **An OOM on one device of a sharded program can hang the job instead of ending it.** With 4-step chunks GPU 0 ran
+   out of memory in the reverse (49013168, 14:19) and the other three ranks waited in XLA's collective rendezvous
+   (`rendezvous.cc:116 ... Acquire clique`) until the job was cancelled an hour later; nothing reached the end of the
+   log. A sharded gradient whose log stops after an allocator summary is dead: cancel it.
+3. **The sharded adjoint split REcoM's per-step calendar scalars like node fields.** `daynew` and `ndpyr` are `[K]`,
+   not `[K, nod]`; `adjoint_sharded.make_chunk_fn` built every forcing spec as `P(None, 'p')` and shard_map refused
+   (49007970). The production fold (`integrate_sharded._fold_forcing_seq`) already replicates
+   `surface_forcing.STEP_SCALARS`; the adjoint chunk now uses the same list (`_forcing_spec`).
