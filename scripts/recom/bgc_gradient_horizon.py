@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import datetime
 import functools
 import json
 import sys
@@ -46,6 +47,43 @@ NAMES = ("expon_phy", "graz_max", "rho_N", "deg_Chl", "cdomcoeff", "k_Fe_d")   #
 RUN = "pi_1d_spectral_jaxphys"
 STEPS_PER_DAY = 32
 CHL = ("PhyChl", "DiaChl", "CoccoChl", "PhaeoChl")
+START = datetime.datetime(1958, 1, 1)   # the model time of the start state; set in main()
+LIMIT_DAY = 361                         # pi: windows end inside the 1958 forcing; None for --config (repeat-year forcing)
+
+
+def dates(dt, n):
+    """``(year, day_of_year, sec_of_day, month)`` of the ``n`` steps after :data:`START` (as
+    :func:`fesom_jax.surface_forcing.dates_for_steps`, from any start time, e.g. a half-year restart at noon)."""
+    out = []
+    for k in range(n):
+        d = START + datetime.timedelta(seconds=k * float(dt))
+        out.append((d.year, (d - datetime.datetime(d.year, 1, 1)).days + 1,
+                    d.hour * 3600.0 + d.minute * 60.0 + d.second, d.month))
+    return out
+
+
+def setup_config(path, restart, year):
+    """``(fx, state, forcing, start)`` for a production config (e.g. CORE2) and a fesom-jax restart of a run that
+    started on 1 January ``year``: the fields the window functions use (cfg, phys, lay, mesh, op, fs), the restart as
+    a new run segment, the forcing as ``scripts/run_from_config.py`` builds it, and the restart's model time."""
+    from fesom_jax import partit, ssh
+    from fesom_jax import zarr_output as zo
+    from fesom_jax.mesh import load_mesh
+    from fesom_jax.run_config import load_yaml
+    cfg = load_yaml(path)
+    mesh = load_mesh(cfg.mesh)
+    ser = partit.synth_serial(mesh.nod2D, mesh.elem2D, mesh.edge2D)
+    st, meta = zo.read_restart(restart, mesh, ser)
+    st = wiring.start_segment(jax.tree.map(lambda a: jnp.asarray(np.asarray(a)), st), cfg.recom)
+    cf = surface_forcing.build_surface_forcing(mesh, year, sst_ic=np.asarray(st.T[:, 0]), dt=cfg.dt,
+                                               mslp=cfg.forcing_mslp(), bgc_dust_path=cfg.bgc_dust_path(),
+                                               dt_ramp=cfg.dt_ramp, bgc_co2=cfg.bgc_co2(), bgc_oasim=cfg.bgc_oasim(),
+                                               **cfg.forcing_paths())
+    fs = wiring.with_recom_static(cf.static, mesh, cfg.recom)
+    op = ssh.build_ssh_operator(mesh, dt=cfg.dt)
+    fx = dict(cfg=cfg, phys=cfg.physics_kwargs(), lay=cfg.recom.layout, mesh=mesh, op=op, fs=fs, cf=cf, st=st)
+    start = datetime.datetime(int(year), 1, 1) + datetime.timedelta(seconds=int(meta["step"]) * float(cfg.dt))
+    return fx, st, cf, start
 
 
 def split(n: int) -> tuple[int, int]:
@@ -98,7 +136,7 @@ def tangent_check(fx, st0, cf, day):
     mesh, dt = fx["mesh"], fx["cfg"].dt
     zero = jnp.zeros((mesh.elem2D, 2))
     _, p0 = fx["cfg"].recom.load()
-    sf = jax.tree.map(lambda x: x[0], cf.stack(surface_forcing.dates_for_steps(1958, dt, 1, start_day=day)))
+    sf = jax.tree.map(lambda x: x[0], cf.stack(dates(dt, 1)))
     theta = jnp.array([getattr(p0, k) for k in NAMES], jnp.float64)
 
     def f(th, bgc):
@@ -132,7 +170,7 @@ def backward_scan(fx, st0, cf, day, kind, end_day, snapshots, names):
     mesh, dt = fx["mesh"], fx["cfg"].dt
     zero = jnp.zeros((mesh.elem2D, 2))
     n_end = end_day * STEPS_PER_DAY
-    full = cf.stack(surface_forcing.dates_for_steps(1958, dt, n_end, start_day=day))
+    full = cf.stack(dates(dt, n_end))
     params = Params.defaults()._replace(recom=fx["cfg"].recom.load()[1]) if hasattr(Params, "_replace") else \
         dataclasses.replace(Params.defaults(), recom=fx["cfg"].recom.load()[1])
 
@@ -173,7 +211,7 @@ def column_jacobian(fx, st0, cf, day, jac_days, steps_in_day, nodes, names, out,
     nzmax = np.asarray(mesh.nlevels_nod2D) - 1
     ntr = st0.bgc.shape[-1]
     last = max(jac_days) * STEPS_PER_DAY + max(steps_in_day) + 1
-    full = cf.stack(surface_forcing.dates_for_steps(1958, dt, last, start_day=day))
+    full = cf.stack(dates(dt, last))
 
     def one(s, sf):
         return stepmod.step(s, mesh, fx["op"], zero, params, dt=dt, is_first_step=False, step_forcing=sf,
@@ -246,9 +284,9 @@ def window_scan(fx, st0, cf, day, kinds, lengths, starts, out, h=1e-2):
     mesh, dt = fx["mesh"], fx["cfg"].dt
     zero = jnp.zeros((mesh.elem2D, 2))
     params = dataclasses.replace(Params.defaults(), recom=fx["cfg"].recom.load()[1])
-    fits = lambda s, L: day + s + L <= 361
+    fits = lambda s, L: LIMIT_DAY is None or day + s + L <= LIMIT_DAY
     last = max(s + L for s in starts for L in lengths if fits(s, L)) * STEPS_PER_DAY
-    full = cf.stack(surface_forcing.dates_for_steps(1958, dt, last, start_day=day))
+    full = cf.stack(dates(dt, last))
 
     def one(st, sf):
         return stepmod.step(st, mesh, fx["op"], zero, params, dt=dt, is_first_step=False, step_forcing=sf,
@@ -302,7 +340,7 @@ def term_split(fx, st0, cf, day, jac_days, steps_in_day, nodes, names, out, batc
     nzmax = np.asarray(mesh.nlevels_nod2D) - 1
     ntr = st0.bgc.shape[-1]
     last = max(jac_days) * STEPS_PER_DAY + max(steps_in_day) + 1
-    full = cf.stack(surface_forcing.dates_for_steps(1958, dt, last, start_day=day))
+    full = cf.stack(dates(dt, last))
     stop = lambda t: jax.tree.map(lambda l: jax.lax.stop_gradient(l) if isinstance(l, jax.Array) else l, t)
 
     def one(s, sf, **extra):
@@ -419,6 +457,16 @@ def timed(fn, *a):
     return r, time.time() - t
 
 
+def report_memory():
+    """Peak device memory so far (GPU), the number that decides how long a CORE2 window can be."""
+    try:
+        m = jax.devices()[0].memory_stats() or {}
+        print(f"device memory: peak {m.get('peak_bytes_in_use', 0) / 2**30:.1f} GiB of "
+              f"{m.get('bytes_limit', 0) / 2**30:.1f} GiB", flush=True)
+    except Exception as e:                                  # CPU backends have no memory_stats
+        print(f"device memory: not available ({e})", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--days", type=int, nargs="+", default=[1, 5, 30, 90])
@@ -440,17 +488,29 @@ def main():
     ap.add_argument("--restart", default=TF.RESTART, help="restart to start from")
     ap.add_argument("--start-day", type=int, default=None, help="day of 1958 of the start (default: from the restart)")
     ap.add_argument("--no-fd", action="store_true")
+    ap.add_argument("--config", default=None, help="a production run config (e.g. CORE2) instead of the pi twin set-up;"
+                    " --restart is then a restart of that run and --year the year its step 0 started")
+    ap.add_argument("--year", type=int, default=1998, help="with --config: the start year of the run --restart comes from")
     ap.add_argument("--tangent-check", action="store_true", help="one-step physics-tangent check first")
     ap.add_argument("--out", type=Path,
                     default=Path("/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/bgc_gradient_horizon"))
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
-    fx = TF._setup(RUN, TF.RUN_CFG)
-    st0, cf, day = TF.warm_start(fx, a.restart)
-    if day <= 1:
-        raise SystemExit(f"no warm restart at {a.restart}: the windows need a grown ecosystem")
-    day = a.start_day or day
-    print(f"start day {day} of 1958 from {a.restart}, backend {jax.default_backend()}, bgc {st0.bgc.shape}", flush=True)
+    global START, LIMIT_DAY
+    if a.config:
+        fx, st0, cf, START = setup_config(a.config, a.restart, a.year)
+        LIMIT_DAY = None
+        day = (START - datetime.datetime(START.year, 1, 1)).days + 1
+        print(f"start {START.isoformat()} (day {day}) from {a.restart} under {a.config}, backend "
+              f"{jax.default_backend()}, bgc {st0.bgc.shape}", flush=True)
+    else:
+        fx = TF._setup(RUN, TF.RUN_CFG)
+        st0, cf, day = TF.warm_start(fx, a.restart)
+        if day <= 1:
+            raise SystemExit(f"no warm restart at {a.restart}: the windows need a grown ecosystem")
+        day = a.start_day or day
+        START = datetime.datetime(1958, 1, 1) + datetime.timedelta(days=day - 1)
+        print(f"start day {day} of 1958 from {a.restart}, backend {jax.default_backend()}, bgc {st0.bgc.shape}", flush=True)
     b0 = np.asarray(st0.bgc)
     print("surface means: " + "  ".join(f"{n} {b0[:, 0, i].mean():.3g}" for i, n in enumerate(fx["lay"].names)), flush=True)
     if a.tangent_check:
@@ -468,10 +528,10 @@ def main():
         backward_scan(fx, st0, cf, day, a.cost[0], a.backward[0], a.backward[1:], fx["lay"].names)
         return
     for d in a.days:
-        if day + d > 361:
+        if LIMIT_DAY is not None and day + d > LIMIT_DAY:
             raise SystemExit(f"window of {d} days from day {day} leaves 1958")
         n = d * STEPS_PER_DAY
-        stack = cf.stack(surface_forcing.dates_for_steps(1958, fx["cfg"].dt, n, start_day=day))
+        stack = cf.stack(dates(fx["cfg"].dt, n))
         for kind in a.cost:
             cost, theta = make_cost(fx, kind, n)
             fwd = jax.jit(cost)
@@ -511,4 +571,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        report_memory()
