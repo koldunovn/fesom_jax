@@ -43,7 +43,8 @@ from .zarr_output import _folded_gid_owned
 _P = PartitionSpec("p")
 _R = PartitionSpec()
 TRANSPORTS = ("padded", "coloured")
-_PHYS = ("ice_cfg", "gm_cfg", "kpp_cfg", "tke_cfg", "ale_cfg", "visc_cfg", "tracer_cfg")
+_PHYS = ("ice_cfg", "gm_cfg", "kpp_cfg", "tke_cfg", "ale_cfg", "visc_cfg", "tracer_cfg",
+         "recom_cfg", "remat_blocks")    # full REcoM and the in-step remat (scripts/recom/core2_bgc_adj.py, 2026-11-12)
 
 
 @dataclasses.dataclass(eq=False)
@@ -164,9 +165,9 @@ class ShardedChunk:
             seq, cs = xs
             carry_spec = jax.tree.map(lambda _: _P, carry)
             if _scheduled(seq):
-                seq_spec = (jax.tree.map(lambda _: PartitionSpec(None, "p"), seq[0]), jax.tree.map(lambda _: _R, seq[1]))
+                seq_spec = (_forcing_spec(seq[0]), jax.tree.map(lambda _: _R, seq[1]))
             else:
-                seq_spec = jax.tree.map(lambda _: PartitionSpec(None, "p"), seq)
+                seq_spec = _forcing_spec(seq)
             in_specs = tuple(specs[k] for k in names) + (carry_spec, seq_spec, jax.tree.map(lambda _: _R, u))
             f = jax.shard_map(body, mesh=jmesh, in_specs=in_specs, out_specs=carry_spec, check_vma=False)
             return f(*(cs[k] for k in names), carry, seq, u)
@@ -190,6 +191,14 @@ def _scheduled(seq) -> bool:
     """A scheduled chunk's forcing ``(StepForcing, {month, cost_w})``: a plain tuple (a ``StepForcing`` is a NamedTuple,
     so ``isinstance(seq, tuple)`` holds for the plain forcing too)."""
     return type(seq) is tuple
+
+
+def _forcing_spec(sf):
+    """The ``shard_map`` spec of a folded per-step forcing ``[K, P*Lmax_nod, …]``: the device axis sharded, the per-step
+    scalars (REcoM's calendar ``daynew``/``ndpyr``, ``integrate_sharded._STEP_SCALARS``, ``[K]``) replicated, as
+    :func:`fesom_jax.integrate_sharded._fold_forcing_seq` places them."""
+    return type(sf)(**{k: None if v is None else (_R if k in ish._STEP_SCALARS else PartitionSpec(None, "p"))
+                       for k, v in sf._asdict().items()})
 
 
 def localize_forcing_adj(params, gid, valid):
