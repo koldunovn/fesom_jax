@@ -48,10 +48,11 @@ for 1 day on Albedo) and needs the sharded, host-checkpointed path below.
    Miniforge in `$POOL/envs/miniforge-x86`, python 3.12 and `requirements_levante.txt` from PyPI into
    `$POOL/envs/fesom-jax-x86`, the checkout editable.
 2. **Check and gate**: `sbatch -A <project>_gpu scripts/levante/check_gpu.sbatch`. JAX must see the A100, then the
-   1-day pi gradient from the 5-year spin-up runs; compare it with the same job on Albedo (49000368).
+   1-day pi gradient from the 5-year spin-up runs; compare it with the same job on Albedo (49000368). Passed 2026-11-12 (job 28932214, A100-SXM4-80GB): J and every
+   adjoint value identical to the printed digits, the finite differences within 3e-5 relative (forward noise 1.4e-9).
 3. **Jobs**: `scripts/levante/run_horizon_gpu.sbatch` (one A100: pi windows, CORE2 forward only) and
    `scripts/levante/run_config_gpu.sbatch` (forward runs; `--gres=gpu:a100_80:4` for four GPUs). The account in the
-   scripts is `ab0995_gpu`, the repo's Levante convention; `sbatch -A` gives yours.
+   scripts is `bk1415_gpu` (works for a270044, job 28932214); `sbatch -A` gives another.
 
 The CORE2 BGC gradient on four A100 80GB needs a driver that joins REcoM to `fesom_jax.adjoint.chunked_grad` (one
 chunk on the device, the window's boundaries on the host) and `fesom_jax.adjoint_sharded` (the chunk sharded over the

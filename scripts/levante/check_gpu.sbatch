@@ -6,7 +6,7 @@
 #   sbatch -A <project>_gpu scripts/levante/check_gpu.sbatch          (from the checkout)
 #SBATCH --job-name=fj_check_gpu
 #SBATCH --partition=gpu
-#SBATCH --account=ab0995_gpu
+#SBATCH --account=bk1415_gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100_80:1

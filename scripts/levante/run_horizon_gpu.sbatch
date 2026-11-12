@@ -8,7 +8,7 @@
 # start year of the run RESTART comes from, 1998). The driver is single-device: it uses the first of the four GPUs.
 #SBATCH --job-name=fj_hor_gpu
 #SBATCH --partition=gpu
-#SBATCH --account=ab0995_gpu
+#SBATCH --account=bk1415_gpu
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:a100_80:1
