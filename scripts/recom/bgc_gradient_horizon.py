@@ -491,6 +491,9 @@ def main():
     ap.add_argument("--config", default=None, help="a production run config (e.g. CORE2) instead of the pi twin set-up;"
                     " --restart is then a restart of that run and --year the year its step 0 started")
     ap.add_argument("--year", type=int, default=1998, help="with --config: the start year of the run --restart comes from")
+    ap.add_argument("--remat-blocks", action="store_true",
+                    help="step(remat_blocks=True): the heavy sub-blocks of each step recomputed one at a time in the backward "
+                         "(gradient-identical; the CORE2 single-step working set does not fit an A100 otherwise)")
     ap.add_argument("--tangent-check", action="store_true", help="one-step physics-tangent check first")
     ap.add_argument("--out", type=Path,
                     default=Path("/albedo/work/projects/p_specbic/sloza/fesom_jax_runs/bgc_gradient_horizon"))
@@ -511,6 +514,8 @@ def main():
         day = a.start_day or day
         START = datetime.datetime(1958, 1, 1) + datetime.timedelta(days=day - 1)
         print(f"start day {day} of 1958 from {a.restart}, backend {jax.default_backend()}, bgc {st0.bgc.shape}", flush=True)
+    if a.remat_blocks:
+        fx = {**fx, "phys": {**fx["phys"], "remat_blocks": True}}
     b0 = np.asarray(st0.bgc)
     print("surface means: " + "  ".join(f"{n} {b0[:, 0, i].mean():.3g}" for i, n in enumerate(fx["lay"].names)), flush=True)
     if a.tangent_check:
