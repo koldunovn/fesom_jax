@@ -56,4 +56,6 @@ for 1 day on Albedo) and needs the sharded, host-checkpointed path below.
 
 The CORE2 BGC gradient on four A100 80GB needs a driver that joins REcoM to `fesom_jax.adjoint.chunked_grad` (one
 chunk on the device, the window's boundaries on the host) and `fesom_jax.adjoint_sharded` (the chunk sharded over the
-GPUs, padded halo); `scripts/adjoint/core2_adj.py` does this for the physics controls only. Not written yet.
+GPUs, padded halo): `scripts/recom/core2_bgc_adj.py` (2026-11-12; checked on Albedo, pi against the single-GPU gate to 7 digits, CORE2 1 day
+FD ratios 0.9999 / 0.9997, jobs 49008389, 49013205). On Levante: `sbatch scripts/levante/run_bgc_adj_gpu.sbatch --days 1 --out ...` (one whole
+A100 node; the dist_4 partitions travel with the pool, `levante_pool.py rsync`).

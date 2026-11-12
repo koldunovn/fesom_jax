@@ -46,6 +46,8 @@ POOL = [
     (f"{P}/fesom_jax_runs/restart_1997_4pft_jax", "restarts/restart_1997_4pft_jax", "core2"),
     *[(f"{P}/fesom_jax_runs/core2_recom_spectral_w28sl1/seg{k}/restart", f"restarts/w28sl1/seg{k}", "core2")
       for k in (3, 4, 5)],
+    (f"{P}/fesom_jax_data/core2_mesh_ic/mesh_core2_part", "fesom_jax_data/core2_mesh_ic/mesh_core2_part", "core2"),  # dist_4
+    (f"{P}/fesom_jax_data/mesh_pi_part", "fesom_jax_data/mesh_pi_part", "pi"),                                     # dist_4
     (f"{P}/fesom_jax_data/mesh_pi_fork", "fesom_jax_data/mesh_pi_fork", "pi"),
     (f"{P}/fesom_jax_data/ic_pi_fork", "fesom_jax_data/ic_pi_fork", "pi"),
     (f"{P}/fesom_jax_data/forcing_1958_mslp", "fesom_jax_data/forcing_1958_mslp", "pi"),
