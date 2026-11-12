@@ -503,6 +503,19 @@ def flush_monthly(static: OceanStatic) -> str | None:
     (yr, mo), cnt = static._mon_key, static._mon_count
     mean = jax.tree.map(lambda x: x / cnt, static._mon_sum)
     path = f"{static.monthly_out}/{yr:04d}_{mo:02d}"
+    if os.environ.get("FESOM_CPL_MONTHLY_LAYOUT", "global") == "folded" and static.npes > 1:
+        # (awicm_jax lane tco319_ng5 on JUPITER) the gather-free write: every process writes the float32 means of its
+        # own shards into the folded [P*Lmax, ...] store with the gid/owned maps (zarr_output.write_state_zarr,
+        # layout "folded"; zarr_output.reconstruct_global reads a field back in global node order). The global
+        # write first all-gathers every 3-D mean (4.1 GB each at NG5) to every device and every process's host
+        import types
+        mean32 = jax.tree.map(lambda x: x.astype(jnp.float32), mean)
+        zarr_output.write_state_zarr(path, types.SimpleNamespace(**mean32), static.sm, static.part,
+                                     fields=tuple(mean32), layout="folded",
+                                     attrs={"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": int(cnt),
+                                            "coupled_mode": static.mode, "dtype": "float32 monthly means"})
+        static._mon_key, static._mon_sum, static._mon_count = None, None, 0
+        return path
     write = functools.partial(ushow_output.write_global_zarr,
                               attrs={"calendar_month": f"{yr:04d}-{mo:02d}", "n_samples": int(cnt),
                                      "coupled_mode": static.mode},
