@@ -1,0 +1,24 @@
+# The fesom-jax runtime on the Levante GH200 nodes (dolpung, aarch64), pinned to the Albedo env that ran the
+# REcoM estimation lane (/albedo/work/user/sloza/fesom-jax-env/fesom-jax, python 3.12, 2026-11-12; constraints.txt
+# for the JAX set). scripts/levante/fetch_wheels.sh downloads these as aarch64 wheels; make_env_gh200.sbatch installs
+# them offline (numcodecs and asciitree as source, built on the node). The CUDA 12 runtime comes as nvidia-* wheels through jax[cuda12]; no CUDA module is needed.
+jax[cuda12]==0.10.1
+jaxlib==0.10.1
+jax-cuda12-plugin==0.10.1
+jax-cuda12-pjrt==0.10.1
+ml_dtypes==0.6.0
+opt_einsum==3.4.0
+numpy==2.4.6
+scipy==1.17.1
+netCDF4==1.7.4
+cftime==1.6.6.1
+zarr==2.18.7
+numcodecs==0.15.2                 # zarr 2 needs < 0.16, which has no aarch64 wheel: built from source (fetch_wheels.sh)
+asciitree==0.3.3                  # zarr's tree printer, source only
+fasteners==0.20
+PyYAML==6.0.3
+optax==0.2.8
+absl-py==2.5.1
+pytest==9.0.3
+setuptools==84.2.1
+wheel==0.48.0
