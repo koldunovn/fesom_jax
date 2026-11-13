@@ -82,6 +82,9 @@ def main():
     ap.add_argument("--remat-blocks", action="store_true", help="step(remat_blocks=True), as the horizon driver")
     ap.add_argument("--h", type=float, default=1e-2, help="the FD step in log p")
     ap.add_argument("--no-fd", action="store_true")
+    ap.add_argument("--adjoint-freeze", nargs="+", default=None, metavar="FLAG",
+                    help="diagnostic: AdjointConfig flags (e.g. freeze_fct_limiter) whose state dependence the reverse "
+                         "pass omits; the forward and the FD are unchanged, so adjoint/FD near 1 names the term")
     ap.add_argument("--out", type=Path, required=True)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
@@ -129,7 +132,15 @@ def main():
 
     accs = {"chl": lambda fm: (lambda s: jnp.sum(s.bgc[:, 0, chl_ids], axis=-1)),
             "din": lambda fm: (lambda s: s.bgc[:, 0, din_id])}
-    chunk_fn = chunk.make_chunk_fn(dt=dt, phys=phys, adjoint_cfg=None, to_params=to_params, accumulators=accs,
+    adj_cfg = None
+    if a.adjoint_freeze:
+        from fesom_jax.adjoint_stab import FREEZE_FLAGS, AdjointConfig
+        bad = [f for f in a.adjoint_freeze if f not in FREEZE_FLAGS]
+        if bad:
+            raise SystemExit(f"--adjoint-freeze: unknown flags {bad}; known {FREEZE_FLAGS}")
+        adj_cfg = AdjointConfig(**{f: True for f in a.adjoint_freeze})
+        print(f"adjoint freeze (backward only): {a.adjoint_freeze}", flush=True)
+    chunk_fn = chunk.make_chunk_fn(dt=dt, phys=phys, adjoint_cfg=adj_cfg, to_params=to_params, accumulators=accs,
                                    rematerialize=True)
     area = np.asarray(mesh.areasvol)[:, 0]
     a_f = chunk.place(chunk.fold_nodes(area))                     # zero on halo and pad lanes: each node once

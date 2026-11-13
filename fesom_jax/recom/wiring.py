@@ -242,23 +242,29 @@ def _freeze_extinct(X, lay):
     values are unchanged, the step's derivative with respect to those cells is zero. On the 2-year pi state that
     compartment had not yet established (surface Zoo2N about 2e-8, DetZ2 about 1e-16). FESOM_RECOM_GRAD_FREEZE_TRACERS
     (comma-separated tracer names, 2026-11-12) replaces the Zoo2 set, e.g. with HetN/HetC and the detritus pools
-    that the backward scans from the 5-year state found near zero. Read at trace time; unset (the default), ``X``
-    is returned as is and the traced program is unchanged."""
+    that the backward scans from the 5-year state found near zero. An entry ``NAME:THR`` (2026-11-13) gives that
+    tracer its own threshold, e.g. ``DIN:1e-2`` for the nutrient-depleted Kuroshio (DIN between -9e-4 and 2e-3 at
+    100 m in July). Read at trace time; unset (the default), ``X`` is returned as is and the traced program is
+    unchanged."""
     thr = os.environ.get("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "").strip()
     if not thr or X is None:
         return X
     from .layout import ZOO2_NAMES
-    which = [n.strip() for n in os.environ.get("FESOM_RECOM_GRAD_FREEZE_TRACERS", "").split(",") if n.strip()]
-    unknown = [n for n in which if n not in lay.names]
+    entries = [e.strip() for e in os.environ.get("FESOM_RECOM_GRAD_FREEZE_TRACERS", "").split(",") if e.strip()]
+    thr_of = {}
+    for e in entries or ZOO2_NAMES:
+        name, _, t = e.partition(":")
+        thr_of[name.strip()] = float(t) if t.strip() else float(thr)
+    unknown = [n for n in thr_of if n not in lay.names] if entries else []
     if unknown:
         raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_TRACERS: unknown tracers {unknown}")
-    which = which or list(ZOO2_NAMES)
-    ids = [i for i, n in enumerate(lay.names) if n in which]
-    if not ids:
+    thr_vec = np.full(X.shape[-1], -1.0)              # -1: never frozen (|x| < -1 is false)
+    for i, n in enumerate(lay.names):
+        if n in thr_of:
+            thr_vec[i] = thr_of[n]
+    if not (thr_vec > 0).any():
         return X
-    sel = np.zeros(X.shape[-1], bool)
-    sel[ids] = True
-    mask = jnp.asarray(sel) & (jnp.abs(X) < float(thr))
+    mask = jnp.abs(X) < jnp.asarray(thr_vec, X.dtype)
     return jnp.where(mask, jax.lax.stop_gradient(X), X)
 
 

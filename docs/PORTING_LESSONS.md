@@ -10080,3 +10080,21 @@ Three findings from the spectral fork's sharded and gradient gates, one afternoo
    not `[K, nod]`; `adjoint_sharded.make_chunk_fn` built every forcing spec as `P(None, 'p')` and shard_map refused
    (49007970). The production fold (`integrate_sharded._fold_forcing_seq`) already replicates
    `surface_forcing.STEP_SCALARS`; the adjoint chunk now uses the same list (`_forcing_spec`).
+
+### 2026-11-13 (branch recom-spectral, the CORE2 REcoM gradient) — a tracer at zero breaks the gradient; the guard must sit at the noise level
+
+1. **Every CORE2 REcoM gradient failure found so far is a tracer at zero, not a process.** The bursts in the reverse
+   field sit in second-class detritus, Zoo2 and Het at round-off in the gyres (January and July), and in DIN at
+   -9e-4 to 2e-3 at 100 m in the Kuroshio, where it changes sign every few steps next to a front of 11 (July). Holding
+   those cells out of the derivative (`FESOM_RECOM_GRAD_FREEZE_EXTINCT` / `FESOM_RECOM_GRAD_FREEZE_TRACERS`, entries
+   `NAME:THR` for a per-tracer threshold) makes 10 days January and 5 days July pass (adjoint/FD 0.9996-1.0004; jobs
+   49015526, 49015879). Find the tracer's VALUE at the trace's peak before blaming the term: the July peak looked like a
+   transport problem in a healthy tracer until the column dump (49015775) showed DIN at zero.
+2. **The threshold must be the tracer's noise level, not a "small" ecological value.** `DIN:1e-2` cured the growth
+   but cut a real dependence (adjoint/FD 1.134 / 0.842, expon_phy and rho_N off by a factor of 2; 49015878);
+   `DIN:1e-3` passed. Check a guard with the FD, not only with the size of the reverse field.
+3. **Cutting the advection limiter's derivative is not a diagnostic for a transport-side burst.** With
+   `AdjointConfig(freeze_fct_limiter=True)` or `freeze_advection=True` the reverse field grows x1e5 per 0.6 day in a
+   new place (DetCalc, Gulf Stream; 49015771-72, adjoint/FD 1e26): the limited flux's derivative keeps the BGC
+   adjoint stable, like the stabilising loops in `adjoint_stab`'s physics table. `core2_bgc_adj.py --adjoint-freeze`
+   exposes the flags for such tests.

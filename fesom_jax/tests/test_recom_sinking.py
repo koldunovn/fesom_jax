@@ -583,6 +583,11 @@ def test_freeze_extinct_gradient_switch(monkeypatch):
     frozen = np.array([[[0, 0, 0, 1], [0, 0, 0, 0]]], bool)
     np.testing.assert_array_equal(g[frozen], 0.0)
     np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_TRACERS", "Zoo2N,DIN:1.5")   # NAME:THR, its own threshold
+    g = np.asarray(jax.grad(lambda x: jnp.sum(W._freeze_extinct(x, lay) ** 2 / 2))(X))
+    frozen = np.array([[[1, 1, 0, 0], [0, 1, 0, 0]]], bool)
+    np.testing.assert_array_equal(g[frozen], 0.0)
+    np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
     monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_TRACERS", "NoSuchTracer")
     with pytest.raises(ValueError):
         W._freeze_extinct(X, lay)
