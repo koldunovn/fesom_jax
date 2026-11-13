@@ -261,6 +261,8 @@ def _flux_lean_call(fields, static, dates, cache, key, kw):
         if set(place.device_set) != set(mesh.devices.flat):
             place = NamedSharding(mesh, PartitionSpec())
             fields = jax.device_put(fields, place)
+    if lanes_here and forcing_lanes_first_enabled():
+        return _lanes_first_call(fields, static, dates, cache, kw)
     lk = ("lean", key, lanes_here)
     if lk not in cache:
         out_sh = None
@@ -287,6 +289,59 @@ def _flux_lean_call(fields, static, dates, cache, key, kw):
     if mk not in cache:
         cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, place)
     return cache[lk](fields, cache[mk], trig, M, *clim, sc, lanes)
+
+
+def forcing_lanes_first_enabled() -> bool:
+    """``gpu.cpl_forcing_lanes`` (``FESOM_CPL_FORCING_LANES=1``, dist_N with ``cpl_forcing_lean``; lane
+    tco319_ng5_flux): the received fields gathered onto each device's lanes FIRST, then broadcast over the interval,
+    rotated and assembled there. The lean build works on replicated global ``[nsteps, nod2D]`` arrays and gathers at
+    the end, so every device holds the whole interval's forcing: at NG5 (7.4 M nodes, 20 steps, float64 rotation
+    products) that is ~20 GB per device and more than 1 TB on 32 CPU devices (job 28945544). Every operation is
+    element-wise per node and step, and the same stage programs run (products and sums apart), so the values are
+    the lean build's to the bit (pad lanes 1.0 at the end, as there)."""
+    import os
+    return os.environ.get("FESOM_CPL_FORCING_LANES", "0").strip() not in ("", "0")
+
+
+def _assemble_pad(fields, rot, enth, months, sss_clim, chl_clim, pad, **kw):
+    """:func:`_assemble` on the lanes, then the pad lanes set to 1.0 (:func:`_assemble_lanes`' values)."""
+    seq = _assemble(fields, rot, enth, months, sss_clim, chl_clim, **kw)
+    return jax.tree.map(lambda a: jnp.where(pad, jnp.asarray(1, a.dtype), a), seq)
+
+
+def _lanes_first_call(fields, static, dates, cache, kw):
+    """:func:`forcing_lanes_first_enabled`: the lanes' tables (rotation trig, SSS / chlorophyll climatologies, pad
+    mask) placed once, sharded over the lanes; per interval one gather of the received ``(nod2D,)`` fields onto the
+    lanes, then :func:`_flux_seq_lean`'s stages on ``[nsteps, P*Lmax]`` sharded arrays."""
+    import functools
+    from jax.sharding import NamedSharding, PartitionSpec
+    from .. import jra55
+    mesh = static.device_mesh()
+    sh_l, sh_tl = NamedSharding(mesh, PartitionSpec("p")), NamedSharding(mesh, PartitionSpec(None, "p"))
+    rep = NamedSharding(mesh, PartitionSpec())
+    if "lanes_first" not in cache:
+        from ..zarr_output import _folded_gid_owned
+        gid, _ = _folded_gid_owned(static.part, static.sm, "nod")
+        idx = np.where(gid >= 0, gid, 0).astype(np.int64)
+        tabs = (jax.device_put(idx.astype(np.int32), sh_l), jax.device_put(gid < 0, sh_l),
+                tuple(jax.device_put(np.asarray(t)[idx], sh_l) for t in static.trig),
+                jax.device_put(np.asarray(static.M), rep),
+                jax.device_put((np.asarray(LATENT_FUSION, np.float64), np.asarray(1000000.0, np.float64)), rep),
+                jax.device_put(np.asarray(static.sss_clim)[:, idx], sh_tl),
+                jax.device_put(np.asarray(static.chl_clim)[:, idx], sh_tl),
+                jax.jit(lambda f, i: jax.tree.map(lambda a: a[i], f), out_shardings=sh_l))
+        cache["lanes_first"] = tabs
+    idx_d, pad, trig_l, M, sc, sss_l, chl_l, gather = cache["lanes_first"]
+    kw2 = dict(kw, n=int(idx_d.shape[0]))
+    ak = ("lanes_first_asm",) + tuple(sorted(kw2.items()))
+    if ak not in cache:
+        cache[ak] = jax.jit(functools.partial(_assemble_pad, **kw2), out_shardings=sh_tl)
+    mk = ("lanes_first_months", tuple(int(d[3]) for d in dates))
+    if mk not in cache:
+        cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, rep)
+    fl = gather(fields, idx_d)
+    return _flux_seq_lean(fl, cache[mk], trig_l, M, sss_l, chl_l, sc, pad, rotate=bool(jra55.FORCE_ROTATION),
+                          assemble=cache[ak], **kw2)
 
 
 def _flux_seq_staged(fields, months, trig, M, sss_clim, chl_clim, *, T, n, runoff, single, rotate, has_tsk,

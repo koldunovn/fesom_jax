@@ -60,5 +60,9 @@ gpu:
   o2a_surface: true
   cpl_forcing_jit: true   # mode F: the interval's forcing build (stress rotation, runoff, enthalpy) compiled
   cpl_forcing_lean: true  # and gathered onto the lanes in its assembly program
+  cpl_forcing_lanes: true # ... gathered onto the lanes FIRST: the lean build's replicated global [nsteps, nod2D]
+                          # float64 rotation products peak at 29.4 GB per device at NG5 dt 180 (14.9 at dt 360), this
+                          # one at 1.35 (0.89); bitwise the same seq (CORE3 dist_2), XLA memory analysis for dist_32
+                          # (awicm_jax scripts/tco319_ng5/flux_forcing_memory.py, lane tco319_ng5_flux)
   output_async: true
   restart_async: true
