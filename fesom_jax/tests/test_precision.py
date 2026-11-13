@@ -347,7 +347,9 @@ def test_single_step_wsplit_has_no_implicit_promotion(pi_prod):
 
 def test_single_step_wsplit_finite_active_and_near_double(pi_prod):
     """SP + w-split: the State dtypes of the SP policy, finite; the split changes the tracers (w_i is active); and the
-    tracers stay within single-precision distance of the double-precision w-split steps."""
+    split adds nothing to single precision's own distance from double: |SP - DP| with the split (max and 99th
+    percentile) within that of the steps without it (two pi steps from rest already differ by 0.084 K at one node
+    without any split, p99 1.4e-5: the SP spread, CPU job 2893314)."""
     out = _sp_two_steps(pi_prod, ale_cfg=_wsplit_cfg())
     for f in dataclasses.fields(out):
         a = getattr(out, f.name)
@@ -360,9 +362,13 @@ def test_single_step_wsplit_finite_active_and_near_double(pi_prod):
     base = _sp_two_steps(pi_prod)                                   # SP without the split
     assert float(jnp.max(jnp.abs(out.T - base.T))) > 0.0
     dp = _sp_two_steps(pi_prod, ale_cfg=_wsplit_cfg(), precision="double")
-    for k, tol in (("T", 2e-3), ("S", 2e-4)):
-        d = float(jnp.max(jnp.abs(getattr(out, k).astype(jnp.float64) - getattr(dp, k))))
-        assert d < tol, (k, d)
+    dp0 = _sp_two_steps(pi_prod, precision="double")
+    for k in ("T", "S"):
+        d = np.abs(np.asarray(getattr(out, k), np.float64) - np.asarray(getattr(dp, k)))
+        d0 = np.abs(np.asarray(getattr(base, k), np.float64) - np.asarray(getattr(dp0, k)))
+        assert d.max() <= 1.5 * d0.max() + 1e-6, (k, d.max(), d0.max())
+        assert np.quantile(d, 0.99) <= 1.5 * np.quantile(d0, 0.99) + 1e-7, (k, np.quantile(d, 0.99),
+                                                                             np.quantile(d0, 0.99))
 
 
 def test_vert_impl_column_single_matches_double_and_adds_content():
