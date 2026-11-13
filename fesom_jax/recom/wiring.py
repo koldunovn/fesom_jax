@@ -236,7 +236,24 @@ def recom_params(rcfg, params):
     return sw, (p if pr is None else pr)
 
 
-def _freeze_extinct(X, lay):
+#: FESOM_RECOM_GRAD_FREEZE_FLOOR: each phytoplankton type, keyed on its N, with the tracers frozen together with it and
+#: the ``params.derived`` floor of its N (REcoM's ``tiny_N*``, the clip of ``recom_sms.F90``/``sms_fork.py``)
+PHYTO_GROUPS = (("PhyN", ("PhyC", "PhyChl", "PhyCalc"), "tiny_N"),
+                ("DiaN", ("DiaC", "DiaChl", "DiaSi"), "tiny_N_d"),
+                ("CoccoN", ("CoccoC", "CoccoChl"), "tiny_N_c"),
+                ("PhaeoN", ("PhaeoC", "PhaeoChl"), "tiny_N_p"))
+
+
+def phyto_floors(rcfg) -> dict:
+    """``{N tracer name: floor}`` of :data:`PHYTO_GROUPS` from the namelist's parameters (host floats, so the guard's
+    thresholds are constants of the trace, not functions of the controls)."""
+    from .params import derived
+    _, p = rcfg.load()
+    dz = derived(p)
+    return {n: float(getattr(dz, f)) for n, _, f in PHYTO_GROUPS}
+
+
+def _freeze_extinct(X, lay, floors=None):
     """Experiment (plan 20261105 Phase 1, 2026-11-11): FESOM_RECOM_GRAD_FREEZE_EXTINCT=<threshold> holds the second
     zooplankton and its detritus (``ZOO2_NAMES``) out of the derivative wherever ``|x| < threshold``: the forward
     values are unchanged, the step's derivative with respect to those cells is zero. On the 2-year pi state that
@@ -244,27 +261,55 @@ def _freeze_extinct(X, lay):
     (comma-separated tracer names, 2026-11-12) replaces the Zoo2 set, e.g. with HetN/HetC and the detritus pools
     that the backward scans from the 5-year state found near zero. An entry ``NAME:THR`` (2026-11-13) gives that
     tracer its own threshold, e.g. ``DIN:1e-2`` for the nutrient-depleted Kuroshio (DIN between -9e-4 and 2e-3 at
-    100 m in July). Read at trace time; unset (the default), ``X`` is returned as is and the traced program is
-    unchanged."""
+    100 m in July).
+
+    FESOM_RECOM_GRAD_FREEZE_FLOOR=<k> (2026-11-13), independent of the two above and combined with them: the
+    floor-relative guard. Each phytoplankton type of :data:`PHYTO_GROUPS` (its N, C, Chl and Si or Calc together, so
+    its quotas stay consistent) is frozen wherever its N is below ``k`` times its own clip floor (``floors``,
+    :func:`phyto_floors`: ``tiny_N_d = tiny_chl / Chl2N_max_d`` etc.), and every tracer wherever it is negative. It
+    widens the clip's own zero-derivative region ``max(floor, x)`` to a band above the floor: in the 30-day CORE2
+    January window the diatoms of the South Atlantic gyre sit on their floor (DiaN 2.4e-6 = tiny_N_d) and the
+    reverse field grows there. Read at trace time; all unset (the default), ``X`` is returned as is and the traced
+    program is unchanged."""
     thr = os.environ.get("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "").strip()
-    if not thr or X is None:
+    k_floor = os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR", "").strip()
+    if (not thr and not k_floor) or X is None:
         return X
-    from .layout import ZOO2_NAMES
-    entries = [e.strip() for e in os.environ.get("FESOM_RECOM_GRAD_FREEZE_TRACERS", "").split(",") if e.strip()]
-    thr_of = {}
-    for e in entries or ZOO2_NAMES:
-        name, _, t = e.partition(":")
-        thr_of[name.strip()] = float(t) if t.strip() else float(thr)
-    unknown = [n for n in thr_of if n not in lay.names] if entries else []
-    if unknown:
-        raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_TRACERS: unknown tracers {unknown}")
-    thr_vec = np.full(X.shape[-1], -1.0)              # -1: never frozen (|x| < -1 is false)
-    for i, n in enumerate(lay.names):
-        if n in thr_of:
-            thr_vec[i] = thr_of[n]
-    if not (thr_vec > 0).any():
+    mask = None
+    if thr:
+        from .layout import ZOO2_NAMES
+        entries = [e.strip() for e in os.environ.get("FESOM_RECOM_GRAD_FREEZE_TRACERS", "").split(",") if e.strip()]
+        thr_of = {}
+        for e in entries or ZOO2_NAMES:
+            name, _, t = e.partition(":")
+            thr_of[name.strip()] = float(t) if t.strip() else float(thr)
+        unknown = [n for n in thr_of if n not in lay.names] if entries else []
+        if unknown:
+            raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_TRACERS: unknown tracers {unknown}")
+        thr_vec = np.full(X.shape[-1], -1.0)              # -1: never frozen (|x| < -1 is false)
+        for i, n in enumerate(lay.names):
+            if n in thr_of:
+                thr_vec[i] = thr_of[n]
+        if (thr_vec > 0).any():
+            mask = jnp.abs(X) < jnp.asarray(thr_vec, X.dtype)
+    if k_floor:
+        k = float(k_floor)
+        if floors is None:
+            raise ValueError("FESOM_RECOM_GRAD_FREEZE_FLOOR needs the phytoplankton floors (wiring.phyto_floors)")
+        names = list(lay.names)
+        m = X < 0
+        cols = [m[..., i] for i in range(X.shape[-1])]
+        for nname, members, _ in PHYTO_GROUPS:
+            if nname not in names:
+                continue
+            g = X[..., names.index(nname)] < k * floors[nname]
+            for t in (nname,) + members:
+                if t in names:
+                    cols[names.index(t)] = cols[names.index(t)] | g
+        m = jnp.stack(cols, axis=-1)
+        mask = m if mask is None else (mask | m)
+    if mask is None:
         return X
-    mask = jnp.abs(X) < jnp.asarray(thr_vec, X.dtype)
     return jnp.where(mask, jax.lax.stop_gradient(X), X)
 
 
@@ -299,7 +344,8 @@ def full_bgc_step(mesh, st, rcfg, *, params, h0, zbar0, Z0, helem, helem_flux, u
     nlev = (jnp.asarray(mesh.nlevels_nod2D) - 1).astype(jnp.int32)
     lat_rad = jnp.asarray(mesh.geo_coord_nod2D[:, 1], f64)
     X, X_old = transport.hold_major(st.bgc), st.bgc_old          # stage 1 reads each tracer's columns contiguously
-    X, X_old = _freeze_extinct(X, lay), _freeze_extinct(X_old, lay)
+    floors = phyto_floors(rcfg) if os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR", "").strip() else None
+    X, X_old = _freeze_extinct(X, lay, floors), _freeze_extinct(X_old, lay, floors)
     h = h0[:, :nl1]
     full = PR.full                         # the identity in double precision: the double-precision trace is unchanged
     areasvol, area = full(mesh.areasvol), full(mesh.area)

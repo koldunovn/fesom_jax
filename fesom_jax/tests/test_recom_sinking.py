@@ -591,3 +591,37 @@ def test_freeze_extinct_gradient_switch(monkeypatch):
     monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_TRACERS", "NoSuchTracer")
     with pytest.raises(ValueError):
         W._freeze_extinct(X, lay)
+
+
+def test_freeze_floor_gradient_switch(monkeypatch):
+    """FESOM_RECOM_GRAD_FREEZE_FLOOR=<k> (plan 20261105, 2026-11-13): a phytoplankton type whose N is below k times its
+    floor loses the derivative of its N, C, Chl and Si together; any negative tracer loses its derivative; values are
+    unchanged; it combines with the EXTINCT list; unset, nothing is traced; the floors come from the namelist."""
+    from types import SimpleNamespace
+    from fesom_jax.recom import wiring as W
+    lay = SimpleNamespace(names=("DIN", "DiaN", "DiaC", "DiaChl", "DiaSi", "PhyN", "Zoo2N"))
+    floors = {"PhyN": 1e-6, "DiaN": 2e-6, "CoccoN": 1e-6, "PhaeoN": 1e-6}
+    X = jnp.asarray([[[1.0, 2.4e-6, 3e-5, 1e-5, 1e-6, 0.3, 1e-9],           # diatoms on their floor
+                      [-1e-4, 0.5, 2.0, 1.0, 0.4, 1.5e-5, 0.2]]])          # DIN negative; PhyN above 10 x floor
+    for v in ("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "FESOM_RECOM_GRAD_FREEZE_TRACERS", "FESOM_RECOM_GRAD_FREEZE_FLOOR"):
+        monkeypatch.delenv(v, raising=False)
+    assert W._freeze_extinct(X, lay, floors) is X
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR", "10")
+    with pytest.raises(ValueError):
+        W._freeze_extinct(X, lay)                                           # the floors are required
+    np.testing.assert_array_equal(np.asarray(W._freeze_extinct(X, lay, floors)), np.asarray(X))
+    grad = lambda: np.asarray(jax.grad(lambda x: jnp.sum(W._freeze_extinct(x, lay, floors) ** 2 / 2))(X))  # noqa: E731
+    frozen = np.array([[[0, 1, 1, 1, 1, 0, 0], [1, 0, 0, 0, 0, 0, 0]]], bool)
+    g = grad()
+    np.testing.assert_array_equal(g[frozen], 0.0)
+    np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "1e-6")          # + the Zoo2 default list
+    frozen[0, 0, 6] = True
+    g = grad()
+    np.testing.assert_array_equal(g[frozen], 0.0)
+    np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
+    rcfg = SimpleNamespace(load=lambda: (None, SimpleNamespace(**{
+        "Chl2N_max": 3.15, "NCmax": 0.2, "Chl2N_max_d": 4.2, "NCmax_d": 0.2, "SiCmax": 0.8,
+        "Chl2N_max_c": 3.5, "NCmax_c": 0.15, "Chl2N_max_p": 3.15, "NCmax_p": 0.2})))
+    fl = W.phyto_floors(rcfg)
+    assert fl["DiaN"] == pytest.approx(1e-5 / 4.2) and fl["PhyN"] == pytest.approx(1e-5 / 3.15)
