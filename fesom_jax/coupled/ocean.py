@@ -121,6 +121,7 @@ class OceanStatic:
     # their copy to the host, is written by that call (awicm_jax's run_coupled)
     submit: Any = None
     mevp_wide: Any = None     # gpu.mevp_wide's MevpWideHost (dist_N only), None = the per-subcycle exchange
+    se_wide: Any = None       # gpu.se_wide's SeWideHost (dist_N + ssh.split_explicit), None = per-substep exchanges
     _lanes: Any = None        # the jitted global -> lanes gather of the forcing (dist_N)
     _views: dict = dataclasses.field(default_factory=dict)   # the jitted lanes -> global gathers (dist_N)
     _fjit: dict = dataclasses.field(default_factory=dict)    # gpu.cpl_forcing_jit: the compiled forcing builds
@@ -176,9 +177,32 @@ class OceanStatic:
                 bootstrap_ab2=bool(bootstrap), state_is_folded=True, return_folded=True,
                 boundary_node_p=self.bn_p, reuse_executable=True, return_executable=True,
                 sample_fn=self.sample_fn, ssh_gather=self.gather, precision=self.precision,
-                **({} if self.mevp_wide is None else {"mevp_wide": self.mevp_wide}), **self.phys)
+                **({} if self.mevp_wide is None else {"mevp_wide": self.mevp_wide}),
+                **({} if self.se_wide is None else {"se_wide": self.se_wide}), **self.phys)
             self._exe[key] = (jfn, args)
         return self._exe[key]
+
+
+def _se_init(state, sm, se_cfg, *, restart: bool, log=print):
+    """ssh.split_explicit's ring set-up on the folded device State (:func:`fesom_jax.ssh_se.init_state`'s rules: an SE
+    restart resumes exactly, a CG restart or a cold start gets flat rings, announced; an SE restart into a CG run is
+    refused). The flat rings are one program over the State's devices, the element layer mask placed with the
+    State's own sharding (no host constant of the mesh's size in the program, no eager op per level)."""
+    from .. import ssh_se
+    if se_cfg is None or getattr(state, "se_eta", None) is not None:
+        return ssh_se.init_state(state, None, se_cfg, restart=restart, log=log)
+    from ..integrate_sharded import _fold
+    if restart:
+        log("[ocean] split-explicit: the restart carries no SE rings (a CG restart) -> starting the substeps from "
+            "flat rings (eta ring = eta_n, U ring = sum_k h u); the first step has no AB3/AM4 history")
+    lm = np.asarray(sm.fields["elem_layer_mask"])
+    lm = np.asarray(_fold(lm)) if lm.ndim == 3 else lm
+    sh = getattr(state.helem, "sharding", None)
+    if lm.shape != tuple(state.helem.shape):
+        raise AssertionError(f"elem_layer_mask {lm.shape} vs the State's helem {tuple(state.helem.shape)}")
+    lm_d = jax.make_array_from_callback(lm.shape, sh, lambda idx: lm[idx]) if sh is not None else jnp.asarray(lm)
+    se_eta, se_ubt, se_sbar_old = jax.jit(ssh_se.flat_rings)(state.eta_n, state.uv, state.helem, lm_d)
+    return dataclasses.replace(state, se_eta=se_eta, se_ubt=se_ubt, se_sbar_old=se_sbar_old)
 
 
 def _env_setup(cfg: RunConfig, sss_restoring: bool) -> None:
@@ -227,8 +251,7 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         raise ValueError(f"mode must be 'bulk' or 'flux', got {mode!r}")
     if cfg.ice is None or int(cfg.ice.ice_ave_steps) != 1:
         raise NotImplementedError("the coupled ocean runs the sea ice every ocean step (ice: {..., ice_ave_steps: 1})")
-    if cfg.split_explicit() is not None:
-        raise NotImplementedError("the coupled ocean uses the CG SSH solve (ssh.split_explicit is not wired)")
+    se_cfg = cfg.split_explicit()      # ssh.split_explicit (fesom_jax.ssh_se): wired as run.py's driver (lane tco319_ng5)
     if cfg.dt_ramp:
         raise NotImplementedError("dt_ramp is not supported by the coupled ocean")
     _env_setup(cfg, sss_restoring)
@@ -267,6 +290,10 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     from .. import ops
     if ops.ordered_sums_enabled():
         sm = shard_mesh.with_inverse_maps(sm)
+    if se_cfg is not None:            # the per-device SE tables and the CFL guard (raises below M_min), as run.py
+        from .. import ssh_se
+        sm = shard_mesh.with_se_tables(sm, mesh, part)
+        log(f"[ocean] {ssh_se.cfl_guard(mesh, dt, se_cfg)[3]}")
     op = ssh.build_ssh_operator(mesh, dt=dt, precond_variant=1 if precision == "single" else 0)
     deg, kap = cfg.ssh_cheb()
     if deg:
@@ -314,6 +341,7 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
     state = init_ice_avg(state, cfg.ice)
     from ..gm import init_kgm_bug_state             # a FESOM2 bug reproduced (GMConfig): 500 m2/s at every run start
     state = init_kgm_bug_state(state, cfg.gm)
+    state = _se_init(state, sm, se_cfg, restart=cfg.restart_in is not None, log=log)
     if precision == "single":
         state = PR.cast_state(state)
 
@@ -352,6 +380,13 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
                 raise ValueError(f"gpu.mevp_wide={kw} needs the mEVP sea ice (ice.whichEVP: 1)")
             mevp_wide = ice_wide.build_mevp_wide(mesh, part, sm, kw)
             log(f"[ocean] mevp_wide: K={kw}")
+    se_wide = None                    # gpu.se_wide (FESOM_SE_WIDE): one SE exchange every K substeps (run.py's)
+    if npes >= 2 and se_cfg is not None:
+        from .. import se_wide as se_wide_mod
+        ks = se_wide_mod.se_wide_from_env()
+        if ks >= 2:
+            se_wide = se_wide_mod.build_se_wide(mesh, part, sm, ks)
+            log(f"[ocean] se_wide: K={ks}")
     geo = np.asarray(mesh.geo_coord_nod2D, np.float64)
     rot = np.asarray(mesh.coord_nod2D, np.float64)
     trig = tuple(jnp.asarray(t) for t in jra55._g2r_trig(geo[:, 0], geo[:, 1], rot[:, 0], rot[:, 1]))
@@ -363,7 +398,7 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         M=jnp.asarray(jra55._rotation_matrix()), sss_restoring=bool(sss_restoring), bootstrap=bootstrap,
         monthly_out=monthly_out, sample_fn=(None if monthly_out is None else
                                             _monthly_fields_with(monthly_extra) if monthly_extra else _monthly_fields),
-        mevp_wide=mevp_wide)
+        mevp_wide=mevp_wide, se_wide=se_wide)
     if mode == "flux":
         from . import flux
         state, static = flux.init_flux(state, static, runoff=cpl_runoff)
