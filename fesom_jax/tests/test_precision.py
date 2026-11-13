@@ -83,8 +83,12 @@ def test_run_config_precision():
     assert type(cfg).from_dict(sp.to_dict()).precision == "single"
     with pytest.raises(ValueError):
         dataclasses.replace(cfg, precision="float").validate()
-    with pytest.raises(NotImplementedError):
-        dataclasses.replace(cfg, precision="single", ale=None).validate()       # linfs
+    # linfs and (since the #1206 implicit column, lane tco319_ng5) zstar with w-split validate in single precision
+    # (the linfs expectation here was stale: the guard never refused ale=None)
+    dataclasses.replace(cfg, precision="single", ale=None).validate()                         # linfs
+    ale_ws = (cfg.ale._replace(use_wsplit=True) if hasattr(cfg.ale, "_replace")
+              else dataclasses.replace(cfg.ale, use_wsplit=True))
+    dataclasses.replace(cfg, precision="single", ale=ale_ws).validate()                       # zstar + w-split
     with pytest.raises(NotImplementedError):
         dataclasses.replace(cfg, precision="single", ice=cfg.ice._replace(whichEVP=0)).validate()
 
@@ -252,7 +256,7 @@ def pi_prod():
     return mesh, s0, cf, sfs, op
 
 
-def _sp_two_steps(pi_prod, check_mixing=False):
+def _sp_two_steps(pi_prod, check_mixing=False, ale_cfg=None, precision="single"):
     from fesom_jax import step as stepmod
     from fesom_jax.ale import AleConfig
     from fesom_jax.gm import GMConfig
@@ -260,9 +264,16 @@ def _sp_two_steps(pi_prod, check_mixing=False):
     from fesom_jax.params import Params
     from fesom_jax.tke import TkeConfig
     mesh, s0, cf, sfs, op = pi_prod
-    m32, fs, p = PR.cast_tree(mesh), PR.cast_tree(cf.static), PR.cast_tree(Params.defaults())
-    st = jax.device_put(PR.cast_state(s0))
-    kw = dict(ale_cfg=AleConfig(), gm_cfg=GMConfig(), tke_cfg=TkeConfig(), ice_cfg=IceConfig(whichEVP=1))
+    if precision == "double":                 # the same two steps in double precision (w-split comparison)
+        m32, fs, p, st = mesh, cf.static, Params.defaults(), jax.device_put(s0)
+        sfs = [jax.tree.map(lambda x: np.asarray(x, np.float64) if np.asarray(x).dtype == np.float32 else x, sf)
+               for sf in sfs]
+        op = jax.tree.map(lambda x: np.asarray(x, np.float64) if np.asarray(x).dtype == np.float32 else x, op)
+    else:
+        m32, fs, p = PR.cast_tree(mesh), PR.cast_tree(cf.static), PR.cast_tree(Params.defaults())
+        st = jax.device_put(PR.cast_state(s0))
+    kw = dict(ale_cfg=AleConfig() if ale_cfg is None else ale_cfg, gm_cfg=GMConfig(), tke_cfg=TkeConfig(),
+              ice_cfg=IceConfig(whichEVP=1))
 
     def go(st, sfs):
         for i, sf in enumerate(sfs):
@@ -296,6 +307,8 @@ def _sp_two_steps(pi_prod, check_mixing=False):
         finally:
             D.lattice_result_type = orig
         return mixed
+    if precision == "double":
+        return jax.jit(go)(st, sfs)
     with PR.scope("single"):
         return PR.jit(go, "single")(st, sfs)
 
@@ -317,3 +330,70 @@ def test_single_step_dtypes_and_finite(pi_prod):
         want = jnp.float64 if f.name in PR.STATE_F64 else jnp.float32
         assert a.dtype == want, f.name
         assert bool(jnp.all(jnp.isfinite(a))), f.name
+
+
+# ---- w-split in single precision (the #1206 implicit column, tracer_adv.adv_tra_vert_impl; lane tco319_ng5) ----------
+def _wsplit_cfg():
+    from fesom_jax.ale import AleConfig
+    # a tiny threshold: two steps from rest have a small vertical CFL, and the column must carry most of w
+    return AleConfig(use_wsplit=True, wsplit_maxcfl=1e-6)
+
+
+def test_single_step_wsplit_has_no_implicit_promotion(pi_prod):
+    """The w-split implicit column widens explicitly (PR.full): no implicit float32/float64 mix in the SP step."""
+    mixed = _sp_two_steps(pi_prod, check_mixing=True, ale_cfg=_wsplit_cfg())
+    assert not mixed, sorted(set(mixed))
+
+
+def test_single_step_wsplit_finite_active_and_near_double(pi_prod):
+    """SP + w-split: the State dtypes of the SP policy, finite; the split changes the tracers (w_i is active); and the
+    tracers stay within single-precision distance of the double-precision w-split steps."""
+    out = _sp_two_steps(pi_prod, ale_cfg=_wsplit_cfg())
+    for f in dataclasses.fields(out):
+        a = getattr(out, f.name)
+        if a is None:
+            continue
+        want = jnp.float64 if f.name in PR.STATE_F64 else jnp.float32
+        assert a.dtype == want, f.name
+        assert bool(jnp.all(jnp.isfinite(a))), f.name
+    assert float(jnp.max(jnp.abs(out.w_i))) > 0.0
+    base = _sp_two_steps(pi_prod)                                   # SP without the split
+    assert float(jnp.max(jnp.abs(out.T - base.T))) > 0.0
+    dp = _sp_two_steps(pi_prod, ale_cfg=_wsplit_cfg(), precision="double")
+    for k, tol in (("T", 2e-3), ("S", 2e-4)):
+        d = float(jnp.max(jnp.abs(getattr(out, k).astype(jnp.float64) - getattr(dp, k))))
+        assert d < tol, (k, d)
+
+
+def test_vert_impl_column_single_matches_double_and_adds_content():
+    """adv_tra_vert_impl on synthetic columns: the SP result is the DP one rounded (the float64 column), and the
+    content added to the float64 tendency is dT * hnode_new."""
+    import types
+    from fesom_jax import tracer_adv
+    rng = np.random.default_rng(3)
+    n, nl = 64, 12
+    nlev = rng.integers(4, nl + 1, n)                      # nlevels_nod2D (1-based interfaces)
+    k = np.arange(nl)[None, :]
+    mask = k < (nlev - 1)[:, None]
+    area = np.where(k < nlev[:, None], rng.uniform(0.5e8, 2e8, (n, nl)), 0.0)
+    areasvol = np.where(mask, area * rng.uniform(0.9, 1.0, (n, nl)), 0.0)
+    h = np.where(mask, rng.uniform(5.0, 200.0, (n, nl)), 0.0)
+    w_i = np.where(k < nlev[:, None], rng.normal(0.0, 2e-3, (n, nl)), 0.0)
+    T = np.where(mask, rng.uniform(-1.5, 28.0, (n, nl)), 0.0)
+    tend = np.where(mask, rng.normal(0.0, 1.0, (n, nl)), 0.0)
+    mk = lambda f: types.SimpleNamespace(nl=nl, area=f(area), areasvol=f(areasvol), node_layer_mask=jnp.asarray(mask),
+                                         ulevels_nod2D=jnp.ones(n, jnp.int32), nlevels_nod2D=jnp.asarray(nlev, jnp.int32))
+    T_dp, tend_dp = tracer_adv.adv_tra_vert_impl(mk(jnp.asarray), jnp.asarray(w_i), jnp.asarray(T), jnp.asarray(h),
+                                                 dt=360.0, tend=jnp.asarray(tend))
+    with PR.scope("single"):
+        f32 = lambda x: jnp.asarray(x, jnp.float32)          # noqa: E731
+        T_sp, tend_sp = jax.jit(lambda m_a, m_v, w, t, hh, td: tracer_adv.adv_tra_vert_impl(
+            types.SimpleNamespace(**{**vars(mk(jnp.asarray)), "area": m_a, "areasvol": m_v}), w, t, hh, dt=360.0,
+            tend=td))(f32(area), f32(areasvol), f32(w_i), f32(T), jnp.asarray(h, jnp.float64),
+                      jnp.asarray(tend, jnp.float64))
+    assert T_sp.dtype == jnp.float32 and tend_sp.dtype == jnp.float64
+    assert float(jnp.max(jnp.abs(T_sp - T_dp))) < 1e-4
+    assert float(jnp.max(jnp.abs(T_dp - T))) > 1e-3                  # the column did something
+    dT_dp = np.asarray(T_dp) - T
+    np.testing.assert_allclose(np.asarray(tend_dp) - tend, dT_dp * h, rtol=1e-9, atol=1e-9)
+    np.testing.assert_allclose(np.asarray(tend_sp), np.asarray(tend_dp), rtol=1e-4, atol=1e-3)

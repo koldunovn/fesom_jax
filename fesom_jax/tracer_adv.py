@@ -567,7 +567,7 @@ def flux2dtracer_fct(mesh: Mesh, T, LO, adf_h, adf_v, hnode, hnode_new, *,
     return dttf_h + dttf_v
 
 
-def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
+def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT, tend=None):
     """Standalone implicit vertical advection of one tracer by the split ``w_i``
     (``adv_tra_vert_impl``, ``oce_adv_tra_ver.F90:90-239``). Per-**node** tridiagonal =
     mass (``hnode_new`` diagonal) + upwind ``w_i`` advection (``w>0`` = upward); solves
@@ -583,13 +583,24 @@ def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
         c[nz]    = −max(0, w_i[nz+1])·v_bot                      (0 at bottom)
         b[nz]    = hnode_new[nz] + b_adv
     Increment form (== the C): ``dT = TDMA(a,b,c, −(a·T[nz-1] + b_adv·T[nz] + c·T[nz+1]))``,
-    ``T_new = T + dT`` (padded rows: ``b=1, rhs=0 ⇒ dT=0``)."""
+    ``T_new = T + dT`` (padded rows: ``b=1, rhs=0 ⇒ dT=0``).
+
+    Single precision (upstream #1056/#1206, ``oce_adv_tra_ver.F90:27-33``; as fesom3-jax's ``adv_tra_vert_impl``):
+    the column scratch is ``WP_full`` -- ``v = real(dt, WP_full)·area/areasvol``, so ``a``, ``b``, ``c``, the rhs and
+    the sweep are float64 by promotion (``hnode_new`` is float64 already); ``T + dT`` rounds once to ``WP``, and with
+    ``tend`` (the float64 flux-form low-order tendency of :func:`compute_fct_lo`) the return is
+    ``(T_new, tend + dT·hnode_new)`` on the column's layers, the content the implicit step adds. Double precision:
+    the code below unchanged (``tend`` given: the same update, in float64)."""
     nl = mesh.nl
-    safe_av = jnp.where(mesh.areasvol > 0.0, mesh.areasvol, 1.0)
-    v_top = dt * mesh.area / safe_av                  # (nod2D, nl): dt·area[nz]/areasvol[nz]
-    v_bot = dt * _shift_up(mesh.area) / safe_av        # dt·area[nz+1]/areasvol[nz]
-    wu = w_i                                           # face nz
-    wd = _shift_up(w_i)                                # face nz+1
+    # (PR.full: float64 in single precision, every widening explicit; the identity in double, so the double trace is
+    # the one this function always had)
+    safe_av = PR.full(jnp.where(mesh.areasvol > 0.0, mesh.areasvol, 1.0))
+    area = PR.full(mesh.area)
+    v_top = PR.full(dt) * area / safe_av                  # (nod2D, nl): dt·area[nz]/areasvol[nz]
+    v_bot = PR.full(dt) * _shift_up(area) / safe_av        # dt·area[nz+1]/areasvol[nz]
+    wu = PR.full(w_i)                                  # face nz (min/max commute with the exact widening)
+    wd = _shift_up(wu)                                 # face nz+1
+    T_c = PR.full(T)
 
     k = jnp.arange(nl)[None, :]
     nzmin = (mesh.ulevels_nod2D - 1)[:, None]
@@ -607,9 +618,17 @@ def adv_tra_vert_impl(mesh: Mesh, w_i, T, hnode_new, *, dt: float = DT_DEFAULT):
     a = jnp.where(valid, a_adv, 0.0)
     c = jnp.where(valid, c_adv, 0.0)
     b = jnp.where(valid, hnode_new + b_adv, 1.0)
-    rhs = jnp.where(valid, -(a * _shift_down(T) + b_adv * T + c * _shift_up(T)), 0.0)
+    rhs = jnp.where(valid, -(a * _shift_down(T_c) + b_adv * T_c + c * _shift_up(T_c)), 0.0)
     dT = ops.tdma(a, b, c, rhs)
-    return T + ops.mask_below_bottom(dT, valid)
+    if PR.sp():
+        T_new = jnp.where(valid, PR.wp(T_c + dT), T)
+        if tend is None:
+            return T_new
+        return T_new, jnp.where(valid, tend + dT * hnode_new, tend)
+    T_new = T + ops.mask_below_bottom(dT, valid)
+    if tend is None:
+        return T_new
+    return T_new, jnp.where(valid, tend + dT * hnode_new, tend)
 
 
 def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
@@ -644,17 +663,19 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
     # the WP hnode_new for the limiter, and the float64 del_ttf returned for the carry reconstruction.
     lo_tend = None
     if content:
-        if w_i is not None:
-            raise NotImplementedError("single precision does not support w_split (the w-split implicit column "
-                                      "of #1206 is not ported)")
         LO, lo_tend = compute_fct_lo(mesh, flux_h_lo, flux_v_lo, T, hnode, hnode_new, dt=dt,
                                      return_tend=True)
+        # w_split in single precision (#1206; fesom3-jax adv_tra_driver.do_oce_adv_tra_lo): the implicit w_i step
+        # on the LO solution in a float64 column, its content dT·hnode_new added to the float64 LO tendency that
+        # flux2dtracer_fct assembles del_ttf from (so the carry reconstruction sees it)
+        if w_i is not None:
+            LO, lo_tend = adv_tra_vert_impl(mesh, w_i, LO, hnode_new, dt=dt, tend=lo_tend)
     else:
         LO = compute_fct_lo(mesh, flux_h_lo, flux_v_lo, T, hnode, hnode_new, dt=dt)
-    # w_split: add back the IMPLICIT w_i vertical advection on the LO solution
-    # (oce_adv_tra_driver.F90:173). w_i=None ⇒ skipped ⇒ byte-identical.
-    if w_i is not None:
-        LO = adv_tra_vert_impl(mesh, w_i, LO, hnode_new, dt=dt)
+        # w_split: add back the IMPLICIT w_i vertical advection on the LO solution
+        # (oce_adv_tra_driver.F90:173). w_i=None ⇒ skipped ⇒ byte-identical.
+        if w_i is not None:
+            LO = adv_tra_vert_impl(mesh, w_i, LO, hnode_new, dt=dt)
     LO = _exch(LO, "nod")        # S.7: the limiter clusters LO over surrounding cells
     # 4 — antidiffusive fluxes HO − LO
     tr_xy = tracer_gradient_elements(mesh, T)
