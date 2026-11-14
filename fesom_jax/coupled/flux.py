@@ -255,7 +255,8 @@ def _flux_lean_call(fields, static, dates, cache, key, kw):
     leaf = next(iter(fields.values()))
     place = leaf.sharding
     lanes_here = static.npes > 1
-    if lanes_here:                   # the forcing replicated over the ocean's devices (as the coupler puts it)
+    if lanes_here and not (prelaned_enabled() and forcing_lanes_first_enabled()):
+        # the forcing replicated over the ocean's devices (as the coupler puts it)
         from jax.sharding import NamedSharding, PartitionSpec
         mesh = static.device_mesh()
         if set(place.device_set) != set(mesh.devices.flat):
@@ -289,6 +290,25 @@ def _flux_lean_call(fields, static, dates, cache, key, kw):
     if mk not in cache:
         cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, place)
     return cache[lk](fields, cache[mk], trig, M, *clim, sc, lanes)
+
+
+def prelaned_enabled() -> bool:
+    """``FESOM_CPL_FORCING_PRELANED=1`` (lane tco319_ng5 on JUPITER, set by awicm_jax's ocean process with
+    ``AWICM_CPL_LANES=1``; with ``cpl_forcing_lean`` + ``cpl_forcing_lanes``, dist_N, mode F): the received fields
+    arrive already gathered onto the lanes -- folded ``(P*Lmax,)`` arrays sharded over the ocean's devices, each
+    device's slice = the global field at :func:`lanes_index`, pad lanes any value -- so the build skips its own gather
+    (:func:`_lanes_first_call`). The same gather, done by the sender: the values to the bit."""
+    import os
+    return os.environ.get("FESOM_CPL_FORCING_PRELANED", "0").strip() not in ("", "0")
+
+
+def lanes_index(static):
+    """The folded ``(P*Lmax,)`` global node ids of the ocean's lanes (pad lanes: node 0) -- the index that
+    :func:`_lanes_first_call` gathers the received fields with -- and the lane sharding over the ocean's devices."""
+    from jax.sharding import NamedSharding, PartitionSpec
+    from ..zarr_output import _folded_gid_owned
+    gid, _ = _folded_gid_owned(static.part, static.sm, "nod")
+    return np.where(gid >= 0, gid, 0).astype(np.int64), NamedSharding(static.device_mesh(), PartitionSpec("p"))
 
 
 def forcing_lanes_first_enabled() -> bool:
@@ -339,7 +359,7 @@ def _lanes_first_call(fields, static, dates, cache, kw):
     mk = ("lanes_first_months", tuple(int(d[3]) for d in dates))
     if mk not in cache:
         cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, rep)
-    fl = gather(fields, idx_d)
+    fl = fields if prelaned_enabled() else gather(fields, idx_d)     # (FESOM_CPL_FORCING_PRELANED: the sender's)
     return _flux_seq_lean(fl, cache[mk], trig_l, M, sss_l, chl_l, sc, pad, rotate=bool(jra55.FORCE_ROTATION),
                           assemble=cache[ak], **kw2)
 
@@ -411,10 +431,16 @@ def flux_step_forcing_jit(state, forcing: dict, static, dates):
     if miss:
         raise KeyError(f"runoff 'coupled' needs {miss} (the runoff mapper's fields)")
     fields = {}
+    pre = prelaned_enabled() and static.npes > 1 and forcing_lean_enabled() and forcing_lanes_first_enabled()
+    nl = int(static.sm.P * static.sm.Lmax["nod"]) if pre else None
     for k in names:
         a = forcing[k]
         a = a if isinstance(a, jax.Array) else jnp.asarray(np.asarray(a))
-        if a.shape not in ((n,), (T, n)):
+        if pre:
+            if a.shape != (nl,):
+                raise ValueError(f"forcing[{k!r}] has shape {a.shape}; FESOM_CPL_FORCING_PRELANED needs the folded "
+                                 f"lanes ({nl},)")
+        elif a.shape not in ((n,), (T, n)):
             raise ValueError(f"forcing[{k!r}] has shape {a.shape}; need ({n},) or ({T}, {n})")
         fields[k] = a
     cache = static._fjit
