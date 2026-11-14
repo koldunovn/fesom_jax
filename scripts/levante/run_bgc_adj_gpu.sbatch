@@ -5,8 +5,9 @@
 # FESOM_BGC_LAYOUT=loop, 2-step chunks; 64.7 GiB on the first GPU, 102 GB of boundaries on the host per model day).
 #   sbatch scripts/levante/run_bgc_adj_gpu.sbatch --days 1 --out $RUNS/bgc_adj/core2_1d
 # Environment: CONFIG, RESTART, YEAR, DIST (the mesh directory holding dist_4), REMAT (default --remat-blocks; REMAT=
-# drops it), FESOM_BGC_LAYOUT (default major: with the sharded placement of adjoint._placer it fits, 57.4 GiB, and halves
-# the reverse, 423 against 865 s a CORE2 day, 28972957; loop is the low-memory fallback). All flags go to the driver.
+# drops it), FESOM_BGC_LAYOUT (default loop; major halves the reverse, 423 against 865 s a CORE2 day, 28972957, and fits
+# unguarded at 57.4 GiB with adjoint._placer, but with the gradient guards (FESOM_RECOM_GRAD_FREEZE_*) its first reverse
+# chunk asks for 53.5 GiB more on GPU 0 and the job hangs, 28981051: opt in only for unguarded runs). All flags go to the driver.
 #SBATCH --job-name=fj_bgcadj_gpu
 #SBATCH --partition=gpu
 #SBATCH --account=bk1415_gpu
@@ -21,7 +22,7 @@
 set -u
 WT=${WT:-${SLURM_SUBMIT_DIR:-$PWD}}
 source "$WT/scripts/levante/env_gpu.sh"
-export FESOM_BGC_LAYOUT=${FESOM_BGC_LAYOUT:-major}
+export FESOM_BGC_LAYOUT=${FESOM_BGC_LAYOUT:-loop}
 CONFIG=${CONFIG:-$WT/configs/levante/core2_recom_spectral_w28sl1.yaml}
 RESTART=${RESTART:-$POOL/restarts/w28sl1/seg4}
 YEAR=${YEAR:-1998}
