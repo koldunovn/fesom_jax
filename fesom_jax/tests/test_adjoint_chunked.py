@@ -907,3 +907,32 @@ def test_multi_cost_rejects_a_checkpoint_and_handles_float0(capsys):
         assert res.grads[k]["k"].dtype == jax.dtypes.float0
         assert np.array_equal(np.asarray(res.state_cots[k]["x"]), np.asarray(one.state_cot["x"]))
     print(f"\nsynthetic K=2: grads a {[float(g['a']) for g in res.grads]}")
+
+
+def test_placer_keeps_the_carry_layout():
+    """``adjoint._placer`` (plan 20261105, 2026-11-13): a host tree goes back onto the devices with the layout of
+    the carry, not whole onto the default device (GPU 0 held the sharded CORE2 boundary, cotangent and span start in
+    full, 18 GiB above the other GPUs). Host numpy and single-device trees fall back to ``jax.device_put`` as before;
+    ``float0`` leaves pass; a tree of another structure falls back; values are unchanged."""
+    from fesom_jax.adjoint import _placer
+    host = {"a": np.arange(8.0), "b": np.ones((8, 3))}
+    assert _placer(host) is jax.device_put
+    assert _placer(jax.device_put(host)) is jax.device_put
+    devs = jax.devices()
+    if len(devs) < 2:
+        pytest.skip("the sharded placement needs >= 2 devices (XLA_FLAGS=--xla_force_host_platform_device_count=4)")
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+    n = len(devs) * 2
+    sh = NamedSharding(Mesh(np.array(devs), ("p",)), PartitionSpec("p"))
+    like = {"a": jax.device_put(np.zeros(n), sh), "b": jax.device_put(np.zeros((n, 3)), sh)}
+    put = _placer(like)
+    tree = {"a": np.arange(float(n)), "b": np.arange(3.0 * n).reshape(n, 3)}
+    out = put(tree)
+    for k in tree:
+        assert out[k].sharding == sh
+        np.testing.assert_array_equal(np.asarray(out[k]), tree[k])
+    cot = {"a": np.zeros(n, jax.dtypes.float0), "b": tree["b"]}      # an integer field's cotangent
+    out = put(cot)
+    assert out["a"].dtype == jax.dtypes.float0 and out["b"].sharding == sh
+    other = put([np.ones(2)])                                          # another structure: the plain put
+    np.testing.assert_array_equal(np.asarray(other[0]), np.ones(2))

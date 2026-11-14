@@ -10098,3 +10098,19 @@ Three findings from the spectral fork's sharded and gradient gates, one afternoo
    new place (DetCalc, Gulf Stream; 49015771-72, adjoint/FD 1e26): the limited flux's derivative keeps the BGC
    adjoint stable, like the stabilising loops in `adjoint_stab`'s physics table. `core2_bgc_adj.py --adjoint-freeze`
    exposes the flags for such tests.
+
+### 2026-11-13 (branch recom-spectral, the CORE2 REcoM gradient on Levante) — floor cells, and a host state put whole on GPU 0
+
+1. **A phytoplankton type held on its clip floor breaks the gradient like a tracer at zero.** In the 30-day January
+   window the reverse field grew to 1e8 at node 88529 (South Atlantic gyre), where the diatoms sit on their floors all
+   month (DiaChl 1.0e-5 = tiny_chl, DiaN 2.4e-6 = tiny_N_d; column dump 28961588). Not negative, not in the near-zero
+   list, and DIN there (3.5e-3) above its 1e-3 threshold. Freezing each type's N/C/Chl/Si together where its N is
+   below 10 x its own floor, and any negative tracer (`FESOM_RECOM_GRAD_FREEZE_FLOOR=10`), gave adjoint/FD 1.0017 /
+   0.9991 (28962889) against -491 / 15.4 (28956143). Scale a guard by the model's own floor, not by an absolute value.
+2. **`jax.device_put(host_tree)` with no target commits the whole tree to device 0, and a sharded jit then reshards
+   it.** The chunked adjoint put each host boundary, cotangent and span start back that way, so GPU 0 held three full
+   copies of the about 6 GB folded CORE2 carry: 65.6 GiB against 48.0 on the other GPUs (28956141). Putting them with
+   the carry's own shardings (`adjoint._placer`) balanced the peaks (48.7 / 48.3, 28972681; dJ/dlog p within 4e-7,
+   the round-off of a different program) and freed the room for the fast `major` BGC layout: reverse 423 s against
+   865 for a CORE2 day, peaks 57.4 GiB (28972957). Without block remat neither layout fits (65-70 GiB single
+   allocations, 28972958-59). In a sharded loop, read every peak per device: an imbalance points at an unsharded put.

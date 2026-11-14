@@ -256,6 +256,32 @@ def _free(tree) -> None:
     jax.tree.map(lambda x: x.delete() if hasattr(x, "delete") and id(x) not in _KEPT else None, tree)
 
 
+def _placer(like):
+    """``put(tree)``: a host pytree onto the devices with the layout of ``like`` (the carry the walk started from).
+
+    A bare ``jax.device_put(host_tree)`` commits every leaf, whole, to the default device; a sharded chunk then
+    reshards it inside the call. For the sharded CORE2 carry (about 6 GB) that put the boundary state, the
+    cotangent and the rebuilt span's start on GPU 0 in full: GPU 0 peaked 18 GiB above the other three (plan
+    20261105, 28956141: 65.6 against 48.0 GiB). With ``like``'s shardings each device receives only its own
+    lanes. A tree without per-leaf shardings (host numpy), a single-device one, or a tree of another structure
+    falls back to ``jax.device_put`` as before, so the single-device walk is unchanged. ``float0`` leaves (the
+    cotangent of an integer field) are put as they are."""
+    leaves, treedef = jax.tree.flatten(like)
+    shs = [getattr(x, "sharding", None) for x in leaves]
+    if (not leaves or any(sh is None for sh in shs)
+            or all(isinstance(sh, jax.sharding.SingleDeviceSharding) for sh in shs)):
+        return jax.device_put
+
+    def put(tree):
+        t_leaves, t_def = jax.tree.flatten(tree)
+        if t_def != treedef:
+            return jax.device_put(tree)
+        return jax.tree.unflatten(treedef, [
+            jax.device_put(x) if getattr(x, "dtype", None) == jax.dtypes.float0 else jax.device_put(x, sh)
+            for x, sh in zip(t_leaves, shs)])
+    return put
+
+
 def _add_grads(a, b):
     """``a + b`` leaf by leaf; ``float0`` leaves (the cotangent of an integer parameter, which
     supports no arithmetic) pass through."""
@@ -491,6 +517,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     free = _free if free_xs else (lambda _t: None)
     fwd_chunk = _jitted_forward(chunk_fn)
     bwd_chunk = _jitted_backward(chunk_fn)
+    put = _placer(init_state)
 
     # --- forward, boundaries to the host ------------------------------------
     ta = time.time()
@@ -500,7 +527,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         s_fin = None
     else:
         s_fin, boundaries = _forward(fwd_chunk, params, init_state, n_chunks, get_xs,
-                                     stride, free, checkpoint)
+                                     stride, free, checkpoint, put=put)
         loss_v = float(loss_fn(s_fin))
         fwd_t = time.time() - ta
         if checkpoint is not None:
@@ -513,7 +540,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     # `_forward` always keeps the LAST boundary whatever the stride, so the final state is
     # available on a resume too and never has to be recomputed.
     if s_fin is None:
-        s_fin = jax.device_put(boundaries[n_chunks])
+        s_fin = put(boundaries[n_chunks])
     _, vjp_loss = jax.vjp(loss_fn, s_fin)
     cot = jax.block_until_ready(vjp_loss(1.0)[0])
     _free(s_fin)
@@ -530,7 +557,7 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         resumed, grad, c_start, trace = checkpoint.reverse_start(cot, n_chunks, like=init_state)
         if resumed is not cot:
             _free(cot)
-            cot = jax.device_put(resumed)
+            cot = put(resumed)
         fresh = not trace
         trace = list(trace) if trace else [float(adjoint_stab.cotangent_norm(cot))]
     # boundaries reported by an earlier leg are placeholders, so field_trace aligns with trace
@@ -549,9 +576,9 @@ def chunked_grad(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
         # `boundaries` holds only every stride-th state; rebuild the span in between from the
         # nearest stored one. stride == 1 => the span IS `boundaries`.
         span = (boundaries if stride == 1
-                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, get_xs, free))
+                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, get_xs, free, put))
         for c in reversed(range(sup_lo, min(sup_hi, c_start + 1))):
-            s_in = jax.device_put(span[c])
+            s_in = put(span[c])
             xs_c = get_xs(c)
             g_s, g_p = bwd_chunk(s_in, xs_c, params, cot)
             # ⚠️ ORDER MATTERS: `s_in`, `xs_c` and the OLD `cot` are live inputs to the VJP until
@@ -654,6 +681,7 @@ def chunked_grad_multi(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     free = _free if free_xs else (lambda _t: None)
     fwd_chunk = _jitted_forward(chunk_fn)
     bwd_chunk = _jitted_backward(chunk_fn)
+    put = _placer(init_state)
 
     # --- forward, boundaries to the host (once for all costs) ------------------
     ta = time.time()
@@ -687,12 +715,12 @@ def chunked_grad_multi(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
     for sup_lo in reversed(range(0, n_chunks, stride)):
         sup_hi = min(sup_lo + stride, n_chunks)
         span = (boundaries if stride == 1
-                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, xs_fn, free))
+                else _rebuild_span(fwd_chunk, params, boundaries, sup_lo, sup_hi, xs_fn, free, put))
         for c in reversed(range(sup_lo, sup_hi)):
-            s_in = jax.device_put(span[c])
+            s_in = put(span[c])
             xs_c = xs_fn(c)
             for k in range(K):
-                cot = jax.device_put(cots[k])
+                cot = put(cots[k])
                 g_s, g_p = jax.block_until_ready(bwd_chunk(s_in, xs_c, params, cot))
                 if lin_mode is not None and lin_info is None:
                     lin_info = _check_linear(bwd_chunk, s_in, xs_c, params, cot, g_s, g_p,
@@ -746,7 +774,7 @@ def chunked_forward(chunk_fn: Callable[[Any, Any, Any], Any], params, *,
 
 
 def _forward(fwd_chunk, params, init_state, n_chunks, xs_fn, stride, free, checkpoint,
-             keep_boundaries=True):
+             keep_boundaries=True, put=jax.device_put):
     """Run the window, returning ``(final_state, {chunk_index: host_state} | None)``.
 
     The window start and the window end are always kept, whatever the stride."""
@@ -756,7 +784,7 @@ def _forward(fwd_chunk, params, init_state, n_chunks, xs_fn, stride, free, check
         st_r, c0 = checkpoint.forward_resume(like=init_state)
         if st_r is not None:
             kept = checkpoint.load_boundaries(like=init_state)
-            s = jax.device_put(st_r)
+            s = put(st_r)
         elif checkpoint.put_boundary(0, kept[0]):
             raise LegIncomplete("forward", 0)
     for c in range(c0, n_chunks):
@@ -781,7 +809,7 @@ def _host_gb(boundaries) -> float:
     return sum(a.nbytes for a in jax.tree.leaves(boundaries)) / 1e9
 
 
-def _rebuild_span(fwd_chunk, params, stored, lo, hi, xs_fn, free):
+def _rebuild_span(fwd_chunk, params, stored, lo, hi, xs_fn, free, put=jax.device_put):
     """Re-run chunks ``lo..hi-1`` from the stored boundary at ``lo``; host states by chunk index.
 
     The second level of checkpointing, and the reason a year is reachable. Level one trades device
@@ -793,7 +821,7 @@ def _rebuild_span(fwd_chunk, params, stored, lo, hi, xs_fn, free):
     at most once across the whole sweep. The gradient is unchanged; these are the same states.
     ``stored[lo]`` is read once: a lazy store reads it from disk on that access."""
     first = stored[lo]
-    s = jax.device_put(first)
+    s = put(first)
     local = {lo: first}
     for c in range(lo, hi - 1):
         xs_c = xs_fn(c)
