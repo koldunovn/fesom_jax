@@ -603,7 +603,8 @@ def test_freeze_floor_gradient_switch(monkeypatch):
     floors = {"PhyN": 1e-6, "DiaN": 2e-6, "CoccoN": 1e-6, "PhaeoN": 1e-6}
     X = jnp.asarray([[[1.0, 2.4e-6, 3e-5, 1e-5, 1e-6, 0.3, 1e-9],           # diatoms on their floor
                       [-1e-4, 0.5, 2.0, 1.0, 0.4, 1.5e-5, 0.2]]])          # DIN negative; PhyN above 10 x floor
-    for v in ("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "FESOM_RECOM_GRAD_FREEZE_TRACERS", "FESOM_RECOM_GRAD_FREEZE_FLOOR"):
+    for v in ("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "FESOM_RECOM_GRAD_FREEZE_TRACERS", "FESOM_RECOM_GRAD_FREEZE_FLOOR",
+              "FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG"):
         monkeypatch.delenv(v, raising=False)
     assert W._freeze_extinct(X, lay, floors) is X
     monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR", "10")
@@ -620,6 +621,17 @@ def test_freeze_floor_gradient_switch(monkeypatch):
     g = grad()
     np.testing.assert_array_equal(g[frozen], 0.0)
     np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
+    monkeypatch.delenv("FESOM_RECOM_GRAD_FREEZE_EXTINCT")
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "0")              # the phytoplankton clause only
+    frozen[0, 0, 6] = False
+    frozen[0, 1, 0] = False                                                 # the negative DIN stays live
+    g = grad()
+    np.testing.assert_array_equal(g[frozen], 0.0)
+    np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
+    np.testing.assert_array_equal(np.asarray(W._freeze_extinct(X, lay, floors)), np.asarray(X))
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "1")              # explicit 1 = the default
+    frozen[0, 1, 0] = True
+    np.testing.assert_array_equal(grad()[frozen], 0.0)
     rcfg = SimpleNamespace(load=lambda: (None, SimpleNamespace(**{
         "Chl2N_max": 3.15, "NCmax": 0.2, "Chl2N_max_d": 4.2, "NCmax_d": 0.2, "SiCmax": 0.8,
         "Chl2N_max_c": 3.5, "NCmax_c": 0.15, "Chl2N_max_p": 3.15, "NCmax_p": 0.2})))

@@ -269,7 +269,8 @@ def _freeze_extinct(X, lay, floors=None):
     :func:`phyto_floors`: ``tiny_N_d = tiny_chl / Chl2N_max_d`` etc.), and every tracer wherever it is negative. It
     widens the clip's own zero-derivative region ``max(floor, x)`` to a band above the floor: in the 30-day CORE2
     January window the diatoms of the South Atlantic gyre sit on their floor (DiaN 2.4e-6 = tiny_N_d) and the
-    reverse field grows there. Read at trace time; all unset (the default), ``X`` is returned as is and the traced
+    reverse field grows there. FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=0 keeps only the phytoplankton clause (no freeze of
+    negatives). Read at trace time; all unset (the default), ``X`` is returned as is and the traced
     program is unchanged."""
     thr = os.environ.get("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "").strip()
     k_floor = os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR", "").strip()
@@ -297,7 +298,11 @@ def _freeze_extinct(X, lay, floors=None):
         if floors is None:
             raise ValueError("FESOM_RECOM_GRAD_FREEZE_FLOOR needs the phytoplankton floors (wiring.phyto_floors)")
         names = list(lay.names)
-        m = X < 0
+        # FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=0 (2026-11-14) drops the negative clause, keeping the phytoplankton one:
+        # in the 30-day July window it freezes the negative surface DetZ2N off Chile while the positive cell below
+        # stays live, and the reverse field grows in that cell (28983323, column dump 28992468). Unset or 1: as before.
+        neg = os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "1").strip().lower() not in ("0", "false", "no", "off")
+        m = X < 0 if neg else jnp.zeros(X.shape, bool)
         cols = [m[..., i] for i in range(X.shape[-1])]
         for nname, members, _ in PHYTO_GROUPS:
             if nname not in names:
