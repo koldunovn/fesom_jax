@@ -36,7 +36,7 @@ from jax import lax
 
 from . import precision as PR
 from .halo import compact_exchange_maps
-from .ice_wide import _xfer, rings
+from .ice_wide import _xfer, _xfer_grouped, add_grouped_maps, grouped_keys, rings, wide_grouped_wanted
 from .shard_mesh import _owner_map
 
 
@@ -66,6 +66,7 @@ class SeWideHost:
     K: int
     arrays: dict
     rings: tuple
+    gmeta: tuple = None      # static ((meta, Ln_out) entry, refresh, exit) of the point-to-point maps in ``arrays``
 
 
 def build_se_wide(mesh, partition, sm, K: int) -> SeWideHost | None:
@@ -161,8 +162,12 @@ def build_se_wide(mesh, partition, sm, K: int) -> SeWideHost | None:
     arrays["xsn"], arrays["xrn"] = compact_exchange_maps(*sm.exchange["nod"])
     arrays["xse"], arrays["xre"] = compact_exchange_maps(*sm.exchange["elem"])
     assert arrays["div_elem"].shape[2] == D
+    # the same three exchanges point to point (ice_wide.grouped_wide_maps; wide_grouped_wanted picks them when traced)
+    gmeta = (add_grouped_maps(arrays, "ent", sd_n, sl_n, sd_e, sl_e, Lsn, Ln),
+             add_grouped_maps(arrays, "ref", sd_n, sl_n, sd_e, sl_e, Ln, Ln),
+             add_grouped_maps(arrays, "ext", *sm.exchange["nod"], *sm.exchange["elem"], Lsn, Lsn))
     rg = tuple(dict(nod=nods[r], elem=elems[r]) for r in range(P))
-    return SeWideHost(K=K, arrays=arrays, rings=rg)
+    return SeWideHost(K=K, arrays=arrays, rings=rg, gmeta=gmeta)
 
 
 WIDE_KEYS = ("en", "gs", "cor", "earea", "ule", "uln", "div_elem", "div_c", "nb", "kappa",
@@ -171,7 +176,8 @@ WIDE_KEYS = ("en", "gs", "cor", "earea", "ule", "uln", "div_elem", "div_c", "nb"
 
 def fold_arrays(host: SeWideHost) -> dict:
     """``[P, X, …]`` → ``[P*X, …]`` (the ``PartitionSpec('p')`` shard_map inputs)."""
-    return {k: np.ascontiguousarray(host.arrays[k]).reshape((-1,) + host.arrays[k].shape[2:]) for k in WIDE_KEYS}
+    keys = WIDE_KEYS + (grouped_keys() if host.gmeta is not None else ())
+    return {k: np.ascontiguousarray(host.arrays[k]).reshape((-1,) + host.arrays[k].shape[2:]) for k in keys}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,6 +190,7 @@ class SeWide:
     a: dict
     axis_name: str
     skip_refresh: int = -1
+    gmeta: tuple = None      # ((meta, Ln_out) of the entry, the refresh, the exit); their maps are in ``a``
 
     def lane_mesh(self):
         """The mesh fields :func:`fesom_jax.ssh_se._substep` reads, on the SE lanes."""
@@ -194,6 +201,9 @@ class SeWide:
                                      se_kappa=PR.wp(a["kappa"]))
 
     def _x(self, nod, elem, s_n, r_n, s_e, r_e):
+        if self.gmeta is not None and wide_grouped_wanted():          # point to point (ice_wide._xfer_grouped)
+            i, p = {"ren": (0, "ent"), "rrn": (1, "ref"), "xrn": (2, "ext")}[r_n]
+            return _xfer_grouped(nod, elem, self.a, p, self.gmeta[i], self.axis_name)
         return _xfer(nod, elem, self.a[s_n], self.a[r_n], self.a[s_e], self.a[r_e], self.axis_name)
 
     def subcycle(self, init, consts, cfg, tauM, invM, w):
@@ -252,6 +262,7 @@ class SeWide:
         return (n[:, 0], n[:, 1], n[:, 2], e[:, 0:2], e[:, 2:4], e[:, 4:6], e[:, 6:8])
 
 
-def local_se_wide(a: dict, K: int, axis_name: str = "p", skip_refresh: int = -1) -> SeWide:
-    """The per-device :class:`SeWide` from this shard's slice of :func:`fold_arrays`."""
-    return SeWide(K=int(K), a=dict(a), axis_name=axis_name, skip_refresh=int(skip_refresh))
+def local_se_wide(a: dict, K: int, axis_name: str = "p", skip_refresh: int = -1, gmeta: tuple = None) -> SeWide:
+    """The per-device :class:`SeWide` from this shard's slice of :func:`fold_arrays`; ``gmeta`` = the host's
+    (:attr:`SeWideHost.gmeta`) for the point-to-point exchanges (None: the compact all_gather)."""
+    return SeWide(K=int(K), a=dict(a), axis_name=axis_name, skip_refresh=int(skip_refresh), gmeta=gmeta)

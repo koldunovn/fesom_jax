@@ -136,6 +136,7 @@ class MevpWideHost:
     K: int
     arrays: dict
     rings: tuple
+    gmeta: tuple = None      # static ((meta, Ln_out) entry, refresh, exit) of the point-to-point maps in ``arrays``
 
 
 def build_mevp_wide(mesh, partition, sm, K: int) -> MevpWideHost | None:
@@ -240,9 +241,13 @@ def build_mevp_wide(mesh, partition, sm, K: int) -> MevpWideHost | None:
     arrays["own_n"] = np.asarray(sm.owned_mask["nod"])
     arrays["own_e"] = np.asarray(sm.owned_mask["elem"])
     assert D == arrays["csr"].shape[2]
+    # the same three exchanges point to point (wide_grouped_wanted picks them when traced)
+    gmeta = (add_grouped_maps(arrays, "ent", sd_n, sl_n, sd_e, sl_e, Lsn, Ln),
+             add_grouped_maps(arrays, "ref", sd_n, sl_n, sd_e, sl_e, Ln, Ln),
+             add_grouped_maps(arrays, "ext", *sm.exchange["nod"], *sm.exchange["elem"], Lsn, Lsn))
     rg = tuple(dict(nod=nods[r], elem=elems[r], n_std=int(ml_n[r].size),
                     e_std=int(ml_e[r].size), r_km1=km1s[r]) for r in range(P))
-    return MevpWideHost(K=K, arrays=arrays, rings=rg)
+    return MevpWideHost(K=K, arrays=arrays, rings=rg, gmeta=gmeta)
 
 
 # --------------------------------------------------------------------------
@@ -287,6 +292,110 @@ def _xfer(nod, elem, sn, rn, se, re_, axis_name):
             jnp.concatenate([elem, ge], axis=0)[re_])
 
 
+# --------------------------------------------------------------------------
+# The point-to-point transport of the wide exchanges (fesom3_jax --halo-wide grouped)
+# --------------------------------------------------------------------------
+#: The keys of one wide exchange's point-to-point maps (:func:`grouped_wide_maps`), per device.
+GROUPED_FIELDS = ("si", "sv", "cp", "hm", "self")
+
+
+def wide_grouped_wanted() -> bool:
+    """The wide exchanges go point to point when the run's halo transport is grouped (``FESOM_HALO_GROUPED=1``),
+    unless ``FESOM_WIDE_GROUPED=0`` keeps the compact ``all_gather`` (A/B timing). Read when traced."""
+    from . import halo_grouped
+    return halo_grouped.enabled() and os.environ.get("FESOM_WIDE_GROUPED", "1").strip() not in ("", "0")
+
+
+def grouped_wide_maps(sd_n, sl_n, sd_e, sl_e, Lfn: int):
+    """The point-to-point maps of one wide exchange (entry, refresh or exit) from its all_gather maps
+    ``(src_dev, src_lane)`` of the node lanes ``[P, Ln]`` and the element lanes ``[P, Le]`` (the ones
+    :func:`fesom_jax.halo.compact_exchange_maps` takes); ``Lfn`` = the node lane count of the SENT field (the
+    standard ``Lmax["nod"]`` for the entry and the exit, the wide ``Ln`` for a refresh).
+
+    The node and the element field travel as ONE field of ``Lfn + Lfe`` rows (elements after the nodes, channels
+    zero-padded to the wider one, as :func:`_xfer` packs them), so every neighbour gets one message an exchange
+    (fesom3_jax's wide halos on the grouped transport, ``--halo-wide grouped``). The pairs (sender d, receiver e)
+    are edge-coloured into rounds (:func:`fesom_jax.shard_mesh._colour_edges`) and the rounds packed into one buffer
+    for :func:`fesom_jax.halo_grouped.exchange` (one NCCL group, only the real rows). Within a pair the rows go in
+    the receiver's lane order. The compact all_gather instead delivers every device's sent lanes to every device:
+    P times its send set, growing with P.
+
+    Returns ``(maps, meta)``: ``maps`` = ``{si, sv, cp, hm, self}`` ``[P, …]`` (the send rows of the packed buffer
+    and their validity, each lane's position in the received buffer, the lanes that receive, the row an own lane
+    reads: itself, its standard lane, or lane 0 for a pad — the compact exchange's rule), ``meta`` = ``(perms,
+    slots, offs, sendn)`` (STATIC). Every lane gets exactly the value the all_gather exchange gives it."""
+    from . import halo_grouped
+    from .shard_mesh import _colour_edges
+    sd = np.concatenate([np.asarray(sd_n), np.asarray(sd_e)], axis=1).astype(np.int64)
+    sl = np.concatenate([np.asarray(sl_n).astype(np.int64), np.asarray(sl_e).astype(np.int64) + int(Lfn)], axis=1)
+    P, L = sd.shape
+    remote = sd != np.arange(P)[:, None]
+    e_i, l_i = np.nonzero(remote)                        # receiver, its lane
+    d_i, s_i = sd[e_i, l_i], sl[e_i, l_i]                # sender, the row it sends
+    order = np.lexsort((l_i, e_i, d_i))                  # by sender, receiver, receiver lane
+    e_i, l_i, d_i, s_i = e_i[order], l_i[order], d_i[order], s_i[order]
+    sizes = np.bincount(d_i * P + e_i, minlength=P * P).reshape(P, P)
+    start = np.concatenate([[0], np.cumsum(sizes.ravel())])
+    classes = _colour_edges(sizes, P)
+    slots = tuple(max(n for _, _, n in cls) for cls in classes)
+    offs = tuple(int(x) for x in np.cumsum((0,) + slots)[:-1])
+    total = max(int(sum(slots)), 1)
+    si = np.zeros((P, total), np.int32)
+    sv = np.zeros((P, total), bool)
+    cp = np.zeros((P, L), np.int32)
+    for r, cls in enumerate(classes):
+        base = offs[r]
+        for d, e, n in cls:
+            a = int(start[d * P + e])
+            si[d, base:base + n] = s_i[a:a + n]
+            sv[d, base:base + n] = True
+            cp[e, l_i[a:a + n]] = base + np.arange(n, dtype=np.int32)
+    maps = {"si": si, "sv": sv, "cp": cp, "hm": remote, "self": np.where(remote, 0, sl).astype(np.int32)}
+    perms = tuple(tuple((d, e) for d, e, _ in cls) for cls in classes)
+    return maps, (perms, slots, offs, halo_grouped.send_rows(sv, slots, offs))
+
+
+def add_grouped_maps(arrays: dict, prefix: str, sd_n, sl_n, sd_e, sl_e, Lfn: int, Ln_out: int):
+    """:func:`grouped_wide_maps` into ``arrays`` as ``g{prefix}_{field}``; returns the static ``(meta, Ln_out)``
+    (``Ln_out`` = the node lane count of the result: where its element lanes start)."""
+    maps, meta = grouped_wide_maps(sd_n, sl_n, sd_e, sl_e, Lfn)
+    for k, v in maps.items():
+        arrays[f"g{prefix}_{k}"] = v
+    return meta, int(Ln_out)
+
+
+def grouped_keys(prefixes=("ent", "ref", "ext")) -> tuple:
+    """The fold keys of the point-to-point maps of the given exchanges."""
+    return tuple(f"g{p}_{k}" for p in prefixes for k in GROUPED_FIELDS)
+
+
+def _xfer_grouped(nod, elem, a: dict, prefix: str, gmeta, axis_name):
+    """:func:`_xfer`'s exchange (the same values on every lane) point to point: one message per neighbour with its
+    node and element rows, every round of the exchange in one NCCL group (:func:`fesom_jax.halo_grouped.exchange`;
+    ``lax.ppermute`` rounds off the grouped transport, e.g. on the CPU). ``gmeta`` = ``(meta, Ln_out)``."""
+    from . import halo_grouped
+    meta, Ln = gmeta
+    cn, ce = nod.shape[1], elem.shape[1]
+    C = max(cn, ce)
+    if cn < C:
+        nod = jnp.concatenate([nod, jnp.zeros((nod.shape[0], C - cn), nod.dtype)], axis=1)
+    if ce < C:
+        elem = jnp.concatenate([elem, jnp.zeros((elem.shape[0], C - ce), elem.dtype)], axis=1)
+    x = jnp.concatenate([nod, elem], axis=0)
+    g = {k: a[f"g{prefix}_{k}"] for k in GROUPED_FIELDS}
+    buf = jnp.where(g["sv"][:, None], x[g["si"]], jnp.zeros((), x.dtype))
+    perms, slots, offs = meta[:3]
+    if halo_none() or not perms:
+        recv = buf                                       # timing only (FESOM_HALO_NONE): no transfer, wrong values
+    elif halo_grouped.enabled():
+        recv = halo_grouped.exchange(buf, meta)
+    else:
+        rounds = [lax.ppermute(buf[o:o + s], axis_name, perm=list(p)) for p, s, o in zip(perms, slots, offs)]
+        recv = jnp.concatenate(rounds, axis=0) if len(rounds) > 1 else rounds[0]
+    out = jnp.where(g["hm"][:, None], recv[g["cp"]], x[g["self"]])
+    return out[:Ln, :cn], out[Ln:, :ce]
+
+
 @dataclasses.dataclass(frozen=True)
 class MevpWide:
     """Per-device wide-halo context (built inside ``shard_map`` by :func:`local_mevp_wide`),
@@ -297,20 +406,30 @@ class MevpWide:
     a: dict
     axis_name: str
     skip_refresh: int = -1
+    gmeta: tuple = None      # ((meta, Ln_out) of the entry, the refresh, the exit); their maps are in ``a``
+
+    def _grouped(self, i):
+        return None if self.gmeta is None or not wide_grouped_wanted() else self.gmeta[i]
 
     def entry(self, nod, elem):
         """Standard-layout ``[Lsn, cn]`` / ``[Lse, ce]`` → ice lanes, every lane its owner's value."""
         a = self.a
+        if (g := self._grouped(0)) is not None:
+            return _xfer_grouped(nod, elem, a, "ent", g, self.axis_name)
         return _xfer(nod, elem, a["sn"], a["ren"], a["se"], a["ree"], self.axis_name)
 
     def refresh(self, nod, elem):
         """Ice lanes → ice lanes: every non-interior lane gets its owner's (current) value."""
         a = self.a
+        if (g := self._grouped(1)) is not None:
+            return _xfer_grouped(nod, elem, a, "ref", g, self.axis_name)
         return _xfer(nod, elem, a["sn"], a["rrn"], a["se"], a["rre"], self.axis_name)
 
     def exit(self, nod, elem):
         """The standard halo exchange of a node and an element field, in one collective."""
         a = self.a
+        if (g := self._grouped(2)) is not None:
+            return _xfer_grouped(nod, elem, a, "ext", g, self.axis_name)
         return _xfer(nod, elem, a["xsn"], a["xrn"], a["xse"], a["xre"], self.axis_name)
 
     def lane_mesh(self) -> IceLaneMesh:
@@ -341,10 +460,12 @@ WIDE_KEYS = ("en", "gs", "mfac", "earea", "cor", "csr", "sn", "ren", "rrn", "se"
 
 def fold_arrays(host: MevpWideHost) -> dict:
     """``[P, X, …]`` → ``[P*X, …]`` (the ``PartitionSpec('p')`` shard_map inputs)."""
+    keys = WIDE_KEYS + (grouped_keys() if host.gmeta is not None else ())
     return {k: np.ascontiguousarray(host.arrays[k]).reshape(
-        (-1,) + host.arrays[k].shape[2:]) for k in WIDE_KEYS}
+        (-1,) + host.arrays[k].shape[2:]) for k in keys}
 
 
-def local_mevp_wide(a: dict, K: int, axis_name: str = "p") -> MevpWide:
-    """The per-device :class:`MevpWide` from this shard's slice of :func:`fold_arrays`."""
-    return MevpWide(K=int(K), a=dict(a), axis_name=axis_name)
+def local_mevp_wide(a: dict, K: int, axis_name: str = "p", gmeta: tuple = None) -> MevpWide:
+    """The per-device :class:`MevpWide` from this shard's slice of :func:`fold_arrays`; ``gmeta`` = the host's
+    (:attr:`MevpWideHost.gmeta`) for the point-to-point exchanges (None: the compact all_gather)."""
+    return MevpWide(K=int(K), a=dict(a), axis_name=axis_name, gmeta=gmeta)

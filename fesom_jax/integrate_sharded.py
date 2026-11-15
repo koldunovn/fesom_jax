@@ -1032,10 +1032,10 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     def _with_wide(ctx, ex):
         if have_wide:
             ctx = dataclasses.replace(ctx, mevp_wide=ice_wide.local_mevp_wide(
-                ex[i_wide], mevp_wide.K, ctx.axis_name))
+                ex[i_wide], mevp_wide.K, ctx.axis_name, gmeta=mevp_wide.gmeta))
         if have_se_wide:
             ctx = dataclasses.replace(ctx, se_wide=se_wide_mod.local_se_wide(
-                ex[i_se_wide], se_wide.K, ctx.axis_name))
+                ex[i_se_wide], se_wide.K, ctx.axis_name, gmeta=se_wide.gmeta))
         return ctx
 
     def body(m, s, o, stress, h, seq, *ex):
