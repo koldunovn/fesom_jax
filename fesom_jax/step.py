@@ -608,10 +608,14 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     _cav_adv = {} if cavity_cfg is None else {"cavity": True}    # the top-interface LO flux under the shelves
     carry_T = carry_S = None
     if _sp:
+        # the advected T/S feed only the column-local vertical diffusion (bc_T reads the node's own surface value),
+        # refreshed after it below: without Redi and without REcoM (its stage reads S before the floor, unrefreshed)
+        # their halo refresh is redundant (JOINED drops it)
+        _refresh_adv = gm_diag is not None or recom_cfg is not None or not ops.joined_exchanges()
         T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff = _tracers_advect_sp(
             mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live, zbar3_new,
             Z3d_new, dt=dt, exch=_exch, ckpt=_ckpt, adj=_adj, legacy_k33_weights=legacy_k33_weights, w_i=_wi_adv,
-            **({} if cavity_cfg is None else {"cav_adv": {"cavity": True}}))
+            refresh=_refresh_adv, **({} if cavity_cfg is None else {"cav_adv": {"cavity": True}}))
     else:
         T_adv, T_old = _ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, st.helem, st.hnode,
@@ -795,7 +799,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
 def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, zbar3_live, Z3d_live,
                        zbar3_new, Z3d_new, *, dt, exch, ckpt, adj, legacy_k33_weights=False, cav_adv=None,
-                       w_i=None):
+                       w_i=None, refresh=True):
     """Single-precision tracer advection + explicit Redi + ALE reconstruction (FESOM2 #1054/#1056/#1206/#1207).
 
     Upstream order (``oce_ale_tracer.F90``): the FCT advection fills the WP_full ``del_ttf`` (low-order tendency in
@@ -803,6 +807,10 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
     (``:1715-1720``, ``:1904``), and the ALE reconstruction rounds ``T·hnode + del_ttf + carry`` once, the residual
     going back into the carry (``:864-869``). Deviation D3 (user, 2026-10-20): the double-precision path of
     :func:`step` adds Redi after its reconstruction; only this single-precision path follows upstream's order.
+
+    ``refresh=False``: no halo refresh of the advected T and S (the caller's next reader is column-local and it
+    refreshes after it); the owned lanes are the same, the halo lanes (and their carries) are the device's own
+    until that refresh. Under :func:`ops.ts_batched` T and S go as one vmap pass.
     Returns ``(T_adv, S_adv, T_old, S_old, carry_T, carry_S, Kv_eff)``."""
     def one(X, X_old, carry):
         d, X_old_new = tracer_content_sp(mesh, X, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, helem=st.helem,
@@ -810,10 +818,17 @@ def _tracers_advect_sp(mesh, st, uv_adv, w_e_adv, hnode_new, h_wp, Kv, gm_diag, 
                                          zbar3_live=zbar3_live, Z3d_live=Z3d_live, dt=dt, exch=exch, ckpt=ckpt,
                                          adj=adj, w_i=w_i, **({} if cav_adv is None else {"cav_adv": cav_adv}))
         Xn, carry = tracer_adv.ale_reconstruct_carry(mesh, X, d, st.hnode, hnode_new, carry)
-        return exch(Xn, "nod"), X_old_new, carry
+        return (exch(Xn, "nod") if refresh else Xn), X_old_new, carry
 
-    T_adv, T_old, carry_T = one(st.T, st.T_old, st.carry_T)
-    S_adv, S_old, carry_S = one(st.S, st.S_old, st.carry_S)
+    if ops.ts_batched():
+        # T and S as one vmap pass, tracer-major (2, nod, ...): the same operations a tracer, one launch and one halo
+        # exchange for both (fesom3_jax ale_tracer.batch_tracers)
+        out = jax.vmap(one)(jnp.stack((st.T, st.S)), jnp.stack((st.T_old, st.S_old)),
+                            jnp.stack((st.carry_T, st.carry_S)))
+        (T_adv, S_adv), (T_old, S_old), (carry_T, carry_S) = ((o[0], o[1]) for o in out)
+    else:
+        T_adv, T_old, carry_T = one(st.T, st.T_old, st.carry_T)
+        S_adv, S_old, carry_S = one(st.S, st.S_old, st.carry_S)
     Kv_eff = Kv
     if gm_diag is not None:
         k33 = ckpt(lambda: gm_redi.k33_augmentation(mesh, gm_diag.slope_tapered, gm_diag.Ki, zbar3=zbar3_new,

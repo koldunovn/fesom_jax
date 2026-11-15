@@ -79,6 +79,14 @@ def joined_exchanges() -> bool:
     return os.environ.get("FESOM_JOINED", "1").strip() not in ("", "0")
 
 
+def ts_batched() -> bool:
+    """``FESOM_TS_BATCH`` (default on; read when traced): the single-precision T and S advection as one ``jax.vmap``
+    pass (fesom3_jax's ``batch_tracers``): each tracer gets the operations of its own pass, but the two share every
+    kernel launch and every halo exchange (the grouped transport's custom_vmap moves both in one call). ``0`` = T
+    then S, as before (A/B)."""
+    return os.environ.get("FESOM_TS_BATCH", "1").strip() not in ("", "0")
+
+
 def exch_stack(fields, exch, kind: str = "nod"):
     """Refresh the halos of several fields of one entity kind (leading axis = the lanes): under
     :func:`joined_exchanges` the fields of one dtype go side by side (trailing axes flattened, concatenated) in ONE
