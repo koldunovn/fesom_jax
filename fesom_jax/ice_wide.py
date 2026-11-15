@@ -67,11 +67,60 @@ def mevp_wide_from_env() -> int:
     return k
 
 
+_N2E = [None, None]          # (elem_nodes array, its node -> element CSR): rings() of one builder reuse it
+
+
+def _node_elem_csr(en: np.ndarray, nod2D: int):
+    """Every node's elements (ascending), as ``(ptr [nod2D+1], elem ids)``; cached for the last ``en`` object."""
+    if _N2E[0] is en and _N2E[1][0].size == nod2D + 1:
+        return _N2E[1]
+    flat = en.reshape(-1)
+    order = np.argsort(flat, kind="stable")
+    ptr = np.zeros(nod2D + 1, np.int64)
+    np.cumsum(np.bincount(flat, minlength=nod2D), out=ptr[1:])
+    _N2E[0], _N2E[1] = en, (ptr, (order // en.shape[1]).astype(np.int64))
+    return _N2E[1]
+
+
 def rings(elem_nodes, owned_nodes: np.ndarray, K: int, nod2D: int | None = None):
     """Ring sets of one device: ``(R_K node ids, E_K elem ids, E_1 mask over elements,
-    R_{K-1} mask over nodes)``. ``owned_nodes`` = the device's owned global node ids (R_0)."""
+    R_{K-1} mask over nodes)``. ``owned_nodes`` = the device's owned global node ids (R_0).
+
+    R_j = R_{j-1} + the vertices of E_j, E_j = the elements with a vertex in R_{j-1}, grown from the
+    frontier (E_j = E_{j-1} + the elements of R_{j-1} - R_{j-2}): the work is the rings' size, not
+    K sweeps over the whole mesh per device (dist_256 spent > 20 min here). Same sets as the sweep."""
     en = np.asarray(elem_nodes)
     nod2D = int(en.max()) + 1 if nod2D is None else int(nod2D)
+    if K < 1 or en.size == 0 or int(en.min()) < 0:
+        return _rings_sweep(en, owned_nodes, K, nod2D)
+    ptr, n2e = _node_elem_csr(en, nod2D)
+    nodes = np.zeros(nod2D, dtype=bool)
+    front = np.unique(np.asarray(owned_nodes))
+    nodes[front] = True
+    elems = np.zeros(en.shape[0], dtype=bool)
+    e1 = prev = None
+    for j in range(K):
+        if j == K - 1:
+            prev = nodes.copy()
+        cnt = ptr[front + 1] - ptr[front]
+        tot = int(cnt.sum())
+        if tot:
+            idx = np.repeat(ptr[front] - np.cumsum(cnt) + cnt, cnt) + np.arange(tot)
+            ne = np.unique(n2e[idx])
+            ne = ne[~elems[ne]]
+        else:
+            ne = np.zeros(0, np.int64)
+        elems[ne] = True
+        if j == 0:
+            e1 = elems.copy()
+        v = np.unique(en[ne].ravel())
+        front = v[~nodes[v]]
+        nodes[front] = True
+    return np.nonzero(nodes)[0], np.nonzero(elems)[0], e1, prev
+
+
+def _rings_sweep(en, owned_nodes, K: int, nod2D: int):
+    """:func:`rings` by K sweeps over every element (the reference; negative vertex ids)."""
     nodes = np.zeros(nod2D, dtype=bool)
     nodes[np.asarray(owned_nodes)] = True
     e1 = None
