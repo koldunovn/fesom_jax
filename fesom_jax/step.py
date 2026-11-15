@@ -181,6 +181,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         # the dense path is byte-identical (plain jnp.sum), so this is a dead-branch gate.
         _red_mask = halo_ctx.owned_mask.get("nod")
         _red_axis = halo_ctx.axis_name
+    # JOINED (fesom3_jax's joined exchanges) also drops the refreshes whose halos already come out as the owners'
+    # values (node- or element-local maps of halo-complete inputs) or are refreshed again before any owned reader
+    _lean = halo_ctx is not None and ops.joined_exchanges()
 
     # Nested in-step rematerialization (paper §3 NN-twin / any long-window adjoint). The
     # integrate() scan already wraps the WHOLE step in jax.checkpoint, so its backward stores
@@ -350,7 +353,12 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         bvfreq = jax.lax.stop_gradient(bvfreq)
         if bvfreq_local is not None:
             bvfreq_local = jax.lax.stop_gradient(bvfreq_local)
-    density, hpressure, bvfreq = ops.exch_stack((density, hpressure, bvfreq), _exch_j, "nod")   # one exchange (JOINED)
+    if _lean and cavity_cfg is None:
+        # density (the EOS) and hpressure (its column integral) are per-node maps of the halo-complete T, S and hnode:
+        # their halos are the owners' values already; only the smoothed N² (a neighbour mean) needs the refresh
+        bvfreq = _exch_j(bvfreq, "nod")
+    else:
+        density, hpressure, bvfreq = ops.exch_stack((density, hpressure, bvfreq), _exch_j, "nod")  # one (JOINED)
 
     # ALE thickness is static in full-cell linfs (hnode_new == hnode, a memcpy). Compute
     # it once here so the GM coefficient block (substep 2) and the Redi reconstruction
@@ -474,7 +482,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         is_first_step=is_first_step, dt=dt, exch=_exch,
         press_air=getattr(step_forcing, "press_air", None),
         **({} if cavity_cfg is None else {"cavity": True})))()
-    uv_rhs, uv_rhsAB = ops.exch_stack((uv_rhs, uv_rhsAB), _exch_j, "elem")
+    if not _lean:
+        # (JOINED: the viscosity adds to uv_rhs element by element and its result is refreshed below; uv_rhsAB is
+        # read only by the next step's element-local AB shift, whose uv_rhs is refreshed the same way)
+        uv_rhs, uv_rhsAB = ops.exch_stack((uv_rhs, uv_rhsAB), _exch_j, "elem")
 
     # 6 — biharmonic horizontal viscosity (splits internally to exchange u_b/v_b)
     uv_rhs = _ckpt(lambda: momentum.horizontal_viscosity(mesh, st.uv, uv_rhs, dt=dt, exch=_exch,
@@ -747,7 +758,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 16 — commit thickness (hnode := hnode_new; helem = vertex mean)
     hnode, helem = ale.commit_thickness(mesh, hnode_new)
-    hnode = _exch(hnode, "nod")
+    if not _lean:                   # (JOINED: hnode is hnode_new, refreshed at substep 13 or the static thickness)
+        hnode = _exch(hnode, "nod")
     helem = _exch(helem, "elem")
 
     new = dataclasses.replace(
