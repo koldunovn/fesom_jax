@@ -46,6 +46,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from .. import ice_adv, ice_coupling, ice_evp, ice_mevp, ice_thermo
+from .. import ops as _ops
 from .. import forcing as _forcing
 from ..config import VCPW
 
@@ -937,7 +938,7 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
                     hpnd=state.cpl_hpnd, ipnd=state.cpl_ipnd, T_oc=srf.temp, S_oc=srf.salt, cf=cf,
                     runo=runoff, geo_lat=geo_lat, non_cavity=open_water, dt=cfg.ice_dt,
                     use_virt_salt=use_virt_salt)
-    a_out, m_out, ms_out = _exch(th.a_ice, "nod"), _exch(th.m_ice, "nod"), _exch(th.m_snow, "nod")
+    a_out, m_out, ms_out = _ops.exch_stack((th.a_ice, th.m_ice, th.m_snow), exch, "nod")   # one exchange (JOINED)
     if prescribed:                                # the exit half: the updated ice leaves without a tangent
         a_out, m_out, ms_out, u_ice, v_ice, s11, s12, s22 = (_sg(x) for x in (a_out, m_out, ms_out, u_ice, v_ice,
                                                                                s11, s12, s22))

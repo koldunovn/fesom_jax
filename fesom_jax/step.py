@@ -37,7 +37,7 @@ import jax
 import jax.numpy as jnp
 
 from . import precision as PR
-from . import (adjoint_stab, ale, eos, gm, gm_redi, halo, kpp, momentum, pgf, pp, ssh,
+from . import (adjoint_stab, ale, eos, gm, gm_redi, halo, kpp, momentum, ops, pgf, pp, ssh,
                tke, tracer_adv, tracer_diff)
 from .config import DT_DEFAULT, VCPW
 from .mesh import Mesh
@@ -169,11 +169,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # exchange points (``halo_points.OCEAN_SCHEDULE``) + the CG's ``SSHHalo`` (S.6).
     if halo_ctx is None:
         _exch = lambda f, kind: f                       # noqa: E731
+        _exch_j = None                                  # ops.exch_stack: no exchange at all
         _ssh_halo = None
         _red_mask = None                                # reductions: plain masked sum
         _red_axis = None
     else:
         _exch = halo_ctx.exchange
+        _exch_j = halo_ctx.exchange
         _ssh_halo = halo_ctx.ssh_halo
         # distributed reductions (S.7 part 3): owned-node sum + psum. owned_mask=None ⇒
         # the dense path is byte-identical (plain jnp.sum), so this is a dead-branch gate.
@@ -348,9 +350,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         bvfreq = jax.lax.stop_gradient(bvfreq)
         if bvfreq_local is not None:
             bvfreq_local = jax.lax.stop_gradient(bvfreq_local)
-    density = _exch(density, "nod")
-    hpressure = _exch(hpressure, "nod")
-    bvfreq = _exch(bvfreq, "nod")
+    density, hpressure, bvfreq = ops.exch_stack((density, hpressure, bvfreq), _exch_j, "nod")   # one exchange (JOINED)
 
     # ALE thickness is static in full-cell linfs (hnode_new == hnode, a memcpy). Compute
     # it once here so the GM coefficient block (substep 2) and the Redi reconstruction
@@ -391,8 +391,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             pgf_x, pgf_y = jax.lax.stop_gradient(pgf_x), jax.lax.stop_gradient(pgf_y)
     else:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_linfs(mesh, hpressure))()
-    pgf_x = _exch(pgf_x, "elem")
-    pgf_y = _exch(pgf_y, "elem")
+    pgf_x, pgf_y = ops.exch_stack((pgf_x, pgf_y), _exch_j, "elem")
 
     # 4 — vertical mixing. 3-way: tke_cfg ⇒ classical-TKE (the PROGNOSTIC closure, Phase 9b);
     #     elif kpp_cfg ⇒ KPP (the real CORE2 default); else PP (k_ver/a_ver are the ML-hook
@@ -451,8 +450,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                                       a_ver=params.a_ver, Z3d=Z3d_live,
                                       freeze_convection=_adj.freeze_convection,
                                       conv_surrogate=_adj.conv_surrogate)
-    uvnode = _exch(uvnode, "nod")
-    Kv = _exch(Kv, "nod")
+    uvnode, Kv = ops.exch_stack((uvnode, Kv), _exch_j, "nod")
     Av = _exch(Av, "elem")
     # Named diagnostic derivative cuts (AdjointConfig.diag_cuts): a Python-level decision, so
     # an inactive cut traces nothing. Both together equal freeze_mixing below.
@@ -476,8 +474,7 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         is_first_step=is_first_step, dt=dt, exch=_exch,
         press_air=getattr(step_forcing, "press_air", None),
         **({} if cavity_cfg is None else {"cavity": True})))()
-    uv_rhs = _exch(uv_rhs, "elem")
-    uv_rhsAB = _exch(uv_rhsAB, "elem")
+    uv_rhs, uv_rhsAB = ops.exch_stack((uv_rhs, uv_rhsAB), _exch_j, "elem")
 
     # 6 — biharmonic horizontal viscosity (splits internally to exchange u_b/v_b)
     uv_rhs = _ckpt(lambda: momentum.horizontal_viscosity(mesh, st.uv, uv_rhs, dt=dt, exch=_exch,
@@ -560,17 +557,26 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #      the hoisted linfs hnode_new — so substeps 15/16 (tracers/Redi/impl-diff/commit) read the
     #      new thickness, while the GM coefficient block (substep 2) already used the OLD committed
     #      st.hnode (the dual-geometry, lesson #6). linfs ⇒ hnode_new stays the hoist (byte-identical).
+    _joined = _exch_j is not None and ops.joined_exchanges()
     if ale_cfg is not None:
         w, hnode_new = ale.vert_vel_zstar_distribute(
             mesh, w, st.hnode, zbar3_live, hbar, hbar_old, wf_ssh, dt=dt)
-        hnode_new = _exch(hnode_new, "nod")    # the C's zstar-only exchange_nod(hnode_new)
-    w = _exch(w, "nod")
+        if _joined:     # the C's zstar-only exchange_nod(hnode_new) and w's in one exchange
+            hnode_new, w = ops.exch_stack((hnode_new, w), _exch_j, "nod")
+        else:
+            hnode_new = _exch(hnode_new, "nod")
+    if not (_joined and ale_cfg is not None):
+        w = _exch(w, "nod")
     cfl_z = ale.compute_cfl_z(mesh, w, PR.wp(hnode_new), dt=dt)
-    cfl_z = _exch(cfl_z, "nod")
+    # cfl_z, w_e and w_i are column-local maps of the halo-complete w and hnode_new, so their halos come out as the
+    # owners' values without an exchange (JOINED: fesom3_jax's joined exchanges drop such refreshes)
+    if not _joined:
+        cfl_z = _exch(cfl_z, "nod")
     # w_split (oce_ale.F90:2500): move the vertical-CFL excess to the implicit part (config above).
     w_e, w_i = ale.compute_wvel_split(mesh, w, cfl_z, use_wsplit=_use_wsplit, maxcfl=_wsplit_maxcfl)
-    w_e = _exch(w_e, "nod")
-    w_i = _exch(w_i, "nod")
+    if not _joined:
+        w_e = _exch(w_e, "nod")
+        w_i = _exch(w_i, "nod")
 
     # zstar (JZ.6): the about-to-commit ("new") live geometry from hnode_new — the dual-geometry
     # "new" side. Used by the Redi K33 augmentation + the impl vert diff layer-center spacings
@@ -670,8 +676,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # REcoM's sinking (stage 3 below) reads S before the floor.
     S_unclipped = S_new
     S_new = jnp.where(mesh.node_layer_mask, jnp.maximum(S_new, S_FLOOR), S_new)
-    T_new = _exch(T_new, "nod")        # refresh halo for next step's EOS/FCT/Redi reads
-    S_new = _exch(S_new, "nod")
+    # refresh halo for next step's EOS/FCT/Redi reads: T and S in one exchange (JOINED)
+    T_new, S_new = ops.exch_stack((T_new, S_new), _exch_j, "nod")
 
     # 15c — REcoM: the BGC tracers through the same tracer stage (FESOM2's tracer loop continues past T and S with
     #       the same transport fields). recom_cfg=None ⇒ not traced. Under single precision full REcoM (bgc_every 1)

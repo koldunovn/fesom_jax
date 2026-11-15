@@ -145,8 +145,8 @@ def momentum_adv_scalar(mesh: Mesh, uv, w_e, hnode, *, exch=None, cavity: bool =
     inv_av = 1.0 / jnp.where(lm_n, mesh.areasvol, 1.0)
     un_u = jnp.where(lm_n, (vert_u + horiz[:, :, 0]) * inv_av, 0.0)
     un_v = jnp.where(lm_n, (vert_v + horiz[:, :, 1]) * inv_av, 0.0)
-    un_u = _exch(un_u, "nod")        # S.7: scatter result, gathered to cells below
-    un_v = _exch(un_v, "nod")
+    # S.7: scatter result, gathered to cells below (one exchange, JOINED)
+    un_u, un_v = ops.exch_stack((un_u, un_v), exch, "nod")
 
     # --- vertex → element: area·mean(3 vertices) ------------------------------
     cu3 = ops.gather_nodes_to_elem(un_u, mesh.elem_nodes).sum(axis=1) / 3.0   # (elem2D,nl)
@@ -270,8 +270,7 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_c
                                inv=mesh.inv_edge_tri))
 
     # S.7 intra-kernel exchange: refresh halo Uc/Vc before stage 2 gathers them.
-    Uc = _exch(Uc, "elem")
-    Vc = _exch(Vc, "elem")
+    Uc, Vc = ops.exch_stack((Uc, Vc), exch, "elem")
 
     # Stage 2: update = -dt·coef·(U_c[el1]-U_c[el2]) + viLapl·u1, scatter /area
     coef2 = -dt * coef

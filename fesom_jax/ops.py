@@ -72,6 +72,41 @@ def env_switch(name: str) -> bool:
     return os.environ.get(name, "0").strip() not in ("", "0")
 
 
+def joined_exchanges() -> bool:
+    """``FESOM_JOINED`` (default on; read when traced): halo refreshes of fields available at the same point go out
+    stacked in one exchange (fesom3_jax's joined exchanges; the same bytes move, so the same values). ``0`` = one
+    exchange a field, as before (A/B)."""
+    return os.environ.get("FESOM_JOINED", "1").strip() not in ("", "0")
+
+
+def exch_stack(fields, exch, kind: str = "nod"):
+    """Refresh the halos of several fields of one entity kind (leading axis = the lanes): under
+    :func:`joined_exchanges` the fields of one dtype go side by side (trailing axes flattened, concatenated) in ONE
+    ``exch(field, kind)`` call, else one call a field. Bytes are only moved, never cast, so the values are the
+    separate exchanges'. ``exch=None`` ⇒ the fields unchanged."""
+    fields = tuple(fields)
+    if exch is None:
+        return fields
+    if not joined_exchanges() or len(fields) < 2:
+        return tuple(exch(f, kind) for f in fields)
+    out = [None] * len(fields)
+    groups = {}
+    for i, f in enumerate(fields):
+        groups.setdefault(jnp.result_type(f), []).append(i)
+    for idx in groups.values():
+        if len(idx) == 1:
+            out[idx[0]] = exch(fields[idx[0]], kind)
+            continue
+        L = fields[idx[0]].shape[0]
+        flat = [fields[i].reshape(L, -1) for i in idx]
+        x = exch(jnp.concatenate(flat, axis=1), kind)
+        o = 0
+        for i, f in zip(idx, flat):
+            out[i] = x[:, o:o + f.shape[1]].reshape(fields[i].shape)
+            o += f.shape[1]
+    return tuple(out)
+
+
 def env_int(name: str, default: int = 0) -> int:
     """A trace-time integer environment switch (``gpu.*`` keys of :mod:`fesom_jax.run_config`)."""
     v = os.environ.get(name, "").strip()

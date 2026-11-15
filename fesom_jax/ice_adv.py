@@ -96,6 +96,9 @@ def _solve_low_order(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, rhs_a, rh
     return low(a_ice, rhs_a), low(m_ice, rhs_m), low(m_snow, rhs_ms)
 
 
+_exch_stack = ops.exch_stack       # several fields in one exchange (FESOM_JOINED)
+
+
 def _solve_high_order(cfg: IceConfig, mesh: Mesh, rhs_a, rhs_m, rhs_ms, exch=None):
     """High-order increment ``dvalues`` (``ice_solve_high_order``): first approx ``rhs/area``,
     then 2 residual-correction passes ``d ← d + (rhs - mm·d)/area``.
@@ -107,24 +110,37 @@ def _solve_high_order(cfg: IceConfig, mesh: Mesh, rhs_a, rhs_m, rhs_ms, exch=Non
     area = mesh.area[:, 0]
     inv_area = 1.0 / jnp.where(area > 0, area, 1.0)
     nc = mesh.ulevels_nod2D <= 1
-    _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
-
-    def hi(rhs):
-        d = jnp.where(nc, rhs * inv_area, 0.0)
-        for _ in range(2):                                  # num_iter_solve-1 = 2 (C line 309)
-            d = _exch(d, "nod")                             # refresh halo before mm·d reads it
-            d = jnp.where(nc, d + (rhs - _mm_times(mesh, d)) * inv_area, d)
-        return d
-
-    return hi(rhs_a), hi(rhs_m), hi(rhs_ms)
+    # the three tracers' passes side by side, their halo refreshes in one exchange a pass (each tracer's arithmetic
+    # as before)
+    rhs = (rhs_a, rhs_m, rhs_ms)
+    d = tuple(jnp.where(nc, r * inv_area, 0.0) for r in rhs)
+    for _ in range(2):                                      # num_iter_solve-1 = 2 (C line 309)
+        d = _exch_stack(d, exch)                            # refresh halo before mm·d reads it
+        d = tuple(jnp.where(nc, di + (ri - _mm_times(mesh, di)) * inv_area, di) for di, ri in zip(d, rhs))
+    return d
 
 
 def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
              freeze_limiter=False, freeze_limited_flux=False, pin_bounds=False,
              freeze_bounds=False, freeze_extremes=False, freeze_extremes_at=None,
              freeze_bounds_at=None):
+    """One tracer's limiter: :func:`_fem_fct_ratios`, the halo refresh of its ``pplus``/``pminus``, then
+    :func:`_fem_fct_limit` (fct_solve does the three tracers with one refresh)."""
+    icefluxes, pplus, pminus = _fem_fct_ratios(
+        cfg, mesh, vals, vals_l, dvals, pin_bounds=pin_bounds, freeze_bounds=freeze_bounds,
+        freeze_extremes=freeze_extremes, freeze_extremes_at=freeze_extremes_at, freeze_bounds_at=freeze_bounds_at)
+    pplus, pminus = _exch_stack((pplus, pminus), exch)  # icepplus / icepminus: read at HALO vertices by the limiter
+    return _fem_fct_limit(mesh, vals_l, icefluxes, pplus, pminus, freeze_limiter=freeze_limiter,
+                          freeze_limited_flux=freeze_limited_flux)
+
+
+def _fem_fct_ratios(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, pin_bounds=False,
+                    freeze_bounds=False, freeze_extremes=False, freeze_extremes_at=None,
+                    freeze_bounds_at=None):
     """The Zalesak limiter for one tracer (``ice_fem_fct``, ``:351-518``). Returns the
-    flux-corrected tracer ``= vals_l + limited antidiffusive flux``.
+    flux-corrected tracer ``= vals_l + limited antidiffusive flux``. This part returns the antidiffusive element
+    fluxes and the clipping ratios ``(icefluxes, pplus, pminus)``, the ratios before their halo refresh;
+    :func:`_fem_fct_limit` limits and applies.
 
     Sharding: the clipping ratios ``pplus``/``pminus`` (``icepplus``/``icepminus``) are read at
     the element's HALO vertices by the limiter (``cand = pplus[en]``), but are built from the
@@ -166,7 +182,6 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
     steps with the extremes frozen on the coast, x94 at an Antarctic ring node with them frozen
     on the first ring as well); with the whole bound constant on the coast and its first ring
     (7.6 % of the nodes) every state tried contracts or stays at the pin-only level."""
-    _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
     en = mesh.elem_nodes
     g = cfg.ice_gamma_fct
     area = mesh.area[:, 0]
@@ -232,8 +247,14 @@ def _fem_fct(cfg: IceConfig, mesh: Mesh, vals, vals_l, dvals, exch=None,
                        0.0)
     pplus = jnp.where(nc_n, pplus, 0.0)
     pminus = jnp.where(nc_n, pminus, 0.0)
-    pplus = _exch(pplus, "nod")        # icepplus: read at HALO vertices by the limiter below
-    pminus = _exch(pminus, "nod")      # icepminus
+    return icefluxes, pplus, pminus
+
+
+def _fem_fct_limit(mesh: Mesh, vals_l, icefluxes, pplus, pminus, freeze_limiter=False, freeze_limited_flux=False):
+    """The limiting of :func:`_fem_fct`: element factors from the (halo-complete) clipping ratios, the limited
+    antidiffusive flux added to the low-order solution."""
+    en = mesh.elem_nodes
+    nc_e = mesh.ulevels <= 1
 
     # limit element fluxes: ae = min over the 3 vertices of (pplus|pminus by flux sign).
     cand = jnp.where(icefluxes >= 0.0, pplus[en], pminus[en])   # [elem,3]
@@ -280,17 +301,20 @@ def fct_solve(cfg: IceConfig, mesh: Mesh, a_ice, m_ice, m_snow, u_ice, v_ice, ex
     ``freeze_extremes``, ``freeze_extremes_at``, ``freeze_bounds_at``: see ``_fem_fct``
     (``IceConfig.adjoint_cuts`` "fct_limiter", "fct_flux", "fct_pin", "fct_bound", "fct_hilo",
     "fct_hilo_coast", "fct_bound_coast")."""
-    _exch = (lambda f, k: f) if exch is None else exch       # noqa: E731
     rhs_m, rhs_a, rhs_ms = _tg_rhs(cfg, mesh, u_ice, v_ice, a_ice, m_ice, m_snow)
     da, dm, dms = _solve_high_order(cfg, mesh, rhs_a, rhs_m, rhs_ms, exch=exch)
     a_l, m_l, ms_l = _solve_low_order(cfg, mesh, a_ice, m_ice, m_snow, rhs_a, rhs_m, rhs_ms)
-    # refresh the low- + high-order halos read at element vertices inside the limiter.
-    a_l, m_l, ms_l = _exch(a_l, "nod"), _exch(m_l, "nod"), _exch(ms_l, "nod")
-    da, dm, dms = _exch(da, "nod"), _exch(dm, "nod"), _exch(dms, "nod")
-    kw = dict(exch=exch, freeze_limiter=freeze_limiter, freeze_limited_flux=freeze_limited_flux,
-              pin_bounds=pin_bounds, freeze_bounds=freeze_bounds, freeze_extremes=freeze_extremes,
+    # refresh the low- + high-order halos read at element vertices inside the limiter: one exchange (was six)
+    a_l, m_l, ms_l, da, dm, dms = _exch_stack((a_l, m_l, ms_l, da, dm, dms), exch)
+    kw = dict(pin_bounds=pin_bounds, freeze_bounds=freeze_bounds, freeze_extremes=freeze_extremes,
               freeze_extremes_at=freeze_extremes_at, freeze_bounds_at=freeze_bounds_at)
-    m_new = _fem_fct(cfg, mesh, m_ice, m_l, dm, **kw)
-    a_new = _fem_fct(cfg, mesh, a_ice, a_l, da, **kw)
-    ms_new = _fem_fct(cfg, mesh, m_snow, ms_l, dms, **kw)
+    fm, ppm, pmm = _fem_fct_ratios(cfg, mesh, m_ice, m_l, dm, **kw)
+    fa, ppa, pma = _fem_fct_ratios(cfg, mesh, a_ice, a_l, da, **kw)
+    fs, pps, pms = _fem_fct_ratios(cfg, mesh, m_snow, ms_l, dms, **kw)
+    # the three tracers' clipping ratios in one exchange (was six)
+    ppm, pmm, ppa, pma, pps, pms = _exch_stack((ppm, pmm, ppa, pma, pps, pms), exch)
+    kl = dict(freeze_limiter=freeze_limiter, freeze_limited_flux=freeze_limited_flux)
+    m_new = _fem_fct_limit(mesh, m_l, fm, ppm, pmm, **kl)
+    a_new = _fem_fct_limit(mesh, a_l, fa, ppa, pma, **kl)
+    ms_new = _fem_fct_limit(mesh, ms_l, fs, pps, pms, **kl)
     return a_new, m_new, ms_new
