@@ -356,8 +356,7 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     ``new_part.npes`` of :func:`jax.devices`)."""
     import zarr
     from . import halo
-    from .integrate_sharded import _fold
-    from .shard_mesh import _default_pad, _shard_along_axis, local_sizes
+    from .shard_mesh import local_sizes
     from .state import State
 
     out_dir = Path(out_dir)
@@ -381,32 +380,125 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     jmesh = halo.device_mesh("p", devices=devs)
     sharding = NamedSharding(jmesh, PartitionSpec("p"))
 
-    from .precision import CARRY_FIELDS
-    from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
-    out = {}
-    for name in _all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS:
-        if name in CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS and name not in root:
-            # written by single-precision runs only (the carry), or an ice_ave_steps field the writer did not
-            # use (ice_ave_steps == 1, or a restart from before Task 12): None; ice_step.init_ice_avg gives
-            # the latter the upstream init values. The split-explicit rings: only an SE run writes them
-            # (ssh_se.init_state then decides: flat rings for a CG restart into SE). The REcoM fields: only a REcoM run
-            # writes them
-            out[name] = None
-            continue
-        g = reconstruct_global(out_dir, name)            # [n_global, …] host numpy
-        n0 = g.shape[0]
-        if n0 == new_part.nod2D:
-            ml, L = new_part.myList_nod2D, Lmax["nod"]
-        elif n0 == new_part.elem2D:
-            ml, L = new_part.myList_elem2D, Lmax["elem"]
-        else:
-            raise ValueError(f"restart field {name!r} global dim {n0} is neither nod2D "
-                             f"({new_part.nod2D}) nor elem2D ({new_part.elem2D})")
-        folded = _fold(_shard_along_axis(g, ml, L, 0, _default_pad(g.dtype)))   # [P'*L', …]
+    names = restart_field_names(root)
+    out = {name: None for name in names if name not in root}
+    if fast_read_enabled():
+        folded_iter = _folded_fields_fast(root, [n for n in names if n in root], new_part, Lmax)
+    else:
+        folded_iter = ((name, _folded_field_slow(out_dir, name, new_part, Lmax)) for name in names if name in root)
+    for name, folded in folded_iter:
         out[name] = jax.make_array_from_callback(
             folded.shape, sharding, lambda idx, a=folded: a[idx])
-        del g, folded                                    # bound host peak to ~one field
-    return State(**out), meta
+        del folded                                       # bound host peak to ~one field (two while reading ahead)
+    return State(**{name: out[name] for name in names}), meta
+
+
+def restart_field_names(root) -> list:
+    """The State leaves :func:`read_restart` fills, in State order. The optional ones absent from the store come back
+    None: the carry (written by single-precision runs only), an ice_ave_steps field the writer did not use
+    (ice_ave_steps == 1, or a restart from before Task 12; ice_step.init_ice_avg gives them the upstream init
+    values), the split-explicit rings (only an SE run writes them; ssh_se.init_state then decides: flat rings for a
+    CG restart into SE), the REcoM and coupling fields. A required leaf missing from the store raises."""
+    from .precision import CARRY_FIELDS
+    from .state import BGC_FIELDS, CPL_FIELDS, ICE_AVG_FIELDS, SE_FIELDS
+    optional = CARRY_FIELDS + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS
+    names = list(_all_state_fields() + ICE_AVG_FIELDS + SE_FIELDS + BGC_FIELDS + CPL_FIELDS)
+    for name in names:
+        if name not in root and name not in optional:
+            raise KeyError(f"restart field {name!r} missing from the store")
+    return names
+
+
+def fast_read_enabled() -> bool:
+    """``FESOM_RESTART_FAST_READ`` (default on): :func:`read_restart` takes each new lane's value straight from the
+    store's lane that owns its node (element), one gather per field, the next field read from the store on a worker
+    thread meanwhile, instead of rebuilding every field as a dense global array and partitioning that (the NG5
+    coupled ocean's host setup spent ~270 s there at dist_64, cProfile job 2928603). The same values bit for bit
+    (``0``: the old path)."""
+    import os
+    return os.environ.get("FESOM_RESTART_FAST_READ", "1").strip() not in ("", "0")
+
+
+def _folded_field_slow(out_dir, name, new_part, Lmax):
+    """One field the original way: dense global by gid (:func:`reconstruct_global`), then gathered and padded per
+    device and folded, ``[P'*L', ...]``."""
+    from .integrate_sharded import _fold
+    from .shard_mesh import _default_pad, _shard_along_axis
+    g = reconstruct_global(out_dir, name)                # [n_global, ...] host numpy
+    n0 = g.shape[0]
+    if n0 == new_part.nod2D:
+        ml, L = new_part.myList_nod2D, Lmax["nod"]
+    elif n0 == new_part.elem2D:
+        ml, L = new_part.myList_elem2D, Lmax["elem"]
+    else:
+        raise ValueError(f"restart field {name!r} global dim {n0} is neither nod2D "
+                         f"({new_part.nod2D}) nor elem2D ({new_part.elem2D})")
+    return _fold(_shard_along_axis(g, ml, L, 0, _default_pad(g.dtype)))    # [P'*L', ...]
+
+
+def _folded_fields_fast(root, names, new_part, Lmax):
+    """Yields ``(name, [P'*L', ...] host numpy)`` for :func:`read_restart`, equal bit for bit to
+    :func:`_folded_field_slow`: a new lane of global id g takes the store's value at g -- in a folded store the
+    LAST owned lane of g in lane order (what reconstruct_global's ``out[gid[owned]] = data[owned]`` leaves), 0 when
+    no lane owns g; in a canonical_global store row g --, a pad lane the pad value. The source rows per kind are
+    built once (the store's gid/owned arrays read once, not per field); the store read of the next field overlaps
+    the gather of this one (one worker thread)."""
+    import concurrent.futures
+    from .shard_mesh import _default_pad
+    canonical = root.attrs.get("layout") == "canonical_global"
+    n_glob = {"nod": int(new_part.nod2D), "elem": int(new_part.elem2D)}
+    mls = {"nod": new_part.myList_nod2D, "elem": new_part.myList_elem2D}
+    maps = {}
+
+    def source(kind):
+        """(the store row of every new lane, -1 where no lane owns its gid or a pad lane; the new pad lanes)."""
+        if kind not in maps:
+            P, L = len(mls[kind]), int(Lmax[kind])
+            tgt = np.full((P, L), -1, np.int64)
+            for d, ml in enumerate(mls[kind]):
+                ml = np.asarray(ml)
+                tgt[d, : ml.size] = ml
+            tgt = tgt.reshape(-1)
+            pad = tgt < 0
+            if canonical:
+                src = np.where(pad, -1, tgt)
+            else:
+                if int(root.attrs[{"nod": "nod2D", "elem": "elem2D"}[kind]]) != n_glob[kind]:
+                    raise ValueError(f"restart {kind} count differs from the target partition's")
+                gid = np.asarray(root[f"gid_{kind}"][:])
+                owned = np.asarray(root[f"owned_{kind}"][:])
+                row = np.full(n_glob[kind], -1, np.int64)
+                row[gid[owned]] = np.nonzero(owned)[0]   # (a repeated gid: its last owned lane, as numpy assigns)
+                src = np.where(pad, -1, row[np.where(pad, 0, tgt)])
+            maps[kind] = (src, pad)
+        return maps[kind]
+
+    def kind_of(name, z):
+        n0 = z.shape[0] if canonical else {"nod": n_glob["nod"], "elem": n_glob["elem"]}.get(z.attrs["kind"], -1)
+        if n0 == n_glob["nod"]:
+            return "nod"
+        if n0 == n_glob["elem"]:
+            return "elem"
+        raise ValueError(f"restart field {name!r} global dim {n0} is neither nod2D "
+                         f"({n_glob['nod']}) nor elem2D ({n_glob['elem']})")
+
+    def read(name):
+        return np.asarray(root[name][:])
+
+    if not names:
+        return
+    with concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="fjx-restart") as ex:
+        nxt = ex.submit(read, names[0])
+        for i, name in enumerate(names):
+            data = nxt.result()
+            nxt = ex.submit(read, names[i + 1]) if i + 1 < len(names) else None
+            src, pad = source(kind_of(name, root[name]))
+            folded = np.take(data, np.maximum(src, 0), axis=0)
+            if not canonical:
+                folded[(src < 0) & ~pad] = 0             # a gid no lane owns: reconstruct_global's zero
+            folded[pad] = _default_pad(data.dtype)
+            del data
+            yield name, folded
 
 
 # --------------------------------------------------------------------------

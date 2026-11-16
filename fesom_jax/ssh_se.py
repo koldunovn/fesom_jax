@@ -127,7 +127,22 @@ def _trim_cyclic(x):
     return np.where(x < -half, x + CYCLIC_LENGTH_RAD, x)
 
 
+_TABLES = [None, None]          # (the mesh, its tables): build_tables' last result
+
+
 def build_tables(mesh) -> dict:
+    """:func:`_build_tables` of ``mesh``, kept for the same mesh object: the coupled ocean's setup asked for it three
+    times (the CFL guard, :func:`shard_tables`, se_wide.build_se_wide: ~15 s each at NG5, cProfile job 2928603). The
+    arrays are read-only (every caller indexes or casts them into new arrays); a new dict each call."""
+    if _TABLES[0] is not mesh:
+        t = _build_tables(mesh)
+        for v in t.values():
+            v.flags.writeable = False
+        _TABLES[0], _TABLES[1] = mesh, t
+    return dict(_TABLES[1])
+
+
+def _build_tables(mesh) -> dict:
     """The global SE tables (host numpy) of a dense :class:`~fesom_jax.mesh.Mesh`:
 
     * ``se_div_elem`` ``[nod2D, D]`` int32 / ``se_div_c`` ``[nod2D, D, 2]``: node n's divergence row
@@ -698,6 +713,12 @@ def cfl_omega_max(mesh, helem=None):
     H = np.where(np.asarray(mesh.ulevels) == 1, H, 0.0)
     el, c = t["se_div_elem"], t["se_div_c"].astype(np.float64)
     av = np.asarray(mesh.areasvol)[:, 0].astype(np.float64)
+    cache = _cfl_cache_path((en, gs, H, el, c, av))
+    if cache is not None and os.path.isfile(cache):
+        import json
+        with open(cache) as fh:
+            d = json.load(fh)
+        return float(d["omega"]), float(d["rel"])
     gid = np.arange(1, av.shape[0] + 1, dtype=np.int64)
     v = ((gid * 2654435761) % 4294967296).astype(np.float64) / 4294967296.0 - 0.5
     v = v / np.sqrt(np.sum(av * v * v))
@@ -715,7 +736,49 @@ def cfl_omega_max(mesh, helem=None):
         if not lam > 0.0:
             break
         v = Av / lam
-    return float(np.sqrt(lam if lam > 0.0 else 0.0)), (abs(lam - lam_old) / lam if lam > 0.0 else 0.0)
+    omega, rel = float(np.sqrt(lam if lam > 0.0 else 0.0)), (abs(lam - lam_old) / lam if lam > 0.0 else 0.0)
+    if cache is not None:
+        _cfl_cache_write(cache, omega, rel)
+    return omega, rel
+
+
+def _cfl_cache_path(arrays):
+    """``FESOM_SE_CFL_CACHE=<dir>``: :func:`cfl_omega_max`'s result kept in ``<dir>/se_cfl_<sha1>.json``, the sha1
+    over every input of the power iterations (the operator's arrays, ``CFL_NIT``), so a run on the same mesh skips
+    them (NG5: ~130 s of the coupled ocean's host setup, cProfile job 2928603) and gets the very same float back.
+    None without the variable."""
+    d = os.environ.get("FESOM_SE_CFL_CACHE", "").strip()
+    if not d:
+        return None
+    import hashlib
+    h = hashlib.sha1(f"fesom_jax ssh_se.cfl_omega_max v1 nit={CFL_NIT}".encode())
+    for a in arrays:
+        a = np.ascontiguousarray(a)
+        h.update(f"|{a.dtype.str}{a.shape}|".encode())
+        h.update(a.reshape(-1).view(np.uint8))
+    return os.path.join(d, f"se_cfl_{h.hexdigest()}.json")
+
+
+def _cfl_cache_write(path, omega, rel):
+    """Create the cache file once: written aside, then hard-linked into place (an existing file is kept as it is;
+    a failure only costs the next run the iterations)."""
+    import json
+    tmp = f"{path}.{os.getpid()}.tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "w") as fh:
+            json.dump({"omega": omega, "rel": rel, "nit": CFL_NIT}, fh)
+        try:
+            os.link(tmp, path)
+        except FileExistsError:
+            pass
+    except OSError:
+        pass
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def cfl_guard(mesh, dt, cfg: SeConfig, helem=None):
