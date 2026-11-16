@@ -383,7 +383,8 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
     names = restart_field_names(root)
     out = {name: None for name in names if name not in root}
     if fast_read_enabled():
-        folded_iter = _folded_fields_fast(root, [n for n in names if n in root], new_part, Lmax)
+        folded_iter = _folded_fields_fast(root, [n for n in names if n in root], new_part, Lmax,
+                                          need=_addressable_lanes(sharding, new_part, Lmax))
     else:
         folded_iter = ((name, _folded_field_slow(out_dir, name, new_part, Lmax)) for name in names if name in root)
     for name, folded in folded_iter:
@@ -411,12 +412,26 @@ def restart_field_names(root) -> list:
 
 def fast_read_enabled() -> bool:
     """``FESOM_RESTART_FAST_READ`` (default on): :func:`read_restart` takes each new lane's value straight from the
-    store's lane that owns its node (element), one gather per field, the next field read from the store on a worker
-    thread meanwhile, instead of rebuilding every field as a dense global array and partitioning that (the NG5
-    coupled ocean's host setup spent ~270 s there at dist_64, cProfile job 2928603). The same values bit for bit
-    (``0``: the old path)."""
+    store's lane that owns its node (element), one gather per field, instead of rebuilding every field as a dense
+    global array and partitioning that; a process reads only the store chunks its own devices' lanes come from, on
+    ``FESOM_RESTART_READ_THREADS`` threads (default 8) -- the NG5 coupled ocean's host setup spent ~240-270 s in
+    read_restart at dist_64, each of its processes reading and decompressing the whole store on one thread (jobs
+    2928603, 2928755). The same values bit for bit on every lane a process holds (``0``: the old path)."""
     import os
     return os.environ.get("FESOM_RESTART_FAST_READ", "1").strip() not in ("", "0")
+
+
+def _addressable_lanes(sharding, new_part, Lmax) -> dict:
+    """{kind: bool [P'*L'_kind]}: the folded lanes this process's devices hold under ``sharding`` (all of them with one
+    process)."""
+    need = {}
+    for kind, L in (("nod", Lmax["nod"]), ("elem", Lmax["elem"])):
+        n = int(new_part.npes) * int(L)
+        m = np.zeros(n, bool)
+        for idx in sharding.addressable_devices_indices_map((n,)).values():
+            m[idx[0]] = True
+        need[kind] = m
+    return need
 
 
 def _folded_field_slow(out_dir, name, new_part, Lmax):
@@ -436,14 +451,16 @@ def _folded_field_slow(out_dir, name, new_part, Lmax):
     return _fold(_shard_along_axis(g, ml, L, 0, _default_pad(g.dtype)))    # [P'*L', ...]
 
 
-def _folded_fields_fast(root, names, new_part, Lmax):
+def _folded_fields_fast(root, names, new_part, Lmax, need=None):
     """Yields ``(name, [P'*L', ...] host numpy)`` for :func:`read_restart`, equal bit for bit to
-    :func:`_folded_field_slow`: a new lane of global id g takes the store's value at g -- in a folded store the
-    LAST owned lane of g in lane order (what reconstruct_global's ``out[gid[owned]] = data[owned]`` leaves), 0 when
-    no lane owns g; in a canonical_global store row g --, a pad lane the pad value. The source rows per kind are
-    built once (the store's gid/owned arrays read once, not per field); the store read of the next field overlaps
-    the gather of this one (one worker thread)."""
+    :func:`_folded_field_slow` on every lane of ``need`` ({kind: bool mask}, default all; the other lanes are left
+    unset -- make_array_from_callback reads only this process's devices' lanes): a new lane of global id g takes the
+    store's value at g -- in a folded store the LAST owned lane of g in lane order (what reconstruct_global's
+    ``out[gid[owned]] = data[owned]`` leaves), 0 when no lane owns g; in a canonical_global store row g --, a pad
+    lane the pad value. The source rows per kind are built once (the store's gid/owned arrays read once, not per
+    field); of each field only the chunks holding the needed rows are read, on FESOM_RESTART_READ_THREADS threads."""
     import concurrent.futures
+    import os
     from .shard_mesh import _default_pad
     canonical = root.attrs.get("layout") == "canonical_global"
     n_glob = {"nod": int(new_part.nod2D), "elem": int(new_part.elem2D)}
@@ -451,7 +468,8 @@ def _folded_fields_fast(root, names, new_part, Lmax):
     maps = {}
 
     def source(kind):
-        """(the store row of every new lane, -1 where no lane owns its gid or a pad lane; the new pad lanes)."""
+        """(the store row of every needed new lane, -1 where no lane owns its gid or a pad lane; their pad mask; the
+        needed lanes, None = all)."""
         if kind not in maps:
             P, L = len(mls[kind]), int(Lmax[kind])
             tgt = np.full((P, L), -1, np.int64)
@@ -459,6 +477,9 @@ def _folded_fields_fast(root, names, new_part, Lmax):
                 ml = np.asarray(ml)
                 tgt[d, : ml.size] = ml
             tgt = tgt.reshape(-1)
+            sel = None if need is None or need[kind].all() else np.nonzero(need[kind])[0]
+            if sel is not None:
+                tgt = tgt[sel]
             pad = tgt < 0
             if canonical:
                 src = np.where(pad, -1, tgt)
@@ -470,7 +491,7 @@ def _folded_fields_fast(root, names, new_part, Lmax):
                 row = np.full(n_glob[kind], -1, np.int64)
                 row[gid[owned]] = np.nonzero(owned)[0]   # (a repeated gid: its last owned lane, as numpy assigns)
                 src = np.where(pad, -1, row[np.where(pad, 0, tgt)])
-            maps[kind] = (src, pad)
+            maps[kind] = (src, pad, sel, P * L)
         return maps[kind]
 
     def kind_of(name, z):
@@ -482,22 +503,32 @@ def _folded_fields_fast(root, names, new_part, Lmax):
         raise ValueError(f"restart field {name!r} global dim {n0} is neither nod2D "
                          f"({n_glob['nod']}) nor elem2D ({n_glob['elem']})")
 
-    def read(name):
-        return np.asarray(root[name][:])
+    nthreads = max(1, int(os.environ.get("FESOM_RESTART_READ_THREADS", "8")))
+    with concurrent.futures.ThreadPoolExecutor(nthreads, thread_name_prefix="fjx-restart") as ex:
+        for name in names:
+            z = root[name]
+            src, pad, sel, nlanes = source(kind_of(name, z))
+            n, C = int(z.shape[0]), int(z.chunks[0])
+            data = np.empty(z.shape, z.dtype)            # (only the chunks read are ever touched)
+            rows = src[src >= 0]
+            chunks = np.unique(rows // C) if rows.size else np.zeros(0, np.int64)
 
-    if not names:
-        return
-    with concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="fjx-restart") as ex:
-        nxt = ex.submit(read, names[0])
-        for i, name in enumerate(names):
-            data = nxt.result()
-            nxt = ex.submit(read, names[i + 1]) if i + 1 < len(names) else None
-            src, pad = source(kind_of(name, root[name]))
-            folded = np.take(data, np.maximum(src, 0), axis=0)
-            if not canonical:
-                folded[(src < 0) & ~pad] = 0             # a gid no lane owns: reconstruct_global's zero
-            folded[pad] = _default_pad(data.dtype)
+            def get(c, z=z, data=data, n=n, C=C):
+                a, b = int(c) * C, min((int(c) + 1) * C, n)
+                data[a:b] = z[a:b]
+            for f in [ex.submit(get, c) for c in chunks]:
+                f.result()
+            vals = np.take(data, np.maximum(src, 0), axis=0)
             del data
+            if not canonical:
+                vals[(src < 0) & ~pad] = 0               # a gid no lane owns: reconstruct_global's zero
+            vals[pad] = _default_pad(vals.dtype)
+            if sel is None:
+                folded = vals
+            else:
+                folded = np.empty((nlanes,) + vals.shape[1:], vals.dtype)
+                folded[sel] = vals
+            del vals
             yield name, folded
 
 
