@@ -683,18 +683,37 @@ def _surface_vel_nodes(mesh, uv):
     bit of a sum before the cast to the working precision."""
     from .. import ops
     e = mesh.elem2D
-    m = mesh.elem_layer_mask[:, 0]
-    area = mesh.elem_area
+    t = _surface_vel_tables(mesh)
+    m, area, inv = t["m"], t["area"], t["inv"]
     contrib = jnp.where(m[:, None], area[:, None] * uv[:, 0, :], 0.0)                 # (elem2D,2)
     area_lev = jnp.where(m, area, 0.0)
-    inv = mesh.inv_elem_nodes
-    if inv is None:
-        inv = jnp.asarray(ops.inverse_map(np.asarray(mesh.elem_nodes), mesh.nod2D))
     vals = jnp.broadcast_to(contrib[:, None], (e, 3, 2)).reshape(3 * e, 2)
     num = ops.ordered_sum(vals, inv)
     den = ops.ordered_sum(jnp.broadcast_to(area_lev[:, None], (e, 3)).reshape(-1), inv)
     safe = jnp.where(den > 0.0, den, 1.0)[:, None]
-    return jnp.where(mesh.node_layer_mask[:, 0][:, None], num / safe, 0.0)
+    return jnp.where(t["nm"][:, None], num / safe, 0.0)
+
+
+_SURF_VEL = [None, None]          # (the mesh, its _surface_vel_tables)
+
+
+def _surface_vel_tables(mesh) -> dict:
+    """What :func:`_surface_vel_nodes` reads of the mesh, as host numpy, made once per mesh object: the surface level
+    of the element and node layer masks, the element areas and the elements' inverse map. Inside the jitted
+    ocean_to_atm every mesh array the trace touches becomes a captured constant: the whole [elem2D, nl] and
+    [nod2D, nl] masks were (2.47 GB of constants in the NG5 coupled ocean's program, bool[14741520, 70] 1.03 GB of
+    them, job 2928690; replicated on every device and in the compile cache); now only their first level. The same
+    values."""
+    if _SURF_VEL[0] is not mesh:
+        from .. import ops
+        inv = mesh.inv_elem_nodes
+        inv = np.asarray(inv) if inv is not None else np.asarray(ops.inverse_map(np.asarray(mesh.elem_nodes),
+                                                                                  mesh.nod2D))
+        _SURF_VEL[0], _SURF_VEL[1] = mesh, {"m": np.asarray(mesh.elem_layer_mask)[:, 0].copy(),
+                                            "area": np.asarray(mesh.elem_area),
+                                            "inv": inv,
+                                            "nm": np.asarray(mesh.node_layer_mask)[:, 0].copy()}
+    return _SURF_VEL[1]
 
 
 def _ocean_to_atm(state, static: OceanStatic) -> dict:
