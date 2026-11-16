@@ -206,6 +206,11 @@ with plots, is [`examples/02_core2_realistic.ipynb`](examples/02_core2_realistic
 
 ### 2. Backward — gradients
 
+> **Long windows (beyond about a day), the sea-ice adjoint and every validated setting: [`docs/ADJOINT_GUIDE.md`](docs/ADJOINT_GUIDE.md).**
+> The defaults (`AdjointConfig()`, `IceConfig()`) give the exact adjoint, which grows without bound over long windows
+> and returns NaN through the unrolled mEVP subcycles; the guide lists the backward-only settings that fix this
+> and how far each one has been checked against finite differences (CORE2 to one year, the 4 km Arctic mesh).
+
 Continuing from **§1** (the packaged `pi` mesh — so this needs **no data**). The *code* is identical
 at CORE2 scale — the *memory* is not: reverse mode stores the forward pass, and a naive `jax.grad`
 fits only **1–2 CORE2 steps** on an 80 GB A100. For any real window pass `remat_segments=-1` — see

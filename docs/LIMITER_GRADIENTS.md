@@ -1,5 +1,9 @@
 # Limiter gradients — the Zalesak FCT AD decision (Task 4.1)
 
+> **Current status and settings: [`ADJOINT_GUIDE.md`](ADJOINT_GUIDE.md).** This document is kept as the design and history record
+> up to about 2026-10-11. The one-year windows, the 4 km Arctic mesh (farc), the sea-ice volume cost and the
+> sharded adjoint paths came later and are described only in the guide.
+
 The FCT (flux-corrected transport) tracer advection adds a high-order (HO)
 antidiffusive flux on top of the monotone low-order (LO) upwind flux, then runs the
 **Zalesak limiter** to clip the antidiffusive part so the update introduces no new

@@ -1,5 +1,9 @@
 # The classical-TKE adjoint on CORE2: where it grows and what carries it (stage 1)
 
+> **Current status and settings: [`ADJOINT_GUIDE.md`](ADJOINT_GUIDE.md).** This document is kept as the design and history record
+> up to about 2026-10-11. The one-year windows, the 4 km Arctic mesh (farc), the sea-ice volume cost and the
+> sharded adjoint paths came later and are described only in the guide.
+
 Status: stage 1 (diagnosis) of the TKE-adjoint work, 2026-09-27. Stage 2 (derivative-only candidate settings,
 calibration against finite differences, evaluation) builds on §10. Driver `scripts/adjoint/tke_diag.py`, tables
 `scripts/adjoint/tke_diag_summary.py`, figures `scripts/adjoint/plot_tke_diag.py` (in `docs/figures/adjoint_tke/`).

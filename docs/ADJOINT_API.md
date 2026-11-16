@@ -1,5 +1,9 @@
 # The public adjoint API — design
 
+> **Current status and settings: [`ADJOINT_GUIDE.md`](ADJOINT_GUIDE.md).** This document is kept as the design and history record
+> up to about 2026-10-11. The one-year windows, the 4 km Arctic mesh (farc), the sea-ice volume cost and the
+> sharded adjoint paths came later and are described only in the guide.
+
 Task 3 of `docs/plans/20260810-split-nn-eddy-and-promote-adjoint.md`. What `fesom_jax.adjoint`
 must offer so the research code can stop importing `fesom_jax.integrate._run_steps`, and why the
 surface is shaped the way it is. No code in this task; Task 4 implements it and carries the tests.

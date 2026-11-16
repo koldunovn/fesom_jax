@@ -1,5 +1,9 @@
 # Adjoint horizon — lessons learned (NN-GM study, 2026-08-07)
 
+> **Current status and settings: [`ADJOINT_GUIDE.md`](ADJOINT_GUIDE.md).** This document is kept as the design and history record
+> up to about 2026-10-11. The one-year windows, the 4 km Arctic mesh (farc), the sea-ice volume cost and the
+> sharded adjoint paths came later and are described only in the guide.
+
 **Headline.** The adjoint of the full CORE2 configuration (zstar + TKE + mEVP ice + GM) was
 unusable beyond about a day, and the cause was not chaos. It was the prognostic turbulence
 closure's response to the ocean state. Freezing that one feedback in the backward pass — the
