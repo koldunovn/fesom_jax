@@ -83,8 +83,9 @@ def test_run_config_precision():
     assert type(cfg).from_dict(sp.to_dict()).precision == "single"
     with pytest.raises(ValueError):
         dataclasses.replace(cfg, precision="float").validate()
+    dataclasses.replace(cfg, precision="single", ale=None).validate()           # linfs: allowed since d94fd35
     with pytest.raises(NotImplementedError):
-        dataclasses.replace(cfg, precision="single", ale=None).validate()       # linfs
+        dataclasses.replace(cfg, precision="single", ale=cfg.ale._replace(use_wsplit=True)).validate()
     with pytest.raises(NotImplementedError):
         dataclasses.replace(cfg, precision="single", ice=cfg.ice._replace(whichEVP=0)).validate()
 

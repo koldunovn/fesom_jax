@@ -67,7 +67,9 @@ def test_full_fields_restart_roundtrip(tmp_path):
     assert hp.bgc_carb.shape[:2] == hp.T.shape[:2] and hp.bgc_diag.shape == hp.T.shape[:2] + (len(wiring.DIAG2D),)
     with pytest.raises(ValueError):
         wiring.start_segment(dataclasses.replace(loaded, bgc_benthos=None), rcfg)
-    assert set(BGC_FULL_FIELDS) >= set(RESTART_SKIP)
+    # every field a restart skips is one start_segment rebuilds, except the coupled ocean's `fw` diagnostic, which
+    # coupled.ocean recreates when its monthly output asks for it (State.cpl_fw)
+    assert set(BGC_FULL_FIELDS) >= set(RESTART_SKIP) - {"cpl_fw"}
 
 
 @TS.need_twin
