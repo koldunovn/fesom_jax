@@ -11192,3 +11192,44 @@ merged as they are.
 Lesson: with squash-published history, compare by content and replay onto the pre-squash tip, not onto the
 squash. And a CPU test job on a 128-core node needs its XLA pools sized to the cores it is given: two groups
 run with 128 threads were time-cut at 3 h, about four times the suite's measured cost.
+
+### 2026-11-17 (port/omip-fixes) — the OMIP-line fixes ported onto main; CI green again
+
+Five commits of the OMIP line (`omip/core2`) were not on main: the cycle tooling (19ba94a), NaN below the
+bottom in the mean output (506b9be), the split-explicit SSH volume fix in single precision (be86bc7), the
+ice-2 freshwater balance on the steps without an ice update (c87ea1b), and the cycle start from a restart of
+another dt (a1d633b). main is a squash history, so they were cherry-picked onto it, not merged.
+
+- `run.py`: main already had `plan_chunks(restarted=)` (0020342, a restart never re-bootstraps AB2 at step 0),
+  which does what the OMIP line's `continue_ab2` did; main's form is kept and a1d633b's dt check feeds it.
+- `ssh_se.py`: main had gained an opt-in explicit transpose of the old divergence (`FESOM_SE_DIV_VJP`, for the
+  fast adjoint) on the tables be86bc7 replaces. It was rebuilt for the edge-inflow form: the inflow is linear
+  in U, so its transpose is an ordered sum over an inverse map of at most 6 entries per element.
+  `test_se_div_vjp.py` checks it against JAX's transpose on the dense CORE2 tables and on the dist_4 shards.
+- Tests (jobs 29047750, 29049186, 29049450): the split-explicit, ice-2, run-entry, output, precision and REcoM
+  files, the dense fast adjoint (8 tests) and the sharded one (9 tests, 40 min). Two stale assertions on
+  main itself were fixed on the way (`test_precision.py` after d94fd35, `test_recom_restart.py` after
+  c8491cf).
+- The double-precision lock (`test_dp_lock.py`) fails on main with exactly the hashes it gives after the port
+  (jobs 29048992, 29047750): the port changes no DP program. The baseline is older than the 2026-11-10 merge,
+  whose coupled line changed the default ice step's program (entry above); it is not re-pinned here.
+- CI had failed since 2026-10-28: jax unpinned (0.12 broke the version-specific jaxpr pins) and a `ci` group
+  smaller than `core2`. jax is pinned to 0.10.1, and the `unit` group was re-timed on the runner's shape (job
+  29047299): 13 files at 30 s or less moved to `ci`. The `ci` group on 2 cores and 16 GB: 832 passed, 8
+  skipped, 9 min 8 s (job 29049187).
+
+`test_cycle_start`'s dt-change check had never tested anything. `run_from_config` takes an injected `sop` as
+the SSH operator of `cfg.dt`, and the test passed the fixture's operator, built for 1800 s, to runs at 3600 s.
+Those solved the SSH with the wrong dt and were NaN everywhere within 4 steps (job 29049110); the comparison
+helper `_owned_worst` builds `max(worst, float(np.max(np.abs(A - B))))`, and Python's `max(0.0, nan)` is 0.0,
+so two NaN states compared as bitwise equal. At 900 s on the same wrong operator the runs stay finite and reach
+|SSH| ~ 3e6 m (job 29049368). On the operator of their own dt they are healthy, and the AB2 re-bootstrap moves
+T by up to 0.096 K over 4 steps (job 29049450).
+
+Lesson: a test that asserts something about two runs has to assert first that both are physically sane, and
+finite is not sane enough. A NaN-blind equality helper and an operator that silently binds to the run's dt
+together made a check pass on two blown-up states. Still open: `_owned_worst` itself is NaN-blind (its other
+uses compare healthy runs at one dt), and `run_from_config` does not check that an injected `sop` was built
+for `cfg.dt`. Second: when another branch changes a rule, re-read the tests that encode it. main's "a
+restart never re-bootstraps AB2 at step 0" and the OMIP test's opposite expectation were each right on their
+own branch.
