@@ -437,17 +437,38 @@ def test_monthly_output(core2_setup, tmp_path):
 
 
 @have_forcing
-def test_cycle_start(core2_setup, tmp_path):
+def test_cycle_start(core2_setup, tmp_path, monkeypatch):
     """An OMIP cycle start (``cycle_start=True``, fesom3-jax's tools/run_cycles.py protocol): the restart's state with
     the clock at step 0 and AB2 carried on. With the forcing injected, the clock only names the steps, so the cycle
-    start must be BITWISE the plain continuation of the same restart over the same forcing; a restart whose step is
-    rewritten to 0 without ``cycle_start`` cold-bootstraps AB2 instead and must differ. The run counts its steps from
-    0 (``res.step``) and names its archival restart by the cycle's calendar. A cycle start at another dt re-bootstraps
-    AB2, so it must be bitwise that step-0 restart at the same dt."""
+    start must be BITWISE the plain continuation of the same restart over the same forcing. The run counts its steps
+    from 0 (``res.step``) and names its archival restart by the cycle's calendar.
+
+    A restart never re-bootstraps AB2 at step 0 (``plan_chunks(restarted=True)``), so a restart whose step is
+    rewritten to 0 is bitwise the cycle start too. The one exception is a cycle start from a restart written at
+    another dt: its AB2 history is stale, so the first step re-bootstraps it, and the result must differ from the
+    step-0 restart run at that dt, which carries the history on. The first chunk's ``bootstrap_ab2`` of every run is
+    recorded to pin which run bootstraps.
+
+    The other dt is DT/2 (a cycle run at a smaller dt), and its runs get ``sop=None``: ``run_from_config`` takes an
+    injected ``sop`` as the operator of ``cfg.dt``, and the fixture's is built for DT. The OMIP line passed it to its
+    runs at 2*DT, which solved the SSH with the wrong dt and were NaN everywhere within the 4 steps (job 29049110);
+    ``_owned_worst`` passes NaN against NaN as 0 (``max(0.0, nan)`` is 0.0), so its bitwise check compared two
+    blown-up states. With the DT operator at DT/2 the runs stay finite but reach |SSH| ~ 3e6 m (job 29049368).
+    Every compared run is therefore checked for a bounded SSH and velocity."""
     import json
     import shutil
+    from fesom_jax import run as run_mod
     from fesom_jax import zarr_output
     from fesom_jax.integrate_sharded import unfold_state
+    boots = []
+    _plan = run_mod.plan_chunks
+
+    def _record(*a, **k):
+        chunks = _plan(*a, **k)
+        boots.append(chunks[0].bootstrap_ab2)
+        return chunks
+
+    monkeypatch.setattr(run_mod, "plan_chunks", _record)
     fx = core2_setup
     common = dict(mesh=fx["mesh"], part=fx["part"], sm=fx["sm"], sop=fx["sop"], year=YEAR)
     kw = dict(kpp=KppConfig(), dt=DT)
@@ -475,17 +496,28 @@ def test_cycle_start(core2_setup, tmp_path):
     boot = run_from_config(RunConfig(n_steps=m, restart_in=str(r0), **kw), forcing=fx["cf"], forcing_stack=stack0,
                            **common)
     worst_boot = _owned_worst(a, unfold_state(boot.state_p, 1), fx["part"], fx["sm"], 1)
-    assert worst_boot > 0.0, "a step-0 restart without cycle_start must re-bootstrap AB2"
+    assert worst_boot == 0.0, f"a restart never re-bootstraps AB2 at step 0: step-0 restart != cycle start " \
+                              f"({worst_boot:.2e})"
 
-    kw2 = dict(kpp=KppConfig(), dt=2 * DT)                # a restart of another dt: AB2 re-bootstrapped
-    stack2 = fx["cf"].stack(_chunk_dates(YEAR, 2 * DT, 0, m, None))
+    kw2 = dict(kpp=KppConfig(), dt=DT / 2)                # a restart of another dt: AB2 re-bootstrapped
+    common2 = dict(common, sop=None)                      # the SSH operator of DT/2, built by the run
+    stack2 = fx["cf"].stack(_chunk_dates(YEAR, DT / 2, 0, m, None))
     cyc2 = run_from_config(RunConfig(n_steps=m, restart_in=str(r), **kw2), forcing=fx["cf"], forcing_stack=stack2,
-                           cycle_start=True, **common)
+                           cycle_start=True, **common2)
     boot2 = run_from_config(RunConfig(n_steps=m, restart_in=str(r0), **kw2), forcing=fx["cf"], forcing_stack=stack2,
-                            **common)
-    worst2 = _owned_worst(unfold_state(cyc2.state_p, 1), unfold_state(boot2.state_p, 1), fx["part"], fx["sm"], 1)
-    assert worst2 == 0.0, f"a cycle start at another dt != the step-0 restart at that dt ({worst2:.2e})"
-    print(f"CYCLE_START_OK (bitwise the continuation; the bootstrap differs by {worst_boot:.2e})")
+                            **common2)
+    c2, b2 = unfold_state(cyc2.state_p, 1), unfold_state(boot2.state_p, 1)
+    nn, ne = int(fx["part"].myDim_nod2D[0]), int(fx["part"].myDim_elem2D[0])
+    for name, x in (("cycle start", a), ("continuation", b), ("cycle start at DT/2", c2), ("step-0 restart at DT/2", b2)):
+        eta, uv = np.asarray(x.eta_n)[0, :nn], np.asarray(x.uv)[0, :ne]
+        assert np.all(np.abs(eta) < 10.0) and np.all(np.abs(uv) < 10.0), \
+            f"{name}: max |SSH| {np.nanmax(np.abs(eta)):.3g} m, max |uv| {np.nanmax(np.abs(uv)):.3g} m/s"
+    worst2 = _owned_worst(c2, b2, fx["part"], fx["sm"], 1)
+    assert worst2 > 0.0, "a cycle start at another dt must re-bootstrap AB2 (the step-0 restart carries it on)"
+    #            cold   cyc    cont   boot   cyc2   boot2
+    assert boots == [True, False, False, False, True, False], boots
+    print(f"CYCLE_START_OK (bitwise the continuation and the step-0 restart; the re-bootstrap at another dt "
+          f"differs by {worst2:.2e})")
 
 
 @have_forcing
