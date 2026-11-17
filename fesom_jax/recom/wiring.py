@@ -270,7 +270,8 @@ def _freeze_extinct(X, lay, floors=None):
     widens the clip's own zero-derivative region ``max(floor, x)`` to a band above the floor: in the 30-day CORE2
     January window the diatoms of the South Atlantic gyre sit on their floor (DiaN 2.4e-6 = tiny_N_d) and the
     reverse field grows there. FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=0 keeps only the phytoplankton clause (no freeze of
-    negatives). Read at trace time; all unset (the default), ``X`` is returned as is and the traced
+    negatives); ``=nbr`` freezes each negative cell with its vertical neighbours, ``=column`` the tracer's whole
+    column at that node (2026-11-17). Read at trace time; all unset (the default), ``X`` is returned as is and the traced
     program is unchanged."""
     thr = os.environ.get("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "").strip()
     k_floor = os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR", "").strip()
@@ -301,8 +302,26 @@ def _freeze_extinct(X, lay, floors=None):
         # FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=0 (2026-11-14) drops the negative clause, keeping the phytoplankton one:
         # in the 30-day July window it freezes the negative surface DetZ2N off Chile while the positive cell below
         # stays live, and the reverse field grows in that cell (28983323, column dump 28992468). Unset or 1: as before.
-        neg = os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "1").strip().lower() not in ("0", "false", "no", "off")
-        m = X < 0 if neg else jnp.zeros(X.shape, bool)
+        # FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=nbr / column (2026-11-17): the negative clause widened along the vertical,
+        # per tracer, so no live cell of that tracer is left coupled to a frozen negative one by sinking or vertical
+        # mixing: ``nbr`` adds the cells directly above and below each negative cell (13757: the negative surface DetZ2N
+        # and the positive level 1 under it; 108568: the negative bottom DetSi pair and the layer above), ``column``
+        # the tracer's whole column at that node. X is [node, level, tracer]; cells below the bottom are zero, never
+        # negative, so they do not spread the mask.
+        nv = os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "1").strip().lower()
+        if nv in ("0", "false", "no", "off"):
+            m = jnp.zeros(X.shape, bool)
+        elif nv in ("1", "true", "yes", "on", "cell"):
+            m = X < 0
+        elif nv in ("nbr", "column"):
+            m = X < 0
+            if nv == "column":
+                m = jnp.broadcast_to(jnp.any(m, axis=1, keepdims=True), X.shape)
+            else:
+                f = jnp.zeros_like(m[:, :1])
+                m = m | jnp.concatenate([m[:, 1:], f], axis=1) | jnp.concatenate([f, m[:, :-1]], axis=1)
+        else:
+            raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG={nv!r}: expected 0, 1, nbr or column")
         cols = [m[..., i] for i in range(X.shape[-1])]
         for nname, members, _ in PHYTO_GROUPS:
             if nname not in names:

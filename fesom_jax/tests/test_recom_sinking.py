@@ -637,3 +637,44 @@ def test_freeze_floor_gradient_switch(monkeypatch):
         "Chl2N_max_c": 3.5, "NCmax_c": 0.15, "Chl2N_max_p": 3.15, "NCmax_p": 0.2})))
     fl = W.phyto_floors(rcfg)
     assert fl["DiaN"] == pytest.approx(1e-5 / 4.2) and fl["PhyN"] == pytest.approx(1e-5 / 3.15)
+
+
+def test_freeze_floor_neg_vertical(monkeypatch):
+    """FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=nbr / column (plan 20261105, 2026-11-17): a negative cell freezes its
+    tracer's vertical neighbours (nbr) or that tracer's whole column at the node (column), per tracer and per node;
+    values unchanged; any other value is an error."""
+    from types import SimpleNamespace
+    from fesom_jax.recom import wiring as W
+    lay = SimpleNamespace(names=("DIN", "DetZ2N"))
+    floors = {"PhyN": 1e-6, "DiaN": 2e-6, "CoccoN": 1e-6, "PhaeoN": 1e-6}
+    # two nodes x five levels x two tracers; DetZ2N negative at the surface of node 0, DIN at level 2 of node 1
+    X = np.full((2, 5, 2), 0.5)
+    X[0, 0, 1] = -2e-6
+    X[1, 2, 0] = -1e-4
+    X = jnp.asarray(X)
+    for v in ("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "FESOM_RECOM_GRAD_FREEZE_TRACERS"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR", "10")
+    grad = lambda: np.asarray(jax.grad(lambda x: jnp.sum(W._freeze_extinct(x, lay, floors) ** 2 / 2))(X))  # noqa: E731
+
+    def check(frozen):
+        g = grad()
+        np.testing.assert_array_equal(g[frozen], 0.0)
+        np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
+        np.testing.assert_array_equal(np.asarray(W._freeze_extinct(X, lay, floors)), np.asarray(X))
+
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "nbr")
+    frozen = np.zeros(X.shape, bool)
+    frozen[0, 0:2, 1] = True
+    frozen[1, 1:4, 0] = True
+    check(frozen)
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "column")
+    frozen = np.zeros(X.shape, bool)
+    frozen[0, :, 1] = True
+    frozen[1, :, 0] = True
+    check(frozen)
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "1")
+    check(np.asarray(X) < 0)
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "neighbours")
+    with pytest.raises(ValueError):
+        W._freeze_extinct(X, lay, floors)
