@@ -244,6 +244,17 @@ PHYTO_GROUPS = (("PhyN", ("PhyC", "PhyChl", "PhyCalc"), "tiny_N"),
                 ("PhaeoN", ("PhaeoC", "PhaeoChl"), "tiny_N_p"))
 
 
+def phyto_groups(names) -> tuple:
+    """:data:`PHYTO_GROUPS` for the layout ``names``. With the coccolithophores (the spectral fork), PhyCalc is
+    coccolith calcite: made by CoccoC (``sms_fork.py``: ``calcification = Cphot_cocco * CoccoC * ...``) and lost as
+    ``PhyCalc / (CoccoC + TINY)``, so it is frozen with the coccos, not with PhyN (plan 20261105, 2026-11-17: the
+    60-day column dumps 29076169-70, a live PhyCalc beside frozen coccos west of Gibraltar and in the Ross Sea)."""
+    if "CoccoN" not in names:
+        return PHYTO_GROUPS
+    return tuple((n, tuple(t for t in mem if t != "PhyCalc") if n == "PhyN" else
+                  (mem + ("PhyCalc",) if n == "CoccoN" else mem), f) for n, mem, f in PHYTO_GROUPS)
+
+
 def phyto_floors(rcfg) -> dict:
     """``{N tracer name: floor}`` of :data:`PHYTO_GROUPS` from the namelist's parameters (host floats, so the guard's
     thresholds are constants of the trace, not functions of the controls)."""
@@ -323,7 +334,7 @@ def _freeze_extinct(X, lay, floors=None):
         else:
             raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG={nv!r}: expected 0, 1, nbr or column")
         cols = [m[..., i] for i in range(X.shape[-1])]
-        for nname, members, _ in PHYTO_GROUPS:
+        for nname, members, _ in phyto_groups(names):
             if nname not in names:
                 continue
             g = X[..., names.index(nname)] < k * floors[nname]

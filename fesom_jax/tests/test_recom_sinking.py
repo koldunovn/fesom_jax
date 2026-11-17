@@ -678,3 +678,22 @@ def test_freeze_floor_neg_vertical(monkeypatch):
     monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "neighbours")
     with pytest.raises(ValueError):
         W._freeze_extinct(X, lay, floors)
+
+
+def test_freeze_floor_phycalc_with_coccos(monkeypatch):
+    """With the coccolithophores in the layout (the spectral fork), the floor guard freezes PhyCalc, coccolith calcite,
+    with the coccos and not with PhyN (plan 20261105, 2026-11-17); without them PhyCalc stays with PhyN."""
+    from types import SimpleNamespace
+    from fesom_jax.recom import wiring as W
+    floors = {"PhyN": 1e-6, "DiaN": 2e-6, "CoccoN": 1e-6, "PhaeoN": 1e-6}
+    for v in ("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "FESOM_RECOM_GRAD_FREEZE_TRACERS", "FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG"):
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR", "10")
+    lay = SimpleNamespace(names=("PhyN", "PhyC", "PhyChl", "PhyCalc", "CoccoN", "CoccoC", "CoccoChl"))
+    X = jnp.asarray([[[0.13, 0.9, 0.2, 2e-6, 2.86e-6, 1.9e-5, 1e-5],       # PhyN healthy, coccos on their floor
+                      [3e-6, 2e-5, 1e-5, 2e-6, 0.05, 0.3, 0.1]]])           # PhyN on its floor, coccos healthy
+    g = np.asarray(jax.grad(lambda x: jnp.sum(W._freeze_extinct(x, lay, floors) ** 2 / 2))(X))
+    frozen = np.array([[[0, 0, 0, 1, 1, 1, 1], [1, 1, 1, 0, 0, 0, 0]]], bool)
+    np.testing.assert_array_equal(g[frozen], 0.0)
+    np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
+    assert W.phyto_groups(("PhyN", "PhyCalc")) is W.PHYTO_GROUPS
