@@ -90,6 +90,10 @@ class IceConfig(NamedTuple):
     scale_area: float = 5.8e9     # CORE2 namelist.oce value (NOT the 2.0e8 module default)
     # --- timestep (fesom_ice.c:69, 231 ice_setup) ---
     ice_ave_steps: int = 1
+    # not FESOM2 (fesom3_jax's IceConfig.ice_dyn_steps): the EVP/mEVP and the ice advection every N steps with
+    # N*dt, the thermodynamics, the ice-ocean stress and the fluxes every step with dt (ice_step.ice_dyn_cfgs);
+    # 1 = every step (the program as before); not combined with ice_ave_steps > 1
+    ice_dyn_steps: int = 1
     ice_dt: float = 500.0         # = ice_ave_steps * ocean dt (CORE2 dt=500)
     # --- thermo densities (fesom_ice.c:77-81) ---
     rhoair: float = 1.3

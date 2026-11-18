@@ -461,6 +461,8 @@ class RunConfig:
             n = self.ice.ice_ave_steps
             if isinstance(n, bool) or not isinstance(n, int) or n < 1:
                 raise ValueError(f"ice.ice_ave_steps must be an integer >= 1, got {n!r}")
+            from .ice_step import ice_dyn_steps
+            ice_dyn_steps(self.ice)          # ice.ice_dyn_steps: an integer >= 1, not with ice_ave_steps > 1
         if self.kpp is not None and self.tke is not None:
             raise ValueError(
                 "kpp and tke are both set — the model runs exactly one vertical-mixing scheme "
