@@ -197,6 +197,46 @@ def _with_ice_dt(cfg: IceConfig, dt: float) -> IceConfig:
     return cfg._replace(ice_dt=cfg.ice_ave_steps * dt)
 
 
+def ice_dyn_steps(cfg) -> int:
+    """``IceConfig.ice_dyn_steps`` (1 without sea ice), checked: an integer >= 1, not combined with
+    ``ice_ave_steps > 1``."""
+    if cfg is None:
+        return 1
+    n = getattr(cfg, "ice_dyn_steps", 1)
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ValueError(f"IceConfig.ice_dyn_steps must be an integer >= 1, got {n!r}")
+    if n > 1 and int(cfg.ice_ave_steps) > 1:
+        raise ValueError(f"ice_ave_steps = {cfg.ice_ave_steps} and ice_dyn_steps = {n}: choose one")
+    return int(n)
+
+
+def ice_dyn_cfgs(cfg: IceConfig, dt: float):
+    """``(cfg_dyn, cfg_thermo)`` of one ice step: ``cfg`` with the ice time step of the dynamics (EVP/mEVP) and the
+    TG/FCT advection, ``ice_dt = ice_dyn_steps * dt``, and with that of the thermodynamics, ``ice_dt = dt``
+    (``ice_ave_steps * dt`` in general, :func:`_with_ice_dt`).
+
+    ``IceConfig.ice_dyn_steps = N > 1`` (not FESOM2; fesom3_jax's option, commits be0691c / c043688 there): the
+    dynamics and the advection run on the first step of each cycle of N steps with N*dt on that step's surface; the
+    steps between hold the ice velocities and stresses and advect nothing (cut_off as after a zero-velocity
+    transport, :func:`held_ice_dynamics`); the thermodynamics, the ice-ocean stress and the fluxes run every step
+    with dt on the step's own surface. No surface mean, no extra state: a restart carries u_ice, v_ice and the
+    stresses, so the cycle's phase follows from the absolute step (the drivers pass it as a static flag). Unlike
+    ``ice_ave_steps = N`` the mixed layer's relaxation to freezing (thermo o2ihf ~ H_ML/ice_dt) keeps its every-step
+    strength. ``N == 1``: both are :func:`_with_ice_dt`'s ``cfg`` (the same object: the program as before)."""
+    cfg = _with_ice_dt(cfg, dt)
+    n = ice_dyn_steps(cfg)
+    return (cfg if n == 1 else cfg._replace(ice_dt=n * dt)), cfg
+
+
+def held_ice_dynamics(state):
+    """A step between two ice dynamics steps (``IceConfig.ice_dyn_steps > 1``): the velocities and stresses of the
+    last EVP/mEVP stay, there is no TG/FCT step (no transport, and the FCT's stabilising diffusion acts on the dynamics
+    steps only, as in fesom3_jax), and cut_off is applied as after it. Returns ``(u_ice, v_ice, s11, s12, s22, a_co,
+    m_co, ms_co)``."""
+    a_co, m_co, ms_co = ice_thermo.cut_off(state.a_ice, state.m_ice, state.m_snow)
+    return (state.u_ice, state.v_ice, state.sigma11, state.sigma12, state.sigma22, a_co, m_co, ms_co)
+
+
 def update_decision(k_prev, nave: int):
     """FESOM2's ice update decision (``fesom_module.F90:1129-1135``): ``ice_update`` when the
     counter ``ice_steps_since_upd`` has reached ``ice_ave_steps - 1`` (then it restarts at 0),
@@ -337,6 +377,15 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
             raise ValueError(f"Params.ice_ctrl sets {_clash}, which Params.ice_pstar / ice_cd "
                              "also set; use one of the two")
         cfg = cfg._replace(**_ctrl)
+    # IceConfig.ice_dyn_steps = N > 1 (ice_dyn_cfgs): the EVP/mEVP and the FCT with N*dt on the steps the caller
+    # flags (ice_update, static, required), held on the others; the thermodynamics every step with cfg's dt. N = 1:
+    # cfg_dyn IS cfg (the program as before).
+    _ndyn = ice_dyn_steps(cfg)
+    if _ndyn > 1 and ice_update is None:
+        raise ValueError(f"ice_dyn_steps = {_ndyn}: the ice step needs ice_update (static: True on the dynamics "
+                         "steps), from run_steps_sharded_forced's ice_phase")
+    _dyn_step = _ndyn == 1 or bool(ice_update)
+    cfg_dyn = cfg if _ndyn == 1 else cfg._replace(ice_dt=_ndyn * cfg.ice_dt)
 
     # IceConfig.adjoint_mode="prescribed": the ice TRAJECTORY is taken as given. The nine
     # prognostic ice fields carry no tangent into this step (below) and none out of it (at the
@@ -440,30 +489,34 @@ def ice_surface_step(cfg: IceConfig, mesh: Mesh, state: State, sf, fs, *,
     def _ice_update():
         """ice_timestep (ice_setup_step.F90): EVP/mEVP → FCT → cut_off → thermo. Returns the new
         prognostic ice state and the thermo outputs oce_fluxes reads."""
-        _evp_u, _evp_v = _cut(("ocean_vel",), srf.u, srf.v)
-        u_ice, v_ice, s11, s12, s22 = _evp(
-            cfg, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow,
-            u_ice=state.u_ice, v_ice=state.v_ice,
-            sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,
-            srfoce_u=_evp_u, srfoce_v=_evp_v, elevation=_cut(("ssh",), srf.ssh),
-            stress_ax=stress_ax, stress_ay=stress_ay, boundary_node=boundary_node, exch=exch,
-            **_evp_kw)
-        if cavity_cfg is not None:                  # ice_timestep: cavity_ice_clean_vel after the EVP
-            u_ice, v_ice = _cav.cavity_ice_clean_vel(mesh, u_ice, v_ice)
+        if _dyn_step:
+            _evp_u, _evp_v = _cut(("ocean_vel",), srf.u, srf.v)
+            u_ice, v_ice, s11, s12, s22 = _evp(
+                cfg_dyn, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow,
+                u_ice=state.u_ice, v_ice=state.v_ice,
+                sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,
+                srfoce_u=_evp_u, srfoce_v=_evp_v, elevation=_cut(("ssh",), srf.ssh),
+                stress_ax=stress_ax, stress_ay=stress_ay, boundary_node=boundary_node, exch=exch,
+                **_evp_kw)
+            if cavity_cfg is not None:              # ice_timestep: cavity_ice_clean_vel after the EVP
+                u_ice, v_ice = _cav.cavity_ice_clean_vel(mesh, u_ice, v_ice)
 
-        _fct_u, _fct_v = _cut(("advect", "fct"), u_ice, v_ice)
-        _bn = (None if not {"fct_hilo_coast", "fct_bound_coast"} & set(_cuts) else
-               ice_evp.boundary_node_mask(mesh) if boundary_node is None else boundary_node)
-        a_adv, m_adv, ms_adv = ice_adv.fct_solve(
-            cfg, mesh, state.a_ice, state.m_ice, state.m_snow, _fct_u, _fct_v, exch=exch,
-            freeze_limiter="fct_limiter" in _cuts, freeze_limited_flux="fct_flux" in _cuts,
-            pin_bounds="fct_pin" in _cuts, freeze_bounds="fct_bound" in _cuts,
-            freeze_extremes="fct_hilo" in _cuts,
-            freeze_extremes_at=None if "fct_hilo_coast" not in _cuts else _bn,
-            freeze_bounds_at=(None if "fct_bound_coast" not in _cuts
-                              else ice_adv.coast_ring(mesh, _bn)))
-        _th_u, _th_v = _cut(("advect",), u_ice, v_ice)
-        a_co, m_co, ms_co = ice_thermo.cut_off(a_adv, m_adv, ms_adv)
+            _fct_u, _fct_v = _cut(("advect", "fct"), u_ice, v_ice)
+            _bn = (None if not {"fct_hilo_coast", "fct_bound_coast"} & set(_cuts) else
+                   ice_evp.boundary_node_mask(mesh) if boundary_node is None else boundary_node)
+            a_adv, m_adv, ms_adv = ice_adv.fct_solve(
+                cfg_dyn, mesh, state.a_ice, state.m_ice, state.m_snow, _fct_u, _fct_v, exch=exch,
+                freeze_limiter="fct_limiter" in _cuts, freeze_limited_flux="fct_flux" in _cuts,
+                pin_bounds="fct_pin" in _cuts, freeze_bounds="fct_bound" in _cuts,
+                freeze_extremes="fct_hilo" in _cuts,
+                freeze_extremes_at=None if "fct_hilo_coast" not in _cuts else _bn,
+                freeze_bounds_at=(None if "fct_bound_coast" not in _cuts
+                                  else ice_adv.coast_ring(mesh, _bn)))
+            _th_u, _th_v = _cut(("advect",), u_ice, v_ice)
+            a_co, m_co, ms_co = ice_thermo.cut_off(a_adv, m_adv, ms_adv)
+        else:                                       # ice_dyn_steps > 1, a step between: held
+            u_ice, v_ice, s11, s12, s22, a_co, m_co, ms_co = held_ice_dynamics(state)
+            _th_u, _th_v = _cut(("advect",), u_ice, v_ice)
         _oc_t, _oc_s = _cut(("ocean_ts",), srf.temp, srf.salt)
         _warm = (float(getattr(cfg, "adjoint_warm_ts", 0.0))
                  if cfg.adjoint_mode in ("dynamics", "exact") else 0.0)

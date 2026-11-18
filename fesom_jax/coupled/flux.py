@@ -886,11 +886,23 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
     the cavity branches on (as :data:`CAVITY_ENV`), clears the sea ice under the shelves after the EVP and after the
     thermodynamics (ice_timestep), makes the shelf front an ice coast, calls the three-equation melt at the
     :data:`CAVITY_MELT` point (unless a hook is set there) and applies the shelf-base drag after :func:`cavity_stress`
-    (oce_fluxes_mom -> cavity_momentum_fluxes). ``None`` = the program as before."""
-    from ..ice_step import IceStepOut, _with_ice_dt
+    (oce_fluxes_mom -> cavity_momentum_fluxes). ``None`` = the program as before.
+
+    ``IceConfig.ice_dyn_steps = N > 1`` (not FESOM2, :func:`fesom_jax.ice_step.ice_dyn_cfgs`): ``ice_update`` (static,
+    required) says whether this step runs the dynamics: True = the EVP/mEVP and the FCT with ice_dt = N*dt on this
+    step's surface, False = the velocities and stresses held, no transport (:func:`fesom_jax.ice_step.
+    held_ice_dynamics`); the thermodynamics (dt), oce_fluxes and oce_fluxes_mom run every step. The drivers fix the
+    flag at trace time from the absolute step (:func:`fesom_jax.integrate_sharded.run_steps_sharded_forced`'s
+    ``ice_phase``). ``N == 1`` (default): ``ice_update`` is not read, the program as before."""
+    from ..ice_step import IceStepOut, held_ice_dynamics, ice_dyn_cfgs, ice_dyn_steps
     if int(cfg.ice_ave_steps) != 1:
         raise NotImplementedError("mode F runs the sea ice every ocean step (ice_ave_steps = 1)")
-    cfg = _with_ice_dt(cfg, dt)
+    ndyn = ice_dyn_steps(cfg)
+    if ndyn > 1 and ice_update is None:
+        raise ValueError(f"ice_dyn_steps = {ndyn}: the coupled ice step needs ice_update (static: True on the "
+                         "dynamics steps), from run_steps_sharded_forced's ice_phase")
+    dyn_step = ndyn == 1 or bool(ice_update)
+    cfg_dyn, cfg = ice_dyn_cfgs(cfg, dt)        # (the same object twice with ice_dyn_steps = 1)
     fc = flux_config(cfg)
     open_water = fs.open_water
     geo_lat = jnp.asarray(mesh.geo_coord_nod2D)[:, 1]
@@ -923,17 +935,20 @@ def ice_surface_step_cpl(cfg, mesh, state, cf: CplForcing, fs, *, dt: float, bou
         kw["adjoint_subcycles"] = 0
     elif getattr(cfg, "adjoint_sweeps", -1) >= 0:
         kw["adjoint_subcycles"] = int(cfg.adjoint_sweeps)
-    u_ice, v_ice, s11, s12, s22 = _evp(
-        cfg, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow, u_ice=state.u_ice,
-        v_ice=state.v_ice, sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,
-        srfoce_u=srf.u, srfoce_v=srf.v, elevation=srf.ssh, stress_ax=cf.taux_ico, stress_ay=cf.tauy_ico,
-        boundary_node=boundary_node, exch=exch, **kw)
-    if cavity_cfg is not None:                                    # cavity_ice_clean_vel after the EVP
-        u_ice, v_ice = _cav.cavity_ice_clean_vel(mesh, u_ice, v_ice)
-    a_adv, m_adv, ms_adv = ice_adv.fct_solve(cfg, mesh, state.a_ice, state.m_ice, state.m_snow, u_ice, v_ice,
-                                             exch=exch)
-    a_co, m_co, ms_co = ice_thermo.cut_off(a_adv, m_adv, ms_adv)
-    runoff = fs.runoff_node if cf.runoff is None else cf.runoff     # the climatology, or hydr_oce + calv_oce
+    if dyn_step:
+        u_ice, v_ice, s11, s12, s22 = _evp(
+            cfg_dyn, mesh, a_ice=state.a_ice, m_ice=state.m_ice, m_snow=state.m_snow, u_ice=state.u_ice,
+            v_ice=state.v_ice, sigma11=state.sigma11, sigma12=state.sigma12, sigma22=state.sigma22,
+            srfoce_u=srf.u, srfoce_v=srf.v, elevation=srf.ssh, stress_ax=cf.taux_ico, stress_ay=cf.tauy_ico,
+            boundary_node=boundary_node, exch=exch, **kw)
+        if cavity_cfg is not None:                                # cavity_ice_clean_vel after the EVP
+            u_ice, v_ice = _cav.cavity_ice_clean_vel(mesh, u_ice, v_ice)
+        a_adv, m_adv, ms_adv = ice_adv.fct_solve(cfg_dyn, mesh, state.a_ice, state.m_ice, state.m_snow, u_ice,
+                                                 v_ice, exch=exch)
+        a_co, m_co, ms_co = ice_thermo.cut_off(a_adv, m_adv, ms_adv)
+    else:                                                         # ice_dyn_steps > 1, a step between: held
+        u_ice, v_ice, s11, s12, s22, a_co, m_co, ms_co = held_ice_dynamics(state)
+    runoff =fs.runoff_node if cf.runoff is None else cf.runoff     # the climatology, or hydr_oce + calv_oce
     th = thermo_cpl(cfg, fc, A=a_co, h=m_co, hsn=ms_co, ice_temp_old=state.cpl_ice_temp, apnd=state.cpl_apnd,
                     hpnd=state.cpl_hpnd, ipnd=state.cpl_ipnd, T_oc=srf.temp, S_oc=srf.salt, cf=cf,
                     runo=runoff, geo_lat=geo_lat, non_cavity=open_water, dt=cfg.ice_dt,

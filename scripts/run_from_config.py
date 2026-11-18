@@ -150,6 +150,10 @@ def main():
     ap.add_argument("--ice-ave-steps", type=int, default=None,
                     help="override ice.ice_ave_steps=N: the sea-ice step every N ocean steps at "
                          "ice_dt = N*dt, FESOM2's scheme (plan Task 12; opt-in). A/B knob.")
+    ap.add_argument("--ice-dyn-steps", type=int, default=None,
+                    help="override ice.ice_dyn_steps=N (not FESOM2, fesom3_jax's option): the sea-ice dynamics "
+                         "and advection every N steps at N*dt, the thermodynamics every step; not with "
+                         "--ice-ave-steps. A/B knob.")
     ap.add_argument("--output-layout", choices=["global", "folded"], default=None,
                     help="output + restart on-disk layout. 'global' = partition-independent canonical "
                          "node order — xarray/ushow read it directly (no unfold), byte-identical at "
@@ -194,6 +198,10 @@ def main():
         if cfg.ice is None:
             raise SystemExit("error: --ice-ave-steps needs `ice:` in the config")
         repl["ice"] = cfg.ice._replace(ice_ave_steps=int(args.ice_ave_steps))
+    if args.ice_dyn_steps is not None:
+        if cfg.ice is None:
+            raise SystemExit("error: --ice-dyn-steps needs `ice:` in the config")
+        repl["ice"] = repl.get("ice", cfg.ice)._replace(ice_dyn_steps=int(args.ice_dyn_steps))
     if repl:
         cfg = dataclasses.replace(cfg, **repl)
 

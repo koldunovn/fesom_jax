@@ -842,7 +842,10 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     updates when ``(ice_phase + j) % N == N - 1``, FESOM2's rule) and the scan runs over whole ice cycles of ``N``
     steps, so no step has a ``lax.cond`` whose predicate the host must fetch (one host sync a step on a GPU, after
     which the devices wait for the next step's first launches). The steps a chunk leaves after its last whole cycle
-    run inline. ``None`` ⇒ byte-unchanged.
+    run inline. ``None`` ⇒ byte-unchanged. With ``IceConfig.ice_dyn_steps = N > 1`` instead (not FESOM2,
+    :func:`fesom_jax.ice_step.ice_dyn_cfgs`; required then) ``ice_phase`` is the chunk's first absolute step modulo
+    ``N`` and step ``j`` runs the ice dynamics and advection when ``(ice_phase + j) % N == 0``, the same scan over
+    whole cycles.
 
     ``precision`` (``"double"`` default ⇒ byte-unchanged; ``"single"`` ⇒ FESOM2's single-precision build,
     :mod:`fesom_jax.precision`): every floating input is cast to float32 (``hnode``/``hnode_new`` stay float64, the
@@ -916,16 +919,24 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
     #    node-sharded CONSTANT, the scan xs is the tiny replicated schedule, and
     #    surface_forcing.combine_step_forcing builds each step's StepForcing in-scan.
     if ice_phase is not None:
-        if ice_cfg is None or int(ice_cfg.ice_ave_steps) < 2:
-            raise ValueError("ice_phase (gpu.ice_static) needs sea ice with ice_ave_steps > 1")
+        from .ice_step import ice_dyn_steps as _ice_dyn_steps
+        _ndyn = _ice_dyn_steps(ice_cfg)
+        if ice_cfg is None or (int(ice_cfg.ice_ave_steps) < 2 and _ndyn < 2):
+            raise ValueError("ice_phase needs sea ice with ice_ave_steps > 1 (gpu.ice_static) or ice_dyn_steps > 1")
         if return_grad_fn:
-            raise ValueError("ice_phase (gpu.ice_static) is wired into the forward only")
+            raise ValueError("ice_phase (gpu.ice_static, ice_dyn_steps) is wired into the forward only")
         _nave = int(ice_cfg.ice_ave_steps)
-        if not 0 <= int(ice_phase) < _nave:
-            raise ValueError(f"ice_phase must be in [0, {_nave}), got {ice_phase}")
+        _ncyc = max(_nave, _ndyn)                                 # the steps of one ice cycle
+        if not 0 <= int(ice_phase) < _ncyc:
+            raise ValueError(f"ice_phase must be in [0, {_ncyc}), got {ice_phase}")
 
         def _ice_flag(j):
+            if _ndyn > 1:      # ice_dyn_steps: the dynamics on the cycle's first step (ice_phase = absolute step % N)
+                return (int(ice_phase) + j) % _ndyn == 0
             return (int(ice_phase) + j) % _nave == _nave - 1     # FESOM2: update when the counter is N - 1
+    elif ice_cfg is not None and int(getattr(ice_cfg, "ice_dyn_steps", 1)) > 1:
+        raise ValueError(f"ice_dyn_steps = {ice_cfg.ice_dyn_steps} needs ice_phase (the chunk's first absolute step "
+                         "modulo ice_dyn_steps)")
     use_tables = forcing_tables is not None
     if use_tables:
         if step_forcing_seq is not None:
@@ -1076,7 +1087,7 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                 st = s
                 acc = (None if sample_fn is None
                        else jax.tree.map(jnp.zeros_like, PR.full_tree(sample_fn(s))))
-            flags = tuple(_ice_flag(j0 + i) for i in range(_nave))
+            flags = tuple(_ice_flag(j0 + i) for i in range(_ncyc))
 
             def adv(c, a, sf, upd):
                 c = one(c, False, sf, upd)
@@ -1084,18 +1095,18 @@ def run_steps_sharded_forced(sm: ShardedMesh, state_p: State, sop: ShardedSSHOpe
                     a = jax.tree.map(lambda u, v: u + v, a, PR.full_tree(sample_fn(c)))
                 return c, a
 
-            ncyc, nrest = divmod(n_steps - j0, _nave)
+            ncyc, nrest = divmod(n_steps - j0, _ncyc)
             if ncyc:
-                cyc = jax.tree.map(lambda x: x[j0:j0 + ncyc * _nave].reshape((ncyc, _nave) + x.shape[1:]), seq)
+                cyc = jax.tree.map(lambda x: x[j0:j0 + ncyc * _ncyc].reshape((ncyc, _ncyc) + x.shape[1:]), seq)
 
                 def cycle(carry, sfc):
                     c, a = carry
-                    for i in range(_nave):
+                    for i in range(_ncyc):
                         c, a = adv(c, a, jax.tree.map(lambda x: x[i], sfc), flags[i])
                     return (c, a), None
                 (st, acc), _ = lax.scan(jax.checkpoint(cycle), (st, acc), xs=cyc, length=ncyc)
             for i in range(nrest):
-                st, acc = adv(st, acc, jax.tree.map(lambda x: x[j0 + ncyc * _nave + i], seq), flags[i])
+                st, acc = adv(st, acc, jax.tree.map(lambda x: x[j0 + ncyc * _ncyc + i], seq), flags[i])
             return st if sample_fn is None else (st, acc)
         # bootstrap_ab2: True ⇒ cold start / post-dt-ramp (AB2 first-step branch); False ⇒ a
         # restart-continuation chunk carries the AB2 history forward (is_first_step=False), so a

@@ -148,11 +148,21 @@ class OceanStatic:
         y, d, s, _ = self.dates(1)[0]
         return f"{y:04d}-doy{d:03d}-{int(s):05d}"
 
-    def executable(self, nsteps: int, bootstrap: bool, state):
+    def ice_phase(self, step: int | None = None):
+        """``ice.ice_dyn_steps = N > 1``: the phase ``step % N`` of the absolute step (default the State's) in the
+        cycle of the ice dynamics (the dynamics run on the steps with phase 0, :func:`fesom_jax.ice_step.ice_dyn_cfgs`);
+        None with N = 1. From the absolute step, so a restart at any step resumes the cycle (the State carries the
+        ice velocities and stresses)."""
+        from ..ice_step import ice_dyn_steps
+        n = ice_dyn_steps(self.cfg.ice)
+        return None if n == 1 else int(self.step if step is None else step) % n
+
+    def executable(self, nsteps: int, bootstrap: bool, state, ice_phase=None):
         """The compiled interval program ``(jfn, const_args)`` of ``nsteps`` steps (built once per
-        ``(nsteps, bootstrap)``): ``jfn(const_args[0], state, const_args[2], const_args[3], const_args[4], seq,
-        *const_args[6:]) -> (state, sums)`` with ``seq`` a :class:`StepForcing` of ``[nsteps, nod2D]`` leaves."""
-        key = (int(nsteps), bool(bootstrap))
+        ``(nsteps, bootstrap)``, and ``ice_phase`` with ice.ice_dyn_steps > 1, :meth:`ice_phase`): ``jfn(const_args[0],
+        state, const_args[2], const_args[3], const_args[4], seq, *const_args[6:]) -> (state, sums)`` with ``seq`` a
+        :class:`StepForcing` of ``[nsteps, nod2D]`` leaves."""
+        key = (int(nsteps), bool(bootstrap)) if ice_phase is None else (int(nsteps), bool(bootstrap), int(ice_phase))
         if key not in self._exe:
             from ..integrate_sharded import run_steps_sharded_forced
             n = self.nod2D
@@ -178,7 +188,8 @@ class OceanStatic:
                 boundary_node_p=self.bn_p, reuse_executable=True, return_executable=True,
                 sample_fn=self.sample_fn, ssh_gather=self.gather, precision=self.precision,
                 **({} if self.mevp_wide is None else {"mevp_wide": self.mevp_wide}),
-                **({} if self.se_wide is None else {"se_wide": self.se_wide}), **self.phys)
+                **({} if self.se_wide is None else {"se_wide": self.se_wide}),
+                **({} if ice_phase is None else {"ice_phase": int(ice_phase)}), **self.phys)
             self._exe[key] = (jfn, args)
         return self._exe[key]
 
@@ -251,6 +262,12 @@ def init_ocean(config=DEFAULT_CONFIG, *, mesh_dir: str | None = None, restart_in
         raise ValueError(f"mode must be 'bulk' or 'flux', got {mode!r}")
     if cfg.ice is None or int(cfg.ice.ice_ave_steps) != 1:
         raise NotImplementedError("the coupled ocean runs the sea ice every ocean step (ice: {..., ice_ave_steps: 1})")
+    from ..ice_step import ice_dyn_steps
+    ndyn = ice_dyn_steps(cfg.ice)     # (not FESOM2) the ice dynamics + advection every N steps
+    if ndyn > 1:
+        log(f"[ocean] ice_dyn_steps {ndyn}: the sea-ice dynamics and advection every {ndyn} steps (ice_dt "
+            f"{ndyn * float(cfg.dt):g} s, the absolute steps divisible by {ndyn}), the thermodynamics and the fluxes "
+            "every step")
     se_cfg = cfg.split_explicit()      # ssh.split_explicit (fesom_jax.ssh_se): wired as run.py's driver (lane tco319_ng5)
     if cfg.dt_ramp:
         raise NotImplementedError("dt_ramp is not supported by the coupled ocean")
@@ -504,7 +521,7 @@ def ocean_interval(state, static: OceanStatic, forcing: dict, nsteps: int | None
         state, seq = build(state, forcing, static, dates)
     if static.npes > 1 and not (mode == "flux" and flux.forcing_jit_enabled() and flux.forcing_lean_enabled()):
         seq = to_lanes(seq, static)            # (gpu.cpl_forcing_lean: gathered onto the lanes by the build)
-    jfn, a = static.executable(nsteps, static.bootstrap, state)
+    jfn, a = static.executable(nsteps, static.bootstrap, state, ice_phase=static.ice_phase())
     out = jfn(a[0], state, a[2], a[3], a[4], seq, *a[6:])
     state, sums = out if static.sample_fn is not None else (out, None)
     static.bootstrap = False

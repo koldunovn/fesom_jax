@@ -596,6 +596,13 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         if jax.process_index() == 0:
             print(f"[run] ice_static: the ice branch at trace time, counter {ice_phase} of "
                   f"{int(cfg.ice.ice_ave_steps)} at the start", flush=True)
+    # ice.ice_dyn_steps = N > 1 (not FESOM2, ice_step.ice_dyn_cfgs): each chunk's ice dynamics steps (the absolute
+    # steps divisible by N) fixed at trace time from the chunk's first step (run_steps_sharded_forced ice_phase)
+    from .ice_step import ice_dyn_steps as _ice_dyn_steps
+    _ndyn = _ice_dyn_steps(cfg.ice)
+    if _ndyn > 1 and jax.process_index() == 0:
+        print(f"[run] ice_dyn_steps {_ndyn}: the sea-ice dynamics and advection every {_ndyn} steps, the "
+              "thermodynamics every step", flush=True)
 
     # --- run length + chunk plan ------------------------------------------
     if cfg.n_steps is not None:
@@ -988,6 +995,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
                 boundary_node_p=boundary_node_p, reuse_executable=_REUSE_EXE,
                 sample_fn=out_sample_fn, ssh_gather=_gather_for(ch.dt), mevp_wide=mevp_wide,
                 precision=precision, se_wide=se_wide, **({} if ice_phase is None else {"ice_phase": ice_phase}),
+                **({} if _ndyn == 1 else {"ice_phase": ch.start % _ndyn}),
                 **_fkw,
                 **cfg.physics_kwargs())
             # out_sample_fn ⇒ (final_state, per-step field SUMS over this chunk); else the final state.
