@@ -431,6 +431,22 @@ Reading: both failures sit in sparse, near-zero cells of a heterotroph or detrit
     - The Aleutians (116270): DetZ2N positive at levels 8-10 (2e-6 to 6e-5), PhyCalc / DiaN / PhaeoN masks at level 10 switching 48 / 140 / 196 times (near 10 x floor at the nutricline). The same open site as before.
     - Side note on the physics: at 115468 (71.8 S, July-August) the ice opens by day 30, and the surface layer warms to 7.9 C and freshens to 31.2-33.2 while level 1 stays at -1.8 to 1.1 C. That is a warm surface layer in Antarctic winter, worth a look in the forward.
   - **The PhyCalc fix (2026-11-17, 9f30134):** `wiring.phyto_groups` moves PhyCalc from the PhyN group to the Cocco group whenever CoccoN is in the layout. The 692f804 layout is unchanged, and so is the unguarded program (`test_freeze_floor_phycalc_with_coccos`). 45-day reruns with the same guards (list + `DIN:1e-3` + `FREEZE_FLOOR=10` + `nbr`, stride 24): January 29076618, July 29076619 (`core2_calcgrp/h45_*`). To compare against 29062181-83 (0.893 / 1.37 and 2.7e7 / -6.6e5). Expected: Gibraltar (92377, only in the 60-day window) and the Ross Sea (115468, also 60-day only) are not in the 45-day traces anyway. So these runs test whether the PhyCalc fix changes the 45-day sites (Okhotsk 54324 in January, Hudson Strait 69571 in July); if not, those two remain the limits. The direct test of the fix is the 60-day pair: January 29076664, July 29076665 (stride 32, 12 h, `core2_calcgrp/h60_*`), against 29062185-89; at Gibraltar (92377) and in the Ross Sea (115468), the trace should no longer start in DetCalc / PhyCalc.
+  - **Result (29076618-19, 29076664-65; 6 h 02 / 5 h 58 for 45 days, 8 h 00 / 7 h 43 for 60 days; peaks 47.9 GiB): the PhyCalc fix rescues 45 days in January only.** Adjoint/FD Chl / DIN, `|dJ/dx0|` Chl:
+
+    | | `nbr`, before the fix (29062181-89) | **`nbr` + PhyCalc with the coccos (29076618-65)** |
+    |---|---|---|
+    | January 45 d | 0.893 / 1.37, 974 | **0.993 / 0.996, 2.37** (DIN 15.5, against 8572) |
+    | July 45 d | 2.7e7 / -6.6e5, 3.0e6 | 4.4e6 / -4.2e5, 7.1e5 |
+    | January 60 d | -6e15 / 2.5e15, 2e16 | -3.7e17 / 3.7e16, 1.7e18 |
+    | July 60 d | 3e23 / -1.7e21, 1.4e22 | 8.0e19 / 2.5e18, 4.1e19 |
+
+    Reverse traces:
+    - January 45 d: Okhotsk (54324) DetCalc level 6 is still there, but it peaks at 3.8e5 at day 27.6 (1e8 before) and decays: CoccoN level 2 ends at 2.4 at day 0 (974 before). The weak Canary DetSi site (53108, 6e2 at day 18.5) is unchanged.
+    - **January 60 d: Gibraltar is not fixed.** The trace still starts in DetCalc level 2 at node 92377 at day 51.8 (2.8e8 at day 50, 2.1e19 at day 45, against 1.3e17), then CoccoN levels 6-7 back to day 0, and Okhotsk adds DetCalc level 6 at 6.8e22 at day 27.5. So DetCalc itself is a growth path at 92377, not only through the PhyCalc it is fed by.
+    - July 60 d: the Ross Sea PhyCalc start is gone (115468 is only an Alk blip, 15.6 at day 53.8). Two new sites take over before Hudson Strait: node 13048 (DIN level 15, then DON, DiaSi, up to 7e11, days 50.6-44.8) and node 110507 (DON, HetN, 1.5e11, days 44.7-37.3). Then Hudson Strait 69571 / 69572 Alk (1.7e22 against 2.1e25), 101091 Alk, and the Aleutians.
+    - July 45 / 60 d: Hudson Strait Alk peaks lower (8.6e8 against 2.7e9 at 45 d), but the Aleutian site (116270 / 33234, DetZ2N level 9, days 18-7) is now the largest peak in both (4e10 and 2.6e24, against 6.4e8 and 9.5e23). It amplifies what reaches it, and the end state is HetN level 8 at node 32891.
+
+    Reading: the grouping fix is correct but not enough. Beyond 30 days (45 days in January) the limits are DetCalc at Gibraltar and Okhotsk, Hudson Strait Alk and the open Aleutian site. Next (proposed): the column Jacobian / dump at 92377 level 2, days 45-52, to find the DetCalc term (dissolution or sinking) whose derivative grows, before adding DetCalc to any freeze group.
 
 ## Decisions for the user
 
