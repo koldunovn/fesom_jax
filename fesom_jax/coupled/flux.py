@@ -248,6 +248,23 @@ def _stages():
     return g["_STAGES"]
 
 
+def _put_host(tree, sharding):
+    """Host values (the same on every process) onto ``sharding``: each process fills its own devices from its copy
+    (``jax.make_array_from_callback``), no collective. ``jax.device_put`` of a host value onto a sharding over several
+    processes first checks that every process passes the same value (multihost_utils.assert_equal: a process_allgather
+    that puts every process's copy on EVERY device): for the SSS climatology on the lanes ``[12, P*Lmax]`` float64 that
+    is 47 GB per GH200 at dist_256 (64 processes; job 2974998: XLA's remat "Can't reduce memory use below 87.29GiB",
+    then the 57.25 GiB allocation failed), 23 GB at dist_128. The same values on the same devices (a placement only).
+    One process, or a sharding of this process's devices only: ``jax.device_put`` as before."""
+    if jax.process_count() == 1 or sharding.is_fully_addressable:
+        return jax.device_put(tree, sharding)
+
+    def one(a):
+        a = np.asarray(a)
+        return jax.make_array_from_callback(a.shape, sharding, lambda i: a[i])
+    return jax.tree.map(one, tree)
+
+
 def _flux_lean_call(fields, static, dates, cache, key, kw):
     """The lean build (:func:`forcing_lean_enabled`): constants, scalars, month rows and (dist_N) the lane maps
     placed once per placement of the forcing."""
@@ -285,11 +302,11 @@ def _flux_lean_call(fields, static, dates, cache, key, kw):
         sc = (np.asarray(LATENT_FUSION, np.float64), np.asarray(1000000.0, np.float64))
         if "clim" not in cache:
             cache["clim"] = (jnp.asarray(static.sss_clim), jnp.asarray(static.chl_clim))
-        cache[pk] = jax.device_put((static.trig, static.M, cache["clim"], sc, lanes), place)
+        cache[pk] = _put_host((static.trig, static.M, cache["clim"], sc, lanes), place)
     trig, M, clim, sc, lanes = cache[pk]
     mk = ("lean_months", place, tuple(int(d[3]) for d in dates))
     if mk not in cache:
-        cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, place)
+        cache[mk] = _put_host(np.array([d[3] for d in dates], np.int32) - 1, place)
     return cache[lk](fields, cache[mk], trig, M, *clim, sc, lanes)
 
 
@@ -344,12 +361,12 @@ def _lanes_first_call(fields, static, dates, cache, kw):
         from ..zarr_output import _folded_gid_owned
         gid, _ = _folded_gid_owned(static.part, static.sm, "nod")
         idx = np.where(gid >= 0, gid, 0).astype(np.int64)
-        tabs = (jax.device_put(idx.astype(np.int32), sh_l), jax.device_put(gid < 0, sh_l),
-                tuple(jax.device_put(np.asarray(t)[idx], sh_l) for t in static.trig),
-                jax.device_put(np.asarray(static.M), rep),
-                jax.device_put((np.asarray(LATENT_FUSION, np.float64), np.asarray(1000000.0, np.float64)), rep),
-                jax.device_put(np.asarray(static.sss_clim)[:, idx], sh_tl),
-                jax.device_put(np.asarray(static.chl_clim)[:, idx], sh_tl),
+        tabs = (_put_host(idx.astype(np.int32), sh_l), _put_host(gid < 0, sh_l),
+                tuple(_put_host(np.asarray(t)[idx], sh_l) for t in static.trig),
+                _put_host(np.asarray(static.M), rep),
+                _put_host((np.asarray(LATENT_FUSION, np.float64), np.asarray(1000000.0, np.float64)), rep),
+                _put_host(np.asarray(static.sss_clim)[:, idx], sh_tl),
+                _put_host(np.asarray(static.chl_clim)[:, idx], sh_tl),
                 jax.jit(lambda f, i: jax.tree.map(lambda a: a[i], f), out_shardings=sh_l))
         cache["lanes_first"] = tabs
     idx_d, pad, trig_l, M, sc, sss_l, chl_l, gather = cache["lanes_first"]
@@ -359,7 +376,7 @@ def _lanes_first_call(fields, static, dates, cache, kw):
         cache[ak] = jax.jit(functools.partial(_assemble_pad, **kw2), out_shardings=sh_tl)
     mk = ("lanes_first_months", tuple(int(d[3]) for d in dates))
     if mk not in cache:
-        cache[mk] = jax.device_put(np.array([d[3] for d in dates], np.int32) - 1, rep)
+        cache[mk] = _put_host(np.array([d[3] for d in dates], np.int32) - 1, rep)
     fl = fields if prelaned_enabled() else gather(fields, idx_d)     # (FESOM_CPL_FORCING_PRELANED: the sender's)
     return _flux_seq_lean(fl, cache[mk], trig_l, M, sss_l, chl_l, sc, pad, rotate=bool(jra55.FORCE_ROTATION),
                           assemble=cache[ak], **kw2)
