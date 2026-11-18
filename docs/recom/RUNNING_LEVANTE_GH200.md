@@ -18,7 +18,12 @@ GH200 each, account `mh1571`, decision D3). Everything below is for the Levante 
    `--run`; rsync over ssh with `--partial`, so a broken copy resumes). The Levante configs in `configs/levante/` are
    written by `python scripts/albedo/levante_pool.py configs --user a270044` from the Albedo ones; edit those and rerun.
 2. **Code**: push `recom-spectral` to the fork from Albedo, then on a Levante login node
-   `git clone -b recom-spectral <fork> /work/bk1415/a270044/fesom_jax_recom`.
+   `git clone -b recom-spectral <fork> /work/bk1415/a270044/fesom_jax_recom`. The fork is
+   `https://github.com/sveta-loza/fesom_jax.git` (`main` follows `koldunovn/fesom_jax`, `recom-spectral` is the REcoM
+   work). The Levante checkout reaches it as the remote `github` (HTTPS, the token in `~/.git-credentials`); its
+   `origin` is the git bundle it was first made from and cannot be pushed to. Commits made on Levante go back with
+   `git push github recom-spectral` and come to Albedo with `git pull --ff-only` (first pushed this way 2026-11-18,
+   2c17a89..0e3a7db). No bundle is needed any more.
 3. **Wheels**, on a Levante login node (x86, internet): `bash scripts/levante/fetch_wheels.sh`. It downloads the aarch64
    / CPython 3.12 wheels of `scripts/levante/requirements_levante.txt` (the Albedo env's versions) and creates the slurm
    log directory. numcodecs 0.15.2 (zarr 2 needs < 0.16, which has no aarch64 wheel) and asciitree come as source.
