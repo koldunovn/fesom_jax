@@ -9,7 +9,8 @@ the intervals:
   dt to the thermodynamics, not with ice_ave_steps > 1, an interval without the static phase is refused;
 * a step between two dynamics steps holds u_ice, v_ice and the stresses bit for bit and runs the thermodynamics;
 * intervals of 1, 1 and 2 steps (phases 0, 1, 0: the phase comes from the absolute step) are the one interval of 4
-  steps, and a restart store written after the first (odd) step resumes the cycle to the same State;
+  steps up to the programs' other fusion (1e-15), and a restart store written after the first (odd) step resumes the
+  cycle to the same State bit for bit;
 * dist_2 (two fake CPU devices, padded halo, the mEVP wide halo) gives the serial run's State, as close as it does
   with the dynamics every step.
 
@@ -111,7 +112,8 @@ def test_config():
 
 @need
 def test_cpl_phase_held_steps_and_restart(tmp_path):
-    """Intervals 1 + 1 + 2 = one interval of 4 (bitwise); the held step; a restart after the odd first step."""
+    """Intervals 1 + 1 + 2 = one interval of 4 (up to the programs' other fusion, as gpu.ice_static's test); the held
+    step bit for bit; a restart after the odd first step = the 1 + 1 + 2 run bit for bit (the same programs)."""
     from fesom_jax import coupled as C
     from fesom_jax.integrate_sharded import run_steps_sharded_forced
     state, st = _init(tmp_path, 2, "a")
@@ -138,9 +140,11 @@ def test_cpl_phase_held_steps_and_restart(tmp_path):
     assert not np.array_equal(a2["m_ice"], a1["m_ice"]), "step 1 (held): no thermodynamics"
     s = C.ocean_interval(s, st, fo, nsteps=2)                  # steps 2 (dynamics), 3 (held)
     assert sorted(st._exe) == [(1, False, 1), (1, True, 0), (2, False, 0)]
-    got = _view(s, st)
-    for f in FIELDS:
-        np.testing.assert_array_equal(got[f], ref[f], err_msg=f"1+1+2 steps vs 4: {f}")
+    b = _view(s, st)
+    rel = {f: _rel(ref[f], b[f]) for f in FIELDS}
+    print("\n[ice_dyn_steps 1+1+2 vs 4 steps] max|d|/max|a|:", {f: f"{v:.1e}" for f, v in rel.items() if v > 0})
+    bad = {f: v for f, v in rel.items() if v > 1e-10}
+    assert not bad, bad
 
     state, st = _init(tmp_path, 2, "c", restart_in=rst)       # the restart: step 1, phase 1, no AB2 bootstrap
     assert st.step == 1 and st.ice_phase() == 1 and not st.bootstrap
@@ -148,7 +152,7 @@ def test_cpl_phase_held_steps_and_restart(tmp_path):
     s = C.ocean_interval(s, st, fo, nsteps=2)
     got = _view(s, st)
     for f in FIELDS:
-        np.testing.assert_array_equal(got[f], ref[f], err_msg=f"restart after step 0: {f}")
+        np.testing.assert_array_equal(got[f], b[f], err_msg=f"restart after step 0: {f}")
 
     # the static phase is required (a lax.cond on the device phase would sync the host every step)
     with pytest.raises(ValueError, match="needs ice_phase"):
