@@ -97,20 +97,55 @@ def exch_stack(fields, exch, kind: str = "nod"):
         return fields
     if not joined_exchanges() or len(fields) < 2:
         return tuple(exch(f, kind) for f in fields)
-    out = [None] * len(fields)
+    return exch_join([(f, kind) for f in fields], exch)
+
+
+def _multi_ctx(exch):
+    """The :class:`fesom_jax.halo.HaloCtx` behind ``exch`` when its :meth:`~fesom_jax.halo.HaloCtx.exchange_multi`
+    joins exchanges (``FESOM_JOIN_MULTI``), else None."""
+    from . import halo_grouped
+    if not halo_grouped.multi_enabled():
+        return None
+    ctx = getattr(exch, "__self__", None)
+    return ctx if hasattr(ctx, "exchange_multi") else None
+
+
+def exch_join(items, exch):
+    """Refresh the halos of ``items = [(field, kind), ...]`` (fields available at the same point): under
+    :func:`joined_exchanges` the fields of one kind and dtype go side by side (trailing axes flattened, concatenated)
+    in one ``exch(field, kind)`` call, and with ``FESOM_JOIN_MULTI`` (``gpu.join_multi``) those calls of every kind
+    and dtype in ONE grouped call (:meth:`fesom_jax.halo.HaloCtx.exchange_multi`); else one call a field. Bytes are
+    only moved, never cast, so the values are the separate exchanges'. Returns the fields in ``items``' order;
+    ``exch=None`` ⇒ unchanged."""
+    items = list(items)
+    if exch is None:
+        return tuple(f for f, _ in items)
+    if not joined_exchanges() or len(items) < 2:
+        return tuple(exch(f, k) for f, k in items)
     groups = {}
-    for i, f in enumerate(fields):
-        groups.setdefault(jnp.result_type(f), []).append(i)
-    for idx in groups.values():
+    for i, (f, k) in enumerate(items):
+        groups.setdefault((k, jnp.result_type(f)), []).append(i)
+    blocks = []
+    for (k, _), idx in groups.items():
         if len(idx) == 1:
-            out[idx[0]] = exch(fields[idx[0]], kind)
+            blocks.append((items[idx[0]][0], k, idx, None))
             continue
-        L = fields[idx[0]].shape[0]
-        flat = [fields[i].reshape(L, -1) for i in idx]
-        x = exch(jnp.concatenate(flat, axis=1), kind)
+        L = items[idx[0]][0].shape[0]
+        flat = [items[i][0].reshape(L, -1) for i in idx]
+        blocks.append((jnp.concatenate(flat, axis=1), k, idx, flat))
+    ctx = _multi_ctx(exch)
+    if ctx is not None and len(blocks) > 1:
+        xs = ctx.exchange_multi([(b, k) for b, k, _, _ in blocks])
+    else:
+        xs = [exch(b, k) for b, k, _, _ in blocks]
+    out = [None] * len(items)
+    for x, (_, _, idx, flat) in zip(xs, blocks):
+        if flat is None:
+            out[idx[0]] = x
+            continue
         o = 0
         for i, f in zip(idx, flat):
-            out[i] = x[:, o:o + f.shape[1]].reshape(fields[i].shape)
+            out[i] = x[:, o:o + f.shape[1]].reshape(items[i][0].shape)
             o += f.shape[1]
     return tuple(out)
 

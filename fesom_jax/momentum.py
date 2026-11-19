@@ -243,7 +243,23 @@ def _bidiff_edge_terms(mesh: Mesh, uv, vc: ViscConfig = _DEFAULT_VISC):
     return el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef
 
 
-def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_cfg=None):
+def bidiff_stage1(mesh: Mesh, uv, vc: ViscConfig = _DEFAULT_VISC):
+    """:func:`visc_filt_bidiff`'s stage 1 (from ``uv`` alone): ``(edge terms, U_c, V_c)``, U_c/V_c before their halo
+    refresh. Split out so the coupled step can send that refresh along with the momentum advection's (gpu.join_multi);
+    the same operations."""
+    terms = _bidiff_edge_terms(mesh, uv, vc)
+    el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef = terms
+    # Stage 1: U_c[el1] -= u1·coef, U_c[el2] += u1·coef  (antisymmetric scatter)
+    du = jnp.where(emask, u1 * coef, 0.0)                          # (edge,nl)
+    dv = jnp.where(emask, v1 * coef, 0.0)
+    Uc = PR.wp(ops.scatter_add(jnp.stack([-du, du], axis=1), mesh.edge_tri, mesh.elem2D,
+                               inv=mesh.inv_edge_tri))                       # U_c is WP
+    Vc = PR.wp(ops.scatter_add(jnp.stack([-dv, dv], axis=1), mesh.edge_tri, mesh.elem2D,
+                               inv=mesh.inv_edge_tri))
+    return terms, Uc, Vc
+
+
+def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_cfg=None, pre=None):
     """Biharmonic flow-aware horizontal viscosity (opt_visc=7), two edge→element
     scatter stages added into ``uv_rhs``. Returns the updated ``uv_rhs``
     ``[elem2D, nl, 2]``. Mirror of ``fesom_visc_filt_bidiff`` (``fesom_momentum.c:654``).
@@ -257,20 +273,14 @@ def visc_filt_bidiff(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_c
     ``visc_cfg`` (a :class:`~fesom_jax.config.ViscConfig`) supplies the γ's; ``None`` ⇒ the
     module-constant defaults ⇒ byte-identical (NG5 passes ``gamma1=0.2``).
     """
-    _exch = exch if exch is not None else (lambda f, kind: f)
     vc = visc_cfg if visc_cfg is not None else _DEFAULT_VISC
-    el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef = _bidiff_edge_terms(mesh, uv, vc)
-
-    # Stage 1: U_c[el1] -= u1·coef, U_c[el2] += u1·coef  (antisymmetric scatter)
-    du = jnp.where(emask, u1 * coef, 0.0)                          # (edge,nl)
-    dv = jnp.where(emask, v1 * coef, 0.0)
-    Uc = PR.wp(ops.scatter_add(jnp.stack([-du, du], axis=1), mesh.edge_tri, mesh.elem2D,
-                               inv=mesh.inv_edge_tri))                       # U_c is WP
-    Vc = PR.wp(ops.scatter_add(jnp.stack([-dv, dv], axis=1), mesh.edge_tri, mesh.elem2D,
-                               inv=mesh.inv_edge_tri))
-
-    # S.7 intra-kernel exchange: refresh halo Uc/Vc before stage 2 gathers them.
-    Uc, Vc = ops.exch_stack((Uc, Vc), exch, "elem")
+    if pre is None:
+        terms, Uc, Vc = bidiff_stage1(mesh, uv, vc)
+        # S.7 intra-kernel exchange: refresh halo Uc/Vc before stage 2 gathers them.
+        Uc, Vc = ops.exch_stack((Uc, Vc), exch, "elem")
+    else:
+        terms, Uc, Vc = pre             # (stage 1 done and its Uc/Vc refreshed by the caller: gpu.join_multi)
+    el1s, el2s, a1, a2, length, emask, u1, v1, sq, coef = terms
 
     # Stage 2: update = -dt·coef·(U_c[el1]-U_c[el2]) + viLapl·u1, scatter /area
     coef2 = -dt * coef
@@ -345,11 +355,12 @@ def visc_filt_bcksct(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_c
     return ops.mask_below_bottom(out, mesh.elem_layer_mask)
 
 
-def horizontal_viscosity(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_cfg=None):
-    """``viscosity_filter(opt_visc)``: 7 (default) :func:`visc_filt_bidiff`, 5 :func:`visc_filt_bcksct`."""
+def horizontal_viscosity(mesh: Mesh, uv, uv_rhs, *, dt=DT_DEFAULT, exch=None, visc_cfg=None, pre=None):
+    """``viscosity_filter(opt_visc)``: 7 (default) :func:`visc_filt_bidiff`, 5 :func:`visc_filt_bcksct`. ``pre``
+    (opt_visc 7 only): :func:`bidiff_stage1`'s result with U_c/V_c refreshed (None: computed here)."""
     opt = 7 if visc_cfg is None else int(visc_cfg.opt_visc)
     if opt == 7:
-        return visc_filt_bidiff(mesh, uv, uv_rhs, dt=dt, exch=exch, visc_cfg=visc_cfg)
+        return visc_filt_bidiff(mesh, uv, uv_rhs, dt=dt, exch=exch, visc_cfg=visc_cfg, pre=pre)
     if opt == 5:
         return visc_filt_bcksct(mesh, uv, uv_rhs, dt=dt, exch=exch, visc_cfg=visc_cfg)
     raise NotImplementedError(f"opt_visc={opt} is not ported (7 = bidiff, 5 = bcksct)")

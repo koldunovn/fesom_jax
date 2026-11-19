@@ -676,10 +676,15 @@ def advect_one_fct(mesh: Mesh, uv, w_e, helem, hnode, hnode_new, T, T_old,
         # (oce_adv_tra_driver.F90:173). w_i=None ⇒ skipped ⇒ byte-identical.
         if w_i is not None:
             LO = adv_tra_vert_impl(mesh, w_i, LO, hnode_new, dt=dt)
-    LO = _exch(LO, "nod")        # S.7: the limiter clusters LO over surrounding cells
-    # 4 — antidiffusive fluxes HO − LO
-    tr_xy = tracer_gradient_elements(mesh, T)
-    tr_xy = _exch(tr_xy, "elem")  # S.7: eXDim halo elem gradients are read by fill_up_dn_grad
+    if exch is not None and ops._multi_ctx(exch) is not None:
+        # gpu.join_multi: LO (nodes) and the element gradients of T (from T alone) in one grouped call
+        tr_xy = tracer_gradient_elements(mesh, T)
+        LO, tr_xy = ops.exch_join([(LO, "nod"), (tr_xy, "elem")], exch)
+    else:
+        LO = _exch(LO, "nod")        # S.7: the limiter clusters LO over surrounding cells
+        # 4 — antidiffusive fluxes HO − LO
+        tr_xy = tracer_gradient_elements(mesh, T)
+        tr_xy = _exch(tr_xy, "elem")  # S.7: eXDim halo elem gradients are read by fill_up_dn_grad
     eud = fill_up_dn_grad(mesh, tr_xy)
     adf_h = adv_flux_hor_ho(mesh, uv, helem, ttfAB, eud) - flux_h_lo
     # w_split: the antidiffusive (HO−LO) vertical flux uses the FULL w (= w_e + w_i) for FCT

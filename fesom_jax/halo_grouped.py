@@ -245,3 +245,86 @@ def exchange(buf, meta):
 
     f.defvjp(f_fwd, f_bwd)
     return f(buf)
+
+
+def multi_enabled() -> bool:
+    """``FESOM_JOIN_MULTI=1`` (``gpu.join_multi``, read when traced; lane ocean_speed on JUPITER): halo refreshes of
+    the same program point go out in ONE grouped call although they differ in entity kind (nodes / elements) or
+    dtype (float32 / float64): each map's rounds become segments of one NCCL group over the fields' bytes side by
+    side (:func:`exchange_multi`). Bytes are moved, never converted, so every field gets the values of its own
+    exchange. Forward only (no derivative rule): the coupled ocean's interval program."""
+    return os.environ.get("FESOM_JOIN_MULTI", "0").strip() not in ("", "0")
+
+
+def _words(x):
+    """``[total, C]`` of a 4- or 8-byte dtype -> uint32 words ``[total, W]`` (a bitcast: the same bytes)."""
+    import jax.numpy as jnp
+    from jax import lax
+    if x.dtype.itemsize == 4:
+        return lax.bitcast_convert_type(x, jnp.uint32)
+    if x.dtype.itemsize == 8:
+        w = lax.bitcast_convert_type(x, jnp.uint32)                  # [total, C, 2]
+        return w.reshape(x.shape[0], -1)
+    raise ValueError(f"exchange_multi: {x.dtype} (4- or 8-byte dtypes only)")
+
+
+def _unwords(w, like):
+    import jax.numpy as jnp
+    from jax import lax
+    if like.dtype.itemsize == 4:
+        return lax.bitcast_convert_type(w, like.dtype)
+    return lax.bitcast_convert_type(w.reshape(like.shape + (2,)), like.dtype)
+
+
+def _multi_flat(xs, metas):
+    """The unbatched core of :func:`exchange_multi`: ``xs[i]`` ``[total_i, *rest_i]``."""
+    import jax.numpy as jnp
+    flats = [x.reshape(x.shape[0], -1) for x in xs]
+    words = [_words(f) for f in flats]
+    seg_off, seg_len, seg_round, seg_send, seg_recv, dst, src = [], [], [], [], [], [], []
+    base, r0 = 0, 0
+    for w, meta in zip(words, metas):
+        item, so, sl, sr, ss, srv, d, s = _layout(meta, int(w.shape[1]) * 4)
+        seg_off += [base + o for o in so]
+        seg_len += list(sl)
+        seg_round += [r0 + r for r in sr]
+        seg_send += list(ss)
+        seg_recv += list(srv)
+        dst += list(d)
+        src += list(s)
+        base += item
+        r0 += len(meta[0])
+    x = jnp.concatenate([w.reshape(-1) for w in words])
+    y = _call(x, (base, tuple(seg_off), tuple(seg_len), tuple(seg_round), tuple(seg_send), tuple(seg_recv),
+                  tuple(dst), tuple(src)))
+    out, o = [], 0
+    for x0, f, w in zip(xs, flats, words):
+        n = int(w.size)
+        out.append(_unwords(y[o:o + n].reshape(w.shape), f).reshape(x0.shape))
+        o += n
+    return tuple(out)
+
+
+def exchange_multi(bufs, metas):
+    """Several coloured exchanges in ONE custom call: ``bufs[i]`` is a packed send buffer ``[total_i, *rest_i]`` of
+    the coloured map ``metas[i] = (perms, slots, offs, sendn)`` (as :func:`exchange` takes it; float32 or float64,
+    nodes or elements); returns what ``exchange(bufs[i], metas[i])`` returns for each, the same bytes in the same
+    places. The buffers go side by side as uint32 words; every round of every map is a segment of its own in the
+    one NCCL group. Under a vmap (the T/S batch) the items move into the rows' columns as in :func:`exchange`."""
+    import jax
+    import jax.numpy as jnp
+    metas = tuple(metas)
+    if not all(m[0] for m in metas):
+        raise ValueError("exchange_multi: a map without rounds (one device)")
+
+    @jax.custom_batching.custom_vmap
+    def batched(*xs):
+        return _multi_flat(xs, metas)
+
+    @batched.def_vmap
+    def rule(n, in_batched, *xs):
+        xs = [jnp.moveaxis(x if b else jnp.broadcast_to(x, (n,) + x.shape), 0, 1) for x, b in zip(xs, in_batched)]
+        ys = batched(*xs)
+        return tuple(jnp.moveaxis(y, 1, 0) for y in ys), tuple(True for _ in ys)
+
+    return batched(*bufs)

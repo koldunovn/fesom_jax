@@ -184,6 +184,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # JOINED (fesom3_jax's joined exchanges) also drops the refreshes whose halos already come out as the owners'
     # values (node- or element-local maps of halo-complete inputs) or are refreshed again before any owned reader
     _lean = halo_ctx is not None and ops.joined_exchanges()
+    # gpu.join_multi (FESOM_JOIN_MULTI, lane ocean_speed): exchanges of one program point in ONE grouped call although
+    # they mix nodes and elements or float32 and float64 (halo.HaloCtx.exchange_multi); off: the trace as before
+    _multi = _lean and ops._multi_ctx(halo_ctx.exchange) is not None
 
     # Nested in-step rematerialization (paper §3 NN-twin / any long-window adjoint). The
     # integrate() scan already wraps the WHOLE step in jax.checkpoint, so its backward stores
@@ -353,7 +356,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         bvfreq = jax.lax.stop_gradient(bvfreq)
         if bvfreq_local is not None:
             bvfreq_local = jax.lax.stop_gradient(bvfreq_local)
-    if _lean and cavity_cfg is None:
+    _bv_late = _multi and _lean and cavity_cfg is None and gm_cfg is None
+    if _bv_late:
+        pass        # (gpu.join_multi: the smoothed N² goes with the pressure gradient's exchange below; no reader before)
+    elif _lean and cavity_cfg is None:
         # density (the EOS) and hpressure (its column integral) are per-node maps of the halo-complete T, S and hnode:
         # their halos are the owners' values already; only the smoothed N² (a neighbour mean) needs the refresh
         bvfreq = _exch_j(bvfreq, "nod")
@@ -399,7 +405,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             pgf_x, pgf_y = jax.lax.stop_gradient(pgf_x), jax.lax.stop_gradient(pgf_y)
     else:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_linfs(mesh, hpressure))()
-    pgf_x, pgf_y = ops.exch_stack((pgf_x, pgf_y), _exch_j, "elem")
+    if _bv_late:
+        bvfreq, pgf_x, pgf_y = ops.exch_join([(bvfreq, "nod"), (pgf_x, "elem"), (pgf_y, "elem")], _exch_j)
+    else:
+        pgf_x, pgf_y = ops.exch_stack((pgf_x, pgf_y), _exch_j, "elem")
 
     # 4 — vertical mixing. 3-way: tke_cfg ⇒ classical-TKE (the PROGNOSTIC closure, Phase 9b);
     #     elif kpp_cfg ⇒ KPP (the real CORE2 default); else PP (k_ver/a_ver are the ML-hook
@@ -458,8 +467,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                                       a_ver=params.a_ver, Z3d=Z3d_live,
                                       freeze_convection=_adj.freeze_convection,
                                       conv_surrogate=_adj.conv_surrogate)
-    uvnode, Kv = ops.exch_stack((uvnode, Kv), _exch_j, "nod")
-    Av = _exch(Av, "elem")
+    if _multi:      # (gpu.join_multi: the node pair and the element Av in one grouped call)
+        uvnode, Kv, Av = ops.exch_join([(uvnode, "nod"), (Kv, "nod"), (Av, "elem")], _exch_j)
+    else:
+        uvnode, Kv = ops.exch_stack((uvnode, Kv), _exch_j, "nod")
+        Av = _exch(Av, "elem")
     # Named diagnostic derivative cuts (AdjointConfig.diag_cuts): a Python-level decision, so
     # an inactive cut traces nothing. Both together equal freeze_mixing below.
     Kv = adjoint_stab.dcut(_adj, "mix.kv_out", Kv)
@@ -477,9 +489,22 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 5 — momentum RHS (lagged eta_n, w_e, uv; shifts the OLD AB slot). Embeds
     #     momentum_adv_scalar, which exchanges its node uvnode_rhs internally (S.7).
+    _exch_mom, _vbox = _exch, {}
+    if _multi and (visc_cfg is None or int(visc_cfg.opt_visc) == 7) and not remat_blocks:
+        # gpu.join_multi: the biharmonic viscosity's stage 1 (from st.uv alone) ahead of the momentum RHS, its U_c/V_c
+        # element refresh sent with the momentum advection's node exchange (one grouped call); stage 2 below
+        _vt, _vUc, _vVc = momentum.bidiff_stage1(mesh, st.uv, visc_cfg if visc_cfg is not None
+                                                 else momentum._DEFAULT_VISC)
+
+        def _exch_mom(f, kind):
+            if kind != "nod" or "pre" in _vbox:
+                return _exch(f, kind)
+            x, uc, vc_ = ops.exch_join([(f, kind), (_vUc, "elem"), (_vVc, "elem")], _exch_j)
+            _vbox["pre"] = (_vt, uc, vc_)
+            return x
     uv_rhs, uv_rhsAB = _ckpt(lambda: momentum.compute_vel_rhs(
         mesh, st.uv, st.uv_rhsAB, st.eta_n, pgf_x, pgf_y, st.w_e, h_wp,
-        is_first_step=is_first_step, dt=dt, exch=_exch,
+        is_first_step=is_first_step, dt=dt, exch=_exch_mom,
         press_air=getattr(step_forcing, "press_air", None),
         **({} if cavity_cfg is None else {"cavity": True})))()
     if not _lean:
@@ -489,7 +514,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
 
     # 6 — biharmonic horizontal viscosity (splits internally to exchange u_b/v_b)
     uv_rhs = _ckpt(lambda: momentum.horizontal_viscosity(mesh, st.uv, uv_rhs, dt=dt, exch=_exch,
-                                                         visc_cfg=visc_cfg))()
+                                                         visc_cfg=visc_cfg, **({"pre": _vbox["pre"]}
+                                                                               if "pre" in _vbox else {})))()
     uv_rhs = _exch(uv_rhs, "elem")
 
     # w_split config (static; ale_cfg=None ⇒ off ⇒ byte-identical). Used at substeps 7 + 13.
@@ -692,7 +718,12 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     S_unclipped = S_new
     S_new = jnp.where(mesh.node_layer_mask, jnp.maximum(S_new, S_FLOOR), S_new)
     # refresh halo for next step's EOS/FCT/Redi reads: T and S in one exchange (JOINED)
-    T_new, S_new = ops.exch_stack((T_new, S_new), _exch_j, "nod")
+    _ts_helem = _multi and _lean and recom_cfg is None
+    if _ts_helem:   # (gpu.join_multi: substep 16's helem, a vertex mean of hnode_new, computed here and sent along)
+        hnode, helem = ale.commit_thickness(mesh, hnode_new)
+        T_new, S_new, helem = ops.exch_join([(T_new, "nod"), (S_new, "nod"), (helem, "elem")], _exch_j)
+    else:
+        T_new, S_new = ops.exch_stack((T_new, S_new), _exch_j, "nod")
 
     # 15c — REcoM: the BGC tracers through the same tracer stage (FESOM2's tracer loop continues past T and S with
     #       the same transport fields). recom_cfg=None ⇒ not traced. Under single precision full REcoM (bgc_every 1)
@@ -757,10 +788,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 sp_estimate=_sp)
 
     # 16 — commit thickness (hnode := hnode_new; helem = vertex mean)
-    hnode, helem = ale.commit_thickness(mesh, hnode_new)
-    if not _lean:                   # (JOINED: hnode is hnode_new, refreshed at substep 13 or the static thickness)
-        hnode = _exch(hnode, "nod")
-    helem = _exch(helem, "elem")
+    if not _ts_helem:
+        hnode, helem = ale.commit_thickness(mesh, hnode_new)
+        if not _lean:               # (JOINED: hnode is hnode_new, refreshed at substep 13 or the static thickness)
+            hnode = _exch(hnode, "nod")
+        helem = _exch(helem, "elem")
 
     new = dataclasses.replace(
         st,
