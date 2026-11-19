@@ -64,5 +64,9 @@ gpu:
                           # float64 rotation products peak at 29.4 GB per device at NG5 dt 180 (14.9 at dt 360), this
                           # one at 1.35 (0.89); bitwise the same seq (CORE3 dist_2), XLA memory analysis for dist_32
                           # (awicm_jax scripts/tco319_ng5/flux_forcing_memory.py, lane tco319_ng5_flux)
+  join_multi: 2           # (grouped transport only, forward) the step's same-point halo refreshes in one grouped call
+                          # across nodes/elements and float32/float64, EOS/N2/PGF at the top (lane ocean_speed: bitwise;
+                          # NG5 dist_256 ocean alone 116.5 -> 111.7 ms an interval, job 3001392; coupled NA=16 3.07 ->
+                          # 3.02 s/day, job 3001915)
   output_async: true
   restart_async: true
