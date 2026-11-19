@@ -96,6 +96,7 @@ def library():
     lib.fjx_nccl_init.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ip, ip]
     lib.fjx_nccl_init.restype = ctypes.c_int
     lib.fjx_nccl_error.argtypes, lib.fjx_nccl_error.restype = [ctypes.c_int], ctypes.c_char_p
+    lib.fjx_owned_reserve.argtypes, lib.fjx_owned_reserve.restype = [ctypes.c_int, ctypes.c_longlong], ctypes.c_int
     _lib = lib
     return lib
 
@@ -393,6 +394,10 @@ def exchange_multi_start(bufs, metas, tag: int, deps=()):
     words = [_words(f) for f in flats]
     lay = _multi_layout(words, metas)
     x = jnp.concatenate([w.reshape(-1) for w in words])
+    # the call site's stream, events and buffers made now, on the host while tracing (not inside the program)
+    rc = library().fjx_owned_reserve(int(tag), int(x.shape[0]) * 4)
+    if rc:
+        raise RuntimeError(f"fjx_owned_reserve(tag {tag}, {int(x.shape[0]) * 4} bytes) failed: {rc}")
     tok = jax.ffi.ffi_call(TARGET_START_OWNED, jax.ShapeDtypeStruct((1,), np.int32), has_side_effect=True)(
         x, *deps, tag=np.int32(tag), **_attrs(lay))
     return Pending(tok, int(tag), tuple((tuple(b.shape), b.dtype, tuple(f.shape), tuple(w.shape))
