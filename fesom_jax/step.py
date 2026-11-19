@@ -187,6 +187,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # gpu.join_multi (FESOM_JOIN_MULTI, lane ocean_speed): exchanges of one program point in ONE grouped call although
     # they mix nodes and elements or float32 and float64 (halo.HaloCtx.exchange_multi); off: the trace as before
     _multi = _lean and ops._multi_ctx(halo_ctx.exchange) is not None
+    # gpu.join_multi: 2 also moves work that reads only the step's starting State ahead of an exchange it can join:
+    # the EOS / N² / pressure gradient to the top of the step (with the node velocity's refresh), the mixing's
+    # uvnode/Kv/Av refresh into the momentum advection's (forward only: the default adjoint config)
+    _multi2 = _multi and ops.env_int("FESOM_JOIN_MULTI", 0) >= 2 and adjoint_cfg is None
 
     # Nested in-step rematerialization (paper §3 NN-twin / any long-window adjoint). The
     # integrate() scan already wraps the WHOLE step in jax.checkpoint, so its backward stores
@@ -237,6 +241,21 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # KPP surface-forcing inputs (Phase 6C; None on the pi path ⇒ KPP unavailable, by design).
     heat_flux = water_flux = stress_node_surf = None
     ice_out = None
+    _topx = None
+    if (_multi2 and step_forcing is not None and not bulk_uvnode_lag and gm_cfg is None and cavity_cfg is None
+            and kpp_cfg is None and tke_cfg is not None and tke_cfg.n2_source != "local"):
+        # gpu.join_multi 2: the EOS, N² and pressure gradient (from st.T, st.S, the thickness) here, the smoothed N²
+        # and the pressure gradient refreshed with the step's first node velocity in one grouped call
+        density, hpressure, bvfreq = _ckpt(
+            lambda: eos.compute_pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live))()
+        if ale_cfg is not None:
+            pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_shchepetkin(
+                mesh, density, Z3d_live, st.helem, batches=pgf_batches))()
+        else:
+            pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_linfs(mesh, hpressure))()
+        _uvn, bvfreq, pgf_x, pgf_y = ops.exch_join([(pp.compute_vel_nodes(mesh, st.uv), "nod"), (bvfreq, "nod"),
+                                                    (pgf_x, "elem"), (pgf_y, "elem")], _exch_j)
+        _topx = (density, hpressure, bvfreq, pgf_x, pgf_y, _uvn)
     if step_forcing is not None:
         # Atmospheric-forcing seam (Params.forcing_adj): the anomalies enter the forcing itself, ahead of every consumer
         # (bulk formulae, ice-atmosphere stress, ice thermodynamics)
@@ -252,7 +271,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         # and is what the step returns. ``bulk_uvnode_lag=True`` keeps the legacy (one step
         # old) uvnode — the pre-fix C dumps / byte gates. Pi path (no forcing): untouched.
         if not bulk_uvnode_lag:
-            st = dataclasses.replace(st, uvnode=_exch(pp.compute_vel_nodes(mesh, st.uv), "nod"))
+            st = dataclasses.replace(st, uvnode=_topx[5] if _topx is not None else
+                                     _exch(pp.compute_vel_nodes(mesh, st.uv), "nod"))
         if ice_cfg is not None:
             from . import ice_step as _ice_step       # lazy: keep ice deps off the pi path
             # the coupled ocean's mode F (fesom_jax.coupled.flux.CplForcing): FESOM2's coupled ice block; a trace-time
@@ -342,6 +362,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         if _tke_local:
             bvfreq_local = bvfreq_raw
         bvfreq_raw = jax.lax.stop_gradient(bvfreq_raw)
+    elif _topx is not None:
+        density, hpressure, bvfreq = _topx[:3]       # (gpu.join_multi 2: at the top, N² refreshed there)
     else:
         density, hpressure, bvfreq = _ckpt(
             lambda: eos.compute_pressure_bv(mesh, st.T, st.S, h_wp, Z3d=Z3d_live, **_cav_eos))()
@@ -356,8 +378,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         bvfreq = jax.lax.stop_gradient(bvfreq)
         if bvfreq_local is not None:
             bvfreq_local = jax.lax.stop_gradient(bvfreq_local)
-    _bv_late = _multi and _lean and cavity_cfg is None and gm_cfg is None
-    if _bv_late:
+    _bv_late = _multi and _lean and cavity_cfg is None and gm_cfg is None and _topx is None
+    if _topx is not None:
+        pass        # (gpu.join_multi 2: refreshed at the top of the step)
+    elif _bv_late:
         pass        # (gpu.join_multi: the smoothed N² goes with the pressure gradient's exchange below; no reader before)
     elif _lean and cavity_cfg is None:
         # density (the EOS) and hpressure (its column integral) are per-node maps of the halo-complete T, S and hnode:
@@ -398,14 +422,18 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     density_m_rho0) — do NOT subtract DENSITY_0 again (the pre-2026-07-03 double subtraction
     #     was analytically harmless — the kernel is offset-invariant — but coarsened the stencil-
     #     difference ulp ~30× and diverged from the pgf.py ρ−ρ0 contract).
-    if ale_cfg is not None:
+    if _topx is not None:
+        pgf_x, pgf_y = _topx[3], _topx[4]             # (gpu.join_multi 2: at the top, refreshed there)
+    elif ale_cfg is not None:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_shchepetkin(
             mesh, density, Z3d_live, st.helem, batches=pgf_batches))()
         if _adj.freeze_pgf:
             pgf_x, pgf_y = jax.lax.stop_gradient(pgf_x), jax.lax.stop_gradient(pgf_y)
     else:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_linfs(mesh, hpressure))()
-    if _bv_late:
+    if _topx is not None:
+        pass
+    elif _bv_late:
         bvfreq, pgf_x, pgf_y = ops.exch_join([(bvfreq, "nod"), (pgf_x, "elem"), (pgf_y, "elem")], _exch_j)
     else:
         pgf_x, pgf_y = ops.exch_stack((pgf_x, pgf_y), _exch_j, "elem")
@@ -467,7 +495,10 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                                       a_ver=params.a_ver, Z3d=Z3d_live,
                                       freeze_convection=_adj.freeze_convection,
                                       conv_surrogate=_adj.conv_surrogate)
-    if _multi:      # (gpu.join_multi: the node pair and the element Av in one grouped call)
+    _mix_late = _multi2 and (visc_cfg is None or int(visc_cfg.opt_visc) == 7) and not remat_blocks
+    if _mix_late:
+        pass        # (gpu.join_multi 2: refreshed with the momentum advection's exchange below; nothing reads them first)
+    elif _multi:    # (gpu.join_multi: the node pair and the element Av in one grouped call)
         uvnode, Kv, Av = ops.exch_join([(uvnode, "nod"), (Kv, "nod"), (Av, "elem")], _exch_j)
     else:
         uvnode, Kv = ops.exch_stack((uvnode, Kv), _exch_j, "nod")
@@ -499,14 +530,21 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         def _exch_mom(f, kind):
             if kind != "nod" or "pre" in _vbox:
                 return _exch(f, kind)
-            x, uc, vc_ = ops.exch_join([(f, kind), (_vUc, "elem"), (_vVc, "elem")], _exch_j)
-            _vbox["pre"] = (_vt, uc, vc_)
-            return x
+            extra = [(uvnode, "nod"), (Kv, "nod"), (Av, "elem")] if _mix_late else []
+            out = ops.exch_join([(f, kind), (_vUc, "elem"), (_vVc, "elem")] + extra, _exch_j)
+            _vbox["pre"] = (_vt, out[1], out[2])
+            if _mix_late:
+                _vbox["mix"] = out[3:6]
+            return out[0]
     uv_rhs, uv_rhsAB = _ckpt(lambda: momentum.compute_vel_rhs(
         mesh, st.uv, st.uv_rhsAB, st.eta_n, pgf_x, pgf_y, st.w_e, h_wp,
         is_first_step=is_first_step, dt=dt, exch=_exch_mom,
         press_air=getattr(step_forcing, "press_air", None),
         **({} if cavity_cfg is None else {"cavity": True})))()
+    if _mix_late:
+        if "mix" not in _vbox:
+            raise AssertionError("gpu.join_multi 2: the momentum advection made no node exchange")
+        uvnode, Kv, Av = _vbox["mix"]
     if not _lean:
         # (JOINED: the viscosity adds to uv_rhs element by element and its result is refreshed below; uv_rhsAB is
         # read only by the next step's element-local AB shift, whose uv_rhs is refreshed the same way)
