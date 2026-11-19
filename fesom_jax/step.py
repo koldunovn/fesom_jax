@@ -191,6 +191,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # the EOS / N² / pressure gradient to the top of the step (with the node velocity's refresh), the mixing's
     # uvnode/Kv/Av refresh into the momentum advection's (forward only: the default adjoint config)
     _multi2 = _multi and ops.env_int("FESOM_JOIN_MULTI", 0) >= 2 and adjoint_cfg is None
+    # gpu.lean2 (FESOM_LEAN2, lane ocean_speed; split-explicit on the wide SE lanes, forward): two more element
+    # refreshes dropped whose halos come out as the owners' values: the momentum predictor's du (a column solve of
+    # halo-complete uv, uv_rhs, Av, stress and thickness; the SE reads only its owned lanes) and the trimmed uv after
+    # the substeps (a column map of uv, du and the exchanged <<U>>)
+    _lean2 = _lean and ops.env_switch("FESOM_LEAN2") and adjoint_cfg is None
 
     # Nested in-step rematerialization (paper §3 NN-twin / any long-window adjoint). The
     # integrate() scan already wraps the WHOLE step in jax.checkpoint, so its backward stores
@@ -569,7 +574,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     du = _ckpt(lambda: momentum.impl_vert_visc(mesh, st.uv, uv_rhs, _av_visc, stress_surf, dt=dt,
                                                elem_geo=elem_geo_live,
                                                w_i=(st.w_i if _use_wsplit else None)))()
-    du = _exch(du, "elem")
+    if not (_lean2 and ale_cfg is not None and ale_cfg.split_explicit is not None and halo_ctx is not None
+            and halo_ctx.se_wide is not None):
+        du = _exch(du, "elem")
 
     # zstar (Phase 9a, JZ.3): the SSH plumbing gains the real-freshwater tail (ssh_rhs +
     # compute_hbar) and the D2 stiffness-as-function-of-hbar increment (the solve matvec).
@@ -589,7 +596,9 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             raise ValueError("split-explicit SSH needs its rings in the State: state = "
                              "ssh_se.cold_start(state, mesh) (a cold start, or a CG state entering SE)")
         se_out = ssh_se.se_block(mesh, st, du, wf_ssh, _se, dt=dt, is_first_step=is_first_step, exch=_exch,
-                                 wide=None if halo_ctx is None else halo_ctx.se_wide)
+                                 wide=None if halo_ctx is None else halo_ctx.se_wide,
+                                 **({"trim_refresh": False} if _lean2 and halo_ctx is not None
+                                    and halo_ctx.se_wide is not None else {}))
         uv, eta_n, hbar, hbar_old = se_out.uv, se_out.eta_n, se_out.hbar, se_out.hbar_old
         d_eta, ssh_rhs, ssh_rhs_old = st.d_eta, st.ssh_rhs, st.ssh_rhs_old
     else:

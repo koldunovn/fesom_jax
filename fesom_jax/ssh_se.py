@@ -564,7 +564,8 @@ def _scan(c, n, k, lmesh, cfg, tauM, invM, w, exch):
     return lax.scan(jax.checkpoint(body), c, None, length=n, unroll=min(se_unroll(), n))[0]
 
 
-def se_block(mesh, st, du, water_flux, cfg: SeConfig, *, dt, is_first_step, exch=None, wide=None) -> SeOut:
+def se_block(mesh, st, du, water_flux, cfg: SeConfig, *, dt, is_first_step, exch=None, wide=None,
+             trim_refresh: bool = True) -> SeOut:
     """Substeps 8-12 of the step in SE mode: the barotropic forcing, the ``cfg.M`` substeps, the trim, and
     ``eta_n = hbar = eta^M``. ``st`` is the step's carried state (uv = u^n, eta_n = eta^n, helem = h^n, the rings),
     ``du`` the momentum predictor's increment (substep 7), ``water_flux`` the node freshwater flux (zstar; ``None`` ⇒
@@ -639,7 +640,8 @@ def se_block(mesh, st, du, water_flux, cfg: SeConfig, *, dt, is_first_step, exch
     cy = jnp.where(ok, (sy - umean[:, 1]) / Hs, 0.0)
     lm3 = lm[:, :, None]
     uv_new = jnp.where(lm3, ust - jnp.stack([cx, cy], axis=-1)[:, None, :], uv)
-    uv_new = _exch(uv_new, "elem")
+    if trim_refresh:            # (False: gpu.lean2, the trim's inputs halo-complete, see fesom_jax.step)
+        uv_new = _exch(uv_new, "elem")
     return SeOut(uv=uv_new, eta_n=eta_n, hbar=hbar, hbar_old=hbar_old,
                  se_eta=jnp.stack([eta1, eta2], axis=-1), se_ubt=jnp.stack([U0, U1, U2], axis=1),
                  se_sbar_old=jnp.stack([ux, uy], axis=-1), umean=umean, he=He)
