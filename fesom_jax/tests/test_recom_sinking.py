@@ -641,7 +641,7 @@ def test_freeze_floor_gradient_switch(monkeypatch):
 
 def test_freeze_floor_neg_vertical(monkeypatch):
     """FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=nbr / column (plan 20261105, 2026-11-17): a negative cell freezes its
-    tracer's vertical neighbours (nbr) or that tracer's whole column at the node (column), per tracer and per node;
+    tracer's vertical neighbours (nbr), grown through mixed interfaces (nbrkv), or that tracer's whole column at the node (column), per tracer and per node;
     values unchanged; any other value is an error."""
     from types import SimpleNamespace
     from fesom_jax.recom import wiring as W
@@ -655,13 +655,14 @@ def test_freeze_floor_neg_vertical(monkeypatch):
     for v in ("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "FESOM_RECOM_GRAD_FREEZE_TRACERS"):
         monkeypatch.delenv(v, raising=False)
     monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR", "10")
-    grad = lambda: np.asarray(jax.grad(lambda x: jnp.sum(W._freeze_extinct(x, lay, floors) ** 2 / 2))(X))  # noqa: E731
+    kv = None
+    grad = lambda: np.asarray(jax.grad(lambda x: jnp.sum(W._freeze_extinct(x, lay, floors, kv) ** 2 / 2))(X))  # noqa: E731
 
     def check(frozen):
         g = grad()
         np.testing.assert_array_equal(g[frozen], 0.0)
         np.testing.assert_array_equal(g[~frozen], np.asarray(X)[~frozen])
-        np.testing.assert_array_equal(np.asarray(W._freeze_extinct(X, lay, floors)), np.asarray(X))
+        np.testing.assert_array_equal(np.asarray(W._freeze_extinct(X, lay, floors, kv)), np.asarray(X))
 
     monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "nbr")
     frozen = np.zeros(X.shape, bool)
@@ -675,6 +676,24 @@ def test_freeze_floor_neg_vertical(monkeypatch):
     check(frozen)
     monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "1")
     check(np.asarray(X) < 0)
+    # nbrkv (2026-11-20): nbr, grown through interfaces with Kv > 1e-3. Node 0 as west of Gibraltar (92377): the
+    # negative surface cell, levels 1-3 joined by Kv 0.1 (interfaces 2, 3), so nbr's level 1 carries the freeze to
+    # levels 2-3 and stops at the stratified interface 4. Node 1 stratified throughout: nbr's footprint.
+    kv = np.full((2, 6), 1e-6)
+    kv[0, 2:4] = 0.1
+    kv[:, 5] = 0.0
+    kv = jnp.asarray(kv)
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "nbrkv")
+    frozen = np.zeros(X.shape, bool)
+    frozen[0, 0:4, 1] = True
+    frozen[1, 1:4, 0] = True
+    check(frozen)
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_NEG_KV", "1.0")             # no interface mixed: nbr exactly
+    frozen[0, 2:4, 1] = False
+    check(frozen)
+    monkeypatch.delenv("FESOM_RECOM_GRAD_FREEZE_NEG_KV")
+    with pytest.raises(ValueError):
+        W._freeze_extinct(X, lay, floors)                                  # nbrkv needs Kv
     monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG", "neighbours")
     with pytest.raises(ValueError):
         W._freeze_extinct(X, lay, floors)

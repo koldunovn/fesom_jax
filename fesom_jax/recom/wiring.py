@@ -264,7 +264,29 @@ def phyto_floors(rcfg) -> dict:
     return {n: float(getattr(dz, f)) for n, _, f in PHYTO_GROUPS}
 
 
-def _freeze_extinct(X, lay, floors=None):
+def _grow_through_mixed(m, kv, thr):
+    """``m`` ``[node, level, tracer]`` grown along each column through every interface whose diffusivity exceeds
+    ``thr``: a cell joins the mask when a cell it is mixed with (a chain of interfaces with ``Kv > thr``) is in it.
+    ``kv`` ``[node, nl]`` on interfaces, interface ``k`` the top of level ``k`` (``Kv_eff``); interface 0 (the
+    surface) and those below the bottom (Kv 0) join nothing. Two boolean associative scans (down, then up) of
+    ``out[k] = m[k] | (link[k] & out[k-1])``."""
+    if kv is None:
+        raise ValueError("FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=nbrkv needs Kv (full_bgc_step's Kv_eff)")
+    L = m.shape[1]
+    link = jax.lax.stop_gradient(kv[:, 1:L]) > thr                      # link[:, k-1]: levels k-1 and k mixed
+    link = jnp.broadcast_to(link[:, :, None], (m.shape[0], L - 1, m.shape[2]))
+    f = jnp.zeros_like(m[:, :1])
+
+    def comb(p, q):                                                      # (a, b): x -> b | (a & x), p then q
+        return p[0] & q[0], q[1] | (q[0] & p[1])
+
+    down = jnp.concatenate([f, link], axis=1)                            # level k joined to level k-1
+    m = jax.lax.associative_scan(comb, (down, m), axis=1)[1]
+    up = jnp.concatenate([link, f], axis=1)                              # level k joined to level k+1
+    return jax.lax.associative_scan(comb, (up, m), axis=1, reverse=True)[1]
+
+
+def _freeze_extinct(X, lay, floors=None, kv=None):
     """Experiment (plan 20261105 Phase 1, 2026-11-11): FESOM_RECOM_GRAD_FREEZE_EXTINCT=<threshold> holds the second
     zooplankton and its detritus (``ZOO2_NAMES``) out of the derivative wherever ``|x| < threshold``: the forward
     values are unchanged, the step's derivative with respect to those cells is zero. On the 2-year pi state that
@@ -282,7 +304,10 @@ def _freeze_extinct(X, lay, floors=None):
     January window the diatoms of the South Atlantic gyre sit on their floor (DiaN 2.4e-6 = tiny_N_d) and the
     reverse field grows there. FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG=0 keeps only the phytoplankton clause (no freeze of
     negatives); ``=nbr`` freezes each negative cell with its vertical neighbours, ``=column`` the tracer's whole
-    column at that node (2026-11-17). Read at trace time; all unset (the default), ``X`` is returned as is and the traced
+    column at that node (2026-11-17); ``=nbrkv`` the ``nbr`` mask grown along the column through every interface with
+    ``Kv > FESOM_RECOM_GRAD_FREEZE_NEG_KV`` (default 1e-3; ``kv``, full_bgc_step's ``Kv_eff``), so a frozen cell's mixed
+    pair or mixed layer is frozen with it, while stratified water keeps ``nbr``'s footprint (2026-11-20: ``column``
+    freezes live surface grazers and PhyChl because of round-off negatives at depth, dump 29125804). Read at trace time; all unset (the default), ``X`` is returned as is and the traced
     program is unchanged."""
     thr = os.environ.get("FESOM_RECOM_GRAD_FREEZE_EXTINCT", "").strip()
     k_floor = os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR", "").strip()
@@ -324,15 +349,17 @@ def _freeze_extinct(X, lay, floors=None):
             m = jnp.zeros(X.shape, bool)
         elif nv in ("1", "true", "yes", "on", "cell"):
             m = X < 0
-        elif nv in ("nbr", "column"):
+        elif nv in ("nbr", "column", "nbrkv"):
             m = X < 0
             if nv == "column":
                 m = jnp.broadcast_to(jnp.any(m, axis=1, keepdims=True), X.shape)
             else:
                 f = jnp.zeros_like(m[:, :1])
                 m = m | jnp.concatenate([m[:, 1:], f], axis=1) | jnp.concatenate([f, m[:, :-1]], axis=1)
+            if nv == "nbrkv":
+                m = _grow_through_mixed(m, kv, float(os.environ.get("FESOM_RECOM_GRAD_FREEZE_NEG_KV", "1e-3")))
         else:
-            raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG={nv!r}: expected 0, 1, nbr or column")
+            raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_FLOOR_NEG={nv!r}: expected 0, 1, nbr, nbrkv or column")
         cols = [m[..., i] for i in range(X.shape[-1])]
         for nname, members, _ in phyto_groups(names):
             if nname not in names:
@@ -380,7 +407,7 @@ def full_bgc_step(mesh, st, rcfg, *, params, h0, zbar0, Z0, helem, helem_flux, u
     lat_rad = jnp.asarray(mesh.geo_coord_nod2D[:, 1], f64)
     X, X_old = transport.hold_major(st.bgc), st.bgc_old          # stage 1 reads each tracer's columns contiguously
     floors = phyto_floors(rcfg) if os.environ.get("FESOM_RECOM_GRAD_FREEZE_FLOOR", "").strip() else None
-    X, X_old = _freeze_extinct(X, lay, floors), _freeze_extinct(X_old, lay, floors)
+    X, X_old = _freeze_extinct(X, lay, floors, Kv_eff), _freeze_extinct(X_old, lay, floors, Kv_eff)
     h = h0[:, :nl1]
     full = PR.full                         # the identity in double precision: the double-precision trace is unchanged
     areasvol, area = full(mesh.areasvol), full(mesh.area)
