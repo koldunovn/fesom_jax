@@ -157,8 +157,7 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "fct_flux_barrier": "FESOM_FCT_FLUX_BARRIER", "o2a_surface": "FESOM_O2A_SURFACE",
             "o2a_lanes_surface": "FESOM_O2A_LANES_SURFACE",
             "mevp_wide_barrier": "FESOM_MEVP_WIDE_BARRIER", "cpl_forcing_lean": "FESOM_CPL_FORCING_LEAN",
-            "cpl_forcing_lanes": "FESOM_CPL_FORCING_LANES", "join_multi": "FESOM_JOIN_MULTI",
-            "lean2": "FESOM_LEAN2"}
+            "cpl_forcing_lanes": "FESOM_CPL_FORCING_LANES", "join_multi": "FESOM_JOIN_MULTI"}
 # Lane ocean_speed2 (performance only, off when absent; configs/core3_cpl.yaml has the measurements):
 # `ice_mm_sum3` (an integer 1-4: the association; 4 = the Triton order behind a barrier) the ice FCT mass-matrix
 # element sum (ice_adv._mm_times); `ice_fct_extreme` the ice FCT cluster bounds as ordered gathers
