@@ -119,6 +119,36 @@ class HaloCtx:
         out = halo_exchange_coloured(field, self.bulk_maps[kind], self.bulk_meta[kind], self.axis_name, grouped=True)
         return out if mode == "off" else lax.optimization_barrier(out)
 
+    def exchange_multi(self, items):
+        """``[(field, kind), ...]`` -> the refreshed fields, as :meth:`exchange` refreshes each. Under the grouped
+        coloured transport with :func:`halo_grouped.multi_enabled` (``FESOM_JOIN_MULTI``) the send buffers of all of
+        them go out in ONE grouped call (:func:`halo_grouped.exchange_multi`: nodes and elements, float32 and float64
+        side by side; the same send gathers, received rows and halo writes as :func:`halo_exchange_coloured`, so the
+        same values); otherwise one :meth:`exchange` each."""
+        items = list(items)
+        if serial_identity(self.axis_name) or halo_none():
+            return [f for f, _ in items]
+        if (len(items) < 2 or not halo_grouped.multi_enabled() or not halo_grouped.enabled()
+                or not self.use_coloured or self.exch_ragged is None or halo_barrier_mode() != "off"
+                or not all(self.col_meta[k][0] for _, k in items)):
+            return [self.exchange(f, k) for f, k in items]
+        bufs, metas = [], []
+        for f, k in items:
+            c = self.exch_ragged[k]
+            rest = f.shape[1:]
+            buf = f[c["send_idx"]]
+            vmask = c["send_valid"].reshape(c["send_valid"].shape + (1,) * len(rest))
+            bufs.append(jnp.where(vmask, buf, jnp.zeros_like(buf)))
+            metas.append(self.col_meta[k])
+        recvs = halo_grouped.exchange_multi(tuple(bufs), tuple(metas))
+        out = []
+        for (f, k), recv in zip(items, recvs):
+            c = self.exch_ragged[k]
+            gathered = recv[c["colpos"]]
+            mask = c["halo_mask"].reshape(c["halo_mask"].shape + (1,) * (f.ndim - 1))
+            out.append(jnp.where(mask, gathered, f))
+        return out
+
     def _transport(self, field, kind: str):
         if self.use_coloured and self.exch_ragged is not None:
             return halo_exchange_coloured(

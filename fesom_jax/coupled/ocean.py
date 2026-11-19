@@ -117,6 +117,7 @@ class OceanStatic:
     _mon_count: int = 0
     flux: Any = None          # mode F constants (fesom_jax.coupled.flux.FluxConfig), None in mode B
     _o2a: Any = None          # the jitted ocean_to_atm
+    _o2a_lanes: Any = None    # (the jitted ocean_to_atm_lanes and its lane tables)
     # None, or a writer's submit(fn, *args) (one background thread, single process): the monthly means' store, with
     # their copy to the host, is written by that call (awicm_jax's run_coupled)
     submit: Any = None
@@ -731,6 +732,136 @@ def _surface_vel_tables(mesh) -> dict:
                                             "inv": inv,
                                             "nm": np.asarray(mesh.node_layer_mask)[:, 0].copy()}
     return _SURF_VEL[1]
+
+
+def _lane_array(static, per_device, shape_tail, dtype, sharding):
+    """A folded ``[P*Lk, *shape_tail]`` array sharded over the lanes, each addressable device's slice made by
+    ``per_device(d)`` (``d`` = its partition rank) on the host: no collective, no other device's slice built."""
+    devs = list(sharding.mesh.devices.flat)
+    bufs, L = [], None
+    for d, dev in enumerate(devs):
+        if dev.process_index != jax.process_index():
+            continue
+        a = np.ascontiguousarray(np.asarray(per_device(d), dtype=dtype))
+        L = a.shape[0]
+        bufs.append(jax.device_put(a, dev))
+    return jax.make_array_from_single_device_arrays((len(devs) * L,) + tuple(shape_tail), sharding, bufs)
+
+
+def _o2a_lane_tables(static: OceanStatic):
+    """Host-built, lane-sharded tables of :func:`ocean_to_atm_lanes` (this process's devices only): per node lane
+    the surface layer mask, the eight rotation trig values and the surface velocity's inverse map (the positions of
+    the node's elements in the device's element lanes, in the GLOBAL inverse map's order and width); per element
+    lane its surface layer mask and area. Every value is the global table's at the lane's global id."""
+    from jax.sharding import NamedSharding, PartitionSpec
+    from .. import ops
+    mesh, part, sm = static.mesh, static.part, static.sm
+    Ln, Le = int(sm.Lmax["nod"]), int(sm.Lmax["elem"])
+    E = int(mesh.elem2D)
+    t = _surface_vel_tables(mesh)
+    inv_g = np.asarray(t["inv"])                                 # [nod2D, D] positions 3e + k, sentinel 3E
+    D = inv_g.shape[1]
+    trig = [np.asarray(x) for x in static.trig]
+    own = np.asarray(sm.owned_mask["nod"])                       # [P, Ln]
+    shl = NamedSharding(static.device_mesh(), PartitionSpec("p"))
+
+    def nod_ids(d):
+        ml = np.asarray(part.myList_nod2D[d], np.int64)
+        g = np.full(Ln, -1, np.int64)
+        g[:ml.size] = ml
+        return g
+
+    def elem_ids(d):
+        ml = np.asarray(part.myList_elem2D[d], np.int64)
+        g = np.full(Le, -1, np.int64)
+        g[:ml.size] = ml
+        return g
+
+    def nm(d):
+        g = nod_ids(d)
+        return np.where(g >= 0, t["nm"][np.maximum(g, 0)], False)
+
+    def em(d):
+        g = elem_ids(d)
+        return np.where(g >= 0, t["m"][np.maximum(g, 0)], False)
+
+    def earea(d):
+        g = elem_ids(d)
+        return np.where(g >= 0, t["area"][np.maximum(g, 0)], 0.0)
+
+    def trig_l(d):
+        g = nod_ids(d)
+        return np.stack([np.where(g >= 0, x[np.maximum(g, 0)], 0.0) for x in trig], axis=-1)
+
+    def inv_l(d):
+        g, ge = nod_ids(d), elem_ids(d)
+        ok = ge >= 0
+        srt = np.argsort(ge[ok], kind="stable")
+        keys, lanes = ge[ok][srt], np.nonzero(ok)[0][srt]
+        out = np.full((Ln, D), 3 * Le, np.int32)                 # the local sentinel (3 * the element lanes)
+        rows = np.nonzero(own[d] & (g >= 0))[0]
+        e = inv_g[g[rows]] // 3                                  # [rows, D] global elements (E: the sentinel)
+        real = inv_g[g[rows]] < 3 * E
+        pos = np.searchsorted(keys, np.where(real, e, 0))
+        pos = np.minimum(pos, keys.size - 1)
+        hit = keys[pos] == np.where(real, e, -1)
+        if not np.all(hit[real]):
+            raise AssertionError(f"ocean_to_atm_lanes: device {d} lacks elements of its owned nodes")
+        out[rows] = np.where(real, 3 * lanes[pos], 3 * Le).astype(np.int32)
+        return out
+
+    tabs = {"nm": _lane_array(static, nm, (), bool, shl), "em": _lane_array(static, em, (), bool, shl),
+            "area": _lane_array(static, earea, (), np.asarray(t["area"]).dtype, shl),
+            "trig": _lane_array(static, trig_l, (8,), np.float64, shl),
+            "inv": _lane_array(static, inv_l, (D,), np.int32, shl)}
+    return tabs, shl
+
+
+def ocean_to_atm_lanes(state, static: OceanStatic) -> dict:
+    """:func:`ocean_to_atm`'s fields on the node LANES (``(P*Lmax,)`` sharded over the ocean's devices; the owned
+    lanes hold the values, the halo and pad lanes anything): no gather of the State into global node order and no
+    replicated whole-mesh work (lane ocean_speed: 28 ms of the NG5 interval at dist_256, an all-gather of ~370 MB a
+    device). Each owned lane computes what :func:`_ocean_to_atm` computes for its node: the same operations on the
+    same values (the surface velocity's ordered sum over the node's elements in the global inverse map's order and
+    width, the rotation with the node's trig values), so the same bits (mode F, ``gpu.o2a_surface``, dist_N)."""
+    if static.mode != "flux" or static.npes == 1 or os.environ.get("FESOM_O2A_SURFACE", "0").strip() in ("", "0"):
+        raise NotImplementedError("ocean_to_atm_lanes: mode F, dist_N and gpu.o2a_surface only")
+    if static._o2a_lanes is None:
+        from jax.sharding import PartitionSpec
+        from .. import ops
+        tabs, shl = _o2a_lane_tables(static)
+        from jax.sharding import NamedSharding
+        Mh = np.asarray(static.M)
+        M = jax.make_array_from_callback(Mh.shape, NamedSharding(shl.mesh, PartitionSpec()), lambda i: Mh[i])
+        P_ = PartitionSpec("p")
+
+        def body(T1, a_ice, m_snow, m_ice, cit, cia, uv1, nm, em, area, trig, inv, Mr):
+            e = em.shape[0]
+            contrib = jnp.where(em[:, None], area[:, None] * uv1, 0.0)                    # (Le,2)
+            area_lev = jnp.where(em, area, 0.0)
+            vals = jnp.broadcast_to(contrib[:, None], (e, 3, 2)).reshape(3 * e, 2)
+            num = ops.ordered_sum(vals, inv)
+            den = ops.ordered_sum(jnp.broadcast_to(area_lev[:, None], (e, 3)).reshape(-1), inv)
+            safe = jnp.where(den > 0.0, den, 1.0)[:, None]
+            uvn = jnp.where(nm[:, None], num / safe, 0.0)
+            tr = tuple(trig[:, k] for k in range(8))
+            u_g, v_g = r2g(uvn[:, 0].astype(jnp.float64), uvn[:, 1].astype(jnp.float64), tr, Mr)
+            wp = T1.dtype
+            return {"sst_feom": T1 + jnp.asarray(TMELT, wp), "sie_feom": a_ice, "snt_feom": m_snow,
+                    "ist_feom": (cit * a_ice).astype(wp), "sia_feom": cia.astype(wp),
+                    "u_feom": u_g.astype(wp), "v_feom": v_g.astype(wp), "sit_feom": m_ice}
+
+        sm_fn = jax.shard_map(body, mesh=shl.mesh, in_specs=(P_,) * 12 + (PartitionSpec(),), out_specs=P_,
+                              check_vma=False)
+
+        def f(s, tb, Mr):
+            from . import flux
+            cit, cia = flux.ice_temp_alb(s, static)
+            return sm_fn(s.T[:, 0], s.a_ice, s.m_snow, s.m_ice, cit, cia, s.uv[:, 0, :], tb["nm"], tb["em"],
+                         tb["area"], tb["trig"], tb["inv"], Mr)
+        static._o2a_lanes = (jax.jit(f, out_shardings=shl), tabs, M)
+    fn, tabs, M = static._o2a_lanes
+    return fn(state, tabs, M)
 
 
 def _ocean_to_atm(state, static: OceanStatic) -> dict:
