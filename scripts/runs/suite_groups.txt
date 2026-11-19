@@ -90,6 +90,7 @@ ice fesom_jax/tests/test_ice_adjoint_mode.py
 ice fesom_jax/tests/test_ice_adv.py
 ice fesom_jax/tests/test_ice_ave_steps.py
 ice fesom_jax/tests/test_ice_coupling.py
+ice fesom_jax/tests/test_ice_dyn_steps.py
 ice fesom_jax/tests/test_ice_evp.py
 ice fesom_jax/tests/test_ice_ic.py
 ice fesom_jax/tests/test_ice_step.py
@@ -111,6 +112,7 @@ sharding fesom_jax/tests/test_gm_nn_sharded.py
 sharding fesom_jax/tests/test_gradient_sharded.py
 sharding fesom_jax/tests/test_halo.py
 sharding fesom_jax/tests/test_halo_grouped.py
+sharding fesom_jax/tests/test_wide_grouped.py
 sharding fesom_jax/tests/test_mevp_frozen_sweep_sharded.py
 sharding fesom_jax/tests/test_mevp_wide_sharded.py
 sharding fesom_jax/tests/test_place_cache.py
