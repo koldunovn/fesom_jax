@@ -18,6 +18,8 @@ source scripts/albedo/env.sh
 export JAX_PLATFORMS=cuda PYTHONUNBUFFERED=1 XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=0.95
 export XLA_FLAGS="--xla_gpu_enable_command_buffer="
 echo "=== $(hostname) $(date) $(git rev-parse --short HEAD) ==="
+GUARDS=$(env | grep '^FESOM_RECOM_GRAD_' | sort | tr '\n' ' ')
+echo "=== gradient guards: ${GUARDS:-none} ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 $PY scripts/recom/core2_bgc_adj.py "$@"
 echo "=== exit $? $(date) ==="

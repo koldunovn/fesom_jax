@@ -30,6 +30,8 @@ DIST=${DIST:-$POOL/fesom_jax_data/core2_mesh_ic/mesh_core2_part}
 cd "$WT" || exit 2
 "$PY" -c "import sys, fesom_jax; sys.exit(0 if fesom_jax.__file__.startswith('$WT/') else 4)" || { echo "FATAL: fesom_jax not from $WT"; exit 4; }
 echo "=== $(hostname) $(date) job ${SLURM_JOB_ID:-local} $(git rev-parse --short HEAD) CONFIG=$CONFIG RESTART=$RESTART DIST=$DIST REMAT=${REMAT---remat-blocks} FESOM_BGC_LAYOUT=$FESOM_BGC_LAYOUT ==="
+GUARDS=$(env | grep '^FESOM_RECOM_GRAD_' | sort | tr '\n' ' ')
+echo "=== gradient guards: ${GUARDS:-none} ==="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 "$PY" scripts/recom/core2_bgc_adj.py --config "$CONFIG" --year "$YEAR" --restart "$RESTART" --dist-dir "$DIST" \
     --npes 4 ${REMAT---remat-blocks} --chunk-steps 2 "$@"
