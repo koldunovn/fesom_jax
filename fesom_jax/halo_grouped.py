@@ -26,6 +26,8 @@ from pathlib import Path
 import numpy as np
 
 TARGET = "fesom_grouped_exchange"
+TARGET_START_OWNED, TARGET_DONE_OWNED = "fesom_grouped_start_owned", "fesom_grouped_done_owned"
+TARGET_GATE = "fesom_gate"
 _SRC = Path(__file__).with_name("_nccl_group.cc")
 _BUILD = Path(__file__).with_name("_build")
 _CXXFLAGS = ["-O2", "-std=c++17", "-fPIC", "-shared"]
@@ -131,6 +133,9 @@ def init(devices):
         raise RuntimeError(f"the grouped halo transport's ncclCommInitRank: "
                            f"{'CUDA failed' if res == -1 else lib.fjx_nccl_error(res).decode()}")
     jax.ffi.register_ffi_target(TARGET, jax.ffi.pycapsule(lib.FjxGroupedExchange), platform="CUDA")
+    jax.ffi.register_ffi_target(TARGET_START_OWNED, jax.ffi.pycapsule(lib.FjxGroupedStartOwned), platform="CUDA")
+    jax.ffi.register_ffi_target(TARGET_DONE_OWNED, jax.ffi.pycapsule(lib.FjxGroupedDoneOwned), platform="CUDA")
+    jax.ffi.register_ffi_target(TARGET_GATE, jax.ffi.pycapsule(lib.FjxGate), platform="CUDA")
     _mesh_key = key
 
 
@@ -328,3 +333,94 @@ def exchange_multi(bufs, metas):
         return tuple(jnp.moveaxis(y, 1, 0) for y in ys), tuple(True for _ in ys)
 
     return batched(*bufs)
+
+
+# ------------------------------------------------------------------------------------------------- the async exchange
+def async_enabled() -> bool:
+    """``FESOM_HALO_ASYNC=1`` (``gpu.halo_async``, read when traced; lane ocean_speed2 on JUPITER; with the grouped
+    transport and ``gpu.join_multi``): halo refreshes whose fields are not read for a while are STARTED where their
+    fields are ready and FINISHED where the first of them is read, the NCCL group running on a stream of its own
+    while XLA's stream computes what lies between (:func:`exchange_multi_start` / :func:`exchange_multi_done`). The
+    same send buffers, rows and halo writes as :func:`exchange_multi`: the same values. Forward only."""
+    return os.environ.get("FESOM_HALO_ASYNC", "0").strip() not in ("", "0")
+
+
+def _attrs(lay):
+    item, seg_off, seg_len, seg_round, seg_send, seg_recv, dst, src = lay
+    return dict(item=np.int64(item), seg_off=np.asarray(seg_off, np.int64), seg_len=np.asarray(seg_len, np.int64),
+                seg_round=np.asarray(seg_round, np.int32), seg_send=np.asarray(seg_send, np.int64),
+                seg_recv=np.asarray(seg_recv, np.int64), dst=np.asarray(dst, np.int32), src=np.asarray(src, np.int32))
+
+
+def _multi_layout(words, metas):
+    """The joined layout of :func:`_multi_flat`: every map's rounds as segments over the words side by side."""
+    seg_off, seg_len, seg_round, seg_send, seg_recv, dst, src = [], [], [], [], [], [], []
+    base, r0 = 0, 0
+    for w, meta in zip(words, metas):
+        item, so, sl, sr, ss, srv, d, s = _layout(meta, int(w.shape[1]) * 4)
+        seg_off += [base + o for o in so]
+        seg_len += list(sl)
+        seg_round += [r0 + r for r in sr]
+        seg_send += list(ss)
+        seg_recv += list(srv)
+        dst += list(d)
+        src += list(s)
+        base += item
+        r0 += len(meta[0])
+    return (base, tuple(seg_off), tuple(seg_len), tuple(seg_round), tuple(seg_send), tuple(seg_recv), tuple(dst),
+            tuple(src))
+
+
+class Pending:
+    """An exchange in flight (:func:`exchange_multi_start`): the token (a traced value), the call site's tag and
+    the static layout :func:`exchange_multi_done` needs."""
+
+    def __init__(self, token, tag, shapes, metas, nwords):
+        self.token, self.tag, self.shapes, self.metas, self.nwords = token, tag, shapes, metas, nwords
+
+
+def exchange_multi_start(bufs, metas, tag: int, deps=()):
+    """:func:`exchange_multi`'s exchange begun on the comm stream (the FFI's own send / receive buffers of call site
+    ``tag``): ``bufs`` are copied at once, so XLA may reuse them; returns a :class:`Pending` for
+    :func:`exchange_multi_done`. ``deps``: arrays the call takes but does not read, so that XLA schedules it after
+    them. Not under vmap; forward only."""
+    import jax
+    import jax.numpy as jnp
+    metas = tuple(metas)
+    if not all(m[0] for m in metas):
+        raise ValueError("exchange_multi_start: a map without rounds (one device)")
+    flats = [x.reshape(x.shape[0], -1) for x in bufs]
+    words = [_words(f) for f in flats]
+    lay = _multi_layout(words, metas)
+    x = jnp.concatenate([w.reshape(-1) for w in words])
+    tok = jax.ffi.ffi_call(TARGET_START_OWNED, jax.ShapeDtypeStruct((1,), np.int32), has_side_effect=True)(
+        x, *deps, tag=np.int32(tag), **_attrs(lay))
+    return Pending(tok, int(tag), tuple((tuple(b.shape), b.dtype, tuple(f.shape), tuple(w.shape))
+                                        for b, f, w in zip(bufs, flats, words)), metas, int(x.shape[0]))
+
+
+def exchange_multi_done(p: Pending, deps=()):
+    """The received buffers of :func:`exchange_multi_start`'s exchange (what :func:`exchange_multi` returns): XLA's
+    stream waits for the exchange's end here; ``deps`` (taken, not read): XLA schedules the wait after them (the
+    work the exchange overlaps)."""
+    import jax
+    y = jax.ffi.ffi_call(TARGET_DONE_OWNED, jax.ShapeDtypeStruct((p.nwords,), np.uint32), has_side_effect=True)(
+        p.token, *deps, tag=np.int32(p.tag))
+    out, o = [], 0
+    for shape, dtype, fshape, wshape in p.shapes:
+        n = int(np.prod(wshape))
+        like = jax.ShapeDtypeStruct(fshape, dtype)
+        out.append(_unwords(y[o:o + n].reshape(wshape), like).reshape(shape))
+        o += n
+    return tuple(out)
+
+
+def gate(xs, deps):
+    """``xs`` (a tuple of arrays) returned as they are, by a no-op custom call that also takes ``deps``: whatever
+    reads the results is scheduled after ``deps`` (XLA keeps no optimization_barrier until scheduling; a custom
+    call's operands it must respect). The results alias ``xs`` (XLA copies one only where it is still read later)."""
+    import jax
+    xs = tuple(xs)
+    out = jax.ffi.ffi_call(TARGET_GATE, tuple(jax.ShapeDtypeStruct(x.shape, x.dtype) for x in xs),
+                           input_output_aliases={i: i for i in range(len(xs))}, has_side_effect=True)(*xs, *deps)
+    return tuple(out)

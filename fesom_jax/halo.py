@@ -149,6 +149,43 @@ class HaloCtx:
             out.append(jnp.where(mask, gathered, f))
         return out
 
+    def async_ok(self, kinds) -> bool:
+        """:meth:`exchange_multi_start` applies: the grouped coloured transport with ``FESOM_JOIN_MULTI`` and
+        ``FESOM_HALO_ASYNC`` (:func:`halo_grouped.async_enabled`), several devices, no barrier mode."""
+        return (halo_grouped.async_enabled() and halo_grouped.multi_enabled() and halo_grouped.enabled()
+                and self.use_coloured and self.exch_ragged is not None and halo_barrier_mode() == "off"
+                and not serial_identity(self.axis_name) and not halo_none()
+                and all(self.col_meta[k][0] for k in kinds))
+
+    def exchange_multi_start(self, items, tag: int, deps=()):
+        """:meth:`exchange_multi` begun (lane ocean_speed2, ``FESOM_HALO_ASYNC``): the send buffers gathered and the
+        grouped exchange started on the comm stream; returns a handle for :meth:`exchange_multi_done`, which writes
+        the received rows into the fields' halos. The same values as :meth:`exchange_multi`. Call only when
+        :meth:`async_ok` holds."""
+        items = list(items)
+        bufs, metas = [], []
+        for f, k in items:
+            c = self.exch_ragged[k]
+            rest = f.shape[1:]
+            buf = f[c["send_idx"]]
+            vmask = c["send_valid"].reshape(c["send_valid"].shape + (1,) * len(rest))
+            bufs.append(jnp.where(vmask, buf, jnp.zeros_like(buf)))
+            metas.append(self.col_meta[k])
+        return items, halo_grouped.exchange_multi_start(tuple(bufs), tuple(metas), tag, deps)
+
+    def exchange_multi_done(self, handle, deps=()):
+        """The fields of :meth:`exchange_multi_start`'s handle with their halos refreshed (XLA's stream waits for
+        the exchange here)."""
+        items, pend = handle
+        recvs = halo_grouped.exchange_multi_done(pend, deps)
+        out = []
+        for (f, k), recv in zip(items, recvs):
+            c = self.exch_ragged[k]
+            gathered = recv[c["colpos"]]
+            mask = c["halo_mask"].reshape(c["halo_mask"].shape + (1,) * (f.ndim - 1))
+            out.append(jnp.where(mask, gathered, f))
+        return out
+
     def _transport(self, field, kind: str):
         if self.use_coloured and self.exch_ragged is not None:
             return halo_exchange_coloured(

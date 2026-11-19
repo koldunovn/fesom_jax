@@ -51,10 +51,18 @@ int Slot(int32_t ordinal) {
   return -1;
 }
 
+ffi::Error EnqueueRaw(cudaStream_t stream, int slot, const void* send, size_t total, void* recv, int64_t item,
+                      ffi::Span<const int64_t> seg_off, ffi::Span<const int64_t> seg_len,
+                      ffi::Span<const int32_t> seg_round, ffi::Span<const int64_t> seg_send,
+                      ffi::Span<const int64_t> seg_recv, ffi::Span<const int32_t> dst, ffi::Span<const int32_t> src);
+
 ffi::Error Enqueue(cudaStream_t stream, int slot, ffi::AnyBuffer x, void* recv, int64_t item,
                    ffi::Span<const int64_t> seg_off, ffi::Span<const int64_t> seg_len,
                    ffi::Span<const int32_t> seg_round, ffi::Span<const int64_t> seg_send,
-                   ffi::Span<const int64_t> seg_recv, ffi::Span<const int32_t> dst, ffi::Span<const int32_t> src);
+                   ffi::Span<const int64_t> seg_recv, ffi::Span<const int32_t> dst, ffi::Span<const int32_t> src) {
+  return EnqueueRaw(stream, slot, x.untyped_data(), x.size_bytes(), recv, item, seg_off, seg_len, seg_round, seg_send,
+                    seg_recv, dst, src);
+}
 
 ffi::Error Exchange(cudaStream_t stream, int32_t ordinal, ffi::AnyBuffer x, ffi::Result<ffi::AnyBuffer> y,
                     int64_t item, ffi::Span<const int64_t> seg_off, ffi::Span<const int64_t> seg_len,
@@ -66,10 +74,10 @@ ffi::Error Exchange(cudaStream_t stream, int32_t ordinal, ffi::AnyBuffer x, ffi:
   return Enqueue(stream, slot, x, y->untyped_data(), item, seg_off, seg_len, seg_round, seg_send, seg_recv, dst, src);
 }
 
-ffi::Error Enqueue(cudaStream_t stream, int slot, ffi::AnyBuffer x, void* recv, int64_t item,
-                   ffi::Span<const int64_t> seg_off, ffi::Span<const int64_t> seg_len,
-                   ffi::Span<const int32_t> seg_round, ffi::Span<const int64_t> seg_send,
-                   ffi::Span<const int64_t> seg_recv, ffi::Span<const int32_t> dst, ffi::Span<const int32_t> src) {
+ffi::Error EnqueueRaw(cudaStream_t stream, int slot, const void* send, size_t total, void* recv, int64_t item,
+                      ffi::Span<const int64_t> seg_off, ffi::Span<const int64_t> seg_len,
+                      ffi::Span<const int32_t> seg_round, ffi::Span<const int64_t> seg_send,
+                      ffi::Span<const int64_t> seg_recv, ffi::Span<const int32_t> dst, ffi::Span<const int32_t> src) {
   const int P = g_comms.nranks, r = g_comms.rank[slot];
   const size_t R = dst.size() / P, nseg = seg_off.size();
   if (dst.size() != R * P || src.size() != R * P || seg_len.size() != nseg || seg_round.size() != nseg ||
@@ -82,11 +90,10 @@ ffi::Error Enqueue(cudaStream_t stream, int slot, ffi::AnyBuffer x, void* recv, 
     if (ns < 0 || nr < 0 || ns > seg_len[j] || nr > seg_len[j])
       return ffi::Error::InvalidArgument("fjx grouped exchange: a shard's length outside its segment");
   }
-  const size_t total = x.size_bytes();
   if (item <= 0 || total % item != 0)
     return ffi::Error::InvalidArgument("fjx grouped exchange: the buffer is no whole number of items");
   const size_t batch = total / item;
-  const char* sb = static_cast<const char*>(x.untyped_data());
+  const char* sb = static_cast<const char*>(send);
   char* rb = static_cast<char*>(recv);
   ncclComm_t comm = g_comms.comm[slot];
   ncclGroupStart();
@@ -155,6 +162,107 @@ ffi::Error Done(cudaStream_t stream, int32_t ordinal, ffi::AnyBuffer y, ffi::Any
   return ffi::Error::Success();
 }
 
+// The same exchange with buffers of our own (lane ocean_speed2; ifs_jax's IFX_SL_EARLY form, sync_waits lane):
+// StartOwned copies x into this device's send buffer of the call site `tag` (on XLA's stream, before the ready
+// event), the shard's own stream waits for that event and NCCL receives into the call site's receive buffer;
+// DoneOwned makes XLA's stream wait for the end and copies the receive buffer into its result. No buffer XLA can see
+// is read or written after the start returns, so XLA may copy, move or reuse x and the token as it likes. A call
+// site's next start (the next step of a loop) comes after its done in XLA's stream order, and its NCCL work after
+// that start's copy: the buffers are free again. Buffers grow on demand (cudaMalloc, kept). Both take any number of
+// further operands they do not read (`deps`): XLA then schedules the start after those values (e.g. a synchronous
+// exchange it must not delay) and the done after the work it should overlap.
+struct Owned {
+  std::vector<void*> send, recv;
+  std::vector<size_t> size;
+};
+std::vector<Owned> g_owned;
+
+ffi::Error OwnedBuffers(int slot, int32_t ordinal, int tag, size_t bytes, void** send, void** recv) {
+  if (g_owned.size() < g_comms.device.size()) g_owned.resize(g_comms.device.size());
+  Owned& o = g_owned[slot];
+  if (o.size.size() <= static_cast<size_t>(tag)) {
+    o.send.resize(tag + 1, nullptr);
+    o.recv.resize(tag + 1, nullptr);
+    o.size.resize(tag + 1, 0);
+  }
+  if (o.size[tag] < bytes) {
+    int prev = 0;
+    if (cudaGetDevice(&prev) != cudaSuccess || cudaSetDevice(ordinal) != cudaSuccess)
+      return ffi::Error::Internal("fjx grouped start (owned): cannot select the device");
+    if (o.send[tag]) cudaFree(o.send[tag]);
+    if (o.recv[tag]) cudaFree(o.recv[tag]);
+    o.send[tag] = o.recv[tag] = nullptr;
+    o.size[tag] = 0;
+    if (cudaMalloc(&o.send[tag], bytes) != cudaSuccess || cudaMalloc(&o.recv[tag], bytes) != cudaSuccess)
+      return ffi::Error::Internal("fjx grouped start (owned): cannot allocate " + std::to_string(bytes) + " bytes");
+    o.size[tag] = bytes;
+    cudaSetDevice(prev);
+  }
+  *send = o.send[tag];
+  *recv = o.recv[tag];
+  return ffi::Error::Success();
+}
+
+ffi::Error StartOwned(cudaStream_t stream, int32_t ordinal, ffi::AnyBuffer x, ffi::RemainingArgs deps,
+                      ffi::Result<ffi::AnyBuffer> token,
+                      int64_t item, ffi::Span<const int64_t> seg_off, ffi::Span<const int64_t> seg_len,
+                      ffi::Span<const int32_t> seg_round, ffi::Span<const int64_t> seg_send,
+                      ffi::Span<const int64_t> seg_recv, ffi::Span<const int32_t> dst, ffi::Span<const int32_t> src,
+                      int32_t tag) {
+  const int slot = Slot(ordinal);
+  if (slot < 0 || tag < 0)
+    return ffi::Error::Internal("fjx grouped start (owned): no communicator for device " + std::to_string(ordinal));
+  Async& a = g_async[slot];
+  if (a.comm == nullptr || a.ready.size() <= static_cast<size_t>(tag)) {
+    int prev = 0;
+    if (cudaGetDevice(&prev) != cudaSuccess || cudaSetDevice(ordinal) != cudaSuccess)
+      return ffi::Error::Internal("fjx grouped start (owned): cannot select the device");
+    if (a.comm == nullptr && cudaStreamCreateWithFlags(&a.comm, cudaStreamNonBlocking) != cudaSuccess)
+      return ffi::Error::Internal("fjx grouped start (owned): cannot create the stream");
+    while (a.ready.size() <= static_cast<size_t>(tag)) {
+      cudaEvent_t r, d;
+      if (cudaEventCreateWithFlags(&r, cudaEventDisableTiming) != cudaSuccess ||
+          cudaEventCreateWithFlags(&d, cudaEventDisableTiming) != cudaSuccess)
+        return ffi::Error::Internal("fjx grouped start (owned): cannot create the events");
+      a.ready.push_back(r);
+      a.done.push_back(d);
+    }
+    cudaSetDevice(prev);
+  }
+  void *sb = nullptr, *rb = nullptr;
+  ffi::Error e = OwnedBuffers(slot, ordinal, tag, x.size_bytes(), &sb, &rb);
+  if (e.failure()) return e;
+  if (cudaMemcpyAsync(sb, x.untyped_data(), x.size_bytes(), cudaMemcpyDeviceToDevice, stream) != cudaSuccess)
+    return ffi::Error::Internal("fjx grouped start (owned): cannot copy the send buffer");
+  if (cudaEventRecord(a.ready[tag], stream) != cudaSuccess || cudaStreamWaitEvent(a.comm, a.ready[tag], 0) != cudaSuccess)
+    return ffi::Error::Internal("fjx grouped start (owned): cannot order the stream after XLA's");
+  e = EnqueueRaw(a.comm, slot, sb, x.size_bytes(), rb, item, seg_off, seg_len, seg_round, seg_send, seg_recv, dst, src);
+  if (e.failure()) return e;
+  if (cudaEventRecord(a.done[tag], a.comm) != cudaSuccess)
+    return ffi::Error::Internal("fjx grouped start (owned): cannot record the end");
+  return ffi::Error::Success();
+}
+
+ffi::Error DoneOwned(cudaStream_t stream, int32_t ordinal, ffi::AnyBuffer token, ffi::RemainingArgs deps,
+                     ffi::Result<ffi::AnyBuffer> out, int32_t tag) {
+  const int slot = Slot(ordinal);
+  if (slot < 0 || tag < 0 || g_async[slot].done.size() <= static_cast<size_t>(tag) ||
+      g_owned.size() <= static_cast<size_t>(slot) || g_owned[slot].size.size() <= static_cast<size_t>(tag) ||
+      g_owned[slot].size[tag] < out->size_bytes())
+    return ffi::Error::Internal("fjx grouped done (owned): no exchange started under this tag");
+  if (cudaStreamWaitEvent(stream, g_async[slot].done[tag], 0) != cudaSuccess)
+    return ffi::Error::Internal("fjx grouped done (owned): cannot wait for the exchange");
+  if (cudaMemcpyAsync(out->untyped_data(), g_owned[slot].recv[tag], out->size_bytes(), cudaMemcpyDeviceToDevice,
+                      stream) != cudaSuccess)
+    return ffi::Error::Internal("fjx grouped done (owned): cannot copy the received buffer");
+  return ffi::Error::Success();
+}
+
+// A no-op that orders the schedule (lane ocean_speed2): its results alias its first operands (input_output_aliases),
+// the further operands are only taken, so XLA computes whatever reads the results after those operands (e.g. the work
+// an asynchronous exchange overlaps after the exchange's start, whose token is such an operand). No device work.
+ffi::Error Gate(ffi::RemainingArgs args, ffi::RemainingRets rets) { return ffi::Error::Success(); }
+
 }  // namespace
 
 XLA_FFI_DEFINE_HANDLER_SYMBOL(FjxGroupedStart, Start,
@@ -183,6 +291,34 @@ XLA_FFI_DEFINE_HANDLER_SYMBOL(FjxGroupedDone, Done,
                                   .Arg<ffi::AnyBuffer>()
                                   .Ret<ffi::AnyBuffer>()
                                   .Attr<int32_t>("tag"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(FjxGroupedStartOwned, StartOwned,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::DeviceOrdinal>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .RemainingArgs()
+                                  .Ret<ffi::AnyBuffer>()
+                                  .Attr<int64_t>("item")
+                                  .Attr<ffi::Span<const int64_t>>("seg_off")
+                                  .Attr<ffi::Span<const int64_t>>("seg_len")
+                                  .Attr<ffi::Span<const int32_t>>("seg_round")
+                                  .Attr<ffi::Span<const int64_t>>("seg_send")
+                                  .Attr<ffi::Span<const int64_t>>("seg_recv")
+                                  .Attr<ffi::Span<const int32_t>>("dst")
+                                  .Attr<ffi::Span<const int32_t>>("src")
+                                  .Attr<int32_t>("tag"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(FjxGroupedDoneOwned, DoneOwned,
+                              ffi::Ffi::Bind()
+                                  .Ctx<ffi::PlatformStream<cudaStream_t>>()
+                                  .Ctx<ffi::DeviceOrdinal>()
+                                  .Arg<ffi::AnyBuffer>()
+                                  .RemainingArgs()
+                                  .Ret<ffi::AnyBuffer>()
+                                  .Attr<int32_t>("tag"));
+
+XLA_FFI_DEFINE_HANDLER_SYMBOL(FjxGate, Gate, ffi::Ffi::Bind().RemainingArgs().RemainingRets());
 
 #define FJX_GROUPED_BINDING                              \
   ffi::Ffi::Bind()                                       \

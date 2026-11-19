@@ -138,6 +138,26 @@ def exch_join(items, exch):
         xs = ctx.exchange_multi([(b, k) for b, k, _, _ in blocks])
     else:
         xs = [exch(b, k) for b, k, _, _ in blocks]
+    return _unblock(items, blocks, xs)
+
+
+def _blocks(items):
+    """:func:`exch_join`'s blocks: the fields of one kind and dtype side by side (trailing axes flattened)."""
+    groups = {}
+    for i, (f, k) in enumerate(items):
+        groups.setdefault((k, jnp.result_type(f)), []).append(i)
+    blocks = []
+    for (k, _), idx in groups.items():
+        if len(idx) == 1:
+            blocks.append((items[idx[0]][0], k, idx, None))
+            continue
+        L = items[idx[0]][0].shape[0]
+        flat = [items[i][0].reshape(L, -1) for i in idx]
+        blocks.append((jnp.concatenate(flat, axis=1), k, idx, flat))
+    return blocks
+
+
+def _unblock(items, blocks, xs):
     out = [None] * len(items)
     for x, (_, _, idx, flat) in zip(xs, blocks):
         if flat is None:
@@ -148,6 +168,29 @@ def exch_join(items, exch):
             out[i] = x[:, o:o + f.shape[1]].reshape(items[i][0].shape)
             o += f.shape[1]
     return tuple(out)
+
+
+def exch_join_start(items, exch, tag: int, deps=()):
+    """:func:`exch_join` begun (``gpu.halo_async``, lane ocean_speed2): the same blocks in one grouped exchange on
+    the comm stream (:meth:`fesom_jax.halo.HaloCtx.exchange_multi_start`, call site ``tag``); returns a handle for
+    :func:`exch_join_done`, or None where it does not apply (no grouped transport with ``gpu.join_multi`` and
+    ``gpu.halo_async``, one device): then the caller exchanges as before. The same values as :func:`exch_join`."""
+    items = list(items)
+    ctx = _multi_ctx(exch)
+    if ctx is None or not joined_exchanges() or not items or not hasattr(ctx, "async_ok"):
+        return None
+    if not ctx.async_ok(sorted({k for _, k in items})):
+        return None
+    blocks = _blocks(items)
+    h = ctx.exchange_multi_start([(b, k) for b, k, _, _ in blocks], tag, tuple(deps))
+    return ctx, h, items, blocks
+
+
+def exch_join_done(handle, deps=()):
+    """The fields of :func:`exch_join_start`'s handle refreshed, in its items' order (the wait is here, after
+    ``deps``: arrays XLA must compute first)."""
+    ctx, h, items, blocks = handle
+    return _unblock(items, blocks, ctx.exchange_multi_done(h, tuple(deps)))
 
 
 def env_int(name: str, default: int = 0) -> int:
