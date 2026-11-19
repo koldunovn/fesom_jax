@@ -191,6 +191,13 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     # the EOS / N² / pressure gradient to the top of the step (with the node velocity's refresh), the mixing's
     # uvnode/Kv/Av refresh into the momentum advection's (forward only: the default adjoint config)
     _multi2 = _multi and ops.env_int("FESOM_JOIN_MULTI", 0) >= 2 and adjoint_cfg is None
+    # gpu.halo_async (FESOM_HALO_ASYNC, lane ocean_speed2; the grouped transport with gpu.join_multi, forward only):
+    # exchanges whose fields are read later STARTED on the comm stream and FINISHED where they are first read, the
+    # work between them overlapping the transfer (halo.HaloCtx.exchange_multi_start/done; the same values). Bit 1: the
+    # momentum join's U_c/V_c (and with join_multi 2 the mixing's uvnode/Kv/Av) over the momentum RHS, the advection's
+    # node exchange going alone; bit 2 (join_multi 2): the top join's N² and pressure gradient over the ice block, the
+    # node velocity going alone. 0 (default): the trace as before
+    _async = ops.env_int("FESOM_HALO_ASYNC", 0) if (_multi and adjoint_cfg is None and not remat_blocks) else 0
 
     # Nested in-step rematerialization (paper §3 NN-twin / any long-window adjoint). The
     # integrate() scan already wraps the WHOLE step in jax.checkpoint, so its backward stores
@@ -253,8 +260,23 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
                 mesh, density, Z3d_live, st.helem, batches=pgf_batches))()
         else:
             pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_linfs(mesh, hpressure))()
-        _uvn, bvfreq, pgf_x, pgf_y = ops.exch_join([(pp.compute_vel_nodes(mesh, st.uv), "nod"), (bvfreq, "nod"),
-                                                    (pgf_x, "elem"), (pgf_y, "elem")], _exch_j)
+        _th = None
+        if _async & 2:
+            # gpu.halo_async bit 2: the node velocity (ocean2ice reads it) alone, then N² and the pressure gradient
+            # started after it and finished after the ice block (below); the ice block's inputs gated on the start
+            _uvn = _exch(pp.compute_vel_nodes(mesh, st.uv), "nod")
+            _th = ops.exch_join_start([(bvfreq, "nod"), (pgf_x, "elem"), (pgf_y, "elem")], _exch_j, 2, deps=(_uvn,))
+            if _th is None:
+                bvfreq, pgf_x, pgf_y = ops.exch_join([(bvfreq, "nod"), (pgf_x, "elem"), (pgf_y, "elem")], _exch_j)
+            else:
+                from . import halo_grouped as _hg
+                _gk = [k for k in ("a_ice", "m_ice") if getattr(st, k, None) is not None]
+                _g = _hg.gate((_uvn,) + tuple(getattr(st, k) for k in _gk), (_th[1][1].token,))
+                _uvn = _g[0]
+                st = dataclasses.replace(st, **dict(zip(_gk, _g[1:])))
+        else:
+            _uvn, bvfreq, pgf_x, pgf_y = ops.exch_join([(pp.compute_vel_nodes(mesh, st.uv), "nod"), (bvfreq, "nod"),
+                                                        (pgf_x, "elem"), (pgf_y, "elem")], _exch_j)
         _topx = (density, hpressure, bvfreq, pgf_x, pgf_y, _uvn)
     if step_forcing is not None:
         # Atmospheric-forcing seam (Params.forcing_adj): the anomalies enter the forcing itself, ahead of every consumer
@@ -326,6 +348,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             heat_flux, water_flux = sfx.heat_flux, sfx.water_flux
             stress_node_surf = sfx.stress_node_surf
 
+    if _topx is not None and _async & 2 and _th is not None:
+        # (gpu.halo_async bit 2: the wait for N² and the pressure gradient, after the ice block's results)
+        _deps = tuple(jax.tree.leaves(ice_out)) if ice_out is not None else (stress_surf,)
+        bvfreq, pgf_x, pgf_y = ops.exch_join_done(_th, deps=_deps)
+        _topx = (_topx[0], _topx[1], bvfreq, pgf_x, pgf_y, _topx[5])
     # Surface-flux adjustment seam (Params.surface_adj): ONE place after the ice / no-ice
     # branches join, before EOS, mixing (TKE reads stress_node_surf, KPP heat_flux) and the
     # momentum/tracer consumers. None ⇒ a dead branch (nothing traced).
@@ -526,9 +553,23 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         # element refresh sent with the momentum advection's node exchange (one grouped call); stage 2 below
         _vt, _vUc, _vVc = momentum.bidiff_stage1(mesh, st.uv, visc_cfg if visc_cfg is not None
                                                  else momentum._DEFAULT_VISC)
+        if _async & 1:
+            # gpu.halo_async bit 1: U_c/V_c (+ the mixing's uvnode/Kv/Av) started here, finished after the momentum
+            # RHS (below); the RHS's inputs gated on the start, so its advection's node part runs beside the transfer
+            _vbox["h"] = ops.exch_join_start([(_vUc, "elem"), (_vVc, "elem")] + (
+                [(uvnode, "nod"), (Kv, "nod"), (Av, "elem")] if _mix_late else []), _exch_j, 1)
+            if _vbox["h"] is not None:
+                from . import halo_grouped as _hg
+                _guv, _gwe = _hg.gate((st.uv, st.w_e), (_vbox["h"][1][1].token,))
+                st = dataclasses.replace(st, uv=_guv, w_e=_gwe)
+            else:
+                del _vbox["h"]
 
         def _exch_mom(f, kind):
             if kind != "nod" or "pre" in _vbox:
+                return _exch(f, kind)
+            if "h" in _vbox:                     # (gpu.halo_async: the advection's node exchange alone)
+                _vbox["pre"] = None
                 return _exch(f, kind)
             extra = [(uvnode, "nod"), (Kv, "nod"), (Av, "elem")] if _mix_late else []
             out = ops.exch_join([(f, kind), (_vUc, "elem"), (_vVc, "elem")] + extra, _exch_j)
@@ -541,6 +582,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
         is_first_step=is_first_step, dt=dt, exch=_exch_mom,
         press_air=getattr(step_forcing, "press_air", None),
         **({} if cavity_cfg is None else {"cavity": True})))()
+    if "h" in _vbox:                             # (gpu.halo_async bit 1: the wait, after the momentum RHS)
+        _out = ops.exch_join_done(_vbox.pop("h"), deps=(uv_rhs, uv_rhsAB))
+        _vbox["pre"] = (_vt, _out[0], _out[1])
+        if _mix_late:
+            _vbox["mix"] = tuple(_out[2:5])
     if _mix_late:
         if "mix" not in _vbox:
             raise AssertionError("gpu.join_multi 2: the momentum advection made no node exchange")

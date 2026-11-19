@@ -378,8 +378,62 @@ def _lanes_first_call(fields, static, dates, cache, kw):
     if mk not in cache:
         cache[mk] = _put_host(np.array([d[3] for d in dates], np.int32) - 1, rep)
     fl = fields if prelaned_enabled() else gather(fields, idx_d)     # (FESOM_CPL_FORCING_PRELANED: the sender's)
+    if forcing_one_enabled():
+        from .. import halo_grouped
+        if halo_grouped._mesh_key is not None:            # (the fusion cut's custom call is registered)
+            ok = ("lanes_first_one", bool(jra55.FORCE_ROTATION)) + tuple(sorted(kw2.items()))
+            if ok not in cache:
+                P_ = PartitionSpec
+                L = int(idx_d.shape[0]) // int(mesh.devices.size)
+                body = functools.partial(_flux_one_body, rotate=bool(jra55.FORCE_ROTATION), **dict(kw2, n=L))
+                sm = jax.shard_map(body, mesh=mesh, in_specs=(P_("p"), P_(), P_("p"), P_(), P_(None, "p"),
+                                                              P_(None, "p"), P_(), P_("p")),
+                                   out_specs=P_(None, "p"), check_vma=False)
+                cache[ok] = jax.jit(sm, out_shardings=sh_tl)
+            return cache[ok](fl, cache[mk], trig_l, M, sss_l, chl_l, sc, pad)
     return _flux_seq_lean(fl, cache[mk], trig_l, M, sss_l, chl_l, sc, pad, rotate=bool(jra55.FORCE_ROTATION),
                           assemble=cache[ak], **kw2)
+
+
+def forcing_one_enabled() -> bool:
+    """``gpu.cpl_forcing_one`` (``FESOM_CPL_FORCING_ONE=1``, lane ocean_speed2 on JUPITER; with cpl_forcing_lean +
+    cpl_forcing_lanes, dist_N, the grouped transport): the lanes-first build's eight programs (m1b a1 m2 a2 m3 a3
+    enth_mb assemble) as ONE program over the lanes (shard_map), the stages' results passed through a no-op custom
+    call (fesom_jax.halo_grouped.gate) between a product stage and a sum stage: XLA fuses nothing across a custom
+    call, so no product meets its sum in a fusion (no FMA contraction), as with the separate programs; every stage's
+    operations on the same values, element by element. Saves seven dispatches (~0.4 ms each of the ocean's Python
+    thread, the device idle between them) an interval."""
+    import os
+    return os.environ.get("FESOM_CPL_FORCING_ONE", "0").strip() not in ("", "0")
+
+
+def _cut(tree):
+    """``tree`` through :func:`fesom_jax.halo_grouped.gate` (no device work; a fusion boundary)."""
+    from .. import halo_grouped
+    leaves, tdef = jax.tree.flatten(tree)
+    return jax.tree.unflatten(tdef, list(halo_grouped.gate(tuple(leaves), ())))
+
+
+def _flux_one_body(fields, months, trig, M, sss_clim, chl_clim, scalars, pad, *, T, n, runoff, single, rotate,
+                   has_tsk):
+    """:func:`forcing_one_enabled`: one device's lanes (``n`` = its lanes) of :func:`_flux_seq_lean` + the
+    assembly, the stages cut apart by :func:`_cut`."""
+    m1b, a1, m2, a2, m3, a3, enth_mb = _lean_stages()
+    rot = None
+    if rotate:
+        pairs = [(fields["taux_oce"], fields["tauy_oce"]), (fields["taux_ico"], fields["tauy_ico"])]
+        x = _cut(m1b(pairs, trig, T=T))
+        x = _cut(a1(x))
+        x = _cut(m2(x, M))
+        x = _cut(a2(x))
+        x = _cut(m3(x, trig))
+        rot = _cut(a3(x))
+    enth = None
+    if runoff == "coupled":
+        lf, mega = scalars
+        enth = _cut(enth_mb(fields["calv_oce"], lf, mega, T=T, single=single))
+    return _assemble_pad(fields, rot, enth, months, sss_clim, chl_clim, pad, T=T, n=n, runoff=runoff, single=single,
+                         has_tsk=has_tsk)
 
 
 def _flux_seq_staged(fields, months, trig, M, sss_clim, chl_clim, *, T, n, runoff, single, rotate, has_tsk,

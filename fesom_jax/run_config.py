@@ -157,7 +157,8 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
             "fct_flux_barrier": "FESOM_FCT_FLUX_BARRIER", "o2a_surface": "FESOM_O2A_SURFACE",
             "o2a_lanes_surface": "FESOM_O2A_LANES_SURFACE",
             "mevp_wide_barrier": "FESOM_MEVP_WIDE_BARRIER", "cpl_forcing_lean": "FESOM_CPL_FORCING_LEAN",
-            "cpl_forcing_lanes": "FESOM_CPL_FORCING_LANES", "join_multi": "FESOM_JOIN_MULTI"}
+            "cpl_forcing_lanes": "FESOM_CPL_FORCING_LANES", "join_multi": "FESOM_JOIN_MULTI",
+            "halo_async": "FESOM_HALO_ASYNC", "cpl_forcing_one": "FESOM_CPL_FORCING_ONE"}
 # Lane ocean_speed2 (performance only, off when absent; configs/core3_cpl.yaml has the measurements):
 # `ice_mm_sum3` (an integer 1-4: the association; 4 = the Triton order behind a barrier) the ice FCT mass-matrix
 # element sum (ice_adv._mm_times); `ice_fct_extreme` the ice FCT cluster bounds as ordered gathers
@@ -180,6 +181,13 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
 # gradients, hnode_new + w, T/S + helem. `join_multi: 2` also moves the EOS / N² / pressure gradient to the top of
 # the step (their refresh with the first node velocity's) and the mixing's uvnode/Kv/Av refresh into the momentum
 # advection's (forward only).
+# Lane ocean_speed2 (JUPITER): `halo_async` (an integer bit mask; with the grouped transport and join_multi, forward
+# only) exchanges started where their fields are ready and finished where they are first read, on a stream of their
+# own beside the compute (fesom_jax.halo_grouped.exchange_multi_start/done; the same values): 1 the momentum join's
+# U_c/V_c (+ uvnode/Kv/Av) over the momentum RHS, 2 (join_multi 2) the top join's N² / pressure gradient over the
+# ice block. `cpl_forcing_one` (with cpl_forcing_lanes, the grouped transport) the coupled forcing build's eight
+# programs as one, its product and sum stages cut apart by a no-op custom call (fesom_jax.coupled.flux.
+# forcing_one_enabled; the same values).
 # `serial_halo_skip`: on one device every halo exchange returns its field (the one-device maps are the identity,
 # checked on the host): fesom_jax.halo.serial_skip_enabled; the same bits, no all_gather and permutation gather.
 # `cpl_forcing_jit` (coupled ocean, mode F): the interval's forcing build and the monthly sums as compiled programs
@@ -196,7 +204,8 @@ _GPU_ENV = {"halo_compact": "FESOM_HALO_COMPACT", "column_unroll": "FESOM_COLUMN
 # (ice_ave_steps > 1): each step's ice update branch is fixed at trace time from the cycle's phase, no lax.cond and
 # no host sync a step (run_steps_sharded_forced ice_phase, FESOM_ICE_STATIC).
 _GPU_INT = ("mevp_wide", "cg_batch", "mevp_unroll", "forcing_procs", "forcing_ahead", "se_wide", "se_unroll",
-            "step_unroll", "chunk_tail", "ice_scatter_fuse", "cg_prefix", "potit_unroll", "ice_mm_sum3", "join_multi")
+            "step_unroll", "chunk_tail", "ice_scatter_fuse", "cg_prefix", "potit_unroll", "ice_mm_sum3", "join_multi",
+            "halo_async")
 # `chunk_tail` (an integer q >= 0): a chunk shorter than the chunk length whose length is a multiple of q runs as
 # q-chunks (run.split_tails, FESOM_CHUNK_TAIL): one compiled length less where month ends leave 2q.
 _GPU_STR = ("bgc_layout", "bgc_halo")        # string-valued switches, passed through as written
