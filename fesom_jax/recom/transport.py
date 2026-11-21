@@ -150,17 +150,30 @@ def _over_stack(fn, arrays, axes):
 
 
 def bgc_advect_redi(mesh, X, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_new, zbar3_live, Z3d_live,
-                    gm_diag, dt, exch, ckpt, adj, helem_flux=None, legacy_fct_bounds: bool = False):
+                    gm_diag, dt, exch, ckpt, adj, helem_flux=None, legacy_fct_bounds: bool = False,
+                    tracer_names=None):
     """The first half of the BGC tracer stage: FCT advection (the T* reconstruction included) + the explicit Redi
     terms, halo-refreshed after the advection. Returns ``(X_adv, X_old_new)`` (``(nod2D, nl, ntr)``); arguments as
-    :func:`bgc_transport`."""
+    :func:`bgc_transport`.
+
+    Gradient guard (plan 20261105, 2026-11-21): FESOM_RECOM_GRAD_FREEZE_FCT_LIMITER=<name>[,<name>...] freezes the
+    Zalesak limiter factors (``AdjointConfig.freeze_fct_limiter``'s operation) for the listed tracers only, by name in
+    ``tracer_names`` (the layout's names; :func:`recom_stage3` passes them). The global flag made the 60-day January
+    gradient diverge in the sinking DetCalc / DetSi (job 29136295); this cuts the limiter of one tracer (DSi, the
+    Argentine slope site of 29126302). Read at trace time; unset (the default), or without ``tracer_names``, or with
+    the global flag on, the traced program is unchanged. The forward is the same either way."""
     h_flux = helem if helem_flux is None else helem_flux
 
-    def one(x, x_old):
+    def make_one(freeze_limiter):
+        def one(x, x_old):
+            return _advect_redi_one(x, x_old, freeze_limiter)
+        return one
+
+    def _advect_redi_one(x, x_old, freeze_limiter):
         x_adv, x_old_new = ckpt(lambda: tracer_adv.advect_one_fct(
             mesh, uv_adv, w_e_adv, h_flux, hnode, hnode_new, x, x_old, dt=dt, exch=exch,
             Z3d=Z3d_live, zbar3=zbar3_live, w_i=w_i,
-            freeze_limited_flux=adj.freeze_advection, freeze_limiter=adj.freeze_fct_limiter,
+            freeze_limited_flux=adj.freeze_advection, freeze_limiter=freeze_limiter,
             legacy_fct_bounds=legacy_fct_bounds))()
         x_adv = exch(x_adv, "nod")
         if gm_diag is not None:
@@ -173,7 +186,22 @@ def bgc_advect_redi(mesh, X, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode
                          mesh, x, gm_diag.slope_tapered, gm_diag.Ki, hnode, hnode_new, helem, dt=dt))())
         return x_adv, x_old_new
 
-    return _over_stack(one, (X, X_old), (-1, -1))
+    sel = [e.strip() for e in os.environ.get("FESOM_RECOM_GRAD_FREEZE_FCT_LIMITER", "").split(",") if e.strip()]
+    if not sel or tracer_names is None or adj.freeze_fct_limiter:
+        return _over_stack(make_one(adj.freeze_fct_limiter), (X, X_old), (-1, -1))
+    names = list(tracer_names)
+    unknown = [n for n in sel if n not in names]
+    if unknown:
+        raise ValueError(f"FESOM_RECOM_GRAD_FREEZE_FCT_LIMITER: unknown tracers {unknown}")
+    frz = [i for i, n in enumerate(names) if n in sel]
+    live = [i for i, n in enumerate(names) if n not in sel]
+    a_f, o_f = _over_stack(make_one(True), (X[..., frz], X_old[..., frz]), (-1, -1))
+    parts_a, parts_o, order = [a_f], [o_f], frz
+    if live:
+        a_l, o_l = _over_stack(make_one(False), (X[..., live], X_old[..., live]), (-1, -1))
+        parts_a, parts_o, order = [a_f, a_l], [o_f, o_l], frz + live
+    inv = np.argsort(np.asarray(order))
+    return (jnp.concatenate(parts_a, axis=-1)[..., inv], jnp.concatenate(parts_o, axis=-1)[..., inv])
 
 
 def bgc_diffuse(mesh, X_adv, *, Kv_eff, hnode_new, Z3d_new, bc, dt, exch, ckpt, sp_estimate: bool = False):
@@ -242,7 +270,7 @@ def recom_stage3(mesh, X1, X_old, *, uv_adv, w_e_adv, w_i, helem, hnode, hnode_n
     X_adv, X_old_new = bgc_advect_redi(
         mesh, X1, X_old, uv_adv=uv_adv, w_e_adv=w_e_adv, w_i=w_i, helem=helem, hnode=hnode, hnode_new=hnode_new,
         zbar3_live=zbar3_live, Z3d_live=Z3d_live, gm_diag=gm_diag, dt=dt, exch=exch, ckpt=ckpt, adj=adj,
-        helem_flux=helem_flux, legacy_fct_bounds=legacy_fct_bounds)
+        helem_flux=helem_flux, legacy_fct_bounds=legacy_fct_bounds, tracer_names=tracer_layout.names)
     bc = surface_bc(sfc, dt, tracer_layout)
     ratio = jnp.where(hnode_new > 0.0, hnode / jnp.where(hnode_new > 0.0, hnode_new, 1.0), 0.0)[..., None]
 

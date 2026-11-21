@@ -679,6 +679,48 @@ def test_FCT_frozen_limiter_keeps_the_forward_and_cuts_only_the_factor_derivativ
     np.testing.assert_array_equal(g_env, g1)
 
 
+def test_bgc_freeze_fct_limiter_per_tracer(mesh, fct_chain, monkeypatch):
+    """FESOM_RECOM_GRAD_FREEZE_FCT_LIMITER=<names> (plan 20261105, 2026-11-21): the BGC advection freezes the limiter
+    factors of the listed tracers only. The forward is the same (to the ulp of re-batching); the listed tracer's gradient is the frozen one
+    (``freeze_limiter=True``), the others' the live one; unset is the default program's result; unknown names fail."""
+    from fesom_jax.adjoint_stab import AdjointConfig
+    from fesom_jax.recom import transport
+    st = fct_chain["st"]
+    Tin, Told, uv, w = _sharp_case(mesh, fct_chain)
+    X = jnp.stack([Tin, 2.0 * Tin - 5.0, 0.5 * Tin + 1.0], axis=-1)
+    X_old = jnp.stack([Told] * 3, axis=-1)
+    names = ("DIN", "DSi", "DetSi")
+    wv = jnp.asarray(np.random.RandomState(23).randn(*X.shape))
+
+    def run(x):
+        return transport.bgc_advect_redi(
+            mesh, x, X_old, uv_adv=uv, w_e_adv=w, w_i=None, helem=st.helem, hnode=st.hnode,
+            hnode_new=fct_chain["hnode_new"], zbar3_live=None, Z3d_live=None, gm_diag=None, dt=DT,
+            exch=lambda a, kind: a, ckpt=lambda f: f, adj=AdjointConfig(), tracer_names=names)[0]
+
+    def vjp():
+        out, f = jax.vjp(run, X)
+        return np.asarray(out), np.asarray(f(wv)[0])
+
+    monkeypatch.delenv("FESOM_RECOM_GRAD_FREEZE_FCT_LIMITER", raising=False)
+    out0, g0 = vjp()
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FCT_LIMITER", "DSi")
+    out1, g1 = vjp()
+    # the same forward; DSi is batched alone, so XLA may round it differently (1 ulp seen)
+    np.testing.assert_allclose(out1, out0, rtol=2e-15, atol=0)
+    for i in (0, 2):
+        np.testing.assert_allclose(g1[..., i], g0[..., i], rtol=0, atol=1e-12 * np.abs(g0[..., i]).max())
+    wv1 = np.asarray(wv[..., 1])
+    f1 = lambda T: tracer_adv.advect_one_fct(mesh, uv, w, st.helem, st.hnode, fct_chain["hnode_new"],  # noqa: E731
+                                             T, Told, dt=DT, freeze_limiter=True)[0]
+    g_frz = np.asarray(jax.vjp(f1, X[..., 1])[1](jnp.asarray(wv1))[0])
+    np.testing.assert_allclose(g1[..., 1], g_frz, rtol=0, atol=1e-12 * np.abs(g_frz).max())
+    assert not np.allclose(g1[..., 1], g0[..., 1])
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_FCT_LIMITER", "DSi,Silicate")
+    with pytest.raises(ValueError):
+        run(X)
+
+
 def test_FCT_frozen_limiter_is_the_derivative_where_the_limiter_is_off(mesh, fct_chain):
     """Where the limiter does not bind, its factors are the constant 1 and freezing them
     leaves the derivative: at the probes of test_FCT_gradient_finite_and_fd the frozen-limiter
