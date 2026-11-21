@@ -127,6 +127,10 @@ class OceanStatic:
     _views: dict = dataclasses.field(default_factory=dict)   # the jitted lanes -> global gathers (dist_N)
     _fjit: dict = dataclasses.field(default_factory=dict)    # gpu.cpl_forcing_jit: the compiled forcing builds
     _mon_add: Any = None                                     # ... and the monthly sums' compiled addition
+    # None, or monthly_writer(static, (year, month), n_samples, sums): the month's sums (the stream of sample_fn, on
+    # the devices, folded lanes) handed to another writer instead of the stores below (awicm_jax lane c1279_out: the
+    # Zarr v3 output in global order); called on the thread that drives the ocean, the sums are not used afterwards
+    monthly_writer: Any = None
 
     @property
     def nod2D(self) -> int:
@@ -554,6 +558,10 @@ def flush_monthly(static: OceanStatic) -> str | None:
     if static._mon_sum is None or static.monthly_out is None:
         return None
     (yr, mo), cnt = static._mon_key, static._mon_count
+    if static.monthly_writer is not None:
+        sums = static._mon_sum
+        static._mon_key, static._mon_sum, static._mon_count = None, None, 0
+        return static.monthly_writer(static, (yr, mo), cnt, sums)
     mean = jax.tree.map(lambda x: x / cnt, static._mon_sum)
     path = f"{static.monthly_out}/{yr:04d}_{mo:02d}"
     if os.environ.get("FESOM_CPL_MONTHLY_LAYOUT", "global") == "folded" and static.npes > 1:
