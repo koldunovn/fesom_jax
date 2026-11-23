@@ -99,6 +99,13 @@ def rings(elem_nodes, owned_nodes: np.ndarray, K: int, nod2D: int | None = None)
     nodes[front] = True
     elems = np.zeros(en.shape[0], dtype=bool)
     e1 = prev = None
+    # FESOM_RINGS_FAST (awicm_jax lane c1279_start, default on): the new elements / nodes of a ring made unique
+    # with a scratch index (last occurrence kept) instead of np.unique's sort (NG5 dist_128: ~29 s of every ocean
+    # process's start in the 2 x 128 calls, job 3078725). Only the sets matter here (the masks; the id lists come
+    # from them at the end): the same rings.
+    fast = os.environ.get("FESOM_RINGS_FAST", "1") != "0"
+    if fast:
+        sc_e, sc_n = _scratch("e", en.shape[0]), _scratch("n", nod2D)
     for j in range(K):
         if j == K - 1:
             prev = nodes.copy()
@@ -106,17 +113,44 @@ def rings(elem_nodes, owned_nodes: np.ndarray, K: int, nod2D: int | None = None)
         tot = int(cnt.sum())
         if tot:
             idx = np.repeat(ptr[front] - np.cumsum(cnt) + cnt, cnt) + np.arange(tot)
-            ne = np.unique(n2e[idx])
-            ne = ne[~elems[ne]]
+            if fast:
+                ne = n2e[idx]
+                ne = _first_unique(ne[~elems[ne]], sc_e)
+            else:
+                ne = np.unique(n2e[idx])
+                ne = ne[~elems[ne]]
         else:
             ne = np.zeros(0, np.int64)
         elems[ne] = True
         if j == 0:
             e1 = elems.copy()
-        v = np.unique(en[ne].ravel())
-        front = v[~nodes[v]]
+        if fast:
+            v = en[ne].ravel()
+            front = _first_unique(v[~nodes[v]], sc_n)
+        else:
+            v = np.unique(en[ne].ravel())
+            front = v[~nodes[v]]
         nodes[front] = True
     return np.nonzero(nodes)[0], np.nonzero(elems)[0], e1, prev
+
+
+_SCRATCH = {}
+
+
+def _scratch(kind, n):
+    a = _SCRATCH.get(kind)
+    if a is None or a.size < n:
+        a = _SCRATCH[kind] = np.empty(n, np.int64)
+    return a
+
+
+def _first_unique(a, scratch):
+    """The distinct values of the int array `a` (non-negative, < scratch.size), in no particular order."""
+    if a.size < 2:
+        return a
+    pos = np.arange(a.size)
+    scratch[a] = pos
+    return a[scratch[a] == pos]
 
 
 def _rings_sweep(en, owned_nodes, K: int, nod2D: int):
