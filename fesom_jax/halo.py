@@ -363,17 +363,44 @@ def compact_exchange_maps(src_dev, src_lane, field_len=None):
     if field_len is not None:
         Lmax = int(field_len)
     remote = src_dev != np.arange(P)[:, None]
-    uniq = [np.unique(src_lane[remote & (src_dev == d)]) for d in range(P)]
-    S = max(1, max(u.size for u in uniq))
-    send = np.zeros((P, S), dtype=np.int32)
-    for d, u in enumerate(uniq):
-        send[d, :u.size] = u
-    read = src_lane.astype(np.int32).copy()
-    for e in range(P):
-        for d in range(P):
-            m = remote[e] & (src_dev[e] == d)
-            if m.any():
-                read[e, m] = Lmax + d * S + np.searchsorted(uniq[d], src_lane[e, m])
+    mode = os.environ.get("FESOM_COMPACT_MAPS_FAST", "1")
+    if mode != "0":
+        # (awicm_jax lane c1279_start, default on) the same send / read without the P x P loop over lanes (NG5
+        # dist_128: ~25 s of every ocean process's start, job 3078725): the remote (device, lane) pairs made unique
+        # once, sorted by device then lane = each device's sorted lane set; a remote entry's slot is its pair's rank
+        # within its device's set (searchsorted's answer). Integer index arithmetic: identical tables.
+        sel = remote & (src_dev >= 0) & (src_dev < P)
+        dv = src_dev[sel].astype(np.int64)
+        ln = src_lane[sel].astype(np.int64)
+        lmin = int(ln.min()) if ln.size else 0
+        span = int(ln.max()) - lmin + 1 if ln.size else 1
+        keys, inv = np.unique(dv * span + (ln - lmin), return_inverse=True)
+        kd = keys // span
+        cnt = np.bincount(kd, minlength=P)
+        S_f = max(1, int(cnt.max()) if cnt.size else 0)
+        start = np.concatenate([[0], np.cumsum(cnt)[:-1]])
+        send_f = np.zeros((P, S_f), dtype=np.int32)
+        send_f[kd, np.arange(keys.size) - start[kd]] = keys % span + lmin
+        read_f = src_lane.astype(np.int32).copy()
+        read_f[sel] = Lmax + dv * S_f + (inv.reshape(-1) - start[dv])
+    if mode == "0" or mode == "check":
+        uniq = [np.unique(src_lane[remote & (src_dev == d)]) for d in range(P)]
+        S = max(1, max(u.size for u in uniq))
+        send = np.zeros((P, S), dtype=np.int32)
+        for d, u in enumerate(uniq):
+            send[d, :u.size] = u
+        read = src_lane.astype(np.int32).copy()
+        for e in range(P):
+            for d in range(P):
+                m = remote[e] & (src_dev[e] == d)
+                if m.any():
+                    read[e, m] = Lmax + d * S + np.searchsorted(uniq[d], src_lane[e, m])
+        if mode == "check":
+            assert S == S_f and np.array_equal(send, send_f) and np.array_equal(read, read_f), \
+                "FESOM_COMPACT_MAPS_FAST=check: the fast maps differ"
+            print(f"FESOM_COMPACT_MAPS_FAST=check: equal (P {P}, S {S})", flush=True)
+    else:
+        S, send, read = S_f, send_f, read_f
     if field_len is None:
         # halo_exchange_compact gives an own-device lane that does not read itself lane 0's value
         other = ~remote & (src_lane != np.arange(Lmax)[None, :])
