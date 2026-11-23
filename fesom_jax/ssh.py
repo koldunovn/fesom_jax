@@ -363,6 +363,17 @@ def partition_ssh_operator(op: SSHOperator, partition) -> ShardedSSHOperator:
 
     sel_rows, sel_cols, sel_sv, sel_pv, nnz = [], [], [], [], []
     diag_PL = np.full((P, Lmax_nod), 1.0, dtype=np.float64)
+    # FESOM_SSH_PART_FAST (awicm_jax lane c1279_start, default on): each device's entries found from its rows' CSR
+    # ranges (the operator's rows are sorted: build_ssh_operator's CSR), not by mapping all entries per device --
+    # NG5 dist_128: 79 s of every ocean process's start (job 3078725) for 128 x 2 gathers over all entries. The
+    # same entries in the same (global) order: the arrays are identical. =0: the loop below; =check: both, compared.
+    mode = os.environ.get("FESOM_SSH_PART_FAST", "1")
+    if mode != "0" and rows_g.size and bool(np.all(rows_g[1:] >= rows_g[:-1])):
+        fast = _partition_ssh_fast(rows_g, cols_g, sv_g, pv_g, diag_g, nonzero, N, P, Lmax_nod, partition, op.cheb)
+        if mode != "check":
+            return fast[0]
+    else:
+        fast = None
     for d in range(P):
         ml = np.asarray(partition.myList_nod2D[d])
         md = int(partition.myDim_nod2D[d])
@@ -400,10 +411,66 @@ def partition_ssh_operator(op: SSHOperator, partition) -> ShardedSSHOperator:
         sv_PL[d, :k] = sel_sv[d]
         pv_PL[d, :k] = sel_pv[d]
 
-    return ShardedSSHOperator(
+    out = ShardedSSHOperator(
         rows=rows_PL, cols=cols_PL, stiff_vals=sv_PL, precond_vals=pv_PL,
         diag=diag_PL, P=P, nnz_max=nnz_max, Lmax_nod=Lmax_nod, cheb=op.cheb,
     )
+    if fast is not None:                       # FESOM_SSH_PART_FAST=check
+        for k in ("rows", "cols", "stiff_vals", "precond_vals", "diag"):
+            a, b = getattr(fast[0], k), getattr(out, k)
+            assert a.dtype == b.dtype and a.shape == b.shape and np.array_equal(a, b), k
+        assert fast[0].nnz_max == out.nnz_max
+        print(f"FESOM_SSH_PART_FAST=check: the fast partition equals the loop's (P {P}, nnz_max {nnz_max})",
+              flush=True)
+    return out
+
+
+def _partition_ssh_fast(rows_g, cols_g, sv_g, pv_g, diag_g, nonzero, N, P, Lmax_nod, partition, cheb):
+    """partition_ssh_operator's arrays from each device's rows' CSR ranges (rows_g sorted). Returns
+    (ShardedSSHOperator,) -- a tuple, so the caller can tell it from None; partition_ssh_operator returns [0]."""
+    indptr = np.searchsorted(rows_g, np.arange(N + 1))
+    g2l = np.full(N, -1, dtype=np.int64)
+    per = []
+    diag_PL = np.full((P, Lmax_nod), 1.0, dtype=np.float64)
+    for d in range(P):
+        ml = np.asarray(partition.myList_nod2D[d]).astype(np.int64)
+        md = int(partition.myDim_nod2D[d])
+        n_local = ml.size
+        g2l[ml] = np.arange(n_local)
+        if int(np.count_nonzero(g2l[ml] == np.arange(n_local))) != n_local:   # (a repeated node: the loop's way)
+            raise RuntimeError("FESOM_SSH_PART_FAST: a device's node list repeats a node (FESOM_SSH_PART_FAST=0)")
+        st = indptr[ml]
+        cnt = indptr[ml + 1] - st
+        tot = int(cnt.sum())
+        e = np.repeat(st - np.concatenate([[0], np.cumsum(cnt)[:-1]]), cnt) + np.arange(tot)
+        e.sort()                                       # the entries of the device's rows in the global order
+        rl = g2l[rows_g[e]]
+        cl = g2l[cols_g[e]]
+        dropped_nonzero = (rl < md) & (cl < 0) & nonzero[e]
+        if dropped_nonzero.any():
+            raise ValueError(
+                f"partition_ssh_operator: device {d} drops "
+                f"{int(dropped_nonzero.sum())} NONZERO owned-row operator entries "
+                f"(column outside the node halo) — the SSH stencil exceeds the node "
+                f"halo; the local matvec would be incomplete on owned rows."
+            )
+        keep = cl >= 0
+        ek = e[keep]
+        per.append((rl[keep].astype(np.int32), cl[keep].astype(np.int32), sv_g[ek].astype(np.float64),
+                    pv_g[ek].astype(np.float64)))
+        diag_PL[d, :n_local] = diag_g[ml]
+        g2l[ml] = -1
+    nnz = [x[0].size for x in per]
+    nnz_max = int(max(nnz))
+    rows_PL = np.zeros((P, nnz_max), dtype=np.int32)
+    cols_PL = np.zeros((P, nnz_max), dtype=np.int32)
+    sv_PL = np.zeros((P, nnz_max), dtype=np.float64)
+    pv_PL = np.zeros((P, nnz_max), dtype=np.float64)
+    for d, (r, c, a, b) in enumerate(per):
+        k = r.size
+        rows_PL[d, :k], cols_PL[d, :k], sv_PL[d, :k], pv_PL[d, :k] = r, c, a, b
+    return (ShardedSSHOperator(rows=rows_PL, cols=cols_PL, stiff_vals=sv_PL, precond_vals=pv_PL,
+                               diag=diag_PL, P=P, nnz_max=nnz_max, Lmax_nod=Lmax_nod, cheb=cheb),)
 
 
 def local_ssh_operator(sop: ShardedSSHOperator, d: int) -> SSHOperator:
