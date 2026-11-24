@@ -10114,3 +10114,22 @@ Three findings from the spectral fork's sharded and gradient gates, one afternoo
    the round-off of a different program) and freed the room for the fast `major` BGC layout: reverse 423 s against
    865 for a CORE2 day, peaks 57.4 GiB (28972957). Without block remat neither layout fits (65-70 GiB single
    allocations, 28972958-59). In a sharded loop, read every peak per device: an imbalance points at an unsharded put.
+
+### 2026-11-24 (branch recom-spectral, the CORE2 REcoM gradient) — a forcing reader that clamps instead of failing: two weeks of gradient windows ran under one frozen record
+
+1. **The JRA reader holds one year and clamps outside it.** `jra55._Field` shifts the file's time axis to the year
+   the reader was opened for, and `_getcoeffld` returns the first or last record for a date before or after it
+   ("no extrapolation", as the C). `run.py` rolls the reader with `reopen_year` at every year change. The REcoM
+   gradient, horizon and column-dump drivers built the forcing for `--year` (the run's start year, 1998) and stepped
+   restarts dated 2000, so every step of every window got the 31 December record: no diurnal cycle, no season, a
+   southern midsummer noon over the Pacific sector for 60 days. Nothing failed. The costs were finite and stable, the
+   1-day checks on a 1998 restart were right, and the adjoint agreed with finite differences of the same wrong forward.
+2. **It showed only in the state, not in the gradient diagnostics.** The reverse traces gave sites; the column dumps
+   were read for near-zero tracers and mask switches, tracer by tracer. T, S and ice were in every dump and nobody
+   printed them. The July dump 29232468 did: the Ross Sea ice-free at 7.9 C in August, Hudson Strait freezing, the
+   East Australian Current at 28.6 C. Read the physical state of a burst site before its tracers, and check that a
+   forward driver written beside the run driver reproduces a few days of the run driver's state (a restart-to-restart
+   comparison) before tuning anything on it.
+3. **Fix at the trap, not at the callers.** `SurfaceForcing.step_forcing` now rolls the reader to the date's year
+   (4abe9b0; a no-op for the run driver). A silent clamp on an out-of-range date is the hazard; a reader asked for
+   another year should serve it or raise.
