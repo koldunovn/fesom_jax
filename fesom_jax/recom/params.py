@@ -97,7 +97,7 @@ NAMELIST_GROUPS = {
             'c_co2_phaeo', 'c_co2_calc', 'd_co2_phy', 'd_co2_dia', 'd_co2_cocco', 'd_co2_phaeo', 'd_co2_calc',),
     "pairon": ('Fe2N', 'Fe2N_benthos', 'kScavFe', 'kScavFe2', 'dust_sol', 'RiverFeConc',),
     "pacalc": ('calc_prod_ratio', 'calc_diss_guts', 'calc_diss_rate', 'calc_diss_rate2', 'calc_diss_omegac',
-            'calc_diss_exp', 'k_din_calc',),
+            'calc_diss_exp', 'k_din_calc', 'calc_scale_cocco', 'calc_on_net_cocco',),
     "pabenthos_decay_rate": ('decayRateBenN', 'decayRateBenC', 'decayRateBenSi', 'q_NC_Denit',),
     "paco2_flux_param": ('permil', 'permeg', 'Xacc', 'CO2_for_spinup',),
     "paalkalinity_restoring": ('surf_relax_Alk',),
@@ -109,7 +109,7 @@ NAMELIST_GROUPS = {
     # forcing group of gen_surface_forcing.F90:118-144; darwin_bbphy(4) is read as darwin_bbphy(1)..(4)
     "spectral": ('RECOM_CDOM', 'RECOM_MARSHALL', 'RECOM_RADTRANS', 'OASIM', 'RECOM_BMASS', 'RECOM_CALC_ACDOM',
             'RECOM_CALC_APART', 'RECOM_CALC_APHYT', 'RECOM_CALC_REFLEC', 'RECOM_CO2LIM_SPECTRAL',
-            'DAR_NONSPECTRAL_BACKSCATTERING_RATIO',
+            'DAR_NONSPECTRAL_BACKSCATTERING_RATIO', 'cdom_remin_dic',
             'darwin_bbphy(1)', 'darwin_bbphy(2)', 'darwin_bbphy(3)', 'darwin_bbphy(4)', 'QYmax', 'QYmax_d',
             'QYmax_cocco', 'QYmax_phaeo', 'cdomcoeff', 'bb_to_b', 'bb_bg443', 'bb_bg_slope', 'aphyt_slope_phy',
             'aphyt_icept_phy', 'aphyt_slope_dia', 'aphyt_icept_dia', 'aphyt_slope_cocco', 'aphyt_icept_cocco',
@@ -400,6 +400,7 @@ class RecomParams(NamedTuple):
     res_ovf_c: float = -1.0             # fork :487
     res_ovf_p: float = -1.0             # fork :488
     k_din_calc: float = -1.0            # fork :568 [mmol N m-3], -1 = off
+    calc_scale_cocco: float = 1.0       # fork 84ad0b5c &pacalc: factor on the coccolithophore PIC production
     darwin_bbphy_1: float = 0.0020      # fork :719 darwin_bbphy(tnabp) = (/0.0020, 0.0105, 0.0200, 0.0020/)
     darwin_bbphy_2: float = 0.0105
     darwin_bbphy_3: float = 0.0200
@@ -499,6 +500,8 @@ class RecomSwitches:
     par_layer_mean: bool = False        # fork :283 default .true. (FORK_DEFAULTS): the exact layer-mean broadband PAR
     res_phy_const: bool = False         # fork :336
     ovf_to_cdom: bool = True            # fork :478
+    calc_on_net_cocco: bool = False     # fork 84ad0b5c &pacalc: PIC production on max(0, Cphot_cocco - phyRespRate_cocco)
+    cdom_remin_dic: bool = False        # fork cb446565 &spectral: the CDOM sinks credited to DIC, O2 consumed at redO2C
     RECOM_CDOM: bool = True             # fork :613
     RECOM_MARSHALL: bool = False        # fork :614
     RECOM_RADTRANS: bool = True         # fork :615

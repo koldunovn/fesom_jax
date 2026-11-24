@@ -174,6 +174,12 @@ What this means:
   writes a 2.8 view of a 2.6 restart. 2.8 output masks the levels below the bottom with `_FillValue` 9.97e36 (2.6
   wrote 0); `compare_fortran_jax.py` fills them with 0.
 - Production runs (`21e0d02a` on 2.6) differ from this branch by the 11 REcoM commits and by the whole host change.
+- The 2.6 branch after `21e0d02a` (to `84ad0b5c`, 2026-11-20; none of it on `fesom2.8_recom_spectral` `a89bb3d6`): all
+  options off by default and stated bit-identical there. Ported (2026-11-24, `test_recom_fork_options.py`, checked
+  against the budgets the commits state, no Fortran twin with them on): `&pacalc calc_scale_cocco`,
+  `calc_on_net_cocco` (`84ad0b5c`) and `&spectral cdom_remin_dic` (`cb446565`). Not ported, so a namelist that sets
+  them raises `KeyError`: `mort_phy` / `mort_d` / `mort_c` / `mort_p` / `mort_light` (`4d96c3aa`), `ice_light_transm`
+  (`e4d41f5`), `ice_light_physical` and its four constants (`4c55725`), `npp_net_ovf` (`b2f780e`, diagnostic only).
 
 ### The CORE2 warm 1998 pair on 2.8 (compared 2026-11-03)
 

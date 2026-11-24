@@ -25,7 +25,9 @@ What differs from 692f804, all of it in this module:
 * ``tiny_Si = tiny_C_d / SiCmax`` (S:362; 692f804 multiplies), no ``kScavFe2`` term in the iron sink (S:6320-6321), the DOC sms assembled in two steps (S:5783-5810);
 * CDOM (``Layout.cdom``, S:6493-6538, F:1031): fixed constants :data:`FCDOM`, :data:`RHO_CDOM`,
   :data:`PHOT_CDOM`, :data:`KPHOT_CDOM` (``module REcoM_spectral``, M:2678-2681), the DOC ``(1 - fcdom)``
-  factor and the overflow split ``ovf_to_cdom``.
+  factor and the overflow split ``ovf_to_cdom``;
+* the fork's 2026-11-19/20 options (84ad0b5c, cb446565; S = that commit's ``recom_sms.F90``): ``calc_scale_cocco`` and
+  ``calc_on_net_cocco`` (S:4494-4499), ``cdom_remin_dic`` (S:6579-6585). Off / 1.0 by default, the values unchanged.
 
 Switch values this port assumes (the fork's ``tmp_run_kdind15``, checked by :func:`check_fork_switches`):
 ``enable_3zoo2det``, ``Grazing_detritus``, ``REcoM_Grazing_Variable_Preference``, ``het_resp_noredfield``,
@@ -562,7 +564,13 @@ def recom_sms_fork(state, temp, sali, carb: CarbCache, thick, zbar, nlev, surf_s
         PICPOCCO2 = co2_effect(hco3c, co2c, phc, p.a_co2_calc, p.b_co2_calc, p.c_co2_calc, p.d_co2_calc, p.Cunits)
         kdc = jnp.where(p.k_din_calc >= 0.0, p.k_din_calc, p.k_din_c)
         PICPOCN = jnp.maximum(TINY, -0.31 * (DIN / (DIN + kdc)) + 1.31)
-        calcification = 1.0 * Cphot_cocco * CoccoC * PICPOCtemp * PICPOCN
+        # fork 84ad0b5c (S:4494-4499): calc_scale_cocco (default 1.0, the old literal) and, with calc_on_net_cocco,
+        # the PIC production on net photosynthesis
+        if sw.calc_on_net_cocco:
+            calcification = (p.calc_scale_cocco * jnp.maximum(0.0, Cphot_cocco - phyRespRate_cocco) * CoccoC
+                             * PICPOCtemp * PICPOCN)
+        else:
+            calcification = p.calc_scale_cocco * Cphot_cocco * CoccoC * PICPOCtemp * PICPOCN
         calcification = calcification * PICPOCCO2                               # CO2lim
         calc_loss_agg = aggregationRate * PhyCalc
         aux = recipQuota_cocco / (CoccoC + TINY) * PhyCalc
@@ -888,6 +896,13 @@ def recom_sms_fork(state, temp, sali, carb: CarbCache, thick, zbar, nlev, surf_s
                + p.lossC_z2 * Zoo2C
                + p.lossC_z3 * MicZooC) * dt_b
         s[L.icdom] = (-RHO_CDOM * arrFunc * cdomC - cdom_photo_rate * cdomC) * dt_b + FCDOM * src
+        if sw.cdom_remin_dic:
+            # fork cb446565 (S:6579-6585): the two CDOM sinks go to DIC and consume O2 at redO2C, like the DOC
+            # remineralisation; off (the default), that carbon leaves the model. The O2 term enters sms(ioxy)
+            # before the overflow respiration's and before the main O2 expression (S:6677-6699).
+            cdom_sink = (RHO_CDOM * arrFunc + cdom_photo_rate) * cdomC
+            s[L.idic] = s[L.idic] + cdom_sink * dt_b
+            oxy_cdom = -cdom_sink * REDO2C * dt_b
     # carbon overflow (S:6545-6579): the rates are 0 unless the switch values are set
     ovfFlux = ovfRate * PhyC + ovfRate_dia * DiaC
     s[L.iphyc] = s[L.iphyc] - ovfRate * PhyC * dt_b
@@ -910,6 +925,8 @@ def recom_sms_fork(state, temp, sali, carb: CarbCache, thick, zbar, nlev, surf_s
         s[L.iphac] = s[L.iphac] - ovrRate_phaeo * PhaeoC * dt_b
     s[L.idic] = s[L.idic] + ovrFlux * dt_b
     oxy_ovr = -ovrFlux * REDO2C * dt_b
+    if cdom and sw.cdom_remin_dic:
+        oxy_ovr = oxy_cdom + oxy_ovr
     s[L.ioxy] = (+Cphot * PhyC + Cphot_dia * DiaC
                  + ((Cphot_cocco * CoccoC) if coccos else z0) + ((Cphot_phaeo * PhaeoC) if coccos else z0)
                  - phyRespRate * PhyC - phyRespRate_dia * DiaC
