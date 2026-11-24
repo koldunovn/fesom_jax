@@ -365,6 +365,13 @@ class SurfaceForcing:
         HOST. The readers already return host numpy, so ``xp=np`` is a pure host op — used by
         the run driver so a big-mesh per-chunk stack is never staged on GPU 0 (the NG5 forcing
         OOM: a global ``[n_steps, nod2D]`` stack is ~2.65 GB/field at 7.4 M × 48 steps)."""
+        # The reader holds ONE year: its time axis is shifted to the year it was opened for, and a date outside it
+        # is clamped to the first or last record (jra55._getcoeffld, "no extrapolation"). A caller that built the
+        # forcing for the run's start year and asks for a later year (a restart of year 3 with ``year`` = the
+        # start year, as the REcoM gradient drivers did until 2026-11-24) therefore got the 31 December record
+        # at every step. Roll the reader to the date's year; a no-op when it already holds it (the run driver).
+        if int(year) != getattr(self.jra, "year", int(year)):
+            self.jra.reopen_year(int(year))
         f = self.jra.step(int(year), int(day), float(sec), point_slope=self.point_slope)
         return StepForcing(
             u_air=xp.asarray(f.u_wind), v_air=xp.asarray(f.v_wind),
