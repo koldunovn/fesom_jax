@@ -20,6 +20,7 @@ import jax.numpy as jnp
 
 from . import ops
 from .config import DENSITY_0, G
+from .ale import elem_bottom_interface
 from .mesh import Mesh
 
 
@@ -77,7 +78,8 @@ def _drho_dz(R0, Rm, Rp, Z0, Zm, Zp, Zn):
     return lin + curv * ((Zn - Z0) + (Zn - Zm))
 
 
-def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem, *, batches: int = 1):
+def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem, *, batches: int = 1,
+                                linfs: bool = False):
     """Shchepetkin density-Jacobian PGF (substep 3 under zstar; ``fesom_eos.c:348-503``).
     ``(pgf_x, pgf_y)`` element layer fields ``[elem2D, nl]`` from the node density anomaly
     ``density_m_rho0 = ρ − ρ0`` ``[nod2D, nl]``, the live per-node mid-depths ``Z_3d_n``
@@ -103,12 +105,20 @@ def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem, *, bat
     own ``jax.checkpoint`` inside a ``lax.map``. Forward values are those of ``batches=1`` to
     rounding (other XLA fusions: 2e-18 on pi, not bitwise); the backward holds one block's
     ``[elem2D/batches, 3, nl]`` stencil temporaries at a time instead of all of them (farc:
-    ~37 GiB of the ~80 GiB one-step VJP peak)."""
+    ~37 GiB of the ~80 GiB one-step VJP peak).
+
+    ``linfs=True``: FESOM2's ``pressure_force_4_linfs_shchepetkin`` (``oce_ale_pressure_bv.F90:796-1040``), the PGF
+    of linfs with partial cells (FESOM2 refuses the full-cell PGF there). It drops the slope term ``⟨∂_zρ⟩·∂ₓZ`` on
+    every element layer except the bottom one (and the top one of a cavity element): with the static linfs geometry
+    ``Z_3d_n`` is the same at the three vertices there, so the term is zero up to rounding, and FESOM2 does not form
+    it."""
     en = mesh.elem_nodes                                   # (elem2D,3)
     elem = dict(en=en, ulev=mesh.ulevels, nlev=mesh.nlevels, gs=mesh.gradient_sca,
-                zbot=mesh.zbar[mesh.nlevels - 1], emask=mesh.elem_layer_mask, hel_in=helem)
+                zbot=elem_bottom_interface(mesh), emask=mesh.elem_layer_mask, hel_in=helem)
     nod = (density_m_rho0, Z_3d_n, jnp.asarray(mesh.ulevels_nod2D), jnp.asarray(mesh.nlevels_nod2D))
     nl = mesh.zbar.shape[0]
+    if linfs:
+        elem["linfs"] = True
     if batches <= 1:
         return _shchepetkin_elems(nod, nl, **elem)
     ne = en.shape[0]
@@ -121,13 +131,14 @@ def pressure_force_shchepetkin(mesh: Mesh, density_m_rho0, Z_3d_n, helem, *, bat
             x = jnp.concatenate([x, x[:pad]], axis=0)
         return x.reshape((batches, size) + x.shape[1:])
 
-    one = jax.checkpoint(lambda e: _shchepetkin_elems(nod, nl, **e))
+    flags = {k: elem.pop(k) for k in ("linfs",) if k in elem}
+    one = jax.checkpoint(lambda e: _shchepetkin_elems(nod, nl, **e, **flags))
     px, py = jax.lax.map(one, {k: blocks(v) for k, v in elem.items()})
     return (px.reshape((batches * size,) + px.shape[2:])[:ne],
             py.reshape((batches * size,) + py.shape[2:])[:ne])
 
 
-def _shchepetkin_elems(nod, nl, *, en, ulev, nlev, gs, zbot, emask, hel_in):
+def _shchepetkin_elems(nod, nl, *, en, ulev, nlev, gs, zbot, emask, hel_in, linfs=False):
     """:func:`pressure_force_shchepetkin` on the elements whose per-element arrays are given:
     vertices ``en``, level indices ``ulev``/``nlev``, shape-function gradients ``gs``, static
     bottom interface ``zbot``, layer mask ``emask``, thickness ``hel_in``; ``nod`` = (ρ−ρ0,
@@ -182,8 +193,15 @@ def _shchepetkin_elems(nod, nl, *, en, ulev, nlev, gs, zbot, emask, hel_in):
     dz_dy = gy[:, 0:1] * Zd[:, 0] + gy[:, 1:2] * Zd[:, 1] + gy[:, 2:3] * Zd[:, 2]
 
     fac = hel * g * inv_r                                  # helem·g/ρ0 (0 below bottom)
-    aux_x = (drho_dx - mdz * dz_dx) * fac
-    aux_y = (drho_dy - mdz * dz_dy) * fac
+    if linfs:
+        # pressure_force_4_linfs_shchepetkin: the slope term only on the bottom layer (and a cavity element's top)
+        kk = k[:, 0, :]
+        slope = (kk == bot_e[:, 0, :]) | ((kk == surf_e[:, 0, :]) & (ulev > 1)[:, None])
+        aux_x = jnp.where(slope, drho_dx - mdz * dz_dx, drho_dx) * fac
+        aux_y = jnp.where(slope, drho_dy - mdz * dz_dy, drho_dy) * fac
+    else:
+        aux_x = (drho_dx - mdz * dz_dx) * fac
+        aux_y = (drho_dy - mdz * dz_dy) * fac
     # vertical integral: pgf[k] = Σ_{j<k} aux_j + ½ aux_k = cumsum_incl(aux) − ½ aux.
     pgf_x = jnp.cumsum(aux_x, axis=1) - 0.5 * aux_x
     pgf_y = jnp.cumsum(aux_y, axis=1) - 0.5 * aux_y

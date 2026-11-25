@@ -217,6 +217,12 @@ def main():
 
     mesh_dir = args.mesh_dir or cfg.mesh          # None ⇒ the packaged pi mesh (mesh: null)
     mesh = load_mesh(mesh_dir) if mesh_dir is not None else load_mesh(); _lap("load_mesh")
+    if cfg.use_partial_cell:        # FESOM2 partial bottom cells: before the partition, sharded mesh, SSH operator, IC
+        from fesom_jax import partial_cells
+        mesh = partial_cells.apply(mesh, thresh=float(cfg.partial_cell_thresh)); _lap("partial_cells")
+        if _IS_LEAD:
+            print(f"[run] partial cells (thresh {cfg.partial_cell_thresh} m): bottom thickness "
+                  f"min {float(partial_cells.bottom_elem_thickness(mesh).min()):.2f} m", flush=True)
     part = _build_partition(mesh, cfg.partition, args.dist_dir or mesh_dir); _lap("partition")
     if cfg.lane_order():            # the lanes inside the shards in a cache-friendly order (global ids unchanged)
         from fesom_jax.lane_order import edge_lane_distance, reorder_lanes

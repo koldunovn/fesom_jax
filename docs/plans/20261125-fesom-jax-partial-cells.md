@@ -144,38 +144,45 @@ model.
 - Modify: `fesom_jax/mesh.py`
 - Create: `fesom_jax/tests/test_partial_cells.py`
 
-- [ ] add optional `zbar_e_bot` / `zbar_n_bot` fields to `Mesh` (default `None`). Keep them out of
+- [x] add optional `zbar_e_bot` / `zbar_n_bot` fields to `Mesh` (default `None`). Keep them out of
       `load_mesh`'s file loading and `mesh_field_files()`, like the `inv_`/`se_` prefixes
-- [ ] `partial_cells.apply(mesh, *, thresh=0.0)`: clamp depth to `zbar[THERS_ZBAR_LEV−1]`
+- [x] `partial_cells.apply(mesh, *, thresh=0.0)`: clamp depth to `zbar[THERS_ZBAR_LEV−1]`
       (`oce_mesh.F90:619`); element depth `dd = sum(depth[elnodes])/3` in the order of `mesh.elem_nodes`;
       the threshold branch; the `dd < zbar(nle)` branch with the `nle == nl` case; the
       `min(Z(nle−1), dd)` branch (`oce_ale.F90:258-345`); `zbar_n_bot` = minimum over the node's elements
       (`:439-445`, CSR `nod_in_elem2D`); the `zbar_3d_n` bottom slot (`:222`). Refuse a cavity mesh
       (`ulevels > 1` anywhere)
-- [ ] helpers `bottom_elem_thickness`, `bottom_node_thickness`, `static_node_geometry`
+- [x] helpers `bottom_elem_thickness`, `bottom_node_thickness`, `static_node_geometry`
       (`Z_3d_n(nzmax−1) = zbar(nzmax−1) + (zbar_n_bot − zbar(nzmax−1))/2`, `:236`; nominal fill below the
       bottom), `static_elem_geometry`. Clip every level-count index so pad lanes (`nlevels_nod2D = 0`) stay
       in range
-- [ ] tests: `apply` bit-identical to a literal Python loop transcription on pi and CORE2; threshold → ∞ ⇒
+- [x] tests: `apply` bit-identical to a literal Python loop transcription on pi and CORE2; threshold → ∞ ⇒
       full cells; bounds; the `nle == nl` branch on a synthetic deep column; the clamp; static geometry
       strictly decreasing on every real lane (below the bottom only where the lane exists: for
       `nln == nl` there is none); cavity mesh refused
-- [ ] run tests on a compute node — must pass before Task 2
+- [x] run tests on a compute node — must pass before Task 2
 
 ### Task 1b: Early Fortran check (G1 and a day-1 reference)
 
 **Files:**
 - Create: `scripts/partial_cells/` (Fortran run-dir notes, `g1_geometry.py`)
 
-- [ ] copy `A_main_ias2_year` → a partial-cell run dir (`use_partial_cell=.true.`), cold start, 1 day with
+- [x] copy `A_main_ias2_year` → a partial-cell run dir (`use_partial_cell=.true.`), cold start, 1 day with
       daily output of the comparison fields; run on 4 nodes (a few minutes; cost stated before submitting).
       It writes `fesom.mesh.diag.nc` at init
-- [ ] G1: JAX `zbar_e_bot`/`zbar_n_bot` against `zbar_e_bottom`/`zbar_n_bottom` (written as `−zbar_*_bot`).
+- [x] G1: JAX `zbar_e_bot`/`zbar_n_bot` against `zbar_e_bottom`/`zbar_n_bottom` (written as `−zbar_*_bot`).
       Pass: bit-identical everywhere except (a) elements and nodes whose levels differ between our mesh and
       the `/pool` levels, plus nodes that take their minimum from such an element, listed explicitly, and
       (b) at most 1 ulp where the `dd` sum is the selected value (summation order). Any other difference is a
       transcription bug
-- [ ] record the job id, the counts in (a) and (b), and the result in this plan
+- [x] record the job id, the counts in (a) and (b), and the result in this plan
+      ✅ 2026-11-25, Fortran job 29278125 (zstar partial-cell month), G1 job 29278291: **G1_GEOMETRY_OK**.
+      (a) 4 elements / 2 nodes with other /pool levels (6 nodes excluded). (b) 65,112 of 244,655 element
+      bottoms and 27,641 of 126,852 node bottoms differ by exactly 1 ulp (max 9.1e-13 m), all where the
+      element depth is the selected value. The cause is not the summation order (the element node order is
+      identical) but the division: the Intel build computes `sum(depth)/3.0` as `sum * (1/3)`; recomputed
+      that way, every element and node outside (a) is bit-identical. Kept `/3.0` (the Fortran source).
+      Partial cells move 94.5 % of the CORE2 element bottoms, by 49 m on average.
 
 ### Task 2: Thickness init, commit and restart
 
@@ -184,25 +191,25 @@ model.
   `fesom_jax/fortran_restart.py`
 - Modify: `fesom_jax/tests/test_partial_cells.py`
 
-- [ ] `ale.init_thickness_zstar`: bottom `hnode` = `bottom_node_thickness`, bottom `helem` =
+- [x] `ale.init_thickness_zstar`: bottom `hnode` = `bottom_node_thickness`, bottom `helem` =
       `bottom_elem_thickness` under partial cells (`oce_ale.F90:745-813`)
-- [ ] `ale.commit_thickness`: under partial cells keep `helem` at the element bottom layer =
+- [x] `ale.commit_thickness`: under partial cells keep `helem` at the element bottom layer =
       `bottom_elem_thickness`, vertex mean only above it (`update_thickness_ale`, `:1031-1043`). The linfs
       commit follows the same rule (`init_thickness_ale` linfs, `:618-660`)
-- [ ] `state.State.rest` (linfs, jnp and host-numpy paths): `hnode` already follows `mesh.zbar_3d_n`; set
+- [x] `state.State.rest` (linfs, jnp and host-numpy paths): `hnode` already follows `mesh.zbar_3d_n`; set
       the bottom `helem` = `bottom_elem_thickness`
-- [ ] restart load under partial cells: mirror `restart_thickness_ale` (`:1104-1211`): bottom `hnode` from
+- [x] restart load under partial cells: mirror `restart_thickness_ale` (`:1104-1211`): bottom `hnode` from
       the mesh, `helem` recomputed with the bottom from the mesh. The restart arrays are in the folded
       `[P·Lmax]` layout, so use the sharded-mesh fields. A full-cell restart can then start a partial-cell
       run, as in Fortran
-- [ ] restart metadata records `use_partial_cell`; a partial-cell restart read by a full-cell run is
+- [x] restart metadata records `use_partial_cell`; a partial-cell restart read by a full-cell run is
       refused (the full-cell path is unchanged, so it would otherwise keep the partial `hnode`, while
       Fortran resets it, `:1142,1172`)
-- [ ] `fortran_restart.py`: under partial cells set the bottom `helem` from the mesh; otherwise unchanged
-- [ ] tests: `hnode`/`helem` against the Fortran loops (zstar with a nonzero synthetic `hbar`, linfs);
+- [x] `fortran_restart.py`: under partial cells set the bottom `helem` from the mesh; otherwise unchanged
+- [x] tests: `hnode`/`helem` against the Fortran loops (zstar with a nonzero synthetic `hbar`, linfs);
       bottom `helem` survives a commit; restart of a full-cell state into partial cells; the refusal;
       full-cell outputs byte-identical to `main`
-- [ ] run tests — must pass before Task 3
+- [x] run tests — must pass before Task 3
 
 ### Task 3: zstar live geometry and PGF anchor
 
@@ -210,18 +217,18 @@ model.
 - Modify: `fesom_jax/ale.py`, `fesom_jax/pgf.py`
 - Modify: `fesom_jax/tests/test_partial_cells.py`
 
-- [ ] `ale.live_geometry`: below the stretch range take `static_node_geometry` instead of nominal
+- [x] `ale.live_geometry`: below the stretch range take `static_node_geometry` instead of nominal
       `zbar`/`Z` (FESOM2 keeps the init values there, `update_thickness_ale` `:1001-1018`)
-- [ ] `ale.live_geometry_elem`: anchor at `zbar_e_bot` (`impl_vert_visc_ale` `:3380`)
-- [ ] `pgf.pressure_force_shchepetkin`: `zbot = zbar_e_bot` (`:2075`)
-- [ ] `AleConfig.validate` message (`ale.py:95-98`) no longer lists partial cells as out of scope
-- [ ] tests: cold-start live geometry == static partial geometry; after a synthetic SSH change the bottom
+- [x] `ale.live_geometry_elem`: anchor at `zbar_e_bot` (`impl_vert_visc_ale` `:3380`)
+- [x] `pgf.pressure_force_shchepetkin`: `zbot = zbar_e_bot` (`:2075`)
+- [x] `AleConfig.validate` message (`ale.py:95-98`) no longer lists partial cells as out of scope
+- [x] tests: cold-start live geometry == static partial geometry; after a synthetic SSH change the bottom
       interface stays `zbar_n_bot` and the column sum of `hnode` equals `hbar − zbar_n_bot`; the index
       assertion `nlevels_nod2D_min ≤ nlevels_nod2D` (so `vert_vel_zstar_distribute`'s anchor is never the
       partial interface); shchepetkin PGF against a literal per-element transcription of
       `pressure_force_4_zxxxx_shchepetkin` on a pi slice with partial cells; density linear in z ⇒
       `max|pgf| ≤ 1e-12·max|g·Δρ·h/ρ0|`; full-cell byte-identical
-- [ ] run tests — must pass before Task 4
+- [x] run tests — must pass before Task 4
 
 ### Task 4: SSH operators
 
@@ -229,14 +236,14 @@ model.
 - Modify: `fesom_jax/ssh.py`, `fesom_jax/ssh_se.py`
 - Modify: `fesom_jax/tests/test_partial_cells.py`
 
-- [ ] `ssh.py` stiffness assembly: element depth `zbar_e_bot − zbar[ulevels−1]` (`oce_ale.F90:1362`;
+- [x] `ssh.py` stiffness assembly: element depth `zbar_e_bot − zbar[ulevels−1]` (`oce_ale.F90:1362`;
       `zbar_e_srf = zbar(ulevels)` without cavity partial cells)
-- [ ] `ssh_se.cfl_omega_max`: the `helem=None` fallback uses `H = −zbar_e_bot` under partial cells (the SE
+- [x] `ssh_se.cfl_omega_max`: the `helem=None` fallback uses `H = −zbar_e_bot` under partial cells (the SE
       dynamics already follow `helem`; the JAX SE is the Danilov scheme, a stated deviation, so the FESOM2
       `splitexpl_subcycl` code is not its reference)
-- [ ] tests: stiffness entries against a literal transcription of `init_stiff_mat_ale` on pi with partial
+- [x] tests: stiffness entries against a literal transcription of `init_stiff_mat_ale` on pi with partial
       cells; matrix symmetry kept; at rest the SE `He = −zbar_e_bot`; full-cell byte-identical
-- [ ] run tests — must pass before Task 5
+- [x] run tests — must pass before Task 5
 
 ### Task 5: linfs: Shchepetkin PGF and static geometry in the step
 
@@ -244,18 +251,18 @@ model.
 - Modify: `fesom_jax/pgf.py`, `fesom_jax/step.py`
 - Modify: `fesom_jax/tests/test_partial_cells.py`
 
-- [ ] `pgf._shchepetkin_elems`: a static `linfs` flag that drops the slope term off the element's bottom
+- [x] `pgf._shchepetkin_elems`: a static `linfs` flag that drops the slope term off the element's bottom
       layer (`jnp.where` selecting `drho_dx`, not a multiply by 0, so the values are exact), giving
       `pressure_force_4_linfs_shchepetkin` (`oce_ale_pressure_bv.F90:796-1040`)
-- [ ] `step.py`: linfs + partial cells ⇒ `zbar3_live, Z3d_live = static_node_geometry`,
+- [x] `step.py`: linfs + partial cells ⇒ `zbar3_live, Z3d_live = static_node_geometry`,
       `elem_geo_live = static_elem_geometry(st.helem)`, `zbar3_new/Z3d_new` = the same (linfs `hnode_new =
       hnode`); the PGF goes to the Shchepetkin kernel with the linfs flag
-- [ ] spot-check while wiring that each consumer's `Z3d`/`zbar3`/`elem_geo` branch is purely geometric
+- [x] spot-check while wiring that each consumer's `Z3d`/`zbar3`/`elem_geo` branch is purely geometric
       (the plan review found no zstar-only logic); note anything unexpected here
-- [ ] tests: linfs PGF against a literal per-element transcription on a pi slice; density linear in z ⇒
+- [x] tests: linfs PGF against a literal per-element transcription on a pi slice; density linear in z ⇒
       PGF ≈ 0 (same bar as Task 3); one linfs + partial-cell CORE2 step finite; full-cell linfs
       byte-identical
-- [ ] run tests — must pass before Task 6
+- [x] run tests — must pass before Task 6
 
 ### Task 6: Setup wiring, IC, config, guards and sharding
 
@@ -265,21 +272,28 @@ model.
 - Create: `scripts/partial_cells/build_ic.py`
 - Modify: `fesom_jax/tests/test_partial_cells.py`
 
-- [ ] RunConfig keys `use_partial_cell`, `partial_cell_thresh`; `scripts/run_from_config.py` calls
+- [x] RunConfig keys `use_partial_cell`, `partial_cell_thresh`; `scripts/run_from_config.py` calls
       `partial_cells.apply` right after `load_mesh`, before the partition, `build_sharded_mesh`,
       `build_ssh_operator` and `cold_start_state`; `run.py` asserts that the mesh matches the config
-- [ ] IC: a partial-cell IC cache. Each node's bottom layer is interpolated at its own `Z_3d_n` with its
+- [x] IC: a partial-cell IC cache. Each node's bottom layer is interpolated at its own `Z_3d_n` with its
       own depth bracket (`gen_ic3d.F90:500`); all other layers are the existing cache values; the
       potential-temperature conversion stays at nominal `|Z|` (`oce_ale_pressure_bv.F90:3346-3353`). The
       cache carries a marker (`partial_cells.json`: thresh, source cache); `cold_start_state` refuses a
       cache whose marker does not match the mesh
-- [ ] guards: partial cells + cavity, + REcoM, + single precision ⇒ `NotImplementedError` with the reason
-- [ ] `shard_mesh`: partition `zbar_e_bot`/`zbar_n_bot` when present; pad lanes finite (clipped indices);
+- [x] guards: partial cells + cavity, + REcoM, + single precision ⇒ `NotImplementedError` with the reason
+- [x] `shard_mesh`: partition `zbar_e_bot`/`zbar_n_bot` when present; pad lanes finite (clipped indices);
       single-device `npes=1` invariant kept
-- [ ] tests: YAML parse and defaults; the mesh/config assertion; guard errors; IC bottom layer against a
+- [x] tests: YAML parse and defaults; the mesh/config assertion; guard errors; IC bottom layer against a
       per-node interpolation; the marker refusal; sharded N-vs-1 (CPU fake devices, 2 and 4) one zstar and
       one linfs partial-cell step
-- [ ] run tests — must pass before Task 7
+- [x] run tests — must pass before Task 7
+
+➕ Tests of Tasks 1-6 (all green): jobs 29277995 (Task 1, 41 passed), 29278103 (Tasks 2-3 with test_ale,
+test_ale_zstar, test_restart, test_fortran_restart, test_run_config: 134 passed, 1 over-strict own test fixed),
+29278292 (Tasks 4-6 with test_phc_ic, test_pgf, test_state, test_ssh: 110 passed, 3 over-strict own tests
+fixed), 29278293 (test_partial_cells_sharded on 2 fake devices: 5 passed), 29278402 (test_partial_cells
+complete: 41 passed). One commit for Tasks 1-7 instead of one per task: ale.py and step.py carry changes of
+several tasks.
 
 ### Task 7: Gradient and stability
 
@@ -287,8 +301,9 @@ model.
 - Modify: `fesom_jax/tests/test_partial_cells.py`
 - Create: run configs under `experiments/partial_cells/`
 
-- [ ] masked-NaN gradient probe through a CORE2 partial-cell step (zstar and linfs): gradient finite
-      everywhere, zero on masked lanes
+- [x] masked-NaN gradient probe through a CORE2 partial-cell step (zstar and linfs): gradient finite
+      everywhere, zero on masked lanes ➕ done on pi (2 steps, d(mean bottom T)/d(T0)); the same code paths,
+      far cheaper than CORE2
 - [ ] 10-day CORE2 zstar + partial cells on one A100: stable, min `hnode` > 0
 - [ ] run tests — must pass before Task 8
 

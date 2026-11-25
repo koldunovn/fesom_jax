@@ -715,7 +715,8 @@ def cfl_omega_max(mesh, helem=None):
     en = np.asarray(mesh.elem_nodes)
     gs = np.asarray(mesh.gradient_sca).astype(np.float64)
     if helem is None:
-        H = -np.asarray(mesh.zbar).astype(np.float64)[np.asarray(mesh.nlevels) - 1]
+        H = (-np.asarray(mesh.zbar_e_bot, np.float64) if getattr(mesh, "zbar_e_bot", None) is not None   # partial cells
+             else -np.asarray(mesh.zbar).astype(np.float64)[np.asarray(mesh.nlevels) - 1])
     else:
         lm = np.asarray(mesh.elem_layer_mask)
         H = np.where(lm, np.asarray(helem, np.float64), 0.0).sum(axis=1)

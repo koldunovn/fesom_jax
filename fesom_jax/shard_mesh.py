@@ -68,6 +68,10 @@ ELEM_FIELDS = (
     "elem_layer_mask", "elem_iface_mask",
 )
 EDGE_FIELDS = ("edge_dxdy", "edge_cross_dxdy")
+# Optional entity fields, partitioned only when the mesh carries them: the partial bottom cells
+# (fesom_jax.partial_cells; None = full cells, so a full-cell sharded mesh is unchanged).
+OPTIONAL_NODE_FIELDS = ("zbar_n_bot",)
+OPTIONAL_ELEM_FIELDS = ("zbar_e_bot",)
 
 # Connectivity: (field, row_kind, value_kind) — gather rows by row_kind's myList,
 # remap the int VALUES from global to local via the value_kind's global→local map.
@@ -474,6 +478,11 @@ def build_sharded_mesh(mesh: Mesh, partition: Partition) -> ShardedMesh:
     for name in EDGE_FIELDS:
         arr = np.asarray(getattr(mesh, name))
         fields[name] = _gather_pad(arr, mylist["edge"], Lmax["edge"], _default_pad(arr.dtype))
+    for names, kind in ((OPTIONAL_NODE_FIELDS, "nod"), (OPTIONAL_ELEM_FIELDS, "elem")):
+        for name in names:
+            if getattr(mesh, name, None) is not None:
+                arr = np.asarray(getattr(mesh, name))
+                fields[name] = _gather_pad(arr, mylist[kind], Lmax[kind], _default_pad(arr.dtype))
     for name, row_kind, val_kind in CONN_FIELDS:
         fields[name] = _gather_pad_conn(
             getattr(mesh, name), mylist[row_kind], g2l[val_kind], Lmax[row_kind])

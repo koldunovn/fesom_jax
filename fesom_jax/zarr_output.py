@@ -374,6 +374,15 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
                              or int(mesh.elem2D) != int(new_part.elem2D)):
         raise ValueError("mesh and new_part disagree on global counts (nod2D/elem2D)")
 
+    # Partial cells (fesom_jax.partial_cells): a full-cell run refuses a partial-cell restart (its hnode/helem keep
+    # the partial bottom, while FESOM2 would reset them); a partial-cell run resets the bottom thicknesses from the
+    # mesh as FESOM2's restart_thickness_ale does (oce_ale.F90:1104-1211), so a full-cell restart can start it.
+    pc_mesh = mesh is not None and mesh.zbar_e_bot is not None
+    if mesh is not None and not pc_mesh and int(meta.get("use_partial_cell", 0)) == 1:
+        raise ValueError(f"restart {out_dir} was written with partial cells (use_partial_cell); this run uses full "
+                         "cells. Set use_partial_cell: true (with the same partial_cell_thresh) to continue it")
+    hnode_global = None
+
     _, Lmax = local_sizes(new_part)
     devs = halo.first_devices(new_part.npes) if devices is None else list(devices)
     if len(devs) < new_part.npes:
@@ -394,6 +403,10 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
             out[name] = None
             continue
         g = reconstruct_global(out_dir, name)            # [n_global, …] host numpy
+        if pc_mesh and name in ("hnode", "hnode_new", "helem"):
+            g = restart_thickness_partial_cells(name, g, mesh, hnode_global)
+            if name == "hnode":
+                hnode_global = g
         n0 = g.shape[0]
         if n0 == new_part.nod2D:
             ml, L = new_part.myList_nod2D, Lmax["nod"]
@@ -407,6 +420,34 @@ def read_restart(out_dir, mesh, new_part, *, devices=None):
             folded.shape, sharding, lambda idx, a=folded: a[idx])
         del g, folded                                    # bound host peak to ~one field
     return State(**out), meta
+
+
+def restart_thickness_partial_cells(name, g, mesh, hnode=None):
+    """FESOM2 ``restart_thickness_ale`` (``oce_ale.F90:1104-1211``) for partial cells, on a global host field:
+    ``hnode``/``hnode_new`` get ``bottom_node_thickness`` in the node's bottom layer; ``helem`` is the vertex mean of
+    the (corrected) ``hnode`` above the element's bottom layer and ``bottom_elem_thickness`` in it (the same
+    arithmetic as :func:`fesom_jax.ale.commit_thickness`). ``hnode`` must be passed for ``helem``."""
+    nl = g.shape[1]
+    zbar = np.asarray(mesh.zbar, np.float64)
+    out = np.array(g, np.float64, copy=True)
+    if name in ("hnode", "hnode_new"):
+        nln = np.asarray(mesh.nlevels_nod2D)
+        k = nln - 2
+        rows = np.arange(out.shape[0])
+        out[rows, k] = zbar[k] - np.asarray(mesh.zbar_n_bot, np.float64)
+        return out.astype(g.dtype)
+    if name != "helem":
+        raise ValueError(name)
+    if hnode is None:
+        raise ValueError("restart_thickness_partial_cells: helem needs the corrected hnode (read hnode first)")
+    en = np.asarray(mesh.elem_nodes)
+    hel = (hnode[en[:, 0]] + hnode[en[:, 1]] + hnode[en[:, 2]]) / 3.0
+    nlev = np.asarray(mesh.nlevels)
+    k = nlev - 2
+    rows = np.arange(hel.shape[0])
+    hel[rows, k] = zbar[k] - np.asarray(mesh.zbar_e_bot, np.float64)
+    lm = np.asarray(mesh.elem_layer_mask)
+    return np.where(lm, hel, 0.0).astype(g.dtype)
 
 
 # --------------------------------------------------------------------------

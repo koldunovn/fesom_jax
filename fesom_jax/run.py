@@ -391,6 +391,12 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     dt (a cycle run at a smaller dt, or the cycle after it) re-bootstraps AB2 on the first step, as after a
     ``dt_ramp``; a ``dt_ramp`` is refused (its step would restart the ramp)."""
     cfg.validate()
+    # partial cells live in the mesh (fesom_jax.partial_cells.apply, called by the driver right after load_mesh, before
+    # the partition, the sharded mesh, the SSH operator and the cold state are built): the config and the mesh must agree
+    if bool(cfg.use_partial_cell) != (mesh.zbar_e_bot is not None):
+        raise ValueError(f"use_partial_cell is {cfg.use_partial_cell} but the mesh "
+                         f"{'has' if mesh.zbar_e_bot is not None else 'has no'} partial cells: apply "
+                         "fesom_jax.partial_cells.apply(mesh, thresh=cfg.partial_cell_thresh) right after load_mesh")
     _t_entry = time.perf_counter()          # progress prints are relative to entry, not node uptime
     # Working precision (fesom_jax.precision): "double" leaves every program as it was; "single" repeats FESOM2's
     # single-precision build — the forcing in point-slope form (#940), the SP preconditioner variant (#995), the
@@ -728,11 +734,15 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
     # cost) so a coarse cadence (checkpoint_every steps) is <<1% overhead.
     target = out_dir if out_dir is not None else cfg.restart_out
 
+    # partial cells are recorded so a full-cell run refuses a partial-cell restart (zarr_output.read_restart)
+    _restart_attrs = {"use_partial_cell": int(mesh.zbar_e_bot is not None),
+                      "partial_cell_thresh": float(cfg.partial_cell_thresh)}
+
     def _write_restart_at(sp, step, dtv):
         yr, doy, _, _ = _chunk_dates(year, cfg.dt, step, 1, cfg.dt_ramp)[0]
         zarr_output.write_restart(target, sp, sm, part, step=step,
                                   calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv,
-                                  layout=restart_layout)
+                                  layout=restart_layout, attrs=_restart_attrs)
 
     # ARCHIVAL restart: a SEPARATE, immutable, never-overwritten directory per firing (calendar
     # boundary or end-of-run) — see the docstring. `restart_archive_out=None` ⇒ fully inert (no
@@ -742,7 +752,7 @@ def run_from_config(cfg: RunConfig, *, mesh, part, sm=None, sop=None, forcing=No
         tag = _archive_tag(yr, doy, sec)
         zarr_output.write_restart(f"{restart_archive_out}/{tag}", sp, sm, part, step=step,
                                   calendar_date=f"{yr}-doy{doy:03d}", dt_stage=dtv,
-                                  layout=restart_layout)
+                                  layout=restart_layout, attrs=_restart_attrs)
         zarr_output.write_restart_latest(restart_archive_out, tag)
         return tag
 

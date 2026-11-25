@@ -48,6 +48,8 @@ gm:    null          # null = GM off;  {} or {k_gm_min: …} = GM on (+ override
 kpp:   {}            # vertical mixing: KPP …                  (kpp XOR tke — exactly one)
 tke:   null          #                 … or classical-TKE
 ice:   {}            # mEVP sea ice (needed for the NG5 LKF figures)
+use_partial_cell: false   # FESOM2 partial bottom cells (zstar and linfs); see below
+partial_cell_thresh: 0.0  # m: a bottom layer this thin or thinner keeps its full cell
 
 # promoted run-dependent scalars
 visc:   {gamma1: 0.2}   # horizontal-viscosity γ's (only the NON-default ones; NG5 wants γ1=0.2)
@@ -68,6 +70,17 @@ restart_out: /work/.../ng5_out/restart
 n_steps: 1440            # OR a duration string (below)
 duration: 2yr            # "2yr" / "3mo" / "5d" / "12h" / "100step" / an int (steps)
 ```
+
+**Partial bottom cells** (`use_partial_cell: true`, FESOM2 `&ale_def`): the bottom layer of each column ends
+at the topographic depth (`aux3d.out`, clamped to `zbar(5)` as FESOM2 reads it) instead of the nearest model
+interface, moving it by at most half a layer either way (FESOM2 `init_bottom_elem_thickness`). The driver applies
+them to the mesh right after loading it (`fesom_jax.partial_cells.apply`); the mesh export and its level files
+stay as they are. linfs then uses FESOM2's `pressure_force_4_linfs_shchepetkin`, as FESOM2 does (it refuses the
+full-cell pressure gradient with partial cells). A cold start needs an IC cache built for the partial cells
+(`scripts/partial_cells/build_ic.py`: each node's bottom layer interpolated at its own depth); a cache of the other
+kind is refused. A full-cell restart can start a partial-cell run (the bottom thicknesses are reset from the
+mesh, as FESOM2's `restart_thickness_ale` does); the reverse is refused. Not ported: partial cells together with
+cavities, REcoM or single precision. FESOM2's own namelist calls the option "not recommended" and defaults it off.
 
 **Unknown keys raise** (no silent typos). `dt_ramp` is a dt change at a step boundary; the driver
 re-bootstraps the AB2 history there (a dt change invalidates the history formed at the old dt) and

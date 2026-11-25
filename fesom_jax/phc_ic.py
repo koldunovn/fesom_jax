@@ -105,9 +105,13 @@ def _ptheta(s, t, p, pr):
 # Stage 3: bilinear-horizontal + linear-vertical interpolation
 # --------------------------------------------------------------------------
 def _load_one_variable(ncvar, geo_deg, Z, nlevels_nod2D, node_layer_mask,
-                       nc_lon, nc_lat, nc_depth, bilin_i, bilin_j, d_indx):
+                       nc_lon, nc_lat, nc_depth, bilin_i, bilin_j, d_indx, bottom=None):
     """Port of ``load_one_variable`` (``fesom_phc.c:97``) for npes=1, no cavity (ul1=0).
-    Returns ``out[N, nl]`` with ``PHC_DUMMY`` where unfilled. Vectorized over nodes."""
+    Returns ``out[N, nl]`` with ``PHC_DUMMY`` where unfilled. Vectorized over nodes.
+
+    ``bottom = (k_bot, Z_bot)`` (partial cells): each node's bottom layer ``k_bot[n]`` (0-based) is
+    interpolated at its own mid-depth ``Z_bot[n]`` with its own depth bracket, as FESOM2's ``do_ic3d``
+    interpolates every layer at ``Z_3d_n(k, node)`` (``gen_ic3d.F90:498-515``). ``None`` ⇒ unchanged."""
     Ndepth, Nlat, Nlon_real = ncvar.shape
     Nlon = Nlon_real + 2  # padded
 
@@ -177,6 +181,23 @@ def _load_one_variable(ncvar, geo_deg, Z, nlevels_nod2D, node_layer_mask,
             d0 = data1d[:, 0]
             out[:, k] = np.where(lay & (d0 <= _DUMMY_HI), d0, out[:, k])
         # di == Ndepth-1 (below deepest PHC): stays DUMMY → vertical fill handles it.
+    if bottom is not None:
+        k_bot, Z_bot = (np.asarray(a) for a in bottom)
+        rows = np.arange(N)
+        di = np.array([_binarysearch_d(nc_depth, -float(z)) for z in Z_bot], dtype=np.int64)
+        lay = node_ok & node_layer_mask[rows, k_bot]
+        mid = (di >= 0) & (di < Ndepth - 1)
+        dic = np.clip(di, 0, Ndepth - 2)
+        d1 = data1d[rows, dic]
+        d2 = data1d[rows, dic + 1]
+        both = (d1 <= _DUMMY_HI) & (d2 <= _DUMMY_HI)
+        cf_a = (d2 - d1) / (nc_depth[dic + 1] - nc_depth[dic])
+        cf_b = d1 - cf_a * nc_depth[dic]
+        val = np.full(N, PHC_DUMMY)
+        val = np.where(lay & mid & both, -cf_a * Z_bot + cf_b, val)
+        d0 = data1d[:, 0]
+        val = np.where(lay & (di == -1) & (d0 <= _DUMMY_HI), d0, val)
+        out[rows, k_bot] = val
     return out
 
 
@@ -385,10 +406,17 @@ def load_phc_ic(mesh, path: str | None = None, t_insitu: bool = True,
     Ndepth = nc_depth.shape[0]
     d_indx = np.array([_binarysearch_d(nc_depth, -Z[k]) for k in range(nl - 1)], dtype=np.int64)
 
+    # partial cells: the bottom layer of each node sits at its own Z_3d_n (fesom_jax.partial_cells)
+    bottom = None
+    if getattr(mesh, "zbar_n_bot", None) is not None:
+        from .partial_cells import static_node_geometry
+        Z3 = np.asarray(static_node_geometry(mesh)[1])
+        k_bot = nlevels_nod2D - 2
+        bottom = (k_bot, Z3[np.arange(Z3.shape[0]), k_bot])
     T = _load_one_variable(temp, geo_deg, Z, nlevels_nod2D, node_layer_mask,
-                           nc_lon, nc_lat, nc_depth, bilin_i, bilin_j, d_indx)
+                           nc_lon, nc_lat, nc_depth, bilin_i, bilin_j, d_indx, bottom)
     S = _load_one_variable(salt, geo_deg, Z, nlevels_nod2D, node_layer_mask,
-                           nc_lon, nc_lat, nc_depth, bilin_i, bilin_j, d_indx)
+                           nc_lon, nc_lat, nc_depth, bilin_i, bilin_j, d_indx, bottom)
     T_pre_surf = T[:, 0].copy()
     S_pre_surf = S[:, 0].copy()
 
@@ -408,7 +436,8 @@ def load_phc_ic(mesh, path: str | None = None, t_insitu: bool = True,
     S[below] = 0.0
     np.putmask(T, T > 100.0, T - 273.15)
 
-    # insitu → potential temperature (fesom_phc.c:544-557): ptheta over valid layers.
+    # insitu → potential temperature (fesom_phc.c:544-557): ptheta over valid layers. The pressure is the
+    # nominal |Z| also with partial cells: FESOM2 insitu2pot keeps Z there on purpose (oce_ale_pressure_bv.F90:3346-3353).
     if t_insitu:
         valid = node_layer_mask                       # k ∈ [ulevels-1, nlevels-1), ul=1
         pp = np.abs(Z)[None, :]                        # (1, nl-1) pressure ≈ |Z|
@@ -431,10 +460,49 @@ def build_and_cache_ic(mesh, path: str | None = None,
     defaults (:mod:`fesom_jax.paths`)."""
     res = load_phc_ic(mesh, path, rank_nodes=rank_nodes)
     out_dir = Path(paths.resolve("ic_dir", out_dir))          # may not exist yet ⇒ resolve
+    sig = partial_cell_signature(mesh)
+    if sig is None and (out_dir / PARTIAL_CELL_MARKER).exists():
+        raise ValueError(f"{out_dir} holds a partial-cell IC ({PARTIAL_CELL_MARKER}); write the full-cell IC "
+                         "to another directory")
     out_dir.mkdir(parents=True, exist_ok=True)
     np.save(out_dir / "T_ic.npy", res.T)
     np.save(out_dir / "S_ic.npy", res.S)
+    if sig is not None:
+        import json
+        (out_dir / PARTIAL_CELL_MARKER).write_text(json.dumps({"use_partial_cell": True, "zbar_n_bot_sha256": sig}))
     return res
+
+
+# A partial-cell IC differs from the full-cell one in each node's bottom layer; its cache carries this marker,
+# with a hash of the mesh's zbar_n_bot, so a cold start never pairs a cache with the other kind of mesh.
+PARTIAL_CELL_MARKER = "partial_cells.json"
+
+
+def partial_cell_signature(mesh):
+    """sha256 of the mesh's ``zbar_n_bot`` (float64 bytes), or ``None`` for a full-cell mesh."""
+    zbn = getattr(mesh, "zbar_n_bot", None)
+    if zbn is None:
+        return None
+    import hashlib
+    return hashlib.sha256(np.ascontiguousarray(np.asarray(zbn, np.float64)).tobytes()).hexdigest()
+
+
+def check_ic_cache(mesh, ic_dir) -> None:
+    """Refuse an IC cache built for the other kind of mesh (full cells vs partial cells, or another
+    ``partial_cell_thresh``)."""
+    import json
+    marker = Path(ic_dir) / PARTIAL_CELL_MARKER
+    sig = partial_cell_signature(mesh)
+    if sig is None:
+        if marker.exists():
+            raise ValueError(f"IC cache {ic_dir} was built for partial cells; this mesh has full cells")
+        return
+    if not marker.exists():
+        raise ValueError(f"the mesh has partial cells but IC cache {ic_dir} was built for full cells: build a "
+                         "partial-cell IC (scripts/partial_cells/build_ic.py), whose bottom layer is interpolated "
+                         "at each node's partial-cell depth as FESOM2 does")
+    if json.loads(marker.read_text()).get("zbar_n_bot_sha256") != sig:
+        raise ValueError(f"IC cache {ic_dir} was built for other partial cells (another partial_cell_thresh?)")
 
 
 # The pi IC (T_ic/S_ic for the packaged 3140-node pi mesh) ships inside the package, like
@@ -471,6 +539,7 @@ def phc_initial_state(mesh, ic_dir: str | Path | None = None,
     if xp is None:
         xp = jnp
     ic_dir = Path(paths.require("ic_dir", ic_dir))    # None ⇒ $FESOM_IC_DIR → data/ic_core2
+    check_ic_cache(mesh, ic_dir)
     T = xp.asarray(np.load(ic_dir / "T_ic.npy"))
     S = xp.asarray(np.load(ic_dir / "S_ic.npy"))
     mask = np.asarray(mesh.node_layer_mask) if xp is np else mesh.node_layer_mask

@@ -575,7 +575,10 @@ def build_ssh_operator(
         g = gradient_sca[elis]                     # (E,6) ∂N/∂x(0:3), ∂N/∂y(3:6)
         # (E,) zbar_e_bot − zbar_e_srf (<0); FESOM's zbar_e_srf = zbar(ulevels(el)) (oce_ale.F90:1362): the
         # water column below an ice shelf starts at the shelf base. Off the shelves ulevels = 1 ⇒ zbar[0], unchanged.
-        depth = zbar[nlevels[elis] - 1] - zbar[ulevels_el[elis] - 1]
+        # Partial cells: zbar_e_bot is the element's partial-cell bottom (fesom_jax.partial_cells), else zbar(nlevels).
+        zbot = (np.asarray(mesh.zbar_e_bot)[elis] if mesh.zbar_e_bot is not None
+                else zbar[nlevels[elis] - 1])
+        depth = zbot - zbar[ulevels_el[elis] - 1]
         dx_i = edge_cross[:, 2 * i + 0]
         dy_i = edge_cross[:, 2 * i + 1]
         fy = depth[:, None] * (g[:, 0:3] * dy_i[:, None] - g[:, 3:6] * dx_i[:, None])
