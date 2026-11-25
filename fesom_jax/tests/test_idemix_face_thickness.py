@@ -13,6 +13,8 @@ import pytest
 
 import jax.numpy as jnp
 
+pytest.importorskip("idemix_jax")  # the IDEMIX library is a separate package
+
 from idemix_jax import IdemixForcing, IdemixParams
 from idemix_jax.mesh import masks_from_levels, validate_lateral_inputs
 
