@@ -30,9 +30,13 @@ jobs:
           python-version: "3.12"
 
       - name: Install (CPU)
+        # jax is pinned to the version every result in this repository was validated with. Unpinned,
+        # the runner took jax 0.12 (2026-10-28 on): the model ran (645 tests passed), but the
+        # pinned-jaxpr gates in test_tke_cuts.py / test_tke_candidates.py are version-specific
+        # by design and failed. Moving to a newer jax means re-pinning those hashes and this line.
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev]"
+          pip install -e ".[dev]" "jax==0.10.1" "jaxlib==0.10.1"
 
       - name: The pi mesh must ship with the package
         # If this fails, a fresh `pip install` cannot run the model and the quick-start is fiction.

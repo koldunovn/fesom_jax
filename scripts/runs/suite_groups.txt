@@ -10,10 +10,17 @@
 #               320 s total. This is what .github/workflows/ci.yml runs, selected FROM THIS FILE
 #               so the workflow cannot drift from it — the previous hand-maintained --ignore list
 #               named 3 of the 7 sharded files and put 4 of them on the runner.
+#               ⚠️ New cheap files land in `unit` unmeasured. By 2026-11 the merges had left `ci`
+#               at 41 files against 51 in `core2`, and test_suite_groups.py failed in CI. The
+#               `unit` group was re-timed on the same shape on 2026-11-17 (job 29047299, jax
+#               0.10.1, one pytest process per file): 13 of its 34 files took 30 s or less,
+#               134 s together, and moved here (54 files).
 #   unit      — pi mesh, closures, algebra, pytrees, but too slow for a 2-core runner.
-#               ⚠️ test_adjoint_config.py alone is 1341 s of the group's 2378 s. A file can be
-#               data-free and still not be cheap; the two properties are separate and this
-#               grouping keeps them separate.
+#               ⚠️ test_adjoint_config.py alone is 1341 s of the group's 2378 s (job 26833514;
+#               1837 s in job 29047299). A file can be data-free and still not be cheap; the two
+#               properties are separate and this grouping keeps them separate.
+#               ⚠️ test_adjoint_chunked.py does not fit a runner at all: the out-of-memory killer
+#               stopped it at 16 GB after 308 s (job 29047299).
 #   core2     — anything that assembles a CORE2 step or loads the CORE2 mesh/IC/forcing.
 #               This is where the wall time is: a handful of tests, minutes each.
 #   ice       — the assembled sea-ice step. Kept separate for MEMORY, not for time: the jit
@@ -132,7 +139,7 @@ ci fesom_jax/tests/test_canonical_redist.py
 ci fesom_jax/tests/test_coarsen.py
 ci fesom_jax/tests/test_coarsen_remap.py
 ci fesom_jax/tests/test_config.py
-unit fesom_jax/tests/test_controls.py
+ci fesom_jax/tests/test_controls.py
 ci fesom_jax/tests/test_diagnostics.py
 ci fesom_jax/tests/test_eki.py
 ci fesom_jax/tests/test_eos.py
@@ -181,10 +188,10 @@ core2 fesom_jax/tests/test_adjoint_costs.py
 core2 fesom_jax/tests/test_fortran_restart.py
 ci fesom_jax/tests/test_adjoint_check_unit.py
 ci fesom_jax/tests/test_tke_cuts.py
-unit fesom_jax/tests/test_tke_cuts_pi.py
+ci fesom_jax/tests/test_tke_cuts_pi.py
 core2 fesom_jax/tests/test_tke_cuts_core2.py
 ci fesom_jax/tests/test_tke_candidates.py
-unit fesom_jax/tests/test_tke_candidates_pi.py
+ci fesom_jax/tests/test_tke_candidates_pi.py
 core2 fesom_jax/tests/test_tke_candidates_core2.py
 ice fesom_jax/tests/test_ice_controls.py
 scripts scripts/tests/test_cbar_ice.py
@@ -194,25 +201,25 @@ ice fesom_jax/tests/test_ice_frozen_sweep.py
 scripts scripts/tests/test_frozen_sweep_core2.py
 sharding fesom_jax/tests/test_dp_lock.py
 ice fesom_jax/tests/test_precision.py
-unit fesom_jax/tests/test_precision_gpu.py
+ci fesom_jax/tests/test_precision_gpu.py
 sharding fesom_jax/tests/test_precision_shard.py
 scripts scripts/tests/test_compare_precision.py
-unit fesom_jax/tests/test_k33_weights.py
+ci fesom_jax/tests/test_k33_weights.py
 core2 fesom_jax/tests/test_physics_twin_pi.py
 # Classified 2026-10-25 (physics/upstream-944-1116, for the full-suite run): files merged without a manifest line
 core2 fesom_jax/tests/test_forcing_adj.py
 ice fesom_jax/tests/test_ice_static.py
 unit fesom_jax/tests/test_lane_order.py
 sharding fesom_jax/tests/test_mslp.py
-unit fesom_jax/tests/test_ops_ordered_vjp.py
+ci fesom_jax/tests/test_ops_ordered_vjp.py
 unit fesom_jax/tests/test_output_async.py
 unit fesom_jax/tests/test_recom_carbonate.py
-unit fesom_jax/tests/test_recom_dump_io.py
-unit fesom_jax/tests/test_recom_ic.py
-unit fesom_jax/tests/test_recom_params.py
+ci fesom_jax/tests/test_recom_dump_io.py
+ci fesom_jax/tests/test_recom_ic.py
+ci fesom_jax/tests/test_recom_params.py
 unit fesom_jax/tests/test_recom_sinking.py
-unit fesom_jax/tests/test_recom_sms.py
-unit fesom_jax/tests/test_recom_stage1.py
+ci fesom_jax/tests/test_recom_sms.py
+ci fesom_jax/tests/test_recom_stage1.py
 sharding fesom_jax/tests/test_recom_transport.py
 core2 fesom_jax/tests/test_se_div_vjp.py
 sharding fesom_jax/tests/test_se_sharded.py
@@ -225,7 +232,7 @@ sharding scripts/tests/test_fram_cost.py
 scripts scripts/tests/test_xs_ahead.py
 # Classified 2026-10-26 (recom/port, for the Task 17 full-suite run): the REcoM and forcing-ramp files added since
 # 2026-10-25; test_recom_step.py and test_recom_sp.py hold a dist_4 test each, so they run in `sharding`
-unit fesom_jax/tests/test_forcing_ramp.py
+ci fesom_jax/tests/test_forcing_ramp.py
 core2 fesom_jax/tests/test_recom_core2.py
 core2 fesom_jax/tests/test_recom_grad.py
 core2 fesom_jax/tests/test_recom_inputs.py
@@ -247,7 +254,7 @@ scripts scripts/tests/test_icecal_s1sum.py
 scripts scripts/tests/test_icecal_fdgn.py
 # Classified 2026-11-10 (merge/adjoint_all): the merged test files without a manifest line
 ice fesom_jax/tests/test_ice_dyn_ctrl.py
-unit fesom_jax/tests/test_tke_cut_census.py
+ci fesom_jax/tests/test_tke_cut_census.py
 core2 fesom_jax/tests/test_ocean_speed2_switches.py
 sharding fesom_jax/tests/test_ocean_speed3_switches.py
 sharding_slow scripts/tests/test_cbar_ice_sharded.py
