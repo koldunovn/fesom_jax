@@ -534,6 +534,7 @@ Reading: both failures sit in sparse, near-zero cells of a heterotroph or detrit
     - Three of the 47 columns have negative bottom-layer DetSi in days 40-42.
     - Reading (untested): the forward itself is noisy here, a limiter or the sinking / bottom flux acting on a near-zero bottom cell under strong advection, with the sign changes switching the negative-freeze clause on and off step by step. That the reverse peaks in DetCalc, whose forward is smooth, points at a term that divides by or switches on the vanishing DetC / DetSi (the ballasted sinking speed is the candidate), not at DetCalc's own transport. Candidates for a guard: the per-tracer FCT limiter freeze extended to DetN, DetC, DetSi, DetCalc (cheap, the mechanism of 7267c4f), or a freeze of the sinking-speed dependence where the detritus is below a floor. To separate them without 8 h runs: a day-35 January restart (as `seg4_d45`) and 10-day windows over days 35-45.
     - Log: `fesom_jax_pool/runs/slurm/fj_core2_cols_jan_fy.29271060.out`, data: `fesom_jax_pool/runs/bgc_adj/core2_nbrkv_dsilim_fy/h60_jan/columns/columns.npz`.
+  - **Day-35 restart for short January windows submitted (2026-11-25, the user's go): 29272189** (`restarts/w28sl1/seg3_d35`, 1120 steps from `seg3` with `run_from_config.py`, as `seg4_d45`). For 10-day windows over days 35-45 of the 60-day window (the 53992 episode at days 40-42), one per guard candidate.
 
 ## Decisions for the user
 
