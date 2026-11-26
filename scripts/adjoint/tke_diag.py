@@ -59,6 +59,10 @@ class _StashingTke:
         if getattr(params, "tke_nn", None) is not None:
             raise NotImplementedError("step_tke_inputs: params.tke_nn (per-column constants) "
                                       "is not supported")
+        if kw.get("idemix") is not None or cfg.mxl_nsqr_floor != 1.0e-12:
+            # the recorded COLUMN_KW reproduce the only_tke column with the C mixing-length N² floor
+            raise NotImplementedError("step_tke_inputs: IDEMIX coupling (idemix) and a non-default "
+                                      "TkeConfig.mxl_nsqr_floor are not recorded")
         inp = tkemod.tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode,
                                        Z3d=kw.get("Z3d"), bvfreq_raw=kw.get("bvfreq_raw"))
         inp.update(bvfreq=bvfreq, stress_node_surf=stress_node_surf,

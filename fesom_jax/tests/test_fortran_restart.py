@@ -126,6 +126,32 @@ def test_without_the_ab_slot_the_old_tracer_is_the_current_one(tmp_path):
     assert any(r.startswith("T_old=T") for r in rep["derived"])
 
 
+def test_an_element_iwe_in_the_restart_is_not_converted_and_warns(tmp_path):
+    """FESOM2 (cvmix_IDEMIX, cvmix_TKE+IDEMIX) writes its IDEMIX energy ``iwe`` as an ELEMENT
+    variable (io_restart.F90, def_elem_var_optional); State.iwe is node-placed. The converter does
+    not map it: iwe stays the reference value (an IDEMIX cold start) and a UserWarning says so.
+    Without an ``iwe`` variable nothing warns."""
+    import warnings
+    mesh = _mesh()
+    oce, ice = _restart(tmp_path)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        st, _ = FR.state_from_fortran(mesh, oce, ice, _ref(mesh))
+    assert not [w for w in caught if "iwe" in str(w.message)]   # no warning without iwe
+    rec = 1000.0 * 99 + 10.0 * np.arange(4)[:, None] + np.arange(2)[None, :]
+    _write(tmp_path / "fesom.2000.oce.restart", "iwe", np.stack([np.full_like(rec, -1.0), rec]),
+           ("time", "nz", "elem"))
+    oce = FR.FortranRestart(tmp_path / "fesom.2000.oce.restart")
+    assert oce.has("iwe")
+    with pytest.warns(UserWarning, match="element-placed and is not converted"):
+        st_iwe, rep = FR.state_from_fortran(mesh, oce, ice, _ref(mesh))
+    assert np.all(np.asarray(st_iwe.iwe) == -999.0) and "iwe" in rep["reference"]
+    for f in dataclasses.fields(State):
+        a, b = getattr(st, f.name), getattr(st_iwe, f.name)
+        if a is not None:
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b), err_msg=f.name)
+
+
 def test_the_source_table_covers_every_state_field_and_every_field_a_step_reads():
     names = {f.name for f in dataclasses.fields(State)}
     assert set(FR.SOURCES) == names

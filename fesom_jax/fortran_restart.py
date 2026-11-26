@@ -29,6 +29,7 @@ its internal arrays, which are the frame fesom-jax computes in.
 from __future__ import annotations
 
 import datetime
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -69,6 +70,12 @@ SOURCES = {
     "ssh_rhs": "reference", "density": "reference", "hpressure": "reference",
     "bvfreq": "reference", "Kv": "reference", "Av": "reference", "pgf_x": "reference",
     "pgf_y": "reference",
+    # the IDEMIX wave energy (idemix-jax): not read with IDEMIX off. NOT converted: FESOM2 writes
+    # its IDEMIX energy as an ELEMENT variable (io_restart.F90, def_elem_var_optional('iwe', ...),
+    # cvmix_IDEMIX / cvmix_TKE+IDEMIX), State.iwe lives on node interfaces, and no element->node
+    # map is defined here. A converted restart starts iwe at 0 (the reference State's zeros), an
+    # IDEMIX cold start; state_from_fortran warns when the restart carries an 'iwe' variable.
+    "iwe": "reference",
 }
 # The optional State fields of other run modes, None in a converted restart (each mode's driver builds them: the
 # single-precision rounding carry starts at 0 in precision.cast_state, ice_ave_steps > 1 in ice_step.init_ice_avg,
@@ -235,6 +242,13 @@ def state_from_fortran(mesh, oce: FortranRestart, ice: FortranRestart | None, re
         else:
             out[name] = np.zeros_like(ref[name])
             rep["zeroed"].append(name)
+    if oce.has("iwe"):
+        # FESOM2's IDEMIX energy is element-placed (io_restart.F90 def_elem_var_optional('iwe'));
+        # State.iwe is node-placed and the converter defines no element->node map (SOURCES)
+        warnings.warn(
+            f"{oce.path}: the Fortran IDEMIX wave energy 'iwe' is element-placed and is not "
+            "converted; the converted restart starts iwe at 0 (an IDEMIX cold start)",
+            UserWarning, stacklevel=2)
     done = {r.split("<-")[0].split("=")[0].split(" ")[0] for r in rep["restart"] + rep["derived"]}
     rep["reference"] = sorted(k for k in out if k not in done and k not in rep["zeroed"])
     from .state import State

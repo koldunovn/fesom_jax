@@ -71,6 +71,16 @@ The sea-ice adjoint track adds two ice parameters (optional, ``None`` ⇒ nothin
 * ``ice_pstar`` — the ice strength P* [N/m²] (``IceConfig.pstar``);
 * ``ice_cd`` — the ice-ocean drag coefficient C_d (``IceConfig.cd_oce_ice``), ice path only.
 
+The IDEMIX integration (idemix-jax) adds the internal-wave closure constants:
+
+* ``idemix`` — an :class:`idemix_jax.IdemixParams` (``tau_v``, ``tau_h``, ``gamma``,
+  ``jstar``, ``mu0``) or ``None``; read only when ``step`` runs with an ``idemix_cfg``.
+* ``idemix_field`` — an optional :class:`fesom_jax.idemix.IdemixParamsField` of per-node LOG
+  multipliers (``log_mu0``, ``log_fbot``, each ``[nod2D]`` or ``None``): node ``i`` runs IDEMIX
+  with ``mu0 * exp(log_mu0[i])`` and the bottom tidal flux ``fbot[i] * exp(log_fbot[i])``. Its
+  gradient at 0 is the per-node sensitivity map. ``None`` (default) ⇒ no leaves, the scalar
+  path, byte-identical. Needs an ``idemix_cfg`` and a dense step (``step`` raises otherwise).
+
 :meth:`Params.defaults` reproduces the config constants exactly (so passing
 ``Params.defaults()`` is numerically identical to the un-parameterised path).
 """
@@ -156,6 +166,19 @@ class Params:
     # ``IceConfig.adjoint_mode="exact"`` for a gradient: "dynamics"/"prescribed" cut the
     # ice-state tangents.
     ice_ctrl: object = None
+    # IDEMIX internal-wave closure constants (idemix-jax host patch C). Same contract as
+    # ``tke_nn``: ``None`` (default) ⇒ unused, no leaves, byte-identical; an
+    # :class:`idemix_jax.IdemixParams` (``tau_v``/``tau_h``/``gamma``/``jstar``/``mu0``, five
+    # float64 leaves — e.g. ``IdemixParams.fesom_operational()``) ⇒ read by
+    # :func:`fesom_jax.idemix.mixing_idemix` when ``step`` gets an ``idemix_cfg``, and
+    # differentiable like ``tke_c_k``. Un-annotated so building a ``Params`` never imports
+    # idemix_jax.
+    idemix: object = None
+    # Per-node IDEMIX log multipliers (idemix-jax host patch 0010, the adjoint sensitivity map):
+    # an optional :class:`fesom_jax.idemix.IdemixParamsField` (``log_mu0``/``log_fbot``, each
+    # ``[nod2D]`` or None). ``None`` (default) ⇒ no leaves, byte-identical scalar path.
+    # Un-annotated for the same import reason as ``idemix``.
+    idemix_field: object = None
 
     @staticmethod
     def defaults(gm_cfg=None) -> "Params":
@@ -183,6 +206,7 @@ tree_util.register_dataclass(
     Params,
     data_fields=["k_ver", "a_ver", "k_gm", "redi_kmax",
                  "tke_c_k", "tke_c_eps", "tke_cd", "tke_alpha", "tke_nn", "gm_nn",
-                 "surface_adj", "forcing_adj", "ice_pstar", "ice_cd", "recom", "ice_ctrl"],
+                 "surface_adj", "forcing_adj", "ice_pstar", "ice_cd", "recom", "ice_ctrl",
+                 "idemix", "idemix_field"],
     meta_fields=[],
 )

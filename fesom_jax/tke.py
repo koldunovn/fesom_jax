@@ -57,9 +57,13 @@ class TkeConfig(NamedTuple):
     static double in :mod:`fesom_jax.cvmix_tke` (``TKE_C66``).
 
     **Un-ported combinations raise** (:meth:`validate`, the C ``fesom_tke_alloc:247-253``
-    init-abort parity): IDEMIX (``not only_tke``), Langmuir (``l_lc``), Dirichlet BCs
-    (``use_dirichlet``), ``mxl_choice != 2``. The port covers exactly the reference config;
-    a future edit flipping one of these fails loudly rather than running un-ported physics.
+    init-abort parity): Langmuir (``l_lc``), Dirichlet BCs (``use_dirichlet``),
+    ``mxl_choice != 2``. ``only_tke=False`` is IDEMIX coupling: the column core
+    (:func:`~fesom_jax.cvmix_tke.integrate_tke_column`) accepts ``iw_diss``/``alpha_c``/
+    ``E_iw``, but the config alone supplies none — IDEMIX coupling REQUIRES ``idemix_cfg`` at
+    the step seam (enforced there), else the TKE runs the ``only_tke`` physics. The port covers
+    exactly the reference config plus that coupling; a future edit flipping one of the other
+    gates fails loudly rather than running un-ported physics.
     """
 
     # --- structural statics (the column-core bounds, fesom_tke.c:231-240) ---
@@ -69,7 +73,7 @@ class TkeConfig(NamedTuple):
 
     # --- master gates (the C runs exactly the reference branch; else validate raises) ---
     mxl_choice: int = 2           # Blanke–Delecluse wall constraints (choice 2 only)
-    only_tke: bool = True         # IDEMIX coupling OFF (.not.only_tke is gate-only)
+    only_tke: bool = True         # IDEMIX coupling OFF (False = IDEMIX; needs idemix_cfg at the step seam)
     use_dirichlet: bool = False   # Dirichlet surface+bottom BCs (Neumann is executed)
     l_lc: bool = False            # Langmuir (tke_dolangmuir=F; gate-only)
 
@@ -83,6 +87,14 @@ class TkeConfig(NamedTuple):
     #                               "ramp_kv" (Kv ramp, Av switch), "off"
     conv_ramp_dn2: float = 1.0e-6  # "ramp"/"ramp_kv": N² width (s⁻²) of the one-sided ramp (pp.mo_convect)
 
+    # --- research knob (NOT in the FESOM namelist; default = the C/Fortran literal) ---
+    # the N² floor of the unconstrained mixing length √2·√tke/√max(floor, N²)
+    # (cvmix_tke.F90:671 ``max(1d-12,Nsqr)``). The default 1e-12 is bitwise the program
+    # before this field existed; a larger floor caps the mixing length in weakly stratified
+    # water and CHANGES THE FORWARD (it departs from FESOM). Kept last so positional
+    # construction of the fields above is unchanged.
+    mxl_nsqr_floor: float = 1.0e-12
+
     # NOTE: how the BACKWARD pass treats this closure is NOT set here — it is one flag of
     # :class:`fesom_jax.adjoint_stab.AdjointConfig` (``freeze_mixing=True``), passed to ``step`` as
     # ``adjoint_cfg``, so that every backward-only simplification lives in one object rather
@@ -93,14 +105,17 @@ class TkeConfig(NamedTuple):
         parity). Called at the step seam whenever ``tke_cfg is not None``; returns ``self``
         so it can wrap an expression. ``tke_cfg=None`` is the KPP/PP path and never reaches
         here."""
-        if (not self.only_tke or self.l_lc or self.use_dirichlet
-                or self.mxl_choice != 2):
+        if not (math.isfinite(self.mxl_nsqr_floor) and self.mxl_nsqr_floor > 0.0):
+            raise ValueError(f"TkeConfig.mxl_nsqr_floor must be finite and > 0 (the N^2 floor "
+                             f"of the mixing length; default 1e-12), got {self.mxl_nsqr_floor!r}")
+        if self.l_lc or self.use_dirichlet or self.mxl_choice != 2:
             raise ValueError(
                 "TkeConfig only supports the classical-TKE reference config "
-                "(only_tke=True, l_lc=False, use_dirichlet=False, mxl_choice=2). "
-                "IDEMIX / Langmuir / Dirichlet BCs / mxl_choice!=2 are gate-only, not "
-                "ported (no C reference run ⇒ no oracle). Use tke_cfg=None for the "
-                "KPP/PP path. (fesom_tke.c:247-253 abort parity)")
+                "(l_lc=False, use_dirichlet=False, mxl_choice=2). "
+                "Langmuir / Dirichlet BCs / mxl_choice!=2 are gate-only, not "
+                "ported (no C reference run ⇒ no oracle). only_tke=False selects IDEMIX "
+                "coupling, which requires idemix_cfg at the step seam. Use tke_cfg=None "
+                "for the KPP/PP path. (fesom_tke.c:247-253 abort parity)")
         if self.n2_source not in N2_SOURCES:
             raise ValueError(f"TkeConfig.n2_source must be one of {N2_SOURCES}, "
                              f"got {self.n2_source!r}")
@@ -155,6 +170,59 @@ def _wire_kv_av(mesh, KappaM, KappaH, is_surf, is_bot, exch):
     return Kv, Av
 
 
+def _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior, nzmin=None):
+    """``dz_trr`` from the interface masks and layer-centre spacing ``dZ`` that
+    :func:`tke_column_inputs` already holds: the four lines of upstream's inline code, verbatim,
+    so the TKE trace is unchanged.
+
+    ``nzmin`` (``[N, 1]`` top wet interface, opt-in; only :func:`interface_spacing`, i.e. the
+    IDEMIX column, passes it) takes the surface cap from the column's own top wet layer,
+    ``hnode[uln0]/2`` (F90:520). ``None`` keeps upstream's ``hnode[:, :1]/2``: the TKE path, whose
+    cavity block (:func:`mixing_tke` with ``cavity=True``) re-caps from ``hnode[uln0]`` itself."""
+    # dz_trr: interior |ΔZ| (tracer-point spacing) + hnode/2 surface & bottom end caps
+    dz_trr = jnp.where(is_interior, jnp.abs(dZ), 0.0)
+    if nzmin is None:
+        dz_trr = jnp.where(is_surf, hnode[:, :1] / 2.0, dz_trr)    # dz_trr[uln0]=hnode[uln0]/2
+    else:
+        hnode_top = jnp.take_along_axis(hnode, nzmin, axis=-1)     # hnode[uln0], the top wet layer
+        dz_trr = jnp.where(is_surf, hnode_top / 2.0, dz_trr)       # dz_trr[uln0]=hnode[uln0]/2 (F90:520)
+    hnode_bot = jnp.take_along_axis(hnode, (nlev - 1)[:, None], axis=-1)   # hnode[nln0]
+    dz_trr = jnp.where(is_bot, hnode_bot / 2.0, dz_trr)        # dz_trr[nln0+1]=hnode[nln0]/2
+    return dz_trr
+
+
+def interface_spacing(mesh, hnode, Z3d):
+    """The tracer-point interface spacing ``dz_trr`` ``[N, nl]`` the IDEMIX column takes as its
+    ``dzt``: interior ``|ΔZ|`` + ``hnode/2`` surface & bottom end caps, each from the column's own
+    top / bottom wet layer (``gen_modules_cvmix_idemix.F90:518-521``,
+    ``gen_modules_cvmix_tke.F90:352-355``). Factored out of :func:`tke_column_inputs`. It is the
+    ``dzt`` the TKE column core takes only where the two agree (below). The surface cap reads
+    ``hnode[uln0]``; before it read
+    ``hnode[:, 0]`` whatever ``ulevels_nod2D`` -- identical without cavities (every CORE2 and pi
+    node has ``ulevels_nod2D == 1``), 0 under a cavity, where ``hnode`` above the top wet layer
+    is 0.
+
+    :func:`tke_column_inputs` (the TKE path) calls the shared :func:`_dz_trr` on its own masks
+    WITHOUT the top-wet-layer cap, so its program is upstream's: there ``hnode[:, :1]/2``, and
+    :func:`mixing_tke` with ``cavity=True`` re-caps ``dz_trr`` from ``hnode[uln0]`` before its
+    column shift (upstream 4fe45cc). The two agree on a mesh without cavities
+    (``ulevels_nod2D == 1`` everywhere), and with ``cavity=True`` once that re-cap is applied. On a
+    cavity mesh with ``cavity=False`` (upstream's unrefused gap) they differ at the surface
+    interface of every cavity node: the TKE's ``hnode[:, 0]/2`` is 0 there, this
+    ``hnode[uln0]/2``."""
+    nl = mesh.nl
+    k = jnp.arange(nl)[None, :]
+    nzmin = (mesh.ulevels_nod2D - 1)[:, None]                   # surface interface (0, no cavity)
+    nlev = (mesh.nlevels_nod2D - 1)                             # per-node layer count (bottom = nlev)
+    nzmax = nlev[:, None]                                       # bottom interface
+    is_surf = (k == nzmin)
+    is_bot = (k == nzmax)
+    is_interior = (k >= nzmin + 1) & (k <= nzmax - 1)           # interfaces [uln0+1, nln0]
+    Z = _layer_center_Z(mesh, Z3d)                             # (N|1, nl) layer centers
+    dZ = _shift_down(Z) - Z                                    # Z[nz-1]-Z[nz] (>0 interior; 0 at k=0)
+    return _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior, nzmin=nzmin)
+
+
 COLUMN_INPUTS = ("tke_old", "Ssqr", "Nsqr", "dzw", "dzt", "forc_tke_surf", "nlev")
 """The keys of :func:`tke_column_inputs` that are the positional inputs of
 :func:`fesom_jax.cvmix_tke.integrate_tke_column`, in its order."""
@@ -168,12 +236,16 @@ def tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, *, Z3d=Non
     Returns a dict: the column-core inputs ``tke_old`` (= ``tke``), ``Ssqr`` (vertical shear²
     of the node velocity over the live layer-centre spacing, interior interfaces only),
     ``Nsqr`` (``bvfreq`` zeroed at the surface and bottom interfaces), ``dzw`` (= ``hnode``),
-    ``dzt`` (interface spacing with ``hnode/2`` end caps), ``forc_tke_surf``
-    (``|stress_node_surf|/ρ₀``), ``nlev`` (per-node layer count); plus ``uvnode`` (the
-    element→node velocity the step reuses) and the interface masks ``is_surf``, ``is_bot``,
-    ``is_interior``. ``integrate_tke_column(*(d[k] for k in COLUMN_INPUTS), ...)`` is
-    exactly the solve :func:`mixing_tke` performs, so diagnostics that re-run the column core
-    on these inputs see the model's own column state, not a re-implementation of it.
+    ``dzt`` (interface spacing with ``hnode/2`` end caps, the surface cap upstream's
+    ``hnode[:, 0]/2``: :func:`interface_spacing` on a mesh without cavities; on a cavity mesh it
+    differs at the cavity nodes' surface interface until :func:`mixing_tke` with ``cavity=True``
+    re-caps it),
+    ``forc_tke_surf`` (``|stress_node_surf|/ρ₀``), ``nlev`` (per-node layer count); plus
+    ``uvnode`` (the element→node velocity the step reuses) and the interface masks ``is_surf``,
+    ``is_bot``, ``is_interior``. ``integrate_tke_column(*(d[k] for k in COLUMN_INPUTS), ...)``
+    is exactly the solve :func:`mixing_tke` performs (with IDEMIX on, plus its ``iw_diss`` /
+    ``alpha_c`` / ``E_iw`` keywords), so diagnostics that re-run the column core on these
+    inputs see the model's own column state, not a re-implementation of it.
 
     ``bvfreq_raw`` (the unsmoothed N², only when a ``tke_pr_ratio`` / ``tke_pr_raw_cut``
     Prandtl or ``tke_ml_ratio`` / ``tke_ml_raw_cut`` mixing-length cut is on) adds
@@ -202,11 +274,9 @@ def tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, *, Z3d=Non
     # bvfreq2 = the shared smoothed N², ZEROED at surface+bottom (nonzero only interior) —
     # ⚠️ a naive slice leaks the nonzero surface value (fesom_tke.c:362-364).
     bvfreq2 = jnp.where(is_interior, bvfreq, 0.0)
-    # dz_trr: interior |ΔZ| (tracer-point spacing) + hnode/2 surface & bottom end caps
-    dz_trr = jnp.where(is_interior, jnp.abs(dZ), 0.0)
-    dz_trr = jnp.where(is_surf, hnode[:, :1] / 2.0, dz_trr)    # dz_trr[uln0]=hnode[uln0]/2
-    hnode_bot = jnp.take_along_axis(hnode, (nlev - 1)[:, None], axis=-1)   # hnode[nln0]
-    dz_trr = jnp.where(is_bot, hnode_bot / 2.0, dz_trr)        # dz_trr[nln0+1]=hnode[nln0]/2
+    # upstream's surface cap hnode[:, 0]/2: interface_spacing without cavities, and under
+    # mixing_tke(cavity=True) after its re-cap; not at cavity nodes with cavity=False
+    dz_trr = _dz_trr(hnode, dZ, nlev, is_surf, is_bot, is_interior)
     out = dict(tke_old=tke, Ssqr=vshear2, Nsqr=bvfreq2, dzw=hnode, dzt=dz_trr,
                forc_tke_surf=forc_tke_surf, nlev=nlev, uvnode=uvnode,
                is_surf=is_surf, is_bot=is_bot, is_interior=is_interior)
@@ -219,7 +289,7 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
                params, *, dt: float = DT_DEFAULT, exch=None, Z3d=None,
                freeze_convection: bool = False, cuts=frozenset(), tke_adj=None,
                freeze_state: bool = False, bvfreq_raw=None, conv_surrogate=None,
-               ice_conc=None, turner=None, cavity: bool = False):
+               ice_conc=None, turner=None, cavity: bool = False, idemix=None):
     """Assembled classical-TKE vertical-mixing driver — the mirror of ``fesom_tke_mixing``
     (``fesom_tke.c:270-505``) followed by the shared ``mo_convect`` (``fesom_step.c:264``).
     Returns ``(Kv, Av, uvnode, tke_new)`` — the ``(Kv, Av, uvnode)`` triple PP/KPP return
@@ -252,7 +322,16 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
     "surface" is the shelf base, forced by the shelf-base drag in ``stress_node_surf``. Here every column is shifted up
     by ``ulevels_nod2D - 1`` before :func:`integrate_tke_column` (whose surface is ``k = 0``) and back after it, and
     the surface cap of ``dzt`` is half the TOP WET layer. ``False`` ⇒ the unchanged program.
+
+    ``idemix`` is ``None`` (``only_tke``) or a tuple ``(iw_diss, alpha_c, E_iw)`` of ``[N, nl]``
+    arrays forwarded to the column core (IDEMIX coupling; see ``integrate_tke_column``). They
+    are IDEMIX outputs, not column inputs assembled here, so ``freeze_state`` does not cut them
+    (the step freezes IDEMIX's own ocean-state inputs under the same flag). ``idemix`` together
+    with ``cavity=True`` is REFUSED (``ValueError``): the triple is on the global interface
+    levels, and the cavity column shift above does not move it, so under a shelf it would force
+    and cap the wrong interfaces.
     """
+    iw_diss, alpha_c, E_iw = idemix if idemix is not None else (None, None, None)
     inp = tke_column_inputs(mesh, uv, bvfreq, tke, stress_node_surf, hnode, Z3d=Z3d,
                             bvfreq_raw=bvfreq_raw)
     if freeze_state:
@@ -281,6 +360,13 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
         cd = params.tke_cd * m[:, 2:3]
 
     if cavity:
+        if idemix is not None:
+            # the (iw_diss, alpha_c, E_iw) triple is on GLOBAL interface levels; the column shift
+            # below does not move it, so it would be misaligned by ulevels_nod2D-1 under a shelf
+            raise ValueError(
+                "IDEMIX coupling (idemix=...) with ice-shelf cavities (cavity=True) is not "
+                "supported: the IDEMIX triple is not shifted with the cavity TKE column and no "
+                "IDEMIX + cavity reference exists. Drop the cavity config or IDEMIX.")
         if inp.get("Nsqr_raw") is not None or turner is not None or ice_conc is not None:
             raise NotImplementedError("tke cavity column shift: the adjoint Prandtl / mixing-length cuts are not wired")
         _u = (mesh.ulevels_nod2D - 1).astype(jnp.int32)[:, None]
@@ -312,7 +398,9 @@ def mixing_tke(mesh, uv, bvfreq, tke, stress_node_surf, hnode, cfg: TkeConfig,
         kappaM_max=_l(cfg.kappaM_max), dt=dt, with_diags=False, cuts=cuts, adj=tke_adj,
         n2_raw=_f_opt(inp.get("Nsqr_raw")), ice_conc=_f_opt(ice_conc),
         lat=(None if tke_adj is None or tke_adj.pr_lat is None
-             else _f(mesh.geo_coord_nod2D[:, 1])), turner=turner)
+             else _f(mesh.geo_coord_nod2D[:, 1])), turner=turner,
+        iw_diss=_f_opt(iw_diss), alpha_c=_f_opt(alpha_c), E_iw=_f_opt(E_iw),
+        mxl_nsqr_floor=cfg.mxl_nsqr_floor)
     tke_new, KappaM, KappaH = PR.wp(tke_new), PR.wp(KappaM), PR.wp(KappaH)
     if cavity:
         tke_new, KappaM, KappaH = _down(tke_new), _down(KappaM), _down(KappaH)
