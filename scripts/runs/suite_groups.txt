@@ -257,3 +257,6 @@ core2 fesom_jax/tests/test_ocean_speed2_switches.py
 sharding fesom_jax/tests/test_ocean_speed3_switches.py
 sharding_slow scripts/tests/test_cbar_ice_sharded.py
 sharding_slow scripts/tests/test_cbar_ice_sharded_fd.py
+# Partial bottom cells (2026-11-26, plan 20261125-fesom-jax-partial-cells): pi + CORE2 steps; sharded on 2 fake devices
+core2 fesom_jax/tests/test_partial_cells.py
+sharding fesom_jax/tests/test_partial_cells_sharded.py
