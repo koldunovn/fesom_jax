@@ -526,12 +526,24 @@ def get_seawater_viscosity(temp, salt, nlev):
 def get_particle_density(det_c, det_n, det_si, det_cal, nlev, params: RecomParams):
     """Bulk density of a detritus class [kg m-3] from its C, N, Si and CaCO3 concentrations (Cram et al.
     2018), ``recom_sinking.F90:1060-1168``: the components floored at ``tiny``, their fractions of the sum
-    weight ``rho_POC``, ``rho_PON``, ``rho_opal``, ``rho_CaCO3``; 0 below the bottom."""
+    weight ``rho_POC``, ``rho_PON``, ``rho_opal``, ``rho_CaCO3``; 0 below the bottom.
+
+    Gradient guard (plan 20261105, 2026-11-26): FESOM_RECOM_GRAD_FREEZE_SINK_RHO=<thr> holds the density out of the
+    derivative wherever the floored sum ``aux`` is below ``thr`` [mmol m-3] (``inf``: everywhere); the forward
+    values are unchanged. ``d rho / d x_i = (rho_i - rho) / aux``, so where the detritus vanishes the ballasted speed
+    ``w_ref * (rho - rho_seawater) / (rho_ref_part - rho_ref_water)`` has a derivative of order ``1 / aux``, and the
+    flux it carries is that speed times the layer above, which need not be small: one step multiplies a perturbation
+    of the cell by about ``x_above / aux * w_ref |rho_i - rho| / 203 * dt / h`` (the bottom layer of the shelf column
+    53992, DetC 4.4e-3 over a sum of 1e-4, the January reverse growth of 29233255). Read at trace time; unset (the
+    default), the traced program is unchanged."""
     p = params
     b1, b2, b3, b4 = (jnp.maximum(TINY, x) for x in (det_c, det_n, det_si, det_cal))
     aux = b1 + b2 + b3 + b4
     a1, a2, a3, a4 = b1 / aux, b2 / aux, b3 / aux, b4 / aux
     rho = p.rho_CaCO3 * a4 + p.rho_opal * a3 + p.rho_POC * a1 + p.rho_PON * a2
+    thr = os.environ.get("FESOM_RECOM_GRAD_FREEZE_SINK_RHO", "").strip()
+    if thr:
+        rho = jnp.where(aux < float(thr), jax.lax.stop_gradient(rho), rho)
     wet = jnp.arange(det_c.shape[1])[None, :] < jnp.asarray(nlev)[:, None]
     return jnp.where(wet, rho, 0.0)
 

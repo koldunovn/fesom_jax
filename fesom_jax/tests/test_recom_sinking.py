@@ -562,6 +562,35 @@ def test_sink_dst3_sign_and_upwind_grad_switches(toy, monkeypatch):
     np.testing.assert_allclose((flipped * vol).sum(axis=1), (base * vol).sum(axis=1), rtol=0, atol=1e-12 * scale)
 
 
+def test_freeze_sink_rho_gradient_switch(monkeypatch):
+    """FESOM_RECOM_GRAD_FREEZE_SINK_RHO=<thr> (plan 20261105, 2026-11-26): the particle density keeps its value and
+    loses its derivative where the floored detritus sum is below thr (``inf``: everywhere); cells above keep the full
+    derivative; unset, the traced program is unchanged."""
+    _, p = _params()
+    nlev = jnp.asarray([3])
+    # level 0 rich (sum 0.14), level 1 near zero with a negative DetSi (sum about 1.2e-5), level 2 in between (2e-3)
+    cols = [jnp.asarray([[v0, v1, v2]]) for v0, v1, v2 in
+            ((1e-1, 8.8e-6, 1e-3), (2e-2, 1.0e-6, 2e-4), (1e-2, -3e-6, 5e-4), (1e-2, 2.2e-6, 3e-4))]
+    f = lambda c, n, s, k: S.get_particle_density(c, n, s, k, nlev, p)
+    jac = lambda: np.stack([np.diagonal(np.asarray(j)[0, :, 0, :])               # d rho[k] / d x_i[k], [tracer, level]
+                            for j in jax.jacrev(f, argnums=(0, 1, 2, 3))(*cols)])
+    monkeypatch.delenv("FESOM_RECOM_GRAD_FREEZE_SINK_RHO", raising=False)
+    jx = str(jax.make_jaxpr(f)(*cols))
+    base, j0 = np.asarray(f(*cols)), jac()
+    assert np.abs(j0[3, 1]) > 1e7 > 1e5 > np.abs(j0[3, 0])          # the 1 / aux derivative in the near-zero cell
+    assert j0[2, 1] == 0.0                                         # the negative DetSi sits on its floor
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_SINK_RHO", "1e-3")
+    np.testing.assert_array_equal(np.asarray(f(*cols)), base)
+    j1 = jac()
+    np.testing.assert_array_equal(j1[:, 1], 0.0)
+    np.testing.assert_array_equal(j1[:, [0, 2]], j0[:, [0, 2]])
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_SINK_RHO", "inf")
+    np.testing.assert_array_equal(np.asarray(f(*cols)), base)
+    np.testing.assert_array_equal(jac(), 0.0)
+    monkeypatch.setenv("FESOM_RECOM_GRAD_FREEZE_SINK_RHO", "")       # empty = unset
+    assert str(jax.make_jaxpr(f)(*cols)) == jx
+
+
 def test_freeze_extinct_gradient_switch(monkeypatch):
     """FESOM_RECOM_GRAD_FREEZE_EXTINCT=<thr> (plan 20261105, 2026-11-11): the Zoo2 tracers below thr keep their
     values and lose their derivative; other tracers and larger values are untouched; unset, nothing is traced."""
