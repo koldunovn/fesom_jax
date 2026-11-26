@@ -67,17 +67,20 @@ def fortran_fields(run, recs):
 
 
 def jax_fields(stores):
-    """Mean over the monthly-mean stores ``stores`` (each one calendar period) of the three fields."""
+    """Mean over the monthly-mean stores ``stores`` (each one calendar month) of the three fields. As for the Fortran
+    output, the speed is that of the mean velocity: u and v are averaged first (the mean of the monthly speeds is
+    another, larger quantity). The months are weighted equally, as the Fortran year mean of 12 monthly records is."""
     acc = None
     for s in stores:
         g = zarr.open_group(str(s), mode="r")
-        def a(name):
-            x = np.asarray(g[name][...], np.float64)
-            return x[0] if x.shape[0] == 1 and x.ndim >= 2 and x.shape[1] == mesh.nod2D else x
+        def a(name):           # ushow layout: (time, nod2) and (time, nz, nod2), float32
+            x = np.asarray(g[name][...], np.float64)[0]
+            return x.T if x.ndim == 2 else x
         T, u, v, ssh = a("temp"), a("u"), a("v"), a("ssh")
-        f = {"bottom_T": T[rows, kb], "bottom_speed": np.hypot(u[rows, kb], v[rows, kb]), "ssh": ssh}
+        f = {"bottom_T": T[rows, kb], "u": u[rows, kb], "v": v[rows, kb], "ssh": ssh}
         acc = f if acc is None else {k: acc[k] + f[k] for k in acc}
-    return {k: v / len(stores) for k, v in acc.items()}
+    m = {k: x / len(stores) for k, x in acc.items()}
+    return {"bottom_T": m["bottom_T"], "bottom_speed": np.hypot(m["u"], m["v"]), "ssh": m["ssh"]}
 
 
 def rms(x, m):
@@ -147,5 +150,17 @@ for name, keep, Ffc, Fpc, Jfc, Jpc, kind in cases:
         print(f"{fld:14s} {r['rms_dF']:10.3e} {r['rms_dJ']:10.3e} {r['corr']:7.3f} {r['amp']:6.2f} "
               f"{r['rms_pc']:12.3e} {r['rms_fc']:12.3e}  {'PASS' if not fails else 'MISS ' + ','.join(fails)}")
 (ROOT / "g2_report.json").write_text(json.dumps(report, indent=1))
+# the response fields, for the figure (scripts/partial_cells/fig_response.py, nereus env)
+geo = np.degrees(np.asarray(mesh.geo_coord_nod2D))
+dump = {"lon": geo[:, 0], "lat": geo[:, 1]}
+for name, keep, Ffc, Fpc, Jfc, Jpc, kind in cases:
+    tag = name.replace(" ", "_")
+    for fld in ("bottom_T", "bottom_speed", "ssh"):
+        dump[f"{tag}__{fld}__F"] = np.where(keep, Fpc[fld] - Ffc[fld], np.nan)
+        dump[f"{tag}__{fld}__J"] = np.where(keep, Jpc[fld] - Jfc[fld], np.nan)
+zbar = np.asarray(mesh.zbar)
+from fesom_jax import partial_cells as _pc
+dump["bottom_shift"] = np.asarray(_pc.apply(mesh).zbar_n_bot) - zbar[nln - 1]
+np.savez_compressed(ROOT / "g2_fields.npz", **dump)
 print(f"\ncases: {[c[0] for c in cases]}")
 print("G2_RESPONSE_OK" if ok_all and cases else "G2_RESPONSE_MISS")

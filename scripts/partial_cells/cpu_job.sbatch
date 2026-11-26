@@ -12,7 +12,7 @@
 #SBATCH --time=00:30:00
 #SBATCH -o /work/ab0995/a270088/fesom_jax_dev/runs/partial_cells/cpu.%j.out
 source /sw/etc/profile.levante 2>/dev/null
-PY=/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python
+PY=${PY:-/work/ab0995/a270088/mambaforge/envs/fesom-jax/bin/python}   # PY=<nereus python> for the figure
 cd "${SLURM_SUBMIT_DIR}"
 export PYTHONPATH="${SLURM_SUBMIT_DIR}" JAX_PLATFORMS=cpu OMP_NUM_THREADS=16
 echo "=== $(hostname) $(date) $(git rev-parse --short HEAD) CMD=$CMD ==="

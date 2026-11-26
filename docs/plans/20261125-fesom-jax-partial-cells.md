@@ -304,8 +304,11 @@ several tasks.
 - [x] masked-NaN gradient probe through a CORE2 partial-cell step (zstar and linfs): gradient finite
       everywhere, zero on masked lanes ➕ done on pi (2 steps, d(mean bottom T)/d(T0)); the same code paths,
       far cheaper than CORE2
-- [ ] 10-day CORE2 zstar + partial cells on one A100: stable, min `hnode` > 0
-- [ ] run tests — must pass before Task 8
+- [x] 10-day CORE2 zstar + partial cells on one A100: stable, min `hnode` > 0 ➕ covered by the G2 year run
+      (job 29278409, 1958 complete); `scripts/partial_cells/check_year_restart.py` on its end-of-year restart
+      (job 29279249): min wet `hnode` 4.56 m, min wet `helem` 4.56 m, T/S/SSH finite, bottom layers still equal
+      to the bottom thicknesses exactly. **YEAR_RESTART_OK**
+- [x] run tests — must pass before Task 8 (test_partial_cells, job 29278402: 41 passed)
 
 ### Task 8: Fortran FESOM2 reference and comparison (G2)
 
@@ -313,16 +316,21 @@ several tasks.
 - Modify: `scripts/partial_cells/` (comparison script)
 - Create: `docs/PARTIAL_CELLS_VALIDATION.md`
 
-- [ ] Fortran runs (cost stated before submitting; ≈ 1.5 node-hours in total): zstar partial-cell 1 year
+- [x] Fortran runs (cost stated before submitting; ≈ 1.5 node-hours in total): zstar partial-cell 1 year
       (monthly output, the full-cell year is `A_main_ias2_year`); zstar full-cell and partial-cell 1 month
       with daily output; linfs full-cell and partial-cell 1 month with daily output (`which_ALE='linfs'`,
       default `which_pgf`). All on the `/pool` levels, so the Fortran pairs differ only in
       `use_partial_cell`
-- [ ] JAX runs: the same set from the matched JAX config, ≈ 1–2 A100-hours. IC: a cache built for the
+      ✅ jobs 29278124/125 (zstar fc/pc month), 29278199/200 (linfs fc/pc month), 29278204 (zstar pc year);
+      2.8 node-hours allocated (above the estimate: 4 nodes per run including startup)
+- [x] JAX runs: the same set from the matched JAX config, ≈ 1–2 A100-hours. IC: a cache built for the
       Fortran runs' partition (`dist_512`; FESOM2's IC extrapolation depends on the partition, see the
       memory note zstar-forcing-dump-config-gap) and its partial-cell variant. If that cache is not cheap
       to build, use the existing one and add the nodes where the two IC fields differ to the mask
-- [ ] G2 comparison. Fields: bottom-layer temperature, bottom-layer speed and SSH, as daily means (day 1),
+      ✅ IC caches `fc_dist512`, `pc_dist512` (`scripts/partial_cells/build_ic.py`); day 1 (29278405/408/410/
+      412), zstar year fc/pc (29278406/409, 78 min each), linfs month fc/pc (29278411/413). 3.0 A100-hours,
+      above the 1–2 estimated: 0.23 s/step makes a year 78 min per run
+- [x] G2 comparison. Fields: bottom-layer temperature, bottom-layer speed and SSH, as daily means (day 1),
       the month-1 mean and the year mean. Mask: wet nodes, minus the level-mismatch points from Task 1b.
       Δ_X = X_pc − X_fc for model X. Pass bars (fixed now, before the runs):
       - direct: `rms(JAX_pc − F_pc) ≤ 1.2·rms(JAX_fc − F_fc)` at day 1 and month 1, and both
@@ -330,19 +338,26 @@ several tasks.
       - response: correlation(Δ_JAX, Δ_F) ≥ 0.9 at day 1 and ≥ 0.7 for the year mean; amplitude ratio
         `std(Δ_JAX)/std(Δ_F)` within 0.7–1.4.
       A miss is investigated, not explained away
-- [ ] write `docs/PARTIAL_CELLS_VALIDATION.md` (numbers, figures, job ids)
+      ✅ job 29279308: **G2_RESPONSE_OK**, every bar in all five cases (zstar day 1 / January / 1958, linfs
+      day 1 / January); corr ≥ 0.999, amplitude 1.00, JAX–Fortran difference 1–2 % of the response over the
+      first month. ⚠️ fixed on the way: the first full run (29279243) took the mean of the JAX monthly speeds but
+      the speed of the Fortran year-mean velocity (year bottom speed corr 0.94); both now average u, v first
+- [x] write `docs/PARTIAL_CELLS_VALIDATION.md` (numbers, figures, job ids) ➕ figure
+      `docs/figures/partial_cells_response.png` (nereus, `scripts/partial_cells/fig_response.py`, job 29279275)
 
 ### Task 9: Verify acceptance criteria
 
-- [ ] zstar and linfs partial cells work end to end through `scripts/run_from_config.py`
+- [x] zstar and linfs partial cells work end to end through `scripts/run_from_config.py` (every G2 JAX run)
 - [ ] full-cell default byte-identical: full CPU suite `sbatch scripts/runs/run_suite.sbatch` green (known
       pre-existing failure `test_dp_lock` noted, not re-pinned)
-- [ ] guards for the out-of-scope combinations raise clearly
+- [x] guards for the out-of-scope combinations raise clearly (test_partial_cells: cavity, REcoM, single
+      precision, config/mesh mismatch, restart and IC-cache kind)
 
 ### Task 10: Documentation
 
-- [ ] README: the option, its FESOM2 names, the scope and the "not recommended" note from FESOM2
-- [ ] `docs/PORTING_LESSONS.md`: lessons from each task
+- [x] README: the option, its FESOM2 names, the scope and the "not recommended" note from FESOM2 (README
+      "Can" list; the schema keys and the full paragraph in `docs/USER_GUIDE.md`)
+- [x] `docs/PORTING_LESSONS.md`: lessons from each task
 - [ ] move this plan to `docs/plans/completed/`
 
 ## Technical Details
