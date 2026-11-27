@@ -257,8 +257,7 @@ def live_geometry(mesh: Mesh, hnode, *, keep_f64: bool = False):
     h_str = jnp.where(stretch, hnode, 0.0)
     revcum = lax.cumsum(h_str, axis=1, reverse=True)        # Σ_{j≥nz} h_str[j]
     zbar_nom = jnp.broadcast_to(zbar[None, :], (mesh.nod2D, nl))   # AD-safe nominal (dz>0)
-    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])             # (nl,) nominal mid-depths, padded
-    Z_nom = Zp[None, :]
+    Z_nom = None
     if mesh.zbar_n_bot is not None:
         # partial cells: below the stretch range FESOM2 keeps the init_ale geometry (update_thickness_ale only
         # rewrites nz <= nlevels_nod2D_min-2), whose bottom interface / bottom mid-depth carry zbar_n_bot
@@ -271,7 +270,13 @@ def live_geometry(mesh: Mesh, hnode, *, keep_f64: bool = False):
 
     # Z mid-layer: zbar_3d_n[nz+1] + hnode[nz]/2 in the stretch range; nominal mesh.Z below.
     zbar_below = jnp.concatenate([zbar_3d_n[:, 1:], zbar_3d_n[:, -1:]], axis=1)  # [nz+1]
-    Z_3d_n = jnp.where(stretch, PR.full(zbar_below) + 0.5 * hnode, PR.full(Z_nom))
+    if Z_nom is None:
+        # full cells: these two lines are main's, op for op, so that a full-cell mesh lowers to the same program text
+        # as before partial cells (tracing Zp or Zp[None, :] earlier reorders the HLO and changes test_dp_lock's hash)
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])             # (nl,) nominal mid-depths, padded
+        Z_3d_n = jnp.where(stretch, PR.full(zbar_below) + 0.5 * hnode, PR.full(Zp[None, :]))
+    else:
+        Z_3d_n = jnp.where(stretch, PR.full(zbar_below) + 0.5 * hnode, PR.full(Z_nom))
     return zbar_3d_n, (Z_3d_n if keep_f64 else PR.wp(Z_3d_n))
 
 

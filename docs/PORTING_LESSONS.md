@@ -11276,3 +11276,14 @@ FESOM2's `oce_ale.F90` (`init_bottom_elem_thickness` / `init_bottom_node_thickne
   a derived quantity (speed, a product, a variance) is averaged over several output records, both sides must
   average the same primitive fields first; and a sudden change of an error's growth rate is a reason to look
   at the analysis code before the model.
+ - The full suite (array 29281090) found that the full-cell programs on the branch did not lower to main's text:
+   `test_dp_lock`'s three hashes differed from main's, with the same length and the same number of f64 types.
+   The diff of the two StableHLO dumps (`DP_HASH_DUMP`) showed the only change: in `ale.live_geometry` I had
+   moved `Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])` and its `Zp[None, :]` above the `zbar_3d_n` where, so the
+   same ops were traced in another order. A first fix moved `Zp` back but kept `Zp[None, :]` out of the `where`
+   call, which still reordered one broadcast. With the full-cell lines written exactly as on main, all three
+   programs (`fwd_core2_full`, `fwd_core2_gpu`, `adj_core2`) hash equal to main's (job 29327883). Lesson: "a
+   `None` field traces the old program" holds only if the old lines are left as they were, op for op, including
+   where an expression sits inside a call; check it by comparing the lowered text with the base commit, not by
+   reading the diff. (`test_dp_lock` itself also fails on main, whose hashes no longer match the lock written at
+   bdeb99e; that is not from this branch.)
