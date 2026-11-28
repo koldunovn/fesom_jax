@@ -348,8 +348,17 @@ several tasks.
 ### Task 9: Verify acceptance criteria
 
 - [x] zstar and linfs partial cells work end to end through `scripts/run_from_config.py` (every G2 JAX run)
-- [ ] full-cell default byte-identical: full CPU suite `sbatch scripts/runs/run_suite.sbatch` green (known
-      pre-existing failure `test_dp_lock` noted, not re-pinned)
+- [x] full-cell default byte-identical: full CPU suite green except failures that main has too.
+      `run_suite.sbatch` (29279250) is stale (its 2:30 cut it at 3 % of the suite); the array
+      `run_suite_parallel.sbatch` 29281090 ran instead (82f766c; sharding_slow and unit on a8f0b74, which only
+      reorders full-cell ops back to main's): ci 832, ice 250, unit 432, sharding_slow 36 passed; core2 hit its
+      8 h limit after ~516 of 569 tests with no failure, and 29327277 ran tests 511-569 (58 passed, 1 skipped,
+      the 41 of test_partial_cells.py among them). Failing, and failing identically on main d7e4e5d (29327279):
+      `test_dp_lock` (main's hashes no longer match the lock written at bdeb99e), `test_ssh_gathered`
+      (`configs/core2_cpl.yaml` has `gathered: true`, from main 989aa80), and three FD-gradient tests in
+      `scripts/tests` (`test_tke_lbfgs` ×2, `test_icecal`, same numbers on main).
+      ➕ The suite caught a real difference: the full-cell DP programs did not lower to main's text (op order in
+      `ale.live_geometry`). Fixed in a8f0b74; all three DP programs now hash equal to main's (29327883).
 - [x] guards for the out-of-scope combinations raise clearly (test_partial_cells: cavity, REcoM, single
       precision, config/mesh mismatch, restart and IC-cache kind)
 
@@ -358,7 +367,7 @@ several tasks.
 - [x] README: the option, its FESOM2 names, the scope and the "not recommended" note from FESOM2 (README
       "Can" list; the schema keys and the full paragraph in `docs/USER_GUIDE.md`)
 - [x] `docs/PORTING_LESSONS.md`: lessons from each task
-- [ ] move this plan to `docs/plans/completed/`
+- [x] move this plan to `docs/plans/completed/`
 
 ## Technical Details
 

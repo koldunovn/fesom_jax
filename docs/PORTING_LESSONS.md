@@ -11236,7 +11236,7 @@ own branch.
 
 ## 2026-11-25/26 — partial bottom cells (FESOM2 `use_partial_cell`, issue #3)
 
-Plan `docs/plans/20261125-fesom-jax-partial-cells.md`. The issue asked for "fesom3's partial cells"; FESOM3
+Plan `docs/plans/completed/20261125-fesom-jax-partial-cells.md`. The issue asked for "fesom3's partial cells"; FESOM3
 (`~/fesom3`) has the namelist flag and no implementation (every driver builds full cells), so the reference is
 FESOM2's `oce_ale.F90` (`init_bottom_elem_thickness` / `init_bottom_node_thickness`), zstar and linfs.
 

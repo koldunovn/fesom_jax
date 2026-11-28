@@ -1,7 +1,7 @@
 # Partial bottom cells: validation against FESOM2
 
 fesom-jax supports FESOM2's partial bottom cells (`use_partial_cell`, `partial_cell_thresh`) with the zstar and
-linfs vertical coordinates (issue #3, plan `docs/plans/20261125-fesom-jax-partial-cells.md`). With partial cells,
+linfs vertical coordinates (issue #3, plan `docs/plans/completed/20261125-fesom-jax-partial-cells.md`). With partial cells,
 the bottom layer of each column ends at the topographic depth instead of at the next model level. This page shows
 that the port reproduces FESOM2. It has three parts: the geometry, the response of the model to partial cells,
 and a one-year stability check. FESOM2's own namelist describes the option as "not recommended"; the port keeps
@@ -109,6 +109,13 @@ initial state, the guards, a finite gradient through a partial-cell step, and th
 `partial_cell_thresh` above every layer thickness gives the full-cell zstar step to 1e-12.
 `test_partial_cells_sharded.py` (5 tests) checks that a sharded partial-cell step on 1 and 2 devices agrees with
 the single-device step, for zstar and linfs.
+
+With partial cells off, the code lowers to the same programs as before the port: the three double-precision
+programs of `test_dp_lock` (the CORE2 forward chunk with the standard and the GPU options, and the CORE2
+adjoint) hash equal to those of main d7e4e5d (job 29327883). The full CPU suite (array 29281090, with the
+end of the CORE2 group rerun in 29327277 after its 8 h limit) passes except five tests that fail on main as well,
+with the same numbers (job 29327279): `test_dp_lock` (main no longer matches its lock file),
+`test_ssh_gathered` (a config on main) and three finite-difference gradient checks in `scripts/tests`.
 
 ## Jobs and cost
 
