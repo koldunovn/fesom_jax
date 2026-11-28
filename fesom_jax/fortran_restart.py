@@ -207,8 +207,17 @@ def state_from_fortran(mesh, oce: FortranRestart, ice: FortranRestart | None, re
     en = np.asarray(mesh.elem_nodes)
     if en.shape[0] == 3 and en.shape[1] != 3:
         en = en.T
-    helem = hn[en].mean(axis=1)                                            # (e, nl)
-    out["helem"] = np.where(M["elem_layer"], helem, ref["helem"])
+    if getattr(mesh, "zbar_e_bot", None) is not None:
+        # partial cells: restart_thickness_ale puts bottom_node_thickness / bottom_elem_thickness into the bottom
+        # layers (oce_ale.F90:1142,1172) — the same rule as the zarr restart read
+        from .zarr_output import restart_thickness_partial_cells
+        hn = restart_thickness_partial_cells("hnode", hn, mesh)
+        out["hnode"] = hn
+        out["helem"] = restart_thickness_partial_cells("helem", ref["helem"], mesh, hn)
+        rep["derived"].append("partial cells: bottom hnode/helem from the mesh")
+    else:
+        helem = hn[en].mean(axis=1)                                        # (e, nl)
+        out["helem"] = np.where(M["elem_layer"], helem, ref["helem"])
     out["hnode_new"] = hn.copy()
     out["hbar_old"] = out["hbar"].copy()
     rep["derived"] += ["helem = element mean of hnode", "hnode_new = hnode", "hbar_old = hbar"]

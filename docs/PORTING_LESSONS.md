@@ -11233,3 +11233,57 @@ uses compare healthy runs at one dt), and `run_from_config` does not check that 
 for `cfg.dt`. Second: when another branch changes a rule, re-read the tests that encode it. main's "a
 restart never re-bootstraps AB2 at step 0" and the OMIP test's opposite expectation were each right on their
 own branch.
+
+## 2026-11-25/26 — partial bottom cells (FESOM2 `use_partial_cell`, issue #3)
+
+Plan `docs/plans/completed/20261125-fesom-jax-partial-cells.md`. The issue asked for "fesom3's partial cells"; FESOM3
+(`~/fesom3`) has the namelist flag and no implementation (every driver builds full cells), so the reference is
+FESOM2's `oce_ale.F90` (`init_bottom_elem_thickness` / `init_bottom_node_thickness`), zstar and linfs.
+
+- The change stays small because zstar stretches only the layers above `nlevels_nod2D_min-2` and the partial
+  bottom always lies below them (`nlevels_nod2D_min ≤ nlevels_nod2D`). Only the static fill of the live geometry,
+  the anchors of the element columns (`zbar_e_bot` instead of `zbar(nlevels)`), the bottom `hnode`/`helem`, the
+  SSH stiffness depth and the IC's bottom layer change. The kernels already took per-node geometry through their
+  `Z3d`/`zbar3`/`elem_geo` arguments for zstar, so linfs with partial cells passes the static partial-cell geometry
+  through the same arguments.
+- linfs needs another pressure gradient: FESOM2 refuses the full-cell PGF with partial cells, and its default
+  `pressure_force_4_linfs_shchepetkin` is our zstar Shchepetkin kernel without the slope term off the bottom layer.
+  A flag on the existing kernel, not a second kernel (the plan review's suggestion).
+- The plan review caught two things that would have failed silently: the run driver builds the sharded mesh, the
+  SSH operator and the cold state in `scripts/run_from_config.py` before `fesom_jax.run` is called, so a hook in
+  `run.py` would have left them full-cell; and the cold start reads cached IC files, so the bottom-layer
+  interpolation change would never have reached a run without a separate partial-cell IC cache (now with a marker
+  the cold start checks).
+- Geometry against a FESOM2 partial-cell run (`fesom.mesh.diag.nc`): 27 % of the element bottoms differed by
+  exactly 1 ulp. My first explanation, the summation order of the three node depths, was wrong: the element node
+  order is identical. The Intel build computes `sum(depth(elnodes))/3.0` as `sum * (1/3)`; recomputed that way,
+  every element and node is bit-identical. Lesson: when a 1-ulp difference against Fortran persists after the
+  obvious cause is ruled out, test the compiler's rewrite of a division by a constant directly. We keep `/3.0`, as
+  the source says.
+- Three of my own tests were wrong, not the model: two bitwise comparisons of a jitted value with a numpy or eager
+  recomputation (XLA compiles the vertex mean's `/3` and the PGF sums differently, an ulp apart), and an "another
+  threshold must give another signature" check whose threshold (7 m) changed nothing on pi. A test that asserts that a parameter changes
+  something has to use a value that changes something on the test mesh.
+- G2 against FESOM2 (`docs/PARTIAL_CELLS_VALIDATION.md`): for zstar and linfs, the response to partial cells
+  (partial minus full cells) of the bottom temperature, the bottom speed and SSH agrees with FESOM2's at
+  correlation ≥ 0.999 on day 1, in January and for the 1958 mean, and the JAX–Fortran difference is 1–2 % of
+  the response over the first month, the same size as with full cells.
+- The first G2 run gave the year-mean bottom speed a correlation of only 0.94, with a JAX–Fortran difference as
+  large as the response, while January agreed to 2e-5 m/s. A jump of 200× in a month-to-year step, when the
+  bottom temperature and SSH differences grew 5×, did not look like chaos, so I checked before writing it up as
+  eddy divergence. The script averaged the speeds of the 12 JAX monthly means but took the speed of the
+  year-mean Fortran velocity. A one-month case has one record per side, so only the year showed it. Lesson: when
+  a derived quantity (speed, a product, a variance) is averaged over several output records, both sides must
+  average the same primitive fields first; and a sudden change of an error's growth rate is a reason to look
+  at the analysis code before the model.
+ - The full suite (array 29281090) found that the full-cell programs on the branch did not lower to main's text:
+   `test_dp_lock`'s three hashes differed from main's, with the same length and the same number of f64 types.
+   The diff of the two StableHLO dumps (`DP_HASH_DUMP`) showed the only change: in `ale.live_geometry` I had
+   moved `Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])` and its `Zp[None, :]` above the `zbar_3d_n` where, so the
+   same ops were traced in another order. A first fix moved `Zp` back but kept `Zp[None, :]` out of the `where`
+   call, which still reordered one broadcast. With the full-cell lines written exactly as on main, all three
+   programs (`fwd_core2_full`, `fwd_core2_gpu`, `adj_core2`) hash equal to main's (job 29327883). Lesson: "a
+   `None` field traces the old program" holds only if the old lines are left as they were, op for op, including
+   where an expression sits inside a call; check it by comparing the lowered text with the base commit, not by
+   reading the diff. (`test_dp_lock` itself also fails on main, whose hashes no longer match the lock written at
+   bdeb99e; that is not from this branch.)

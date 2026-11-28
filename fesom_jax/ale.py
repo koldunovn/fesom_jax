@@ -93,7 +93,8 @@ class AleConfig(NamedTuple):
         if not self.zstar:
             raise ValueError(
                 "AleConfig only supports which_ALE='zstar' (zstar=True); zlevel / "
-                "local-zstar / partial cells are out of scope (no C reference run). "
+                "local-zstar are out of scope (no reference run; partial cells are the RunConfig "
+                "switch use_partial_cell). "
                 "Use ale_cfg=None for the linfs path. (fesom_ale.c:25-30 abort parity)")
         if self.split_explicit is not None:
             from .ssh_se import SeConfig
@@ -135,8 +136,22 @@ def commit_thickness(mesh: Mesh, hnode_new):
     hnode = jnp.asarray(hnode_new)
     h3 = ops.gather_nodes_to_elem(hnode, mesh.elem_nodes)   # (elem2D, 3, nl)
     helem = PR.wp((h3[:, 0] + h3[:, 1] + h3[:, 2]) / 3.0)     # WP in single precision (hnode is WP_full)
+    if mesh.zbar_e_bot is not None:
+        helem = bottom_helem(mesh, helem)
     helem = ops.mask_below_bottom(helem, mesh.elem_layer_mask)
     return hnode, helem
+
+
+def bottom_helem(mesh: Mesh, helem):
+    """Partial cells: ``helem`` with the element's bottom layer set to ``bottom_elem_thickness``. FESOM2 sets
+    it there at init and restart (``oce_ale.F90:660,812,1172,1207``) and never updates it (``update_thickness_ale``
+    averages the vertex ``hnode`` only on the layers above, ``:1040-1042``); linfs keeps the whole ``helem``
+    static."""
+    from .partial_cells import bottom_elem_thickness, _level_index
+    nl = helem.shape[-1]
+    k_bot = _level_index(mesh.nlevels, 2, nl)[:, None]
+    return jnp.where(jnp.arange(nl)[None, :] == k_bot,
+                     PR.wp(bottom_elem_thickness(mesh))[:, None].astype(helem.dtype), helem)
 
 
 # ===========================================================================
@@ -195,7 +210,14 @@ def init_thickness_zstar(mesh: Mesh, hbar, hbar_old, *, alpha: float = 1.0,
     stretch = _stretch_mask(mesh)                             # (nod2D, nl)
     ratio = jnp.where(dd != 0.0, hbar / dd_safe, 0.0)[:, None]   # (nod2D,1)
     factor = 1.0 + jnp.where(stretch, ratio, 0.0)            # 1 off the stretch range
-    hnode = jnp.where(mesh.node_layer_mask, dz[None, :] * factor, 0.0)
+    dz_n = dz[None, :]
+    if mesh.zbar_n_bot is not None:
+        # partial cells: the node's bottom layer is bottom_node_thickness (oce_ale.F90:778); it lies below
+        # the stretch range (nlevels_nod2D_min <= nlevels_nod2D), so factor is 1 there.
+        from .partial_cells import bottom_node_thickness, _level_index
+        k_bot = _level_index(mesh.nlevels_nod2D, 2, nl)[:, None]
+        dz_n = jnp.where(jnp.arange(nl)[None, :] == k_bot, bottom_node_thickness(mesh)[:, None], dz_n)
+    hnode = jnp.where(mesh.node_layer_mask, dz_n * factor, 0.0)
 
     hnode, helem = commit_thickness(mesh, hnode)            # vertex-mean helem (full cell)
     eta_n = alpha * hbar_old + (1.0 - alpha) * hbar         # ⚠️ reversed weights (lesson #7)
@@ -235,6 +257,12 @@ def live_geometry(mesh: Mesh, hnode, *, keep_f64: bool = False):
     h_str = jnp.where(stretch, hnode, 0.0)
     revcum = lax.cumsum(h_str, axis=1, reverse=True)        # Σ_{j≥nz} h_str[j]
     zbar_nom = jnp.broadcast_to(zbar[None, :], (mesh.nod2D, nl))   # AD-safe nominal (dz>0)
+    Z_nom = None
+    if mesh.zbar_n_bot is not None:
+        # partial cells: below the stretch range FESOM2 keeps the init_ale geometry (update_thickness_ale only
+        # rewrites nz <= nlevels_nod2D_min-2), whose bottom interface / bottom mid-depth carry zbar_n_bot
+        from .partial_cells import static_node_geometry
+        zbar_nom, Z_nom = static_node_geometry(mesh)
     # single precision (FESOM2 #1207): hnode is WP_full, zbar_3d_n / Z_3d_n are WP — formed from the
     # float64 thickness and rounded once (PR.full / PR.wp are the identity in double precision).
     zbar_3d_n = jnp.where(stretch, PR.full(anchor) + revcum, PR.full(zbar_nom))
@@ -242,9 +270,23 @@ def live_geometry(mesh: Mesh, hnode, *, keep_f64: bool = False):
 
     # Z mid-layer: zbar_3d_n[nz+1] + hnode[nz]/2 in the stretch range; nominal mesh.Z below.
     zbar_below = jnp.concatenate([zbar_3d_n[:, 1:], zbar_3d_n[:, -1:]], axis=1)  # [nz+1]
-    Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])             # (nl,) nominal mid-depths, padded
-    Z_3d_n = jnp.where(stretch, PR.full(zbar_below) + 0.5 * hnode, PR.full(Zp[None, :]))
+    if Z_nom is None:
+        # full cells: these two lines are main's, op for op, so that a full-cell mesh lowers to the same program text
+        # as before partial cells (tracing Zp or Zp[None, :] earlier reorders the HLO and changes test_dp_lock's hash)
+        Zp = jnp.concatenate([mesh.Z, mesh.Z[-1:]])             # (nl,) nominal mid-depths, padded
+        Z_3d_n = jnp.where(stretch, PR.full(zbar_below) + 0.5 * hnode, PR.full(Zp[None, :]))
+    else:
+        Z_3d_n = jnp.where(stretch, PR.full(zbar_below) + 0.5 * hnode, PR.full(Z_nom))
     return zbar_3d_n, (Z_3d_n if keep_f64 else PR.wp(Z_3d_n))
+
+
+def elem_bottom_interface(mesh: Mesh):
+    """The element's static bottom interface ``(elem2D,)``: ``zbar(nlevels)`` with full cells, ``zbar_e_bot`` with
+    partial cells — the anchor FESOM2 builds every element column on (``zbar_n(nle+1)=zbar_e_bot``,
+    ``oce_ale.F90:3380``, ``oce_ale_pressure_bv.F90:2075``)."""
+    if mesh.zbar_e_bot is not None:
+        return mesh.zbar_e_bot
+    return mesh.zbar[mesh.nlevels - 1]
 
 
 def live_geometry_elem(mesh: Mesh, helem):
@@ -264,7 +306,7 @@ def live_geometry_elem(mesh: Mesh, helem):
     mask the below-bottom lanes anyway. At cold start (nominal ``helem``) this telescopes to
     the static ``mesh.zbar``/``mesh.Z`` bit-for-bit."""
     hel = jnp.where(mesh.elem_layer_mask, helem, 0.0)         # 0 below bottom
-    zbar_bot = mesh.zbar[mesh.nlevels - 1][:, None]           # (elem2D,1) static bottom interface
+    zbar_bot = elem_bottom_interface(mesh)[:, None]           # (elem2D,1) static bottom interface
     revcum = jnp.cumsum(hel[:, ::-1], axis=1)[:, ::-1]        # Σ_{j≥nz} hel[j]
     zbar_n = zbar_bot + revcum                                # interface depths [e,nz]
     zbar_n_below = jnp.concatenate([zbar_n[:, 1:], zbar_bot], axis=1)   # zbar_n[nz+1]

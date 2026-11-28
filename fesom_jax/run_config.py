@@ -20,6 +20,8 @@ docstrings map the concepts, but the format is a clean YAML (see :func:`to_yaml`
 YAML schema (every key optional; absent ⇒ the bit-identical default)::
 
     ale:   {}            # {} = zstar on (defaults); null/absent = linfs
+    use_partial_cell: false   # FESOM2 partial bottom cells (zstar and linfs; fesom_jax.partial_cells)
+    partial_cell_thresh: 0.0  # m; bottom layers this thin or thinner keep the full cell
     gm:    null          # null = GM off; {} or {k_gm_min: …} = on (+ overrides)
     kpp:   {}            # the vertical-mixing scheme sub-configs (mutually exclusive: kpp xor tke)
     tke:   null
@@ -98,7 +100,7 @@ _SPEC_FIELDS = ("dt", "mesh", "partition", "precision", "forcing", "ssh", "gpu",
                 "snapshot_every",
                 "checkpoint_every", "restart_in", "restart_out",
                 "restart_archive_out", "restart_archive_period", "restart_archive_length",
-                "n_steps", "duration", "params_file")
+                "n_steps", "duration", "params_file", "use_partial_cell", "partial_cell_thresh")
 _ARCHIVE_PERIODS = ("year", "month", "day")
 # The `forcing:` mapping — WHAT the forcing is (`kind`/`start_year`) plus WHERE its input
 # files live. The four path keys are optional overrides of the env var / Levante default
@@ -235,6 +237,10 @@ class RunConfig:
     # working precision: "double" (default, every program unchanged) or "single" — FESOM2's single-precision build
     # (#1207 policy, fesom_jax.precision; CORE2 production physics only)
     precision: str = "double"
+    # partial bottom cells (FESOM2 &ale_def use_partial_cell / partial_cell_thresh; fesom_jax.partial_cells). The driver
+    # applies them to the mesh right after loading it; false = full cells, every program unchanged
+    use_partial_cell: bool = False
+    partial_cell_thresh: float = 0.0        # m: a bottom layer this thin or thinner keeps its full cell
 
     # ----------------------------------------------------------------------
     @classmethod
@@ -391,6 +397,20 @@ class RunConfig:
                                               "BGC-every-k sums and k-step stage have no single-precision scheme)")
                 if self.forcing is None:
                     raise ValueError("full REcoM needs the forced path (forcing: with mslp: true)")
+        if not isinstance(self.use_partial_cell, bool):
+            raise TypeError(f"use_partial_cell must be true or false, got {self.use_partial_cell!r}")
+        if float(self.partial_cell_thresh) < 0.0:
+            raise ValueError(f"partial_cell_thresh must be >= 0 m, got {self.partial_cell_thresh}")
+        if self.use_partial_cell:
+            if self.cavity is not None:
+                raise NotImplementedError("use_partial_cell with cavity: is not ported (FESOM2 then needs the surface "
+                                          "partial cells, use_cavity_partial_cell, and the cavity PGF branches)")
+            if self.recom is not None:
+                raise NotImplementedError("use_partial_cell with recom: is not ported (REcoM's sinking and benthos "
+                                          "read the bottom geometry, not adapted to partial cells)")
+            if self.precision != "double":
+                raise NotImplementedError("use_partial_cell with precision: single is not ported (FESOM2 #1207 keeps "
+                                          "the partial-cell bottom depths in WP; not checked for the JAX policy)")
         if self.precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {PRECISIONS}, got {self.precision!r}")
         if self.precision == "single":

@@ -216,8 +216,17 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
             "classical TKE, mEVP sea ice); got ale/tke/kpp/ice = "
             f"{ale_cfg}/{tke_cfg}/{kpp_cfg}/{ice_cfg}")
     zbar3_live = Z3d_live = elem_geo_live = None
+    # linfs with partial cells (fesom_jax.partial_cells): FESOM2's kernels read the init_ale geometry, whose bottom
+    # interface and bottom mid-depth carry the partial cells, wherever zstar reads the live one; it is static in linfs.
+    _pc_linfs = ale_cfg is None and mesh.zbar_e_bot is not None
+    if _sp and mesh.zbar_e_bot is not None:
+        raise NotImplementedError("single precision with partial cells is not ported (RunConfig.validate refuses it)")
     if ale_cfg is not None:
         zbar3_live, Z3d_live = ale.live_geometry(mesh, st.hnode)
+        elem_geo_live = ale.live_geometry_elem(mesh, st.helem)
+    elif _pc_linfs:
+        from .partial_cells import static_node_geometry
+        zbar3_live, Z3d_live = static_node_geometry(mesh)
         elem_geo_live = ale.live_geometry_elem(mesh, st.helem)
 
     # CORE2 surface forcing (None ⇒ pi path: keep the passed stress_surf, zero BCs).
@@ -383,9 +392,11 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     #     density_m_rho0) — do NOT subtract DENSITY_0 again (the pre-2026-07-03 double subtraction
     #     was analytically harmless — the kernel is offset-invariant — but coarsened the stencil-
     #     difference ulp ~30× and diverged from the pgf.py ρ−ρ0 contract).
-    if ale_cfg is not None:
+    #     linfs with partial cells ⇒ FESOM2's pressure_force_4_linfs_shchepetkin (its default which_pgf; FESOM2 refuses
+    #     the full-cell PGF with partial cells, oce_ale_pressure_bv.F90:525-576).
+    if ale_cfg is not None or _pc_linfs:
         pgf_x, pgf_y = _ckpt(lambda: pgf.pressure_force_shchepetkin(
-            mesh, density, Z3d_live, st.helem, batches=pgf_batches))()
+            mesh, density, Z3d_live, st.helem, batches=pgf_batches, linfs=_pc_linfs))()
         if _adj.freeze_pgf:
             pgf_x, pgf_y = jax.lax.stop_gradient(pgf_x), jax.lax.stop_gradient(pgf_y)
     else:
@@ -577,6 +588,8 @@ def step(state: State, mesh: Mesh, op: SSHOperator, stress_surf, params: Params 
     zbar3_new = Z3d_new = None
     if ale_cfg is not None:
         zbar3_new, Z3d_new = ale.live_geometry(mesh, hnode_new)
+    elif _pc_linfs:
+        zbar3_new, Z3d_new = zbar3_live, Z3d_live          # linfs: hnode_new = hnode, the geometry is static
     # single precision: the implicit vertical-diffusion column builds its geometry in WP_full from hnode_new
     # (oce_ale_tracer.F90:1081); everything else reads the WP geometry.
     Z3d_diff = ale.live_geometry(mesh, hnode_new, keep_f64=True)[1] if _sp else Z3d_new

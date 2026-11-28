@@ -261,8 +261,16 @@ class State:
             dz[:-1] = zbar[:-1] - zbar[1:]
             node_mask = np.asarray(mesh.node_layer_mask)
             elem_mask = np.asarray(mesh.elem_layer_mask)
-        hnode = xp.where(node_mask, dz_n, 0.0)
+        hnode = xp.where(node_mask, dz_n, 0.0)      # partial cells: zbar_3d_n carries zbar_n_bot ⇒ bottom_node_thickness
         helem = xp.where(elem_mask, dz[None, :], 0.0)
+        if mesh.zbar_e_bot is not None:
+            # partial cells (linfs init_thickness_ale, oce_ale.F90:660): the bottom layer of each element is
+            # bottom_elem_thickness = zbar(nlevels-1) - zbar_e_bot
+            nlev = np.asarray(mesh.nlevels) if xp is np else jnp.asarray(mesh.nlevels)
+            k_bot = xp.clip(nlev - 2, 0, nl - 1)[:, None]
+            zb = np.asarray(zbar) if xp is np else zbar
+            bot = zb[k_bot[:, 0]] - (np.asarray(mesh.zbar_e_bot) if xp is np else mesh.zbar_e_bot)
+            helem = xp.where(elem_mask & (xp.arange(nl)[None, :] == k_bot), bot[:, None], helem)
 
         return dataclasses.replace(
             st, T=T, S=S, T_old=T, S_old=S, hnode=hnode, hnode_new=hnode, helem=helem

@@ -1,0 +1,19 @@
+# Partial-cells validation (docs/plans/20261125-fesom-jax-partial-cells.md, Task 8): CORE2, the JAX twin of the
+# Fortran FESOM2 setup fesom2_icefw_runs/A_main_ias2_year (zstar or linfs, GM/Redi, cvmix TKE, mEVP with
+# ice_ave_steps 2, opt_visc 7, dt 1800, JRA55-do 1958, PHC3 winter IC built for the Fortran run's dist_512 order).
+# The pair zstar_fc / zstar_pc differs only in use_partial_cell.
+ale: {}
+use_partial_cell: true
+partial_cell_thresh: 0.0
+gm: {}
+kpp: null
+tke: {}
+ice: {whichEVP: 1, ice_ave_steps: 2}
+visc: {}
+tracer: {}
+dt: 1800.0
+mesh: data/mesh_core2
+partition: null
+forcing: {kind: core2, start_year: 1958}
+snapshot_every: 0
+checkpoint_every: 0

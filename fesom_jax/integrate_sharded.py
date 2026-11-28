@@ -42,7 +42,8 @@ from . import step as stepmod
 from .halo import HaloCtx
 from .mesh import Mesh
 from .params import Params
-from .shard_mesh import (CONN_FIELDS, EDGE_FIELDS, ELEM_FIELDS, NODE_FIELDS,
+from .shard_mesh import (CONN_FIELDS, EDGE_FIELDS, ELEM_FIELDS, NODE_FIELDS, OPTIONAL_ELEM_FIELDS,
+                         OPTIONAL_NODE_FIELDS,
                          REPLICATED_FIELDS, ShardedMesh)
 from .ssh import SSHHalo, SSHOperator, ShardedSSHOperator
 from .state import State
@@ -95,7 +96,7 @@ def _to_global_sharded(x, spec, mesh):
 
 # entity-leading mesh fields (shard 'p'); the rest (zbar/Z + the CSR dummy) replicate.
 _ENTITY_FIELDS = (set(NODE_FIELDS) | set(ELEM_FIELDS) | set(EDGE_FIELDS)
-                  | {c[0] for c in CONN_FIELDS})
+                  | {c[0] for c in CONN_FIELDS} | set(OPTIONAL_NODE_FIELDS) | set(OPTIONAL_ELEM_FIELDS))
 
 
 # --------------------------------------------------------------------------

@@ -670,6 +670,10 @@ above; these are the constraints on the *gradient* modes):
 ### Can
 - **Full forward ocean** (ALE/EOS/PGF/FCT/SSH-CG/KPP/GM-Redi/EVP-ice) with real JRA55 + PHC,
   float64; N-vs-1 correct vs single-device (field-appropriate; see below).
+- **Partial bottom cells** (FESOM2 `use_partial_cell` / `partial_cell_thresh`, zstar and linfs; off by
+  default, and FESOM2's namelist calls it "not recommended"): the bottom layer follows the topography;
+  switch and limits in [`docs/USER_GUIDE.md`](docs/USER_GUIDE.md), comparison with FESOM2 in
+  [`docs/PARTIAL_CELLS_VALIDATION.md`](docs/PARTIAL_CELLS_VALIDATION.md).
 - **End-to-end gradients** w.r.t. physics params, initial state, and forcing — through the CG
   solve and the EVP scan. 1-step gradient validated tight; multi-step mechanism validated.
 - **Multi-GPU + multi-node** (CORE2→NG5, up to 64 GPU), halo-only comms in four transports

@@ -137,7 +137,14 @@ class Mesh:
     se_elem_nb: Optional[jax.Array] = None        # (elem2D, 3) i4 edge neighbours, ascending edge id; -1 = coast
     se_kappa: Optional[jax.Array] = None          # (elem2D, 3) f8 FESOM_F's l^2/(d A_e) per neighbour slot
     se_div_inv: Optional[jax.Array] = None        # (elem2D, Dinv) i4 the inflow rows' inverse (ssh_se.div_inverse)
+    # --- optional partial bottom cells (FESOM2 use_partial_cell; fesom_jax.partial_cells.apply). None = full cells, so
+    #     a full-cell mesh traces the program it always traced. ---
+    zbar_e_bot: Optional[jax.Array] = None        # (elem2D,) f8 element bottom depth, m (<= 0)
+    zbar_n_bot: Optional[jax.Array] = None        # (nod2D,)  f8 node bottom depth = deepest element bottom, m
 
+
+# Built by fesom_jax.partial_cells.apply, never read from the mesh export.
+PARTIAL_CELL_FIELDS = ("zbar_e_bot", "zbar_n_bot")
 
 INVERSE_MAP_FIELDS = (("inv_elem_nodes", "elem_nodes", "nod"),
                       ("inv_edges", "edges", "nod"),
@@ -279,7 +286,7 @@ def load_mesh(mesh_dir: str | Path = DEFAULT_PI_MESH_DIR,
         f.name: load(f.name)
         for f in dataclasses.fields(Mesh)
         if not f.metadata.get("static") and not f.name.endswith("_mask")
-        and not f.name.startswith(("inv_", "se_"))
+        and not f.name.startswith(("inv_", "se_")) and f.name not in PARTIAL_CELL_FIELDS
     }
 
     if check_orientation:
@@ -314,5 +321,5 @@ def mesh_field_files() -> Mapping[str, str]:
         f.name: f"{f.name}.npy"
         for f in dataclasses.fields(Mesh)
         if not f.metadata.get("static") and not f.name.endswith("_mask")
-        and not f.name.startswith(("inv_", "se_"))
+        and not f.name.startswith(("inv_", "se_")) and f.name not in PARTIAL_CELL_FIELDS
     }
